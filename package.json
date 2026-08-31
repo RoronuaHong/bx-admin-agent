@@ -1,0 +1,12 @@
+{
+  "name": "bx-admin-agent",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @bx/agent-server --filter @bx/web dev",
+    "dev:server": "pnpm --filter @bx/agent-server dev",
+    "dev:web": "pnpm --filter @bx/web dev",
+    "test": "pnpm --filter @bx/agent-server test",
+    "build": "pnpm --filter @bx/web build"
+  }
+}

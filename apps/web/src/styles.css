@@ -1,0 +1,172 @@
+:root {
+  --bg: #f4f4f1;
+  --panel: #fcfcf9;
+  --ink: #141413;
+  --muted: #707068;
+  --line: #dbdbd4;
+  --line-strong: #141413;
+  --fill: #ffffff;
+  --fill-soft: #eeece8;
+  --danger: #8f2b22;
+  /* 停止生成按钮语义色（赤陶橙）：更通透温暖，与纸感主题协调 */
+  --stop: #c25c2c;
+  --ok: #1f1f1c;
+  --shadow: 0 20px 50px rgba(20, 20, 19, 0.07);
+  --font-display: "Newsreader", "Noto Serif SC", serif;
+  --font-body: "Noto Sans SC", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --pad: 22px;
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 18px;
+  --radius-pill: 999px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  --bg: #0c0c0b;
+  --panel: #131312;
+  --ink: #f2f2ec;
+  --muted: #9a9a92;
+  --line: #2a2a26;
+  --line-strong: #f2f2ec;
+  --fill: #191917;
+  --fill-soft: #20201e;
+  --danger: #e07a70;
+  /* 停止生成按钮语义色（暖杏金）：深色下柔和醒目 */
+  --stop: #f2b386;
+  --ok: #f2f2ec;
+  --shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+  height: 100%;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+html {
+  background: var(--bg);
+}
+
+/* 统一自定义滚动条（适配浅/深主题，随 --ink 自动调色） */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 18%, transparent) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
+  border-radius: 999px;
+  border: 1.5px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ink) 30%, transparent);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+body {
+  color: var(--ink);
+  font-family: var(--font-body);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 160 160' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--line);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+button,
+a,
+.chip {
+  touch-action: manipulation;
+}
+
+.brand-mark {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@media (max-width: 720px) {
+  :root {
+    --pad: 16px;
+  }
+}

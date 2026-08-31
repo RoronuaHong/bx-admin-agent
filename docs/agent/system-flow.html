@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能助手系统流程图</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --paper: #ffffff;
+    --ink: #1a2233;
+    --ink-2: #4a5568;
+    --ink-3: #8a94a6;
+    --line: #e4e8ef;
+    --brand: #2f6bff;
+    --brand-soft: #eaf1ff;
+    --green: #0ea37e;
+    --green-soft: #e6f7f1;
+    --amber: #d97706;
+    --amber-soft: #fdf3e3;
+    --red: #dc2626;
+    --red-soft: #fdeaea;
+    --violet: #7c3aed;
+    --violet-soft: #f1ebfe;
+    --cyan: #0891b2;
+    --cyan-soft: #e0f6fb;
+    --shadow: 0 1px 2px rgba(26,34,51,.04), 0 4px 16px rgba(26,34,51,.05);
+    --w-main: 840px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    padding: 48px 24px 72px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell { max-width: 1080px; margin: 0 auto; }
+
+  /* ── 头部 ── */
+  .masthead { margin-bottom: 36px; }
+  .masthead .kicker {
+    font-size: 12px; letter-spacing: .14em; color: var(--brand);
+    font-weight: 600; text-transform: uppercase; margin-bottom: 10px;
+  }
+  .masthead h1 {
+    font-size: 30px; font-weight: 700; letter-spacing: -.02em;
+    color: var(--ink); line-height: 1.25;
+  }
+  .masthead p { color: var(--ink-2); font-size: 14.5px; margin-top: 10px; max-width: 760px; }
+  .masthead .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 18px;
+    font-size: 12.5px; color: var(--ink-3);
+  }
+  .masthead .meta b { color: var(--ink-2); font-weight: 600; }
+
+  /* ── 顶层架构总览 ── */
+  .arch-bar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px; margin-bottom: 36px;
+  }
+  .arch {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; box-shadow: var(--shadow); position: relative;
+  }
+  .arch .a-idx {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .1em; color: var(--ink-3);
+    text-transform: uppercase; margin-bottom: 4px;
+  }
+  .arch .a-name { font-size: 14px; font-weight: 700; margin-bottom: 3px; }
+  .arch .a-desc { font-size: 11.5px; color: var(--ink-3); line-height: 1.5; }
+  .arch.blue { border-top: 3px solid var(--brand); } .arch.blue .a-name { color: var(--brand); }
+  .arch.green { border-top: 3px solid var(--green); } .arch.green .a-name { color: var(--green); }
+  .arch.violet { border-top: 3px solid var(--violet); } .arch.violet .a-name { color: var(--violet); }
+  .arch.amber { border-top: 3px solid var(--amber); } .arch.amber .a-name { color: var(--amber); }
+  .arch .a-flow {
+    position: absolute; top: 50%; right: -9px; transform: translateY(-50%);
+    font-size: 15px; color: var(--ink-3); z-index: 1;
+  }
+
+  /* ── 图例 ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 18px;
+    padding: 14px 18px; background: var(--paper);
+    border: 1px solid var(--line); border-radius: 12px; margin-bottom: 34px;
+    box-shadow: var(--shadow);
+  }
+  .legend span {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12.5px; color: var(--ink-2);
+  }
+  .legend i { width: 9px; height: 9px; border-radius: 3px; }
+
+  /* ── 泳道 ── */
+  .lane { margin-bottom: 44px; position: relative; }
+  .lane-head {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px;
+    margin-bottom: 18px; padding-left: 2px;
+  }
+  .lane-head .no {
+    font-size: 12px; font-weight: 700; color: var(--brand);
+    font-variant-numeric: tabular-nums;
+    background: var(--brand-soft); border-radius: 999px;
+    padding: 4px 12px; letter-spacing: .04em;
+  }
+  .lane-head .name { font-size: 16px; font-weight: 700; color: var(--ink); }
+  .lane-head .desc { font-size: 12.5px; color: var(--ink-3); }
+
+  /* ── 主流程（垂直管道） ── */
+  .pipeline { display: flex; flex-direction: column; align-items: center; }
+  .step {
+    width: 100%; max-width: var(--w-main);
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 22px;
+    position: relative;
+    box-shadow: var(--shadow);
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  .step:hover { border-color: #cbd5e1; box-shadow: 0 2px 4px rgba(26,34,51,.05), 0 10px 28px rgba(26,34,51,.07); }
+  .step .step-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .step .idx {
+    width: 30px; height: 30px; border-radius: 9px;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 700; color: #fff; flex-shrink: 0;
+  }
+  .step .idx.i-blue { background: var(--brand); }
+  .step .idx.i-green { background: var(--green); }
+  .step .idx.i-violet { background: var(--violet); }
+  .step .idx.i-red { background: var(--red); }
+  .step .idx.i-amber { background: var(--amber); }
+  .step h3 { font-size: 15.5px; font-weight: 700; color: var(--ink); }
+  .step .role {
+    font-size: 11.5px; color: var(--ink-3); font-weight: 500;
+    letter-spacing: .02em;
+  }
+  .step .body { display: flex; flex-wrap: wrap; gap: 8px 10px; }
+  .pill {
+    font-size: 12.5px; padding: 5px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: #fbfcfe; color: var(--ink-2);
+    line-height: 1.4;
+  }
+  .pill code, .pill em { font-style: normal; color: var(--ink); font-weight: 600; }
+  .pill code { font-family: "SF Mono", Consolas, monospace; font-size: 11.5px; }
+  .pill.hl { border-color: var(--brand-soft); background: var(--brand-soft); }
+  .pill.hl code { color: var(--brand); }
+
+  /* 连接管道 */
+  .conn {
+    width: 2px; height: 30px;
+    background: linear-gradient(var(--line), var(--brand));
+    position: relative;
+  }
+  .conn::after {
+    content: ""; position: absolute; bottom: 0; left: 50%;
+    transform: translateX(-50%);
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid var(--brand);
+  }
+  .conn-label { font-size: 11.5px; color: var(--ink-3); padding: 2px 8px; text-align: center; max-width: var(--w-main); }
+  .conn-label b { color: var(--brand); font-weight: 600; }
+
+  /* 分支盒子 */
+  .forks { width: 100%; max-width: var(--w-main); display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin: 14px 0 6px; }
+  .fork {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; box-shadow: var(--shadow);
+    position: relative; overflow: hidden;
+    transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  }
+  .fork::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  }
+  .fork.amber::before { background: var(--amber); }
+  .fork.green::before { background: var(--green); }
+  .fork.ink::before { background: var(--ink-3); }
+  .fork.red::before { background: var(--red); }
+  .fork:hover { border-color: #cbd5e1; box-shadow: 0 2px 4px rgba(26,34,51,.05), 0 10px 28px rgba(26,34,51,.07); transform: translateY(-1px); }
+  .fork .f-title { font-size: 13px; font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+  .fork .f-desc { font-size: 12px; color: var(--ink-3); line-height: 1.5; }
+
+  /* 子节点网格 */
+  .subs { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-top: 14px; }
+  .sub {
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; background: #fbfcfe;
+    border-left: 3px solid var(--line);
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  .sub:hover { border-color: #cbd5e1; box-shadow: var(--shadow); }
+  .sub .s-name { font-size: 13px; font-weight: 700; color: var(--ink); margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
+  .sub .s-tag { font-size: 11px; color: var(--ink-3); font-family: "SF Mono", Consolas, monospace; }
+  .sub .s-desc { font-size: 11.5px; color: var(--ink-2); margin-top: 3px; line-height: 1.5; }
+  .sub.blue { border-left-color: var(--brand); }
+  .sub.green { border-left-color: var(--green); }
+  .sub.amber { border-left-color: var(--amber); }
+  .sub.red { border-left-color: var(--red); }
+  .sub.violet { border-left-color: var(--violet); }
+  .sub.cyan { border-left-color: var(--cyan); }
+  .sub.gray { border-left-color: var(--ink-3); }
+  .sub .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+
+  /* 泳道内分组 */
+  .group-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; box-shadow: var(--shadow);
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  .card:hover { border-color: #cbd5e1; box-shadow: 0 2px 4px rgba(26,34,51,.05), 0 10px 28px rgba(26,34,51,.07); }
+  .card .c-title { font-size: 13.5px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .card .c-title .dotc { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .card ul { list-style: none; }
+  .card li { font-size: 12px; color: var(--ink-2); padding: 3px 0; line-height: 1.5; }
+  .card li code { font-family: "SF Mono", Consolas, monospace; font-size: 11px; color: var(--ink); }
+
+  /* 兜底编排链（泳道 D） */
+  .d-flow { display: flex; flex-direction: column; align-items: center; }
+  .d-step {
+    width: 100%; max-width: 560px;
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 18px; box-shadow: var(--shadow);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .d-step .d-idx {
+    width: 24px; height: 24px; border-radius: 7px; flex-shrink: 0;
+    display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; color: #fff;
+  }
+  .d-step .d-name { font-size: 13px; font-weight: 700; color: var(--ink); }
+  .d-step .d-desc { font-size: 11.5px; color: var(--ink-3); line-height: 1.5; }
+  .d-conn { width: 2px; height: 22px; background: linear-gradient(var(--line), var(--amber)); position: relative; }
+  .d-conn::after {
+    content: ""; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid var(--amber);
+  }
+
+  .foot { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12.5px; line-height: 1.8; }
+  .foot b { color: var(--ink-2); }
+
+  /* 响应式 */
+  @media (max-width: 960px) {
+    .arch .a-flow { display: none; }
+  }
+  @media (max-width: 640px) {
+    body { padding: 28px 16px 48px; }
+    .masthead h1 { font-size: 23px; }
+    .step { padding: 15px 16px; }
+    .arch .a-flow { display: none; }
+    .forks { grid-template-columns: 1fr; }
+    .subs { grid-template-columns: 1fr; }
+    .group-grid { grid-template-columns: 1fr; }
+    .lane { margin-bottom: 34px; }
+  }
+
+  /* 打印 */
+  @media print {
+    body { background: #fff; padding: 0; }
+    .arch, .step, .fork, .sub, .card, .d-step { box-shadow: none; break-inside: avoid; }
+    .conn, .d-conn { background: var(--ink-3); }
+    .conn::after, .d-conn::after { border-top-color: var(--ink-3); }
+    .foot { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- 头部 -->
+  <header class="masthead">
+    <div class="kicker">System Workflow · LangGraph</div>
+    <h1>智能助手处理流程</h1>
+    <p>ReAct 状态机架构 · 语义判定 100% 交大模型，服务端仅承担协议护栏、受控渲染与确定性兜底。</p>
+    <div class="meta">
+      <span>入口 <b>chat.ts · chatStream</b></span>
+      <span>状态机 <b>LangGraph StateGraph</b></span>
+      <span>渲染 <b>workflow-orchestrate.ts</b></span>
+      <span>会话 <b>session.ts</b></span>
+      <span>工具注册 <b>tools.ts</b></span>
+    </div>
+  </header>
+
+  <!-- 顶层架构总览 -->
+  <div class="arch-bar">
+    <div class="arch blue">
+      <div class="a-idx">Layer 1 · 请求接入</div>
+      <div class="a-name">输入预处理</div>
+      <div class="a-desc">会话加载 · 历史压缩投影 · 项目绑定 · 模型解析 · 模型级门槛</div>
+      <span class="a-flow">→</span>
+    </div>
+    <div class="arch green">
+      <div class="a-idx">Layer 2 · Agent 核心</div>
+      <div class="a-name">LangGraph 状态机</div>
+      <div class="a-desc">preprocess → understand ⇄ tool → final；协议护栏 + 数量护栏 + 确定性兜底</div>
+      <span class="a-flow">→</span>
+    </div>
+    <div class="arch violet">
+      <div class="a-idx">Layer 3 · 服务端能力</div>
+      <div class="a-name">规则编排 · 渲染 · 导出</div>
+      <div class="a-desc">runServerFallback 兜底 · PC 源码映射 · 表格受控渲染 · Excel 生成</div>
+      <span class="a-flow">→</span>
+    </div>
+    <div class="arch amber">
+      <div class="a-idx">Layer 4 · 数据与输出</div>
+      <div class="a-name">会话持久化 · 上屏</div>
+      <div class="a-desc">session.ts 落盘 · text / table / file / chart 事件流 · done 收束</div>
+    </div>
+  </div>
+
+  <!-- 图例 -->
+  <div class="legend">
+    <span><i style="background:var(--brand)"></i> 主流程节点</span>
+    <span><i style="background:var(--green)"></i> 模型决策 / Schema 转换</span>
+    <span><i style="background:var(--violet)"></i> 服务端护栏 / 能力</span>
+    <span><i style="background:var(--amber)"></i> 分支 / 反馈重试 / 兜底</span>
+    <span><i style="background:var(--red)"></i> 异常 / 收束 / 熔断</span>
+  </div>
+
+  <!-- ══════════ 泳道 A：主流程 ══════════ -->
+  <section class="lane">
+    <div class="lane-head">
+      <span class="no">A · 主流程</span>
+      <span class="name">LangGraph 状态机（请求内）</span>
+      <span class="desc">节点 = superstep，箭头 = 转移；graph 生命周期 = 单请求</span>
+    </div>
+
+    <div class="pipeline">
+
+      <!-- A0 -->
+      <div class="step">
+        <div class="step-head"><span class="idx i-blue">0</span><div><h3>用户请求接入</h3><span class="role">会话级预处理 · Graph 之外 · Layer 1</span></div></div>
+        <div class="subs">
+          <div class="sub gray"><div class="s-name"><span class="dot" style="background:var(--ink-3)"></span>① 会话加载</div><div class="s-tag">session.ts</div><div class="s-desc">挂起澄清直读 · 历史 push user · 项目绑定 setCurrentProject</div></div>
+          <div class="sub blue"><div class="s-name"><span class="dot" style="background:var(--brand)"></span>② 内容源处理</div><div class="s-tag">sources.ts · uploads.ts</div><div class="s-desc">图片 vision(direct/ocr) · 文件上传 · URL/本地路径内容注入</div></div>
+          <div class="sub green"><div class="s-name"><span class="dot" style="background:var(--green)"></span>③ 模型解析</div><div class="s-tag">pickAutoModel · auto 路由</div><div class="s-desc">图片→视觉模型 · 长文本→大上下文 · 写操作→强模型</div></div>
+          <div class="sub violet"><div class="s-name"><span class="dot" style="background:var(--violet)"></span>④ 历史压缩投影</div><div class="s-tag">buildModelTurns</div><div class="s-desc">full → prune（表格折叠/超长截断）→ LLM 摘要（tools=[]）</div></div>
+          <div class="sub red"><div class="s-name"><span class="dot" style="background:var(--red)"></span>⑤ 模型级门槛</div><div class="s-tag">agentCapable</div><div class="s-desc">false → 一次模型调用纯问答（C5），不进状态机</div></div>
+        </div>
+      </div>
+      <div class="conn-label"><code>agentCapable=false</code> → 一次模型调用纯文本回复（tools=[]，带 staticGuide 前缀），不走下方状态机（见 C5）</div>
+      <div class="conn"></div>
+
+      <!-- A1 + 子节点 -->
+      <div class="step">
+        <div class="step-head"><span class="idx i-blue">1</span><div><h3>Prompt 骨架注入</h3><span class="role">preprocess · 无模型 · 实测 1903 字符 ≈ 476 tokens</span></div></div>
+        <div class="body" style="margin-bottom:4px">
+          <span class="pill hl">薄指令 <em>1132 字符 ≈ 283 tokens</em></span>
+          <span class="pill">Skills 目录索引 <em>771 字符</em></span>
+          <span class="pill hl">拼接为 system 前缀 <code>staticGuide</code>（Prompt Cache）</span>
+        </div>
+        <div class="subs">
+          <div class="sub blue"><div class="s-name">① 角色与流程骨架</div><div class="s-tag">[workflow/agent]</div><div class="s-desc">极简角色；第一步 submit → 定位 → call_api</div></div>
+          <div class="sub green"><div class="s-name">② 工具调用协议约束</div><div class="s-tag">[workflow/tool-calling] · 5 条</div><div class="s-desc">走函数调用通道；禁文本模拟；业务闲聊自主判定；目标/词义不明先反问；取数后先核对数据语义再收束</div></div>
+          <div class="sub gray"><div class="s-name">③ 项目上下文</div><div class="s-tag">[workflow/intent-context]</div><div class="s-desc">当前项目 1 行（key + label）</div></div>
+          <div class="sub red"><div class="s-name">④ 常驻底线</div><div class="s-tag">[workflow/rules] alwaysApply</div><div class="s-desc">禁止编造 / 默认参数 / 优先级最高</div></div>
+          <div class="sub violet"><div class="s-name">⑤ 技能目录</div><div class="s-tag">[workflow/skills]</div><div class="s-desc">name + description · 交模型按需加载</div></div>
+          <div class="sub amber"><div class="s-name">⑥ 闲聊 / 知识库边界</div><div class="s-tag">[workflow/chit-chat]</div><div class="s-desc">KB 问题可调 search_knowledge_base</div></div>
+        </div>
+      </div>
+      <div class="conn"></div>
+
+      <!-- A2 -->
+      <div class="step">
+        <div class="step-head"><span class="idx i-green">2</span><div><h3>语义理解 → ToolCall Schema</h3><span class="role">understand · 模型调用 · Function Calling</span></div></div>
+        <div class="body">
+          <span class="pill">输入 <em>turns + steps + 工具 Schema</em></span>
+          <span class="pill"><code>tool_choice</code> <em>required / auto</em></span>
+          <span class="pill hl"><code>submit_understood_intent</code></span>
+          <span class="pill"><code>search_api_module</code> · <code>read_api_module</code></span>
+          <span class="pill hl"><code>call_api</code> <em>{operation, params}</em></span>
+          <span class="pill">纯文本 <em>闲聊 / 收束</em></span>
+          <span class="pill">steps 只读投影 <code>compactStepsForModel</code></span>
+        </div>
+      </div>
+      <div class="conn-label">模型提交 <b>toolCalls</b> 或直接输出文本（继续）</div>
+      <div class="conn"></div>
+
+      <!-- 伪调用分支 -->
+      <div class="forks">
+        <div class="fork amber">
+          <div class="f-title" style="color:var(--amber)">◇ 伪调用? <code style="font-size:11px;color:var(--ink-3)">isToolPlanText</code></div>
+          <div class="f-desc">JSON / XML / 方括号文本模拟工具调用 → 拦截 + 注入 [workflow/retry] 回 understand 重试；连续 3 次 → pseudoPlanExhausted（C1）</div>
+        </div>
+        <div class="fork green">
+          <div class="f-title" style="color:var(--green)">→ toolCalls &gt; 0</div>
+          <div class="f-desc">模型提交真实工具调用 → 进入 A3 工具执行</div>
+        </div>
+        <div class="fork ink">
+          <div class="f-title" style="color:var(--ink-3)">→ 纯文本 / 闲聊</div>
+          <div class="f-desc">直接收束到 A4，不走工具执行</div>
+        </div>
+        <div class="fork red">
+          <div class="f-title" style="color:var(--red)">→ 输出就绪 / 图表短路</div>
+          <div class="f-desc"><code>outputReady</code> / <code>forcedReply</code> → 强制 final（仅 analysis_chart 图表已上屏 presentGenericChart；列表/详情改为「数据回喂模型 + list/detail-verify 校验」由模型自主总结收束，不再 forcedReply）</div>
+        </div>
+        <div class="fork amber">
+          <div class="f-title" style="color:var(--amber)">→ 自循环续探</div>
+          <div class="f-desc"><code>NEED_RETRY</code> 显式信号 / <code>businessPending</code>（业务已提交但未取到数据）→ 回 understand 继续</div>
+        </div>
+        <div class="fork amber">
+          <div class="f-title" style="color:var(--amber)">→ 澄清需求</div>
+          <div class="f-desc"><code>needsClarification</code>（缺槽位 / 多候选取舍）→ final 渲染澄清问题，等用户补充</div>
+        </div>
+      </div>
+
+      <!-- A3 + 子节点 -->
+      <div class="step">
+        <div class="step-head"><span class="idx i-violet">3</span><div><h3>工具执行</h3><span class="role">tool · 服务端护栏 · 执行 ToolCall Schema</span></div></div>
+        <div class="subs">
+          <div class="sub cyan"><div class="s-name"><span class="dot" style="background:var(--cyan)"></span>① 同轮去重</div><div class="s-tag">callApiKey</div><div class="s-desc">operation | path | JSON(params) 全等 → 合并执行第一个，其余注 [workflow/observe]</div></div>
+          <div class="sub red"><div class="s-name"><span class="dot" style="background:var(--red)"></span>② 跨轮熔断</div><div class="s-tag">TOOL_SIGNATURE</div><div class="s-desc">同一工具+入参连续 ≥3 次 → doomLoopExhausted（C2）</div></div>
+          <div class="sub blue"><div class="s-name"><span class="dot" style="background:var(--brand)"></span>③ Gate 门禁</div><div class="s-tag">rulesGateBeforeCallApi</div><div class="s-desc">可调用性校验 → MODULE_RETRY / CLARIFICATION_REQUIRED</div></div>
+          <div class="sub amber"><div class="s-name"><span class="dot" style="background:var(--amber)"></span>④ 写操作确认</div><div class="s-tag">confirmation_required</div><div class="s-desc">非 GET / 高危 → 阻塞等待前端确认（waitForConfirmation）；确认后 resumeTool 恢复执行，取消/超时 → 如实返回「未执行」</div></div>
+          <div class="sub green"><div class="s-name"><span class="dot" style="background:var(--green)"></span>⑤ 真实执行</div><div class="s-tag">callUpstream</div><div class="s-desc">SSRF 白名单 + method 判定 + 登录态注入 → 真实接口请求</div></div>
+          <div class="sub violet"><div class="s-name"><span class="dot" style="background:var(--violet)"></span>⑥ 受控渲染</div><div class="s-tag">renderListForAgent / renderDetailForAgent</div><div class="s-desc">PC 源码列映射 + 枚举翻译 + 展示值（日期/布尔/图片缩略图）；英文表头 / 未翻译枚举 → output-align 交模型按 pc-column-mapping 补映射</div></div>
+          <div class="sub gray"><div class="s-name"><span class="dot" style="background:var(--ink-3)"></span>⑦ 数据回喂</div><div class="s-tag">pendingTables 暂存</div><div class="s-desc">中文 md 表格回喂模型；上屏延迟到 final 聚合（A4 ①）</div></div>
+          <div class="sub gray"><div class="s-name"><span class="dot" style="background:var(--ink-3)"></span>⑧ 动态上下文写文件</div><div class="s-tag">persistToolOutput</div><div class="s-desc">探索类结果 >4K → .agent-context/tool-outputs + 摘要索引；模型 read_file 按需读回细节</div></div>
+        </div>
+      </div>
+      <div class="conn-label" style="color:var(--amber)">续探回环：模型基于数据 → 继续分页 / 收束总结</div>
+      <div class="conn"></div>
+
+      <!-- A4 + 子节点 -->
+      <div class="step">
+        <div class="step-head"><span class="idx i-red">4</span><div><h3>结果收束</h3><span class="role">final · 输出校验与 Guardrail</span></div></div>
+        <div class="subs">
+          <div class="sub blue"><div class="s-name"><span class="dot" style="background:var(--brand)"></span>① 聚合上屏</div><div class="s-tag">flushPendingTables</div><div class="s-desc">同 columns 多页合并一张表；多模块分表；写 session.lastTable</div></div>
+          <div class="sub cyan"><div class="s-name"><span class="dot" style="background:var(--cyan)"></span>② 输出校验</div><div class="s-tag">validateFinalText</div><div class="s-desc">裸 JSON / 伪调用 / 澄清 JSON → 清空或协议兜底</div></div>
+          <div class="sub green"><div class="s-name"><span class="dot" style="background:var(--green)"></span>③ 图表短路返回</div><div class="s-tag">forcedReply</div><div class="s-desc">analysis_chart 图表已上屏（presentGenericChart）→ 服务端拼好总结直接作为最终回答</div></div>
+          <div class="sub amber"><div class="s-name"><span class="dot" style="background:var(--amber)"></span>④ 导出兜底</div><div class="s-tag">lastTable → xlsx</div><div class="s-desc">用户要导出 + 有缓存数据 + 模型未真调 export_dataset → 自动生成 + 下载 URL</div></div>
+          <div class="sub violet"><div class="s-name"><span class="dot" style="background:var(--violet)"></span>⑤ 图表 / 报表上屏</div><div class="s-tag">presentGenericChart</div><div class="s-desc">统计类 → ECharts 图表上屏 + 模型 summarize_chart_data 收束</div></div>
+          <div class="sub gray"><div class="s-name"><span class="dot" style="background:var(--ink-3)"></span>⑥ 事件输出</div><div class="s-tag">emitEvent</div><div class="s-desc">text / text_delta / table / file / chart → done 收束 · 历史 push</div></div>
+        </div>
+      </div>
+      <div class="conn"></div>
+
+      <div class="step" style="max-width:360px;text-align:center;box-shadow:none;border-color:var(--green)">
+        <div class="step-head" style="justify-content:center;margin-bottom:0"><div><h3 style="color:var(--green)">⏹ 响应上屏 · done</h3><span class="role">session.messages push assistant · 持久化</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 泳道 B：协议护栏 ══════════ -->
+  <section class="lane">
+    <div class="lane-head">
+      <span class="no">B · 协议护栏</span>
+      <span class="name">服务端唯一判定（非语义）</span>
+      <span class="desc">全部基于结构 / 契约 / 数量，零业务词</span>
+    </div>
+    <div class="group-grid">
+      <div class="card">
+        <div class="c-title" style="color:var(--cyan)"><span class="dotc" style="background:var(--cyan)"></span>B1 伪调用协议检测</div>
+        <ul>
+          <li><code>isToolPlanText</code> / <code>validateFinalText</code></li>
+          <li>识别文本模拟工具调用（JSON / XML / 方括号 / action 键）</li>
+          <li>工具名 = <code>AGENT_TOOL_NAMES</code> 英文契约，零中文 / 零功能词</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--cyan)"><span class="dotc" style="background:var(--cyan)"></span>B2 同轮重复去重</div>
+        <ul>
+          <li><code>callApiKey</code> = operation | path | JSON(params)</li>
+          <li>同轮全等 → 合并执行第一个</li>
+          <li>其余注 <code>[workflow/observe]</code> 引导模型基于分页信息递增</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--cyan)"><span class="dotc" style="background:var(--cyan)"></span>B3 Gate 可调用性门禁</div>
+        <ul>
+          <li><code>rulesGateBeforeCallApi</code> 模块可调用性校验</li>
+          <li>歧义 / 不可调用 → <code>MODULE_RETRY</code> 回喂模型自愈</li>
+          <li>缺槽位 → <code>CLARIFICATION_REQUIRED</code> 澄清</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--ink-3)"><span class="dotc" style="background:var(--ink-3)"></span>B4 数量护栏</div>
+        <ul>
+          <li><code>understandAttempts</code> 首轮理解重试 ≤ 3（仅首轮 +1；工具执行后续探轮不消耗，对齐 Cursor 循环语义）</li>
+          <li><code>MAX_TOOL_ROUNDS</code> 工具轮次上限（=14）</li>
+          <li><code>recursionLimit</code> LangGraph 递归上限（兜底）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 泳道 C：确定性兜底 ══════════ -->
+  <section class="lane">
+    <div class="lane-head">
+      <span class="no">C · 确定性兜底</span>
+      <span class="name">弱模型 / 异常保护 → 泳道 D</span>
+      <span class="desc">服务端规则编排，不给模型无限空转</span>
+    </div>
+    <div class="group-grid">
+      <div class="card">
+        <div class="c-title" style="color:var(--red)"><span class="dotc" style="background:var(--red)"></span>C1 伪调用耗尽</div>
+        <ul>
+          <li><code>pseudoPlanExhausted</code>：伪调用连续 3 次（understandAttempts ≥ 2）→ 强制 final</li>
+          <li>→ 泳道 D 规则编排拿真实数据</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--red)"><span class="dotc" style="background:var(--red)"></span>C2 跨轮 Doom Loop 熔断</div>
+        <ul>
+          <li><code>TOOL_SIGNATURE</code> = name | operation | path | JSON(params)</li>
+          <li>同一工具 + 同一入参连续 ≥3 次 → <code>doomLoopExhausted</code> → 强制 final</li>
+          <li>正确递增分页（page:1→2→3）签名不同不触发；与 B2 双层互补</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--red)"><span class="dotc" style="background:var(--red)"></span>C3 模型调用失败</div>
+        <ul>
+          <li>402 / 401008 → 如实抛错（不静默降级）+ 封禁 30min</li>
+          <li>429 / 503 / 504001 → 瞬时重试 2 次（退避 3s / 6s）</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--amber)"><span class="dotc" style="background:var(--amber)"></span>C4 导出意图兜底</div>
+        <ul>
+          <li>用户要导出 / 下载 + <code>lastTable</code> 有数据 + 模型未走 export_dataset</li>
+          <li>→ 服务端自动 <code>execExportDataset</code> 生成 xlsx / pdf + 预览上屏</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--violet)"><span class="dotc" style="background:var(--violet)"></span>C5 模型级门槛</div>
+        <ul>
+          <li><code>MODEL_&lt;ID&gt;_AGENT=false</code> → 不进多轮工具循环</li>
+          <li>一次模型调用纯问答（tools=[]，带 staticGuide 前缀）</li>
+          <li>弱模型只开放普通对话，不进多轮工具循环</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 泳道 D：服务端规则编排兜底 ══════════ -->
+  <section class="lane">
+    <div class="lane-head">
+      <span class="no">D · 规则编排兜底</span>
+      <span class="name">runServerFallback · 确定性路径</span>
+      <span class="desc">C1 / C2 熔断、写意图或模型未取数时的服务端兜底（Graph 之外）</span>
+    </div>
+    <div class="d-flow">
+      <div class="d-step">
+        <span class="d-idx" style="background:var(--amber)">D1</span>
+        <div>
+          <div class="d-name">触发条件</div>
+          <div class="d-desc">businessToolCalled=false / pseudoPlanExhausted / doomLoopExhausted / writeForce（模型信号驱动，无中文预判）</div>
+        </div>
+      </div>
+      <div class="d-conn"></div>
+      <div class="d-step">
+        <span class="d-idx" style="background:var(--red)">D2</span>
+        <div>
+          <div class="d-name">写操作确认门</div>
+          <div class="d-desc">writeForce → confirmation_required + waitForConfirmation 阻塞；取消则如实返回「未执行」</div>
+        </div>
+      </div>
+      <div class="d-conn"></div>
+      <div class="d-step">
+        <span class="d-idx" style="background:var(--brand)">D3</span>
+        <div>
+          <div class="d-name">规则选路</div>
+          <div class="d-desc">resolveApiOperation / resolveModuleDetail / listPriority（英文 CRUD 契约词）；不命中 → 澄清</div>
+        </div>
+      </div>
+      <div class="d-conn"></div>
+      <div class="d-step">
+        <span class="d-idx" style="background:var(--violet)">D4</span>
+        <div>
+          <div class="d-name">执行 + 受控渲染</div>
+          <div class="d-desc">call_api 真实请求 → renderListForAgent / renderDetailForAgent（中文列 + 枚举翻译）→ UI_TABLE 上屏 + 写 lastTable</div>
+        </div>
+      </div>
+      <div class="d-conn"></div>
+      <div class="d-step">
+        <span class="d-idx" style="background:var(--green)">D5</span>
+        <div>
+          <div class="d-name">澄清或收束</div>
+          <div class="d-desc">缺槽位 → CLARIFICATION_REQUIRED 渲染成友好问题；成功 → text 收束 + push assistant 历史</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 泳道 E：会话与数据持久化 ══════════ -->
+  <section class="lane">
+    <div class="lane-head">
+      <span class="no">E · 会话与数据层</span>
+      <span class="name">session.ts · 跨请求状态底座</span>
+      <span class="desc">graph 不跨请求，跨轮上下文全靠 session 持久化（用户可见历史 ≠ 模型实际 token）</span>
+    </div>
+    <div class="group-grid">
+      <div class="card">
+        <div class="c-title" style="color:var(--ink-3)"><span class="dotc" style="background:var(--ink-3)"></span>E1 会话载体</div>
+        <ul>
+          <li>token / country / menus（登录态）</li>
+          <li>messages（完整历史，持久化到磁盘）</li>
+          <li>TTL 过期回收</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--brand)"><span class="dotc" style="background:var(--brand)"></span>E2 历史分层压缩</div>
+        <ul>
+          <li><code>buildModelTurns</code>：full → prune（表格折叠 / 超长截断，零模型调用）→ LLM 摘要（tools=[]）</li>
+          <li>缓存 <code>historyCompact</code>{summary, coveredIndex} 跨轮复用</li>
+          <li>模型只见「摘要块 + 预算内历史」只读投影</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--amber)"><span class="dotc" style="background:var(--amber)"></span>E3 最近表格缓存</div>
+        <ul>
+          <li><code>lastTable</code>{title, columns, rows, total, at}</li>
+          <li>导出延续场景数据源（A4 ④ / C4 自动导出）</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="c-title" style="color:var(--green)"><span class="dotc" style="background:var(--green)"></span>E4 挂起澄清</div>
+        <ul>
+          <li><code>pendingClarification</code> 存选项 / 轮次</li>
+          <li>下一轮用户回序号 → 直读收束（A0 挂起澄清直读）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <b>架构原则：</b>语义判定 100% 交大模型（业务 / 闲聊 / 意图 / 模块 / 分页 / 参数 / 输出格式）；服务端仅承担协议护栏（B1-B4）、数量护栏（understandAttempts / MAX_TOOL_ROUNDS / Doom Loop 熔断）、受控渲染（PC 列定义 + 源码枚举）、确定性兜底（C1-C5 → D1-D5）。静态引导前缀化（system 稳定前缀 → Prompt Cache）；模型级门槛（agentCapable，弱模型只开放普通对话）。跨请求上下文靠 session 持久化（E1-E4），graph 不跨请求。工具名 / 分类 / 协议全部从注册表派生，零业务词写死。
+  </div>
+
+</div>
+</body>
+</html>

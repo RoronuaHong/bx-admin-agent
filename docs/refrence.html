@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh‑CN">
+
+<head>
+    <meta charset="UTF‑8" />
+    <meta name="viewport" content="width=device‑width, initial‑scale=1.0" />
+    <title>AI Agent企业落地知识手册</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0
+        }
+
+        body {
+            font-family: system‑ui, ‑apple‑system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+            background: #f7f8fa;
+            color: #1f2329;
+            line-height: 1.6;
+            padding: 20px;
+            max-width: 1100px;
+            margin: 0 auto
+        }
+
+        h1 {
+            font-size: 26px;
+            margin-bottom: 16px;
+            color: #0e1419
+        }
+
+        h2 {
+            font-size: 20px;
+            margin: 28px 0 12px 0;
+            border-left: 4px solid #2563eb;
+            padding-left: 10px;
+            color: #1a202c
+        }
+
+        h3 {
+            font-size: 17px;
+            margin: 20px 0 10px 0;
+            color: #2d3748
+        }
+
+        p {
+            margin-bottom: 12px
+        }
+
+        ul,
+        ol {
+            padding-left: 22px;
+            margin-bottom: 14px
+        }
+
+        li {
+            margin: 6px 0
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            background: #fff
+        }
+
+        th,
+        td {
+            border: 1px solid #dcdfe6;
+            padding: 10px 12px;
+            text-align: left;
+            font-size: 14px
+        }
+
+        th {
+            background: #eef4ff;
+            font-weight: 600
+        }
+
+        .code-block {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 14px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 13px;
+            margin: 14px 0;
+            white-space: pre
+        }
+
+        .note {
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 14px 0
+        }
+
+        .warning {
+            background: #fef2f2;
+            border: 1px solid #fca5a5;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 14px 0
+        }
+
+        .info {
+            background: #eff6ff;
+            border: 1px solid #93c5fd;
+            padding: 12px;
+            border-radius: 8px;
+            margin: 14px 0
+        }
+
+        .card {
+            background: #ffffff;
+            padding: 16px;
+            border-radius: 10px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+            margin-bottom: 18px
+        }
+
+        .download-wrap {
+            margin: 20px 0;
+            text-align: center
+        }
+
+        .btn {
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer
+        }
+
+        .btn:hover {
+            background: #1d4ed8
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="download-wrap">
+        <button class="btn" id="downloadBtn">📥 下载本页面为HTML文件</button>
+    </div>
+
+    <h1>AI Agent 企业落地知识手册</h1>
+
+    <div class="card">
+        <h2>一、什么是企业级AI Agent</h2>
+        <p>Agent 不是增强版聊天机器人。核心价值：<strong>把大模型自然语言理解，变成跨多系统自动执行任务的数字员工</strong>。</p>
+        <p>生产级Agent标志：有状态 State、Checkpoint断点恢复、HITL人工介入、Skill安全层、完整审计日志。</p>
+    </div>
+
+    <div class="card">
+        <h2>二、企业Agent标准架构（LangGraph体系）</h2>
+        <div class="code-block">
+            前端输入(query、userId、tenantId)
+            ↓
+            graph.invoke(state) 进入LangGraph
+            ↓
+            Node1：意图识别LLM节点 ← 薄Prompt
+            输出action + params 写入State
+            ↓
+            add_conditional_edges 条件路由
+            ↓
+            Skill业务节点（安全核心）
+              • 鉴权
+              • Pydantic参数校验
+              • 租户、软删除硬编码
+              • 调用 API / MCP‑Server / NL2SQL(只读)
+              • 写操作强制HITL人工确认
+            ↓
+            结果回写State → Checkpoint快照落盘
+            ↓
+            Node2：LLM组装回答节点
+            ↓
+            返回前端聊天框
+        </div>
+
+        <h3>组件分工</h3>
+        <ul>
+            <li><strong>LLM</strong>：大脑，做理解、意图、结构化输出，不执行业务。</li>
+            <li><strong>LangGraph</strong>：编排内核，State、Node、Edge、Checkpoint、HITL。</li>
+            <li><strong>Skill</strong>：安全业务Node；参数校验、鉴权、异常捕获；不把敏感数据存入State快照。</li>
+            <li><strong>Tool</strong>：最小原子能力；裸工具，不直接交给LLM调用。</li>
+            <li><strong>MCP</strong>：外部资源标准化协议；仅在Skill内部调用，MCP本身不带安全防护。</li>
+            <li><strong>Prompt(薄)</strong>：只约束输出格式；安全逻辑全部写代码，不靠提示词。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>三、两种访问数据库方案对比</h2>
+
+        <h3>方案1：Skill调用业务API（业务操作首选）</h3>
+        <p>LLM输出action+业务参数；Skill调用预开发HTTP/gRPC接口；SQL由后端开发预写ORM/模板。</p>
+        <ul>
+            <li>✅ 业务口径可靠，安全在接口层</li>
+            <li>✅ 支持增删改写操作，配合HITL</li>
+            <li>❌ 新查询需求需要开发新接口，灵活性低</li>
+            <li>适用：后台业务、工单、订单、人员操作</li>
+        </ul>
+
+        <h3>方案2：NL2SQL直连数据库（<strong>仅限只读查询</strong>）</h3>
+        <p>LLM生成SQL字符串，Skill内部做七层防护后，执行在只读副本库。</p>
+
+        <div class="warning">
+            <strong>硬规则：生产环境禁止NL2SQL执行 INSERT / UPDATE / DELETE / DROP。写操作走API+Skill+HITL。</strong>
+        </div>
+
+        <h4>NL2SQL七层防护</h4>
+        <ol>
+            <li>数据库账号：独立只读副本，仅SELECT权限，使用数据库视图屏蔽敏感字段。</li>
+            <li>Schema管控：只向大模型提供允许访问的表/视图元数据。</li>
+            <li>AST语法解析校验(sqlglot)：拦截高危语句，表白名单，禁止多语句。<strong>不靠关键词字符串匹配，不靠Prompt约束。</strong></li>
+            <li>AST自动改写SQL：强制追加租户过滤条件，防止越权。</li>
+            <li>资源限制：SQL超时、最大返回行数，防止慢SQL打垮库。</li>
+            <li>完整审计日志：用户、会话id、原始提问、生成SQL。</li>
+            <li>结果层：敏感字段脱敏，截断超长结果。</li>
+        </ol>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>对比项</th>
+                    <th>调用业务API模式</th>
+                    <th>NL2SQL直连只读库</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>AI输出</td>
+                    <td>action + 业务params</td>
+                    <td>完整SQL文本</td>
+                </tr>
+                <tr>
+                    <td>SQL来源</td>
+                    <td>开发预写ORM/模板</td>
+                    <td>大模型动态生成</td>
+                </tr>
+                <tr>
+                    <td>灵活度</td>
+                    <td>低，受接口能力约束</td>
+                    <td>高，自由组合统计查询</td>
+                </tr>
+                <tr>
+                    <td>业务口径</td>
+                    <td>高可靠</td>
+                    <td>存在AI理解错误风险</td>
+                </tr>
+                <tr>
+                    <td>写操作支持</td>
+                    <td>✅支持(HITL)</td>
+                    <td>❌严禁</td>
+                </tr>
+                <tr>
+                    <td>典型场景</td>
+                    <td>业务后台Agent</td>
+                    <td>内部BI、自然语言问数助手</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>四、AI Agent主要应用方向与前景</h2>
+        <h3>1）企业内部数字员工（当前最大市场）</h3>
+        <ul>
+            <li>自然语言取数助手(NL2SQL只读)</li>
+            <li>跨系统工单、CRM、权限编排助手</li>
+            <li>IT运维Agent（高危操作人工确认）</li>
+            <li>财务法务文档解析、报表生成</li>
+        </ul>
+
+        <h3>2）SaaS产品内置Agent能力</h3>
+        <p>不替换原有系统；增加自然语言入口，调用产品原有工具接口。例如IDE Agent、CRM智能助手、低代码AI工作流。</p>
+
+        <h3>3）垂直行业智能体</h3>
+        <p>金融投研、制造故障排查、电商客诉处理等。高风险动作必须人工复核。</p>
+
+        <h3>4）C端个人Agent（成熟度偏低）</h3>
+        <p>大多停留在信息问答；系统权限管控是难点，全自动执行操作产品较少。</p>
+
+        <h3>技术演进路线</h3>
+        <ul>
+            <li>过去：Function‑Call，无状态单次调用工具。</li>
+            <li>现在：有状态Agent(LangGraph/AutoGen)，强调可控、审计、HITL。</li>
+            <li>短期1‑2年：MCP协议普及；MCP‑Server会变多，但依然要封装Skill安全层。</li>
+            <li>远期：多智能体协作；工程复杂度高，大规模生产落地尚少。</li>
+        </ul>
+
+        <div class="note">
+            <strong>就业机会：</strong>最大机会不是训练大模型，而是<strong>Agent应用工程落地</strong>：LangGraph编排、Skill安全封装、RAG、MCP对接、NL2SQL防护、权限审计。后端开发可转型Agent应用工程师。
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>五、现实瓶颈 &amp; 哪些场景不适合Agent</h2>
+        <ul>
+            <li>幻觉没有彻底解决，安全逻辑必须代码硬写，不能依赖Prompt。</li>
+            <li>多步Agent Token消耗高；简单固定流程优先传统接口。</li>
+            <li>高风险写操作，Agent只能给建议，必须HITL人工确认。</li>
+        </ul>
+
+        <h3>不适合上Agent的场景</h3>
+        <ol>
+            <li>流程高度固定、输入输出确定：直接写业务接口。</li>
+            <li>希望Agent全自动执行高危写操作，无人工复核。</li>
+            <li>追求100%零人工全自动业务，企业现实中大多是人‑Agent协同。</li>
+        </ol>
+    </div>
+
+    <div class="card">
+        <h2>六、面试口述速记</h2>
+        <div class="info">
+            <p>企业Agent核心是利用编排框架做有状态任务，Skill作为安全层。<br>
+                访问数据库分两种模式：业务操作用API模式；数据分析可以NL2SQL只读，做多层AST防护，禁止写SQL。<br>
+                Agent适合开放多变的复杂任务；简单固定流程优先传统接口；高风险操作强制人工介入。</p>
+        </div>
+    </div>
+
+    <script>
+        // 页面内一键下载HTML
+        document.getElementById('downloadBtn').addEventListener('click', function () {
+            const html = document.documentElement.outerHTML;
+            const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'agent_handbook.html';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(a.href);
+        })
+    </script>
+</body>
+
+</html>

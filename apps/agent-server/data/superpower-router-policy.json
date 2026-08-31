@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "pc-aligned-router-policy",
+  "description": "Deterministic routing policy for PC-admin parity.",
+  "guards": {
+    "requireOperation": true,
+    "strictIndexPath": true,
+    "pcLogAlignmentOnly": true,
+    "postWriteReadback": true,
+    "denyUnknownOperation": true
+  },
+  "runtimeHints": {
+    "readbackTimeoutMs": 30000,
+    "maxToolRounds": 14
+  },
+  "autoModel": {
+    "description": "auto 模式模型路由（Cursor 模型路由轻量版）：写操作/复杂统计优先强模型，简单列表走快模型；数组为空则退化默认逻辑。额度状态（2026-08-25 晚实测）：**TokenHub 主力全部 402 永久耗尽**（待开通后付费）；**nemotronultra 限流已恢复**（业务正确：影片列表前2页 60.5s 表格=1 SUBMIT✓，历史最快最准 52.1s 分页聚合）；备选 zenhy3（54.4s 正确）/nemotronfree（89s 正确）；lagunas/xpreviewfree 业务失败（表格=0）已移除首选。**故 auto 首选 nemotronultra**。待 TokenHub 续费后需按实测更新回 TokenHub 模型。fallbackModels 为额度耗尽降级链（需为真实 chat 模型，勿放视频/3D/embedding 端点）。",
+    "strongModels": ["nemotronultra", "zenhy3", "nemotronfree", "xpreviewfree"],
+    "fastModels": ["nemotronultra"],
+    "fallbackModels": ["nemotronultra", "zenhy3", "lagunas", "nemotronfree", "xpreviewfree", "nvnemotronultra", "nvnemotronsuper", "nvlagunaxs", "hyvision", "dsflash"]
+  }
+}

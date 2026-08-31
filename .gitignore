@@ -1,0 +1,17 @@
+node_modules
+dist
+.data
+.env
+.env.local
+# 知识库索引/向量缓存（构建产物，可由脚本重建）
+docs/knowledge/.index.json
+docs/knowledge/.vectors.json
+*.log
+*.err
+test-output.txt
+_test_result.txt
+.DS_Store
+.superpowers
+coverage
+# 长工具结果临时文件（Cursor 式动态上下文，运行时产物，可清理）
+.agent-context

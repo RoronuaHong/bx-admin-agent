@@ -1,0 +1,46 @@
+data: {"type":"tool_call","name":"render_table","input":{"data":[{"userId":485,"account":"yyc123456","nickname":"YYC","deptName":"测试部","email":"123@qq.com","createTime":"2024-12-13 17:52:13","lastLoginTime":"2024-12-17 10:53:25","queryLimitDays":30,"remark":null,"status":1},{"userId":482,"account":"zhengdingwen","nickname":"Zhengdingwen","deptName":"测试部","email":"","createTime":"2024-12-13 17:51:51","lastLoginTime":"2025-03-24 20:23:21","queryLimitDays":30,"remark":null,"status":1},{"userId":343,"account":"lizhenjian","nickname":"Lizhenjian","deptName":"开发部","email":"","createTime":"2024-08-09 16:04:34","lastLoginTime":"2024-12-16 14:54:40","queryLimitDays":30,"remark":null,"status":1},{"userId":336,"account":"xiaomage","nickname":"Xiaomage","deptName":"测试部","email":"","createTime":"2024-07-26 14:32:50","lastLoginTime":"2025-02-25 16:52:43","queryLimitDays":30,"remark":null,"status":1},{"userId":284,"account":"test02","nickname":"Test02","deptName":"测试部","email":"","createTime":"2024-06-18 16:27:12","lastLoginTime":"2024-12-16 15:36:31","queryLimitDays":30,"remark":null,"status":1},{"userId":283,"account":"test01","nickname":"Test01","deptName":"测试部","email":"","createTime":"2024-06-18 16:26:52","lastLoginTime":"2024-12-16 14:56:33","queryLimitDays":30,"remark":null,"status":1},{"userId":249,"account":"jixiaofan","nickname":"Jixiaofan","deptName":"开发部","email":"","createTime":"2024-05-16 11:21:35","lastLoginTime":"2024-05-21 15:35:10","queryLimitDays":30,"remark":null,"status":1},{"userId":248,"account":"huxiaowen","nickname":"Huxiaowen","deptName":"开发部","email":"","createTime":"2024-05-16 11:21:15","lastLoginTime":"2024-05-16 14:57:13","queryLimitDays":30,"remark":null,"status":1},{"userId":247,"account":"xuzilong","nickname":"Xuzilong","deptName":"开发部","email":"","createTime":"2024-05-16 11:20:55","lastLoginTime":"2024-08-08 17:07:36","queryLimitDays":30,"remark":null,"status":1},{"userId":245,"account":"lihaolun","nickname":"Lihaolun","deptName":"开发部","email":"","createTime":"2024-05-16 11:20:15","lastLoginTime":"2024-05-16 14:31:35","queryLimitDays":30,"remark":null,"status":1}],"columns":[{"title":"用户ID","key":"userId","dataIndex":"userId"},{"title":"登录账号","key":"account","dataIndex":"account"},{"title":"用户昵称","key":"nickname","dataIndex":"nickname"},{"title":"部门名称","key":"deptName","dataIndex":"deptName"},{"title":"邮箱","key":"email","dataIndex":"email"},{"title":"创建时间","key":"createTime","dataIndex":"createTime"},{"title":"最后登录","key":"lastLoginTime","dataIndex":"lastLoginTime"},{"title":"查询限制天数","key":"queryLimitDays","dataIndex":"queryLimitDays"},{"title":"备注","key":"remark","dataIndex":"remark"},{"title":"账号状态","key":"status","dataIndex":"status"}],"maxRows":50,"title":"用户列表 - 第 1 页"}}
+
+data: {"type":"tool_result","name":"render_table","result":"UI_TABLE\n{\"title\":\"用户列表 - 第 1 页\",\"total\":10,\"tree\":false,\"columns\":[{\"key\":\"userId\",\"title\":\"用户ID\"},{\"key\":\"account\",\"title\":\"登录账号\"},{\"key\":\"nickname\",\"title\":\"用户昵称\"},{\"key\":\"deptName\",\"title\":\"部门名称\"},{\"key\":\"email\",\"title\":\"邮箱\"},{\"key\":\"createTime\",\"title\":\"创建时间\"},{\"key\":\"lastLoginTime\",\"title\":\"最后登录\"},{\"key\":\"queryLimitDays\",\"title\":\"查询限制天数\"},{\"key\":\"remark\",\"title\":\"备注\"},{\"key\":\"status\",\"title\":\"账号状态\"}],\"rows\":[{\"_depth\":0,\"userId\":\"485\",\"account\":\"yyc123456\",\"nickname\":\"YYC\",\"deptName\":\"测试部\",\"email\":\"123@qq.com\",\"createTime\":\"2024-12-13 17:52:13\",\"lastLoginTime\":\"2024-12-17 10:53:25\",\"queryLimitDays\":\"30\",\"remark\":\"\",\"status\":\"1\"},{\"_depth\":0,\"userId\":\"482\",\"account\":\"zhengdingwen\",\"nickname\":\"Zhengdingwen\",\"deptName\":\"测试部\",\"email\":\"\",\"createTime\":\"2024-12-13 17:51:51\",\"lastLoginTime\":\"2025-03-24 20:23:21\",\"queryLimitDays\":\"30\",\"remark\":\"\",\"status\":\"1\"},{\"_depth\":0,\"userId\":\"343\",\"account\":\"lizhenjian\",\"nickname\":\"Lizhenjian\",\"deptName\":\"开发部\",\"email\":\"\",\"createTime\":\"2024-08-09 16:04:34\",\"lastLoginTime\":\"2024-12-16 14:54:40\",\"queryLimitDays\":\"30\",\"remark\":\"\",\"status\":\"1\"},{\"_depth\":0,\"userId\":\"336\",\"account\":\"xiaomage\",\"nickname\":\"Xiaomage\",\"deptName\":\"测试部\",\"email\":\"\",\"createTi"}
+
+data: {"type":"table","table":{"title":"用户列表 - 第 1 页","total":10,"tree":false,"columns":[{"key":"userId","title":"用户ID"},{"key":"account","title":"登录账号"},{"key":"nickname","title":"用户昵称"},{"key":"deptName","title":"部门名称"},{"key":"email","title":"邮箱"},{"key":"createTime","title":"创建时间"},{"key":"lastLoginTime","title":"最后登录"},{"key":"queryLimitDays","title":"查询限制天数"},{"key":"remark","title":"备注"},{"key":"status","title":"账号状态"}],"rows":[{"_depth":0,"userId":"485","account":"yyc123456","nickname":"YYC","deptName":"测试部","email":"123@qq.com","createTime":"2024-12-13 17:52:13","lastLoginTime":"2024-12-17 10:53:25","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"482","account":"zhengdingwen","nickname":"Zhengdingwen","deptName":"测试部","email":"","createTime":"2024-12-13 17:51:51","lastLoginTime":"2025-03-24 20:23:21","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"343","account":"lizhenjian","nickname":"Lizhenjian","deptName":"开发部","email":"","createTime":"2024-08-09 16:04:34","lastLoginTime":"2024-12-16 14:54:40","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"336","account":"xiaomage","nickname":"Xiaomage","deptName":"测试部","email":"","createTime":"2024-07-26 14:32:50","lastLoginTime":"2025-02-25 16:52:43","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"284","account":"test02","nickname":"Test02","deptName":"测试部","email":"","createTime":"2024-06-18 16:27:12","lastLoginTime":"2024-12-16 15:36:31","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"283","account":"test01","nickname":"Test01","deptName":"测试部","email":"","createTime":"2024-06-18 16:26:52","lastLoginTime":"2024-12-16 14:56:33","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"249","account":"jixiaofan","nickname":"Jixiaofan","deptName":"开发部","email":"","createTime":"2024-05-16 11:21:35","lastLoginTime":"2024-05-21 15:35:10","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"248","account":"huxiaowen","nickname":"Huxiaowen","deptName":"开发部","email":"","createTime":"2024-05-16 11:21:15","lastLoginTime":"2024-05-16 14:57:13","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"247","account":"xuzilong","nickname":"Xuzilong","deptName":"开发部","email":"","createTime":"2024-05-16 11:20:55","lastLoginTime":"2024-08-08 17:07:36","queryLimitDays":"30","remark":"","status":"1"},{"_depth":0,"userId":"245","account":"lihaolun","nickname":"Lihaolun","deptName":"开发部","email":"","createTime":"2024-05-16 11:20:15","lastLoginTime":"2024-05-16 14:31:35","queryLimitDays":"30","remark":"","status":"1"}]}}
+
+data: {"type":"text_delta","text":"<tool_call>\n<function"}
+
+data: {"type":"text_delta","text":"=call_api>\n"}
+
+data: {"type":"text_delta","text":"<parameter=operation"}
+
+data: {"type":"text_delta","text":"ID"}
+
+data: {"type":"text_delta","text":">\nsystemUser"}
+
+data: {"type":"text_delta","text":"_page"}
+
+data: {"type":"text_delta","text":"\n</parameter>\n"}
+
+data: {"type":"text_delta","text":"<parameter=params"}
+
+data: {"type":"text_delta","text":">\n{\"pageNum"}
+
+data: {"type":"text_delta","text":"\": 2,"}
+
+data: {"type":"text_delta","text":" \"pageSize\":"}
+
+data: {"type":"text_delta","text":" 20}\n"}
+
+data: {"type":"text_delta","text":"</parameter>\n"}
+
+data: {"type":"text_delta","text":"<parameter=confirm>\n"}
+
+data: {"type":"text_delta","text":"false"}
+
+data: {"type":"text_delta","text":"\n</parameter>\n"}
+
+data: {"type":"text_delta","text":"</function>\n</tool_call>"}
+
+data: {"type":"text_delta","text":"\n"}
+
+data: {"type":"text","text":"<tool_call>\n<function=call_api>\n<parameter=operationID>\nsystemUser_page\n</parameter>\n<parameter=params>\n{\"pageNum\": 2, \"pageSize\": 20}\n</parameter>\n<parameter=confirm>\nfalse\n</parameter>\n</function>\n</tool_call>"}
+
+data: {"type":"done"}
+
