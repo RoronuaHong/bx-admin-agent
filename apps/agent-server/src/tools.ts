@@ -178,6 +178,46 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "禁止丢弃相对时间词、禁止反问用户要具体日期。返回 date(YYYY-MM-DD)、datetime(ISO 8601)、timestamp(毫秒)。",
 };
 
+// ---- M0（工具领域分组）：工具→领域标注（通用分类词，非业务词，符合「禁止写死」红线）----
+export type ToolDomain =
+  | "backend-api"        // 后台业务：模块定位 + 取数 + 渲染 + 代码改动
+  | "knowledge"          // 知识检索：文档/网页/文件
+  | "finance"            // 财务（M1+ 预留）
+  | "customer-service"   // 客服咨询（M1+ 预留）
+  | "database"           // 数据库直查（M1+ 预留）
+  | "common";            // 通用：意图/反问/项目切换/时间
+
+// 唯一事实来源；listAgentTools 自动附带 domain，新增工具漏标会在启动时告警（见 checkToolDomainCoverage）。
+export const TOOL_DOMAIN: Record<string, ToolDomain> = {
+  // 后台业务 API 域
+  submit_understood_intent: "backend-api",
+  search_api_module: "backend-api",
+  read_api_module: "backend-api",
+  call_api: "backend-api",
+  grep_codebase: "backend-api",
+  search_symbol: "backend-api",
+  get_list_columns: "backend-api",
+  get_page_schema: "backend-api",
+  render_table: "backend-api",
+  export_dataset: "backend-api",
+  normalize_output: "backend-api",
+  read_field_mapping: "backend-api",
+  summarize_chart_data: "backend-api",
+  write_code_file: "backend-api",
+  git_commit_push: "backend-api",
+  // 知识检索域
+  search_knowledge_base: "knowledge",
+  search_dingtalk_doc: "knowledge",
+  read_file: "knowledge",
+  list_dir: "knowledge",
+  fetch_url: "knowledge",
+  // 通用域
+  request_clarification: "common",
+  parse_intent: "common",
+  set_project: "common",
+  get_current_time: "common",
+};
+
 export function getSubmitUnderstoodIntentTool(): AgentToolDef {
   // 完全抛弃 aliases（2026-08-22）：module 不再用候选 enum 约束，改为自由文本英文模块 id。
   // 模块定位 100% 交模型实时 grep 源码（search_api_module 底层 rg 扫 PC 端 src/api+src/views；
@@ -222,7 +262,7 @@ export function getSubmitUnderstoodIntentTool(): AgentToolDef {
 }
 
 export function listAgentTools(): AgentToolDef[] {
-  return [
+  const all: AgentToolDef[] = [
     getSubmitUnderstoodIntentTool(),
     {
       name: "search_api_module",
@@ -686,7 +726,47 @@ export function listAgentTools(): AgentToolDef[] {
       },
     },
   ];
+  // M0（工具领域分组）：附 domain 元数据；漏标回退 common，未覆盖工具在启动时告警一次（见 checkToolDomainCoverage）。
+  return all.map((t) => ({ ...t, domain: TOOL_DOMAIN[t.name] ?? "common" }));
 }
+
+// ---- M0：工具领域分组辅助（领域为通用分类词，非业务词，符合红线）----
+// listAgentToolsForDomains 供 M1 Supervisor 路由命中 worker 后调用；M0 阶段仍全量注入，仅提供能力。
+export function listAgentToolsForDomains(domains: ToolDomain[]): AgentToolDef[] {
+  const set = new Set(domains);
+  return listAgentTools().filter((t) => set.has((t.domain as ToolDomain) ?? "common"));
+}
+
+// 生成「按领域分组的工具目录」文本，注入 system 前缀，让模型看清工具归属（不裁掉任何工具，仅组织呈现）。
+// 内容完全静态，模块级缓存避免多轮循环重复重建（buildStaticGuide 每 understand 轮调用一次）。
+let catalogCache: string | null = null;
+export function toolCatalogByDomain(): string {
+  if (catalogCache) return catalogCache;
+  const groups: Partial<Record<ToolDomain, string[]>> = {};
+  for (const t of listAgentTools()) {
+    const d = (t.domain as ToolDomain) ?? "common";
+    (groups[d] ??= []).push(t.name);
+  }
+  const order: ToolDomain[] = ["backend-api", "knowledge", "finance", "customer-service", "database", "common"];
+  const lines = order
+    .filter((d) => groups[d]?.length)
+    .map((d) => `- ${d}：${groups[d]!.join("、")}`);
+  catalogCache = "[workflow/tool-catalog] 可用工具按领域分组（按需选用，无需全部使用）：\n" + lines.join("\n");
+  return catalogCache;
+}
+
+// 开发期一次性校验：所有工具都应被 TOOL_DOMAIN 覆盖，漏标回退 common 并在控制台告警（不阻断运行）。
+let domainCoverageChecked = false;
+function checkToolDomainCoverage() {
+  if (domainCoverageChecked) return;
+  domainCoverageChecked = true;
+  for (const t of listAgentTools()) {
+    if (!TOOL_DOMAIN[t.name]) {
+      console.warn(`[tools] 工具 ${t.name} 未配置 domain，已回退 common（请在 TOOL_DOMAIN 补充）`);
+    }
+  }
+}
+checkToolDomainCoverage();
 
 // SSRF 防护：检查 URL 主机是否在白名单内（白名单为空时允许所有 http/https）。
 function normalizeInternalUrl(url: string): string {

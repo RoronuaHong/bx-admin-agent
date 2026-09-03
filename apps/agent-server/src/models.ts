@@ -40,6 +40,8 @@ export interface AgentToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** M0（工具领域分组）：通用分类词（backend-api/knowledge/common 等），非业务词，符合红线；listAgentTools 自动附带 */
+  domain?: string;
 }
 
 export interface AgentResult {

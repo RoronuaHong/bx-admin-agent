@@ -194,7 +194,7 @@ interface WorkerDef {
 - [ ] 确认生产环境 token 来源（与测试环境是否同一登录体系）
 - [ ] 数据库 Agent 语义确认：直查 SQL 还是归后台 API Agent
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
-- [ ] 是否现在启动 M0（工具分组），还是等知识库 P0 完成后再动架构
+- [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
 
 ---
 
@@ -206,3 +206,4 @@ interface WorkerDef {
 | 2026-09-02 | 盘点 in2 环境配置（6 个 env 文件，含墨西哥）；§4.1 写入文档 |
 | 2026-09-02 | 盘点 h5 环境配置（9 个 env 文件含墨西哥，多一套独立 test）；**发现生产=海外公网 HTTPS 域名，与测试完全不同**；§4.1 重写 |
 | 2026-09-02 | 用户确认去掉墨西哥地区；§4.1 地区维度收敛为印度/巴西（in2: 4 个 env、h5: 6 个 env），API 表格与核心结论同步移除墨西哥 |
+| 2026-09-03 | **M0 落地**：tools.ts 全量 23 个工具加 `domain` 标注（backend-api 15 / knowledge 5 / common 4；finance/customer-service/database 预留）+ `listAgentToolsForDomains` 过滤函数 + `toolCatalogByDomain` 注入 system 前缀；chat.ts buildStaticGuide 消费。实际按请求裁剪留 M1 路由。红线合规（领域为通用分类词，无业务词写死） |

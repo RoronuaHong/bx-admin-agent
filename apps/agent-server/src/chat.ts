@@ -7,7 +7,7 @@ import type { PendingClarification } from "./session.js";
 import { getUpload, MAX_AT_ONCE } from "./uploads.js";
 import { callAgent, type AgentStep, type ModelTurn, type OptionImage, type ToolCall, type CallAgentOptions, type AgentToolDef } from "./models.js";
 import { extractLocalPaths, extractUrls, fetchLink, resolveLocalDoc, type ContentNote } from "./sources.js";
-import { listAgentTools, runAgentTool, resolveOperationByApiGrep } from "./tools.js";
+import { listAgentTools, runAgentTool, resolveOperationByApiGrep, toolCatalogByDomain } from "./tools.js";
 import { loadResidentRules, loadSkills } from "./skills.js";
 import { transcribeImage } from "./vision.js";
 import { getModel as legacyModel } from "./legacy.js";
@@ -310,7 +310,7 @@ function estimateTurnsChars(turns: ModelTurn[]): number {
  * preprocess 节点与「模型级门槛轻量路径」共用——同一请求多轮循环中前缀一致，
  * OpenAI 兼容端点可命中 prompt cache。不注入任何业务词/功能词判定（语义 100% 交模型）。
  */
-function buildStaticGuide(session: Session): string {
+export function buildStaticGuide(session: Session): string {
   const parts: string[] = [];
   parts.push(
     "[workflow/agent] 你是影视后台管理系统的智能助手。需要业务数据时调用可用工具（工具自带完整使用规范）：" +
@@ -398,6 +398,10 @@ function buildStaticGuide(session: Session): string {
       "回答必须是普通文本：禁止输出 JSON、禁止输出工具调用描述，一段话说清即收束。" +
       "注意：中文输入默认视为有效请求（可能含业务/知识库/闲聊意图），不要当作乱码或测试内容。",
   );
+
+  // M0（工具领域分组）：注入按领域分组的工具目录，让模型看清工具归属（不裁掉任何工具；按请求裁剪由 M1 路由层负责）。
+  parts.push(toolCatalogByDomain());
+
   return parts.join("\n\n");
 }
 
