@@ -47,6 +47,8 @@ export interface AgentToolDef {
 export interface AgentResult {
   text: string;
   toolCalls: ToolCall[];
+  /** token 用量（成本维度）：OpenAI 取流式末帧 usage；anthropic 取 bodyResult.usage。未提供则为 undefined。 */
+  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
 }
 
 export interface CallAgentOptions {
@@ -57,6 +59,8 @@ export interface CallAgentOptions {
    * 同一请求多轮循环中前缀一致 → OpenAI 兼容端点可命中 prompt cache。
    */
   systemExtra?: string;
+  /** 追踪上下文 runId（由 chat.ts 透传），非空时 callAgentSafe 自动记录一条 llm span。 */
+  traceRunId?: string;
 }
 
 // 带工具能力的模型调用：按协议构建消息（anthropic: tool_use/tool_result；openai: function calling），
@@ -223,7 +227,17 @@ async function callAnthropicAgent(
   const toolCalls: ToolCall[] = (bodyResult?.content || [])
     .filter((block) => block.type === "tool_use" && block.id && block.name)
     .map((block) => ({ id: block.id!, name: block.name!, input: (block.input as Record<string, unknown>) || {} }));
-  return { text, toolCalls };
+  return {
+    text,
+    toolCalls,
+    usage: bodyResult?.usage
+      ? {
+          promptTokens: bodyResult.usage.input_tokens,
+          completionTokens: bodyResult.usage.output_tokens,
+          totalTokens: (bodyResult.usage.input_tokens || 0) + (bodyResult.usage.output_tokens || 0),
+        }
+      : undefined,
+  };
 }
 
 async function callOpenAiAgent(
@@ -469,6 +483,7 @@ async function callOpenAiAgent(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastUsage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -487,12 +502,14 @@ async function callOpenAiAgent(
             tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }>;
           };
         }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
       };
       try {
         chunk = JSON.parse(payload);
       } catch {
         continue;
       }
+      if (chunk.usage) lastUsage = chunk.usage;
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) continue;
       if (delta.content) {
@@ -659,7 +676,17 @@ async function callOpenAiAgent(
     ...textParsedToolCalls,
   ];
 
-  return { text: text.trim(), toolCalls };
+  return {
+    text: text.trim(),
+    toolCalls,
+    usage: lastUsage
+      ? {
+          promptTokens: lastUsage.prompt_tokens,
+          completionTokens: lastUsage.completion_tokens,
+          totalTokens: lastUsage.total_tokens,
+        }
+      : undefined,
+  };
 }
 
 function safeParseJson(raw?: string): Record<string, unknown> {

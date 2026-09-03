@@ -35,6 +35,7 @@ import {
   presentGenericChart,
   synthesizeReplyFromToolResults,
 } from "./report-pc-parity.js";
+import * as trace from "./trace.js";
 
 // ---- 工具分类（英文契约名，非业务词；全部从注册表派生，集中一处，杜绝散落清单漂移）----
 // AGENT_TOOL_NAMES 从工具注册表动态生成（listAgentTools 是唯一事实来源），
@@ -429,7 +430,7 @@ function pruneHistoryTurns(turns: ModelTurn[]): ModelTurn[] {
 }
 
 /** LLM 摘要（对齐 Cursor /summarize）：把历史压缩成要点，一次模型调用，失败时上层回退低损裁剪。 */
-async function summarizeHistory(model: ModelEntry, turns: ModelTurn[], signal?: AbortSignal): Promise<string> {
+async function summarizeHistory(model: ModelEntry, turns: ModelTurn[], signal?: AbortSignal, traceRunId?: string): Promise<string> {
   const input = turns
     .map((t) => `${t.role === "user" ? "用户" : "助手"}：${t.content}`)
     .join("\n\n")
@@ -451,7 +452,7 @@ async function summarizeHistory(model: ModelEntry, turns: ModelTurn[], signal?: 
     [],
     [],
     signal,
-    {},
+    { traceRunId },
   );
   const text = (result.text || "").trim();
   return text ? text.slice(0, HISTORY_SUMMARY_MAX_CHARS) : "";
@@ -468,6 +469,7 @@ async function buildModelTurns(
   humanText: string,
   model: ModelEntry,
   signal?: AbortSignal,
+  traceRunId?: string,
 ): Promise<ModelTurn[]> {
   const total = session.messages.length;
   const covered = session.historyCompact?.coveredIndex ?? 0;
@@ -501,7 +503,7 @@ async function buildModelTurns(
 
   if (HISTORY_AUTO_COMPACT && !session.historyCompact?.summary) {
     try {
-      const summary = await summarizeHistory(model, historyTurns, signal);
+      const summary = await summarizeHistory(model, historyTurns, signal, traceRunId);
       if (summary) {
         const keepStart = Math.max(freshStart, total - 1 - HISTORY_KEEP_RECENT_TURNS);
         const kept = pruneHistoryTurns(historyTurns.slice(keepStart - freshStart));
@@ -646,22 +648,29 @@ async function callAgentSafe(
   opts: CallAgentOptions,
   onDelta?: (chunk: string) => void,
 ): Promise<Awaited<ReturnType<typeof callAgent>>> {
+  const span = opts.traceRunId ? trace.span(opts.traceRunId, "llm", model.id, { model: model.id }) : undefined;
   let lastErr: unknown;
   for (let attempt = 0; attempt <= MODEL_GATEWAY_RETRIES; attempt++) {
     try {
-      return await callAgent(model, turns, images, tools, steps, signal, opts, onDelta);
+      const r = await callAgent(model, turns, images, tools, steps, signal, opts, onDelta);
+      span?.end({ usage: r.usage });
+      return r;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // 瞬时错误才重试：504001/504（上游超时）、503（服务暂不可用）、429（限流，
       // 如 zen 免费链 FreeUsageLimitError 按窗口重置，退避后可恢复）均属此类；
       // 402/401008（永久额度耗尽）等业务性错误不重试，直接抛出走友好提示。
       const isTransientGateway = /504001|gateway_error|model http 50[34][:\s]|model http 429|rate.?limit|FreeUsageLimit/i.test(msg);
-      if (!isTransientGateway || attempt >= MODEL_GATEWAY_RETRIES) throw err;
+      if (!isTransientGateway || attempt >= MODEL_GATEWAY_RETRIES) {
+        span?.end({ status: "error", error: msg });
+        throw err;
+      }
       lastErr = err;
       console.log(`[chat:model] 瞬时错误重试 ${attempt + 1}/${MODEL_GATEWAY_RETRIES}（退避 ${3000 * (attempt + 1)}ms）: ${msg.slice(0, 180)}`);
       await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
     }
   }
+  span?.end({ status: "error", error: String(lastErr) });
   throw lastErr;
 }
 
@@ -1230,6 +1239,8 @@ export async function* chatStream(
   opts: { model?: string; images?: string[]; files?: string[] } = {},
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
+  // M0 traces：开一次请求的追踪上下文（runId 贯穿各节点 span）
+  const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model });
   if (session.pendingClarification) {
     // 仅问 project 的待澄清：本部署已默认绑定影视后台，直接丢弃，按新消息走主流程
     if (
@@ -1328,6 +1339,8 @@ export async function* chatStream(
   const wantAuto = !opts.model || opts.model === "auto" || opts.model === "AUTO";
   let model: ModelEntry | null = wantAuto ? pickAutoModel(images.length > 0, userText.length) : getModel(opts.model);
   if (!model) model = legacyModel();
+  // M0 traces：补写真实模型名（beginRun 时还不知道最终选型），让 run span 的 model 字段准确
+  if (model) trace.setRunModel(runId, model.id);
   if (!model) {
     yield {
       type: "text",
@@ -1425,7 +1438,7 @@ export async function* chatStream(
 
   // 历史上下文压缩（对齐 Cursor /summarize 分层）：session.messages 本体保留完整，
   // 模型只见「摘要块 + 预算内历史」的只读投影；超预算先低损 prune，仍超才 LLM 摘要。
-  const turns: ModelTurn[] = await buildModelTurns(session, humanText, model, signal);
+  const turns: ModelTurn[] = await buildModelTurns(session, humanText, model, signal, runId);
 
   // 这些变量需在 try/catch 两级作用域可见（catch 兜底编排要复用），故提升到 try 之外。
   const eventQueue: ChatEvent[] = [];
@@ -1495,6 +1508,8 @@ export async function* chatStream(
       understandAttempts: Annotation<number>,
       /** M1（Supervisor 路由）：当前选中的 Worker id（route_to_agent 工具命中后写入；null = 未路由/全量工具） */
       activeWorkerId: Annotation<string | null>,
+      /** 追踪上下文 runId（M0 traces）：贯穿各节点，作为所有 span 的归属键；空串表示未开启追踪 */
+      traceRunId: Annotation<string>,
       /**
        * 伪调用耗尽（对齐 Cursor 确定性回退 + 模型门槛）：模型连续多次把工具调用写成文本
        * （JSON/XML/方括号）而非 function calling，达到阈值后不再让它无限 agent，
@@ -1681,6 +1696,7 @@ export async function* chatStream(
           result = await callAgentSafe(activeModel, turns, rawImages, llmTools, llmSteps, signal, {
             toolChoice,
             systemExtra: state.staticGuide || "",
+            traceRunId: state.traceRunId,
           }, onModelDelta);
         } catch (modelErr) {
           // 模型调用异常（402 额度耗尽 / 超时 / 网络错误）：**一律直接抛出错误信息，不再降级重试**。
@@ -1819,6 +1835,8 @@ export async function* chatStream(
         // 路由命中后下一轮 understand 会基于新 activeWorkerId 裁剪工具集重新规划。
         const routeCall = state.toolCalls.find((c) => c.name === "route_to_agent");
         if (routeCall) {
+          const routeSpan = trace.span(state.traceRunId, "route", "route_to_agent", { worker: activeWorkerId ?? undefined });
+          try {
           emitEvent({ type: "tool_call", name: routeCall.name, input: routeCall.input });
           emitEvent({ type: "reasoning", text: describeCallForReasoning(routeCall) });
           const rc = await runAgentTool(routeCall.name, routeCall.input, toolOpts);
@@ -1841,12 +1859,19 @@ export async function* chatStream(
             doomLoopExhausted: toolSignatureStreak >= 3,
             activeWorkerId: activeWorkerId ?? state.activeWorkerId,
           };
+          } finally {
+            routeSpan.end({ meta: { targetWorker: activeWorkerId ?? undefined } });
+          }
         }
         // M1 执行层防护：基于当前生效的 Worker 白名单强制工具边界。
         // 白名单外的工具调用一律拒绝执行（返回说明回喂模型），模型须先 route_to_agent 切回对应 Worker。
         const curWorker = activeWorkerId ? resolveWorkerById(activeWorkerId) : null;
         const curWhitelist = workerToolNames(curWorker);
         for (const call of state.toolCalls) {
+          const s = trace.span(state.traceRunId, "tool", call.name, { worker: activeWorkerId ?? undefined });
+          let toolStatus: trace.SpanStatus = "ok";
+          let toolNote: string | undefined;
+          try {
           // M1 执行层防护：越权工具调用拒绝执行（META_TOOLS 始终放行；route_to_agent 已走短路分支）
           if (curWhitelist && !META_TOOLS.has(call.name) && !curWhitelist.has(call.name)) {
             const reject =
@@ -1856,6 +1881,8 @@ export async function* chatStream(
             emitEvent({ type: "tool_call", name: call.name, input: call.input });
             emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(reject) });
             nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: reject });
+            toolStatus = "reject";
+            toolNote = "worker whitelist violation";
             continue;
           }
           emitEvent({ type: "tool_call", name: call.name, input: call.input });
@@ -2289,6 +2316,9 @@ export async function* chatStream(
             clarificationText = content.replace(/^CLARIFICATION_REQUIRED\s*/, "").trim();
             break;
           }
+          } finally {
+            s.end({ status: toolStatus, note: toolNote });
+          }
         }
         return {
           steps: nextSteps,
@@ -2519,6 +2549,7 @@ export async function* chatStream(
       console.log(`[chat:agent] 模型 ${model.id} 无 agent 能力（MODEL_${model.id.toUpperCase()}_AGENT=false），走纯问答`);
       const light = await callAgentSafe(model, turns, rawImages, [], [], signal, {
         systemExtra: buildStaticGuide(session),
+        traceRunId: runId,
       });
       const text = (light.text || "（模型未返回有效回复，请重试或更换模型。）").slice(0, config.contextMaxChars);
       session.messages.push({ role: "assistant", text });
@@ -2555,6 +2586,8 @@ export async function* chatStream(
         doomLoopExhausted: false,
         // M1（Supervisor 路由）：初始未路由，工具全量可见；route_to_agent 命中后 understand 自动裁剪
         activeWorkerId: null,
+        // M0 traces：追踪 runId 透传各节点
+        traceRunId: runId,
       },
       { recursionLimit },
     );
@@ -2830,6 +2863,7 @@ export async function* chatStream(
       };
     }
   } finally {
+    trace.endRun(runId);
     yield { type: "done" };
     touchSession(session);
   }
