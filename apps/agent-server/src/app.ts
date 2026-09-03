@@ -20,6 +20,7 @@ import { chatStream, resolveConfirmWaiter } from "./chat.js";
 import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 import { readDownloadBytes } from "./downloads.js";
 import { attachMcp } from "./mcp.js";
+import { attachA2a } from "./a2a.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -368,6 +369,9 @@ export function createApp() {
 
   // MCP Server 出口：/mcp（Streamable HTTP），把本地工具暴露给任何 MCP 客户端。
   attachMcp(app);
+
+  // A2A Server 出口：/a2a（JSON-RPC）+ /.well-known/agent-card.json，把本 agent 作为任务级 agent 暴露给自有其他 agent。
+  attachA2a(app);
 
   return app;
 }

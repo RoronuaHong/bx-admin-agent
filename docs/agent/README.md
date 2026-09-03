@@ -15,6 +15,8 @@ PC 后台仓库 `bx-film-admin-in2` 不再维护 `docs/agent` 正文（仅保留
 | [CHAT_FLOW.md](./CHAT_FLOW.md) | 智能问法全场景流程（输入一句话 → 8 大场景完整链路 + 防护点） |
 | [VERIFY_SCENARIOS.md](./VERIFY_SCENARIOS.md) | 多场景端到端验证报告（简单/复杂/超复杂/续聊/错误返回，2026-08-22） |
 | [PROMPT_ARCHITECTURE.md](./PROMPT_ARCHITECTURE.md) | Prompt 分层架构：阶段1（输入→工具返回）零业务 prompt / 阶段2（工具返回→输出）薄 prompt，含去留决策表与可行性检查 |
+| [MULTI_AGENT_ARCHITECTURE.md](./MULTI_AGENT_ARCHITECTURE.md) | Multi-Agent 架构规划（Supervisor 路由 + Worker 配置化上下文；领域 × 环境维度；M0→M3 落地路径，2026-09-02） |
+| [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) | A2A 接入方案（Agent2Agent 标准：对外 A2A Server 暴露 + 挂 M3 的 A2A Client 编排；Agent Card/JSON-RPC/Task→chatStream 映射/只读安全，2026-09-03） |
 
 环境变量（`apps/agent-server/.env`）：
 

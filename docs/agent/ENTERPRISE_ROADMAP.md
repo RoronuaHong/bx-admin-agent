@@ -53,6 +53,8 @@
 
 ## 3. 差距清单（按优先级）
 
+> ⚠️ 2026-09-02 新增演进方向：**Multi-Agent 架构**（领域 Agent 拆分 + 测试/生产环境维度），详见 [MULTI_AGENT_ARCHITECTURE.md](./MULTI_AGENT_ARCHITECTURE.md)。
+
 ### P0：钉钉凭证（阻塞知识库第一步）
 - [ ] 获取公司钉钉「企业内部应用」的 **Client ID / Client Secret**
   - 前置：公司钉钉管理员开通应用、授权文档读权限
