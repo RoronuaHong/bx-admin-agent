@@ -8,6 +8,7 @@ import { getUpload, MAX_AT_ONCE } from "./uploads.js";
 import { callAgent, type AgentStep, type ModelTurn, type OptionImage, type ToolCall, type CallAgentOptions, type AgentToolDef } from "./models.js";
 import { extractLocalPaths, extractUrls, fetchLink, resolveLocalDoc, type ContentNote } from "./sources.js";
 import { listAgentTools, runAgentTool, resolveOperationByApiGrep, toolCatalogByDomain } from "./tools.js";
+import { resolveWorkerById, workerToolNames } from "./worker-registry.js";
 import { loadResidentRules, loadSkills } from "./skills.js";
 import { transcribeImage } from "./vision.js";
 import { getModel as legacyModel } from "./legacy.js";
@@ -1490,6 +1491,8 @@ export async function* chatStream(
       staticGuide: Annotation<string>,
       /** 语义理解（understand）重试次数，条件边据此防止首轮无工具调用时无限循环 */
       understandAttempts: Annotation<number>,
+      /** M1（Supervisor 路由）：当前选中的 Worker id（route_to_agent 工具命中后写入；null = 未路由/全量工具） */
+      activeWorkerId: Annotation<string | null>,
       /**
        * 伪调用耗尽（对齐 Cursor 确定性回退 + 模型门槛）：模型连续多次把工具调用写成文本
        * （JSON/XML/方括号）而非 function calling，达到阈值后不再让它无限 agent，
@@ -1610,9 +1613,16 @@ export async function* chatStream(
         }
         const isFirstRound = state.round === 0 && tools.length > 0;
 
+        // M1（Supervisor 路由）：命中 Worker 后按白名单裁剪工具 + 套用首选模型
+        const worker = state.activeWorkerId ? resolveWorkerById(state.activeWorkerId) : null;
+        const workerNames = workerToolNames(worker);
+        const routedTools: AgentToolDef[] = workerNames
+          ? listAgentTools().filter((t) => workerNames.has(t.name))
+          : listAgentTools();
+
         // 输出已就绪却还在空转：禁止再调工具，强制给用户最终答复
         const forceAnswer = state.outputReady === true;
-        const llmTools = forceAnswer ? [] : tools;
+        const llmTools = forceAnswer ? [] : routedTools;
         // steps 只读投影压缩（Claude Code Micro-compact 同款）：注入模型前把旧轮次工具结果
         // 替换占位符，模型只看到最近几轮完整结果——收敛每轮注入量（越到后面越慢的主因）。
         // state.steps 保持完整：返回时写回未压缩 steps（下方 return steps: steps）。
@@ -1653,7 +1663,8 @@ export async function* chatStream(
         let result: Awaited<ReturnType<typeof callAgentSafe>> | undefined;
         // 2026-08-24：模型调用异常一律直接抛错、不再降级，故 tool-loop 每轮固定使用
         // understand 首轮选定的 model（无「降级成功复用」概念）。
-        const activeModel = model;
+        // M1 增强（§3.8）：Worker 配 preferredModel 时覆盖默认模型，实现「按 Agent 维度切模型」
+        const activeModel = worker?.preferredModel ? (getModel(worker.preferredModel) ?? model) : model;
         // 对齐 Cursor agent 模式：业务请求**首轮**强制工具调用——tool_choice=required 迫使模型
         // 必须调 submit_understood_intent 提交理解，杜绝「首轮空转文本回复 → 重试仍空转 → final」
         // 的失败路径（实测稳定性 2/3 的根因）。
@@ -1752,6 +1763,8 @@ export async function* chatStream(
         let pageKind = state.pageKind || "";
         // 对齐 Cursor 数据处理：列表分页渲染结果暂存，final 收束时合并为一张总表
         let pendingTables: ChatTableView[] = Array.isArray(state.pendingTables) ? [...state.pendingTables] : [];
+        // M1（Supervisor 路由）：route_to_agent 命中后写入；贯穿整个工具节点，最终回写 state
+        let activeWorkerId: string | null = state.activeWorkerId ?? null;
         const toolOpts = {
           token: session.token,
           country: session.country,
@@ -1938,6 +1951,9 @@ export async function* chatStream(
           const persisted = persistToolOutput(call.name, content, call.input);
           if (persisted) content = persisted;
           nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+          // M1（Supervisor 路由）：route_to_agent 成功命中后从结果标记提取 worker id，贯穿本节点回写 state
+          const workerMatch = /\[ACTIVE_WORKER:([^\]]+)\]/.exec(content);
+          if (workerMatch) activeWorkerId = workerMatch[1];
 
           // 探索型工具结果后追加轻量下一步引导（Cursor 式收敛，非服务端硬判）：
           // 业务数据请求下，search/read/grep 返回的只是「候选/接口信息」，仍须 call_api 取数才能作答。
@@ -2243,6 +2259,8 @@ export async function* chatStream(
           lastToolSignature,
           toolSignatureStreak,
           doomLoopExhausted: toolSignatureStreak >= 3,
+          // M1（Supervisor 路由）：route_to_agent 命中后把 worker id 写回 state，后续 understand 自动裁剪工具
+          activeWorkerId: activeWorkerId ?? state.activeWorkerId,
         };
       })
       .addNode("final", async (state) => {
@@ -2491,6 +2509,8 @@ export async function* chatStream(
         lastToolSignature: "",
         toolSignatureStreak: 0,
         doomLoopExhausted: false,
+        // M1（Supervisor 路由）：初始未路由，工具全量可见；route_to_agent 命中后 understand 自动裁剪
+        activeWorkerId: null,
       },
       { recursionLimit },
     );

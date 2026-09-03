@@ -22,6 +22,7 @@ import { appendClarificationMetric } from "./clarification-policy.js";
 import { resolveCodebaseRoot } from "./project-context.js";
 import { lookupTermModules, formatTranslationHits } from "./translation-lookup.js";
 import { runContractSearch } from "./query-contraction.js";
+import { DEFAULT_WORKERS, resolveWorker } from "./worker-registry.js";
 import {
   parseUnderstoodIntent,
   SUBMIT_UNDERSTOOD_INTENT,
@@ -176,6 +177,12 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "获取服务器当前日期与时间（ISO 格式）。当用户口语含相对时间（今天/昨天/本周/本月/最近 N 天等）" +
     "或调用接口需要 date/timeRange/timestamp 等时间参数时，先调用本工具取得当前日期，再自行换算为接口要求的参数；" +
     "禁止丢弃相对时间词、禁止反问用户要具体日期。返回 date(YYYY-MM-DD)、datetime(ISO 8601)、timestamp(毫秒)。",
+  // M1（Supervisor 路由）：模型主动选择 Worker 上下文（领域×项目×环境）。服务端校验命中后装配工具子集与领域提示；
+  // 路由判定完全交模型，工具仅描述可选值，无业务逻辑写死。
+  route_to_agent:
+    "切换当前 Agent 执行的 Worker（上下文域）。传入 domain（必填，可选值 backend-api/knowledge/common/finance/customer-service/database）" +
+    "与可选 project（项目标识，如 bx-film-admin）、environment（test/prod，缺省 test）。服务端校验是否存在匹配 Worker，" +
+    "命中后后续工具调用被限定在该 Worker 上下文（工具子集 + 领域提示），实现「按类型分 Agent」的路由。若不确定用哪个域，先用 request_clarification 收敛。",
 };
 
 // ---- M0（工具领域分组）：工具→领域标注（通用分类词，非业务词，符合「禁止写死」红线）----
@@ -216,6 +223,8 @@ export const TOOL_DOMAIN: Record<string, ToolDomain> = {
   parse_intent: "common",
   set_project: "common",
   get_current_time: "common",
+  // 路由工具（M1 Supervisor 选 Worker 上下文）本就属于通用调度层
+  route_to_agent: "common",
 };
 
 export function getSubmitUnderstoodIntentTool(): AgentToolDef {
@@ -257,6 +266,26 @@ export function getSubmitUnderstoodIntentTool(): AgentToolDef {
         summary: { type: "string", description: "一句话复述你理解的用户意图" },
       },
       required: ["isBusinessRequest", "operationType"],
+    },
+  };
+}
+
+export function getRouteToAgentTool(): AgentToolDef {
+  return {
+    name: "route_to_agent",
+    description: TOOL_DESCRIPTIONS.route_to_agent,
+    inputSchema: {
+      type: "object",
+      properties: {
+        domain: {
+          type: "string",
+          enum: ["backend-api", "knowledge", "common", "finance", "customer-service", "database"],
+          description: "目标领域/上下文域（必填）",
+        },
+        project: { type: "string", description: "项目标识（如 bx-film-admin），backend-api 类通常需要" },
+        environment: { type: "string", enum: ["test", "prod"], description: "环境，缺省 test" },
+      },
+      required: ["domain"],
     },
   };
 }
@@ -725,6 +754,7 @@ export function listAgentTools(): AgentToolDef[] {
         },
       },
     },
+    getRouteToAgentTool(),
   ];
   // M0（工具领域分组）：附 domain 元数据；漏标回退 common，未覆盖工具在启动时告警一次（见 checkToolDomainCoverage）。
   return all.map((t) => ({ ...t, domain: TOOL_DOMAIN[t.name] ?? "common" }));
@@ -1484,6 +1514,21 @@ export async function runAgentTool(
     } catch (e: unknown) {
       return `错误：git 操作失败；${(e as Error).message}`;
     }
+  }
+
+  if (name === "route_to_agent") {
+    const domain = String(input.domain || "").trim();
+    const project = input.project ? String(input.project).trim() : undefined;
+    const environment = input.environment ? String(input.environment).trim() : "test";
+    if (!domain) return "错误：参数缺失；domain 为必填（可选值见工具描述）";
+    const worker = resolveWorker(domain, project, environment);
+    if (!worker) {
+      const available = DEFAULT_WORKERS.map(
+        (w) => `${w.id}(${w.domain}${w.project ? "/" + w.project : ""}${w.environment ? "/" + w.environment : ""})`,
+      ).join(", ");
+      return `未找到匹配 Worker（domain=${domain} project=${project ?? "-"} env=${environment}）。已注册：${available}`;
+    }
+    return `已切换到 Worker「${worker.label}」（id=${worker.id}）。后续工具调用将限定在该 Worker 上下文（工具子集 + 领域提示）。\n[ACTIVE_WORKER:${worker.id}]`;
   }
 
   if (name === "parse_intent") {

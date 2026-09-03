@@ -85,6 +85,7 @@ interface WorkerDef {
   allowedHosts?: string[];        // call_api 主机白名单（按环境收紧）
   writeConfirmPolicy?: "always" | "normal";  // prod 强制 always
   permissions?: { read: boolean; write: boolean };  // M3 启用
+  preferredModel?: string;  // 可选：该 worker 优先/强制使用的模型 id（覆盖默认）；M1+ 增强，详见 §3.8
 }
 ```
 
@@ -108,6 +109,7 @@ interface WorkerDef {
 - **Supervisor 判定完全交模型**：系统提示只说明「根据用户请求的领域与场景选择路由目标」，不含任何业务词 → 领域判断的 if/else（红线：禁止词形路由）
 - `environment` 走工具 schema 的 enum（`test`/`prod` 是通用终端语义，非业务词，合规）
 - **不确定时反问**：模型对 domain 模糊（如"查一下"）→ 复用现有 `request_clarification` 收敛，禁止硬猜路由
+- **模型选择装配（M1+ 增强）**：`resolveWorker` 命中 WorkerDef 后，若该 worker 配 `preferredModel`，后续 understand/final 的模型调用使用该模型（详见 §3.8）；未配则沿用默认模型池。模型选择是 worker 的「装配属性」，不改变「Worker 共享执行引擎」的核心设计
 
 ### 3.5 环境如何落地到 call_api
 
@@ -137,6 +139,22 @@ interface WorkerDef {
 | finance | call_api（财务模块）+ 报表工具 … |
 | customer-service | search_knowledge_base + 纯问答 … |
 | 通用 | request_clarification / set_project / route_to_agent / get_current_time … |
+
+---
+
+### 3.8 可选增强：Worker 级模型选择（preferredModel，M1+）
+
+**背景（2026-09-03 用户决策）**：用户希望「每个 Agent 可单独切换模型」。原 §3.1 设计为「所有 Worker 共享同一个模型池、同一个执行引擎」（强调不按进程/实例拆分模型）。本增强作为**可选**能力叠加，不推翻核心设计：
+
+- `WorkerDef.preferredModel?: string`：路由命中 worker 后，该 worker 的 understand/final 模型调用改用 `preferredModel`（若存在），实现「按 Agent 维度选模型」。
+- **语义澄清**：这是「按 worker 装配不同模型」，不是「每 worker 一个独立模型进程」。执行引擎、工具循环、护栏全部复用；仅模型 id 参数按 worker 替换（对齐 Cursor 的「per-agent model」配置风格）。
+- **默认行为不变**：未配 `preferredModel` 的 worker 沿用全局默认模型（与现状一致），保证零影响回退。
+- **A2A 通道**：A2A Server 侧（§3.2.3）一期「固定用配置默认模型，不给外部任意选」——`preferredModel` 仅作用于**本 Agent 内部 worker 路由**，不影响 A2A 对外暴露时的模型策略（外部调用方不跨 worker 选模型）。
+- **红线合规**：`preferredModel` 是配置层模型 id（通用契约值，如 `nemotron-3-ultra-free`），非业务词；worker→模型的映射走配置，无词形推断。
+
+**落地关联**：
+- M1 路由层（`route_to_agent` + `resolveWorker`）新增：命中 worker 后把 `preferredModel` 写入 `state.activeWorker`，`understand`/`final` 取模型时优先用该值。
+- §6 待办新增「worker 级模型切换」实现项；§5 M1 行标注含此增强。
 
 ---
 
@@ -179,7 +197,7 @@ interface WorkerDef {
 | 阶段 | 内容 | 风险 | 依赖 |
 |---|---|---|---|
 | **M0** | 工具按领域分组标记 + 系统提示按领域裁剪候选（不拆 Agent） | 零 | 无 |
-| **M1** | 加 Supervisor 路由层：主管模型判（领域×环境）→ 交给对应上下文 | 小 | 环境配置（test/prod URL） |
+| **M1** | 加 Supervisor 路由层：主管模型判（领域×环境）→ 交给对应上下文；含可选 worker 级模型切换（`preferredModel`）| 小 | 环境配置（test/prod URL） |
 | **M2** | Worker 独立成子图，各自完整 understand⇄tool→final 循环 | 中 | M1 路由稳定 |
 | **M3** | 并行 worker / 按 worker 隔离权限 / 独立审计；出现独立部署 worker 时经 A2A Client 编排（见 [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) §3.3）| 大 | 权限体系 |
 
@@ -195,6 +213,7 @@ interface WorkerDef {
 - [ ] 数据库 Agent 语义确认：直查 SQL 还是归后台 API Agent
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
 - [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
+- [ ] M1 实现 worker 级模型切换（`preferredModel`）：`resolveWorker` 命中后写入 `state.activeWorker`，understand/final 模型调用优先用该值；未配则沿用默认（2026-09-03 立项，见 §3.8）
 
 ---
 
@@ -207,3 +226,4 @@ interface WorkerDef {
 | 2026-09-02 | 盘点 h5 环境配置（9 个 env 文件含墨西哥，多一套独立 test）；**发现生产=海外公网 HTTPS 域名，与测试完全不同**；§4.1 重写 |
 | 2026-09-02 | 用户确认去掉墨西哥地区；§4.1 地区维度收敛为印度/巴西（in2: 4 个 env、h5: 6 个 env），API 表格与核心结论同步移除墨西哥 |
 | 2026-09-03 | **M0 落地**：tools.ts 全量 23 个工具加 `domain` 标注（backend-api 15 / knowledge 5 / common 4；finance/customer-service/database 预留）+ `listAgentToolsForDomains` 过滤函数 + `toolCatalogByDomain` 注入 system 前缀；chat.ts buildStaticGuide 消费。实际按请求裁剪留 M1 路由。红线合规（领域为通用分类词，无业务词写死） |
+| 2026-09-03 | **M0 提交推送**（commit 81a29b8）+ 新增 `scripts/m0-instance-check.mjs` 实例测试 11/11 通过；同日立项 **M1 可选增强：Worker 级模型切换（preferredModel）**，写入 §3.3/§3.4/§3.8/§5/§6（不推翻「共享模型池」核心设计） |
