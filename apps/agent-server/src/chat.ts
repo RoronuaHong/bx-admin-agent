@@ -76,6 +76,7 @@ const META_TOOLS = new Set([
   "parse_intent",
   "set_project",
   "request_clarification",
+  "route_to_agent", // M1 Supervisor 路由：切换 Worker 上下文，属通用调度层，非业务数据动作
 ]);
 /** 业务工具 = 数据产出 + 探索定位（模型真做业务动作的判定集） */
 const BUSINESS_TOOLS = new Set([...DATA_OUTPUT_TOOLS, ...EXPLORE_TOOLS]);
