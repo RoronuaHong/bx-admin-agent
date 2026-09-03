@@ -450,6 +450,7 @@ async function summarizeHistory(model: ModelEntry, turns: ModelTurn[], signal?: 
     [],
     [],
     signal,
+    {},
   );
   const text = (result.text || "").trim();
   return text ? text.slice(0, HISTORY_SUMMARY_MAX_CHARS) : "";

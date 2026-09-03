@@ -2327,12 +2327,13 @@ async function onClearContext() {
 }
 
 /* 等待助手返回时的 loading 气泡 */
+/* 状态条：与正文块统一顶部 10px 间距节奏 */
 .loading {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   padding: 14px 18px;
-  margin-top: 8px;
+  margin-top: 10px;
   background: var(--fill);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -2392,8 +2393,9 @@ async function onClearContext() {
 }
 
 /* 思考过程折叠块：与「工具调用细节」统一设计语言，但通过左侧强调色区分 */
+/* 间距节奏：与其他辅助块（工具调用/表格/状态条）统一顶部 10px，去掉交错的 8/4px */
 .msg-reasoning {
-  margin: 8px 0;
+  margin: 10px 0 0;
   border-radius: var(--radius, 10px);
   background: var(--fill);
   border: 1px solid var(--line);
@@ -2449,7 +2451,8 @@ async function onClearContext() {
 
 .reasoning-body {
   border-top: 1px solid var(--line);
-  padding: 10px 12px;
+  /* 四周统一 12px，比原 10px 12px 更透气 */
+  padding: 12px;
   animation: rise 0.2s ease both;
 }
 
@@ -3159,13 +3162,15 @@ async function onClearContext() {
   filter: brightness(0.97);
 }
 
+/* 表格块：与推理/工具块统一顶部 10px 间距节奏 */
 .msg-tables {
-  margin-top: 8px;
+  margin-top: 10px;
   max-width: min(920px, 100%);
 }
 
+/* 工具调用块：与推理/表格块统一顶部 10px 间距节奏 */
 .msg-tool-results {
-  margin-top: 8px;
+  margin-top: 10px;
   max-width: min(920px, 100%);
 }
 
