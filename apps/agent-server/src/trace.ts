@@ -55,6 +55,24 @@ interface RunMeta {
 const TRACE_DIR = join(process.cwd(), ".data", "traces");
 const runMetas = new Map<string, RunMeta>();
 
+/**
+ * 进程内「当前 runId」兜底（单并发调试用）。
+ *
+ * 主路径仍走显式透传（LangGraph LoopState.traceRunId / 子 Agent 入口参数），
+ * 但独立子 Agent 函数或工具若拿不到显式 runId，可退而用 currentRunId()
+ * 落到当前 run，避免子 Agent 内部 LLM 轮次脱离主 run 树。
+ *
+ * 注意：这是「单并发」兜底——多并发场景必须显式透传 runId（见 MULTI_AGENT 文档
+ * 「trace 透传契约」）。多并发下 currentRunId 会串，不能作为生产路径。
+ */
+let currentRunId: string | null = null;
+export function setCurrentRunId(runId: string | null): void {
+  currentRunId = runId;
+}
+export function getCurrentRunId(): string | null {
+  return currentRunId;
+}
+
 /** 开一次请求的根追踪上下文，返回 runId（后续所有 span 都带上它）。 */
 export function beginRun(meta: {
   sessionId?: string;
@@ -71,6 +89,8 @@ export function beginRun(meta: {
     worker: meta.worker,
     startMs: Date.now(),
   });
+  // 进程内当前 run 兜底（单并发调试 / 独立子 Agent 函数退路）；多并发必须显式透传
+  currentRunId = runId;
   return runId;
 }
 
@@ -85,6 +105,8 @@ export function endRun(runId: string): void {
   const meta = runMetas.get(runId);
   if (!meta) return;
   runMetas.delete(runId);
+  // 仅当当前 run 兜底仍指向本 run 时才清（多并发下不误清他人）
+  if (currentRunId === runId) currentRunId = null;
   const endMs = Date.now();
   appendSpan({
     runId,

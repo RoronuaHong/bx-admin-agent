@@ -217,6 +217,22 @@ interface WorkerDef {
 
 ---
 
+## 6.1 Trace 透传契约（通用追踪，跨主/子 Agent）
+
+> 适用：M0/M1（Worker 与主 Agent 同进程同图）+ M2/M3（Worker 独立子图/远程 A2A）。
+> 目标：让「一次用户请求」的调用栈能贯穿主 Agent → 子 Agent → 工具，形成完整 span 树。
+
+**核心约束**：
+1. **runId 由最外层（入口 Supervisor / chatStream）开**，通过 `beginRun` 生成，不依赖 AsyncLocalStorage（已验证 ALS 在 `yield*` 下不跨 await 传播）。
+2. **显式透传优先**：主 Agent 的 `LoopState.traceRunId` 已贯穿 understand/tool/final 节点；任何子 Agent 入口（M2/M3 的独立子图或远程 A2A handler）**必须接收 `traceRunId` 参数**，并透传给自己的 `callAgentSafe(... {traceRunId})` 与工具 span，否则子 Agent 内部 LLM 轮次会脱离主 run 树。
+3. **parentSpanId 建树**：子 Agent 入口处开一个 `trace.span(runId, "agent", workerId, {parentSpanId: 父spanId})` 作为子树根，子 Agent 内部 llm/tool span 的 `parentSpanId` 指向它 → inspect 脚本可渲染层级。
+4. **进程内兜底（仅单并发调试）**：`trace.setCurrentRunId/ getCurrentRunId` 供独立子 Agent 函数退路使用；**多并发生产路径必须显式透传**，不得依赖 currentRunId（会串）。
+5. **G2 越权断言可选**：有「执行层越权拒绝」机制的 Agent（如本仓库 M1 worker 白名单）用 `rejectMode:"observe"/"enforce"`；无此机制的 Agent 用 `"off"`（eval-core 的 assertTraceGates 已支持三态）。
+
+**eval-core.mjs 是通用的**：`assertTraceGates` / `summarize` 纯函数，只认 span 通用字段（run/llm/tool/route + usage + status），不认识任何业务词/worker 语义/登录方式。业务项目只需写适配器（login + 触发请求 + 传 runId），红线断言零改动。
+
+---
+
 ## 7. 进度记录
 
 | 日期 | 进展 |
@@ -227,3 +243,4 @@ interface WorkerDef {
 | 2026-09-02 | 用户确认去掉墨西哥地区；§4.1 地区维度收敛为印度/巴西（in2: 4 个 env、h5: 6 个 env），API 表格与核心结论同步移除墨西哥 |
 | 2026-09-03 | **M0 落地**：tools.ts 全量 23 个工具加 `domain` 标注（backend-api 15 / knowledge 5 / common 4；finance/customer-service/database 预留）+ `listAgentToolsForDomains` 过滤函数 + `toolCatalogByDomain` 注入 system 前缀；chat.ts buildStaticGuide 消费。实际按请求裁剪留 M1 路由。红线合规（领域为通用分类词，无业务词写死） |
 | 2026-09-03 | **M0 提交推送**（commit 81a29b8）+ 新增 `scripts/m0-instance-check.mjs` 实例测试 11/11 通过；同日立项 **M1 可选增强：Worker 级模型切换（preferredModel）**，写入 §3.3/§3.4/§3.8/§5/§6（不推翻「共享模型池」核心设计） |
+| 2026-09-03 | **Eval 通用化**：抽 `eval-core.mjs`（assertTraceGates/summarize 纯函数，不依赖登录/cookie/worker/业务词）；`eval-trace-gate.mjs` 退化为 bx-admin-agent 适配器；trace.ts 加 `currentRunId` 进程内兜底（单并发调试）+ `parentSpanId` 建树能力；§6.1 写入「trace 透传契约」（主→子 Agent runId 显式透传 + 黑名单 G2 三态） |
