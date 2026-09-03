@@ -206,3 +206,8 @@ export function getRun(runId: string): TraceSpan[] {
     return [];
   }
 }
+
+/** 返回最近一次请求的 runId（eval 脚本用于「刚跑完的请求」断言）。无数据返回 null。 */
+export function latestRunId(): string | null {
+  return listRuns(1)[0]?.runId ?? null;
+}
