@@ -1621,7 +1621,6 @@ export async function* chatStream(
         const routedTools: AgentToolDef[] = workerNames
           ? listAgentTools().filter((t) => workerNames.has(t.name))
           : listAgentTools();
-
         // 输出已就绪却还在空转：禁止再调工具，强制给用户最终答复
         const forceAnswer = state.outputReady === true;
         const llmTools = forceAnswer ? [] : routedTools;
@@ -1814,7 +1813,51 @@ export async function* chatStream(
             seenCallKeys.set(key, c.id);
           }
         }
+        // M1（Supervisor 路由）同轮隔离短路：本轮 toolCalls 含 route_to_agent 时，
+        // 只执行它并立即 return，放弃本轮其余调用（call_api 等），
+        // 避免 Worker 上下文切换前误执行「旧 Worker 视角」下的业务工具（同轮捆绑泄漏）。
+        // 路由命中后下一轮 understand 会基于新 activeWorkerId 裁剪工具集重新规划。
+        const routeCall = state.toolCalls.find((c) => c.name === "route_to_agent");
+        if (routeCall) {
+          emitEvent({ type: "tool_call", name: routeCall.name, input: routeCall.input });
+          emitEvent({ type: "reasoning", text: describeCallForReasoning(routeCall) });
+          const rc = await runAgentTool(routeCall.name, routeCall.input, toolOpts);
+          emitEvent({ type: "tool_result", name: routeCall.name, result: truncateToolResultForUi(rc) });
+          nextSteps.push({ kind: "toolResult", toolCallId: routeCall.id, content: rc });
+          const rwm = /\[ACTIVE_WORKER:([^\]]+)\]/.exec(rc);
+          if (rwm) activeWorkerId = rwm[1];
+          return {
+            steps: nextSteps,
+            toolCalls: [],
+            round: state.round + 1,
+            needsClarification: false,
+            clarificationText: "",
+            outputReady,
+            forcedReply,
+            pageKind,
+            pendingTables,
+            lastToolSignature,
+            toolSignatureStreak,
+            doomLoopExhausted: toolSignatureStreak >= 3,
+            activeWorkerId: activeWorkerId ?? state.activeWorkerId,
+          };
+        }
+        // M1 执行层防护：基于当前生效的 Worker 白名单强制工具边界。
+        // 白名单外的工具调用一律拒绝执行（返回说明回喂模型），模型须先 route_to_agent 切回对应 Worker。
+        const curWorker = activeWorkerId ? resolveWorkerById(activeWorkerId) : null;
+        const curWhitelist = workerToolNames(curWorker);
         for (const call of state.toolCalls) {
+          // M1 执行层防护：越权工具调用拒绝执行（META_TOOLS 始终放行；route_to_agent 已走短路分支）
+          if (curWhitelist && !META_TOOLS.has(call.name) && !curWhitelist.has(call.name)) {
+            const reject =
+              `错误：当前 Worker 上下文（${activeWorkerId}）不允许调用 ${call.name}（不在本 Worker 工具白名单内）。` +
+              `本 Worker 可用工具：${[...curWhitelist].join(", ")}。` +
+              `如确需调用 ${call.name}，请先调用 route_to_agent 切换到对应 Worker（如 backend-api）。`;
+            emitEvent({ type: "tool_call", name: call.name, input: call.input });
+            emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(reject) });
+            nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: reject });
+            continue;
+          }
           emitEvent({ type: "tool_call", name: call.name, input: call.input });
           // 思考过程（对齐 DeepSeek「深度思考」）：把 agent 实际操作链以人类可读摘要流向前端，
           // 折叠块内展示。描述取自工具名 + 关键入参，不编造模型未产生的思维链。
@@ -1956,7 +1999,6 @@ export async function* chatStream(
           // M1（Supervisor 路由）：route_to_agent 成功命中后从结果标记提取 worker id，贯穿本节点回写 state
           const workerMatch = /\[ACTIVE_WORKER:([^\]]+)\]/.exec(content);
           if (workerMatch) activeWorkerId = workerMatch[1];
-
           // 探索型工具结果后追加轻量下一步引导（Cursor 式收敛，非服务端硬判）：
           // 业务数据请求下，search/read/grep 返回的只是「候选/接口信息」，仍须 call_api 取数才能作答。
           // 避免弱模型把候选清单/接口源码当最终答案中途收束（2026-08-24 优惠活动配置实测：

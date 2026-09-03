@@ -70,12 +70,17 @@ export function resolveWorkerById(id: string): WorkerDef | null {
 }
 
 export function resolveWorker(domain: string, project?: string, environment?: string): WorkerDef | null {
+  // 模型常传占位值（"-"/空串/"none"）表达「未指定」，此时按「不限」匹配，
+  // 避免 knowledge/common 这类不绑定项目/环境的 Worker 因占位值非空而匹配失败（M1 路由空转）。
+  const p = project && project !== "-" && project.toLowerCase() !== "none" ? project : undefined;
+  const e = environment && environment !== "-" && environment.toLowerCase() !== "none" ? environment : undefined;
   return (
     DEFAULT_WORKERS.find(
       (w) =>
         w.domain === domain &&
-        (!project || w.project === project) &&
-        (!environment || w.environment === environment),
+        (!p || w.project === p) &&
+        // worker 未声明 environment 视为「不限环境」放行；声明了才要求精确匹配
+        (!w.environment || !e || w.environment === e),
     ) ?? null
   );
 }
