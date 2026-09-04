@@ -143,3 +143,13 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 身份 Identity | ✅ P2 落地：①溯源——`ownerKey`（countryId:loginName）chatStream 入口计算，贯穿 trace run span meta / 成本 `byOwner` 维度（+`inspect-cost.mjs --owner`）/ 审计（P1）/ 会话；②多项目 ACL——项目配置可选 `allowOwners`（未配置=开放），`set_project` 判定先于会话写入（拒绝零副作用）+ 未知项目诚实拒绝，`projectAccessibleBy` 纯函数；③最小权限——`/cost/summary` 与 `/audit/list` HTTP 面强制 ownerKey 过滤（只看自己），全局视角只走 CLI；顺手修 bySession/byOwner runs 计数恒 0 缺陷。验证：ACL 11 用例 + 真实 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200 + 最小权限不泄漏 | src/trace.ts / src/cost.ts / src/chat.ts / src/tools.ts / src/project-registry.ts / src/app.ts / scripts/inspect-cost.mjs |
 | 2026-09-04 | 异步 Async | ✅ P2 落地：`/chat/stream` 执行与推送解耦——后台消费者驱动 chatStream（任务级 AbortController），事件入缓冲，SSE 只做转发订阅者（断开不停执行）；断线闭环=任务收束自动落「后台任务结果」会话（task-<sessionId>，前端不在线数据不丢）；并发保护=进行中重连只回放+task_running；新增 `/chat/cancel`（显式取消）+ `/chat/task/status`（状态查询）+ shared 契约加 task_running 事件；缓冲 5min GC + lastTasks 上限 100。验证实例 8/8：断线后台完成落库配对 / 进行中重连回放 / cancel 收束 running=null | src/app.ts / packages/shared/src/index.ts |
 | 2026-09-04 | 版本+可观测 | ✅ P3 落地（八维度收官）：①版本——`trace.ts getRelease()`（RELEASE env > git 短 sha，进程内缓存），run span meta 落 release（实测 b6b0dd7）+ eval 基线顶层加 release 字段（回归按版本对比）；②可观测——`GET /trace/runs`（最近 N run 摘要+统计 avgRounds/tokens，实测 stats 正确）+ `GET /trace/run/:runId`（span 树，非本人 404 不泄漏存在性），ownerKey 隔离口径与 cost/audit 一致。验证：真实 run release 落盘 + 端点 own 200/unknown 404/anon 401 + 基线 release 字段 | src/trace.ts / src/app.ts / scripts/eval-trace-gate.mjs |
+| 2026-09-04 | 全链路多点回归 | ✅ 新增可复用回归工具 `chain-multirun.mjs`（battery/chit/kb/read/write/async 六 suite）+ `chain-report.mjs`（聚合分析），证据落 `.data/multirun/`；**2026-09-04 首轮多点实测 24/26（92.3%）**：正确性链路全绿（battery 9/9、chit 3/3、kb 1/1 命中考勤制度、write 4/4 双确认点全拒+审计 denied、async 6/6 断线落库配对、read 数据正确性 3/3 含逐页校验与 G6 全中）；唯二红=读链路效率 G1/G4（2/3 次 rounds 10-12、tokens 114k-146k）——trace 定性为上游免费链**空响应轮**（tok=0、无工具调用、10-35s/轮，每轮后模型自愈继续，数据终局正确）非客户端缺陷；改善建议见 §5 | scripts/chain-multirun.mjs / scripts/chain-report.mjs |
+
+---
+
+## 5. 多点回归发现的改善项（按 ROI 排序）
+
+1. **空响应轮即时重试**（低成本高收益）：read#3 实测 4 个空响应轮（llm 返回空内容、tok=0、无工具调用，10-35s/轮）。现靠条件边重跑 understand 自愈（数据终局正确），但每轮浪费 1 轮次 + ~30s。建议 `callAgentSafe` 把「空结果（无 text 且无 toolCalls）」纳入瞬时重试（与 429 同路，退避后重发一次），预计可消掉大部分空轮。
+2. **G4 预算自适应**：60k 阈值按「≤8 轮健康轮次」标定；实际成本大头是 prompt 随轮次线性累积（每轮 11-24k，completion 仅 1-2k）。可改为 `maxTotalTokens ≈ base + perRound × rounds` 或直接以 `EVAL_MAX_TOKENS` 按场景注入（闸门已支持）。
+3. **多模型降级信号**：劣化窗口（空响应轮/短路）有明确 span 签名（tok=0 / rounds=1&tokens=0）。可让 `/trace/runs` 统计输出 `emptyRoundRate`，超阈值时提示切换 EVAL_MODEL 到备选（zenhy3/nemotronfree），把「人发现劣化」变成「数据提醒劣化」。
+4. **前端可视化**：`/trace/runs` 端点已就绪，接一个只读页面即可看到轮次/成本/版本分布。
