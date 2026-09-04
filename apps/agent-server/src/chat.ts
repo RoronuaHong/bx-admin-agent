@@ -616,11 +616,19 @@ function pickClarificationOption(pending: PendingClarification, userText: string
   return null;
 }
 
-// 网关瞬时错误偶发兜底：最多重试 2 次（含 429 限流退避）。
-// 覆盖 TokenHub 504001 网关超时 / 503 服务暂不可用（过载、健康检查、限流，body 常为空）
-// / 429 限流（zen 免费链 FreeUsageLimitError 按窗口重置，退避 3s×attempt 后可恢复）。
-// 流式已大幅降低概率，此处仅防偶发网关抖动直接炸掉整轮。
+// 网关瞬时错误 / 空响应偶发兜底：最多重试 2 次（含 429 限流退避）。
+// 覆盖：
+// - TokenHub 504001 网关超时 / 503 服务暂不可用（过载、健康检查、限流，body 常为空）
+// - 429 限流（zen 免费链 FreeUsageLimitError 按窗口重置，退避 3s×attempt 后可恢复）
+// - 空响应（无 text 且无 toolCalls，tok=0）：上游免费链偶发空流；原先靠条件边再跑一轮
+//   understand 自愈，浪费 1 轮次 + ~30s；在此层退避重发可消掉大部分空轮（多点回归 §5.1）。
+// 流式已大幅降低网关抖动概率；空响应重试耗尽后仍返回空结果，交条件边兜底，不抛错。
 const MODEL_GATEWAY_RETRIES = 2;
+
+/** 上游偶发空流：无文本且无工具调用（与多点回归 emptyRound 签名一致）。 */
+function isEmptyAgentResult(r: { text?: string; toolCalls?: unknown[] }): boolean {
+  return !r.text?.trim() && !(r.toolCalls?.length);
+}
 
 // ---- 模型额度耗尽标记（2026-08-24 起不再降级）----
 // TokenHub 免费体验额度逐模型耗尽（已实测 dsflash/dspro/hy3 402/401008）。
@@ -652,10 +660,27 @@ async function callAgentSafe(
 ): Promise<Awaited<ReturnType<typeof callAgent>>> {
   const span = opts.traceRunId ? trace.span(opts.traceRunId, "llm", model.id, { model: model.id }) : undefined;
   let lastErr: unknown;
+  let emptyRetries = 0;
   for (let attempt = 0; attempt <= MODEL_GATEWAY_RETRIES; attempt++) {
     try {
       const r = await callAgent(model, turns, images, tools, steps, signal, opts, onDelta);
-      span?.end({ usage: r.usage });
+      // 空响应纳入瞬时重试（与 429 同预算）：退避后同参重发，避免空轮占用 understand 轮次预算。
+      // 耗尽后返回空结果（不抛），条件边仍可按 understandAttempts 兜底。
+      if (isEmptyAgentResult(r) && attempt < MODEL_GATEWAY_RETRIES) {
+        emptyRetries += 1;
+        const backoffMs = 3000 * (attempt + 1);
+        console.log(
+          `[chat:model] 空响应瞬时重试 ${attempt + 1}/${MODEL_GATEWAY_RETRIES}（退避 ${backoffMs}ms）`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        continue;
+      }
+      span?.end({
+        usage: r.usage,
+        ...(emptyRetries > 0
+          ? { note: isEmptyAgentResult(r) ? "empty_after_retry" : "recovered_from_empty", meta: { emptyRetries } }
+          : {}),
+      });
       return r;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

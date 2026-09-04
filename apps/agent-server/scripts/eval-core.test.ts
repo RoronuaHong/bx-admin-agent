@@ -9,7 +9,7 @@
  *
  * 运行：tsx scripts/eval-core.test.ts
  */
-import { assertTraceGates, summarize } from "./eval-core.mjs";
+import { assertTraceGates, summarize, resolveTokenBudget } from "./eval-core.mjs";
 
 const results: Array<{ name: string; ok: boolean; detail: string }> = [];
 
@@ -97,13 +97,13 @@ assert(
     .find((r) => r.name === "G3_no_pseudo_tool")!.ok,
 );
 
-// ---- G4 成本 ----
+// ---- G4 成本（固定阈值 + 自适应）----
 assert(
-  "G4 预算内 → pass",
+  "G4 固定预算内 → pass",
   assertTraceGates({ spans: baseSpans, maxTotalTokens: 60000 }).find((r) => r.name === "G4_token_budget_le")!.ok,
 );
 assert(
-  "G4 超预算 → fail",
+  "G4 固定超预算 → fail",
   !assertTraceGates({ spans: baseSpans, maxTotalTokens: 1000 }).find((r) => r.name === "G4_token_budget_le")!.ok,
 );
 assert(
@@ -111,6 +111,40 @@ assert(
   assertTraceGates({
     spans: [{ kind: "run", endMs: 1 }, { kind: "llm" }],
     maxTotalTokens: 10,
+  }).find((r) => r.name === "G4_token_budget_le")!.ok,
+);
+// 自适应：base=8000 + perRound=16000 × rounds（默认）
+assert(
+  "resolveTokenBudget 固定优先",
+  resolveTokenBudget({ rounds: 6, maxTotalTokens: 60000 }).mode === "fixed" &&
+    resolveTokenBudget({ rounds: 6, maxTotalTokens: 60000 }).budget === 60000,
+);
+assert(
+  "resolveTokenBudget 自适应 6 轮 = 104000",
+  resolveTokenBudget({ rounds: 6 }).budget === 8000 + 16000 * 6,
+);
+// 实测 read#2 画像：6 轮 / 98625 tokens——固定 60k 会误红，自适应应放行
+const readLike6 = [
+  { kind: "run", endMs: 1, durationMs: 1, model: "m" },
+  ...Array.from({ length: 6 }, () => ({ kind: "llm", name: "m", usage: { totalTokens: 16437 } })),
+  { kind: "tool", name: "call_api", status: "ok" },
+];
+assert(
+  "G4 自适应放行健康多轮（≈98k/6 轮）→ pass",
+  assertTraceGates({ spans: readLike6 }).find((r) => r.name === "G4_token_budget_le")!.ok,
+);
+assert(
+  "G4 固定 60k 仍可拦截同画像 → fail",
+  !assertTraceGates({ spans: readLike6, maxTotalTokens: 60000 }).find((r) => r.name === "G4_token_budget_le")!.ok,
+);
+// 单轮爆量：1 轮 100k > 8000+16000 → fail
+assert(
+  "G4 自适应拦截单轮爆量 → fail",
+  !assertTraceGates({
+    spans: [
+      { kind: "run", endMs: 1 },
+      { kind: "llm", usage: { totalTokens: 100000 } },
+    ],
   }).find((r) => r.name === "G4_token_budget_le")!.ok,
 );
 

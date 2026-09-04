@@ -248,3 +248,64 @@ export async function clearConversation(id: string) {
 export function downloadUrl(fileId: string, preview = false) {
   return `/agent/chat/download/${fileId}${preview ? "?preview=1" : ""}`;
 }
+
+// ---- P3 可观测：trace 只读视图 ----
+export interface TraceRunSummary {
+  runId: string;
+  startedAt: string;
+  durationMs?: number;
+  model?: string;
+  userText?: string;
+  ownerKey?: string;
+  release?: string;
+  llmRounds: number;
+  emptyRounds: number;
+  emptyRetries: number;
+  toolCalls: number;
+  totalTokens: number;
+  error?: string;
+}
+
+export interface TraceRunsStats {
+  runs: number;
+  llmCalls: number;
+  tokens: number;
+  avgRounds: number;
+  emptyRounds: number;
+  emptyRetries: number;
+  emptyRoundRate: number;
+  shortCircuitRuns: number;
+  degradeHint: string | null;
+}
+
+export interface TraceSpanDto {
+  runId: string;
+  spanId: string;
+  parentSpanId?: string;
+  kind: string;
+  name: string;
+  model?: string;
+  worker?: string;
+  status: string;
+  durationMs: number;
+  usage?: { totalTokens?: number; promptTokens?: number; completionTokens?: number };
+  error?: string;
+  note?: string;
+  meta?: Record<string, unknown>;
+}
+
+export async function fetchTraceRuns(limit = 20): Promise<{ runs: TraceRunSummary[]; stats: TraceRunsStats }> {
+  const data = (await jsonFetch(`/agent/trace/runs?limit=${Math.min(limit, 50)}`)) as {
+    runs: TraceRunSummary[];
+    stats: TraceRunsStats;
+  };
+  return { runs: data.runs || [], stats: data.stats };
+}
+
+export async function fetchTraceRun(runId: string): Promise<{ release?: string; spans: TraceSpanDto[] }> {
+  const data = (await jsonFetch(`/agent/trace/run/${encodeURIComponent(runId)}`)) as {
+    release?: string;
+    spans: TraceSpanDto[];
+  };
+  return { release: data.release, spans: data.spans || [] };
+}

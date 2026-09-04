@@ -18,7 +18,7 @@
  *   EVAL_COUNTRY=xx EVAL_USER=xx EVAL_PASS=xx npx tsx scripts/eval-trace-gate.mjs --prompt "…"
  * 环境变量：AGENT_BASE_URL（默认 http://localhost:8787）、EVAL_COUNTRY、EVAL_USER、EVAL_PASS（后三者必填）、
  *   EVAL_MODEL（默认 auto）、EVAL_PSEUDO_TOOLS（G3 黑名单）、EVAL_EXPECT_TOOLS（G6 期望工具）、
- *   EVAL_MAX_ROUNDS / EVAL_MAX_TOKENS（G1/G4 阈值校准）
+ *   EVAL_MAX_ROUNDS / EVAL_MAX_TOKENS（G1/G4；TOKENS 显式传入则固定阈值，否则 G4 自适应 base+perRound×rounds）
  */
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";

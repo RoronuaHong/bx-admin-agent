@@ -1302,6 +1302,7 @@ async function onClearContext() {
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
         <ThemeToggle />
+        <RouterLink class="ghost" to="/trace">调用观察</RouterLink>
         <button class="ghost" type="button" @click="helpOpen = true">操作说明</button>
         <button class="ghost" type="button" :disabled="sending" @click="onClearContext">重置对话</button>
         <button class="ghost" type="button" @click="onLogout">退出</button>
@@ -1837,6 +1838,7 @@ async function onClearContext() {
   align-items: center;
   justify-content: center;
   line-height: 1;
+  text-decoration: none;
 }
 
 .ghost:hover:not(:disabled) {

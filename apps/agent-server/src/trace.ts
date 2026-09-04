@@ -282,9 +282,57 @@ export interface RunSummary {
   ownerKey?: string;
   release?: string;
   llmRounds: number;
+  /** tok=0 / 无 usage 的 llm span 数（未自愈的空响应轮） */
+  emptyRounds: number;
+  /** callAgentSafe 空响应瞬时重试次数合计（已自愈，仍计入劣化信号） */
+  emptyRetries: number;
   toolCalls: number;
   totalTokens: number;
   error?: string;
+}
+
+/** 空响应轮签名：无 totalTokens（含 usage 缺失 / tok=0）。 */
+export function isEmptyLlmSpan(s: Pick<TraceSpan, "kind" | "usage">): boolean {
+  return s.kind === "llm" && !(s.usage?.totalTokens);
+}
+
+/** 从 llm spans 汇总空轮 / 瞬时重试（§5.3 劣化信号分子）。 */
+export function countEmptySignals(llmSpans: Array<Pick<TraceSpan, "kind" | "usage" | "note" | "meta">>): {
+  emptyRounds: number;
+  emptyRetries: number;
+} {
+  let emptyRounds = 0;
+  let emptyRetries = 0;
+  for (const s of llmSpans) {
+    if (s.kind !== "llm") continue;
+    if (isEmptyLlmSpan(s)) emptyRounds += 1;
+    const n = Number(s.meta?.emptyRetries);
+    if (Number.isFinite(n) && n > 0) emptyRetries += n;
+  }
+  return { emptyRounds, emptyRetries };
+}
+
+export interface TraceRunsStats {
+  runs: number;
+  llmCalls: number;
+  tokens: number;
+  avgRounds: number;
+  /** 未自愈空轮合计 */
+  emptyRounds: number;
+  /** 瞬时重试合计（已自愈空流） */
+  emptyRetries: number;
+  /** (emptyRounds+emptyRetries) / (llmCalls+emptyRetries)，保留 3 位小数 */
+  emptyRoundRate: number;
+  /** 短路收束：≤1 轮且 0 token（疑似未干活） */
+  shortCircuitRuns: number;
+  /** 超阈值时非空；提示切换模型 / 稍后重试（零业务词） */
+  degradeHint: string | null;
+}
+
+/** 空轮率告警阈值（0–1）。可用 TRACE_EMPTY_ROUND_RATE_WARN 覆盖，默认 0.2。 */
+export function emptyRoundRateWarnThreshold(): number {
+  const n = Number(process.env.TRACE_EMPTY_ROUND_RATE_WARN);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.2;
 }
 
 /**
@@ -294,11 +342,14 @@ export interface RunSummary {
 export function listRunSummaries(
   limit = 20,
   ownerKey?: string,
-): { runs: RunSummary[]; stats: { runs: number; llmCalls: number; tokens: number; avgRounds: number } } {
+): { runs: RunSummary[]; stats: TraceRunsStats } {
   const cap = Math.max(limit, 1) + 30; // 多读一些文件以补偿 owner 过滤后的空缺
   const out: RunSummary[] = [];
   let llmCalls = 0;
   let tokens = 0;
+  let emptyRounds = 0;
+  let emptyRetries = 0;
+  let shortCircuitRuns = 0;
   for (const { runId } of listRuns(cap)) {
     const spans = getRun(runId);
     const runSpan = spans.find((s) => s.kind === "run");
@@ -307,8 +358,12 @@ export function listRunSummaries(
     if (ownerKey && runOwner !== ownerKey) continue;
     const llm = spans.filter((s) => s.kind === "llm");
     const roundTokens = llm.reduce((a, s) => a + (s.usage?.totalTokens || 0), 0);
+    const empty = countEmptySignals(llm);
     llmCalls += llm.length;
     tokens += roundTokens;
+    emptyRounds += empty.emptyRounds;
+    emptyRetries += empty.emptyRetries;
+    if (llm.length <= 1 && roundTokens === 0) shortCircuitRuns += 1;
     const errSpan = spans.find((s) => s.status === "error");
     out.push({
       runId,
@@ -319,11 +374,29 @@ export function listRunSummaries(
       ownerKey: runOwner || undefined,
       release: (runSpan.meta?.release as string) || undefined,
       llmRounds: llm.length,
+      emptyRounds: empty.emptyRounds,
+      emptyRetries: empty.emptyRetries,
       toolCalls: spans.filter((s) => s.kind === "tool").length,
       totalTokens: roundTokens,
       error: errSpan?.error,
     });
     if (out.length >= limit) break;
+  }
+  // 分母含瞬时重试次数：重试不另开 llm span，但占用上游调用；分子=未自愈空轮+重试。
+  const attempts = llmCalls + emptyRetries;
+  const emptyRoundRate = attempts ? Number(((emptyRounds + emptyRetries) / attempts).toFixed(3)) : 0;
+  const warn = emptyRoundRateWarnThreshold();
+  let degradeHint: string | null = null;
+  if (emptyRoundRate >= warn || shortCircuitRuns > 0) {
+    const alts = String(process.env.TRACE_DEGRADE_HINT_MODELS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const altPart = alts.length ? `；可切换 EVAL_MODEL 至 ${alts.join("/")}` : "；建议切换 EVAL_MODEL 或稍后重试";
+    const parts: string[] = [];
+    if (emptyRoundRate >= warn) parts.push(`emptyRoundRate=${emptyRoundRate}≥${warn}`);
+    if (shortCircuitRuns > 0) parts.push(`shortCircuitRuns=${shortCircuitRuns}`);
+    degradeHint = `上游疑似劣化（${parts.join(", ")}）${altPart}`;
   }
   return {
     runs: out,
@@ -332,6 +405,11 @@ export function listRunSummaries(
       llmCalls,
       tokens,
       avgRounds: out.length ? Number((llmCalls / out.length).toFixed(1)) : 0,
+      emptyRounds,
+      emptyRetries,
+      emptyRoundRate,
+      shortCircuitRuns,
+      degradeHint,
     },
   };
 }
