@@ -89,4 +89,6 @@ export type ChatEvent =
   | { type: "table"; table: ChatTableView }
   | { type: "file"; file: ChatFileRef }
   | { type: "chart"; chart: ChatChartView }
+  /** P2 异步：该会话已有任务在后台执行，本连接为进度回放（重连/并发保护语义） */
+  | { type: "task_running"; taskId: string; startedAt: number; note?: string }
   | { type: "done" };

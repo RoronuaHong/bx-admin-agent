@@ -12,7 +12,7 @@
 | 维度 | 现状 | 评级 | 一句话缺口 |
 |---|---|---|---|
 | **身份 Identity** | **2026-09-04 P2 已落地**：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限 | ✅ 已补 | 角色模型/管理员视角缺（CLI 承担全局） |
-| **异步 Async** | SSE 流式同步返回（`/chat/stream`） | 🔴 缺失 | 无后台任务/长作业/断线续跑/进度查询 |
+| **异步 Async** | **2026-09-04 P2 已落地**：执行与推送解耦（断线任务继续跑完+结果自动落库）+ 并发回放 + 显式取消 + 任务状态查询 | ✅ 已补 | 无独立任务队列（进程内单任务/会话） |
 | **追踪 Tracing** | **2026-09-03 已建**：`trace.ts` + `inspect-trace.mjs`，runId 贯穿 + span 树 + token usage | ✅ 已补 | 仅 JSONL 落盘，无 Web 可视化/告警 |
 | **评测 Eval** | `eval-full-chain.mjs` 等脚本能跑全链路 PASS/FAIL + `process.exit(1)` | 🟡 雏形 | 未落库基线、未接 CI、断言维度浅（无 traces 复用） |
 | **成本 Cost** | **2026-09-04 P1 已落地**：`cost.ts` 聚合（日/模型/会话/慢调用）+ `inspect-cost.mjs` CLI + `GET /cost/summary` 只读端点 + 预算告警 | ✅ 已补 | 单价未配（只计 token）；告警未接通知渠道 |
@@ -32,9 +32,15 @@
 - 验证：ACL 纯函数 4/4 + set_project 真实路径（名单外拒绝/名单内放行/未配置开放/未知项目拒绝）+ 真实请求 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200。
 - 仍缺：角色/权限模型（越权防护靠 M1 worker 白名单运行期拦截，非数据期 ACL）；跨租户管理员视角（现 CLI 承担）。
 
-### 2.2 异步 Async 🔴
-- 当前：`/chat/stream` 同步流式，单次请求生命周期内完成。
-- 缺口：长耗时作业（如大批量导出、多页聚合、跨项目扫描）无法后台化；断线后无法续跑；无任务状态查询接口。
+### 2.2 异步 Async ✅ P2 已落地（执行与推送解耦）
+- **旧行为（根因）**：`c.req.raw.signal`（客户端断开）直接传进 `chatStream`——刷新/断网 → 各节点 `signal.aborted` → 任务终止、结果不落库（刷新丢结果）；且 generator 是拉模式，SSE 消费断开即冻结。
+- **新架构（本次落地，`chat.ts` 零改动）**：`/chat/stream` 引入任务注册表——**后台消费者**驱动 `chatStream`（任务级 `AbortController`，不依赖客户端连接），事件写入任务缓冲；SSE 连接只是缓冲的转发订阅者（100ms 轮询追新，断开仅停转发）。
+- **断线闭环**：任务收束后服务端自动把 (userText, 最终答复) 追加到「后台任务结果」专用会话（`id=task-<sessionId>`，与前端 conv_xxx 隔离）——前端不在线也数据不丢，刷新后从会话历史恢复。
+- **并发保护**：同会话任务进行中再发请求 → 只回放缓冲 + `task_running` 事件（不开第二个任务，防并发写 session.messages 交错污染）。
+- **显式取消**：`POST /chat/cancel`（abort 任务 controller，与原 signal 语义一致）；客户端断开不再等于取消。
+- **状态查询**：`GET /chat/task/status`（running/last 摘要，刷新后前端可展示「上一任务仍在后台执行」）；缓冲 5 分钟 GC + lastTasks 上限 100 防内存膨胀。
+- 验证（实例 8/8）：T1 断线 2s → 后台完成 → 落库配对 ✓；T2 进行中重连 → task_running ✓；T3 cancel → 收束 → running=null ✓。
+- 遗留：跨进程任务队列（多实例部署时任务在单进程内）；任务进度百分比（当前为事件流粒度）。
 
 ### 2.3 追踪 Tracing ✅（2026-09-03 补齐）
 - 实现：`src/trace.ts`——`beginRun/endRun/span/setRunModel`；`LoopState.traceRunId` 贯穿各节点。
@@ -110,7 +116,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | **P1** | 安全审计 | ✅ 已落地：`audit.ts` 三类事件（越权拒绝/写确认请求/确认结论三态）append-only 落库 + `/audit/list`（ownerKey 隔离）+ `inspect-audit.mjs` | 上线必备合规；runId 关联 trace 可反查上下文 |
 | **P1** | 成本 Cost | ✅ 已落地：`cost.ts` 聚合 + `inspect-cost.mjs` CLI + `GET /cost/summary` 端点 + 预算告警（env 阈值） | traces 已采集，只差聚合 |
 | **P2** | 身份 Identity | ✅ 已落地：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限（只看自己，全局走 CLI） | 多租户上线前必需 |
-| **P2** | 异步 Async | 后台任务框架 | 长作业场景；非阻塞核心路径 |
+| **P2** | 异步 Async | ✅ 已落地：执行与推送解耦（断线任务跑完+自动落库）/ 并发回放 / `/chat/cancel` / `/chat/task/status` | 刷新丢结果根因消除；chat.ts 零改动 |
 | **P3** | 版本 Version | 提示词/工具版本化与回滚 | 降低线上试错成本 |
 | **P3** | 可观测 | Web trace 可视化 + metrics | 体验增强 |
 
@@ -129,3 +135,4 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 安全 Security | ✅ P1 审计落地：`audit.ts`（reject/confirm_request/confirm_result 三类事件，append-only 按月 JSONL，runId 关联 trace，零业务词零依赖）+ `chat.ts` 四处接线（tool 节点越权拒绝 + 三处写确认，确认结论三态 granted/denied/timeout——`waitForConfirmation` 改返回 `{confirmed, outcome}`）+ `GET /audit/list`（ownerKey 隔离最小权限）+ `inspect-audit.mjs` CLI；验证：模块回环 8/8 + 端点匿名 401/登录态 200 | src/audit.ts / src/chat.ts / src/app.ts / scripts/inspect-audit.mjs |
 | 2026-09-04 | 安全+评测 实例验证 | ✅ 真实实例验证：①写确认审计端到端 PASS（真实写意图 → confirmation_required → 自动拒绝零副作用 → 审计落 confirm_request+confirm_result=denied，owner=countryId:loginName、runId 关联 trace、/audit/list 可查）；②读场景回归发现免费链劣化窗口（nemotronultra 2 次 rounds=10 含 3 空响应轮、zenhy3 2 次短路 <1s）——非代码回归（diff 不涉 LLM 循环）；③**gate 盲区修复**：短路/幻觉直答不调工具能骗过 G1-G5，补 **G6 业务期望断言**（`expectTools`，默认关）+ 阈值环境变量（EVAL_MAX_ROUNDS/EVAL_MAX_TOKENS）+ adapter `--expect-tool`；core 单测 23/23，G6 实战拦截 zenhy3 短路（5/6 如实红） | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs |
 | 2026-09-04 | 身份 Identity | ✅ P2 落地：①溯源——`ownerKey`（countryId:loginName）chatStream 入口计算，贯穿 trace run span meta / 成本 `byOwner` 维度（+`inspect-cost.mjs --owner`）/ 审计（P1）/ 会话；②多项目 ACL——项目配置可选 `allowOwners`（未配置=开放），`set_project` 判定先于会话写入（拒绝零副作用）+ 未知项目诚实拒绝，`projectAccessibleBy` 纯函数；③最小权限——`/cost/summary` 与 `/audit/list` HTTP 面强制 ownerKey 过滤（只看自己），全局视角只走 CLI；顺手修 bySession/byOwner runs 计数恒 0 缺陷。验证：ACL 11 用例 + 真实 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200 + 最小权限不泄漏 | src/trace.ts / src/cost.ts / src/chat.ts / src/tools.ts / src/project-registry.ts / src/app.ts / scripts/inspect-cost.mjs |
+| 2026-09-04 | 异步 Async | ✅ P2 落地：`/chat/stream` 执行与推送解耦——后台消费者驱动 chatStream（任务级 AbortController），事件入缓冲，SSE 只做转发订阅者（断开不停执行）；断线闭环=任务收束自动落「后台任务结果」会话（task-<sessionId>，前端不在线数据不丢）；并发保护=进行中重连只回放+task_running；新增 `/chat/cancel`（显式取消）+ `/chat/task/status`（状态查询）+ shared 契约加 task_running 事件；缓冲 5min GC + lastTasks 上限 100。验证实例 8/8：断线后台完成落库配对 / 进行中重连回放 / cancel 收束 running=null | src/app.ts / packages/shared/src/index.ts |

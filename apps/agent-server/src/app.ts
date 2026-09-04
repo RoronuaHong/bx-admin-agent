@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import type { ChatEvent } from "@bx/shared";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { config, getCountry, listModels, listPublicCountries } from "./config.js";
@@ -174,6 +175,62 @@ export function createApp() {
     });
   });
 
+  // ---- P2 异步：任务注册表（执行与 SSE 推送解耦）----
+  // 旧行为：c.req.raw.signal（客户端断开）直接传进 chatStream → 刷新/断网即终止任务，
+  // 结果不落会话（刷新丢结果）。新行为：由「后台消费者」驱动 chatStream（不依赖客户端
+  // 连接），事件写入任务缓冲；SSE 连接只是缓冲的转发订阅者——断开仅停转发，任务照常
+  // 跑完并把结果落 session.messages（用户刷新后从会话历史恢复）。显式取消走 /chat/cancel。
+  interface RunningTask {
+    taskId: string;
+    ownerKey: string;
+    startedAt: number;
+    userText: string;
+    events: ChatEvent[];
+    settled: boolean;
+    controller: AbortController;
+  }
+  const runningTasks = new Map<string, RunningTask>(); // sessionId → 进行中任务
+  const lastTasks = new Map<string, RunningTask>(); // sessionId → 最近任务（含已完成，供状态查询/回放）
+  const TASK_BUFFER_TTL_MS = 5 * 60 * 1000;
+
+  // 任务收束后把结果落库：断线时前端不在线（无法走前端 upsert 通道），服务端把
+  // (userText, 最终答复) 追加到该会话的「后台任务结果」专用会话（id=task-<sessionId>，
+  // 与前端 conv_xxx 会话隔离），保证刷新/重连后数据不丢。title 为通用词，无业务语义。
+  async function persistTaskOutcome(session: { id: string }, ownerKey: string, countryId: string, loginName: string, userText: string, finalText: string): Promise<void> {
+    if (!finalText.trim()) return;
+    try {
+      const convId = `task-${session.id}`;
+      const existing = await getConversation(ownerKey, convId);
+      await upsertMessages({
+        ownerKey,
+        countryId,
+        loginName,
+        id: convId,
+        title: "后台任务结果",
+        messages: [
+          ...(existing?.messages || []),
+          { role: "user", text: userText },
+          { role: "assistant", text: finalText },
+        ],
+      });
+      console.log(`[chat/task] 结果已落库 ${convId}（累计 ${(existing?.messages.length || 0) + 2} 条）`);
+    } catch (e) {
+      console.warn("[chat/task] 结果落库失败（不影响任务收束）:", e instanceof Error ? e.message : e);
+    }
+  }
+
+  // 任务收束后延迟清缓冲（保留摘要字段供 status；防长文本事件长期占内存）
+  function scheduleTaskGc(sessionId: string, task: RunningTask): void {
+    setTimeout(() => {
+      if (lastTasks.get(sessionId) === task) task.events = [];
+    }, TASK_BUFFER_TTL_MS);
+    // lastTasks 上限保护：只保留最近 100 个会话的任务摘要
+    if (lastTasks.size > 100) {
+      const oldest = lastTasks.keys().next().value;
+      if (oldest !== undefined && !runningTasks.has(oldest)) lastTasks.delete(oldest);
+    }
+  }
+
   app.post("/chat/stream", async (c) => {
     try {
       const session = getSession(getCookie(c, COOKIE));
@@ -183,19 +240,120 @@ export function createApp() {
       if (!text) return c.json({ message: "请输入内容" }, 400);
       const pickIds = (list: unknown) =>
         Array.isArray(list) ? list.filter((id): id is string => typeof id === "string") : [];
+      const ownerKey = ownerKeyOf(session.user, session.country.id);
+
+      // 并发保护/断线重连：该会话已有任务在跑 → 仅回放缓冲 + 告知进行中，不开第二个任务
+      //（防两个并发任务同时写 session.messages 交错污染）
+      const existing = runningTasks.get(session.id);
+      if (existing && !existing.settled) {
+        return streamSse(async (send) => {
+          for (const ev of [...existing.events]) send(ev);
+          send({
+            type: "task_running",
+            taskId: existing.taskId,
+            startedAt: existing.startedAt,
+            note: "该会话已有任务在后台执行，本连接为进度回放；任务完成后结果自动落入会话历史",
+          });
+        });
+      }
+
+      // 新任务：后台消费 chatStream（任务级 AbortController，显式取消走 /chat/cancel）
+      const task: RunningTask = {
+        taskId: `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        ownerKey,
+        startedAt: Date.now(),
+        userText: text,
+        events: [],
+        settled: false,
+        controller: new AbortController(),
+      };
+      runningTasks.set(session.id, task);
+      lastTasks.set(session.id, task);
+      void (async () => {
+        try {
+          for await (const event of chatStream(
+            session,
+            text,
+            {
+              model: typeof body.model === "string" ? body.model : undefined,
+              images: pickIds(body.images),
+              files: pickIds(body.files),
+            },
+            task.controller.signal,
+          )) {
+            task.events.push(event);
+          }
+        } catch (error) {
+          console.error("[chat/task] 后台任务异常:", error);
+          task.events.push({
+            type: "error",
+            message: error instanceof Error ? error.message : "任务执行异常",
+            code: "TASK_FAILED",
+          });
+        } finally {
+          // 保险收束：chatStream 正常路径自带 done；异常路径（含取消）这里确保 done 必达
+          const last = task.events[task.events.length - 1];
+          if (!last || last.type !== "done") task.events.push({ type: "done" });
+          task.settled = true;
+          // 断线闭环：最终答复落「后台任务结果」会话（前端不在线也能在刷新后看到）
+          const finalText = [...task.events].reverse().find((e) => e.type === "text");
+          if (finalText && finalText.type === "text") {
+            await persistTaskOutcome(
+              session,
+              ownerKey,
+              session.country.id,
+              session.user?.loginName || "anon",
+              text,
+              finalText.text,
+            );
+          }
+          scheduleTaskGc(session.id, task);
+          console.log(`[chat/task] ${task.taskId} 收束（events=${task.events.length}，${Date.now() - task.startedAt}ms）`);
+        }
+      })();
+
+      // SSE 转发：先回放已产生的事件，再轮询追新直到任务收束。
+      // 客户端断开 → send 抛错 → 静默退出转发（后台任务不受影响）。
       return streamSse(async (send) => {
-        for await (const event of chatStream(session, text, {
-          model: typeof body.model === "string" ? body.model : undefined,
-          images: pickIds(body.images),
-          files: pickIds(body.files),
-        }, c.req.raw.signal)) {
-          send(event);
+        let sent = 0;
+        for (;;) {
+          while (sent < task.events.length) {
+            send(task.events[sent++]);
+          }
+          if (task.settled && sent >= task.events.length) break;
+          await new Promise((r) => setTimeout(r, 100));
         }
       });
     } catch (error) {
       console.error("[chat/stream] error:", error);
       return c.json({ message: error instanceof Error ? error.message : "请求失败" }, 500);
     }
+  });
+
+  // 显式取消进行中任务（对齐前端「停止」按钮语义；客户端断开不再等于取消）
+  app.post("/chat/cancel", (c) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const task = runningTasks.get(session.id);
+    if (!task || task.settled) return c.json({ ok: false, message: "当前没有进行中的任务" }, 404);
+    task.controller.abort();
+    return c.json({ ok: true, taskId: task.taskId });
+  });
+
+  // 任务状态查询（刷新后前端可据此展示「上一任务仍在后台执行」或最近一次结果）
+  app.get("/chat/task/status", (c) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const running = runningTasks.get(session.id);
+    const last = lastTasks.get(session.id);
+    return c.json({
+      running: running && !running.settled
+        ? { taskId: running.taskId, startedAt: running.startedAt, eventCount: running.events.length, userText: running.userText }
+        : null,
+      last: last
+        ? { taskId: last.taskId, settled: last.settled, startedAt: last.startedAt, userText: last.userText }
+        : null,
+    });
   });
 
   // 写操作确认回调：前端点"确认/取消"后调用此接口，唤醒 chatStream 里的 waitForConfirmation
