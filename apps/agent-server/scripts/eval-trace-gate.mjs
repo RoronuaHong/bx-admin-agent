@@ -22,7 +22,7 @@
  */
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getRun, latestRunId } from "../src/trace.ts";
+import { getRun, latestRunId, getRelease } from "../src/trace.ts";
 import { assertTraceGates, summarize } from "./eval-core.mjs";
 
 const BASE_URL = process.env.AGENT_BASE_URL || `http://localhost:${process.env.AGENT_PORT || "8787"}`;
@@ -146,10 +146,14 @@ async function main() {
 
 function finish(results, runId) {
   const sum = summarize(results);
+  // 版本标识（P3）：回归基线按版本可对比（RELEASE env / git 短 sha）
+  const spans = runId ? getRun(runId) : [];
+  const release = spans.find((s) => s.kind === "run")?.meta?.release || getRelease();
   const summary = {
     at: new Date().toISOString(),
     prompt: userText,
     runId: runId || null,
+    release,
     pass: sum.pass,
     total: sum.total,
     rate: sum.rate,

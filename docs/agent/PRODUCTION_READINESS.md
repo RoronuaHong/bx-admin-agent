@@ -17,8 +17,8 @@
 | **评测 Eval** | `eval-full-chain.mjs` 等脚本能跑全链路 PASS/FAIL + `process.exit(1)` | 🟡 雏形 | 未落库基线、未接 CI、断言维度浅（无 traces 复用） |
 | **成本 Cost** | **2026-09-04 P1 已落地**：`cost.ts` 聚合（日/模型/会话/慢调用）+ `inspect-cost.mjs` CLI + `GET /cost/summary` 只读端点 + 预算告警 | ✅ 已补 | 单价未配（只计 token）；告警未接通知渠道 |
 | **安全 Security** | **2026-09-04 P1 已落地**：`audit.ts` 审计落库（越权拒绝/写确认三态）+ `/audit/list` 端点 + `inspect-audit.mjs` CLI | 🟡→✅ 核心 | 限流、Prompt 注入防护仍缺 |
-| **版本 Version** | git 提交即版本 | 🟡 雏形 | 模型/提示词/工具无版本化与回滚机制 |
-| **可观测 Observ** | `trace.ts` span 树 + `console.log` 散点 | 🟡 部分 | 无结构化日志聚合、无 metrics |
+| **版本 Version** | **2026-09-04 P3 已落地**：release 标识（git sha）贯穿 trace run meta + eval 基线，回归按版本可对比 | ✅ 已补 | 提示词仍随代码发布（git revert 即回滚，够用） |
+| **可观测 Observ** | **2026-09-04 P3 已落地**：`GET /trace/runs`（摘要+统计）+ `/trace/run/:id`（span 树），ownerKey 隔离 | ✅ 已补 | 前端可视化页面挂账（端点已就绪） |
 
 ---
 
@@ -98,13 +98,19 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - 验证：模块回环 8/8（写入/倒序/kind 过滤/ownerKey 隔离/日期/limit）+ 端点匿名 401 / 登录态 200。
 - 仍缺：速率限制（防滥用/刷 token）、Prompt 注入防护闭环、审计事件告警推送。
 
-### 2.7 版本 Version 🟡
-- 已有：git 提交即代码版本。
-- 缺口：模型/提示词/工具 schema 无独立版本号；线上回滚只能 git revert，无法「只回退提示词不回退代码」。
+### 2.7 版本 Version ✅ P3 已落地（release 标识贯穿）
+- **release 标识（本次落地）**：`trace.ts getRelease()`——优先 `RELEASE` 环境变量（部署注入），否则 git 短 sha（进程内缓存一次），失败诚实 `unknown`。
+- **贯穿点**：①每个 run 的 span meta 落 `release`（真实请求已验证 `release: "b6b0dd7"`）；②eval 基线 summary 顶层加 `release` 字段——回归可按版本对比（哪个提交引入的退化一目了然）。
+- 设计取舍：提示词/工具随代码单仓发布，git revert 即整体回滚，够用；「只回退提示词不回退代码」的提示词外置化不做（prompt 引导按红线必须在代码内评审维护，外置反而失控）。
+- 遗留：无（版本可回滚=git 语义；版本可观测=release 贯穿）。
 
-### 2.8 可观测 Observability 🟡
-- 已有：trace span 树 + `console.log` 散点。
-- 缺口：无 metrics（QPS/时延分位/错误率）；无结构化日志聚合；多实例下 trace 文件需集中。
+### 2.8 可观测 Observ ✅ P3 已落地（trace 只读视图 + 统计）
+- **端点（本次落地，登录态 + ownerKey 隔离）**：
+  - `GET /trace/runs?limit=` ——最近 N 个 run 摘要（模型/轮次/token/耗时/ownerKey/release/userText）+ 统计（`{runs, llmCalls, tokens, avgRounds}`），实测 `avgRounds=1.2`；
+  - `GET /trace/run/:runId` ——完整 span 树；**归属校验**：非本人 run 一律 404（不泄漏存在性）；响应带当前 release。
+- **最小权限口径与 /cost/summary、/audit/list 一致**：HTTP 面只看自己，全局视角走 CLI（inspect-trace/inspect-cost/inspect-audit）。
+- 验证：own run 200（spans=6, release 正确）/ unknown run 404 / 匿名 401 / 旧 run（无 release 字段时代）诚实显示 undefined 不编造。
+- 遗留：Web 前端可视化页面（端点已就绪，前端接入即可）；进程级 metrics 暴露（Prometheus 格式，等接入需求）。
 
 ---
 
@@ -117,8 +123,8 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | **P1** | 成本 Cost | ✅ 已落地：`cost.ts` 聚合 + `inspect-cost.mjs` CLI + `GET /cost/summary` 端点 + 预算告警（env 阈值） | traces 已采集，只差聚合 |
 | **P2** | 身份 Identity | ✅ 已落地：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限（只看自己，全局走 CLI） | 多租户上线前必需 |
 | **P2** | 异步 Async | ✅ 已落地：执行与推送解耦（断线任务跑完+自动落库）/ 并发回放 / `/chat/cancel` / `/chat/task/status` | 刷新丢结果根因消除；chat.ts 零改动 |
-| **P3** | 版本 Version | 提示词/工具版本化与回滚 | 降低线上试错成本 |
-| **P3** | 可观测 | Web trace 可视化 + metrics | 体验增强 |
+| **P3** | 版本 Version | ✅ 已落地：release 标识（git sha/RELEASE env）贯穿 trace run meta + eval 基线，回归按版本对比 | 降低线上试错成本 |
+| **P3** | 可观测 | ✅ 已落地：`GET /trace/runs`（摘要+统计）+ `/trace/run/:id`（span 树），ownerKey 隔离 | Web 可视化直接接端点即可 |
 
 ---
 
@@ -136,3 +142,4 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 安全+评测 实例验证 | ✅ 真实实例验证：①写确认审计端到端 PASS（真实写意图 → confirmation_required → 自动拒绝零副作用 → 审计落 confirm_request+confirm_result=denied，owner=countryId:loginName、runId 关联 trace、/audit/list 可查）；②读场景回归发现免费链劣化窗口（nemotronultra 2 次 rounds=10 含 3 空响应轮、zenhy3 2 次短路 <1s）——非代码回归（diff 不涉 LLM 循环）；③**gate 盲区修复**：短路/幻觉直答不调工具能骗过 G1-G5，补 **G6 业务期望断言**（`expectTools`，默认关）+ 阈值环境变量（EVAL_MAX_ROUNDS/EVAL_MAX_TOKENS）+ adapter `--expect-tool`；core 单测 23/23，G6 实战拦截 zenhy3 短路（5/6 如实红） | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs |
 | 2026-09-04 | 身份 Identity | ✅ P2 落地：①溯源——`ownerKey`（countryId:loginName）chatStream 入口计算，贯穿 trace run span meta / 成本 `byOwner` 维度（+`inspect-cost.mjs --owner`）/ 审计（P1）/ 会话；②多项目 ACL——项目配置可选 `allowOwners`（未配置=开放），`set_project` 判定先于会话写入（拒绝零副作用）+ 未知项目诚实拒绝，`projectAccessibleBy` 纯函数；③最小权限——`/cost/summary` 与 `/audit/list` HTTP 面强制 ownerKey 过滤（只看自己），全局视角只走 CLI；顺手修 bySession/byOwner runs 计数恒 0 缺陷。验证：ACL 11 用例 + 真实 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200 + 最小权限不泄漏 | src/trace.ts / src/cost.ts / src/chat.ts / src/tools.ts / src/project-registry.ts / src/app.ts / scripts/inspect-cost.mjs |
 | 2026-09-04 | 异步 Async | ✅ P2 落地：`/chat/stream` 执行与推送解耦——后台消费者驱动 chatStream（任务级 AbortController），事件入缓冲，SSE 只做转发订阅者（断开不停执行）；断线闭环=任务收束自动落「后台任务结果」会话（task-<sessionId>，前端不在线数据不丢）；并发保护=进行中重连只回放+task_running；新增 `/chat/cancel`（显式取消）+ `/chat/task/status`（状态查询）+ shared 契约加 task_running 事件；缓冲 5min GC + lastTasks 上限 100。验证实例 8/8：断线后台完成落库配对 / 进行中重连回放 / cancel 收束 running=null | src/app.ts / packages/shared/src/index.ts |
+| 2026-09-04 | 版本+可观测 | ✅ P3 落地（八维度收官）：①版本——`trace.ts getRelease()`（RELEASE env > git 短 sha，进程内缓存），run span meta 落 release（实测 b6b0dd7）+ eval 基线顶层加 release 字段（回归按版本对比）；②可观测——`GET /trace/runs`（最近 N run 摘要+统计 avgRounds/tokens，实测 stats 正确）+ `GET /trace/run/:runId`（span 树，非本人 404 不泄漏存在性），ownerKey 隔离口径与 cost/audit 一致。验证：真实 run release 落盘 + 端点 own 200/unknown 404/anon 401 + 基线 release 字段 | src/trace.ts / src/app.ts / scripts/eval-trace-gate.mjs |

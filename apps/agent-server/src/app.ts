@@ -24,6 +24,7 @@ import { attachMcp } from "./mcp.js";
 import { attachA2a } from "./a2a.js";
 import { aggregateCost, budgetAlerts } from "./cost.js";
 import { listAuditEvents, type AuditEventKind } from "./audit.js";
+import { listRunSummaries, getRun, getRelease } from "./trace.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -354,6 +355,29 @@ export function createApp() {
         ? { taskId: last.taskId, settled: last.settled, startedAt: last.startedAt, userText: last.userText }
         : null,
     });
+  });
+
+  // ---- P3 可观测：trace 只读视图（登录态 + ownerKey 隔离，全局视角走 CLI）----
+  // 最近 N 个 run 摘要 + 统计（轮次/token/版本分布），供 Web 可视化/巡检接入
+  app.get("/trace/runs", (c) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const ownerKey = ownerKeyOf(session.user, session.country.id);
+    const limit = Math.min(Number(c.req.query("limit")) || 20, 50);
+    return c.json(listRunSummaries(limit, ownerKey));
+  });
+
+  // 单个 run 的完整 span 树；归属校验：非本人 run 一律 404（不泄漏存在性）
+  app.get("/trace/run/:runId", (c) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const ownerKey = ownerKeyOf(session.user, session.country.id);
+    const spans = getRun(c.req.param("runId"));
+    const runSpan = spans.find((s) => s.kind === "run");
+    if (!runSpan || (runSpan.meta?.ownerKey as string) !== ownerKey) {
+      return c.json({ message: "不存在" }, 404);
+    }
+    return c.json({ release: getRelease(), spans });
   });
 
   // 写操作确认回调：前端点"确认/取消"后调用此接口，唤醒 chatStream 里的 waitForConfirmation

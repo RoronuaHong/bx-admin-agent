@@ -13,6 +13,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 export type SpanKind = "run" | "llm" | "tool" | "route" | "render" | "guard" | "state";
 export type SpanStatus = "ok" | "error" | "reject" | "skip";
@@ -50,12 +51,40 @@ interface RunMeta {
   worker?: string;
   /** 操作者归属（countryId:loginName，P2 溯源；cost/audit 与 trace 关联靠它） */
   ownerKey?: string;
+  /** 版本标识（P3：RELEASE env / git 短 sha），run 落盘时随 meta 持久化 */
+  release?: string;
   startMs: number;
   endMs?: number;
 }
 
 const TRACE_DIR = join(process.cwd(), ".data", "traces");
 const runMetas = new Map<string, RunMeta>();
+
+/**
+ * 版本标识（P3 版本化）：每次请求的 run 记录「跑在哪个版本上」，
+ * 行为回归/成本波动可关联到具体提交，回滚有据可依。
+ * 取值优先级：RELEASE 环境变量（部署注入）> git 短 sha > "unknown"。
+ * 进程内缓存一次（sha 在进程生命周期内不变，避免每次请求 fork）。
+ */
+let releaseCache: string | null = null;
+export function getRelease(): string {
+  if (releaseCache) return releaseCache;
+  const env = process.env.RELEASE?.trim();
+  if (env) {
+    releaseCache = env;
+    return releaseCache;
+  }
+  try {
+    releaseCache = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      timeout: 5000,
+    }).trim();
+  } catch {
+    releaseCache = "unknown";
+  }
+  return releaseCache;
+}
 
 /** trace 落盘目录（供成本聚合等只读消费者遍历，避免各自重复拼路径）。 */
 export function getTraceDir(): string {
@@ -96,6 +125,7 @@ export function beginRun(meta: {
     model: meta.model,
     worker: meta.worker,
     ownerKey: meta.ownerKey,
+    release: getRelease(),
     startMs: Date.now(),
   });
   // 进程内当前 run 兜底（单并发调试 / 独立子 Agent 函数退路）；多并发必须显式透传
@@ -128,7 +158,7 @@ export function endRun(runId: string): void {
     startMs: meta.startMs,
     endMs,
     durationMs: endMs - meta.startMs,
-    meta: { sessionId: meta.sessionId, userText: meta.userText, ownerKey: meta.ownerKey },
+    meta: { sessionId: meta.sessionId, userText: meta.userText, ownerKey: meta.ownerKey, release: meta.release },
   });
 }
 
@@ -241,4 +271,67 @@ export function getRun(runId: string): TraceSpan[] {
 /** 返回最近一次请求的 runId（eval 脚本用于「刚跑完的请求」断言）。无数据返回 null。 */
 export function latestRunId(): string | null {
   return listRuns(1)[0]?.runId ?? null;
+}
+
+export interface RunSummary {
+  runId: string;
+  startedAt: string;
+  durationMs?: number;
+  model?: string;
+  userText?: string;
+  ownerKey?: string;
+  release?: string;
+  llmRounds: number;
+  toolCalls: number;
+  totalTokens: number;
+  error?: string;
+}
+
+/**
+ * 最近 N 个 run 的摘要 + 统计（P3 可观测：HTTP 面只读视图的数据源）。
+ * @param ownerKey 指定时只返回该操作者的 run（最小权限；旧数据无 ownerKey 被排除——不猜测归属）
+ */
+export function listRunSummaries(
+  limit = 20,
+  ownerKey?: string,
+): { runs: RunSummary[]; stats: { runs: number; llmCalls: number; tokens: number; avgRounds: number } } {
+  const cap = Math.max(limit, 1) + 30; // 多读一些文件以补偿 owner 过滤后的空缺
+  const out: RunSummary[] = [];
+  let llmCalls = 0;
+  let tokens = 0;
+  for (const { runId } of listRuns(cap)) {
+    const spans = getRun(runId);
+    const runSpan = spans.find((s) => s.kind === "run");
+    if (!runSpan) continue;
+    const runOwner = (runSpan.meta?.ownerKey as string) || "";
+    if (ownerKey && runOwner !== ownerKey) continue;
+    const llm = spans.filter((s) => s.kind === "llm");
+    const roundTokens = llm.reduce((a, s) => a + (s.usage?.totalTokens || 0), 0);
+    llmCalls += llm.length;
+    tokens += roundTokens;
+    const errSpan = spans.find((s) => s.status === "error");
+    out.push({
+      runId,
+      startedAt: new Date(runSpan.startMs).toISOString(),
+      durationMs: runSpan.durationMs,
+      model: runSpan.model,
+      userText: (runSpan.meta?.userText as string) || undefined,
+      ownerKey: runOwner || undefined,
+      release: (runSpan.meta?.release as string) || undefined,
+      llmRounds: llm.length,
+      toolCalls: spans.filter((s) => s.kind === "tool").length,
+      totalTokens: roundTokens,
+      error: errSpan?.error,
+    });
+    if (out.length >= limit) break;
+  }
+  return {
+    runs: out,
+    stats: {
+      runs: out.length,
+      llmCalls,
+      tokens,
+      avgRounds: out.length ? Number((llmCalls / out.length).toFixed(1)) : 0,
+    },
+  };
 }
