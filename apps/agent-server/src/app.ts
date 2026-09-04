@@ -21,6 +21,7 @@ import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 import { readDownloadBytes } from "./downloads.js";
 import { attachMcp } from "./mcp.js";
 import { attachA2a } from "./a2a.js";
+import { aggregateCost, budgetAlerts } from "./cost.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -300,6 +301,19 @@ export function createApp() {
     if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
     await clearConversation(ctx.ownerKey, c.req.param("id"));
     return c.json({ ok: true });
+  });
+
+  // 成本汇总（只读，登录即可查）：从 trace 落盘聚合 token/费用 + 预算告警
+  app.get("/cost/summary", (c) => {
+    const ctx = requireOwner(c);
+    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const report = aggregateCost({
+      fromDay: c.req.query("from") || undefined,
+      toDay: c.req.query("to") || undefined,
+      sessionId: c.req.query("session") || undefined,
+      slowestTopN: Number(c.req.query("top")) || 10,
+    });
+    return c.json({ report, alerts: budgetAlerts(report) });
   });
 
   app.post("/chat/upload", async (c) => {

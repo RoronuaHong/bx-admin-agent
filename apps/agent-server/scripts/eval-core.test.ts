@@ -80,14 +80,20 @@ assert(
   }).find((r) => r.name === "G2_reject_enforced")!.ok,
 );
 
-// ---- G3 伪调用 ----
+// ---- G3 伪调用（黑名单由调用方注入，core 不内置工具名）----
+const PSEUDO = ["submit", "submit_understood_intent"];
 assert(
   "G3 无伪调用 → pass",
-  assertTraceGates({ spans: baseSpans }).find((r) => r.name === "G3_no_pseudo_tool")!.ok,
+  assertTraceGates({ spans: baseSpans, pseudoToolNames: PSEUDO }).find((r) => r.name === "G3_no_pseudo_tool")!.ok,
 );
 assert(
-  "G3 出现 submit 伪调用 → fail",
-  !assertTraceGates({ spans: [...baseSpans, { kind: "tool", name: "submit", status: "ok" }] })
+  "G3 出现黑名单伪调用 → fail",
+  !assertTraceGates({ spans: [...baseSpans, { kind: "tool", name: "submit", status: "ok" }], pseudoToolNames: PSEUDO })
+    .find((r) => r.name === "G3_no_pseudo_tool")!.ok,
+);
+assert(
+  "G3 黑名单为空 → 不检测，恒 pass（保持通用，不内置工具名）",
+  assertTraceGates({ spans: [...baseSpans, { kind: "tool", name: "submit", status: "ok" }] })
     .find((r) => r.name === "G3_no_pseudo_tool")!.ok,
 );
 

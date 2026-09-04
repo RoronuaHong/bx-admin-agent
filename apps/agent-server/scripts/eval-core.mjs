@@ -12,7 +12,7 @@
  * 红线（任何 LLM Agent 通用）：
  *   G1 轮次不爆炸   llm span 数 ≤ maxLlmRounds
  *   G2 越权防护     （可选）出现 reject span 时结构正确；或该 Agent 强制要求至少出现一次
- *   G3 无伪调用     tool span 无 submit 这类伪调用名
+ *   G3 无伪调用     tool span 名不命中调用方注入的伪调用黑名单
  *   G4 成本阈值     totalTokens 合计 ≤ maxTotalTokens
  *   G5 请求收束     run span 存在且有 endMs
  */
@@ -27,10 +27,18 @@
  *        enforce = 该 Agent 必有越权场景，reject span 必须 >0 且结构正确
  *        observe = 有 reject 才校验结构（默认，通用安全 Agent 适用）
  *        off     = 不校验 G2（无越权防护机制的 Agent）
+ * @param {string[]} [opts.pseudoToolNames=[]] G3 伪调用黑名单（由调用方注入，
+ *        本模块不内置任何工具名以保持通用；传空数组则跳过 G3 检测）
  * @returns {Array<{name:string, ok:boolean, detail:string}>}
  */
 export function assertTraceGates(opts) {
-  const { spans, maxLlmRounds = 8, maxTotalTokens = 60000, rejectMode = "observe" } = opts || {};
+  const {
+    spans,
+    maxLlmRounds = 8,
+    maxTotalTokens = 60000,
+    rejectMode = "observe",
+    pseudoToolNames = [],
+  } = opts || {};
   const out = [];
 
   const runSpan = spans.find((s) => s.kind === "run");
@@ -75,9 +83,11 @@ export function assertTraceGates(opts) {
   }
   // off: 不产出 G2
 
-  // G3 无伪调用（通用：伪调用名是协议层概念 submit/call_api 写成文本才会出现，
-  // 正常函数调用通道里 tool span 名不会是 submit；此处用通用黑名单）
-  const pseudo = toolSpans.filter((s) => /^submit$/i.test(s.name));
+  // G3 无伪调用：调用方通过 pseudoToolNames 传入「不该以 tool span 出现的名字」，
+  // 本模块不内置任何工具名（避免写死契约词，保持通用）。
+  const pseudo = pseudoToolNames.length
+    ? toolSpans.filter((s) => pseudoToolNames.some((n) => new RegExp(`^${n}$`, "i").test(s.name)))
+    : [];
   out.push({
     name: "G3_no_pseudo_tool",
     ok: pseudo.length === 0,

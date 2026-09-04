@@ -55,6 +55,11 @@ interface RunMeta {
 const TRACE_DIR = join(process.cwd(), ".data", "traces");
 const runMetas = new Map<string, RunMeta>();
 
+/** trace 落盘目录（供成本聚合等只读消费者遍历，避免各自重复拼路径）。 */
+export function getTraceDir(): string {
+  return TRACE_DIR;
+}
+
 /**
  * 进程内「当前 runId」兜底（单并发调试用）。
  *
