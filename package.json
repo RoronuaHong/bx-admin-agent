@@ -7,6 +7,10 @@
     "dev:server": "pnpm --filter @bx/agent-server dev",
     "dev:web": "pnpm --filter @bx/web dev",
     "test": "pnpm --filter @bx/agent-server test",
+    "eval": "pnpm --filter @bx/agent-server eval",
+    "eval:core": "pnpm --filter @bx/agent-server eval:core",
+    "eval:full": "pnpm --filter @bx/agent-server eval:full",
+    "eval:trace-gate": "pnpm --filter @bx/agent-server eval:trace-gate",
     "build": "pnpm --filter @bx/web build"
   }
 }

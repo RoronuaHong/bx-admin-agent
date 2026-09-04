@@ -15,7 +15,12 @@
     "eval-clarification-gate": "tsx scripts/eval-clarification-gate.mjs",
     "eval-enterprise-regression": "tsx scripts/eval-enterprise-regression.mjs",
     "eval-full-chain": "tsx scripts/eval-full-chain.mjs",
-    "eval-e2e-chat": "tsx scripts/eval-e2e-chat.mjs"
+    "eval-e2e-chat": "tsx scripts/eval-e2e-chat.mjs",
+    "test": "tsx scripts/eval-core.test.ts",
+    "eval:core": "tsx scripts/eval-core.test.ts",
+    "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
+    "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",
+    "eval": "tsx scripts/eval-core.test.ts"
   },
   "dependencies": {
     "@bx/shared": "workspace:*",

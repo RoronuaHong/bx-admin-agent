@@ -42,13 +42,28 @@
 - 查询：`scripts/inspect-trace.mjs --last` / `<runId>`。
 - 缺口：仅 CLI 查询；无 Web 可视化、无慢调用/错误率告警。
 
-### 2.4 评测 Eval 🟡 → P0 升级中
-- 已有脚本：`eval-full-chain.mjs`（模块/操作识别 + call_api 路径 + orchestrate 链式）、`eval-intent-routing.mjs`、`eval-understand-then-rules.mjs`、`test-regression.mjs`。
-- 已有能力：单测断言 + 汇总 PASS/FAIL% + `process.exit(1)`。
-- 缺口（本次重点）：
-  - **未落库基线**：每次跑完无基线比对，回归靠人眼。
-  - **未接 CI**：无提交/合并闸门。
-  - **断言维度浅**：只到「模块/操作识别正确」，未复用 traces 断言「轮次不爆炸 / 越权被正确拒绝 / token 成本不超阈值 / 无伪调用」。
+### 2.4 评测 Eval ✅ P0 已落地（分层 + CI 闸门）
+
+**分层入口（`apps/agent-server/package.json`）**：
+
+| 命令 | 依赖 | 跑什么 | 适用 |
+|---|---|---|---|
+| `pnpm eval` / `eval:core` / `pnpm test` | **零依赖** | `eval-core.test.ts`（17 用例，测红线断言逻辑本身） | **CI 必跑**、任何环境 |
+| `pnpm eval:full` | 本地业务源码（CODEBASE_ROOT） | `eval-full-chain` + core | 本地 |
+| `pnpm eval:trace-gate` | agent-server 在线(8787) + 模型凭证 | 真实 chat + trace 红线 (G1-G5) + 基线落库 | 本地 / 定时 |
+
+**通用化**：红线断言已抽为 `scripts/eval-core.mjs`（`assertTraceGates` / `summarize` 纯函数，零 import，
+不认识任何业务词/worker/cookie）。业务项目只写适配器（怎么触发请求），红线零改动。
+G2 越权断言三态：`enforce`（必有越权拒绝）/ `observe`（有才校验）/ `off`（无越权机制的 Agent 关闭）。
+
+**CI 闸门**：`.github/workflows/eval.yml`（push main / PR 触发）只跑 `pnpm eval:core`。
+其余两层 CI runner 不具备条件（无业务源码 / 无 `.env` / 无 8787 服务），强行跑只会假红，故不进 CI。
+
+**⚠️ 评测发现的真实问题（评测价值的体现）**：
+`eval-intent-routing.mjs` 实测 **0/6 FAIL** —— 该脚本用中文业务词硬编码
+（「二级分类详情」「关闭搜索栏」）去查 `api-operation-index`，①索引无中文 key 故恒 null；
+②业务词写死违反 AGENT_CHARTER「禁止写死」红线。状态：**已失效 + 违规，不纳入任何闸门**，
+保留文件仅供追溯。教训：评测资产本身也需被评测，否则会积累「永远红但没人管」的死脚本。
 
 ### 2.5 成本 Cost 🟡
 - 采集：`trace.ts` 的 `llm` span 已捕获 `usage`（promptTokens/completionTokens/totalTokens）。
@@ -72,7 +87,7 @@
 
 | 优先级 | 维度 | 动作 | 理由 |
 |---|---|---|---|
-| **P0** | 评测 Eval | ✅ 已落地：`eval-trace-gate.mjs`（真实 chat + trace 红线断言 + 基线落库） | 复用刚建的 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
+| **P0** | 评测 Eval | ✅ 完整落地：通用 `eval-core` + `eval-trace-gate` + 分层入口（`pnpm eval`/`eval:full`/`eval:trace-gate`）+ CI 闸门 `.github/workflows/eval.yml` | 复用 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
 | **P1** | 安全审计 | 越权/写操作事件落审计库（复用 trace 落盘通道） | 上线必备合规；当前只进 trace 不进审计 |
 | **P1** | 成本 Cost | token 按会话/日聚合 + 超阈值告警 | traces 已采集，只差聚合 |
 | **P2** | 身份 Identity | 调用方溯源 + 多项目 ACL | 多租户上线前必需 |
@@ -89,3 +104,4 @@
 | 2026-09-03 | 追踪 Tracing | ✅ 建 `trace.ts` + `inspect-trace.mjs`：runId 贯穿 + llm/route/tool span + token usage；JSONL 落盘 `.data/traces/` | src/trace.ts / src/chat.ts / src/models.ts / scripts/inspect-trace.mjs |
 | 2026-09-03 | 评估 | 建立本文档（八维度现状 + 优先级） | PRODUCTION_READINESS.md |
 | 2026-09-03 | 评测 Eval | ✅ P0 落地：`eval-trace-gate.mjs` 跑真实 chat + 读 trace 断言 5 条生产红线（轮次/越权/伪调用/成本/收束）+ 基线落库 `.data/eval-baseline/`；`trace.ts` 加 `latestRunId()` | scripts/eval-trace-gate.mjs / src/trace.ts |
+| 2026-09-04 | 评测 Eval | ✅ 通用化 + 分层 + CI：抽 `eval-core.mjs`（纯函数零 import，G2 三态）；`eval-core.test.ts` 17 用例全 PASS 作零依赖地基；`package.json` 加 `eval`/`eval:core`/`eval:full`/`eval:trace-gate`/`test`；根 package.json 转发；**CI 闸门 `.github/workflows/eval.yml`**（push main/PR 只跑零依赖 core，其余层 CI 无条件）；发现 `eval-intent-routing.mjs` 0/6 失效+违规（业务词硬编码），排除出闸门 | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs / package.json / .github/workflows/eval.yml |
