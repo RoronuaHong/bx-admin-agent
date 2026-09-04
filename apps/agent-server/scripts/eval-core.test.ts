@@ -114,6 +114,32 @@ assert(
   }).find((r) => r.name === "G4_token_budget_le")!.ok,
 );
 
+// ---- G6 业务期望（防短路/幻觉直答不调工具却正常收束）----
+const noToolSpans = [
+  { kind: "run", name: "chat.run", endMs: 1700000000000, durationMs: 900, model: "m" },
+  { kind: "llm", name: "m", usage: { totalTokens: 100 } },
+];
+assert(
+  "G6 期望工具已调用 → pass",
+  assertTraceGates({ spans: baseSpans, expectTools: ["call_api"] }).find((r) => r.name === "G6_expect_tool_called")!.ok,
+);
+assert(
+  "G6 短路收束（无任何 tool span）→ fail",
+  !assertTraceGates({ spans: noToolSpans, expectTools: ["call_api"] }).find((r) => r.name === "G6_expect_tool_called")!.ok,
+);
+assert(
+  "G6 期望列表任一命中 → pass",
+  assertTraceGates({ spans: baseSpans, expectTools: ["tool_a", "call_api"] }).find((r) => r.name === "G6_expect_tool_called")!.ok,
+);
+assert(
+  "G6 期望全未命中 → fail",
+  !assertTraceGates({ spans: baseSpans, expectTools: ["tool_a", "tool_b"] }).find((r) => r.name === "G6_expect_tool_called")!.ok,
+);
+assert(
+  "G6 无期望（空数组）→ 不产出 G6（默认关）",
+  !assertTraceGates({ spans: noToolSpans }).some((r) => r.name === "G6_expect_tool_called"),
+);
+
 // ---- summarize ----
 const allPass = assertTraceGates({ spans: baseSpans });
 const s = summarize(allPass);

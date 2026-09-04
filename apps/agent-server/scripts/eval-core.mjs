@@ -15,6 +15,8 @@
  *   G3 无伪调用     tool span 名不命中调用方注入的伪调用黑名单
  *   G4 成本阈值     totalTokens 合计 ≤ maxTotalTokens
  *   G5 请求收束     run span 存在且有 endMs
+ *   G6 业务期望     （可选）场景期望的工具调用确实发生（防「模型短路/幻觉直答
+ *                   不调工具却正常收束」骗过 G1-G5；expectTools 为空则不检测）
  */
 
 /**
@@ -29,6 +31,8 @@
  *        off     = 不校验 G2（无越权防护机制的 Agent）
  * @param {string[]} [opts.pseudoToolNames=[]] G3 伪调用黑名单（由调用方注入，
  *        本模块不内置任何工具名以保持通用；传空数组则跳过 G3 检测）
+ * @param {string[]} [opts.expectTools=[]] G6 业务期望：场景必须发生这些工具调用
+ *        （任一命中即过；防模型短路/幻觉直答不调工具却正常收束；空数组=不检测）
  * @returns {Array<{name:string, ok:boolean, detail:string}>}
  */
 export function assertTraceGates(opts) {
@@ -38,6 +42,7 @@ export function assertTraceGates(opts) {
     maxTotalTokens = 60000,
     rejectMode = "observe",
     pseudoToolNames = [],
+    expectTools = [],
   } = opts || {};
   const out = [];
 
@@ -101,6 +106,17 @@ export function assertTraceGates(opts) {
     ok: totalTokens <= maxTotalTokens,
     detail: `tokens=${totalTokens} ≤ ${maxTotalTokens}`,
   });
+
+  // G6 业务期望：场景期望的工具调用确实发生（防「收束了但没干活」——模型短路或
+  // 幻觉直答不调工具时，G1-G5 全部照样通过，只有这里能拦住）。任一期望命中即过。
+  if (expectTools.length) {
+    const hit = expectTools.find((n) => toolSpans.some((s) => new RegExp(`^${n}$`, "i").test(s.name)));
+    out.push({
+      name: "G6_expect_tool_called",
+      ok: !!hit,
+      detail: hit ? `hit=${hit}` : `none of [${expectTools.join(",")}] called（疑似短路/幻觉直答）`,
+    });
+  }
 
   return out;
 }

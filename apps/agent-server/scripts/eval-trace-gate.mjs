@@ -14,11 +14,13 @@
  * 所有环境相关值一律由环境变量或 --prompt-file 提供，缺失即报错，不猜测、不兜底。
  *
  * 用法（tsx 解析 .ts 模块）：
- *   npx tsx scripts/eval-trace-gate.mjs --prompt-file <file>
+ *   npx tsx scripts/eval-trace-gate.mjs --prompt-file <file> [--expect-tool call_api]
  *   EVAL_COUNTRY=xx EVAL_USER=xx EVAL_PASS=xx npx tsx scripts/eval-trace-gate.mjs --prompt "…"
- * 环境变量：AGENT_BASE_URL（默认 http://localhost:8787）、EVAL_COUNTRY、EVAL_USER、EVAL_PASS（后三者必填）
+ * 环境变量：AGENT_BASE_URL（默认 http://localhost:8787）、EVAL_COUNTRY、EVAL_USER、EVAL_PASS（后三者必填）、
+ *   EVAL_MODEL（默认 auto）、EVAL_PSEUDO_TOOLS（G3 黑名单）、EVAL_EXPECT_TOOLS（G6 期望工具）、
+ *   EVAL_MAX_ROUNDS / EVAL_MAX_TOKENS（G1/G4 阈值校准）
  */
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getRun, latestRunId } from "../src/trace.ts";
 import { assertTraceGates, summarize } from "./eval-core.mjs";
@@ -31,10 +33,11 @@ const promptIdx = args.indexOf("--prompt");
 const pfIdx = args.indexOf("--prompt-file");
 let userText = "";
 try {
-  if (pfIdx >= 0) userText = require("node:fs").readFileSync(args[pfIdx + 1], "utf8").trim();
+  if (pfIdx >= 0) userText = readFileSync(args[pfIdx + 1], "utf8").trim();
   else if (promptIdx >= 0) userText = args[promptIdx + 1];
-} catch {
-  /* 交由下方校验报错 */
+} catch (e) {
+  // 读取失败不静默：明确提示（避免空 prompt 走到下方校验时丢失根因）
+  console.error(`[gate] --prompt-file 读取失败: ${e instanceof Error ? e.message : e}`);
 }
 
 // ---- bx-admin-agent 特化：登录拿 cookie（凭证必填，禁止默认值）----
@@ -119,12 +122,22 @@ async function main() {
 
   const spans = getRun(runId);
   // 红线断言全部来自 eval-core（通用）；rejectMode=observe 适配本 Agent 的越权防护。
-  // 伪调用黑名单由环境变量注入（EVAL_PSEUDO_TOOLS，逗号分隔），本文件不写死任何工具名。
-  const pseudoToolNames = (process.env.EVAL_PSEUDO_TOOLS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const results = assertTraceGates({ spans, rejectMode: "observe", pseudoToolNames });
+  // 伪调用黑名单（EVAL_PSEUDO_TOOLS）、期望工具（--expect-tool / EVAL_EXPECT_TOOLS）、
+  // 阈值（EVAL_MAX_ROUNDS / EVAL_MAX_TOKENS）全部由环境/参数注入，本文件不写死任何工具名。
+  const csv = (v) => String(v || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const pseudoToolNames = csv(process.env.EVAL_PSEUDO_TOOLS);
+  const expectToolIdx = args.indexOf("--expect-tool");
+  const expectTools = expectToolIdx >= 0 ? csv(args[expectToolIdx + 1]) : csv(process.env.EVAL_EXPECT_TOOLS);
+  const maxLlmRounds = Number(process.env.EVAL_MAX_ROUNDS) || undefined;
+  const maxTotalTokens = Number(process.env.EVAL_MAX_TOKENS) || undefined;
+  const results = assertTraceGates({
+    spans,
+    rejectMode: "observe",
+    pseudoToolNames,
+    expectTools,
+    ...(maxLlmRounds ? { maxLlmRounds } : {}),
+    ...(maxTotalTokens ? { maxTotalTokens } : {}),
+  });
   for (const r of results) {
     console.log(`${r.ok ? "PASS" : "FAIL"} | [gate] ${r.name}${r.detail ? ` | ${r.detail}` : ""}`);
   }

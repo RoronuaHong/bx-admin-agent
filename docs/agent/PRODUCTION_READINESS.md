@@ -55,6 +55,15 @@
 **通用化**：红线断言已抽为 `scripts/eval-core.mjs`（`assertTraceGates` / `summarize` 纯函数，零 import，
 不认识任何业务词/worker/cookie）。业务项目只写适配器（怎么触发请求），红线零改动。
 G2 越权断言三态：`enforce`（必有越权拒绝）/ `observe`（有才校验）/ `off`（无越权机制的 Agent 关闭）。
+**G6 业务期望**（2026-09-04 实测补缺）：`expectTools`（adapter 传 `--expect-tool` / `EVAL_EXPECT_TOOLS`）——
+场景期望的工具调用必须真的发生。背景：实测发现 zen 免费链**短路收束**（<1s、0 token、不调工具）能骗过
+G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」），G6 专拦「收束了但没干活」。
+阈值校准：`EVAL_MAX_ROUNDS` / `EVAL_MAX_TOKENS` 环境变量（G1/G4 默认 8 轮 / 60k token）。
+
+**真实波动基线（2026-09-04 实测记录）**：免费链上游存在劣化窗口——同一 prompt（读场景）
+健康时段 rounds=3/tokens≈27k/152s；劣化窗口 nemotronultra 连续 2 次 rounds=10（其中 3 轮
+空响应轮，单轮 LLM 30-212s，无 429 日志）、zenhy3 连续 2 次短路（<1s 收束）。
+劣化期 G1/G4/G6 如实红——这是闸门诚实，不是误报；复跑或换模型窗口即可恢复。
 
 **CI 闸门**：`.github/workflows/eval.yml`（push main / PR 触发）只跑 `pnpm eval:core`。
 其余两层 CI runner 不具备条件（无业务源码 / 无 `.env` / 无 8787 服务），强行跑只会假红，故不进 CI。
@@ -117,3 +126,4 @@ G2 越权断言三态：`enforce`（必有越权拒绝）/ `observe`（有才校
 | 2026-09-04 | 评测 Eval（去硬编码） | ✅ 适配器零硬编码：登录凭证（EVAL_COUNTRY/EVAL_USER/EVAL_PASS）**必填无默认**、prompt **必填无默认业务词**、端点走 `AGENT_BASE_URL`、模型走 `EVAL_MODEL`、G3 伪调用黑名单改 `eval-core` 参数注入（`EVAL_PSEUDO_TOOLS`，core 零内置工具名）；core 单测 18/18（新增空黑名单不检测用例） | eval-trace-gate.mjs / eval-core.mjs / eval-core.test.ts |
 | 2026-09-04 | 成本 Cost | ✅ P1 落地：`cost.ts`（日/模型/会话/慢调用聚合 + `budgetAlerts`，零业务词零依赖）+ `inspect-cost.mjs` CLI + `GET /cost/summary` 只读端点（requireOwner）；`trace.ts` 导出 `getTraceDir()`；实测真实 trace 4 runs/12 llm/79463 tokens 聚合正确；单价/预算全走环境变量（COST_RATE_*/DAILY_TOKEN_BUDGET/RUN_TOKEN_BUDGET，未配价诚实只计 token） | src/cost.ts / src/app.ts / src/trace.ts / scripts/inspect-cost.mjs |
 | 2026-09-04 | 安全 Security | ✅ P1 审计落地：`audit.ts`（reject/confirm_request/confirm_result 三类事件，append-only 按月 JSONL，runId 关联 trace，零业务词零依赖）+ `chat.ts` 四处接线（tool 节点越权拒绝 + 三处写确认，确认结论三态 granted/denied/timeout——`waitForConfirmation` 改返回 `{confirmed, outcome}`）+ `GET /audit/list`（ownerKey 隔离最小权限）+ `inspect-audit.mjs` CLI；验证：模块回环 8/8 + 端点匿名 401/登录态 200 | src/audit.ts / src/chat.ts / src/app.ts / scripts/inspect-audit.mjs |
+| 2026-09-04 | 安全+评测 实例验证 | ✅ 真实实例验证：①写确认审计端到端 PASS（真实写意图 → confirmation_required → 自动拒绝零副作用 → 审计落 confirm_request+confirm_result=denied，owner=countryId:loginName、runId 关联 trace、/audit/list 可查）；②读场景回归发现免费链劣化窗口（nemotronultra 2 次 rounds=10 含 3 空响应轮、zenhy3 2 次短路 <1s）——非代码回归（diff 不涉 LLM 循环）；③**gate 盲区修复**：短路/幻觉直答不调工具能骗过 G1-G5，补 **G6 业务期望断言**（`expectTools`，默认关）+ 阈值环境变量（EVAL_MAX_ROUNDS/EVAL_MAX_TOKENS）+ adapter `--expect-tool`；core 单测 23/23，G6 实战拦截 zenhy3 短路（5/6 如实红） | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs |
