@@ -22,6 +22,7 @@ import { readDownloadBytes } from "./downloads.js";
 import { attachMcp } from "./mcp.js";
 import { attachA2a } from "./a2a.js";
 import { aggregateCost, budgetAlerts } from "./cost.js";
+import { listAuditEvents, type AuditEventKind } from "./audit.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -314,6 +315,21 @@ export function createApp() {
       slowestTopN: Number(c.req.query("top")) || 10,
     });
     return c.json({ report, alerts: budgetAlerts(report) });
+  });
+
+  // 安全审计（只读）：越权拒绝 / 写确认事件。最小权限口径——登录用户只能查
+  // 自己（ownerKey）的审计事件；全局视角走服务端 CLI（inspect-audit.mjs）。
+  app.get("/audit/list", (c) => {
+    const ctx = requireOwner(c);
+    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    const events = listAuditEvents({
+      fromDay: c.req.query("from") || undefined,
+      toDay: c.req.query("to") || undefined,
+      kind: (c.req.query("kind") as AuditEventKind) || undefined,
+      ownerKey: ctx.ownerKey,
+      limit: Number(c.req.query("limit")) || 200,
+    });
+    return c.json({ events });
   });
 
   app.post("/chat/upload", async (c) => {

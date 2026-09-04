@@ -15,6 +15,8 @@ import { getModel as legacyModel } from "./legacy.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { getRouterPolicy } from "./router-policy.js";
 import { getClarificationPolicy } from "./clarification-policy.js";
+import { ownerKeyOf } from "./conversations.js";
+import { auditEvent } from "./audit.js";
 
 import { resolveApiOperation, resolveApiOperationByPath, resolveApiOperationByPathSuffix } from "./api-operation-index.js";
 import { guardCallApi, type CallApiGuardInput } from "./call-api-guard.js";
@@ -1241,6 +1243,8 @@ export async function* chatStream(
 ): AsyncGenerator<ChatEvent> {
   // M0 traces：开一次请求的追踪上下文（runId 贯穿各节点 span）
   const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model });
+  // P1 安全审计：操作者归属（国家线 + 登录名），贯穿本请求所有审计事件
+  const ownerKey = ownerKeyOf(session.user, session.country.id);
   if (session.pendingClarification) {
     // 仅问 project 的待澄清：本部署已默认绑定影视后台，直接丢弃，按新消息走主流程
     if (
@@ -1450,14 +1454,18 @@ export async function* chatStream(
   // 改为 graph 完成后从模型提交的 understood.operationType==="write" 计算（模型信号驱动）。
   // 主 fallback 与 catch 兜底都必须先经用户确认再执行（安全红线），writeForce 仅在该处按需计算。
 
-  function waitForConfirmation(_sessionId: string, callId: string, timeoutMs: number): Promise<boolean> {
+  type ConfirmWait = { confirmed: boolean; outcome: "granted" | "denied" | "timeout" };
+  function waitForConfirmation(_sessionId: string, callId: string, timeoutMs: number): Promise<ConfirmWait> {
+    let timedOut = false;
     return new Promise((resolve) => {
-      registerConfirmWaiter(session.id, callId, resolve);
+      registerConfirmWaiter(session.id, callId, (v) =>
+        // outcome 三态：granted / denied / timeout（超时先到则兜底判定为 timeout，供审计区分）
+        resolve({ confirmed: v, outcome: v ? "granted" : timedOut ? "timeout" : "denied" }),
+      );
       setTimeout(() => {
-        // 超时时尝试清理并 resolve false
-        if (resolveConfirmWaiter(session.id, callId, false)) {
-          // already resolved by registry
-        }
+        // 超时时尝试清理并 resolve false（若用户已先应答，resolveConfirmWaiter 返回 false，不影响已定结论）
+        timedOut = true;
+        resolveConfirmWaiter(session.id, callId, false);
       }, timeoutMs);
     });
   }
@@ -1883,6 +1891,16 @@ export async function* chatStream(
             nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: reject });
             toolStatus = "reject";
             toolNote = "worker whitelist violation";
+            // P1 安全审计：越权拒绝独立留痕（runId 可回 trace 反查完整上下文）
+            auditEvent({
+              kind: "reject",
+              sessionId: session.id,
+              runId: state.traceRunId,
+              ownerKey,
+              tool: call.name,
+              worker: activeWorkerId ?? undefined,
+              detail: "worker whitelist violation",
+            });
             continue;
           }
           emitEvent({ type: "tool_call", name: call.name, input: call.input });
@@ -2006,8 +2024,28 @@ export async function* chatStream(
               description: desc,
               impact: codeImpact || buildConfirmationImpact(userText, call.input, method),
             });
-            const confirmed = await confirmPromise;
-            if (!confirmed) {
+            // P1 安全审计：确认请求与结论三态（granted/denied/timeout）留痕
+            auditEvent({
+              kind: "confirm_request",
+              sessionId: session.id,
+              runId: state.traceRunId,
+              ownerKey,
+              tool: call.name,
+              callId,
+              method: call.name === CALL_API_TOOL ? String(call.input.method || "GET").toUpperCase() : undefined,
+              detail: desc,
+            });
+            const confirmOutcome = await confirmPromise;
+            auditEvent({
+              kind: "confirm_result",
+              sessionId: session.id,
+              runId: state.traceRunId,
+              ownerKey,
+              tool: call.name,
+              callId,
+              result: confirmOutcome.outcome,
+            });
+            if (!confirmOutcome.confirmed) {
               content = "用户取消了该操作，未执行。";
             } else {
               content = await runAgentTool(call.name, call.input, toolOpts);
@@ -2693,7 +2731,28 @@ export async function* chatStream(
               description: userText,
               impact: buildConfirmationImpact(userText, {}, "POST"),
             };
-            confirmed = await confirmPromise;
+            // P1 安全审计：服务端兜底路径的写确认同样留痕
+            auditEvent({
+              kind: "confirm_request",
+              sessionId: session.id,
+              runId,
+              ownerKey,
+              tool: CALL_API_TOOL,
+              callId: confirmCallId,
+              method: "POST",
+              detail: userText,
+            });
+            const confirmOutcome = await confirmPromise;
+            auditEvent({
+              kind: "confirm_result",
+              sessionId: session.id,
+              runId,
+              ownerKey,
+              tool: CALL_API_TOOL,
+              callId: confirmCallId,
+              result: confirmOutcome.outcome,
+            });
+            confirmed = confirmOutcome.confirmed;
           }
           if (!confirmed) {
             text = "你取消了该操作，未执行。";
@@ -2773,7 +2832,28 @@ export async function* chatStream(
             description: userText,
             impact: buildConfirmationImpact(userText, {}, "POST"),
           };
-          confirmed = await confirmPromise;
+          // P1 安全审计：catch 兜底路径的写确认同样留痕
+          auditEvent({
+            kind: "confirm_request",
+            sessionId: session.id,
+            runId,
+            ownerKey,
+            tool: CALL_API_TOOL,
+            callId: confirmCallId,
+            method: "POST",
+            detail: userText,
+          });
+          const confirmOutcome = await confirmPromise;
+          auditEvent({
+            kind: "confirm_result",
+            sessionId: session.id,
+            runId,
+            ownerKey,
+            tool: CALL_API_TOOL,
+            callId: confirmCallId,
+            result: confirmOutcome.outcome,
+          });
+          confirmed = confirmOutcome.confirmed;
         }
         if (!confirmed) {
           session.messages.push({ role: "assistant", text: "你取消了该操作，未执行。" });
