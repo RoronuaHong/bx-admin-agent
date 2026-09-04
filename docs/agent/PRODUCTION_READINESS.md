@@ -150,6 +150,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | G4 预算自适应 | ✅ §5.2 落地：`resolveTokenBudget` 默认 `8000+16000×rounds`；显式 `maxTotalTokens`/`EVAL_MAX_TOKENS` 固定覆盖；core 单测覆盖健康多轮放行/单轮爆量拦截/固定优先 | scripts/eval-core.mjs / eval-core.test.ts |
 | 2026-09-04 | 空轮劣化信号 | ✅ §5.3 落地：`listRunSummaries` stats 增 `emptyRounds/emptyRetries/emptyRoundRate/shortCircuitRuns/degradeHint`；run 摘要带 per-run 空轮计数；阈值/备选模型走 env | src/trace.ts / scripts/trace-empty-stats.test.ts |
 | 2026-09-04 | Trace 前端可视化 | ✅ §5.4 落地：`apps/web` 新增 `/trace` 调用观察页（stats 条 + run 表 + span 树），Chat 顶栏入口，API `fetchTraceRuns`/`fetchTraceRun` | TracePage.vue / api.ts / router.ts |
+| 2026-09-04 | 定位空转熔断 | ✅ 读链路：定位≤1、探索合计（含 read）≤2 超额 skip；错 path（如 `/v0.1/user/getList`）猜 `module.func`；不提前 final→编排（编排 call_api 无 trace span 会红 G6）。实例 read **3/3** | src/chat.ts / api-operation-index.ts / tools.ts |
 
 ---
 

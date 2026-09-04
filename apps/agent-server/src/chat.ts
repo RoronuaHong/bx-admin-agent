@@ -71,6 +71,57 @@ const EXPLORE_TOOLS = new Set([
   "fetch_url",
   "get_current_time",
 ]);
+/**
+ * 模块定位检索类（未取数前反复调用会空转烧轮次）。
+ * 读链路复测：search×2–3 + read×2 后才 call_api → rounds=9–10 触发 G1。
+ * read_api_module 计入「取数前探索」总预算（见 PRE_CALL_EXPLORE_TOOLS），但不计入本集合。
+ */
+const LOCATE_TOOLS = new Set(["search_api_module", "grep_codebase", "list_dir"]);
+/** 取数前探索（定位 + 读定义）；理想路径 search→read 恰好 2 次后必须 call_api */
+const PRE_CALL_EXPLORE_TOOLS = new Set([...LOCATE_TOOLS, "read_api_module"]);
+/** 自上次成功 call_api 起，允许实际执行的定位检索次数（收紧：1 次足够出候选） */
+const MAX_LOCATE_BEFORE_CALL_API = 1;
+/** 自上次成功 call_api 起，允许的取数前探索总次数（search+read 合计） */
+const MAX_PRE_CALL_EXPLORE = 2;
+
+/**
+ * 统计「上次成功 call_api 之后」已实际执行的指定探索工具次数。
+ * 只认 toolResult（避免本轮刚 push 的 toolCalls 虚增计数）；
+ * 被 explore-cap 拦截的回执（`[workflow/locate]`）不计入。
+ */
+function countExploreToolsSinceLastCallApi(steps: AgentStep[], toolSet: Set<string>): number {
+  const idToName = new Map<string, string>();
+  for (const s of steps) {
+    if (s.kind === "toolCalls") for (const c of s.calls) idToName.set(c.id, c.name);
+  }
+  let n = 0;
+  for (const s of steps) {
+    if (s.kind !== "toolResult") continue;
+    const name = idToName.get(s.toolCallId);
+    if (!name) continue;
+    if (name === CALL_API_TOOL) {
+      const c = s.content || "";
+      if (
+        c &&
+        !c.startsWith("错误：") &&
+        !c.startsWith("MODULE_RETRY") &&
+        !c.startsWith("CLARIFICATION_REQUIRED") &&
+        !c.startsWith("[workflow/")
+      ) {
+        n = 0;
+      }
+      continue;
+    }
+    if (toolSet.has(name) && !(s.content || "").startsWith("[workflow/locate]")) n += 1;
+  }
+  return n;
+}
+function countLocateToolsSinceLastCallApi(steps: AgentStep[]): number {
+  return countExploreToolsSinceLastCallApi(steps, LOCATE_TOOLS);
+}
+function countPreCallExploreSinceLastCallApi(steps: AgentStep[]): number {
+  return countExploreToolsSinceLastCallApi(steps, PRE_CALL_EXPLORE_TOOLS);
+}
 /** 代码写入/提交类（高危操作，无条件确认，由服务端单独走确认流程） */
 const CODE_TOOLS = new Set(["write_code_file", "git_commit_push"]);
 /** 提交/会话/澄清类（非业务数据动作） */
@@ -331,7 +382,9 @@ export function buildStaticGuide(session: Session): string {
       "4. 当请求目标/关键用词语义模糊、无法确定唯一业务含义，或缺少必要操作对象时，用 request_clarification 反问用户确认后再执行，" +
       "禁止硬猜取数；已明确的请求直接执行，可选筛选条件缺失时用默认参数，不反问。\n" +
       "5. 取到数据后、总结前必须先核对「数据语义是否对应用户问题」：返回记录的业务对象类别是否与用户请求一致。" +
-      "若发现取错模块或数据对象不符，禁止硬收束——用 search_api_module 重新定位正确模块后再 call_api 取数。",
+      "若发现取错模块或数据对象不符，禁止硬收束——用 search_api_module 重新定位正确模块后再 call_api 取数。\n" +
+      "6. 模块定位：search_api_module / grep_codebase 命中候选后立刻 read_api_module → call_api；" +
+      "未取数前禁止反复检索（系统会对超额定位调用拦截并要求直接取数）。",
   );
 
   const currentProject = getActiveProject(session.id);
@@ -1046,7 +1099,9 @@ function hasSuccessfulApiCall(steps: AgentStep[]): boolean {
       c &&
       !c.startsWith("错误：") &&
       !c.startsWith("MODULE_RETRY") &&
-      !c.startsWith("CLARIFICATION_REQUIRED")
+      !c.startsWith("CLARIFICATION_REQUIRED") &&
+      !c.startsWith("[workflow/") &&
+      !c.startsWith("用户取消")
     ) {
       return true;
     }
@@ -1562,6 +1617,11 @@ export async function* chatStream(
       lastToolSignature: Annotation<string>,
       toolSignatureStreak: Annotation<number>,
       doomLoopExhausted: Annotation<boolean>,
+      /**
+       * 取数前探索熔断（locate/read 超预算且尚未成功 call_api）：
+       * 再回 understand 只会再烧 1 轮空 skip。强制 final → 服务端规则编排兜底。
+       */
+      exploreCapExhausted: Annotation<boolean>,
     });
 
     const graph = new StateGraph(LoopState)
@@ -1764,7 +1824,11 @@ export async function* chatStream(
         // 是否重试用条件边决定：首轮无工具调用且未达上限 → 回 understand 再理解（带 retry 提示）。
         // 伪计划检测与业务/闲聊判定无关（方案 C）：首轮恒检测，模型输出自然语言+JSON 伪计划即清空，
         // 交服务端兜底编排，不依赖任何服务端预判 bool（意图判别 100% 交模型）。
-        const firstRoundPlan = isFirstRound && isToolPlanText(result.text || "");
+        // 伪计划文本（JSON/XML tool 模拟）：任意轮次只要 toolCalls=0 都清空——
+        // 2026-09-04 复测：续探轮输出 `<tool_call><function=call_api>` 被当 gaveFinalText 上屏。
+        // 首轮仍计 understandAttempts / pseudoPlanExhausted；续探轮清空后走空响应续探条件边。
+        const textIsPseudoPlan = !forceAnswer && !(result.toolCalls?.length) && isToolPlanText(result.text || "");
+        const firstRoundPlan = isFirstRound && textIsPseudoPlan;
         // 业务/闲聊判定 100% 交模型（对齐 Cursor，2026-08-25 章程红线）：
         // 服务端不做任何问候句式/业务功能词正则预判；模型判断为闲聊就直接回复问候，
         // 判断为业务就应调用工具。若模型输出 toolCalls=0 的文本，按模型判断结果上屏，
@@ -1772,7 +1836,7 @@ export async function* chatStream(
         // 对齐 Cursor 错误反馈循环：伪调用被拦后把「为什么被拒」注入下一步骤，让模型明确修正
         // （而非静默清空 text 后模型盲重试 → 空转）。此步骤随 steps 写回，条件边回 understand 时可见。
         const pseudoPlanExhausted = firstRoundPlan && (state.understandAttempts || 0) >= 2;
-        if (firstRoundPlan) {
+        if (textIsPseudoPlan) {
           steps.push({
             kind: "system",
             text:
@@ -1795,7 +1859,7 @@ export async function* chatStream(
           : (state.understandAttempts || 0) + 1;
         return {
           toolCalls: forceAnswer ? [] : result.toolCalls,
-          text: firstRoundPlan ? "" : (result.text || ""),
+          text: textIsPseudoPlan ? "" : (result.text || ""),
           steps, // 未压缩 steps 写回 state（只读投影：压缩仅影响模型视图）
           needsClarification: false,
           clarificationText: "",
@@ -1810,6 +1874,7 @@ export async function* chatStream(
         nextSteps.push({ kind: "toolCalls", calls: state.toolCalls });
         let clarificationText = "";
         let outputReady = state.outputReady === true;
+        let exploreCapExhausted = state.exploreCapExhausted === true;
         let forcedReply = state.forcedReply || "";
         let pageKind = state.pageKind || "";
         // 对齐 Cursor 数据处理：列表分页渲染结果暂存，final 收束时合并为一张总表
@@ -1940,6 +2005,32 @@ export async function* chatStream(
             emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(note) });
             nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: note });
             continue;
+          }
+          // 取数前探索熔断：未 call_api 前反复 search/read 会把 rounds 顶到 G1。
+          // 双闸门——定位类 ≤1、探索合计（含 read_api_module）≤2；超额 skip 回喂，不提前 final。
+          // 取数后计数清零，允许重定位（对齐 tool-calling#5 取错模块可重搜）。
+          if (PRE_CALL_EXPLORE_TOOLS.has(call.name)) {
+            const locateCount = countLocateToolsSinceLastCallApi(nextSteps);
+            const exploreCount = countPreCallExploreSinceLastCallApi(nextSteps);
+            const locateHit = LOCATE_TOOLS.has(call.name) && locateCount >= MAX_LOCATE_BEFORE_CALL_API;
+            const exploreHit = exploreCount >= MAX_PRE_CALL_EXPLORE;
+            if (locateHit || exploreHit) {
+              const note =
+                `[workflow/locate] 取数前探索已达上限（定位 ${locateCount}/${MAX_LOCATE_BEFORE_CALL_API}，` +
+                `合计 ${exploreCount}/${MAX_PRE_CALL_EXPLORE}）。请立刻 call_api 取数；禁止再次 ${call.name}。` +
+                `若 call_api 返回 MODULE_RETRY / 数据对象不符，再重新定位。`;
+              console.log(
+                `[chat:explore-cap] 拦截 ${call.name}（locate=${locateCount}/${MAX_LOCATE_BEFORE_CALL_API} explore=${exploreCount}/${MAX_PRE_CALL_EXPLORE}）`,
+              );
+              emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(note) });
+              nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: note });
+              toolStatus = "skip";
+              toolNote = "explore thrash cap";
+              // 不置 exploreCapExhausted、不提前 final：编排兜底的 call_api 不写 trace span，
+              // 会红 G6；且易把 search JSON 合成伪表文案（2026-09-04 复测 read 2/3 红）。
+              // 只 skip + 回喂，让模型下一轮直接 call_api（理想路径 ≤8 轮）。
+              continue;
+            }
           }
           // 跨轮 Doom Loop 熔断（业务工具签名连续相同 → 空转）：
           // 只对实际执行的业务/探索工具统计（call_api / search_api_module 等），
@@ -2088,6 +2179,18 @@ export async function* chatStream(
           const persisted = persistToolOutput(call.name, content, call.input);
           if (persisted) content = persisted;
           nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+          // 成功取数后清探索熔断（允许取错模块后再定位）；取消/错误不清理
+          if (
+            call.name === CALL_API_TOOL &&
+            content &&
+            !content.startsWith("错误：") &&
+            !content.startsWith("MODULE_RETRY") &&
+            !content.startsWith("CLARIFICATION_REQUIRED") &&
+            !content.startsWith("[workflow/") &&
+            !content.startsWith("用户取消")
+          ) {
+            exploreCapExhausted = false;
+          }
           // M1（Supervisor 路由）：route_to_agent 成功命中后从结果标记提取 worker id，贯穿本节点回写 state
           const workerMatch = /\[ACTIVE_WORKER:([^\]]+)\]/.exec(content);
           if (workerMatch) activeWorkerId = workerMatch[1];
@@ -2398,6 +2501,7 @@ export async function* chatStream(
           lastToolSignature,
           toolSignatureStreak,
           doomLoopExhausted: toolSignatureStreak >= 3,
+          exploreCapExhausted,
           // M1（Supervisor 路由）：route_to_agent 命中后把 worker id 写回 state，后续 understand 自动裁剪工具
           activeWorkerId: activeWorkerId ?? state.activeWorkerId,
         };
@@ -2444,11 +2548,12 @@ export async function* chatStream(
           // 业务工具判定集收敛为模块级 BUSINESS_TOOLS（从注册表派生，新增工具自动纳入）。
           const businessToolCalled = (state.toolCalls || []).some((tc) => BUSINESS_TOOLS.has(tc.name));
           const isXmlPseudoCall = /<\s*tool_call\s*>|<[\w-]+\s*=\s*(?:search_api_module|read_api_module|call_api|grep_codebase|submit_understood_intent|request_clarification|export_dataset)\b/.test(state.text);
-          if (v === "pseudo-plan" && !hasToolResults) {
-            if (isXmlPseudoCall) {
-              // XML 形态伪调用：强制清空，禁止泄漏上屏（2026-08-26 修复核心）
-              return { text: "" };
-            }
+          // XML 伪调用：无论 hasToolResults，禁止上屏（2026-09-04 复测：已 search/call_api 后仍泄漏
+          // `<tool_call><function=call_api>...`；原条件误挂在 !hasToolResults 内）。不 return {}，
+          // 落入下方 synthesized，用已取数据合成答复。
+          if (isXmlPseudoCall) {
+            console.log("[chat:final] 拦截 XML 伪工具调用文本，改走 synthesized");
+          } else if (v === "pseudo-plan" && !hasToolResults) {
             // 导出伪调用兜底（弱模型把 export_dataset 写成 XML/文本而未真正 function call）：
             // 若会话缓存有最近渲染数据 → 服务端自动执行导出（用户直接拿到文件，不依赖模型自觉）。
             if (/<export_dataset/.test(state.text)) {
@@ -2473,7 +2578,7 @@ export async function* chatStream(
               return { text: "请先查询数据（如「XX列表」）获取表格后，再说「导出 Excel」即可生成文件。" };
             }
             if (businessToolCalled) return { text: "" };
-          }
+          } else {
           // 导出意图最终兜底（弱模型把「导出」理解成重新查询/伪调用绕路，始终不真调 export_dataset）：
           // 用户明确要求导出/下载表格 + 会话有最近渲染数据 + 模型本轮未走 export_dataset → 服务端自动导出。
           if (
@@ -2497,6 +2602,7 @@ export async function* chatStream(
             }
           }
           return {};
+          }
         }
         const toolResults = (state.steps || [])
           .filter((s): s is Extract<AgentStep, { kind: "toolResult" }> => s.kind === "toolResult")
@@ -2649,6 +2755,7 @@ export async function* chatStream(
         lastToolSignature: "",
         toolSignatureStreak: 0,
         doomLoopExhausted: false,
+        exploreCapExhausted: false,
         // M1（Supervisor 路由）：初始未路由，工具全量可见；route_to_agent 命中后 understand 自动裁剪
         activeWorkerId: null,
         // M0 traces：追踪 runId 透传各节点
@@ -2720,24 +2827,13 @@ export async function* chatStream(
       // 写意图判定（模型信号驱动，2026-08-24 去写死）：模型在 submit_understood_intent 提交的
       // operationType==="write" 即视为写操作（服务端不再用中文写词预判）。
       const writeForce = findLastUnderstood(ls.steps || [])?.operationType === "write";
-      // 伪调用耗尽 / Doom Loop 熔断（确定性回退）：模型多次文本模拟工具调用未走 function calling，
-      // 或同一工具+入参连续重复空转 → 即使 businessToolCalled 为 false 也强制服务端规则编排兜底。
-      if (businessToolCalled || writeForce || ls.pseudoPlanExhausted || ls.doomLoopExhausted) {
-        // 有无「API 数据产出」：call_api 成功结果（JSON/已对齐/UI_TABLE/表格），
-        // 排除探索类 toolResult（[源码定位]/未找到匹配/错误）——否则模型「submit→search→直接结束」
-        // 时 search 结果被误当产出，final 合成失败抛「已完成若干工具调用」兜底文案（实测失败路径）。
-        const hasApiData = (ls.steps || []).some((s) => {
-          if (s.kind !== "toolResult" || !s.content) return false;
-          const c = s.content;
-          if (c.startsWith("[源码定位]") || c.startsWith("未找到匹配") || c.startsWith("错误：")) return false;
-          return (
-            c.includes("[已对齐 PC 端字段") ||
-            c.includes("UI_TABLE") ||
-            c.includes("【表格输出") ||
-            c.includes("【图表摘要") ||
-            /^\s*[\[{]/.test(c.trim())
-          );
-        });
+      // 伪调用耗尽 / Doom Loop / 探索熔断（确定性回退）：模型多次文本模拟工具调用未走 function calling，
+      // 或同一工具+入参连续重复空转，或取数前 search/read 超预算 → 即使 businessToolCalled 为 false 也强制服务端规则编排兜底。
+      if (businessToolCalled || writeForce || ls.pseudoPlanExhausted || ls.doomLoopExhausted || ls.exploreCapExhausted) {
+        // 有无「API 数据产出」：必须是成功 call_api（勿把 search/read 的 JSON 候选当产出——
+        // 2026-09-04 复测：explore-cap 后 search 结果以 `{` 开头误判 hasApiData，跳过编排，
+        // 落「已完成若干工具调用」且 G6 无 call_api）。
+        const hasApiData = hasSuccessfulApiCall(ls.steps || []);
         if (!hasApiData || writeForce) {
           // 写操作（增/改/删）在服务端兜底执行前必须经用户确认：
           // 服务端兜底路径（runServerFallback → orchestrate）没有 tool 节点的确认机制，

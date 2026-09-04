@@ -167,3 +167,20 @@ export function resolveApiOperationByPathSuffix(pathname: string): ApiOperation 
   const hits = idx.operations.filter((o) => normalizeApiPath(o.path).endsWith(p));
   return hits.length === 1 ? hits[0] : null;
 }
+
+/**
+ * 从模型臆造/抄错的 path 反推 operation id（弱模型常把 user.getList 写成 /v0.1/user/getList，
+ * 而索引真实 path 是 /v0.1/useraccount/get）。仅做结构变换，命中索引才有效。
+ * 例：/v0.1/user/getList → 剥版本 → user/getList → user.getList
+ */
+export function guessOperationIdFromPath(pathname: string): string | null {
+  let p = normalizeApiPath(pathname);
+  if (!p) return null;
+  p = p.replace(/^v[\d.]+\/?/i, "");
+  const parts = p.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  const func = parts[parts.length - 1];
+  const mod = parts[parts.length - 2];
+  if (!/^[A-Za-z_][\w]*$/.test(func) || !/^[A-Za-z_][\w-]*$/.test(mod)) return null;
+  return `${mod}.${func}`;
+}

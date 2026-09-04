@@ -10,6 +10,7 @@ import { callUpstream, resolveBaseUrl } from "./upstream.js";
 import type { BaseUrlKey, CountryConfig } from "@bx/shared";
 import {
   findApiOperationCandidates,
+  guessOperationIdFromPath,
   hasOperationPath,
   loadApiOperationIndex,
   resolveApiOperation,
@@ -1067,6 +1068,15 @@ export async function execCallApi(
   const operation = String(input.operation || "").trim();
   const inputPath = String(input.path || "").trim();
   let resolvedOp = operation ? resolveApiOperation(operation) : resolveApiOperationByPath(inputPath);
+  // 仅 path、精确未命中：后缀唯一匹配 → 再按 path 末两段猜 module.func（/v0.1/user/getList→user.getList）
+  if (!operation && !resolvedOp && inputPath) {
+    resolvedOp =
+      resolveApiOperationByPathSuffix(inputPath) ||
+      (() => {
+        const guess = guessOperationIdFromPath(inputPath);
+        return guess ? resolveApiOperation(guess) || resolveOperationByApiGrep(guess) : null;
+      })();
+  }
   // 模型输出的 camelCase 模块名经 resolveApiOperation 归一化后仍可能需候选择一
   if (operation && !resolvedOp) {
     const candidates = findApiOperationCandidates(operation, 4);
@@ -1171,7 +1181,17 @@ export async function execCallApi(
         resolvedOp = suffixOp;
         apiPath = suffixOp.path;
       } else {
-        return `错误：path ${apiPath} 未在接口索引中登记；请改用 operation 调用，或先更新 api-operation-index.json`;
+        const guess = guessOperationIdFromPath(apiPath);
+        const guessedOp = guess
+          ? resolveApiOperation(guess) || resolveOperationByApiGrep(guess)
+          : null;
+        if (guessedOp) {
+          resolvedOp = guessedOp;
+          apiPath = guessedOp.path;
+          if (guessedOp.method) method = guessedOp.method.toUpperCase();
+        } else {
+          return `错误：path ${apiPath} 未在接口索引中登记；请改用 operation 调用，或先更新 api-operation-index.json`;
+        }
       }
     }
     if (!opts.country) {
