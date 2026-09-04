@@ -22,6 +22,8 @@ export interface ProjectConfig {
   codebaseRoot: string;
   gitRepo?: string; // gitlab namespace/repo，如 web/bx-film-admin-in2
   branch?: string;  // 测试 dev / 生产 master
+  /** 访问白名单（ownerKey = countryId:loginName 数组）；未配置/空数组 = 对所有登录用户开放（P2 多项目 ACL） */
+  allowOwners?: string[];
 }
 
 interface PolicyProjectOption {
@@ -30,6 +32,7 @@ interface PolicyProjectOption {
   codebaseRoot?: string;
   gitRepo?: string;
   branch?: string;
+  allowOwners?: string[];
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +64,7 @@ export function getProjectConfig(key: string): ProjectConfig | null {
     codebaseRoot: found.codebaseRoot || path.join(CACHE_ROOT, found.key!),
     gitRepo: found.gitRepo,
     branch: found.branch || "dev",
+    allowOwners: Array.isArray(found.allowOwners) ? found.allowOwners.map(String) : undefined,
   };
 }
 
@@ -73,4 +77,13 @@ export function listProjects(): ProjectConfig[] {
 /** codebaseRoot 是否已就绪（gitlab 拉取已落地或本地目录存在） */
 export function projectCodebaseReady(project: ProjectConfig): boolean {
   return fs.existsSync(project.codebaseRoot);
+}
+
+/**
+ * 多项目 ACL 判定（纯函数）：allowOwners 未配置或为空 = 对所有登录用户开放；
+ * 配置后仅名单内操作者（ownerKey = countryId:loginName）可访问。
+ */
+export function projectAccessibleBy(project: ProjectConfig, ownerKey?: string): boolean {
+  if (!project.allowOwners?.length) return true;
+  return !!ownerKey && project.allowOwners.includes(ownerKey);
 }

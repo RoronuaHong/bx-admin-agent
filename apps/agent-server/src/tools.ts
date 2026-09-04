@@ -20,6 +20,7 @@ import {
 import { getRouterPolicy } from "./router-policy.js";
 import { appendClarificationMetric } from "./clarification-policy.js";
 import { resolveCodebaseRoot } from "./project-context.js";
+import { getProjectConfig, projectAccessibleBy } from "./project-registry.js";
 import { lookupTermModules, formatTranslationHits } from "./translation-lookup.js";
 import { runContractSearch } from "./query-contraction.js";
 import { DEFAULT_WORKERS, resolveWorker } from "./worker-registry.js";
@@ -841,6 +842,8 @@ export interface ApiCallOptions {
   sessionId?: string;  // 用于 parse_intent / set_project 读写会话级全局项目上下文
   /** 当前用户原句，用于报表参数默认（如 Google / 近7天） */
   userText?: string;
+  /** 操作者归属（countryId:loginName，P2 溯源 + 多项目 ACL 判定） */
+  ownerKey?: string;
 }
 
 interface ClarificationPayload {
@@ -1438,11 +1441,18 @@ export async function runAgentTool(
     const projectKey = String(input.projectKey || "").trim();
     const projectLabel = String(input.projectLabel || "").trim();
     if (!projectKey || !projectLabel) return "错误：参数缺失；projectKey 和 projectLabel 均为必填；请传入项目标识和展示名";
+    // P2 多项目 ACL：项目必须在注册表内；allowOwners 配置时仅名单内操作者可切换
+    //（未配置 = 开放）。判定先于会话写入，拒绝时不产生任何副作用。
+    const cfg = getProjectConfig(projectKey);
+    if (!cfg) return `错误：未知项目标识 ${projectKey}；可用项目清单见澄清策略配置`;
+    if (!projectAccessibleBy(cfg, opts.ownerKey)) {
+      return `错误：当前账号无权访问该项目（${projectKey}）；如需开通请联系管理员在项目配置的 allowOwners 中加入该账号`;
+    }
     const sid = opts.sessionId;
     if (!sid) return "错误：无法读取会话 ID；请重新登录";
-    const ok = setActiveProject(sid, { key: projectKey, label: projectLabel, setAt: Date.now() });
+    const ok = setActiveProject(sid, { key: projectKey, label: cfg.label || projectLabel, setAt: Date.now() });
     if (!ok) return "错误：会话不存在；请重新登录";
-    return `已切换全局项目上下文：${projectLabel}（${projectKey}）。后续所有请求均默认在此项目范围内执行，无需重复声明。`;
+    return `已切换全局项目上下文：${cfg.label || projectLabel}（${projectKey}）。后续所有请求均默认在此项目范围内执行，无需重复声明。`;
   }
 
   if (name === "write_code_file") {

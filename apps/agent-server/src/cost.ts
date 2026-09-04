@@ -36,6 +36,8 @@ export interface CostReport {
   byDay: Array<{ day: string } & UsageTotals>;
   byModel: Array<{ model: string } & UsageTotals>;
   bySession: Array<{ sessionId: string } & UsageTotals>;
+  /** 按操作者（countryId:loginName）汇总；旧数据无 ownerKey 归入 "unknown" */
+  byOwner: Array<{ ownerKey: string } & UsageTotals>;
   /** 慢调用 Top N（llm span 按耗时降序），用于定位性能与成本热点 */
   slowestCalls: Array<{ runId: string; model?: string; durationMs: number; totalTokens: number; at: string }>;
 }
@@ -110,19 +112,23 @@ function readAllRuns(): Array<{ runId: string; spans: TraceSpan[] }> {
  * 聚合成本。
  * @param opts.fromDay / toDay  ISO 日期过滤（含边界，如 "2026-09-04"）
  * @param opts.sessionId        只统计某个会话
+ * @param opts.ownerKey         只统计某操作者（P2 溯源；run span meta.ownerKey，
+ *                              旧数据无 ownerKey 会被过滤——诚实不猜测归属）
  * @param opts.slowestTopN      慢调用 Top N（默认 10）
  */
 export function aggregateCost(opts?: {
   fromDay?: string;
   toDay?: string;
   sessionId?: string;
+  ownerKey?: string;
   slowestTopN?: number;
 }): CostReport {
-  const { fromDay, toDay, sessionId, slowestTopN = 10 } = opts || {};
+  const { fromDay, toDay, sessionId, ownerKey, slowestTopN = 10 } = opts || {};
   const totals = empty();
   const dayMap = new Map<string, UsageTotals>();
   const modelMap = new Map<string, UsageTotals>();
   const sessionMap = new Map<string, UsageTotals>();
+  const ownerMap = new Map<string, UsageTotals>();
   const slowest: CostReport["slowestCalls"] = [];
 
   for (const { runId, spans } of readAllRuns()) {
@@ -133,10 +139,20 @@ export function aggregateCost(opts?: {
     if (toDay && day > toDay) continue;
     const sid = (runSpan.meta?.sessionId as string) || "";
     if (sessionId && sid !== sessionId) continue;
+    const runOwner = (runSpan.meta?.ownerKey as string) || "";
+    if (ownerKey && runOwner !== ownerKey) continue;
 
     totals.runs += 1;
     const d = dayMap.get(day) || empty();
     d.runs += 1;
+    // run 级维度（会话/操作者）的 runs 计数与 totals 同步（bucket 在 llm 循环内懒创建，
+    // 这里先确保存在并 +1，避免 bySession/byOwner 的 runs 恒为 0）
+    const st0 = sessionMap.get(sid || "unknown") || empty();
+    st0.runs += 1;
+    sessionMap.set(sid || "unknown", st0);
+    const ot0 = ownerMap.get(runOwner || "unknown") || empty();
+    ot0.runs += 1;
+    ownerMap.set(runOwner || "unknown", ot0);
 
     for (const s of spans) {
       if (s.kind !== "llm") continue;
@@ -151,6 +167,10 @@ export function aggregateCost(opts?: {
       const st = sessionMap.get(sid || "unknown") || empty();
       addUsage(st, s);
       sessionMap.set(sid || "unknown", st);
+
+      const ot = ownerMap.get(runOwner || "unknown") || empty();
+      addUsage(ot, s);
+      ownerMap.set(runOwner || "unknown", ot);
 
       slowest.push({
         runId,
@@ -176,6 +196,9 @@ export function aggregateCost(opts?: {
     byModel: [...modelMap.entries()].map(([model, v]) => ({ model, ...v })).sort(sortByTokens),
     bySession: [...sessionMap.entries()]
       .map(([sid, v]) => ({ sessionId: sid, ...v }))
+      .sort(sortByTokens),
+    byOwner: [...ownerMap.entries()]
+      .map(([ok, v]) => ({ ownerKey: ok, ...v }))
       .sort(sortByTokens),
     slowestCalls: slowest.slice(0, slowestTopN),
   };

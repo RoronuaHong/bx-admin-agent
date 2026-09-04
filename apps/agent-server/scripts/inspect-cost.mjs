@@ -6,6 +6,7 @@
  *   tsx scripts/inspect-cost.mjs --from 2026-09-01    按起始日过滤
  *   tsx scripts/inspect-cost.mjs --from X --to Y      日期区间
  *   tsx scripts/inspect-cost.mjs --session <sid>      仅某会话
+ *   tsx scripts/inspect-cost.mjs --owner <ownerKey>   仅某操作者（countryId:loginName）
  *   tsx scripts/inspect-cost.mjs --top 20             慢调用 Top N
  *
  * 环境变量（可选）：
@@ -26,6 +27,7 @@ const report = aggregateCost({
   fromDay: flag("from"),
   toDay: flag("to"),
   sessionId: flag("session"),
+  ownerKey: flag("owner"),
   slowestTopN: Number(flag("top")) || 10,
 });
 
@@ -59,6 +61,13 @@ if (report.bySession.length) {
   console.log(`\n-- 按会话（Top ${Math.min(report.bySession.length, 10)}）--`);
   for (const s of report.bySession.slice(0, 10)) {
     console.log(`  ${s.sessionId}  calls=${s.llmCalls} tokens=${s.totalTokens} cost=${s.cost.toFixed(4)}`);
+  }
+}
+
+if (report.byOwner.length) {
+  console.log(`\n-- 按操作者（Top ${Math.min(report.byOwner.length, 10)}）--`);
+  for (const o of report.byOwner.slice(0, 10)) {
+    console.log(`  ${o.ownerKey}  runs=${o.runs} calls=${o.llmCalls} tokens=${o.totalTokens} cost=${o.cost.toFixed(4)}`);
   }
 }
 

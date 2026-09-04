@@ -48,6 +48,8 @@ interface RunMeta {
   userText?: string;
   model?: string;
   worker?: string;
+  /** 操作者归属（countryId:loginName，P2 溯源；cost/audit 与 trace 关联靠它） */
+  ownerKey?: string;
   startMs: number;
   endMs?: number;
 }
@@ -84,6 +86,7 @@ export function beginRun(meta: {
   userText?: string;
   model?: string;
   worker?: string;
+  ownerKey?: string;
 }): string {
   const runId = randomUUID();
   runMetas.set(runId, {
@@ -92,6 +95,7 @@ export function beginRun(meta: {
     userText: meta.userText,
     model: meta.model,
     worker: meta.worker,
+    ownerKey: meta.ownerKey,
     startMs: Date.now(),
   });
   // 进程内当前 run 兜底（单并发调试 / 独立子 Agent 函数退路）；多并发必须显式透传
@@ -124,7 +128,7 @@ export function endRun(runId: string): void {
     startMs: meta.startMs,
     endMs,
     durationMs: endMs - meta.startMs,
-    meta: { sessionId: meta.sessionId, userText: meta.userText },
+    meta: { sessionId: meta.sessionId, userText: meta.userText, ownerKey: meta.ownerKey },
   });
 }
 

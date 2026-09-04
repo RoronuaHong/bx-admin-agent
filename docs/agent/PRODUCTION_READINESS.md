@@ -11,7 +11,7 @@
 
 | 维度 | 现状 | 评级 | 一句话缺口 |
 |---|---|---|---|
-| **身份 Identity** | `app.ts` 有 cookie session + `requireOwner`（会话级 401 拦截）；模型侧 `x-api-key` 是上游凭证 | 🟡 雏形 | 无调用方/租户/用户态溯源，无 ACL |
+| **身份 Identity** | **2026-09-04 P2 已落地**：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限 | ✅ 已补 | 角色模型/管理员视角缺（CLI 承担全局） |
 | **异步 Async** | SSE 流式同步返回（`/chat/stream`） | 🔴 缺失 | 无后台任务/长作业/断线续跑/进度查询 |
 | **追踪 Tracing** | **2026-09-03 已建**：`trace.ts` + `inspect-trace.mjs`，runId 贯穿 + span 树 + token usage | ✅ 已补 | 仅 JSONL 落盘，无 Web 可视化/告警 |
 | **评测 Eval** | `eval-full-chain.mjs` 等脚本能跑全链路 PASS/FAIL + `process.exit(1)` | 🟡 雏形 | 未落库基线、未接 CI、断言维度浅（无 traces 复用） |
@@ -24,12 +24,13 @@
 
 ## 2. 维度详情
 
-### 2.1 身份 Identity 🟡
+### 2.1 身份 Identity ✅ P2 已落地（溯源 + 多项目 ACL）
 - 已有：`app.ts` 的 `getSession(getCookie(c, COOKIE))` 会话校验；`/chat/conversations` 等接口走 `requireOwner`。
-- 缺口：
-  - 调用方溯源：谁（哪个前端/服务/用户）发的请求，无 `x-request-id` / `caller` 落库。
-  - 租户隔离：多项目（bx-film-admin 等）仅 `set_project` 切换，无 `allowedProjects` ACL。
-  - 权限分层：无角色/权限模型，越权防护靠 M1 worker 白名单（运行期），非数据期 ACL。
+- **调用方溯源（本次落地）**：`ownerKey`（countryId:loginName）在 chatStream 入口计算一次，贯穿——①trace run span meta（可回溯每次请求的操作者）；②成本聚合 `byOwner` 维度 + `inspect-cost.mjs --owner` CLI；③审计事件（P1 已有）；④会话（conversations 既有）。
+- **多项目 ACL（本次落地）**：项目配置（clarification-policy.json）可选 `allowOwners`（ownerKey 数组）——未配置/空 = 对所有登录用户开放；配置后仅名单内操作者可 `set_project`（判定先于会话写入，拒绝零副作用，未知项目标识诚实拒绝）。判定逻辑为 `project-registry.ts` 纯函数 `projectAccessibleBy`。
+- **最小权限口径**：`GET /cost/summary` 与 `GET /audit/list` 只暴露当前登录操作者自己的数据（ownerKey 强制过滤）；全局视角只走服务端 CLI（inspect-cost.mjs / inspect-audit.mjs），不暴露 HTTP 面。
+- 验证：ACL 纯函数 4/4 + set_project 真实路径（名单外拒绝/名单内放行/未配置开放/未知项目拒绝）+ 真实请求 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200。
+- 仍缺：角色/权限模型（越权防护靠 M1 worker 白名单运行期拦截，非数据期 ACL）；跨租户管理员视角（现 CLI 承担）。
 
 ### 2.2 异步 Async 🔴
 - 当前：`/chat/stream` 同步流式，单次请求生命周期内完成。
@@ -108,7 +109,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | **P0** | 评测 Eval | ✅ 完整落地：通用 `eval-core` + `eval-trace-gate` + 分层入口（`pnpm eval`/`eval:full`/`eval:trace-gate`）+ CI 闸门 `.github/workflows/eval.yml` | 复用 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
 | **P1** | 安全审计 | ✅ 已落地：`audit.ts` 三类事件（越权拒绝/写确认请求/确认结论三态）append-only 落库 + `/audit/list`（ownerKey 隔离）+ `inspect-audit.mjs` | 上线必备合规；runId 关联 trace 可反查上下文 |
 | **P1** | 成本 Cost | ✅ 已落地：`cost.ts` 聚合 + `inspect-cost.mjs` CLI + `GET /cost/summary` 端点 + 预算告警（env 阈值） | traces 已采集，只差聚合 |
-| **P2** | 身份 Identity | 调用方溯源 + 多项目 ACL | 多租户上线前必需 |
+| **P2** | 身份 Identity | ✅ 已落地：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限（只看自己，全局走 CLI） | 多租户上线前必需 |
 | **P2** | 异步 Async | 后台任务框架 | 长作业场景；非阻塞核心路径 |
 | **P3** | 版本 Version | 提示词/工具版本化与回滚 | 降低线上试错成本 |
 | **P3** | 可观测 | Web trace 可视化 + metrics | 体验增强 |
@@ -127,3 +128,4 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 成本 Cost | ✅ P1 落地：`cost.ts`（日/模型/会话/慢调用聚合 + `budgetAlerts`，零业务词零依赖）+ `inspect-cost.mjs` CLI + `GET /cost/summary` 只读端点（requireOwner）；`trace.ts` 导出 `getTraceDir()`；实测真实 trace 4 runs/12 llm/79463 tokens 聚合正确；单价/预算全走环境变量（COST_RATE_*/DAILY_TOKEN_BUDGET/RUN_TOKEN_BUDGET，未配价诚实只计 token） | src/cost.ts / src/app.ts / src/trace.ts / scripts/inspect-cost.mjs |
 | 2026-09-04 | 安全 Security | ✅ P1 审计落地：`audit.ts`（reject/confirm_request/confirm_result 三类事件，append-only 按月 JSONL，runId 关联 trace，零业务词零依赖）+ `chat.ts` 四处接线（tool 节点越权拒绝 + 三处写确认，确认结论三态 granted/denied/timeout——`waitForConfirmation` 改返回 `{confirmed, outcome}`）+ `GET /audit/list`（ownerKey 隔离最小权限）+ `inspect-audit.mjs` CLI；验证：模块回环 8/8 + 端点匿名 401/登录态 200 | src/audit.ts / src/chat.ts / src/app.ts / scripts/inspect-audit.mjs |
 | 2026-09-04 | 安全+评测 实例验证 | ✅ 真实实例验证：①写确认审计端到端 PASS（真实写意图 → confirmation_required → 自动拒绝零副作用 → 审计落 confirm_request+confirm_result=denied，owner=countryId:loginName、runId 关联 trace、/audit/list 可查）；②读场景回归发现免费链劣化窗口（nemotronultra 2 次 rounds=10 含 3 空响应轮、zenhy3 2 次短路 <1s）——非代码回归（diff 不涉 LLM 循环）；③**gate 盲区修复**：短路/幻觉直答不调工具能骗过 G1-G5，补 **G6 业务期望断言**（`expectTools`，默认关）+ 阈值环境变量（EVAL_MAX_ROUNDS/EVAL_MAX_TOKENS）+ adapter `--expect-tool`；core 单测 23/23，G6 实战拦截 zenhy3 短路（5/6 如实红） | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs |
+| 2026-09-04 | 身份 Identity | ✅ P2 落地：①溯源——`ownerKey`（countryId:loginName）chatStream 入口计算，贯穿 trace run span meta / 成本 `byOwner` 维度（+`inspect-cost.mjs --owner`）/ 审计（P1）/ 会话；②多项目 ACL——项目配置可选 `allowOwners`（未配置=开放），`set_project` 判定先于会话写入（拒绝零副作用）+ 未知项目诚实拒绝，`projectAccessibleBy` 纯函数；③最小权限——`/cost/summary` 与 `/audit/list` HTTP 面强制 ownerKey 过滤（只看自己），全局视角只走 CLI；顺手修 bySession/byOwner runs 计数恒 0 缺陷。验证：ACL 11 用例 + 真实 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200 + 最小权限不泄漏 | src/trace.ts / src/cost.ts / src/chat.ts / src/tools.ts / src/project-registry.ts / src/app.ts / scripts/inspect-cost.mjs |

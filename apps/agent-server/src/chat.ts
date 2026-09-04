@@ -1242,9 +1242,9 @@ export async function* chatStream(
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
   // M0 traces：开一次请求的追踪上下文（runId 贯穿各节点 span）
-  const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model });
-  // P1 安全审计：操作者归属（国家线 + 登录名），贯穿本请求所有审计事件
+  // P2 溯源：操作者归属（countryId:loginName）先于 beginRun 计算，贯穿 trace/审计/成本
   const ownerKey = ownerKeyOf(session.user, session.country.id);
+  const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model, ownerKey });
   if (session.pendingClarification) {
     // 仅问 project 的待澄清：本部署已默认绑定影视后台，直接丢弃，按新消息走主流程
     if (
@@ -1302,6 +1302,7 @@ export async function* chatStream(
       token: session.token,
       country: session.country,
       menus: session.menus,
+      ownerKey,
     });
     const text = resumed.startsWith("CLARIFICATION_REQUIRED")
       ? renderClarificationForUser(resumed)
@@ -1796,6 +1797,7 @@ export async function* chatStream(
           menus: session.menus,
           sessionId: session.id,
           userText,
+          ownerKey,
         };
         // 同轮重复取数调用去重（对齐 Cursor「观察→再决策」循环）：
         // 弱模型常在未见数据时并行提交多个参数完全相同的取数调用（实测 lagunas 两次 pageNum:1），
