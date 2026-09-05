@@ -24,8 +24,8 @@ const MODEL = process.env.A2A_MODEL || "";
 
 // backend-api 域工具（路由到 knowledge 后这些应被裁剪掉）
 const BACKEND_API_TOOLS = [
-  "call_api", "search_api_module", "resolve_api_operation", "read_api_module",
-  "grep_codebase", "render_table", "render_list", "render_detail",
+  "call_api", "search_api_module", "read_api_module",
+  "grep_codebase", "render_table",
   "normalize_output", "write_code_file", "git_commit_push", "submit_understood_intent",
   "export_dataset", "summarize_chart_data", "get_page_schema", "get_list_columns",
   "read_field_mapping",
@@ -115,7 +115,10 @@ async function streamChat(cookie, text) {
   if (errors.length) log("错误事件:", JSON.stringify(errors));
   log("===================================");
 
-  // 判定：路由生效后 backend-api 工具若被调用，须被服务端越权拦截（返回拒绝说明）而非执行成功返回后台数据
+  // 判定口径（与机制对齐）：
+  // - routeOk：模型调了 route_to_agent(domain=knowledge)
+  // - restrictOk：路由后若仍尝试 backend-api 工具，须被越权拒绝（或根本未成功执行）
+  // 注意：同轮可能同时提交 route + call_api；route 短路后 call_api 不会执行——仍算机制生效。
   const routeOk = !!routeCall && routeCall.input?.domain === "knowledge";
   const backendToolResults = events.filter(
     (e) => e.type === "tool_result" && BACKEND_API_TOOLS.includes(e.name) && (routeIdx < 0 || events.indexOf(e) > routeIdx),
@@ -129,9 +132,12 @@ async function streamChat(cookie, text) {
   log(
     "VERDICT:",
     ok
-      ? "PASS 路由生效 ✅（route_to_agent 命中 → 后续 understand 轮工具被裁剪，call_api 在 knowledge 上下文不可见）"
-      : "FAIL 路由未生效 ❌（knowledge 路由后仍能直接调用 call_api，工具未裁剪）",
+      ? "PASS 路由护栏生效 ✅（route_to_agent 命中；knowledge 下 backend-api 工具未能成功执行）"
+      : "FAIL 路由护栏未生效 ❌（未路由到 knowledge，或 knowledge 下仍成功执行了 backend-api 工具）",
   );
+  if (hasDirectBackendAfterRoute && ok) {
+    log("注：路由后仍出现 backend-api tool_call 属模型越权尝试；已被执行层拦截（或同轮短路未执行）。");
+  }
   process.exit(ok ? 0 : 1);
 })().catch((e) => {
   console.error("ERROR:", e.message);

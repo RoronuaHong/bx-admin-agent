@@ -20,7 +20,9 @@ check("listAgentTools 每个工具含 domain", missing.length === 0, `总数=${t
 const count = (d) => tools.filter((t) => t.domain === d).length;
 check("backend-api = 15", count("backend-api") === 15, `实际=${count("backend-api")}`);
 check("knowledge = 4 (chat 可见)", count("knowledge") === 4, `实际=${count("knowledge")}`);
-check("common = 4", count("common") === 4, `实际=${count("common")}`);
+// common：request_clarification / parse_intent / set_project / get_current_time /
+// route_to_agent / update_user_preference / get_user_preferences（M1 调度 + 偏好）
+check("common = 7", count("common") === 7, `实际=${count("common")}`);
 
 // 3. 真实调用 buildStaticGuide（chat 主路径），注入工具目录
 const guide = buildStaticGuide({ id: "m0-instance-test" });

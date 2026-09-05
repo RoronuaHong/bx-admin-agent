@@ -3,7 +3,15 @@ import { fetchLink, resolveLocalDoc } from "./sources.js";
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import nodePath from "node:path";
-import { getActiveProject, getSession, setActiveProject, ensureDefaultProject } from "./session.js";
+import {
+  getActiveEnvironment,
+  getActiveProject,
+  getSession,
+  setActiveEnvironment,
+  setActiveProject,
+  setActiveWorkerId,
+  ensureDefaultProject,
+} from "./session.js";
 import { formatUserPrefsGuide, loadUserPreferences, updateUserPreference } from "./user-prefs.js";
 import { config } from "./config.js";
 import { formatModuleSummary, loadApiModuleIndex, resolveApiModules } from "./api-index.js";
@@ -25,7 +33,11 @@ import { resolveCodebaseRoot } from "./project-context.js";
 import { getProjectConfig, projectAccessibleBy } from "./project-registry.js";
 import { lookupTermModules, formatTranslationHits } from "./translation-lookup.js";
 import { runContractSearch } from "./query-contraction.js";
-import { DEFAULT_WORKERS, resolveWorker } from "./worker-registry.js";
+import {
+  DEFAULT_WORKERS,
+  resolveWorker,
+  type ApiEnvironment,
+} from "./worker-registry.js";
 import {
   parseUnderstoodIntent,
   SUBMIT_UNDERSTOOD_INTENT,
@@ -408,6 +420,13 @@ export function listAgentTools(): AgentToolDef[] {
           confirm: {
             type: "boolean",
             description: "是否需要用户确认后再执行（写操作请设为 true，查询操作设为 false）",
+          },
+          environment: {
+            type: "string",
+            enum: ["test", "prod"],
+            description:
+              "API 环境（可选）。缺省用会话 activeEnvironment（route_to_agent 写入，默认 test）。" +
+              "prod 需服务端配置 COUNTRY_<ID>_PROD_*_URL。",
           },
           description: {
             type: "string",
@@ -883,6 +902,19 @@ export interface ApiCallOptions {
   userText?: string;
   /** 操作者归属（countryId:loginName，P2 溯源 + 多项目 ACL 判定） */
   ownerKey?: string;
+  /** M1：本轮默认 API 环境（可被 call_api.environment 覆盖） */
+  environment?: ApiEnvironment;
+}
+
+/** 解析 call_api 实际环境：入参 > opts > session > test */
+function resolveCallEnvironment(
+  input: Record<string, unknown>,
+  opts: ApiCallOptions,
+): ApiEnvironment {
+  const raw = input.environment != null ? String(input.environment).trim().toLowerCase() : "";
+  if (raw === "prod" || raw === "test") return raw;
+  if (opts.environment === "prod" || opts.environment === "test") return opts.environment;
+  return getActiveEnvironment(opts.sessionId);
 }
 
 interface ClarificationPayload {
@@ -948,8 +980,9 @@ async function appendOperationLog(args: {
   resolvedOp?: ApiOperation | null;
   resolvedModule?: string;
   inputLog?: Record<string, unknown>;
+  environment?: ApiEnvironment;
 }): Promise<void> {
-  const { opts, path, fullUrl, params, method, resolvedOp, resolvedModule, inputLog } = args;
+  const { opts, path, fullUrl, params, method, resolvedOp, resolvedModule, inputLog, environment } = args;
   if (!opts.country || !opts.token) return;
   const policy = getRouterPolicy();
 
@@ -983,6 +1016,7 @@ async function appendOperationLog(args: {
         menuId,
         content: JSON.stringify(body),
       },
+      environment: environment ?? "test",
     });
   } catch {
     // 日志失败不影响主流程结果
@@ -1155,6 +1189,7 @@ export async function execCallApi(
   let apiPath = (resolvedOp?.path || inputPath);
   const base = (resolvedOp?.base || String(input.base || "backend").trim()) as BaseUrlKey;
   const url = normalizeInternalUrl(String(input.url || "").trim());
+  const apiEnvironment = resolveCallEnvironment(input, opts);
 
   // 2026-08-24 去写死：删除「列表/分页接口缺参补默认 page=1, size=100」的服务端写死默认值——
   // 分页参数（page/size/pageSize）完全由模型按接口契约（read_api_module 读源码）在 params 里提供，
@@ -1275,9 +1310,11 @@ export async function execCallApi(
       return stringifyResult(mocked);
     }
 
-    const baseUrl = resolveBaseUrl(opts.country, base);
+    const baseUrl = resolveBaseUrl(opts.country, base, apiEnvironment);
     if (!baseUrl) {
-      return `错误：当前国家线未配置 ${base} 地址；请在服务端 COUNTRY_* 环境变量中配置`;
+      return apiEnvironment === "prod"
+        ? `错误：生产环境未配置 ${base} 地址；请在服务端设置 COUNTRY_<ID>_PROD_*_URL（当前环境=prod）`
+        : `错误：当前国家线未配置 ${base} 地址；请在服务端 COUNTRY_* 环境变量中配置`;
     }
     const fullUrl = `${baseUrl}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`;
     const hostErr = checkApiHost(fullUrl);
@@ -1290,6 +1327,7 @@ export async function execCallApi(
         path: apiPath,
         baseUrlKey: base,
         params,
+        environment: apiEnvironment,
       });
       await appendOperationLog({
         opts,
@@ -1300,6 +1338,7 @@ export async function execCallApi(
         resolvedOp,
         resolvedModule,
         inputLog: (input.log && typeof input.log === "object" ? input.log as Record<string, unknown> : undefined),
+        environment: apiEnvironment,
       });
       let resultText = stringifyResult(data);
 
@@ -1315,6 +1354,7 @@ export async function execCallApi(
               path: readOp.path,
               baseUrlKey: readOp.base,
               params: { id: params.id },
+              environment: apiEnvironment,
             });
             resultText += `\n\n[readback]\n${stringifyResult(rb)}`;
           } catch (e) {
@@ -1617,7 +1657,20 @@ export async function runAgentTool(
       ).join(", ");
       return `未找到匹配 Worker（domain=${domain} project=${project ?? "-"} env=${environment}）。已注册：${available}`;
     }
-    return `已切换到 Worker「${worker.label}」（id=${worker.id}）。后续工具调用将限定在该 Worker 上下文（工具子集 + 领域提示）。\n[ACTIVE_WORKER:${worker.id}]`;
+    // 会话级持久化：环境 + worker id（跨用户轮次恢复；与 activeProject 同生命周期）
+    if (opts.sessionId) {
+      setActiveWorkerId(opts.sessionId, worker.id);
+      if (worker.environment === "prod" || worker.environment === "test") {
+        setActiveEnvironment(opts.sessionId, worker.environment);
+      } else if (environment === "prod" || environment === "test") {
+        setActiveEnvironment(opts.sessionId, environment);
+      }
+    }
+    const envNote = worker.environment ? ` environment=${worker.environment}` : "";
+    return (
+      `已切换到 Worker「${worker.label}」（id=${worker.id}${envNote}）。` +
+      `后续工具调用将限定在该 Worker 上下文（工具子集 + 领域提示）。\n[ACTIVE_WORKER:${worker.id}]`
+    );
   }
 
   if (name === "parse_intent") {

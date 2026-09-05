@@ -121,6 +121,11 @@ interface Conversation {
 
 const LEGACY_KEY = "bx-admin-agent-chat";
 const STORAGE_KEY = "bx-admin-agent-chat-v2";
+/** 已关闭会话 id（跨刷新），避免 DELETE 与 upsert 竞态后刷新又把 tab 拉回来。 */
+const CLOSED_KEY = "bx-admin-agent-closed-v1";
+const CLOSED_IDS_CAP = 100;
+/** 与服务端一致：断线兜底会话的稳定 id；旧版 task-<sessionId> 视为孤儿。 */
+const TASK_RESULTS_ID = "task-results";
 // 身份缓存：持久化最近一次成功的登录身份，用于刷新时、fetchMe 未返回/失败时
 // 也能拼出正确的 storageKey 来恢复本地会话，避免落到 ":x:anon" 导致记录"消失"。
 const IDENTITY_CACHE_KEY = "bx-admin-agent-identity-v1";
@@ -203,6 +208,14 @@ function storageKey() {
 function legacyStorageKey() {
   const id = currentIdentity();
   return `${LEGACY_KEY}:${id.countryId}:${id.loginName}`;
+}
+function closedStorageKey() {
+  const id = currentIdentity();
+  return `${CLOSED_KEY}:${id.countryId}:${id.loginName}`;
+}
+
+function isLegacyTaskConversation(id: string) {
+  return id.startsWith("task-") && id !== TASK_RESULTS_ID;
 }
 
 const conversations = ref<Conversation[]>([]);
@@ -288,14 +301,72 @@ function cacheLocally() {
   }
 }
 
-// 主存储：服务端 MongoDB（方案 C，按登录用户归属）。每会话独立 upsert。
-function saveConversations() {
-  const slim = slimConversations();
-  cacheLocally();
-  for (const c of slim) {
-    saveConversationMessages(c.id, c.messages, c.title).catch(() => {
+// 已关闭会话墓碑（内存 + localStorage）：阻止在途 upsert 复活，并在刷新后继续过滤/补删。
+const deletedConversationIds = new Set<string>();
+/** 批量关闭期间禁止 deep-watch 触发的自动保存。 */
+let suppressConversationSave = false;
+
+function loadClosedIds(): string[] {
+  try {
+    const raw = localStorage.getItem(closedStorageKey());
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((x): x is string => typeof x === "string").slice(-CLOSED_IDS_CAP);
+  } catch {
+    return [];
+  }
+}
+
+function persistClosedIds() {
+  try {
+    localStorage.setItem(
+      closedStorageKey(),
+      JSON.stringify([...deletedConversationIds].slice(-CLOSED_IDS_CAP)),
+    );
+  } catch {
+    /* 忽略配额/隐私模式错误 */
+  }
+}
+
+function hydrateClosedIds() {
+  deletedConversationIds.clear();
+  for (const id of loadClosedIds()) deletedConversationIds.add(id);
+}
+
+function markConversationsClosed(ids: string[]) {
+  for (const id of ids) deletedConversationIds.add(id);
+  persistClosedIds();
+}
+
+function shouldHideConversation(id: string) {
+  return deletedConversationIds.has(id) || isLegacyTaskConversation(id);
+}
+
+function persistConversation(id: string, messages: Conversation["messages"], title?: string) {
+  if (shouldHideConversation(id)) return;
+  saveConversationMessages(id, messages, title)
+    .then(() => {
+      // 关闭前已发出的 upsert 可能晚于 DELETE 到达并 upsert 复活 → 再删一次。
+      if (deletedConversationIds.has(id)) {
+        apiDeleteConversation(id).catch(() => {});
+      }
+    })
+    .catch(() => {
       /* 网络/服务端失败：本地缓存兜底，下次变更会重试 */
     });
+}
+
+// 主存储：服务端 MongoDB（方案 C，按登录用户归属）。每会话独立 upsert。
+function saveConversations() {
+  if (suppressConversationSave) {
+    cacheLocally();
+    return;
+  }
+  const slim = slimConversations().filter((c) => !shouldHideConversation(c.id));
+  cacheLocally();
+  for (const c of slim) {
+    persistConversation(c.id, c.messages, c.title);
   }
 }
 
@@ -355,6 +426,15 @@ function sanitizeBubble(m: Bubble): Bubble {
   };
 }
 
+function dedupeConversationList(list: Conversation[]): Conversation[] {
+  const byId = new Map<string, Conversation>();
+  for (const conv of list) {
+    const prev = byId.get(conv.id);
+    if (!prev || (conv.updatedAt || 0) >= (prev.updatedAt || 0)) byId.set(conv.id, conv);
+  }
+  return [...byId.values()].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+}
+
 // 从 v2 多会话恢复。
 function loadConversations(): { conversations: Conversation[]; activeId: string } {
   try {
@@ -367,7 +447,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
     }
     const parsed = JSON.parse(raw) as { activeId?: string; conversations?: Conversation[] };
     if (!Array.isArray(parsed.conversations)) return { conversations: [], activeId: "" };
-    const convs = parsed.conversations
+    const convs = dedupeConversationList(parsed.conversations
       .filter((c) => c && Array.isArray(c.messages))
       .slice(0, 20)
       .map((c) => ({
@@ -379,7 +459,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
           .map((m) => sanitizeBubble({ ...m, id: m.id || ++seq })),
         createdAt: c.createdAt || 0,
         updatedAt: c.updatedAt || 0,
-      }));
+      })));
     const activeId = convs.some((c) => c.id === parsed.activeId) ? String(parsed.activeId) : convs[0]?.id || "";
     return { conversations: convs, activeId };
   } catch {
@@ -439,10 +519,16 @@ function closeConversations(ids: string[], keepId?: string) {
     return;
   }
   const idSet = new Set(ids);
+  // 先打墓碑并取消防抖保存，避免 deep watch / 在途 upsert 把刚删的会话写回 Mongo。
+  markConversationsClosed(ids);
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  suppressConversationSave = true;
   const prevActive = activeId.value;
   const prevIdx = conversations.value.findIndex((c) => c.id === prevActive);
   conversations.value = conversations.value.filter((c) => !idSet.has(c.id));
-  for (const id of ids) apiDeleteConversation(id).catch(() => {});
 
   if (keepId && conversations.value.some((c) => c.id === keepId)) {
     activeId.value = keepId;
@@ -453,7 +539,13 @@ function closeConversations(ids: string[], keepId?: string) {
     activeId.value = next.id;
   }
 
-  saveConversations();
+  // 本地先落盘（用户立刻看到关闭），服务端删除并行发出；失败也不撤墓碑，避免刷新又拉回。
+  cacheLocally();
+  void Promise.all(ids.map((id) => apiDeleteConversation(id).catch(() => {}))).finally(() => {
+    suppressConversationSave = false;
+    // 仅对仍打开的会话做 upsert，绝不写墓碑里的 id。
+    saveConversations();
+  });
   hideTabMenu();
   nextTick(scrollBottom);
 }
@@ -513,7 +605,7 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 watch(
   conversations,
   () => {
-    if (!me.value) return;
+    if (!me.value || suppressConversationSave) return;
     // 防抖：流式/图表更新时 deep watch 会连打 localStorage，易卡主线程
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
@@ -625,12 +717,18 @@ onMounted(async () => {
 // 1) 先读本地缓存立即渲染（无网络等待，避免白屏）；
 // 2) 再拉服务端（按登录用户归属）覆盖为权威数据；
 // 3) 服务端不可达/为空时保留本地缓存；本地也没有则尝试旧 v1 单会话迁移。
+// 4) 墓碑 id / 旧版 task-<sessionId> 不展示，并补删服务端残留。
 async function restoreConversations() {
+  hydrateClosedIds();
+
   // 本地兜底（旧 localStorage / 离线），先渲染。
   const local = loadConversations();
-  if (local.conversations.length) {
-    conversations.value = local.conversations;
-    activeId.value = local.activeId;
+  const localVisible = local.conversations.filter((c) => !shouldHideConversation(c.id));
+  if (localVisible.length) {
+    conversations.value = localVisible;
+    activeId.value = localVisible.some((c) => c.id === local.activeId)
+      ? local.activeId
+      : localVisible[0]?.id || "";
   } else {
     const migrated = migrateLegacy();
     if (migrated) {
@@ -643,22 +741,44 @@ async function restoreConversations() {
   // 服务端权威数据（MongoDB，按当前登录用户归属）。
   try {
     const remote = await fetchConversations();
-    if (remote.length) {
-      const convs: Conversation[] = remote
-        .filter((c) => c && c.id)
-        .slice(0, 20)
-        .map((c) => ({
-          id: c.id,
-          title: c.title || "新对话",
-          messages: (c.messages as Bubble[])
-            .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-            .slice(-80)
-            .map((m) => sanitizeBubble({ ...m, id: m.id || ++seq })),
-          createdAt: c.createdAt || 0,
-          updatedAt: c.updatedAt || 0,
-        }));
+    if (!remote.length) return;
+
+    const toPurge = remote
+      .filter((c) => c?.id && shouldHideConversation(c.id))
+      .map((c) => c.id);
+    for (const id of toPurge) apiDeleteConversation(id).catch(() => {});
+
+    // 墓碑里已不在远端的 id 可回收，避免 closed 列表无限涨。
+    let closedChanged = false;
+    for (const id of [...deletedConversationIds]) {
+      if (!remote.some((c) => c.id === id)) {
+        deletedConversationIds.delete(id);
+        closedChanged = true;
+      }
+    }
+    if (closedChanged) persistClosedIds();
+
+    const convs: Conversation[] = dedupeConversationList(remote
+      .filter((c) => c && c.id && !shouldHideConversation(c.id))
+      .slice(0, 20)
+      .map((c) => ({
+        id: c.id,
+        title: c.title || "新对话",
+        messages: (c.messages as Bubble[])
+          .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+          .slice(-80)
+          .map((m) => sanitizeBubble({ ...m, id: m.id || ++seq })),
+        createdAt: c.createdAt || 0,
+        updatedAt: c.updatedAt || 0,
+      })));
+
+    if (convs.length) {
       conversations.value = convs;
       activeId.value = convs.some((c) => c.id === local.activeId) ? local.activeId : convs[0]?.id || "";
+    } else if (toPurge.length) {
+      // 远端只剩应隐藏会话：保持本地可见列表（可能为空，后续 onMounted 会建空白会话）。
+      conversations.value = localVisible;
+      activeId.value = localVisible[0]?.id || "";
     }
   } catch {
     /* 服务端不可达：保留本地缓存 */

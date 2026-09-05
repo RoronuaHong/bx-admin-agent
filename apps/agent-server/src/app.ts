@@ -13,6 +13,7 @@ import {
   ownerKeyOf,
   renameConversation,
   upsertMessages,
+  TASK_RESULTS_CONV_ID,
   type StoredMessage,
 } from "./conversations.js";
 import { callUpstream } from "./upstream.js";
@@ -209,25 +210,28 @@ export function createApp() {
     userText: string;
     events: ChatEvent[];
     settled: boolean;
+    /** SSE 是否已把 done 成功转发给当前连接（在线收到结果则不必再建「后台任务结果」会话） */
+    clientGotDone: boolean;
+    /** 当前仍在转发的 SSE 订阅数；为 0 且未收到 done → 视为断线，可立即落库 */
+    sseListeners: number;
     controller: AbortController;
   }
   const runningTasks = new Map<string, RunningTask>(); // sessionId → 进行中任务
   const lastTasks = new Map<string, RunningTask>(); // sessionId → 最近任务（含已完成，供状态查询/回放）
   const TASK_BUFFER_TTL_MS = 5 * 60 * 1000;
 
-  // 任务收束后把结果落库：断线时前端不在线（无法走前端 upsert 通道），服务端把
-  // (userText, 最终答复) 追加到该会话的「后台任务结果」专用会话（id=task-<sessionId>，
-  // 与前端 conv_xxx 会话隔离），保证刷新/重连后数据不丢。title 为通用词，无业务语义。
-  async function persistTaskOutcome(session: { id: string }, ownerKey: string, countryId: string, loginName: string, userText: string, finalText: string): Promise<void> {
+  // 任务收束后把结果落库：仅当客户端未收到 done（刷新/断网）时，把
+  // (userText, 最终答复) 追加到该用户的「后台任务结果」专用会话（稳定 id=task-results，
+  // 按 ownerKey 一份，避免 session 轮换刷出一堆同名 tab）。title 为通用词，无业务语义。
+  async function persistTaskOutcome(ownerKey: string, countryId: string, loginName: string, userText: string, finalText: string): Promise<void> {
     if (!finalText.trim()) return;
     try {
-      const convId = `task-${session.id}`;
-      const existing = await getConversation(ownerKey, convId);
+      const existing = await getConversation(ownerKey, TASK_RESULTS_CONV_ID);
       await upsertMessages({
         ownerKey,
         countryId,
         loginName,
-        id: convId,
+        id: TASK_RESULTS_CONV_ID,
         title: "后台任务结果",
         messages: [
           ...(existing?.messages || []),
@@ -235,10 +239,21 @@ export function createApp() {
           { role: "assistant", text: finalText },
         ],
       });
-      console.log(`[chat/task] 结果已落库 ${convId}（累计 ${(existing?.messages.length || 0) + 2} 条）`);
+      console.log(`[chat/task] 结果已落库 ${TASK_RESULTS_CONV_ID}（累计 ${(existing?.messages.length || 0) + 2} 条）`);
     } catch (e) {
       console.warn("[chat/task] 结果落库失败（不影响任务收束）:", e instanceof Error ? e.message : e);
     }
+  }
+
+  /** 等 SSE 把 done 刷出去；无订阅者则马上判定未投递，避免固定 sleep。 */
+  async function waitForClientDelivery(task: RunningTask, maxMs = 2000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) {
+      if (task.clientGotDone) return true;
+      if (task.sseListeners <= 0) return false;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    return task.clientGotDone;
   }
 
   // 任务收束后延迟清缓冲（保留摘要字段供 status；防长文本事件长期占内存）
@@ -320,6 +335,9 @@ export function createApp() {
         userText: text,
         events: [],
         settled: false,
+        clientGotDone: false,
+        // 发起请求自带一条 SSE：先计入，避免任务瞬间结束时 listeners=0 被误判断线落库
+        sseListeners: 1,
         controller: new AbortController(),
       };
       runningTasks.set(session.id, task);
@@ -350,20 +368,24 @@ export function createApp() {
           const last = task.events[task.events.length - 1];
           if (!last || last.type !== "done") task.events.push({ type: "done" });
           task.settled = true;
-          // 断线闭环：最终答复落「后台任务结果」会话（前端不在线也能在刷新后看到）
-          const finalText = [...task.events].reverse().find((e) => e.type === "text");
-          if (finalText && finalText.type === "text") {
-            await persistTaskOutcome(
-              session,
-              ownerKey,
-              session.country.id,
-              session.user?.loginName || "anon",
-              text,
-              finalText.text,
-            );
+          // 有 SSE 订阅则等其刷完 done；已断线（listeners=0）立即落「后台任务结果」
+          const delivered = await waitForClientDelivery(task);
+          if (!delivered) {
+            const finalText = [...task.events].reverse().find((e) => e.type === "text");
+            if (finalText && finalText.type === "text") {
+              await persistTaskOutcome(
+                ownerKey,
+                session.country.id,
+                session.user?.loginName || "anon",
+                text,
+                finalText.text,
+              );
+            }
           }
           scheduleTaskGc(session.id, task);
-          console.log(`[chat/task] ${task.taskId} 收束（events=${task.events.length}，${Date.now() - task.startedAt}ms）`);
+          console.log(
+            `[chat/task] ${task.taskId} 收束（events=${task.events.length}，clientGotDone=${task.clientGotDone}，sse=${task.sseListeners}，${Date.now() - task.startedAt}ms）`,
+          );
         }
       })();
 
@@ -371,12 +393,21 @@ export function createApp() {
       // 客户端断开 → send 抛错 → 静默退出转发（后台任务不受影响）。
       return streamSse(async (send) => {
         let sent = 0;
-        for (;;) {
-          while (sent < task.events.length) {
-            send(task.events[sent++]);
+        try {
+          for (;;) {
+            while (sent < task.events.length) {
+              const ev = task.events[sent++];
+              send(ev);
+              if (ev.type === "done") task.clientGotDone = true;
+            }
+            if (task.settled && sent >= task.events.length) break;
+            await new Promise((r) => setTimeout(r, 100));
           }
-          if (task.settled && sent >= task.events.length) break;
-          await new Promise((r) => setTimeout(r, 100));
+        } catch {
+          // 客户端断开：不标记 clientGotDone，后台 finally 会落「后台任务结果」
+        } finally {
+          // 与创建时预计入的 1 对应；断线后 listeners=0，waitForClientDelivery 立即返回
+          task.sseListeners = Math.max(0, task.sseListeners - 1);
         }
       });
     } catch (error) {

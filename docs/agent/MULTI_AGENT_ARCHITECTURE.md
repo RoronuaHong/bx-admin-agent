@@ -95,7 +95,7 @@ interface WorkerDef {
 | Worker id | 领域 | 项目 | 环境 | 工具子集（示意） |
 |---|---|---|---|---|
 | `backend-api-bx-film-admin-test` | backend-api | bx-film-admin | test | search_api_module / read_api_module / call_api / grep_codebase / get_list_columns / render_table / export_dataset / submit_understood_intent … |
-| `backend-api-bx-film-admin-prod` | backend-api | bx-film-admin | prod | 同上 + writeConfirmPolicy=always |
+| `backend-api-bx-film-admin-prod` ✅ | backend-api | bx-film-admin | prod | 同上 + writeConfirmPolicy=always；域名走 `COUNTRY_*_PROD_*_URL` |
 | `knowledge` | knowledge | - | - | search_knowledge_base / fetch_url / read_file / list_dir / get_current_time |
 | **`consumer-viewing`（高优·方案已定）** | **consumer-viewing** | - | - | search_titles / recommend_titles / render_media_cards / open_title …；**Web only**；多语言跟聊；见 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)（代码未实现） |
 | `finance` | finance | - | - | call_api（财务模块）+ 报表工具（待财务模块明确） |
@@ -200,7 +200,7 @@ interface WorkerDef {
 | 阶段 | 内容 | 风险 | 依赖 |
 |---|---|---|---|
 | **M0** | 工具按领域分组标记 + 系统提示按领域裁剪候选（不拆 Agent） | 零 | 无 |
-| **M1** | 加 Supervisor 路由层：主管模型判（领域×环境）→ 交给对应上下文；含可选 worker 级模型切换（`preferredModel`）| 小 | 环境配置（test/prod URL） |
+| **M1** ✅ | 加 Supervisor 路由层：主管模型判（领域×环境）→ 交给对应上下文；含可选 worker 级模型切换（`preferredModel`）；2026-09-05 收尾（systemPrompt / prod Worker / 双域名） | 小 | 环境配置（test/prod URL） |
 | **M2** | Worker 独立成子图，各自完整 understand⇄tool→final 循环 | 中 | M1 路由稳定 |
 | **M3** | 并行 worker / 按 worker 隔离权限 / 独立审计；出现独立部署 worker 时经 A2A Client 编排（见 [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) §3.3）| 大 | 权限体系 |
 
@@ -216,7 +216,9 @@ interface WorkerDef {
 - [ ] 数据库 Agent 语义确认：直查 SQL 还是归后台 API Agent
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
 - [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
-- [ ] M1 实现 worker 级模型切换（`preferredModel`）：`resolveWorker` 命中后写入 `state.activeWorker`，understand/final 模型调用优先用该值；未配则沿用默认（2026-09-03 立项，见 §3.8）
+- [x] M1 实现 worker 级模型切换（`preferredModel`）：命中后 understand 优先用该模型；未配则沿用默认（代码已挂钩；默认注册表暂未配具体模型 id）
+- [x] **M1 收尾（2026-09-05）**：`systemPrompt` 注入 + `backend-api-…-prod` + `session.activeEnvironment` / `call_api.environment` + `resolveBaseUrl(country×env)` + META 始终可见
+- [x] **M1 路由完善（2026-09-05）**：未路由仅 META；自然问法评测 `eval-m1-routing-natural.mjs`（知识库/后台/模糊）实跑通过
 - [x] **观影助手 Worker 方案（高优）**：2026-09-05 定稿 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)——Web 先行、不做 App；Worker id=`consumer-viewing`；MVP 必补 + 多语言跟聊；**代码未开工**
 
 ---
@@ -249,3 +251,5 @@ interface WorkerDef {
 | 2026-09-03 | **M0 提交推送**（commit 81a29b8）+ 新增 `scripts/m0-instance-check.mjs` 实例测试 11/11 通过；同日立项 **M1 可选增强：Worker 级模型切换（preferredModel）**，写入 §3.3/§3.4/§3.8/§5/§6（不推翻「共享模型池」核心设计） |
 | 2026-09-03 | **Eval 通用化**：抽 `eval-core.mjs`（assertTraceGates/summarize 纯函数，不依赖登录/cookie/worker/业务词）；`eval-trace-gate.mjs` 退化为 bx-admin-agent 适配器；trace.ts 加 `currentRunId` 进程内兜底（单并发调试）+ `parentSpanId` 建树能力；§6.1 写入「trace 透传契约」（主→子 Agent runId 显式透传 + 黑名单 G2 三态） |
 | 2026-09-05 | **观影助手方案定稿（文档 only）**：新增 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)；Worker 清单登记 `consumer-viewing`（高优）；Web 先行 / 不做 App / MVP 必补 / 多语言跟聊；代码未实现 |
+| 2026-09-05 | **M1 收尾落地**：① Worker `systemPrompt` 经 `buildStaticGuide` + understand 动态注入；② 注册 `backend-api-bx-film-admin-prod`（`writeConfirmPolicy=always`）；③ `session.activeEnvironment` / `activeWorkerId` 持久化，`route_to_agent` 写入；④ `call_api.environment` + `resolveBaseUrl(country×env)`（prod 读 `COUNTRY_*_PROD_*_URL`）；⑤ 路由后工具菜单 = 白名单 ∪ META_TOOLS；⑥ `m1-instance-check.mjs` 扩覆盖。独立 `[route]` 节点仍不拆（路由仍在 understand⇄tool） |
+| 2026-09-05 | **M1 路由完善**：未路由时工具菜单收紧为 **仅 META_TOOLS**（机制强制先 `route_to_agent`，杜绝默认全量绕过）；注入 `[workflow/m1-route]` 引导；`/chat/context/clear` 同步清空 Worker；新增自然问法评测 `eval-m1-routing-natural.mjs` |

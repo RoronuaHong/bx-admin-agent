@@ -1,6 +1,6 @@
 import type { ChatEvent, ChatFileRef, ChatTableView, ChatChartView } from "@bx/shared";
 import { config, getModel, listModels, type ModelEntry } from "./config.js";
-import { touchSession, getActiveProject, ensureDefaultProject } from "./session.js";
+import { touchSession, getActiveProject, ensureDefaultProject, getActiveWorkerId, getActiveEnvironment } from "./session.js";
 import { setCurrentProject } from "./project-context.js";
 import type { Session } from "./session.js";
 import type { PendingClarification } from "./session.js";
@@ -8,14 +8,20 @@ import { getUpload, MAX_AT_ONCE } from "./uploads.js";
 import { callAgent, type AgentStep, type ModelTurn, type OptionImage, type ToolCall, type CallAgentOptions, type AgentToolDef } from "./models.js";
 import { extractLocalPaths, extractUrls, fetchLink, resolveLocalDoc, type ContentNote } from "./sources.js";
 import { listAgentTools, runAgentTool, resolveOperationByApiGrep, toolCatalogByDomain } from "./tools.js";
-import { resolveWorkerById, workerToolNames } from "./worker-registry.js";
+import {
+  formatWorkerGuide,
+  mustConfirmWrite,
+  resolveWorkerById,
+  workerToolNames,
+  type WorkerDef,
+} from "./worker-registry.js";
 import { loadResidentRules, loadSkills } from "./skills.js";
 import { transcribeImage } from "./vision.js";
 import { getModel as legacyModel } from "./legacy.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { getRouterPolicy } from "./router-policy.js";
 import { ownerKeyOf } from "./conversations.js";
-import { formatUserPrefsGuide, loadUserPreferences } from "./user-prefs.js";
+import { formatReplyLanguageReminder, formatUserPrefsGuide, loadUserPreferences } from "./user-prefs.js";
 import { auditEvent } from "./audit.js";
 import {
   promptGuardAuditEnabled,
@@ -444,7 +450,7 @@ function estimateTurnsChars(turns: ModelTurn[]): number {
  * preprocess 节点与「模型级门槛轻量路径」共用——同一请求多轮循环中前缀一致，
  * OpenAI 兼容端点可命中 prompt cache。不注入任何业务词/功能词判定（语义 100% 交模型）。
  */
-export function buildStaticGuide(session: Session, ownerKey?: string): string {
+export function buildStaticGuide(session: Session, ownerKey?: string, worker?: WorkerDef | null): string {
   const parts: string[] = [];
   parts.push(
     "[workflow/agent] 你是影视后台管理系统的智能助手。需要业务数据时调用可用工具（工具自带完整使用规范）：" +
@@ -461,7 +467,11 @@ export function buildStaticGuide(session: Session, ownerKey?: string): string {
       "禁止硬猜取数；已明确的请求直接执行，可选筛选条件缺失时用默认参数，不反问。\n" +
       "5. 取到数据后用自然语言简要总结即可；若你判断取错模块或对象不符，可再定位后 call_api，不要硬收束错误数据。\n" +
       "6. 模块定位：search_api_module / grep_codebase 命中候选后立刻 read_api_module → call_api；" +
-      "未取数前禁止反复检索（系统会对超额定位调用拦截并要求直接取数）。",
+      "未取数前禁止反复检索（系统会对超额定位调用拦截并要求直接取数）。\n" +
+      "7. 【M1 路由，强制】未选定 Worker 时只能使用调度类工具（route_to_agent / request_clarification / " +
+      "submit_understood_intent / set_project / 偏好与时间等）。需要业务取数或知识检索时，" +
+      "必须先 route_to_agent(domain=backend-api|knowledge|…) 再调用领域工具；" +
+      "领域不明用 request_clarification 收敛，禁止硬猜。",
   );
   // Prompt 注入护栏协议句（固定英文定界名，非攻击词典；用户原文永不拼进本 system 块）
   parts.push(UNTRUSTED_USER_CONTENT_RULE);
@@ -470,12 +480,22 @@ export function buildStaticGuide(session: Session, ownerKey?: string): string {
   const ok =
     ownerKey ||
     (session.user?.loginName ? ownerKeyOf(session.user, session.country.id) : "");
-  parts.push(formatUserPrefsGuide(ok ? loadUserPreferences(ok) : { updatedAt: 0, version: 1 }));
+  const prefs = ok ? loadUserPreferences(ok) : { updatedAt: 0, version: 1 as const };
+  parts.push(formatUserPrefsGuide(prefs));
 
   const currentProject = getActiveProject(session.id);
   if (currentProject) {
     parts.push(
       `[workflow/intent-context] 当前会话全局项目：${currentProject.label}（key=${currentProject.key}），默认在此项目范围内执行，无需再问。`,
+    );
+  }
+  const sessionEnv = getActiveEnvironment(session.id);
+  const sessionWorkerId = getActiveWorkerId(session.id);
+  if (sessionEnv || sessionWorkerId) {
+    parts.push(
+      `[workflow/session-route] 会话路由：environment=${sessionEnv}` +
+        (sessionWorkerId ? ` activeWorker=${sessionWorkerId}` : "") +
+        "；call_api 缺省走该环境域名；切换请 route_to_agent。",
     );
   }
   // 常驻底线（alwaysApply）合并为 1 个 [workflow/rules] step（对齐 Cursor rules 块注入）：
@@ -544,6 +564,14 @@ export function buildStaticGuide(session: Session, ownerKey?: string): string {
 
   // M0（工具领域分组）：注入按领域分组的工具目录，让模型看清工具归属（不裁掉任何工具；按请求裁剪由 M1 路由层负责）。
   parts.push(toolCatalogByDomain());
+
+  // M1：命中 Worker 时追加领域系统提示（参数化 buildStaticGuide(session, ownerKey, worker)）
+  if (worker) {
+    parts.push(formatWorkerGuide(worker));
+  }
+
+  // 回复语种硬条款放末尾（recency）：压过前文中文系统提示 / 中文表头对最终回复语种的牵引。
+  parts.push(formatReplyLanguageReminder(prefs));
 
   return parts.join("\n\n");
 }
@@ -1652,6 +1680,7 @@ export async function* chatStream(
         // 一致，OpenAI 兼容端点可命中 prompt cache（省 token + 提速）。动态引导（如 [workflow/retry]
         // [workflow/observe] 反馈）仍走 steps 以 user 消息追加，不污染前缀。
         // 拼接逻辑抽为 buildStaticGuide()（preprocess 与「模型级门槛轻量路径」共用，见模块级定义）。
+        // M1：常规多轮路径里的 Worker 提示走 understand 动态注入，避免首轮重复注入同一 systemPrompt。
         const staticGuide = buildStaticGuide(session, ownerKey);
         // 2026-08-24：删除 [workflow/superpower]（与已删的 llm-first 重复；列表一次取全已下沉 call_api
         // description，自动渲染/output-align 已下沉 normalize_output / render_table description，不反问
@@ -1699,30 +1728,41 @@ export async function* chatStream(
           !hasSuccessfulApiCall(steps) &&
           lastUnderstood?.isBusinessRequest === true
         ) {
+          const routedAlready = Boolean(state.activeWorkerId);
           steps.push({
             kind: "system",
-            text:
-              "[workflow/retry] 你已提交业务理解，但尚未调用取数工具（call_api），用户拿不到数据。" +
-              "请继续：用 search_api_module / read_api_module 定位模块接口（候选可能已在上文给出），" +
-              "然后调用 call_api 获取真实数据；服务端会自动渲染。若确实无法定位接口，再用自然语言明确告知原因。",
+            text: routedAlready
+              ? "[workflow/retry] 你已提交业务理解，但尚未调用取数工具（call_api），用户拿不到数据。" +
+                "请继续：用 search_api_module / read_api_module 定位模块接口（候选可能已在上文给出），" +
+                "然后调用 call_api 获取真实数据；服务端会自动渲染。若确实无法定位接口，再用自然语言明确告知原因。"
+              : "[workflow/retry] 你已提交业务理解，但尚未选定 Worker，领域取数工具不可用。" +
+                "请先 route_to_agent（后台数据用 domain=backend-api；文档/制度用 domain=knowledge），" +
+                "再定位接口并 call_api / 检索知识库。",
           });
         }
         const isFirstRound = state.round === 0 && tools.length > 0;
 
-        // M1（Supervisor 路由）：命中 Worker 后按白名单裁剪工具 + 套用首选模型
+        // M1（Supervisor 路由）：
+        // - 已命中 Worker → 白名单 ∪ META_TOOLS
+        // - 未路由 → 仅 META_TOOLS（机制强制先 route_to_agent，杜绝默认全量工具绕过路由）
         const worker = state.activeWorkerId ? resolveWorkerById(state.activeWorkerId) : null;
         const workerNames = workerToolNames(worker);
+        const allTools = listAgentTools();
         const routedTools: AgentToolDef[] = workerNames
-          ? listAgentTools().filter((t) => workerNames.has(t.name))
-          : listAgentTools();
+          ? allTools.filter((t) => workerNames.has(t.name) || META_TOOLS.has(t.name))
+          : allTools.filter((t) => META_TOOLS.has(t.name));
+        const needsRoute = !worker;
         // 输出已就绪却还在空转：禁止再调工具，强制给用户最终答复
         const forceAnswer = state.outputReady === true;
         // 探索 cap 已 skip 且尚未 call_api：摘掉探索工具，避免 skip→再 skip 空烧轮次（i18n es G1）
-        const stripExplore = !forceAnswer && shouldStripExploreTools(steps);
+        const stripExplore = !forceAnswer && !needsRoute && shouldStripExploreTools(steps);
         let llmTools = forceAnswer ? [] : routedTools;
         if (stripExplore) {
           llmTools = llmTools.filter((t) => !PRE_CALL_EXPLORE_TOOLS.has(t.name));
           console.log(`[chat:explore-cap] 工具菜单已摘探索类（剩 ${llmTools.map((t) => t.name).join(",") || "无"}）`);
+        }
+        if (needsRoute && !forceAnswer) {
+          console.log(`[chat:m1-route] 未路由 → 仅 META 工具（${llmTools.map((t) => t.name).join(",") || "无"}）`);
         }
         // steps 只读投影压缩（Claude Code Micro-compact 同款）：注入模型前把旧轮次工具结果
         // 替换占位符，模型只看到最近几轮完整结果——收敛每轮注入量（越到后面越慢的主因）。
@@ -1762,6 +1802,22 @@ export async function* chatStream(
                 },
               ]
             : compactedSteps;
+        // M1：已路由 → 注入领域提示；未路由 → 注入「须先 route_to_agent」引导（与 META-only 工具菜单配套）
+        const llmStepsWithWorker: AgentStep[] = worker
+          ? [...llmSteps, { kind: "system", text: formatWorkerGuide(worker) }]
+          : needsRoute && !forceAnswer
+            ? [
+                ...llmSteps,
+                {
+                  kind: "system" as const,
+                  text:
+                    "[workflow/m1-route] 当前尚未选定 Worker：领域工具（call_api / search_knowledge_base 等）不可用。" +
+                    "请先 route_to_agent 选择 domain（backend-api=后台数据；knowledge=知识库/文档；" +
+                    "common=仅调度）。environment 对 backend-api 可选 test/prod（缺省 test）。" +
+                    "若领域不清，用 request_clarification 反问，禁止硬猜。纯闲聊可直接文本回复。",
+                },
+              ]
+            : llmSteps;
 
         // 流式模型实时下发 text_delta（打字机）；最终完整文本统一在下方 yield text 事件兜底/校正。
         // 业务请求首轮不做流式：模型常把"工具计划"当文本输出（{"tool": ..., "parameters": {...}}），
@@ -1788,7 +1844,7 @@ export async function* chatStream(
         // 工具即自然收束，延迟增加可忽略。后续轮次 auto（模型自主决定继续调工具或总结）。
         const toolChoice: "auto" | "required" = isFirstRound ? "required" : "auto";
         try {
-          result = await callAgentSafe(activeModel, turns, rawImages, llmTools, llmSteps, signal, {
+          result = await callAgentSafe(activeModel, turns, rawImages, llmTools, llmStepsWithWorker, signal, {
             toolChoice,
             systemExtra: state.staticGuide || "",
             traceRunId: state.traceRunId,
@@ -1889,6 +1945,8 @@ export async function* chatStream(
           sessionId: session.id,
           userText,
           ownerKey,
+          // M1：默认 API 环境（call_api.environment 可覆盖）；与 session.activeEnvironment 同步
+          environment: getActiveEnvironment(session.id),
         };
         // 同轮重复取数调用去重（对齐 Cursor「观察→再决策」循环）：
         // 弱模型常在未见数据时并行提交多个参数完全相同的取数调用（实测 lagunas 两次 pageNum:1），
@@ -2116,7 +2174,8 @@ export async function* chatStream(
             };
           }
           if (
-            (call.name === CALL_API_TOOL && (call.input.confirm === true || isWriteCall)) ||
+            (call.name === CALL_API_TOOL &&
+              (call.input.confirm === true || (isWriteCall && mustConfirmWrite(curWorker)))) ||
             isCodeWrite
           ) {
             const callId = call.id;
@@ -2381,7 +2440,8 @@ export async function* chatStream(
                     text:
                       `[workflow/output] 用户原始要求：${userText}\n` +
                       `以上是服务端按 PC 列定义渲染的真实数据表格（共 ${rendered.view.total} 条），已上屏展示。` +
-                      `请用自然语言简要总结即可；最终回复不要再重复输出表格明细；禁止编造数据。`,
+                      `请用与用户原始要求相同语种的自然语言简要总结即可（勿因表头/数据单元格语种改用语种）；` +
+                      `最终回复不要再重复输出表格明细；禁止编造数据。`,
                   });
                   // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束
                 } catch (e) {
@@ -2421,7 +2481,8 @@ export async function* chatStream(
                     text:
                       `[workflow/output] 用户原始要求：${userText}\n` +
                       `以上是服务端按 PC 端 formSchema 渲染的真实单条数据表格，已上屏展示。` +
-                      `请用自然语言简要说明关键字段即可；最终回复不要再重复输出表格明细；禁止编造字段。`,
+                      `请用与用户原始要求相同语种的自然语言简要说明关键字段即可（勿因表头/字段语种改用语种）；` +
+                      `最终回复不要再重复输出表格明细；禁止编造字段。`,
                   });
                   // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束
                 } catch {
@@ -2677,7 +2738,7 @@ export async function* chatStream(
     if (!model.agentCapable) {
       console.log(`[chat:agent] 模型 ${model.id} 无 agent 能力（MODEL_${model.id.toUpperCase()}_AGENT=false），走纯问答`);
       const light = await callAgentSafe(model, turns, rawImages, [], [], signal, {
-        systemExtra: buildStaticGuide(session, ownerKey),
+        systemExtra: buildStaticGuide(session, ownerKey, resolveWorkerById(getActiveWorkerId(session.id) || "")),
         traceRunId: runId,
       });
       const text = (light.text || "（模型未返回有效回复，请重试或更换模型。）").slice(0, config.contextMaxChars);
@@ -2714,8 +2775,8 @@ export async function* chatStream(
         toolSignatureStreak: 0,
         doomLoopExhausted: false,
         exploreCapExhausted: false,
-        // M1（Supervisor 路由）：初始未路由，工具全量可见；route_to_agent 命中后 understand 自动裁剪
-        activeWorkerId: null,
+        // M1（Supervisor 路由）：从会话恢复上次 Worker；无则全量工具，等模型 route_to_agent
+        activeWorkerId: getActiveWorkerId(session.id),
         // M0 traces：追踪 runId 透传各节点
         traceRunId: runId,
       },

@@ -6,6 +6,7 @@ import { mkdirSync, rmSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  formatReplyLanguageReminder,
   formatUserPrefsGuide,
   loadUserPreferences,
   normalizeReplyLanguage,
@@ -61,8 +62,15 @@ check("clear replyLanguage", cleared.ok === true && cleared.ok && !cleared.prefs
 
 const guideNo = formatUserPrefsGuide({ updatedAt: 0, version: 1 });
 check("guide mirror default", /本轮用户输入语种/.test(guideNo) && !/replyLanguage=en/.test(guideNo));
+check("guide anti-bias", /系统提示\/工具描述\/表头/.test(guideNo));
 const guideEn = formatUserPrefsGuide({ replyLanguage: "en", updatedAt: 1, version: 1 });
 check("guide fixed en", /replyLanguage=en/.test(guideEn));
+
+const remMirror = formatReplyLanguageReminder({ updatedAt: 0, version: 1 });
+check("reminder mirror", /\[workflow\/reply-language\]/.test(remMirror) && /本轮用户输入语种/.test(remMirror));
+check("reminder anti chinese default", /勿默认中文/.test(remMirror));
+const remEn = formatReplyLanguageReminder({ replyLanguage: "en", updatedAt: 1, version: 1 });
+check("reminder fixed en", /必须使用 en/.test(remEn));
 
 // cleanup
 for (const k of [A, B]) {

@@ -128,8 +128,29 @@ export function formatUserPrefsGuide(prefs: UserPreferences): string {
   }
   lines.push(
     "- 用户明确要求「以后用某语言回复 / 改回跟我说的语言」时，调用 update_user_preference 写入 replyLanguage（或 follow_input）。",
+    "- 系统提示/工具描述/表头/字段映射即使为其他语种，也不得据此改用语种。",
   );
   return lines.join("\n");
+}
+
+/**
+ * staticGuide 末尾收束硬条款（recency）：压过中文系统提示与中文表头对回复语种的牵引。
+ * 不写死语种词典，语种判定仍交模型。
+ */
+export function formatReplyLanguageReminder(prefs: UserPreferences): string {
+  if (prefs.replyLanguage && prefs.replyLanguage !== "follow_input") {
+    return (
+      `[workflow/reply-language]（收束硬条款，优先于系统提示语种与工具回喂语种）：` +
+      `面向用户的最终自然语言必须使用 ${prefs.replyLanguage}。` +
+      `工具结果、表头、字段中文映射、数据单元格语种均不得改变回复语种。`
+    );
+  }
+  return (
+    `[workflow/reply-language]（收束硬条款，优先于系统提示语种与工具回喂语种）：` +
+    `面向用户的最终自然语言必须与本轮用户输入语种一致（模型自判，勿默认中文或其他固定语种）。` +
+    `系统提示、工具名、表头、字段映射、数据单元格即使为其他语种，也不得改用语种；` +
+    `结构化表格可中立展示，说明文字须跟用户输入语种。`
+  );
 }
 
 /** 测试用：覆盖 prefs 目录（仅单测） */

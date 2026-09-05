@@ -13,6 +13,12 @@ import type { SessionUser } from "@bx/shared";
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
 const COLL = "chat_conversations";
+/** 断线兜底会话稳定 id（按 ownerKey 一份）；旧版 task-<sessionId> 为孤儿。 */
+export const TASK_RESULTS_CONV_ID = "task-results";
+
+export function isLegacyTaskConversationId(id: string): boolean {
+  return id.startsWith("task-") && id !== TASK_RESULTS_CONV_ID;
+}
 
 export interface StoredMessage {
   role: "user" | "assistant";
@@ -91,20 +97,42 @@ function memSet(ownerKey: string, list: ConversationDoc[]) {
   memory.set(ownerKey, list);
 }
 
+function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
+  const byId = new Map<string, ConversationDoc>();
+  for (const doc of list) {
+    const prev = byId.get(doc.id);
+    if (!prev || doc.updatedAt >= prev.updatedAt) byId.set(doc.id, doc);
+  }
+  return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
 // ---- CRUD ----
 export async function listConversations(ownerKey: string): Promise<ConversationDoc[]> {
   const coll = await getColl();
   if (!coll) {
-    return [...memGet(ownerKey)].sort((a, b) => b.updatedAt - a.updatedAt);
+    const list = dedupeDocs(memGet(ownerKey));
+    return purgeLegacyTaskConversations(ownerKey, list);
   }
   const docs = await coll.find({ ownerKey }).sort({ updatedAt: -1 }).toArray();
-  return docs.map(({ _id, ...rest }) => rest as ConversationDoc);
+  const mapped = dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
+  return purgeLegacyTaskConversations(ownerKey, mapped);
+}
+
+/** 列表时顺带清掉旧版按 session 拆分的 task-*，避免刷新冒出一堆「后台任务结果」tab。 */
+async function purgeLegacyTaskConversations(
+  ownerKey: string,
+  list: ConversationDoc[],
+): Promise<ConversationDoc[]> {
+  const legacy = list.filter((d) => isLegacyTaskConversationId(d.id));
+  if (!legacy.length) return list;
+  await Promise.all(legacy.map((d) => deleteConversation(ownerKey, d.id).catch(() => {})));
+  return list.filter((d) => !isLegacyTaskConversationId(d.id));
 }
 
 export async function getConversation(ownerKey: string, id: string): Promise<ConversationDoc | null> {
   const coll = await getColl();
-  if (!coll) return memGet(ownerKey).find((c) => c.id === id) || null;
-  const doc = await coll.findOne({ ownerKey, id });
+  if (!coll) return dedupeDocs(memGet(ownerKey).filter((c) => c.id === id))[0] || null;
+  const doc = await coll.find({ ownerKey, id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
   return rest as ConversationDoc;
@@ -131,12 +159,36 @@ export async function createConversation(input: {
   const coll = await getColl();
   if (!coll) {
     const list = memGet(input.ownerKey);
+    const idx = list.findIndex((c) => c.id === input.id);
+    if (idx >= 0) {
+      const existing = list[idx]!;
+      existing.title = input.title || existing.title || "新对话";
+      existing.updatedAt = now;
+      if (!existing.createdAt) existing.createdAt = now;
+      memSet(input.ownerKey, dedupeDocs(list));
+      return existing;
+    }
     list.unshift(doc);
-    memSet(input.ownerKey, list);
+    memSet(input.ownerKey, dedupeDocs(list));
     return doc;
   }
-  await coll.insertOne(doc as ConversationDoc);
-  return doc;
+  await coll.updateMany(
+    { ownerKey: input.ownerKey, id: input.id },
+    {
+      $set: {
+        title: input.title || "新对话",
+        updatedAt: now,
+      },
+      $setOnInsert: {
+        countryId: input.countryId,
+        loginName: input.loginName,
+        createdAt: now,
+      },
+    },
+    { upsert: true },
+  );
+  const saved = await getConversation(input.ownerKey, input.id);
+  return saved || doc;
 }
 
 export async function upsertMessages(input: {
@@ -167,10 +219,10 @@ export async function upsertMessages(input: {
     doc.messages = input.messages;
     doc.updatedAt = Date.now();
     if (input.title) doc.title = input.title;
-    memSet(input.ownerKey, list);
+    memSet(input.ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateOne(
+  await coll.updateMany(
     { ownerKey: input.ownerKey, id: input.id },
     {
       $set: {
@@ -195,11 +247,17 @@ export async function renameConversation(
 ): Promise<void> {
   const coll = await getColl();
   if (!coll) {
-    const doc = memGet(ownerKey).find((c) => c.id === id);
-    if (doc) doc.title = title;
+    const list = memGet(ownerKey);
+    for (const doc of list) {
+      if (doc.id === id) {
+        doc.title = title;
+        doc.updatedAt = Date.now();
+      }
+    }
+    memSet(ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateOne({ ownerKey, id }, { $set: { title, updatedAt: Date.now() } });
+  await coll.updateMany({ ownerKey, id }, { $set: { title, updatedAt: Date.now() } });
 }
 
 export async function deleteConversation(ownerKey: string, id: string): Promise<void> {
@@ -211,15 +269,21 @@ export async function deleteConversation(ownerKey: string, id: string): Promise<
     );
     return;
   }
-  await coll.deleteOne({ ownerKey, id });
+  await coll.deleteMany({ ownerKey, id });
 }
 
 export async function clearConversation(ownerKey: string, id: string): Promise<void> {
   const coll = await getColl();
   if (!coll) {
-    const doc = memGet(ownerKey).find((c) => c.id === id);
-    if (doc) doc.messages = [];
+    const list = memGet(ownerKey);
+    for (const doc of list) {
+      if (doc.id === id) {
+        doc.messages = [];
+        doc.updatedAt = Date.now();
+      }
+    }
+    memSet(ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateOne({ ownerKey, id }, { $set: { messages: [], updatedAt: Date.now() } });
+  await coll.updateMany({ ownerKey, id }, { $set: { messages: [], updatedAt: Date.now() } });
 }

@@ -1,5 +1,6 @@
 import type { BaseUrlKey, CountryConfig } from "@bx/shared";
 import { createDecipheriv } from "node:crypto";
+import type { ApiEnvironment } from "./worker-registry.js";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -18,11 +19,38 @@ export function unwrapUpstream(payload: unknown) {
   return payload;
 }
 
-export function resolveBaseUrl(country: CountryConfig, key: BaseUrlKey) {
-  if (key === "user") return country.userUrl.replace(/\/$/, "");
-  if (key === "film") return country.filmUrl.replace(/\/$/, "");
-  if (key === "gather") return (country.gatherUrl || "").replace(/\/$/, "");
-  return country.backendUrl.replace(/\/$/, "");
+/** 按国家线 × 环境解析 API 基址（M1：test=COUNTRY_*_URL；prod=COUNTRY_*_PROD_*_URL） */
+export function resolveCountryApiUrls(
+  country: CountryConfig,
+  environment: ApiEnvironment = "test",
+): { backendUrl: string; userUrl: string; filmUrl: string; gatherUrl: string } {
+  if (environment === "test") {
+    return {
+      backendUrl: country.backendUrl || "",
+      userUrl: country.userUrl || "",
+      filmUrl: country.filmUrl || "",
+      gatherUrl: country.gatherUrl || "",
+    };
+  }
+  const envKey = country.id.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  return {
+    backendUrl: (process.env[`COUNTRY_${envKey}_PROD_BACKEND_URL`] || "").trim(),
+    userUrl: (process.env[`COUNTRY_${envKey}_PROD_USER_URL`] || "").trim(),
+    filmUrl: (process.env[`COUNTRY_${envKey}_PROD_FILM_URL`] || "").trim(),
+    gatherUrl: (process.env[`COUNTRY_${envKey}_PROD_GATHER_URL`] || "").trim(),
+  };
+}
+
+export function resolveBaseUrl(
+  country: CountryConfig,
+  key: BaseUrlKey,
+  environment: ApiEnvironment = "test",
+) {
+  const urls = resolveCountryApiUrls(country, environment);
+  if (key === "user") return urls.userUrl.replace(/\/$/, "");
+  if (key === "film") return urls.filmUrl.replace(/\/$/, "");
+  if (key === "gather") return (urls.gatherUrl || "").replace(/\/$/, "");
+  return urls.backendUrl.replace(/\/$/, "");
 }
 
 function tryDecrypt(ciphertext: string, keyB64: string) {
@@ -59,9 +87,18 @@ export async function callUpstream(options: {
   path: string;
   baseUrlKey: BaseUrlKey;
   params: Record<string, unknown>;
+  /** M1：API 环境；缺省 test */
+  environment?: ApiEnvironment;
 }) {
-  const base = resolveBaseUrl(options.country, options.baseUrlKey);
-  if (!base) throw new Error("该环境未配置对应 API 地址");
+  const environment = options.environment ?? "test";
+  const base = resolveBaseUrl(options.country, options.baseUrlKey, environment);
+  if (!base) {
+    throw new Error(
+      environment === "prod"
+        ? "生产环境未配置对应 API 地址；请在服务端设置 COUNTRY_<ID>_PROD_*_URL"
+        : "该环境未配置对应 API 地址",
+    );
+  }
   const path = options.path.startsWith("/") ? options.path : `/${options.path}`;
   const url = new URL(`${base}${path}`);
   url.searchParams.set("clientType", "5");

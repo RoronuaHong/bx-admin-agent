@@ -35,6 +35,10 @@ export interface Session {
   pendingClarification?: PendingClarification;
   // 全局项目上下文：跨轮记忆，用户切换项目后所有请求都在该项目范围内执行。
   activeProject?: ActiveProject;
+  /** M1：当前 API 环境（test/prod）；缺省 test。随 route_to_agent 写入，与 activeProject 同生命周期。 */
+  activeEnvironment?: "test" | "prod";
+  /** M1：最近一次 route_to_agent 命中的 Worker id；新一轮 chatStream 可从此恢复裁剪上下文。 */
+  activeWorkerId?: string | null;
 }
 
 export interface PendingClarificationOption {
@@ -169,6 +173,9 @@ export function clearSessionContext(id?: string | null): boolean {
   if (!session) return false;
   session.messages = [];
   delete session.pendingClarification;
+  // M1：清空路由态，避免「新话题」仍锁在上一 Worker（评测与「清空对话」语义一致）
+  session.activeWorkerId = null;
+  session.activeEnvironment = "test";
   persist();
   return true;
 }
@@ -187,6 +194,37 @@ export function setActiveProject(id: string | null | undefined, project: ActiveP
 export function getActiveProject(id: string | null | undefined): ActiveProject | null {
   if (!id) return null;
   return sessions.get(id)?.activeProject ?? null;
+}
+
+export function setActiveEnvironment(
+  id: string | null | undefined,
+  environment: "test" | "prod",
+): boolean {
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  session.activeEnvironment = environment;
+  persist();
+  return true;
+}
+
+export function getActiveEnvironment(id: string | null | undefined): "test" | "prod" {
+  if (!id) return "test";
+  return sessions.get(id)?.activeEnvironment === "prod" ? "prod" : "test";
+}
+
+export function setActiveWorkerId(id: string | null | undefined, workerId: string | null): boolean {
+  if (!id) return false;
+  const session = sessions.get(id);
+  if (!session) return false;
+  session.activeWorkerId = workerId;
+  persist();
+  return true;
+}
+
+export function getActiveWorkerId(id: string | null | undefined): string | null {
+  if (!id) return null;
+  return sessions.get(id)?.activeWorkerId ?? null;
 }
 
 /** 若会话尚无 activeProject，补齐默认项目并落盘（兼容升级前旧会话）。 */
