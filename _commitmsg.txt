@@ -1,9 +1,0 @@
-feat(pref): 用户偏好记忆 replyLanguage 落地 + 观影助手 Agent 方案定稿
-
-- src/user-prefs.ts 新增: 按 ownerKey 持久化用户偏好(L1 对齐 Cursor User Rules, 与会话历史分库, 覆盖写); 首期仅 replyLanguage(BCP-47 / follow_input / clear), 零业务词
-- tools.ts: 注册 update_user_preference(参数 key 白名单 replyLanguage) + get_user_preferences(读当前偏好); mcp.ts 同步注册 update_user_preference
-- chat.ts: buildStaticGuide 注入 formatUserPrefsGuide(偏好入 system 前缀, 模型回复按偏好语种); 相关引导重构
-- apps/web ChatPage.vue: 偏好相关 UI 支持
-- package.json: test 链追加 user-prefs.test.ts(新单测)
-- docs: VIEWING_ASSISTANT_AGENT.md 观影助手 Agent 方案定稿(Web 先行/不做 App, Worker consumer-viewing 高优登记, 文档 only 未写代码); MULTI_AGENT_ARCHITECTURE.md/README.md 索引同步
-- 清理: 误入库 '+s.description)(0B 空文件) 与 verify-all-out.txt(输出日志) 出库
