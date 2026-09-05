@@ -16,7 +16,7 @@
     "eval-enterprise-regression": "tsx scripts/eval-enterprise-regression.mjs",
     "eval-full-chain": "tsx scripts/eval-full-chain.mjs",
     "eval-e2e-chat": "tsx scripts/eval-e2e-chat.mjs",
-    "test": "tsx scripts/eval-core.test.ts",
+    "test": "tsx scripts/eval-core.test.ts && tsx scripts/rate-limit.test.ts && tsx scripts/alert-notify.test.ts && tsx scripts/prompt-guard.test.ts && tsx scripts/api-op-path-segment.test.ts",
     "eval:core": "tsx scripts/eval-core.test.ts",
     "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
     "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",

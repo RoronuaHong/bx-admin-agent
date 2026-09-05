@@ -6,15 +6,16 @@
  * 两者通过 runId 关联：审计事件带 runId，需要完整上下文时回 trace 反查。
  *
  * 设计原则：
- * - 零业务词：事件类型只有 reject / confirm_request / confirm_result 三种通用
- *   安全语义；tool/worker/method/path 等字段是运行时数据，不是代码写死。
+ * - 零业务词：事件类型为通用安全语义——reject / confirm_request / confirm_result /
+ *   prompt_guard（结构清洗/定界碰撞观察，不拒请求；reject 含 worker 越权与 rate_limit）；
+ *   tool/worker/method/path 等字段是运行时数据，不是代码写死。
  * - 零新依赖：Node 标准库；JSONL 按月分文件（audit-YYYYMM.jsonl），append-only。
  * - 主流程零感知：auditEvent 写失败仅 console，不中断业务路径。
  */
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type AuditEventKind = "reject" | "confirm_request" | "confirm_result";
+export type AuditEventKind = "reject" | "confirm_request" | "confirm_result" | "prompt_guard";
 export type ConfirmOutcome = "granted" | "denied" | "timeout";
 
 export interface AuditEvent {

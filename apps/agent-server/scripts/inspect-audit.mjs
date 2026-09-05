@@ -6,6 +6,7 @@
  *   tsx scripts/inspect-audit.mjs --from 2026-09-01     按起始日过滤
  *   tsx scripts/inspect-audit.mjs --kind reject         只看越权拒绝
  *   tsx scripts/inspect-audit.mjs --kind confirm_result 只看写确认结论
+ *   tsx scripts/inspect-audit.mjs --kind prompt_guard   只看 Prompt 结构观察
  *   tsx scripts/inspect-audit.mjs --limit 50
  *
  * 红线：本脚本不含任何业务词；事件类型与过滤维度均为通用安全语义。

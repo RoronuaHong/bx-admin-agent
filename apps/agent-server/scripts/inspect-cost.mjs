@@ -12,10 +12,12 @@
  * 环境变量（可选）：
  *   COST_RATE_<MODEL>_PROMPT / _COMPLETION   模型单价（每百万 token），未配只统计 token
  *   DAILY_TOKEN_BUDGET / RUN_TOKEN_BUDGET    预算阈值，超出时输出告警
+ *   ALERT_DINGTALK_WEBHOOK                   可选：钉钉机器人 Webhook，有告警时推送
  *
  * 红线：本脚本不含任何业务词，聚合维度仅为时间/模型/会话/耗时（通用维度）。
  */
 import { aggregateCost, budgetAlerts } from "../src/cost.ts";
+import { notifyAlerts } from "../src/alert-notify.ts";
 
 const args = process.argv.slice(2);
 const flag = (name) => {
@@ -82,5 +84,11 @@ const alerts = budgetAlerts(report);
 if (alerts.length) {
   console.log(`\n!! 预算告警 !!`);
   for (const a of alerts) console.log(`  - ${a}`);
+  const push = await notifyAlerts({ kind: "budget", messages: alerts });
+  if (push.attempted) {
+    console.log(
+      `  [notify] sent=${push.sent} dedup=${push.skippedDedup}${push.error ? ` error=${push.error}` : ""}`,
+    );
+  }
   process.exitCode = 1;
 }

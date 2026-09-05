@@ -23,8 +23,11 @@ import { readDownloadBytes } from "./downloads.js";
 import { attachMcp } from "./mcp.js";
 import { attachA2a } from "./a2a.js";
 import { aggregateCost, budgetAlerts } from "./cost.js";
-import { listAuditEvents, type AuditEventKind } from "./audit.js";
+import { auditEvent, listAuditEvents, type AuditEventKind } from "./audit.js";
 import { listRunSummaries, getRun, getRelease } from "./trace.js";
+import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
+import { notifyAlerts } from "./alert-notify.js";
+import { promptGuardAuditEnabled, sanitizeUserInput } from "./prompt-guard.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -132,6 +135,24 @@ export function createApp() {
   });
 
   app.post("/auth/login", async (c) => {
+    const ip = clientIpFromHeaders(c.req.raw.headers);
+    const loginRl = checkRateLimit({ bucket: "login", key: ip });
+    if (!loginRl.allowed) {
+      auditEvent({
+        kind: "reject",
+        sessionId: "anon",
+        detail: `rate_limit:login ip=${ip} limit=${loginRl.limit}`,
+      });
+      c.header("Retry-After", String(loginRl.retryAfterSec));
+      return c.json(
+        {
+          message: "登录尝试过于频繁，请稍后再试",
+          code: "RATE_LIMITED",
+          retryAfterSec: loginRl.retryAfterSec,
+        },
+        429,
+      );
+    }
     const body = await c.req.json<{ country?: string; username?: string; password?: string }>();
     const countryId = body.country || "";
     const username = (body.username || "").trim();
@@ -237,11 +258,20 @@ export function createApp() {
       const session = getSession(getCookie(c, COOKIE));
       if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
       const body = await c.req.json<{ text?: string; model?: string; images?: string[]; files?: string[] }>();
-      const text = preprocess(body.text || "");
+      const ownerKey = ownerKeyOf(session.user, session.country.id);
+      const cleaned = preprocess(body.text || "");
+      const text = cleaned.text;
       if (!text) return c.json({ message: "请输入内容" }, 400);
+      if (promptGuardAuditEnabled() && (cleaned.strippedCount > 0 || cleaned.truncated)) {
+        auditEvent({
+          kind: "prompt_guard",
+          sessionId: session.id,
+          ownerKey,
+          detail: `controls_stripped=${cleaned.strippedCount} truncated=${cleaned.truncated ? 1 : 0}`,
+        });
+      }
       const pickIds = (list: unknown) =>
         Array.isArray(list) ? list.filter((id): id is string => typeof id === "string") : [];
-      const ownerKey = ownerKeyOf(session.user, session.country.id);
 
       // 并发保护/断线重连：该会话已有任务在跑 → 仅回放缓冲 + 告知进行中，不开第二个任务
       //（防两个并发任务同时写 session.messages 交错污染）
@@ -256,6 +286,30 @@ export function createApp() {
             note: "该会话已有任务在后台执行，本连接为进度回放；任务完成后结果自动落入会话历史",
           });
         });
+      }
+
+      // 新任务才计限流（回放进行中任务不消耗配额）
+      const chatRl = checkRateLimit({ bucket: "chat", key: ownerKey });
+      if (!chatRl.allowed) {
+        auditEvent({
+          kind: "reject",
+          sessionId: session.id,
+          ownerKey,
+          detail: `rate_limit:chat owner=${ownerKey} limit=${chatRl.limit}`,
+        });
+        c.header("Retry-After", String(chatRl.retryAfterSec));
+        return c.json(
+          {
+            message: "请求过于频繁，请稍后再试",
+            code: "RATE_LIMITED",
+            retryAfterSec: chatRl.retryAfterSec,
+          },
+          429,
+        );
+      }
+      if (chatRl.limit > 0) {
+        c.header("X-RateLimit-Limit", String(chatRl.limit));
+        c.header("X-RateLimit-Remaining", String(chatRl.remaining));
       }
 
       // 新任务：后台消费 chatStream（任务级 AbortController，显式取消走 /chat/cancel）
@@ -364,7 +418,11 @@ export function createApp() {
     if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
     const ownerKey = ownerKeyOf(session.user, session.country.id);
     const limit = Math.min(Number(c.req.query("limit")) || 20, 50);
-    return c.json(listRunSummaries(limit, ownerKey));
+    const out = listRunSummaries(limit, ownerKey);
+    if (out.stats?.degradeHint) {
+      void notifyAlerts({ kind: "degrade", messages: [out.stats.degradeHint] });
+    }
+    return c.json(out);
   });
 
   // 单个 run 的完整 span 树；归属校验：非本人 run 一律 404（不泄漏存在性）
@@ -498,7 +556,12 @@ export function createApp() {
       ownerKey: ctx.ownerKey,
       slowestTopN: Number(c.req.query("top")) || 10,
     });
-    return c.json({ report, alerts: budgetAlerts(report) });
+    const alerts = budgetAlerts(report);
+    // 异步推送：不阻塞 HTTP；未配 webhook / 去重命中则 no-op
+    if (alerts.length) {
+      void notifyAlerts({ kind: "budget", messages: alerts });
+    }
+    return c.json({ report, alerts });
   });
 
   // 安全审计（只读）：越权拒绝 / 写确认事件。最小权限口径——登录用户只能查
@@ -591,13 +654,10 @@ export function createApp() {
 }
 
 // 输入预处理（规范第一层）：纯代码清洗，不走大模型。
-// 清多余空白/不可见字符、压缩多空格、截断超长输入。
-const MAX_INPUT_LEN = 500;
-function preprocess(raw: string): string {
-  let text = (raw || "").replace(/\u0000/g, ""); // 去 NUL
-  text = text.replace(/[ \t\u3000]+/g, " ").trim(); // 全角/多空格归一
-  if (text.length > MAX_INPUT_LEN) text = `${text.slice(0, MAX_INPUT_LEN)}…`;
-  return text;
+// Unicode 危险控制类剥离 + 空白归一 + 长度截断（零自然语言词典）。
+const MAX_INPUT_LEN = Math.max(1, Number(process.env.CHAT_MAX_INPUT_LEN) || 500);
+function preprocess(raw: string) {
+  return sanitizeUserInput(raw, MAX_INPUT_LEN);
 }
 
 function streamSse(run: (send: (event: unknown) => void) => Promise<void>) {

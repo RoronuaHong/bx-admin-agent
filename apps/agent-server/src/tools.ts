@@ -999,11 +999,14 @@ export function resolveOperationByApiGrep(operation: string): ApiOperation | nul
     const modPath = seg.slice(0, -1).join("/"); // movie/autoUpload
     const directFile = nodePath.join(apiDir, `${modPath}.ts`);
     if (existsSync(directFile)) {
-      const suffix = opSuffix || "getList";
-      return (
-        resolveApiOperation(`${modPath}.${suffix}`) ||
-        resolveApiOperation(`${modPath}.getList`)
-      );
+      // 有 func 后缀：走 resolve（含结构回落）；无后缀：模块下唯一接口才采纳（不默认 getList）
+      if (opSuffix) {
+        return (
+          resolveApiOperation(`${modPath}.${opSuffix}`) ||
+          resolveApiOperation(`${seg.slice(0, -1).join(".")}.${opSuffix}`)
+        );
+      }
+      return resolveUniqueOpUnderModule(modPath);
     }
   }
 
@@ -1025,9 +1028,27 @@ export function resolveOperationByApiGrep(operation: string): ApiOperation | nul
   const file = [...files][0].replace(/\\/g, "/");
   const fm = file.match(/src\/api\/(.+)\.ts$/);
   if (!fm) return null;
-  const moduleId = fm[1]; // 如 <模块>/<接口模块>、<模块>/<接口模块>
-  const suffix = opSuffix || "getList";
-  return resolveApiOperation(`${moduleId}.${suffix}`) || resolveApiOperation(`${moduleId}.getList`);
+  const moduleId = fm[1]; // 如 <模块>/<接口模块>
+  if (opSuffix) {
+    return (
+      resolveApiOperation(`${moduleId}.${opSuffix}`) ||
+      resolveApiOperation(`${moduleId.replace(/\//g, ".")}.${opSuffix}`)
+    );
+  }
+  return resolveUniqueOpUnderModule(moduleId);
+}
+
+/** 模块路径下若索引仅有 1 个 operation 则采纳，多接口不猜（替代写死 getList） */
+function resolveUniqueOpUnderModule(modulePath: string): ApiOperation | null {
+  const needle = modulePath.replace(/\\/g, "/").replace(/\.ts$/i, "").toLowerCase();
+  if (!needle) return null;
+  const ops = loadApiOperationIndex().operations.filter((o) => {
+    const mod = (o.module || "").replace(/\\/g, "/").toLowerCase();
+    const idHead = (o.id.split(".")[0] || "").replace(/\./g, "/").toLowerCase();
+    const file = (o.file || "").replace(/\\/g, "/").replace(/\.ts$/i, "").toLowerCase();
+    return mod === needle || mod.endsWith("/" + needle) || idHead === needle || file.endsWith("/" + needle) || file === needle;
+  });
+  return ops.length === 1 ? ops[0] : null;
 }
 
 /** ⚠️【临时只读模式】统一返回文案：写操作被拦截时的提示（2026-08-25，恢复读写时连同两处守卫一起删除）。 */

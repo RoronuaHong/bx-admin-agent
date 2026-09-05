@@ -17,6 +17,11 @@ import { getRouterPolicy } from "./router-policy.js";
 import { getClarificationPolicy } from "./clarification-policy.js";
 import { ownerKeyOf } from "./conversations.js";
 import { auditEvent } from "./audit.js";
+import {
+  promptGuardAuditEnabled,
+  UNTRUSTED_USER_CONTENT_RULE,
+  wrapUntrustedUserContent,
+} from "./prompt-guard.js";
 
 import { resolveApiOperation, resolveApiOperationByPath, resolveApiOperationByPathSuffix } from "./api-operation-index.js";
 import { guardCallApi, type CallApiGuardInput } from "./call-api-guard.js";
@@ -73,15 +78,24 @@ const EXPLORE_TOOLS = new Set([
 ]);
 /**
  * 模块定位检索类（未取数前反复调用会空转烧轮次）。
- * 读链路复测：search×2–3 + read×2 后才 call_api → rounds=9–10 触发 G1。
  * read_api_module 计入「取数前探索」总预算（见 PRE_CALL_EXPLORE_TOOLS），但不计入本集合。
  */
 const LOCATE_TOOLS = new Set(["search_api_module", "grep_codebase", "list_dir"]);
-/** 取数前探索（定位 + 读定义）；理想路径 search→read 恰好 2 次后必须 call_api */
-const PRE_CALL_EXPLORE_TOOLS = new Set([...LOCATE_TOOLS, "read_api_module"]);
+/**
+ * 取数前探索预算：默认 = 全部 EXPLORE_TOOLS，再减去「非模块定位」白名单。
+ * 新增探索类工具会自动进 cap，避免再漏 read_file/search_symbol 这类旁路。
+ */
+const PRE_CALL_EXPLORE_EXCLUDE = new Set([
+  "search_knowledge_base", // KB 文档检索，非 API 模块定位
+  "fetch_url",
+  "get_current_time",
+]);
+const PRE_CALL_EXPLORE_TOOLS = new Set(
+  [...EXPLORE_TOOLS].filter((n) => !PRE_CALL_EXPLORE_EXCLUDE.has(n)),
+);
 /** 自上次成功 call_api 起，允许实际执行的定位检索次数（收紧：1 次足够出候选） */
 const MAX_LOCATE_BEFORE_CALL_API = 1;
-/** 自上次成功 call_api 起，允许的取数前探索总次数（search+read 合计） */
+/** 自上次成功 call_api 起，允许的取数前探索总次数 */
 const MAX_PRE_CALL_EXPLORE = 2;
 
 /**
@@ -121,6 +135,68 @@ function countLocateToolsSinceLastCallApi(steps: AgentStep[]): number {
 }
 function countPreCallExploreSinceLastCallApi(steps: AgentStep[]): number {
   return countExploreToolsSinceLastCallApi(steps, PRE_CALL_EXPLORE_TOOLS);
+}
+
+/**
+ * 探索预算触顶后模型仍反复调 search（每 skip 仍烧 1 轮 LLM）→ G1。
+ * 剥离探索工具当且仅当（窗口=自上次成功 call_api 之后）：
+ * - 取数前探索预算已耗尽，或本窗口内出现过 explore-cap skip；且
+ * - 最近一次 call_api 不是 MODULE_RETRY / CLARIFICATION（失败后需允许再定位）。
+ */
+function lastCallApiNeedsRelocate(steps: AgentStep[]): boolean {
+  const idToName = new Map<string, string>();
+  for (const s of steps) {
+    if (s.kind === "toolCalls") for (const c of s.calls) idToName.set(c.id, c.name);
+  }
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (s.kind !== "toolResult") continue;
+    if (idToName.get(s.toolCallId) !== CALL_API_TOOL) continue;
+    const c = s.content || "";
+    return (
+      c.startsWith("错误：") ||
+      c.startsWith("MODULE_RETRY") ||
+      c.startsWith("CLARIFICATION_REQUIRED") ||
+      c.startsWith("[workflow/")
+    );
+  }
+  return false;
+}
+
+/** 自上次成功 call_api 之后是否出现过 explore-cap skip（旧窗口的 skip 不计入） */
+function hasExploreCapSkipSinceLastCallApi(steps: AgentStep[]): boolean {
+  const idToName = new Map<string, string>();
+  for (const s of steps) {
+    if (s.kind === "toolCalls") for (const c of s.calls) idToName.set(c.id, c.name);
+  }
+  let saw = false;
+  for (const s of steps) {
+    if (s.kind !== "toolResult") continue;
+    const name = idToName.get(s.toolCallId);
+    if (!name) continue;
+    if (name === CALL_API_TOOL) {
+      const c = s.content || "";
+      if (
+        c &&
+        !c.startsWith("错误：") &&
+        !c.startsWith("MODULE_RETRY") &&
+        !c.startsWith("CLARIFICATION_REQUIRED") &&
+        !c.startsWith("[workflow/")
+      ) {
+        saw = false; // 成功取数：窗口重置
+      }
+      continue;
+    }
+    if ((s.content || "").startsWith("[workflow/locate]")) saw = true;
+  }
+  return saw;
+}
+
+function shouldStripExploreTools(steps: AgentStep[]): boolean {
+  if (lastCallApiNeedsRelocate(steps)) return false;
+  // 仅「探索合计」耗尽才摘菜单（定位 cap=1 后仍允许 read_api_module 走完 search→read→call）
+  if (countPreCallExploreSinceLastCallApi(steps) >= MAX_PRE_CALL_EXPLORE) return true;
+  return hasExploreCapSkipSinceLastCallApi(steps);
 }
 /** 代码写入/提交类（高危操作，无条件确认，由服务端单独走确认流程） */
 const CODE_TOOLS = new Set(["write_code_file", "git_commit_push"]);
@@ -386,6 +462,8 @@ export function buildStaticGuide(session: Session): string {
       "6. 模块定位：search_api_module / grep_codebase 命中候选后立刻 read_api_module → call_api；" +
       "未取数前禁止反复检索（系统会对超额定位调用拦截并要求直接取数）。",
   );
+  // Prompt 注入护栏协议句（固定英文定界名，非攻击词典；用户原文永不拼进本 system 块）
+  parts.push(UNTRUSTED_USER_CONTENT_RULE);
 
   const currentProject = getActiveProject(session.id);
   if (currentProject) {
@@ -1519,7 +1597,18 @@ export async function* chatStream(
   if (notes.length) {
     chunks.push(`\n\n[资料来源]\n${notes.map((n, i) => `${i + 1}. ${n.label}: ${n.text}`).join("\n")}`);
   }
-  const humanText = chunks.join("").slice(0, config.contextMaxChars);
+  // 模型可见 user 内容：定界 + nonce；会话历史仍存清洗后原文（无定界），避免 UI 污染。
+  const wrappedUser = wrapUntrustedUserContent(chunks.join("").slice(0, config.contextMaxChars));
+  if (promptGuardAuditEnabled() && wrappedUser.boundaryCollisions > 0) {
+    auditEvent({
+      kind: "prompt_guard",
+      sessionId: session.id,
+      ownerKey,
+      runId,
+      detail: `boundary_collisions=${wrappedUser.boundaryCollisions}`,
+    });
+  }
+  const humanText = wrappedUser.text;
 
   // 历史上下文压缩（对齐 Cursor /summarize 分层）：session.messages 本体保留完整，
   // 模型只见「摘要块 + 预算内历史」的只读投影；超预算先低损 prune，仍超才 LLM 摘要。
@@ -1732,7 +1821,13 @@ export async function* chatStream(
           : listAgentTools();
         // 输出已就绪却还在空转：禁止再调工具，强制给用户最终答复
         const forceAnswer = state.outputReady === true;
-        const llmTools = forceAnswer ? [] : routedTools;
+        // 探索 cap 已 skip 且尚未 call_api：摘掉探索工具，避免 skip→再 skip 空烧轮次（i18n es G1）
+        const stripExplore = !forceAnswer && shouldStripExploreTools(steps);
+        let llmTools = forceAnswer ? [] : routedTools;
+        if (stripExplore) {
+          llmTools = llmTools.filter((t) => !PRE_CALL_EXPLORE_TOOLS.has(t.name));
+          console.log(`[chat:explore-cap] 工具菜单已摘探索类（剩 ${llmTools.map((t) => t.name).join(",") || "无"}）`);
+        }
         // steps 只读投影压缩（Claude Code Micro-compact 同款）：注入模型前把旧轮次工具结果
         // 替换占位符，模型只看到最近几轮完整结果——收敛每轮注入量（越到后面越慢的主因）。
         // state.steps 保持完整：返回时写回未压缩 steps（下方 return steps: steps）。
@@ -1760,7 +1855,17 @@ export async function* chatStream(
                   "务必基于工具结果说明结论；报表页不要声称已画 ECharts，用文字+表即可。",
               },
             ]
-          : compactedSteps;
+          : stripExplore
+            ? [
+                ...compactedSteps,
+                {
+                  kind: "system" as const,
+                  text:
+                    "[workflow/locate] 探索工具已暂时关闭（取数前预算已用尽）。请立刻 call_api 取数；" +
+                    "若返回 MODULE_RETRY 或数据对象不符，系统会重新开放定位工具。",
+                },
+              ]
+            : compactedSteps;
 
         // 流式模型实时下发 text_delta（打字机）；最终完整文本统一在下方 yield text 事件兜底/校正。
         // 业务请求首轮不做流式：模型常把"工具计划"当文本输出（{"tool": ..., "parameters": {...}}），

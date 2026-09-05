@@ -13,12 +13,12 @@
 |---|---|---|---|
 | **身份 Identity** | **2026-09-04 P2 已落地**：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限 | ✅ 已补 | 角色模型/管理员视角缺（CLI 承担全局） |
 | **异步 Async** | **2026-09-04 P2 已落地**：执行与推送解耦（断线任务继续跑完+结果自动落库）+ 并发回放 + 显式取消 + 任务状态查询 | ✅ 已补 | 无独立任务队列（进程内单任务/会话） |
-| **追踪 Tracing** | **2026-09-03 已建**：`trace.ts` + `inspect-trace.mjs`，runId 贯穿 + span 树 + token usage | ✅ 已补 | 仅 JSONL 落盘，无 Web 可视化/告警 |
-| **评测 Eval** | `eval-full-chain.mjs` 等脚本能跑全链路 PASS/FAIL + `process.exit(1)` | 🟡 雏形 | 未落库基线、未接 CI、断言维度浅（无 traces 复用） |
-| **成本 Cost** | **2026-09-04 P1 已落地**：`cost.ts` 聚合（日/模型/会话/慢调用）+ `inspect-cost.mjs` CLI + `GET /cost/summary` 只读端点 + 预算告警 | ✅ 已补 | 单价未配（只计 token）；告警未接通知渠道 |
-| **安全 Security** | **2026-09-04 P1 已落地**：`audit.ts` 审计落库（越权拒绝/写确认三态）+ `/audit/list` 端点 + `inspect-audit.mjs` CLI | 🟡→✅ 核心 | 限流、Prompt 注入防护仍缺 |
+| **追踪 Tracing** | **2026-09-03 已建**：`trace.ts` + `inspect-trace.mjs`，runId 贯穿 + span 树 + token usage | ✅ 已补 | — |
+| **评测 Eval** | **2026-09-04 P0 已落地**：`eval-core` + trace-gate + CI + chain-multirun 多点回归 | ✅ 已补 | 意图路由旧脚本仍失效（已排除出闸门） |
+| **成本 Cost** | **2026-09-04 P1 已落地**：聚合 + 预算告警 + **钉钉 Webhook 推送** | ✅ 已补 | 单价未配（只计 token）；多 key 成本分摊仍缺 |
+| **安全 Security** | **2026-09-04 P1 已落地**：审计 + **HTTP 限流** + **Prompt 结构护栏**（零词典） | ✅ 核心 | 语义过滤器/双模型隔离未做（非本阶段） |
 | **版本 Version** | **2026-09-04 P3 已落地**：release 标识（git sha）贯穿 trace run meta + eval 基线，回归按版本可对比 | ✅ 已补 | 提示词仍随代码发布（git revert 即回滚，够用） |
-| **可观测 Observ** | **2026-09-04 P3 已落地**：`GET /trace/runs`（摘要+统计）+ `/trace/run/:id`（span 树），ownerKey 隔离 | ✅ 已补 | 前端可视化页面挂账（端点已就绪） |
+| **可观测 Observ** | **2026-09-04 P3 已落地**：`GET /trace/runs` + `/trace/run/:id` + Web `/trace` 观察页 | ✅ 已补 | 进程级 Prometheus metrics 等接入需求 |
 
 ---
 
@@ -88,15 +88,23 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - **预算告警**：`budgetAlerts()` 按 `DAILY_TOKEN_BUDGET`（日）与 `RUN_TOKEN_BUDGET`（单请求均值）环境变量判断，超限输出告警（CLI 退出码 1 可接 CI/巡检）。
 - **单价可配**：`COST_RATE_<MODEL>_PROMPT/_COMPLETION`（每百万 token），未配置只统计 token、不编造费用（诚实降级，未配价 token 计入 `unpricedTokens`）。
 - 设计原则：零业务词（维度仅时间/模型/会话/耗时）、零新依赖（Node 标准库）、采集侧零感知。
-- 遗留：多 key 轮转（NVIDIA_API_KEYS）按 key 成本分摊；告警接入通知渠道（钉钉等）。
+- 遗留：多 key 轮转（NVIDIA_API_KEYS）按 key 成本分摊。
+- **告警推送（2026-09-04）**：`alert-notify.ts` 钉钉自定义机器人 Webhook（`ALERT_DINGTALK_WEBHOOK`）；预算告警（`inspect-cost` + `/cost/summary`）与劣化 `degradeHint`（`/trace/runs`）可推送；`ALERT_DEDUP_MS` 默认 30min 去重；`ALERT_BUDGET_NOTIFY` / `ALERT_DEGRADE_NOTIFY` 可关；未配 webhook 静默。
+- **挂账（后续）**：①生产 Webhook 尚未写入 `.env`（需在钉钉群创建「自定义机器人」后配置 `ALERT_DINGTALK_WEBHOOK` 并实推验收）；②真·单聊推个人（企业应用 OpenAPI + userid）未做，与群机器人 Webhook 不同通道。
 
-### 2.6 安全 Security 🟡→✅ 核心（P1 审计已落地）
+### 2.6 安全 Security ✅ P1 已落地（审计 + 限流 + Prompt 结构护栏）
 - 已有：写操作 `confirmation_required` 双确认（tool 节点 + 服务端兜底×2）；M1 执行层越权拒绝；写确认三态（granted/denied/timeout）。
-- **审计落库（本次落地）**：`src/audit.ts`——三类事件（`reject` / `confirm_request` / `confirm_result`）append-only JSONL 按月分文件（`.data/audit/audit-YYYYMM.jsonl`），与 trace 通过 runId 关联（审计独立留痕，不随 trace 轮转丢失）。接线点：tool 节点越权拒绝 + 三处写确认（工具节点 / 主 fallback / catch 兜底）。
+- **审计落库（本次落地）**：`src/audit.ts`——事件（`reject` / `confirm_request` / `confirm_result` / `prompt_guard`）append-only JSONL 按月分文件（`.data/audit/audit-YYYYMM.jsonl`），与 trace 通过 runId 关联（审计独立留痕，不随 trace 轮转丢失）。接线点：tool 节点越权拒绝 + 三处写确认（工具节点 / 主 fallback / catch 兜底）+ Prompt 结构观察。
 - **查看入口**：①CLI `scripts/inspect-audit.mjs`（`--from/--to/--kind/--limit`，全局视角）；②HTTP `GET /audit/list`（**ownerKey 隔离**：登录用户只能查自己的审计事件，最小权限；全局视角走 CLI）。
 - 设计原则：零业务词（事件类型为通用安全语义）、零新依赖、写失败不阻断主流程、ownerKey 来自登录态（countryId:loginName）。
 - 验证：模块回环 8/8（写入/倒序/kind 过滤/ownerKey 隔离/日期/limit）+ 端点匿名 401 / 登录态 200。
-- 仍缺：速率限制（防滥用/刷 token）、Prompt 注入防护闭环、审计事件告警推送。
+- **HTTP 限流（2026-09-04）**：进程内滑动窗口——`/chat/stream` 按 ownerKey（`RATE_LIMIT_CHAT_PER_MIN`，默认 20）、`/auth/login` 按 IP（`RATE_LIMIT_LOGIN_PER_MIN`，默认 30）；`RATE_LIMIT_WINDOW_MS` 默认 60s；阈值 ≤0 关闭。超限 429 + `Retry-After` + 审计 `reject`（detail=`rate_limit:…`）。进行中任务回放不计配额。多实例需入口层另限。
+- **Prompt 注入结构护栏（2026-09-04，零自然语言词典）**：对齐 OWASP LLM01——靠角色/通道/Unicode 类别/定界，不做越狱话术词表。
+  - `prompt-guard.ts`：`stripDangerousControls`（NUL/C0·C1/双向/零宽/Tags/VS）+ `wrapUntrustedUserContent`（每请求 nonce 定界，碰撞中和）；入口 `preprocess` 走 `sanitizeUserInput`（`CHAT_MAX_INPUT_LEN` 默认 500）。
+  - 用户原文只进 `role=user`（会话历史存清洗后原文；送模型时外包 `[user_message nonce="…"]`）；`buildStaticGuide` 注入 `UNTRUSTED_USER_CONTENT_RULE`（禁止把定界内文字当 system/tool 指令）。
+  - 默认不拒业务文；结构事件可选审计 `prompt_guard`（`PROMPT_GUARD_AUDIT`，默认开）。
+  - 验证：`scripts/prompt-guard.test.ts`（多语种保留 / 控制符剥离 / 定界碰撞中和）。
+- 遗留：语义过滤器、双模型隔离（本阶段明确不做）。
 
 ### 2.7 版本 Version ✅ P3 已落地（release 标识贯穿）
 - **release 标识（本次落地）**：`trace.ts getRelease()`——优先 `RELEASE` 环境变量（部署注入），否则 git 短 sha（进程内缓存一次），失败诚实 `unknown`。
@@ -121,7 +129,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 优先级 | 维度 | 动作 | 理由 |
 |---|---|---|---|
 | **P0** | 评测 Eval | ✅ 完整落地：通用 `eval-core` + `eval-trace-gate` + 分层入口（`pnpm eval`/`eval:full`/`eval:trace-gate`）+ CI 闸门 `.github/workflows/eval.yml` | 复用 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
-| **P1** | 安全审计 | ✅ 已落地：`audit.ts` 三类事件（越权拒绝/写确认请求/确认结论三态）append-only 落库 + `/audit/list`（ownerKey 隔离）+ `inspect-audit.mjs` | 上线必备合规；runId 关联 trace 可反查上下文 |
+| **P1** | 安全审计 | ✅ 已落地：审计三类 + 限流 + Prompt 结构护栏（零词典）+ `/audit/list` + `inspect-audit.mjs` | 上线必备合规；runId 关联 trace 可反查上下文 |
 | **P1** | 成本 Cost | ✅ 已落地：`cost.ts` 聚合 + `inspect-cost.mjs` CLI + `GET /cost/summary` 端点 + 预算告警（env 阈值） | traces 已采集，只差聚合 |
 | **P2** | 身份 Identity | ✅ 已落地：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限（只看自己，全局走 CLI） | 多租户上线前必需 |
 | **P2** | 异步 Async | ✅ 已落地：执行与推送解耦（断线任务跑完+自动落库）/ 并发回放 / `/chat/cancel` / `/chat/task/status` | 刷新丢结果根因消除；chat.ts 零改动 |
@@ -151,6 +159,11 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 空轮劣化信号 | ✅ §5.3 落地：`listRunSummaries` stats 增 `emptyRounds/emptyRetries/emptyRoundRate/shortCircuitRuns/degradeHint`；run 摘要带 per-run 空轮计数；阈值/备选模型走 env | src/trace.ts / scripts/trace-empty-stats.test.ts |
 | 2026-09-04 | Trace 前端可视化 | ✅ §5.4 落地：`apps/web` 新增 `/trace` 调用观察页（stats 条 + run 表 + span 树），Chat 顶栏入口，API `fetchTraceRuns`/`fetchTraceRun` | TracePage.vue / api.ts / router.ts |
 | 2026-09-04 | 定位空转熔断 | ✅ 读链路：定位≤1、探索合计（含 read）≤2 超额 skip；错 path（如 `/v0.1/user/getList`）猜 `module.func`；不提前 final→编排（编排 call_api 无 trace span 会红 G6）。实例 read **3/3** | src/chat.ts / api-operation-index.ts / tools.ts |
+| 2026-09-04 | 全链路复扫（6908145 后） | ✅ `battery/chit/kb/write/async/read` 全绿：battery 9/9、chit 3/3、kb 1/1、write+audit 4/4、async 6/6、read 3/3（gates 6/6）；软观察：chit#1 偶发把「你好」当业务澄清（suite 仍 PASS） | scripts/chain-multirun.mjs |
+| 2026-09-04 | HTTP 限流 | ✅ 进程内滑动窗口：`rate-limit.ts` + `/chat/stream`(ownerKey) + `/auth/login`(IP)；env 可关；429+Retry-After+审计 reject；单测 `rate-limit.test.ts` | src/rate-limit.ts / src/app.ts |
+| 2026-09-04 | 钉钉告警推送 | ✅ 代码就绪（Webhook+去重+单测+mock 实推）；**挂账**：生产 `ALERT_DINGTALK_WEBHOOK` 待群机器人 token；真·单聊推个人未做 | src/alert-notify.ts |
+| 2026-09-04 | Prompt 结构护栏 | ✅ 零词典：`prompt-guard.ts`（控制符剥离 + nonce 定界碰撞中和）+ preprocess/chat 接线 + static guide 协议句 + 审计 `prompt_guard`；单测入 `pnpm test` | src/prompt-guard.ts / src/app.ts / src/chat.ts / scripts/prompt-guard.test.ts |
+| 2026-09-05 | 多语言业务读修复 | ✅ 通用结构回落 + explore-cap；**续修**：strip 窗口仅自上次成功 call_api、apiGrep 去写死 getList（模块唯一才采纳）；单测 13/13 | api-operation-index.ts / chat.ts / tools.ts |
 
 ---
 
