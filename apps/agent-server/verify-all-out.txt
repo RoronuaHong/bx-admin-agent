@@ -1,7 +1,0 @@
-[2026-08-26T07:17:21.651Z] RESUME remaining=3
-[2026-08-26T07:17:22.119Z] #13 hyvision ok(0.5s) tables=0 submit=0 call_api=0 err=模型服务调用失败：model http 400: {"error":{"type":"invalid_request_error","code":"400001","message":"The request is invalid: invalid params. Please check the request body, required fields, and request format.","message_zh":"请求不合法：invalid params，请检查请求体、必填字段及请求格式是否正确。","source":"client","request_id":"fdba16f2-7255-41e | 
-[2026-08-26T07:17:22.120Z]   ..sleep 5min before next
-[2026-08-26T07:26:22.124Z] #13 nvstepflash ERROR(240.0s): timeout >240s
-[2026-08-26T07:26:22.125Z]   ..sleep 5min before next
-[2026-08-26T07:31:37.195Z] #13 nvnanoomni ok(15.0s) tables=0 submit=0 call_api=0 err=- | 需要确认【模块、pageSize】，请确认以下信息：1. 您要查询的是哪个模块的用户列表（例如：系统用户、演员、观众等）？2. 每页显示多少条记录（例如：每页10条、20条）？   1. 系统用户   2. 演员/演员信息   3. 观众/观众信息 请回复序号，或直接描述你的需求。
-[2026-08-26T07:31:37.195Z] DONE

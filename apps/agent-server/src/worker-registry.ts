@@ -59,7 +59,14 @@ export const DEFAULT_WORKERS: WorkerDef[] = [
     id: "common",
     domain: "common",
     label: "通用",
-    toolWhitelist: ["request_clarification", "parse_intent", "set_project", "get_current_time"],
+    toolWhitelist: [
+      "request_clarification",
+      "parse_intent",
+      "set_project",
+      "get_current_time",
+      "update_user_preference",
+      "get_user_preferences",
+    ],
   },
 ];
 

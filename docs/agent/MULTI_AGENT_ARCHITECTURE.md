@@ -14,6 +14,7 @@
 |---|---|
 | 后台管理系统 API Agent ×N | 多个后台系统，**每个系统分测试/生产两套环境** |
 | 知识库查询 Agent | 查企业文档（本地 RAG + 钉钉文档），给引用出处 |
+| **观影助手 Agent（高优）** | C 端找片/推荐；**Web 先行、不做 App**；详见 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md) |
 | 财务 Agent | 财务域查询/报表 |
 | 客服咨询 Agent | 面向用户的咨询问答 |
 | 数据库 Agent | 直查数据库/SQL（待明确，可能归后台 API Agent） |
@@ -96,6 +97,7 @@ interface WorkerDef {
 | `backend-api-bx-film-admin-test` | backend-api | bx-film-admin | test | search_api_module / read_api_module / call_api / grep_codebase / get_list_columns / render_table / export_dataset / submit_understood_intent … |
 | `backend-api-bx-film-admin-prod` | backend-api | bx-film-admin | prod | 同上 + writeConfirmPolicy=always |
 | `knowledge` | knowledge | - | - | search_knowledge_base / fetch_url / read_file / list_dir / get_current_time |
+| **`consumer-viewing`（高优·方案已定）** | **consumer-viewing** | - | - | search_titles / recommend_titles / render_media_cards / open_title …；**Web only**；多语言跟聊；见 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)（代码未实现） |
 | `finance` | finance | - | - | call_api（财务模块）+ 报表工具（待财务模块明确） |
 | `customer-service` | customer-service | - | - | search_knowledge_base + 纯问答（可配弱模型） |
 | `database` | database | - | - | 待明确（SQL 直查 vs 归 backend-api） |
@@ -136,6 +138,7 @@ interface WorkerDef {
 |---|---|
 | backend-api | search_api_module / read_api_module / call_api / grep_codebase / get_list_columns / render_table / export_dataset … |
 | knowledge | search_knowledge_base / fetch_url / read_file / list_dir … |
+| **consumer-viewing** | search_titles / recommend_titles / render_media_cards / open_title / add_to_watchlist …（与 admin 工具隔离） |
 | finance | call_api（财务模块）+ 报表工具 … |
 | customer-service | search_knowledge_base + 纯问答 … |
 | 通用 | request_clarification / set_project / route_to_agent / get_current_time … |
@@ -214,6 +217,7 @@ interface WorkerDef {
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
 - [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
 - [ ] M1 实现 worker 级模型切换（`preferredModel`）：`resolveWorker` 命中后写入 `state.activeWorker`，understand/final 模型调用优先用该值；未配则沿用默认（2026-09-03 立项，见 §3.8）
+- [x] **观影助手 Worker 方案（高优）**：2026-09-05 定稿 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)——Web 先行、不做 App；Worker id=`consumer-viewing`；MVP 必补 + 多语言跟聊；**代码未开工**
 
 ---
 
@@ -244,3 +248,4 @@ interface WorkerDef {
 | 2026-09-03 | **M0 落地**：tools.ts 全量 23 个工具加 `domain` 标注（backend-api 15 / knowledge 5 / common 4；finance/customer-service/database 预留）+ `listAgentToolsForDomains` 过滤函数 + `toolCatalogByDomain` 注入 system 前缀；chat.ts buildStaticGuide 消费。实际按请求裁剪留 M1 路由。红线合规（领域为通用分类词，无业务词写死） |
 | 2026-09-03 | **M0 提交推送**（commit 81a29b8）+ 新增 `scripts/m0-instance-check.mjs` 实例测试 11/11 通过；同日立项 **M1 可选增强：Worker 级模型切换（preferredModel）**，写入 §3.3/§3.4/§3.8/§5/§6（不推翻「共享模型池」核心设计） |
 | 2026-09-03 | **Eval 通用化**：抽 `eval-core.mjs`（assertTraceGates/summarize 纯函数，不依赖登录/cookie/worker/业务词）；`eval-trace-gate.mjs` 退化为 bx-admin-agent 适配器；trace.ts 加 `currentRunId` 进程内兜底（单并发调试）+ `parentSpanId` 建树能力；§6.1 写入「trace 透传契约」（主→子 Agent runId 显式透传 + 黑名单 G2 三态） |
+| 2026-09-05 | **观影助手方案定稿（文档 only）**：新增 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)；Worker 清单登记 `consumer-viewing`（高优）；Web 先行 / 不做 App / MVP 必补 / 多语言跟聊；代码未实现 |

@@ -14,8 +14,8 @@ import { transcribeImage } from "./vision.js";
 import { getModel as legacyModel } from "./legacy.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { getRouterPolicy } from "./router-policy.js";
-import { getClarificationPolicy } from "./clarification-policy.js";
 import { ownerKeyOf } from "./conversations.js";
+import { formatUserPrefsGuide, loadUserPreferences } from "./user-prefs.js";
 import { auditEvent } from "./audit.js";
 import {
   promptGuardAuditEnabled,
@@ -207,6 +207,9 @@ const META_TOOLS = new Set([
   "set_project",
   "request_clarification",
   "route_to_agent", // M1 Supervisor 路由：切换 Worker 上下文，属通用调度层，非业务数据动作
+  "update_user_preference",
+  "get_user_preferences",
+  "get_current_time",
 ]);
 /** 业务工具 = 数据产出 + 探索定位（模型真做业务动作的判定集） */
 const BUSINESS_TOOLS = new Set([...DATA_OUTPUT_TOOLS, ...EXPLORE_TOOLS]);
@@ -400,7 +403,6 @@ const HISTORY_SUMMARY_INPUT_CHARS = 12000; // 摘要输入截断（避免摘要�
 const HISTORY_SUMMARY_MAX_CHARS = 800; // 摘要文本上限
 const HISTORY_KEEP_RECENT_TURNS = 3; // LLM 摘要时保留最近 N 轮完整（对齐 Cursor 保留近期）
 const MAX_TOOL_ROUNDS = getRouterPolicy().runtimeHints.maxToolRounds;
-const MAX_CLARIFICATION_TURNS = getClarificationPolicy().maxClarificationTurnsPerIntent;
 
 // 内容长度超过该阈值时，auto 模式优先选上下文更大的模型。
 const AUTO_LONG_TEXT_CHARS = 4000;
@@ -442,12 +444,12 @@ function estimateTurnsChars(turns: ModelTurn[]): number {
  * preprocess 节点与「模型级门槛轻量路径」共用——同一请求多轮循环中前缀一致，
  * OpenAI 兼容端点可命中 prompt cache。不注入任何业务词/功能词判定（语义 100% 交模型）。
  */
-export function buildStaticGuide(session: Session): string {
+export function buildStaticGuide(session: Session, ownerKey?: string): string {
   const parts: string[] = [];
   parts.push(
     "[workflow/agent] 你是影视后台管理系统的智能助手。需要业务数据时调用可用工具（工具自带完整使用规范）：" +
       "业务请求第一步调用 submit_understood_intent 提交理解，再按需 search_api_module / read_api_module 定位接口并 call_api；" +
-      "可多轮调用工具直至拿到数据；取到数据后组织自然语言总结，始终用中文回复，不向用户复述内部工具调用过程。\n" +
+      "可多轮调用工具直至拿到数据；取到数据后组织自然语言总结，不向用户复述内部工具调用过程。\n" +
       "[workflow/tool-calling]（对齐 Cursor agent，最高优先级）：\n" +
       "1. 所有工具调用必须通过函数调用通道（tool_calls）发起；禁止以任何文本形式模拟工具调用" +
       "（JSON/XML/方括号/自然语言描述），此类输出一律无效，会被系统丢弃；\n" +
@@ -457,13 +459,18 @@ export function buildStaticGuide(session: Session): string {
       "就必须调用工具获取真实数据后回答；仅当纯问候/寒暄/闲聊才直接回复，无需调用工具。\n" +
       "4. 当请求目标/关键用词语义模糊、无法确定唯一业务含义，或缺少必要操作对象时，用 request_clarification 反问用户确认后再执行，" +
       "禁止硬猜取数；已明确的请求直接执行，可选筛选条件缺失时用默认参数，不反问。\n" +
-      "5. 取到数据后、总结前必须先核对「数据语义是否对应用户问题」：返回记录的业务对象类别是否与用户请求一致。" +
-      "若发现取错模块或数据对象不符，禁止硬收束——用 search_api_module 重新定位正确模块后再 call_api 取数。\n" +
+      "5. 取到数据后用自然语言简要总结即可；若你判断取错模块或对象不符，可再定位后 call_api，不要硬收束错误数据。\n" +
       "6. 模块定位：search_api_module / grep_codebase 命中候选后立刻 read_api_module → call_api；" +
       "未取数前禁止反复检索（系统会对超额定位调用拦截并要求直接取数）。",
   );
   // Prompt 注入护栏协议句（固定英文定界名，非攻击词典；用户原文永不拼进本 system 块）
   parts.push(UNTRUSTED_USER_CONTENT_RULE);
+
+  // L1 用户偏好（对齐 Cursor User Rules）：按 ownerKey 注入；无 ownerKey 时仍给默认 mirror 规则
+  const ok =
+    ownerKey ||
+    (session.user?.loginName ? ownerKeyOf(session.user, session.country.id) : "");
+  parts.push(formatUserPrefsGuide(ok ? loadUserPreferences(ok) : { updatedAt: 0, version: 1 }));
 
   const currentProject = getActiveProject(session.id);
   if (currentProject) {
@@ -532,7 +539,7 @@ export function buildStaticGuide(session: Session): string {
     "[workflow/chit-chat] 若用户询问公司内部规范、制度、流程、报销、考勤、部署等**知识库文档类**问题，" +
       "可调用 search_knowledge_base 检索本地知识库后基于检索结果回答（仅此一个工具可用）。" +
       "回答必须是普通文本：禁止输出 JSON、禁止输出工具调用描述，一段话说清即收束。" +
-      "注意：中文输入默认视为有效请求（可能含业务/知识库/闲聊意图），不要当作乱码或测试内容。",
+      "注意：任意语种的有效自然语言输入均视为正常请求（可能含业务/知识库/闲聊意图），不要当作乱码或测试内容。",
   );
 
   // M0（工具领域分组）：注入按领域分组的工具目录，让模型看清工具归属（不裁掉任何工具；按请求裁剪由 M1 路由层负责）。
@@ -571,7 +578,7 @@ async function summarizeHistory(model: ModelEntry, turns: ModelTurn[], signal?: 
   const result = await callAgentSafe(
     model,
     [
-      { role: "user", content: "你是对话历史压缩助手。请把用户与助手的对话压缩成简洁中文摘要。" },
+      { role: "user", content: "你是对话历史压缩助手。请把用户与助手的对话压缩成简洁摘要，摘要语言与对话主体语言一致。" },
       {
         role: "user",
         content:
@@ -731,22 +738,6 @@ function renderClarificationForUser(raw: string): string {
   return lines.join("\n");
 }
 
-function pickClarificationOption(pending: PendingClarification, userText: string): { value: string; label: string } | null {
-  const txt = userText.trim();
-  if (!txt) return null;
-  const num = Number(txt);
-  if (!Number.isNaN(num) && Number.isInteger(num) && num >= 1 && num <= pending.options.length) {
-    const hit = pending.options[num - 1];
-    return { value: hit.value, label: hit.label };
-  }
-  const lowered = txt.toLowerCase();
-  const byValue = pending.options.find((o) => o.value.toLowerCase() === lowered);
-  if (byValue) return { value: byValue.value, label: byValue.label };
-  const byLabel = pending.options.find((o) => o.label.includes(txt));
-  if (byLabel) return { value: byLabel.value, label: byLabel.label };
-  return null;
-}
-
 // 网关瞬时错误 / 空响应偶发兜底：最多重试 2 次（含 429 限流退避）。
 // 覆盖：
 // - TokenHub 504001 网关超时 / 503 服务暂不可用（过载、健康检查、限流，body 常为空）
@@ -830,28 +821,6 @@ async function callAgentSafe(
   }
   span?.end({ status: "error", error: String(lastErr) });
   throw lastErr;
-}
-
-/**
- * 判断用户输入是「对旧澄清的回复」还是「新请求」（2026-08-25 收窄为纯协议判定）：
- * 此前含中文业务词（推荐片段/时间标签/用户等）与功能词（查询/查看/列表等）正则预判，
- * 违反「全部由大模型判断」红线（语义判定应交给模型，服务端不写死业务词/功能词）。
- * 现在只识别强结构信号：
- *  - 纯序号 / 纯候选值（1、<模块>/<接口模块>、xxx）→ 澄清回复
- *  - 简短明确选择短语（是/否/好的/确认/取消）→ 澄清回复
- *  - 其余一律按「新请求」处理（宁可交给主流程/模型判断，不让旧澄清劫持新任务）。
- * 语义歧义（用户新输入恰好类似选择短语）由模型在主流程上下文判断，服务端不做词形预判。
- */
-function isLikelyFreshRequest(userText: string): boolean {
-  const txt = userText.trim();
-  if (!txt) return false;
-  // 纯序号 / 纯候选值（对澄清选项的回复）
-  if (/^\d+$/.test(txt)) return false;
-  if (txt.length <= 64 && /^[a-zA-Z0-9_.\-\/]+$/.test(txt)) return false;
-  // 简短明确选择短语（协议级，非语义）
-  if (/^(是|否|好的|好|确认|取消|嗯|行)$/i.test(txt)) return false;
-  // 其余（含中文长句 / 标点 / 自然语言）一律视为新请求
-  return true;
 }
 
 /** 从工具结果中解析 UI_TABLE / UI_FILE / UI_CHART 块并推送到前端 */
@@ -1032,9 +1001,9 @@ function validateFinalText(text: string): "tool-call" | "clarification" | "bare-
 /**
  * 折叠最终回复中重复的 markdown 表格（2026-08-26，方案 B 兜底）。
  *
- * 背景：列表/详情渲染分支会把真实数据以 UI_TABLE 上屏（前端 admin-table 展示），同时 list-verify/
- * detail-verify 引导模型校验总结。若模型不听引导仍把完整 markdown 表格写进最终文本，用户会看到
- * 「两块数据」（上屏表格 + 文本内重复表格）。此处做服务端兜底折叠。
+ * 背景：列表/详情渲染分支会把真实数据以 UI_TABLE 上屏（前端 admin-table 展示）。
+ * 若模型仍把完整 markdown 表格写进最终文本，用户会看到「两块数据」（上屏表格 + 文本内重复表格）。
+ * 此处做服务端兜底折叠。
  *
  * 规则（纯协议结构检测，零业务词）：
  *  - 仅当本轮已上屏表格（session.lastTable 存在且时间在本次请求窗口内）才折叠；
@@ -1403,75 +1372,11 @@ export async function* chatStream(
   // P2 溯源：操作者归属（countryId:loginName）先于 beginRun 计算，贯穿 trace/审计/成本
   const ownerKey = ownerKeyOf(session.user, session.country.id);
   const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model, ownerKey });
+  // 待澄清状态不在服务端用词形/序号匹配续跑：一律丢弃，本轮当新消息进主 LLM，
+  // 由模型结合会话历史理解用户回复。避免 isLikelyFreshRequest / pickClarificationOption 写死判断。
   if (session.pendingClarification) {
-    // 仅问 project 的待澄清：本部署已默认绑定影视后台，直接丢弃，按新消息走主流程
-    if (
-      session.pendingClarification.missingSlots?.length === 1 &&
-      session.pendingClarification.missingSlots[0] === "project"
-    ) {
-      ensureDefaultProject(session.id);
-      delete session.pendingClarification;
-      touchSession(session);
-    }
-  }
-
-  if (session.pendingClarification) {
-    const pending: PendingClarification = session.pendingClarification;
-    if (isLikelyFreshRequest(userText)) {
-      // 用户给了新需求，丢弃旧的待澄清状态，避免“反问上限”误伤新请求。
-      delete session.pendingClarification;
-      touchSession(session);
-    } else {
-    const picked = pickClarificationOption(pending, userText);
-    if (!picked) {
-      pending.turns += 1;
-      if (pending.turns >= MAX_CLARIFICATION_TURNS) {
-        const ranked = pending.options
-          .filter((o) => o.label)
-          .map((o, i) => `  ${i + 1}. ${o.label}`)
-          .join("\n");
-        const missingLabel = pending.missingSlots.map((s) => SLOT_LABELS[s] || s).join("、");
-        const text = `还需要确认【${missingLabel}】，请选择一项：\n${ranked}\n请回复序号。`;
-        session.messages.push({ role: "assistant", text });
-        yield { type: "text", text };
-        yield { type: "done" };
-        touchSession(session);
-        return;
-      }
-      const options = pending.options
-        .filter((o) => o.label)
-        .map((o, i) => `  ${i + 1}. ${o.label}`)
-        .join("\n");
-      const missingLabel = pending.missingSlots.map((s) => SLOT_LABELS[s] || s).join("、");
-      const text = `需要确认【${missingLabel}】，${pending.question}\n${options}\n请回复序号。`;
-      session.messages.push({ role: "assistant", text });
-      yield { type: "text", text };
-      yield { type: "done" };
-      touchSession(session);
-      return;
-    }
-
-    const resumeInput = { ...pending.resumeInput };
-    if ((pending as PendingClarification).missingSlots.includes("operation") && picked.value) {
-      resumeInput.operation = picked.value;
-    }
     delete session.pendingClarification;
-    const resumed = await runAgentTool(pending.resumeTool, resumeInput, {
-      token: session.token,
-      country: session.country,
-      menus: session.menus,
-      ownerKey,
-    });
-    const text = resumed.startsWith("CLARIFICATION_REQUIRED")
-      ? renderClarificationForUser(resumed)
-      : resumed;
-    session.messages.push({ role: "user", text: userText });
-    session.messages.push({ role: "assistant", text });
-    yield { type: "text", text };
-    yield { type: "done" };
     touchSession(session);
-    return;
-    }
   }
 
   session.messages.push({ role: "user", text: userText });
@@ -1482,15 +1387,6 @@ export async function* chatStream(
   // 请求级项目上下文：grep/渲染/索引按当前会话的项目解析代码根目录（方案 A 多项目）。
   // 下一请求会再次 set 覆盖，无需显式 clear（避免 generator 多出口漏清理）。
   setCurrentProject(getActiveProject(session.id)?.key || "");
-  // 若仍卡在「选项目」待澄清，直接丢弃（项目已绑定）
-  const pendingPc = session.pendingClarification as PendingClarification | undefined;
-  if (
-    pendingPc?.missingSlots?.length === 1 &&
-    pendingPc.missingSlots[0] === "project"
-  ) {
-    delete session.pendingClarification;
-    touchSession(session);
-  }
 
   // ---- 图片：按模型能力处理 ----
   const images: OptionImage[] = (opts.images || [])
@@ -1756,7 +1652,7 @@ export async function* chatStream(
         // 一致，OpenAI 兼容端点可命中 prompt cache（省 token + 提速）。动态引导（如 [workflow/retry]
         // [workflow/observe] 反馈）仍走 steps 以 user 消息追加，不污染前缀。
         // 拼接逻辑抽为 buildStaticGuide()（preprocess 与「模型级门槛轻量路径」共用，见模块级定义）。
-        const staticGuide = buildStaticGuide(session);
+        const staticGuide = buildStaticGuide(session, ownerKey);
         // 2026-08-24：删除 [workflow/superpower]（与已删的 llm-first 重复；列表一次取全已下沉 call_api
         // description，自动渲染/output-align 已下沉 normalize_output / render_table description，不反问
         // 已下沉 request_clarification description + resident rule #3，见 PROMPT_ARCHITECTURE.md §4）。
@@ -2400,9 +2296,8 @@ export async function* chatStream(
               ? (resolveApiOperation(op) || resolveOperationByApiGrep(op))
               : null;
             // 只传 path 不传 operation 时（弱模型常见）：从 path 反查索引模块，保证渲染分支
-            // + list-verify 校验引导不因 module 为空而跳过（2026-08-25 修复：lagunas「影片前2页」
-            // 只取第1页收束的根因——resolvedModule="" → 渲染分支跳过 → 模型没看到用户要求回显
-            // 与中文表格，无从核对「前2页」）。
+            // 不因 module 为空而跳过（2026-08-25 修复：lagunas「影片前2页」只取第1页收束的根因——
+            // resolvedModule="" → 渲染分支跳过 → 模型没看到中文表格）。
             const resolvedModule =
               resolvedOpForRender?.module?.split("/").filter(Boolean).pop() ||
               op.split(".")[0] ||
@@ -2480,43 +2375,15 @@ export async function* chatStream(
                   // 2) 数据回喂：call_api 原始 toolResult 替换为渲染后的中文 markdown 表格（模型直接看真实数据）
                   const idx = nextSteps.findIndex((s) => s.kind === "toolResult" && s.toolCallId === call.id);
                   if (idx >= 0) nextSteps[idx] = { kind: "toolResult", toolCallId: call.id, content: rendered.md };
-                  // 3) 校验引导：模型基于真实数据校验对比输入值，符合则总结收束，不符合可补取。
-                  //    用户原始要求原样回显（薄 prompt）：给模型明确的核对基准（页数/条数/筛选条件/
-                  //    字段范围），逐项比对已渲染数据，避免模型「拿到的不是用户要的」也照常收束。
-                  //    回显用户原话是上下文注入（非词形判定），不违反「全部由大模型判断」红线。
-                  const missing = [...(rendered.needsModelMapping || []), ...(rendered.needsValueMapping || [])].join("、");
-                  // 字段差异清单（2026-08-26）：PC 列定义 vs 接口返回数据的结构差异，显式回喂模型校对。
-                  // pcMissing=PC 端有但接口返回缺（空列）；dataExtra=接口返回有但 PC 端未定义列（未展示）。
-                  // 由模型裁决：缺字段是接口不对/参数缺/嵌套未展平需补取，还是如实说明；多余字段是否有价值。
-                  const fd = rendered.fieldDiff;
-                  const diffText = fd
-                    ? `【字段差异校对】服务端比对了 PC 端列定义与接口返回字段：\n` +
-                      (fd.pcMissing.length ? `- PC 端有定义但接口返回缺失：${fd.pcMissing.join("、")}（已渲染为空列）——请判断是接口不对、缺参数还是嵌套结构未展平，需补取请调 call_api\n` : "") +
-                      (fd.dataExtra.length ? `- 接口返回有但 PC 端未定义：${fd.dataExtra.join("、")}（未展示）——请判断是否用户关注字段，需展示可调 render_table\n` : "")
-                    : "";
-                  // 硬结算清单（对齐 Cursor subagent 自校验 / Claude Code ExitPlanMode 前必须总结）：
-                  // 把「请核对」升级为「必须按固定格式输出逐项结论」，模型被迫显式陈述而非内心默念，
-                  // 缺任一结论视为未通过、继续补取或反问（仍是 prompt 引导、判定交模型，不写死业务词）。
+                  // 3) 薄提示：表格已上屏；总结交模型，不做服务端校验结论/字段差异校对模板。
                   nextSteps.push({
                     kind: "system",
                     text:
-                      `[workflow/list-verify] 用户原始要求：${userText}\n` +
-                      `以上是服务端按 PC 列定义渲染的真实数据表格（共 ${rendered.view.total} 条）` +
-                      (missing ? `；以下字段未能在源码提取到中文映射，已如实展示原文：${missing}` : "") +
-                      (diffText ? `\n${diffText}` : "") +
-                      `。请在收束前**按以下固定格式输出校验结论**（缺一项视为未通过，继续调 call_api 补取或调 request_clarification 反问）：\n` +
-                      `【校验结论】\n` +
-                      `- 传入筛选参数：{列出本次 call_api 实际 params 中的筛选键=值；若用户原话有筛选条件但未传入，须显式写明「未传入」}\n` +
-                      `- 返回数据体现该筛选：是/否（如否，说明实际返回的是全量还是错误对象，并继续补取正确接口）\n` +
-                      `- 业务对象匹配：{返回记录类别} ↔ 用户请求 {target}\n` +
-                      `- 页数/条数：要求 {X} ↔ 实际 {Y}（Y 不足则继续分页补取）\n` +
-                      `- 字段覆盖：{已覆盖字段}；{用户关注的字段是否都在}\n` +
-                      (fd ? `- 字段差异裁决：{对上述 PC 端缺失/多余字段的逐项判断与处理结论}\n` : "") +
-                      `- 结论：通过 / 需补取 / 需反问\n` +
-                      `表格数据已由系统渲染并上屏展示给用户，**你的最终回复不要再重复输出表格明细**，` +
-                      `仅输出上述校验结论与简要说明（如数据规模/关键发现/是否需要补取）；禁止编造数据、禁止重复调同一接口取相同参数。`,
+                      `[workflow/output] 用户原始要求：${userText}\n` +
+                      `以上是服务端按 PC 列定义渲染的真实数据表格（共 ${rendered.view.total} 条），已上屏展示。` +
+                      `请用自然语言简要总结即可；最终回复不要再重复输出表格明细；禁止编造数据。`,
                   });
-                  // 不设 outputReady/forcedReply → 回 understand 由模型自主校验并总结收束（Cursor 模型驱动收束）
+                  // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束
                 } catch (e) {
                   // 列表渲染失败（模块无列定义等）→ 走 output-align 提示模型自行处理。
                   // 2026-08-26 诊断：曾静默吞错导致「影片列表前2页无表格」排查困难——渲染失败必须留痕。
@@ -2548,29 +2415,15 @@ export async function* chatStream(
                   };
                   const idx = nextSteps.findIndex((s) => s.kind === "toolResult" && s.toolCallId === call.id);
                   if (idx >= 0) nextSteps[idx] = { kind: "toolResult", toolCallId: call.id, content: rendered.md };
-                  const missing = [...(rendered.needsModelMapping || []), ...(rendered.needsValueMapping || [])].join("、");
-                  // 详情字段差异清单（同列表语义）：formSchema 定义 vs 返回对象字段
-                  const fd = rendered.fieldDiff;
-                  const diffText = fd
-                    ? `【字段差异校对】服务端比对了 PC 端 formSchema 与接口返回字段：\n` +
-                      (fd.pcMissing.length ? `- PC 端有定义但接口返回缺失：${fd.pcMissing.join("、")}（已显示占位"-"）——请判断是否接口不对/缺参数，需补取请调 call_api\n` : "") +
-                      (fd.dataExtra.length ? `- 接口返回有但 PC 端未定义：${fd.dataExtra.join("、")}（已补充展示）——请判断是否用户关注字段\n` : "")
-                    : "";
+                  // 薄提示：详情已上屏；总结交模型，不做服务端核对清单/字段差异校对。
                   nextSteps.push({
                     kind: "system",
                     text:
-                      `[workflow/detail-verify] 用户原始要求：${userText}\n` +
-                      `以上是服务端按 PC 端 formSchema 渲染的真实单条数据表格` +
-                      (missing ? `；以下字段未能在源码提取到中文映射，已如实展示原文：${missing}` : "") +
-                      (diffText ? `\n${diffText}` : "") +
-                      `。请核对「用户原始要求」与以上记录是否对应（业务对象类别是否对应请见 [workflow/tool-calling] 第5条）：\n` +
-                      `① 业务对象语义匹配：该记录类别是否与用户请求一致；\n` +
-                      `② ID/关键字段是否匹配：符合则简要说明后收束；不符合可继续调 call_api 补取。\n` +
-                      `③ 字段差异裁决：{对上述 PC 端缺失/多余字段的逐项判断}\n` +
-                      `单条数据已由系统渲染并上屏展示，最终回复不要再重复输出表格明细，仅简要说明关键字段与结论；` +
-                      `禁止编造字段、禁止重复调同一接口。`,
+                      `[workflow/output] 用户原始要求：${userText}\n` +
+                      `以上是服务端按 PC 端 formSchema 渲染的真实单条数据表格，已上屏展示。` +
+                      `请用自然语言简要说明关键字段即可；最终回复不要再重复输出表格明细；禁止编造字段。`,
                   });
-                  // 不设 outputReady/forcedReply → 回 understand 由模型自主校验并总结收束
+                  // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束
                 } catch {
                   nextSteps.push(
                     outputAlignStep("call_api 已返回数据，先 normalize_output 对齐字段，再用 render_table 推送预览（树表传 tree/children，汇总传 footer）；用户要 Excel/PDF 时调用 export_dataset。", resolvedModule),
@@ -2824,7 +2677,7 @@ export async function* chatStream(
     if (!model.agentCapable) {
       console.log(`[chat:agent] 模型 ${model.id} 无 agent 能力（MODEL_${model.id.toUpperCase()}_AGENT=false），走纯问答`);
       const light = await callAgentSafe(model, turns, rawImages, [], [], signal, {
-        systemExtra: buildStaticGuide(session),
+        systemExtra: buildStaticGuide(session, ownerKey),
         traceRunId: runId,
       });
       const text = (light.text || "（模型未返回有效回复，请重试或更换模型。）").slice(0, config.contextMaxChars);
@@ -3024,8 +2877,7 @@ export async function* chatStream(
         ? "模型服务暂时不可用，请稍后重试或更换模型。"
         : "未能理解你的需求，请换种说法重试（例如直接说清模块名与要查的列表/详情）。";
     }
-    // 方案 B 兜底（2026-08-26）：若模型不遵守 list-verify 引导仍把完整表格写进最终文本，
-    // 而本轮已上屏 UI_TABLE → 折叠重复的 markdown 表格，避免用户看到「两块数据」。
+    // 方案 B 兜底（2026-08-26）：若模型仍把完整表格写进最终文本，而本轮已上屏 UI_TABLE → 折叠重复的 markdown 表格。
     text = collapseDuplicateTable(text, session);
     session.messages.push({ role: "assistant", text });
     // 最终完整文本：作为 text_delta 增量后的校正/兜底；前端对 text 事件采用覆盖式，避免与增量重复。

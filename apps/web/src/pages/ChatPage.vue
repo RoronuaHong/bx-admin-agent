@@ -402,28 +402,105 @@ function newConversation() {
   });
 }
 
+/** 标签右键菜单：对齐浏览器/IDE 关标签行为。 */
+const tabMenu = ref<{
+  convId: string;
+  idx: number;
+  x: number;
+  y: number;
+} | null>(null);
+
+function hideTabMenu() {
+  tabMenu.value = null;
+}
+
+function openTabMenu(ev: MouseEvent, convId: string, idx: number) {
+  // 不切会话，仅弹出菜单；坐标稍后钳制到视口内。
+  const pad = 8;
+  const menuW = 168;
+  const menuH = 220;
+  const x = Math.min(ev.clientX, window.innerWidth - menuW - pad);
+  const y = Math.min(ev.clientY, window.innerHeight - menuH - pad);
+  tabMenu.value = { convId, idx, x: Math.max(pad, x), y: Math.max(pad, y) };
+}
+
+function ensureBlankConversation() {
+  const now = Date.now();
+  const conv: Conversation = { id: newId(), title: "新对话", messages: [], createdAt: now, updatedAt: now };
+  conversations.value.push(conv);
+  activeId.value = conv.id;
+  createConversation({ id: conv.id, title: conv.title }).catch(() => {});
+}
+
+/** 批量关闭；keepId 为要保留并激活的会话（关闭其他时用）。 */
+function closeConversations(ids: string[], keepId?: string) {
+  if (!ids.length) {
+    hideTabMenu();
+    return;
+  }
+  const idSet = new Set(ids);
+  const prevActive = activeId.value;
+  const prevIdx = conversations.value.findIndex((c) => c.id === prevActive);
+  conversations.value = conversations.value.filter((c) => !idSet.has(c.id));
+  for (const id of ids) apiDeleteConversation(id).catch(() => {});
+
+  if (keepId && conversations.value.some((c) => c.id === keepId)) {
+    activeId.value = keepId;
+  } else if (!conversations.value.length) {
+    ensureBlankConversation();
+  } else if (idSet.has(prevActive)) {
+    const next = conversations.value[Math.min(Math.max(prevIdx, 0), conversations.value.length - 1)];
+    activeId.value = next.id;
+  }
+
+  saveConversations();
+  hideTabMenu();
+  nextTick(scrollBottom);
+}
+
 // 关闭某个会话；当前会话被关则切到相邻会话；全部关完则新建一个空会话。
 function closeConversation(id: string) {
+  closeConversations([id]);
+}
+
+function closeOtherConversations(id: string) {
+  closeConversations(
+    conversations.value.filter((c) => c.id !== id).map((c) => c.id),
+    id,
+  );
+}
+
+function closeLeftConversations(id: string) {
   const idx = conversations.value.findIndex((c) => c.id === id);
-  if (idx === -1) return;
-  conversations.value.splice(idx, 1);
-  if (activeId.value === id) {
-    const next = conversations.value[idx] ?? conversations.value[idx - 1];
-    activeId.value = next ? next.id : "";
+  if (idx <= 0) {
+    hideTabMenu();
+    return;
   }
-  if (!conversations.value.length) {
-    const now = Date.now();
-    const conv: Conversation = { id: newId(), title: "新对话", messages: [], createdAt: now, updatedAt: now };
-    conversations.value.push(conv);
-    activeId.value = conversations.value[0].id;
+  closeConversations(
+    conversations.value.slice(0, idx).map((c) => c.id),
+    id,
+  );
+}
+
+function closeRightConversations(id: string) {
+  const idx = conversations.value.findIndex((c) => c.id === id);
+  if (idx < 0 || idx >= conversations.value.length - 1) {
+    hideTabMenu();
+    return;
   }
-  saveConversations();
-  // 服务端同步删除（失败静默，本地已移除）。
-  apiDeleteConversation(id).catch(() => {});
+  closeConversations(
+    conversations.value.slice(idx + 1).map((c) => c.id),
+    id,
+  );
+}
+
+function closeAllConversations() {
+  closeConversations(conversations.value.map((c) => c.id));
 }
 
 // 切换当前会话。
 function switchConversation(id: string) {
+  hideTabMenu();
   if (activeId.value !== id && conversations.value.some((c) => c.id === id)) {
     activeId.value = id;
     saveConversations();
@@ -513,6 +590,10 @@ onMounted(async () => {
 
   const onEsc = (e: KeyboardEvent) => {
     if (e.key !== "Escape") return;
+    if (tabMenu.value) {
+      hideTabMenu();
+      return;
+    }
     // 能力说明弹窗自管 Esc（capture）；此处只关灯箱
     if (helpOpen.value) return;
     if (modelMenuOpen.value) {
@@ -1319,6 +1400,7 @@ async function onClearContext() {
         :class="{ active: conv.id === activeId }"
         type="button"
         @click="switchConversation(conv.id)"
+        @contextmenu.prevent="openTabMenu($event, conv.id, idx)"
       >
         <span class="tab-index">{{ idx + 1 }}</span>
         <span class="tab-title">{{ conv.title }}</span>
@@ -1326,6 +1408,56 @@ async function onClearContext() {
       </button>
       <button class="tab-new" type="button" title="新建会话" @click="newConversation">＋</button>
     </nav>
+
+    <Teleport to="body">
+      <template v-if="tabMenu">
+        <div class="tab-ctx-backdrop" @click="hideTabMenu" @contextmenu.prevent="hideTabMenu" />
+        <ul
+          class="tab-ctx-menu"
+          role="menu"
+          :style="{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }"
+          @click.stop
+        >
+          <li role="none">
+            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">关闭</button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="conversations.length <= 1"
+              @click="closeOtherConversations(tabMenu.convId)"
+            >
+              关闭其他
+            </button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="tabMenu.idx <= 0"
+              @click="closeLeftConversations(tabMenu.convId)"
+            >
+              关闭左侧
+            </button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="tabMenu.idx >= conversations.length - 1"
+              @click="closeRightConversations(tabMenu.convId)"
+            >
+              关闭右侧
+            </button>
+          </li>
+          <li class="tab-ctx-sep" role="separator" />
+          <li role="none">
+            <button type="button" role="menuitem" @click="closeAllConversations">全部关闭</button>
+          </li>
+        </ul>
+      </template>
+    </Teleport>
 
     <main ref="scroller" class="thread" @scroll.passive="onThreadScroll">
       <div class="thread-scrollbar" ref="threadTrackEl">
@@ -1998,6 +2130,54 @@ async function onClearContext() {
 .tab-new:hover {
   background: color-mix(in srgb, var(--ink) 6%, transparent);
   color: var(--ink);
+}
+
+.tab-ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+}
+
+.tab-ctx-menu {
+  position: fixed;
+  z-index: 81;
+  min-width: 168px;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--ink) 16%, transparent);
+}
+
+.tab-ctx-menu button {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.tab-ctx-menu button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+
+.tab-ctx-menu button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.tab-ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
 }
 
 .thread {

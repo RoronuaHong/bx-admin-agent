@@ -363,6 +363,29 @@ mcpServer.registerTool(
   async (input) => toolResult("get_current_time", input as Record<string, unknown>),
 );
 
+mcpServer.registerTool(
+  "update_user_preference",
+  {
+    title: "更新用户偏好",
+    description: TOOL_DESCRIPTIONS.update_user_preference,
+    inputSchema: z.object({
+      key: z.enum(["replyLanguage"]),
+      value: z.string(),
+    }),
+  },
+  async (input) => toolResult("update_user_preference", input as Record<string, unknown>),
+);
+
+mcpServer.registerTool(
+  "get_user_preferences",
+  {
+    title: "读取用户偏好",
+    description: TOOL_DESCRIPTIONS.get_user_preferences,
+    inputSchema: z.object({}),
+  },
+  async (input) => toolResult("get_user_preferences", input as Record<string, unknown>),
+);
+
 async function toolResult(name: string, input: Record<string, unknown>) {
   const text = await runAgentTool(name, input);
   return { content: [{ type: "text" as const, text }] };

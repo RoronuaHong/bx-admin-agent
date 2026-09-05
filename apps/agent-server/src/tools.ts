@@ -4,6 +4,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import nodePath from "node:path";
 import { getActiveProject, getSession, setActiveProject, ensureDefaultProject } from "./session.js";
+import { formatUserPrefsGuide, loadUserPreferences, updateUserPreference } from "./user-prefs.js";
 import { config } from "./config.js";
 import { formatModuleSummary, loadApiModuleIndex, resolveApiModules } from "./api-index.js";
 import { callUpstream, resolveBaseUrl } from "./upstream.js";
@@ -179,6 +180,13 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "获取服务器当前日期与时间（ISO 格式）。当用户口语含相对时间（今天/昨天/本周/本月/最近 N 天等）" +
     "或调用接口需要 date/timeRange/timestamp 等时间参数时，先调用本工具取得当前日期，再自行换算为接口要求的参数；" +
     "禁止丢弃相对时间词、禁止反问用户要具体日期。返回 date(YYYY-MM-DD)、datetime(ISO 8601)、timestamp(毫秒)。",
+  update_user_preference:
+    "写入或更新当前登录用户的持久偏好（跨会话生效，对齐 Cursor User Rules）。" +
+    "仅当用户明确表达偏好时调用（如「以后请用英文回复」「改回跟我说的语言」）。" +
+    "参数：key（白名单：replyLanguage）、value（语种 BCP-47 如 en/zh-CN，或 follow_input 表示跟本轮输入语种；传 clear 清除）。" +
+    "不要猜测用户偏好；不要从单次业务请求推断语言偏好。",
+  get_user_preferences:
+    "读取当前登录用户已保存的偏好（replyLanguage 等）。用户问「你记得我什么偏好」或写偏好前想确认现状时调用。",
   // M1（Supervisor 路由）：模型主动选择 Worker 上下文（领域×项目×环境）。服务端校验命中后装配工具子集与领域提示；
   // 路由判定完全交模型，工具仅描述可选值，无业务逻辑写死。
   route_to_agent:
@@ -225,6 +233,8 @@ export const TOOL_DOMAIN: Record<string, ToolDomain> = {
   parse_intent: "common",
   set_project: "common",
   get_current_time: "common",
+  update_user_preference: "common",
+  get_user_preferences: "common",
   // 路由工具（M1 Supervisor 选 Worker 上下文）本就属于通用调度层
   route_to_agent: "common",
 };
@@ -754,6 +764,34 @@ export function listAgentTools(): AgentToolDef[] {
             description: "可选时区（IANA 名，如 Asia/Shanghai）；不传则用服务器本地时区",
           },
         },
+      },
+    },
+    {
+      name: "update_user_preference",
+      description: TOOL_DESCRIPTIONS.update_user_preference,
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            enum: ["replyLanguage"],
+            description: "偏好键（白名单）",
+          },
+          value: {
+            type: "string",
+            description:
+              "replyLanguage：BCP-47（en / zh-CN / es…）或 follow_input；clear 清除该项",
+          },
+        },
+        required: ["key", "value"],
+      },
+    },
+    {
+      name: "get_user_preferences",
+      description: TOOL_DESCRIPTIONS.get_user_preferences,
+      inputSchema: {
+        type: "object",
+        properties: {},
       },
     },
     getRouteToAgentTool(),
@@ -2221,11 +2259,8 @@ export async function runAgentTool(
     const options = Array.isArray(input.options) ? input.options : [];
     const riskLevel = String(input.riskLevel || "read");
 
-    // 已有默认/会话项目时，拦截「只问 project」的澄清，避免 UI 反复弹选项目
-    const onlyProject =
-      missingSlots.length === 1 &&
-      missingSlots[0] === "project" &&
-      /项目/.test(question);
+    // 已有默认/会话项目时，拦截「只问 project」的澄清，避免 UI 反复弹选项目（结构条件，不用中文词匹配）
+    const onlyProject = missingSlots.length === 1 && missingSlots[0] === "project";
     if (onlyProject) {
       const active = opts.sessionId
         ? (ensureDefaultProject(opts.sessionId) || getActiveProject(opts.sessionId))
@@ -2284,6 +2319,33 @@ export async function runAgentTool(
     const maxResults = Math.min(Math.max(Number(input.maxResults) || 5, 1), 10);
     const results = await searchKnowledgeBase(query, maxResults);
     return formatSearchResults(results, query);
+  }
+  if (name === "update_user_preference") {
+    if (!opts.ownerKey) {
+      return "错误：无法识别当前用户，偏好未保存";
+    }
+    const key = String(input.key || "").trim();
+    const result = updateUserPreference(opts.ownerKey, key, input.value);
+    if (!result.ok) return `错误：${result.error}`;
+    return JSON.stringify({
+      saved: true,
+      preferences: {
+        replyLanguage: result.prefs.replyLanguage ?? null,
+        updatedAt: result.prefs.updatedAt,
+      },
+      hint: "偏好已持久化，后续会话自动生效。面向用户说明时遵守新偏好。",
+    });
+  }
+  if (name === "get_user_preferences") {
+    if (!opts.ownerKey) {
+      return "错误：无法识别当前用户";
+    }
+    const prefs = loadUserPreferences(opts.ownerKey);
+    return JSON.stringify({
+      replyLanguage: prefs.replyLanguage ?? null,
+      updatedAt: prefs.updatedAt || null,
+      guide: formatUserPrefsGuide(prefs),
+    });
   }
   if (name === "get_current_time") {
     // 通用时间能力工具（2026-08-26，对齐 Claude Code「模型自查环境时间」机制）：返回服务器当前日期/时间，
