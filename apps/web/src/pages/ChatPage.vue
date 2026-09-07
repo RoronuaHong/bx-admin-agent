@@ -100,7 +100,8 @@ interface Bubble {
 
 const router = useRouter();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const me = shallowRef<Me | null>(null);
 const input = ref("");
 const sending = ref(false);
@@ -892,25 +893,25 @@ function startComposerDrag(e: PointerEvent | MouseEvent | TouchEvent) {
 /** 工具名 → 实时活动状态文案（工具调用阶段显示“正在做什么”）。
  * 2026-08-26 改：显示真实工具中文动作，让用户看到当前在调用哪个工具（避免黑盒卡顿感）。
  * 映射表只含通用工具语义，不含任何业务词（符合红线）。 */
-const TOOL_STATUS_MAP: Record<string, { zh: string; en: string }> = {
-  submit_understood_intent: { zh: "正在理解你的意图…", en: "Understanding your intent…" },
-  search_api_module: { zh: "正在搜索业务模块…", en: "Searching business modules…" },
-  read_api_module: { zh: "正在读取接口定义…", en: "Reading API definitions…" },
-  grep_codebase: { zh: "正在检索代码…", en: "Searching the codebase…" },
-  read_file: { zh: "正在读取文件…", en: "Reading files…" },
-  list_dir: { zh: "正在列出目录…", en: "Listing directories…" },
-  call_api: { zh: "正在调用接口查询数据…", en: "Querying data via API…" },
-  request_clarification: { zh: "正在向你确认…", en: "Requesting clarification…" },
-  search_knowledge: { zh: "正在检索知识库…", en: "Searching the knowledge base…" },
-  normalize_output: { zh: "正在整理输出…", en: "Formatting output…" },
-  render_table: { zh: "正在渲染表格…", en: "Rendering table…" },
-  export_dataset: { zh: "正在导出数据…", en: "Exporting data…" },
-  get_page_schema: { zh: "正在读取页面结构…", en: "Reading page schema…" },
+const TOOL_STATUS_MAP: Record<string, { zh: string; en: string; pt?: string; hi?: string }> = {
+  submit_understood_intent: { zh: "正在理解你的意图…", en: "Understanding your intent…", pt: "Entendendo sua intencao…", hi: "आपका अभिप्राय समझा जा रहा है…" },
+  search_api_module: { zh: "正在搜索业务模块…", en: "Searching business modules…", pt: "Buscando modulos de negocio…", hi: "बिजनेस मॉड्यूल खोजे जा रहे हैं…" },
+  read_api_module: { zh: "正在读取接口定义…", en: "Reading API definitions…", pt: "Lendo definicoes de API…", hi: "API परिभाषाएँ पढ़ी जा रही हैं…" },
+  grep_codebase: { zh: "正在检索代码…", en: "Searching the codebase…", pt: "Buscando no codigo…", hi: "कोडबेस खोजा जा रहा है…" },
+  read_file: { zh: "正在读取文件…", en: "Reading files…", pt: "Lendo arquivos…", hi: "फ़ाइलें पढ़ी जा रही हैं…" },
+  list_dir: { zh: "正在列出目录…", en: "Listing directories…", pt: "Listando diretorios…", hi: "डायरेक्टरी सूचीबद्ध की जा रही हैं…" },
+  call_api: { zh: "正在调用接口查询数据…", en: "Querying data via API…", pt: "Consultando dados via API…", hi: "API से डेटा क्वेरी किया जा रहा है…" },
+  request_clarification: { zh: "正在向你确认…", en: "Requesting clarification…", pt: "Solicitando esclarecimento…", hi: "स्पष्टीकरण मांगा जा रहा है…" },
+  search_knowledge: { zh: "正在检索知识库…", en: "Searching the knowledge base…", pt: "Buscando na base de conhecimento…", hi: "ज्ञान आधार खोजा जा रहा है…" },
+  normalize_output: { zh: "正在整理输出…", en: "Formatting output…", pt: "Formatando saida…", hi: "आउटपुट व्यवस्थित किया जा रहा है…" },
+  render_table: { zh: "正在渲染表格…", en: "Rendering table…", pt: "Renderizando tabela…", hi: "तालिका रेंडर की जा रही है…" },
+  export_dataset: { zh: "正在导出数据…", en: "Exporting data…", pt: "Exportando dados…", hi: "डेटा निर्यात किया जा रहा है…" },
+  get_page_schema: { zh: "正在读取页面结构…", en: "Reading page schema…", pt: "Lendo schema da pagina…", hi: "पेज स्कीमा पढ़ा जा रहा है…" },
 };
 function toolStatusText(name: string): string {
   const item = TOOL_STATUS_MAP[name];
-  if (item) return uiLocale.value === "en" ? item.en : item.zh;
-  return uiLocale.value === "en" ? `Calling tool: ${name}…` : `正在调用工具：${name}…`;
+  if (item) return uiLocale.value === "zh" ? item.zh : uiLocale.value === "pt-BR" ? (item.pt || item.en) : uiLocale.value === "hi" ? (item.hi || item.en) : item.en;
+  return uiLocale.value === "zh" ? `正在调用工具：${name}…` : `Calling tool: ${name}…`;
 }
 
 async function send() {
@@ -1085,7 +1086,7 @@ async function onLogout() {
 const copiedId = ref<number | null>(null);
 
 // 登录者显示名：优先中文名，回退登录账号；未登录时显示「你」。
-const meName = computed(() => me.value?.user?.name || me.value?.user?.loginName || tx("你", "You"));
+const meName = computed(() => me.value?.user?.name || me.value?.user?.loginName || tx("你", "You", "Voce", "आप"));
 
 // 输入框能力探测：环境/权限不满足的功能，对应按钮直接隐藏。
 interface Capabilities {
@@ -1310,7 +1311,7 @@ function toggleVoice() {
     recognitionRef.value = initVoice();
   }
   if (!recognitionRef.value) {
-    alert(tx("当前浏览器不支持语音输入", "Voice input is not supported in this browser"));
+    alert(tx("当前浏览器不支持语音输入", "Voice input is not supported in this browser", "Entrada por voz nao e suportada neste navegador", "इस ब्राउज़र में वॉइस इनपुट समर्थित नहीं है"));
     return;
   }
   if (recording.value) {
@@ -1529,7 +1530,7 @@ async function copyBody(item: Bubble) {
       if (copiedId.value === item.id) copiedId.value = null;
     }, 1200);
   } else {
-    alert(tx("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。", "Copy failed: clipboard access is not available in this browser."));
+    alert(tx("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。", "Copy failed: clipboard access is not available in this browser.", "Falha ao copiar: o acesso a area de transferencia nao esta disponivel neste navegador.", "कॉपी विफल: इस ब्राउज़र में क्लिपबोर्ड एक्सेस उपलब्ध नहीं है।"));
   }
 }
 
@@ -1578,7 +1579,7 @@ async function onClearContext() {
       await router.replace("/login");
       return;
     }
-    alert(err instanceof Error ? err.message : tx("重置对话失败", "Failed to reset conversation"));
+    alert(err instanceof Error ? err.message : tx("重置对话失败", "Failed to reset conversation", "Falha ao redefinir a conversa", "चैट रीसेट नहीं हो सका"));
   }
 }
 </script>
@@ -1587,7 +1588,7 @@ async function onClearContext() {
   <div class="booth">
     <header class="top">
       <div class="identity">
-        <div class="brand-mark">{{ tx("小助手", "Assistant") }}</div>
+        <div class="brand-mark">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</div>
       </div>
       <div class="actions">
         <div class="meta">
@@ -1599,10 +1600,10 @@ async function onClearContext() {
         </div>
         <UiLocaleSelect />
         <ThemeToggle />
-        <RouterLink class="ghost" to="/trace">{{ tx("调用观察", "Trace") }}</RouterLink>
-        <button class="ghost" type="button" @click="helpOpen = true">{{ tx("操作说明", "Help") }}</button>
-        <button class="ghost" type="button" :disabled="sending" @click="onClearContext">{{ tx("重置对话", "Reset Chat") }}</button>
-        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout") }}</button>
+        <RouterLink class="ghost" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
+        <button class="ghost" type="button" @click="helpOpen = true">{{ tx("操作说明", "Help", "Ajuda", "सहायता") }}</button>
+        <button class="ghost" type="button" :disabled="sending" @click="onClearContext">{{ tx("重置对话", "Reset Chat", "Redefinir Chat", "चैट रीसेट करें") }}</button>
+        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
       </div>
     </header>
 
@@ -1635,7 +1636,7 @@ async function onClearContext() {
           @click.stop
         >
           <li role="none">
-            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">{{ tx("关闭", "Close") }}</button>
+            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">{{ tx("关闭", "Close", "Fechar", "बंद करें") }}</button>
           </li>
           <li role="none">
             <button
@@ -1644,7 +1645,7 @@ async function onClearContext() {
               :disabled="conversations.length <= 1"
               @click="closeOtherConversations(tabMenu.convId)"
             >
-              {{ tx("关闭其他", "Close Others") }}
+              {{ tx("关闭其他", "Close Others", "Fechar Outros", "अन्य बंद करें") }}
             </button>
           </li>
           <li role="none">
@@ -1654,7 +1655,7 @@ async function onClearContext() {
               :disabled="tabMenu.idx <= 0"
               @click="closeLeftConversations(tabMenu.convId)"
             >
-              {{ tx("关闭左侧", "Close Left") }}
+              {{ tx("关闭左侧", "Close Left", "Fechar a Esquerda", "बाईं ओर बंद करें") }}
             </button>
           </li>
           <li role="none">
@@ -1664,12 +1665,12 @@ async function onClearContext() {
               :disabled="tabMenu.idx >= conversations.length - 1"
               @click="closeRightConversations(tabMenu.convId)"
             >
-              {{ tx("关闭右侧", "Close Right") }}
+              {{ tx("关闭右侧", "Close Right", "Fechar a Direita", "दाईं ओर बंद करें") }}
             </button>
           </li>
           <li class="tab-ctx-sep" role="separator" />
           <li role="none">
-            <button type="button" role="menuitem" @click="closeAllConversations">{{ tx("全部关闭", "Close All") }}</button>
+            <button type="button" role="menuitem" @click="closeAllConversations">{{ tx("全部关闭", "Close All", "Fechar Tudo", "सभी बंद करें") }}</button>
           </li>
         </ul>
       </template>
@@ -1681,7 +1682,7 @@ async function onClearContext() {
         <article v-for="{ item, cards } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
         <div class="who" :class="{ me: item.role === 'user' }">
           <span class="dot" />
-          {{ item.role === "user" ? meName : tx("助手", "Assistant") }}
+          {{ item.role === "user" ? meName : tx("助手", "Assistant", "Assistente", "सहायक") }}
         </div>
         <div v-if="item.text || item.images?.length || item.tables?.length || item.charts?.length || item.files?.length || item.toolResults?.length" class="body-wrap">
           <div v-if="item.images?.length" class="msg-images" :class="item.images.length > 1 ? 'grid' : 'single'">
@@ -1710,9 +1711,9 @@ async function onClearContext() {
               :aria-expanded="item.reasoningExpanded"
               @click="item.reasoningExpanded = !item.reasoningExpanded"
             >
-              <span class="reasoning-tag" aria-hidden="true">{{ tx("推理", "Reasoning") }}</span>
-              <span class="reasoning-title">{{ tx("模型推理过程", "Model reasoning") }}</span>
-              <span class="reasoning-toggle" aria-hidden="true">{{ item.reasoningExpanded ? tx("收起", "Collapse") : tx("展开", "Expand") }}</span>
+              <span class="reasoning-tag" aria-hidden="true">{{ tx("推理", "Reasoning", "Raciocinio", "तर्क") }}</span>
+              <span class="reasoning-title">{{ tx("模型推理过程", "Model reasoning", "Raciocinio do modelo", "मॉडल तर्क") }}</span>
+              <span class="reasoning-toggle" aria-hidden="true">{{ item.reasoningExpanded ? tx("收起", "Collapse", "Recolher", "समेटें") : tx("展开", "Expand", "Expandir", "विस्तार करें") }}</span>
             </button>
             <div v-if="item.reasoningExpanded" class="reasoning-body">
               <p v-for="(line, ri) in item.reasoning.trim().split('\n')" :key="ri" class="reasoning-line">{{ line }}</p>
@@ -1728,7 +1729,7 @@ async function onClearContext() {
               >
                 <span class="tool-group__icon" aria-hidden="true">⚙</span>
                 <span class="tool-group__title">
-                  {{ item.currentTool ? `${tx("正在调用：", "Calling: ")}${toolStatusText(item.currentTool).replace(/…$/, "")}` : tx(`工具调用细节（${cards.length}）`, `Tool details (${cards.length})`) }}
+                  {{ item.currentTool ? `${tx("正在调用：", "Calling: ", "Chamando: ", "कॉल किया जा रहा है: ")}${toolStatusText(item.currentTool).replace(/…$/, "")}` : tx(`工具调用细节（${cards.length}）`, `Tool details (${cards.length})`, `Detalhes das ferramentas (${cards.length})`, `टूल विवरण (${cards.length})`) }}
                 </span>
                 <span class="tool-group__toggle" aria-hidden="true">{{ groupOpenOf(item.id) ? "▾" : "▸" }}</span>
               </button>
@@ -1740,7 +1741,7 @@ async function onClearContext() {
                     :disabled="cards.every(Boolean)"
                     @click="setAllCards(cards, true)"
                   >
-                    {{ tx("全部展开", "Expand All") }}
+                    {{ tx("全部展开", "Expand All", "Expandir Tudo", "सभी विस्तार करें") }}
                   </button>
                   <button
                     type="button"
@@ -1748,7 +1749,7 @@ async function onClearContext() {
                     :disabled="cards.every((v) => !v)"
                     @click="setAllCards(cards, false)"
                   >
-                    {{ tx("全部折叠", "Collapse All") }}
+                    {{ tx("全部折叠", "Collapse All", "Recolher Tudo", "सभी समेटें") }}
                   </button>
                 </div>
                 <ToolResultCard
@@ -1843,7 +1844,7 @@ async function onClearContext() {
           <span class="loading-text">{{ item.status || tx('正在思考…', 'Thinking…') }}</span>
         </div>
         <p v-if="item.error" class="error">{{ item.error }}</p>
-        <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled") }}</div>
+        <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled", "Cancelado", "रद्द") }}</div>
         </article>
       </main>
       <div class="thread-scrollbar" ref="threadTrackEl">
@@ -2151,7 +2152,7 @@ async function onClearContext() {
 
 .actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
   flex-shrink: 0;
 }

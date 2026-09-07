@@ -18,7 +18,8 @@ const emit = defineEmits<{ "update:expanded": [value: boolean] }>();
 
 const internal = ref(false);
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 
 /** 受控模式下由父组件决定，否则用内部状态 */
 const expanded = computed(() => props.expanded ?? internal.value);

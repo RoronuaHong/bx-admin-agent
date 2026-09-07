@@ -8,7 +8,8 @@ const emit = defineEmits<{
   "use-example": [text: string];
 }>();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 
 const dialogRef = ref<HTMLElement | null>(null);
 

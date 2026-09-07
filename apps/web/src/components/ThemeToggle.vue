@@ -4,19 +4,20 @@ import { getUiLocale } from "../ui-locale";
 
 const { theme, toggle } = useTheme();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 </script>
 
 <template>
   <button
     class="theme-toggle"
     type="button"
-    :aria-label="theme === 'dark' ? tx('切换到浅色', 'Switch to light mode') : tx('切换到深色', 'Switch to dark mode')"
-    :title="theme === 'dark' ? tx('浅色', 'Light') : tx('深色', 'Dark')"
+    :aria-label="theme === 'dark' ? tx('切换到浅色', 'Switch to light mode', 'Mudar para modo claro', 'लाइट मोड पर स्विच करें') : tx('切换到深色', 'Switch to dark mode', 'Mudar para modo escuro', 'डार्क मोड पर स्विच करें')"
+    :title="theme === 'dark' ? tx('浅色', 'Light', 'Claro', 'लाइट') : tx('深色', 'Dark', 'Escuro', 'डार्क')"
     @click="toggle"
   >
     <span class="icon" aria-hidden="true">{{ theme === "dark" ? "○" : "●" }}</span>
-    <span class="label">{{ theme === "dark" ? tx("浅色", "Light") : tx("深色", "Dark") }}</span>
+    <span class="label">{{ theme === "dark" ? tx("浅色", "Light", "Claro", "लाइट") : tx("深色", "Dark", "Escuro", "डार्क") }}</span>
   </button>
 </template>
 

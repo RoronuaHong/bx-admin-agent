@@ -17,7 +17,8 @@ import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const me = shallowRef<Me | null>(null);
 const loading = ref(false);
 const error = ref("");
@@ -60,7 +61,7 @@ async function loadRuns() {
       spans.value = [];
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("加载失败", "Load failed");
+    error.value = err instanceof Error ? err.message : tx("加载失败", "Load failed", "Falha ao carregar", "लोड विफल");
     if ((err as Error & { status?: number }).status === 401) {
       await router.replace("/login");
     }
@@ -79,7 +80,7 @@ async function selectRun(runId: string) {
     spans.value = data.spans;
     spanRelease.value = data.release || "";
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("加载 run 失败", "Failed to load run");
+    error.value = err instanceof Error ? err.message : tx("加载 run 失败", "Failed to load run", "Falha ao carregar execucao", "रन लोड नहीं हो सका");
     spans.value = [];
   } finally {
     detailLoading.value = false;
@@ -106,9 +107,9 @@ onMounted(async () => {
   <main class="stage">
     <header class="top">
       <div class="identity">
-        <RouterLink class="brand-mark" to="/chat">{{ tx("小助手", "Assistant") }}</RouterLink>
+        <RouterLink class="brand-mark" to="/chat">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</RouterLink>
         <span class="sep">/</span>
-        <span class="page-title">{{ tx("调用观察", "Trace") }}</span>
+        <span class="page-title">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</span>
       </div>
       <div class="actions">
         <div class="meta">
@@ -118,15 +119,15 @@ onMounted(async () => {
         </div>
         <UiLocaleSelect />
         <ThemeToggle />
-        <RouterLink class="ghost" to="/chat">{{ tx("对话", "Chat") }}</RouterLink>
-        <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh") }}</button>
-        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout") }}</button>
+        <RouterLink class="ghost" to="/chat">{{ tx("对话", "Chat", "Chat", "चैट") }}</RouterLink>
+        <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh", "Atualizar", "रीफ्रेश") }}</button>
+        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
       </div>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section v-if="stats" class="stats" :aria-label="tx('汇总', 'Summary')">
+    <section v-if="stats" class="stats" :aria-label="tx('汇总', 'Summary', 'Resumo', 'सारांश')">
       <div class="stat">
         <span class="stat-k">runs</span>
         <span class="stat-v">{{ stats.runs }}</span>
@@ -154,25 +155,25 @@ onMounted(async () => {
     </section>
 
     <p v-if="stats?.degradeHint" class="hint warn-hint">{{ stats.degradeHint }}</p>
-    <p v-else class="hint">{{ tx("只读视图 · 仅显示当前登录者的 run · 数据来自 /trace/runs", "Read-only view · only shows runs for the current user · data from /trace/runs") }}</p>
+    <p v-else class="hint">{{ tx("只读视图 · 仅显示当前登录者的 run · 数据来自 /trace/runs", "Read-only view · only shows runs for the current user · data from /trace/runs", "Visualizacao somente leitura · mostra apenas execucoes do usuario atual · dados de /trace/runs", "केवल-पढ़ने योग्य दृश्य · केवल वर्तमान उपयोगकर्ता के रन दिखाता है · डेटा /trace/runs से") }}</p>
 
     <div class="split">
       <section class="list-pane">
         <div class="pane-head">
-          <h2>{{ tx("最近请求", "Recent Requests") }}</h2>
-          <span class="muted">{{ loading ? tx("加载中…", "Loading…") : (uiLocale === "en" ? `${runs.length} items` : `${runs.length} 条`) }}</span>
+          <h2>{{ tx("最近请求", "Recent Requests", "Solicitacoes Recentes", "हाल की रिक्वेस्ट") }}</h2>
+          <span class="muted">{{ loading ? tx("加载中…", "Loading…", "Carregando…", "लोड हो रहा है…") : (uiLocale === "zh" ? `${runs.length} 条` : uiLocale === "pt-BR" ? `${runs.length} itens` : uiLocale === "hi" ? `${runs.length} आइटम` : `${runs.length} items`) }}</span>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>{{ tx("时间", "Time") }}</th>
-                <th>{{ tx("模型", "Model") }}</th>
-                <th>{{ tx("轮次", "Rounds") }}</th>
-                <th>{{ tx("空轮", "Empty") }}</th>
+                <th>{{ tx("时间", "Time", "Hora", "समय") }}</th>
+                <th>{{ tx("模型", "Model", "Modelo", "मॉडल") }}</th>
+                <th>{{ tx("轮次", "Rounds", "Rodadas", "राउंड") }}</th>
+                <th>{{ tx("空轮", "Empty", "Vazio", "खाली") }}</th>
                 <th>token</th>
-                <th>{{ tx("耗时", "Duration") }}</th>
-                <th>{{ tx("输入", "Input") }}</th>
+                <th>{{ tx("耗时", "Duration", "Duracao", "अवधि") }}</th>
+                <th>{{ tx("输入", "Input", "Entrada", "इनपुट") }}</th>
               </tr>
             </thead>
             <tbody>
@@ -191,7 +192,7 @@ onMounted(async () => {
                 <td class="clip">{{ shortText(r.userText) }}</td>
               </tr>
               <tr v-if="!runs.length && !loading">
-                <td colspan="7" class="empty">{{ tx("暂无 trace", "No trace yet") }}</td>
+                <td colspan="7" class="empty">{{ tx("暂无 trace", "No trace yet", "Ainda sem trace", "अभी तक कोई ट्रेस नहीं") }}</td>
               </tr>
             </tbody>
           </table>
@@ -200,8 +201,8 @@ onMounted(async () => {
 
       <section class="detail-pane">
         <div class="pane-head">
-          <h2>{{ tx("Span 树", "Span Tree") }}</h2>
-          <span class="muted mono">{{ selectedId ? selectedId.slice(0, 8) : tx("选中左侧一行", "Select a row on the left") }}</span>
+          <h2>{{ tx("Span 树", "Span Tree", "Arvore de Span", "स्पैन ट्री") }}</h2>
+          <span class="muted mono">{{ selectedId ? selectedId.slice(0, 8) : tx("选中左侧一行", "Select a row on the left", "Selecione uma linha a esquerda", "बाईं ओर एक पंक्ति चुनें") }}</span>
         </div>
         <p v-if="selected" class="detail-meta">
           <span>release {{ selected.release || spanRelease || "—" }}</span>
@@ -210,7 +211,7 @@ onMounted(async () => {
           <span>·</span>
           <span>{{ fmtTokens(selected.totalTokens) }} tok</span>
         </p>
-        <p v-if="detailLoading" class="muted">{{ tx("加载 span…", "Loading span…") }}</p>
+        <p v-if="detailLoading" class="muted">{{ tx("加载 span…", "Loading span…", "Carregando span…", "स्पैन लोड हो रहा है…") }}</p>
         <ol v-else-if="spans.length" class="spans">
           <li v-for="s in spans" :key="s.spanId" :class="['span', `k-${s.kind}`, { err: s.status === 'error' || s.status === 'reject' }]">
             <span class="kind">{{ s.kind }}</span>
@@ -221,7 +222,7 @@ onMounted(async () => {
             <span v-if="s.error" class="err-txt">{{ s.error }}</span>
           </li>
         </ol>
-        <p v-else-if="selectedId" class="muted">{{ tx("无 span", "No span") }}</p>
+        <p v-else-if="selectedId" class="muted">{{ tx("无 span", "No span", "Sem span", "कोई स्पैन नहीं") }}</p>
       </section>
     </div>
   </main>

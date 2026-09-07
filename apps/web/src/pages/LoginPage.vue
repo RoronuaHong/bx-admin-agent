@@ -8,7 +8,8 @@ import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const countries = ref<Country[]>([]);
 const country = ref("");
 const username = ref("");
@@ -28,7 +29,7 @@ async function submit() {
     await login({ country: country.value, username: username.value, password: password.value });
     await router.replace("/chat");
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("登录失败", "Login failed");
+    error.value = err instanceof Error ? err.message : tx("登录失败", "Login failed", "Falha no login", "लॉगिन विफल");
   } finally {
     loading.value = false;
   }
@@ -38,7 +39,7 @@ async function submit() {
 <template>
   <main class="stage">
     <header class="top">
-      <p class="kicker">{{ tx("运营助手", "Ops Assistant") }}</p>
+      <p class="kicker">{{ tx("运营助手", "Ops Assistant", "Assistente de Operações", "ऑप्स सहायक") }}</p>
       <div class="top-actions">
         <UiLocaleSelect />
         <ThemeToggle />
@@ -46,27 +47,27 @@ async function submit() {
     </header>
 
     <section class="sheet">
-      <h1 class="brand-mark">{{ tx("小助手", "Assistant") }}</h1>
-      <p class="lead">{{ tx("登录后用自然语言查询与管理运营后台各业务模块，可用的页面与操作以登录后为准。", "After login, you can query and manage backend modules in natural language. Available pages and actions depend on your account.") }}</p>
+      <h1 class="brand-mark">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</h1>
+      <p class="lead">{{ tx("登录后用自然语言查询与管理运营后台各业务模块，可用的页面与操作以登录后为准。", "After login, you can query and manage backend modules in natural language. Available pages and actions depend on your account.", "Depois do login, voce pode consultar e gerenciar os modulos do painel em linguagem natural. As paginas e acoes disponiveis dependem da sua conta.", "लॉगिन के बाद आप प्राकृतिक भाषा में ऑपरेशंस बैकएंड के मॉड्यूल खोज और प्रबंधित कर सकते हैं। उपलब्ध पेज और क्रियाएं आपके खाते पर निर्भर करती हैं।") }}</p>
       <form class="form" @submit.prevent="submit">
         <label>
-          {{ tx("国家 / 环境", "Country / Environment") }}
+          {{ tx("国家 / 环境", "Country / Environment", "Pais / Ambiente", "देश / वातावरण") }}
           <select v-model="country" required>
             <option v-for="item in countries" :key="item.id" :value="item.id">{{ item.label }}</option>
           </select>
         </label>
         <label>
-          {{ tx("账号", "Username") }}
+          {{ tx("账号", "Username", "Usuario", "उपयोगकर्ता नाम") }}
           <input v-model="username" autocomplete="username" inputmode="text" required />
         </label>
         <label>
-          {{ tx("密码", "Password") }}
+          {{ tx("密码", "Password", "Senha", "पासवर्ड") }}
           <input v-model="password" type="password" autocomplete="current-password" required />
         </label>
         <p v-if="error" class="error">{{ error }}</p>
-        <button type="submit" :disabled="loading">{{ loading ? tx("登录中…", "Signing in…") : tx("进入", "Enter") }}</button>
+        <button type="submit" :disabled="loading">{{ loading ? tx("登录中…", "Signing in…", "Entrando…", "साइन इन हो रहा है…") : tx("进入", "Enter", "Entrar", "प्रवेश करें") }}</button>
       </form>
-      <p class="hint">{{ tx("使用原运营账号登录对应国家线。", "Use your existing operations account for the selected country.") }}</p>
+      <p class="hint">{{ tx("使用原运营账号登录对应国家线。", "Use your existing operations account for the selected country.", "Use sua conta operacional existente para o pais selecionado.", "चुने गए देश के लिए अपना मौजूदा ऑपरेशंस खाता उपयोग करें।") }}</p>
     </section>
   </main>
 </template>
@@ -89,7 +90,7 @@ async function submit() {
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .kicker {

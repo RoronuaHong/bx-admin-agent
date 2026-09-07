@@ -6,7 +6,8 @@ import { getUiLocale } from "../ui-locale";
 
 const props = defineProps<{ table: TableView }>();
 const uiLocale = getUiLocale();
-const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const expanded = ref<Set<number>>(new Set());
 const copied = ref<string | null>(null);
 
