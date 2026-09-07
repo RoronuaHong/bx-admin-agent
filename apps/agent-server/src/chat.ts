@@ -1331,6 +1331,14 @@ function shouldPromoteExplainToKnowledgeExecute(intent: UnderstoodIntent | null 
   return /知识库|文档|制度|规范|流程|手册|wiki|policy|handbook|knowledge\s*base|knowledge|kb|manual|guideline/u.test(text);
 }
 
+function shouldUseKnowledgeWorker(intent: UnderstoodIntent | null | undefined): boolean {
+  if (!intent) return false;
+  if (intent.isBusinessRequest === true) return false;
+  if (intent.operationType !== "read" && intent.operationType !== "unknown") return false;
+  const text = `${intent.summary || ""}\n${intent.operationHint || ""}`.toLowerCase();
+  return /知识库|文档|制度|规范|流程|手册|报销|考勤|wiki|policy|handbook|knowledge\s*base|knowledge|kb|manual|guideline|reimbursement|attendance|leave/u.test(text);
+}
+
 function responseModeOf(intent: UnderstoodIntent | null | undefined): "execute" | "clarify" | "explain-capability" | "" {
   return intent?.responseMode || "";
 }
@@ -2463,6 +2471,7 @@ export async function* chatStream(
           if (call.name === SUBMIT_UNDERSTOOD_INTENT) {
             const understood = parseUnderstoodIntent(call.input || {});
             const understoodStepIndex = nextSteps.length - 1;
+            const routeKnowledge = shouldUseKnowledgeWorker(understood);
             if (shouldPromoteToExplain(understood, userText)) {
               understood.responseMode = "explain-capability";
               nextSteps.push({
@@ -2477,11 +2486,37 @@ export async function* chatStream(
                 text: "[workflow/normalize] 当前 understood 更接近知识库/制度/文档检索，已从 explain-capability 调整为 execute，请继续 route_to_agent(domain=knowledge) 并检索知识库。",
               });
             }
+            if (routeKnowledge) {
+              understood.responseMode = "execute";
+              activeWorkerId = "knowledge";
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/normalize] 当前 understood 已命中知识库/制度/文档类只读问题，服务端已将上下文切到 knowledge Worker；请直接检索知识库并基于出处回答。",
+              });
+            }
             nextSteps[understoodStepIndex] = {
               kind: "toolResult",
               toolCallId: call.id,
               content: JSON.stringify({ _understood: true, ...understood }, null, 2),
             };
+            if (routeKnowledge) {
+              return {
+                steps: nextSteps,
+                toolCalls: [],
+                round: state.round + 1,
+                needsClarification: false,
+                clarificationText: "",
+                outputReady: false,
+                forcedReply,
+                pageKind,
+                pendingTables,
+                lastToolSignature,
+                toolSignatureStreak,
+                doomLoopExhausted: toolSignatureStreak >= 3,
+                exploreCapExhausted,
+                activeWorkerId: "knowledge",
+              };
+            }
             if (responseModeOf(understood) === "explain-capability") {
               forcedReply = buildExplainCapabilityReply(understood);
               outputReady = true;
