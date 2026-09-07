@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from "vue";
-import { useRouter } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 import {
   fetchMe,
   fetchTraceRun,
@@ -30,6 +30,23 @@ const spanRelease = ref("");
 const detailLoading = ref(false);
 
 const selected = computed(() => runs.value.find((r) => r.runId === selectedId.value) || null);
+
+async function redirectTraceAccessFallback(status?: number) {
+  if (status === 401) {
+    await router.replace({ path: "/agents/admin/login", query: { next: "/trace" } });
+    return;
+  }
+  if (status === 403) {
+    await router.replace({
+      path: "/",
+      query: {
+        denied: "canViewTrace",
+        deniedSource: me.value?.permissions.traceAccessSource || "denied-allowlist",
+        deniedFrom: "/trace",
+      },
+    });
+  }
+}
 
 function fmtMs(ms?: number) {
   if (ms == null) return "—";
@@ -62,8 +79,9 @@ async function loadRuns() {
     }
   } catch (err) {
     error.value = err instanceof Error ? err.message : tx("加载失败", "Load failed", "Falha ao carregar", "लोड विफल");
-    if ((err as Error & { status?: number }).status === 401) {
-      await router.replace("/login");
+    const status = (err as Error & { status?: number }).status;
+    if (status === 401 || status === 403) {
+      await redirectTraceAccessFallback(status);
     }
   } finally {
     loading.value = false;
@@ -81,6 +99,10 @@ async function selectRun(runId: string) {
     spanRelease.value = data.release || "";
   } catch (err) {
     error.value = err instanceof Error ? err.message : tx("加载 run 失败", "Failed to load run", "Falha ao carregar execucao", "रन लोड नहीं हो सका");
+    const status = (err as Error & { status?: number }).status;
+    if (status === 401 || status === 403) {
+      await redirectTraceAccessFallback(status);
+    }
     spans.value = [];
   } finally {
     detailLoading.value = false;
@@ -90,13 +112,17 @@ async function selectRun(runId: string) {
 async function onLogout() {
   await logout();
   me.value = null;
-  await router.replace("/login");
+  await router.replace("/");
 }
 
 onMounted(async () => {
   me.value = await fetchMe();
   if (!me.value) {
-    await router.replace("/login");
+    await redirectTraceAccessFallback(401);
+    return;
+  }
+  if (!me.value.permissions.canViewTrace) {
+    await redirectTraceAccessFallback(403);
     return;
   }
   await loadRuns();
@@ -107,21 +133,21 @@ onMounted(async () => {
   <main class="stage">
     <header class="top">
       <div class="identity">
-        <RouterLink class="brand-mark" to="/chat">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</RouterLink>
+        <RouterLink class="brand-mark" to="/">{{ tx("Agent 门户", "Agent Portal", "Portal de Agentes", "एजेंट पोर्टल") }}</RouterLink>
         <span class="sep">/</span>
         <span class="page-title">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</span>
       </div>
       <div class="actions">
-        <div class="meta">
+        <div v-if="me" class="meta">
           <span>{{ me?.country.label }}</span>
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
         <UiLocaleSelect />
         <ThemeToggle />
-        <RouterLink class="ghost" to="/chat">{{ tx("对话", "Chat", "Chat", "चैट") }}</RouterLink>
+        <RouterLink class="ghost" :to="me ? '/agents/admin/chat' : '/agents/admin/login'">{{ me ? tx("工作台", "Workspace", "Workspace", "वर्कस्पेस") : tx("登录后台 Agent", "Sign in to Admin Agent", "Entrar no Admin Agent", "एडमिन एजेंट में साइन इन") }}</RouterLink>
         <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh", "Atualizar", "रीफ्रेश") }}</button>
-        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
+        <button v-if="me" class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
       </div>
     </header>
 
@@ -155,7 +181,7 @@ onMounted(async () => {
     </section>
 
     <p v-if="stats?.degradeHint" class="hint warn-hint">{{ stats.degradeHint }}</p>
-    <p v-else class="hint">{{ tx("只读视图 · 仅显示当前登录者的 run · 数据来自 /trace/runs", "Read-only view · only shows runs for the current user · data from /trace/runs", "Visualizacao somente leitura · mostra apenas execucoes do usuario atual · dados de /trace/runs", "केवल-पढ़ने योग्य दृश्य · केवल वर्तमान उपयोगकर्ता के रन दिखाता है · डेटा /trace/runs से") }}</p>
+    <p v-else class="hint">{{ tx("门户级只读视图 · 展示主 Agent 的 trace run 与 span 树 · 数据来自 /trace/runs", "Portal-level read-only view · shows main agent trace runs and span trees · data from /trace/runs", "Visualizacao somente leitura em nivel de portal · mostra execucoes trace e arvores de span do agente principal · dados de /trace/runs", "पोर्टल-स्तरीय केवल-पढ़ने योग्य दृश्य · मुख्य एजेंट के ट्रेस रन और स्पैन ट्री दिखाता है · डेटा /trace/runs से") }}</p>
 
     <div class="split">
       <section class="list-pane">

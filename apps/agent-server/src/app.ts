@@ -120,6 +120,25 @@ export function createApp() {
     return provider; // anthropic / ollama / openai 等协议名兜底
   }
 
+  function permissionsOf(session: { menus?: unknown[]; user?: Parameters<typeof ownerKeyOf>[0]; country?: { id?: string } } | null) {
+    // 预留权限投影层：当前先支持按 ownerKey 白名单收紧 Trace；
+    // 若未配置白名单，则保持“已登录可看”的默认体验。后续上游若补 RBAC / 菜单编码，
+    // 只需在这里替换判定，前端与路由结构无需再改。
+    const ownerKey = session ? ownerKeyOf(session.user, session.country?.id || "") : "";
+    const allowlist = config.traceAllowedOwners;
+    const matchedAllowlist = Boolean(ownerKey && allowlist.includes(ownerKey));
+    return {
+      canViewTrace: Boolean(session) && (!allowlist.length || matchedAllowlist),
+      traceAccessSource: !session
+        ? "anonymous"
+        : !allowlist.length
+          ? "default-login"
+          : matchedAllowlist
+            ? "owner-allowlist"
+            : "denied-allowlist",
+    };
+  }
+
   app.get("/models", (c) => {
     const session = getSession(getCookie(c, COOKIE));
     if (!session) return c.json({ message: "未登录" }, 401);
@@ -177,6 +196,7 @@ export function createApp() {
       return c.json({
         user: session.user,
         country: { id: session.country.id, label: session.country.label },
+        permissions: permissionsOf(session),
       });
     } catch (error) {
       return c.json({ message: error instanceof Error ? error.message : "登录失败" }, 401);
@@ -195,6 +215,7 @@ export function createApp() {
     return c.json({
       user: session.user,
       country: { id: session.country.id, label: session.country.label },
+      permissions: permissionsOf(session),
     });
   });
 
@@ -442,30 +463,28 @@ export function createApp() {
     });
   });
 
-  // ---- P3 可观测：trace 只读视图（登录态 + ownerKey 隔离，全局视角走 CLI）----
+  // ---- P3 可观测：trace 只读视图（门户级入口 + 权限控制）----
   // 最近 N 个 run 摘要 + 统计（轮次/token/版本分布），供 Web 可视化/巡检接入
   app.get("/trace/runs", (c) => {
     const session = getSession(getCookie(c, COOKIE));
     if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
-    const ownerKey = ownerKeyOf(session.user, session.country.id);
+    if (!permissionsOf(session).canViewTrace) return c.json({ message: "无权限查看 Trace" }, 403);
     const limit = Math.min(Number(c.req.query("limit")) || 20, 50);
-    const out = listRunSummaries(limit, ownerKey);
+    const out = listRunSummaries(limit);
     if (out.stats?.degradeHint) {
       void notifyAlerts({ kind: "degrade", messages: [out.stats.degradeHint] });
     }
     return c.json(out);
   });
 
-  // 单个 run 的完整 span 树；归属校验：非本人 run 一律 404（不泄漏存在性）
+  // 单个 run 的完整 span 树；门户级 trace 仍受权限控制
   app.get("/trace/run/:runId", (c) => {
     const session = getSession(getCookie(c, COOKIE));
     if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
-    const ownerKey = ownerKeyOf(session.user, session.country.id);
+    if (!permissionsOf(session).canViewTrace) return c.json({ message: "无权限查看 Trace" }, 403);
     const spans = getRun(c.req.param("runId"));
     const runSpan = spans.find((s) => s.kind === "run");
-    if (!runSpan || (runSpan.meta?.ownerKey as string) !== ownerKey) {
-      return c.json({ message: "不存在" }, 404);
-    }
+    if (!runSpan) return c.json({ message: "不存在" }, 404);
     return c.json({ release: getRelease(), spans });
   });
 

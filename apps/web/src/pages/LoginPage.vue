@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { fetchCountries, login, type Country } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
+const route = useRoute();
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
@@ -27,7 +28,8 @@ async function submit() {
   loading.value = true;
   try {
     await login({ country: country.value, username: username.value, password: password.value });
-    await router.replace("/chat");
+    const nextPath = typeof route.query.next === "string" && route.query.next.startsWith("/") ? route.query.next : "/agents/admin/chat";
+    await router.replace(nextPath);
   } catch (err) {
     error.value = err instanceof Error ? err.message : tx("登录失败", "Login failed", "Falha no login", "लॉगिन विफल");
   } finally {
@@ -39,16 +41,17 @@ async function submit() {
 <template>
   <main class="stage">
     <header class="top">
-      <p class="kicker">{{ tx("运营助手", "Ops Assistant", "Assistente de Operações", "ऑप्स सहायक") }}</p>
+      <p class="kicker">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</p>
       <div class="top-actions">
+        <RouterLink class="ghost-link" to="/">{{ tx("返回门户", "Back to portal", "Voltar ao portal", "पोर्टल पर वापस") }}</RouterLink>
         <UiLocaleSelect />
         <ThemeToggle />
       </div>
     </header>
 
     <section class="sheet">
-      <h1 class="brand-mark">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</h1>
-      <p class="lead">{{ tx("登录后用自然语言查询与管理运营后台各业务模块，可用的页面与操作以登录后为准。", "After login, you can query and manage backend modules in natural language. Available pages and actions depend on your account.", "Depois do login, voce pode consultar e gerenciar os modulos do painel em linguagem natural. As paginas e acoes disponiveis dependem da sua conta.", "लॉगिन के बाद आप प्राकृतिक भाषा में ऑपरेशंस बैकएंड के मॉड्यूल खोज और प्रबंधित कर सकते हैं। उपलब्ध पेज और क्रियाएं आपके खाते पर निर्भर करती हैं।") }}</p>
+      <h1 class="brand-mark">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</h1>
+      <p class="lead">{{ tx("登录后进入后台管理 Agent 工作台，用自然语言查询与管理运营后台各业务模块。", "Sign in to enter the admin agent workspace and manage backend operations in natural language.", "Faca login para entrar no workspace do agente de backoffice e operar o painel com linguagem natural.", "लॉगिन करके एडमिन एजेंट वर्कस्पेस में प्रवेश करें और प्राकृतिक भाषा में बैकएंड ऑपरेशंस संभालें।") }}</p>
       <form class="form" @submit.prevent="submit">
         <label>
           {{ tx("国家 / 环境", "Country / Environment", "Pais / Ambiente", "देश / वातावरण") }}
@@ -67,7 +70,7 @@ async function submit() {
         <p v-if="error" class="error">{{ error }}</p>
         <button type="submit" :disabled="loading">{{ loading ? tx("登录中…", "Signing in…", "Entrando…", "साइन इन हो रहा है…") : tx("进入", "Enter", "Entrar", "प्रवेश करें") }}</button>
       </form>
-      <p class="hint">{{ tx("使用原运营账号登录对应国家线。", "Use your existing operations account for the selected country.", "Use sua conta operacional existente para o pais selecionado.", "चुने गए देश के लिए अपना मौजूदा ऑपरेशंस खाता उपयोग करें।") }}</p>
+      <p class="hint">{{ tx("该登录仅用于后台管理 Agent，使用原运营账号进入对应国家线。Trace 等受控入口会按账号权限显示。", "This sign-in is for the admin agent only. Use your existing operations account for the selected country. Controlled entries such as Trace are shown by account permission.", "Este login e apenas para o agente de backoffice. Use sua conta operacional existente para o pais selecionado. Entradas controladas, como Trace, aparecem conforme a permissao da conta.", "यह लॉगिन केवल एडमिन एजेंट के लिए है। चुने गए देश के लिए अपना मौजूदा ऑपरेशंस खाता उपयोग करें। Trace जैसे नियंत्रित प्रवेश खाते की अनुमति के अनुसार दिखेंगे।") }}</p>
     </section>
   </main>
 </template>
@@ -91,6 +94,24 @@ async function submit() {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.ghost-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 12px;
+}
+
+.ghost-link:hover {
+  color: var(--ink);
+  background: var(--fill-soft);
 }
 
 .kicker {

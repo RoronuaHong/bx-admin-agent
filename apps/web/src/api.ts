@@ -8,6 +8,10 @@ export interface Country {
 export interface Me {
   user: { loginName: string; name: string };
   country: Country;
+  permissions: {
+    canViewTrace: boolean;
+    traceAccessSource: "anonymous" | "default-login" | "owner-allowlist" | "denied-allowlist";
+  };
 }
 
 export type ChatEvent =

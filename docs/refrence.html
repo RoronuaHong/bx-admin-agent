@@ -194,6 +194,14 @@
 
     <div class="card">
         <h2>三、当前项目落地形态（bx-admin-agent）</h2>
+        <p><strong>对外产品形态</strong>已经调整为<strong>多 Agent 门户</strong>：用户先进入一个统一主页面，再选择具体 Agent。当前首批入口包括：后台管理 Agent、知识库 / RAG Agent、观影助手 Agent，以及后续更多 Agent 的预留位置。</p>
+        <ul>
+            <li><strong>门户层是产品入口</strong>：负责展示 Agent 卡片、入口切换、全局 UI 语言 / 主题，不等同于服务端总控编排。</li>
+            <li><strong>后台管理 Agent</strong>：当前唯一完整可用的业务 Agent；登录后进入其独立工作台与会话页。</li>
+            <li><strong>知识库 / RAG Agent</strong>：当前先以产品入口 / 方案占位的形式挂到门户，用于承接制度、流程、知识库、文档检索类能力。</li>
+            <li><strong>观影助手 Agent</strong>：当前同样先以产品入口 / 方案占位的形式挂到门户，避免“文档有、页面没有”的错位。</li>
+            <li><strong>Trace</strong>：现调整为<strong>门户级独立入口</strong>，放在 Header 中按权限展示；路径独立于后台管理 Agent，但当前仍依赖统一登录体系和 <code>canViewTrace</code> 权限投影控制访问。</li>
+        </ul>
         <p>当前项目已经落到可运行的 M1 形态：<strong>一个主聊天编排 + 多个 Worker 配置</strong>，而不是多个完全独立进程中的子 Agent 同时协作。</p>
         <ul>
             <li><strong>Supervisor 负责总控</strong>：接收用户问题，先做结构化理解，再决定是否需要路由。</li>
@@ -203,7 +211,11 @@
         </ul>
 
         <div class="info">
-            <strong>M1目标：</strong>先保证路由、权限、环境和工具边界稳定，再推进真正独立进程化的多 Agent 架构。
+            <strong>边界说明：</strong>门户层解决“用户先进入哪个 Agent、看到哪些入口”的产品问题；<code>Supervisor + Worker</code> 解决“后台管理 Agent 内部如何路由与执行”的运行时问题。两者是上下两层，不应混为同一个“总 Agent”。
+        </div>
+
+        <div class="note">
+            <strong>补充说明（2026-09-07）：</strong>当前项目已经把 Trace 从“后台管理 Agent 二级页”收敛为“门户级观测入口 + 权限控制”。也就是说，<code>/trace</code> 的产品归属在门户层，但是否显示、是否可进入、接口是否返回数据，都统一由 <code>canViewTrace</code> 控制。当前这层权限先通过服务端投影输出，默认可基于 <code>TRACE_ALLOWED_OWNERS</code> 做白名单收紧。
         </div>
     </div>
 
@@ -381,6 +393,7 @@
             <li><code>submit_understood_intent</code> 已扩展支持 <code>responseMode</code>、<code>confidence</code>、<code>missingSlots</code>。</li>
             <li>针对说明型问法已增加防误执行策略：当模型判为 <code>clarify</code> 或 <code>explain-capability</code> 时，不应继续 <code>call_api</code>。</li>
             <li>多语种评测脚手架已预留，但目前按迭代安排默认关闭，不作为当前主线交付项。</li>
+            <li>门户 Header 已增加按权限显示的 <code>Trace</code> 入口；独立路由为 <code>/trace</code>，不是 <code>/agents/admin/trace</code> 的产品主入口。</li>
         </ul>
     </div>
 

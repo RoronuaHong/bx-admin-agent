@@ -693,7 +693,7 @@ onMounted(async () => {
     }
   } else {
     // 未登录 / 登录态失效：不丢弃本地记录（已在上方恢复），仅跳登录页。
-    await router.replace("/login");
+    await router.replace("/agents/admin/login");
     return;
   }
 
@@ -1057,7 +1057,7 @@ async function send() {
     } else {
       const status = (err as Error & { status?: number }).status;
       assistant.error = err instanceof Error ? err.message : tx("发送失败", "Send failed");
-      if (status === 401) await router.replace("/login");
+      if (status === 401) await router.replace("/agents/admin/login");
     }
   } finally {
     sending.value = false;
@@ -1092,7 +1092,7 @@ async function onLogout() {
   await logout();
   clearIdentityCache();
   me.value = null;
-  await router.replace("/login");
+  await router.replace("/agents/admin/login");
 }
 
 // 助手消息 hover 工具：复制
@@ -1563,7 +1563,7 @@ async function switchCountry() {
   await logout();
   clearIdentityCache();
   me.value = null;
-  await router.replace("/login");
+  await router.replace("/agents/admin/login");
 }
 
 async function onClearContext() {
@@ -1589,7 +1589,7 @@ async function onClearContext() {
   } catch (err) {
     const status = (err as Error & { status?: number }).status;
     if (status === 401) {
-      await router.replace("/login");
+      await router.replace("/agents/admin/login");
       return;
     }
     alert(err instanceof Error ? err.message : tx("重置对话失败", "Failed to reset conversation", "Falha ao redefinir a conversa", "चैट रीसेट नहीं हो सका"));
@@ -1601,7 +1601,7 @@ async function onClearContext() {
   <div class="booth">
     <header class="top">
       <div class="identity">
-        <div class="brand-mark">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</div>
+        <RouterLink class="brand-mark" to="/">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</RouterLink>
       </div>
       <div class="actions">
         <div class="meta">

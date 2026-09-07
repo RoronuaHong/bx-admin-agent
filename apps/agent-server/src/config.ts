@@ -150,6 +150,11 @@ export const config = {
     const raw = process.env.ALLOWED_API_HOSTS || "";
     return raw ? raw.split(",").map((h) => h.trim()).filter(Boolean) : [];
   },
+  // Trace 门户权限白名单；空=允许所有已登录用户查看。
+  get traceAllowedOwners(): string[] {
+    const raw = process.env.TRACE_ALLOWED_OWNERS || "";
+    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  },
   // OCR 转录器：本地 ollama 视觉模型
   visionOllamaUrl: process.env.VISION_OLLAMA_URL || "http://localhost:11434",
   visionOllamaModel: process.env.VISION_OLLAMA_MODEL || "qwen2.5vl",

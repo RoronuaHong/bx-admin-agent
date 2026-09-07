@@ -244,14 +244,14 @@
   <div class="masthead">
     <div class="kicker">Business Requirement · Mind Map</div>
     <h1>bx-admin-agent 业务需求思维导图</h1>
-    <p>一个主助手 · Worker 路由 · 查数据 / 读知识 / 结构化理解</p>
+    <p>多 Agent 门户 · 后台管理 Agent · 知识库 / RAG Agent · Worker 路由 · 查数据 / 读知识</p>
   </div>
 
   <div class="tree">
     <!-- 根节点 -->
     <div class="root">
-      <div class="r-name">bx-admin-agent 业务助手</div>
-      <div class="r-sub">自然语言 · M1 路由 · 结构化意图 · 查数据 · 读知识</div>
+      <div class="r-name">bx-admin-agent 多 Agent 门户</div>
+      <div class="r-sub">门户入口 · 后台管理 Agent · 知识库 / RAG Agent · 观影助手 Agent · M1 Worker 路由</div>
     </div>
 
     <!-- SVG 曲线连接：根 → 两个方向 -->
@@ -269,8 +269,8 @@
       <div class="branch">
         <div class="dir blue">
           <span class="emoji">📊</span>
-          <span class="t">项目查询类</span>
-          <span class="pill">5 已落地 · 1 暂缓</span>
+          <span class="t">后台管理 Agent</span>
+          <span class="pill">门户已接入 · 5 已落地 · 1 暂缓</span>
         </div>
         <div class="dir-conn"></div>
         <div class="children">
@@ -334,13 +334,31 @@
       <div class="branch">
         <div class="dir green">
           <span class="emoji">📚</span>
-          <span class="t">文档类 RAG</span>
-          <span class="pill">2 已落地 · 2 规划 · 1 阻塞 · 1 暂缓</span>
+          <span class="t">其他 Agent / 入口扩展</span>
+          <span class="pill">2 门户占位 · 2 已落地 · 2 规划 · 1 阻塞 · 1 暂缓</span>
         </div>
         <div class="dir-conn"></div>
         <div class="children">
           <div class="child blue">
-            <div class="head"><div class="icon">1</div><div><div class="name">本地文档</div><div class="ext">local-docs.md</div></div></div>
+            <div class="head"><div class="icon">0</div><div><div class="name">Agent 门户</div><div class="ext">portal-entry.md</div></div></div>
+            <div class="desc">
+              <div>统一主页面</div>
+              <div>切换各个 Agent</div>
+              <div>Header 挂 Trace 权限入口</div>
+            </div>
+            <div class="status ok">已落地</div>
+          </div>
+          <div class="child blue">
+            <div class="head"><div class="icon">1</div><div><div class="name">知识库 / RAG Agent</div><div class="ext">knowledge-rag-agent.md</div></div></div>
+            <div class="desc">
+              <div>知识库 / 制度 / 流程</div>
+              <div>文档检索入口</div>
+              <div>当前先做产品占位</div>
+            </div>
+            <div class="status wait">规划中</div>
+          </div>
+          <div class="child blue">
+            <div class="head"><div class="icon">2</div><div><div class="name">本地文档</div><div class="ext">local-docs.md</div></div></div>
             <div class="desc">
               <div>目录扫描 + 索引</div>
               <div>md / txt / html</div>
@@ -349,7 +367,7 @@
             <div class="status ok">已落地</div>
           </div>
           <div class="child green">
-            <div class="head"><div class="icon">2</div><div><div class="name">多格式解析</div><div class="ext">multi-format.md</div></div></div>
+            <div class="head"><div class="icon">3</div><div><div class="name">多格式解析</div><div class="ext">multi-format.md</div></div></div>
             <div class="desc">
               <div>PDF / DOCX</div>
               <div>XLSX 解析</div>
@@ -358,7 +376,7 @@
             <div class="status wait">规划中</div>
           </div>
           <div class="child amber">
-            <div class="head"><div class="icon">3</div><div><div class="name">语义检索</div><div class="ext">semantic-rerank.md</div></div></div>
+            <div class="head"><div class="icon">4</div><div><div class="name">语义检索</div><div class="ext">semantic-rerank.md</div></div></div>
             <div class="desc">
               <div>向量 + 词法</div>
               <div>RRF 融合</div>
@@ -367,7 +385,7 @@
             <div class="status ok">已落地</div>
           </div>
           <div class="child violet">
-            <div class="head"><div class="icon">4</div><div><div class="name">钉钉接入</div><div class="ext">dingtalk-doc.md</div></div></div>
+            <div class="head"><div class="icon">5</div><div><div class="name">钉钉接入</div><div class="ext">dingtalk-doc.md</div></div></div>
             <div class="desc">
               <div>等企业凭证</div>
               <div>文档搜索 / 拉取</div>
@@ -376,7 +394,7 @@
             <div class="status block">阻塞</div>
           </div>
           <div class="child cyan">
-            <div class="head"><div class="icon">5</div><div><div class="name">增量索引</div><div class="ext">incremental-idx.md</div></div></div>
+            <div class="head"><div class="icon">6</div><div><div class="name">增量索引</div><div class="ext">incremental-idx.md</div></div></div>
             <div class="desc">
               <div>md5 / ctime 指纹</div>
               <div>只重建变更</div>
@@ -385,7 +403,7 @@
             <div class="status wait">规划中</div>
           </div>
           <div class="child red">
-            <div class="head"><div class="icon">6</div><div><div class="name">多语种评测集</div><div class="ext">eval-routing-natural.md</div></div></div>
+            <div class="head"><div class="icon">7</div><div><div class="name">多语种评测集</div><div class="ext">eval-routing-natural.md</div></div></div>
             <div class="desc">
               <div>runner + cases 已搭好</div>
               <div>默认跳过不执行</div>
@@ -409,12 +427,12 @@
   <!-- 对比表 -->
   <div class="table-title">两个方向核心对比</div>
   <table>
-    <tr><th>维度</th><th>项目查询类</th><th>文档类 RAG</th></tr>
-    <tr><td>数据源</td><td>后台 API（实时接口）</td><td>文档文件（本地 / 钉钉）</td></tr>
-    <tr><td>检索方式</td><td>先结构化理解，再 Worker 路由，最后源码定位接口 + 工具调用</td><td>语义 + 词法双路融合</td></tr>
-    <tr><td>输出形态</td><td>表格 / 文字说明 / 澄清问题</td><td>答案 + 引用出处</td></tr>
-    <tr><td>写操作</td><td>增 / 改 / 删（带确认）</td><td>仅读（文档不动）</td></tr>
-    <tr><td>阻塞</td><td>无</td><td>钉钉需企业凭证</td></tr>
+    <tr><th>维度</th><th>后台管理 Agent</th><th>知识库 / RAG Agent 与其他入口</th></tr>
+    <tr><td>当前状态</td><td>已可登录、可对话；Trace 走门户权限入口</td><td>门户已挂载，能力按规划逐步接入</td></tr>
+    <tr><td>内部实现</td><td>先结构化理解，再 Worker 路由，最后工具调用</td><td>RAG 能力已在项目中存在，但独立 Agent 页面仍处于占位阶段</td></tr>
+    <tr><td>当前入口</td><td>Admin Login / Chat；Trace 位于门户 Header</td><td>Knowledge / RAG Agent / Viewing Agent / More Agents</td></tr>
+    <tr><td>数据源</td><td>后台 API + 本地知识库</td><td>文档、制度、流程、企业知识库等按各 Agent 定义</td></tr>
+    <tr><td>风险控制</td><td>写操作确认、环境显式化、工具白名单</td><td>未完整落地前不伪造登录与工作台</td></tr>
   </table>
 
 </div>
