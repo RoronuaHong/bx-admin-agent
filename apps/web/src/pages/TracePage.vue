@@ -12,8 +12,11 @@ import {
   type TraceSpanDto,
 } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
+import { getUiLocale, toggleUiLocale } from "../ui-locale";
 
 const router = useRouter();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 const me = shallowRef<Me | null>(null);
 const loading = ref(false);
 const error = ref("");
@@ -56,7 +59,7 @@ async function loadRuns() {
       spans.value = [];
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "加载失败";
+    error.value = err instanceof Error ? err.message : tx("加载失败", "Load failed");
     if ((err as Error & { status?: number }).status === 401) {
       await router.replace("/login");
     }
@@ -75,7 +78,7 @@ async function selectRun(runId: string) {
     spans.value = data.spans;
     spanRelease.value = data.release || "";
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "加载 run 失败";
+    error.value = err instanceof Error ? err.message : tx("加载 run 失败", "Failed to load run");
     spans.value = [];
   } finally {
     detailLoading.value = false;
@@ -104,7 +107,7 @@ onMounted(async () => {
       <div class="identity">
         <RouterLink class="brand-mark" to="/chat">小助手</RouterLink>
         <span class="sep">/</span>
-        <span class="page-title">调用观察</span>
+        <span class="page-title">{{ tx("调用观察", "Trace") }}</span>
       </div>
       <div class="actions">
         <div class="meta">
@@ -112,16 +115,17 @@ onMounted(async () => {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
+        <button class="ghost" type="button" @click="toggleUiLocale">{{ uiLocale === "en" ? "中文" : "English" }}</button>
         <ThemeToggle />
-        <RouterLink class="ghost" to="/chat">对话</RouterLink>
-        <button class="ghost" type="button" :disabled="loading" @click="loadRuns">刷新</button>
-        <button class="ghost" type="button" @click="onLogout">退出</button>
+        <RouterLink class="ghost" to="/chat">{{ tx("对话", "Chat") }}</RouterLink>
+        <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh") }}</button>
+        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout") }}</button>
       </div>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section v-if="stats" class="stats" aria-label="汇总">
+    <section v-if="stats" class="stats" :aria-label="tx('汇总', 'Summary')">
       <div class="stat">
         <span class="stat-k">runs</span>
         <span class="stat-v">{{ stats.runs }}</span>
@@ -149,25 +153,25 @@ onMounted(async () => {
     </section>
 
     <p v-if="stats?.degradeHint" class="hint warn-hint">{{ stats.degradeHint }}</p>
-    <p v-else class="hint">只读视图 · 仅显示当前登录者的 run · 数据来自 /trace/runs</p>
+    <p v-else class="hint">{{ tx("只读视图 · 仅显示当前登录者的 run · 数据来自 /trace/runs", "Read-only view · only shows runs for the current user · data from /trace/runs") }}</p>
 
     <div class="split">
       <section class="list-pane">
         <div class="pane-head">
-          <h2>最近请求</h2>
-          <span class="muted">{{ loading ? "加载中…" : `${runs.length} 条` }}</span>
+          <h2>{{ tx("最近请求", "Recent Requests") }}</h2>
+          <span class="muted">{{ loading ? tx("加载中…", "Loading…") : (uiLocale === "en" ? `${runs.length} items` : `${runs.length} 条`) }}</span>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>时间</th>
-                <th>模型</th>
-                <th>轮次</th>
-                <th>空轮</th>
+                <th>{{ tx("时间", "Time") }}</th>
+                <th>{{ tx("模型", "Model") }}</th>
+                <th>{{ tx("轮次", "Rounds") }}</th>
+                <th>{{ tx("空轮", "Empty") }}</th>
                 <th>token</th>
-                <th>耗时</th>
-                <th>输入</th>
+                <th>{{ tx("耗时", "Duration") }}</th>
+                <th>{{ tx("输入", "Input") }}</th>
               </tr>
             </thead>
             <tbody>
@@ -186,7 +190,7 @@ onMounted(async () => {
                 <td class="clip">{{ shortText(r.userText) }}</td>
               </tr>
               <tr v-if="!runs.length && !loading">
-                <td colspan="7" class="empty">暂无 trace</td>
+                <td colspan="7" class="empty">{{ tx("暂无 trace", "No trace yet") }}</td>
               </tr>
             </tbody>
           </table>
@@ -195,8 +199,8 @@ onMounted(async () => {
 
       <section class="detail-pane">
         <div class="pane-head">
-          <h2>Span 树</h2>
-          <span class="muted mono">{{ selectedId ? selectedId.slice(0, 8) : "选中左侧一行" }}</span>
+          <h2>{{ tx("Span 树", "Span Tree") }}</h2>
+          <span class="muted mono">{{ selectedId ? selectedId.slice(0, 8) : tx("选中左侧一行", "Select a row on the left") }}</span>
         </div>
         <p v-if="selected" class="detail-meta">
           <span>release {{ selected.release || spanRelease || "—" }}</span>
@@ -205,7 +209,7 @@ onMounted(async () => {
           <span>·</span>
           <span>{{ fmtTokens(selected.totalTokens) }} tok</span>
         </p>
-        <p v-if="detailLoading" class="muted">加载 span…</p>
+        <p v-if="detailLoading" class="muted">{{ tx("加载 span…", "Loading span…") }}</p>
         <ol v-else-if="spans.length" class="spans">
           <li v-for="s in spans" :key="s.spanId" :class="['span', `k-${s.kind}`, { err: s.status === 'error' || s.status === 'reject' }]">
             <span class="kind">{{ s.kind }}</span>
@@ -216,7 +220,7 @@ onMounted(async () => {
             <span v-if="s.error" class="err-txt">{{ s.error }}</span>
           </li>
         </ol>
-        <p v-else-if="selectedId" class="muted">无 span</p>
+        <p v-else-if="selectedId" class="muted">{{ tx("无 span", "No span") }}</p>
       </section>
     </div>
   </main>

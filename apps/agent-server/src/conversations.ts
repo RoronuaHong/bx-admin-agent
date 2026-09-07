@@ -23,13 +23,17 @@ export function isLegacyTaskConversationId(id: string): boolean {
 export interface StoredMessage {
   role: "user" | "assistant";
   text: string;
-  images?: string[];
+  images?: Array<{ id: string; name: string }>;
   tables?: unknown[];
   charts?: unknown[];
   files?: unknown[];
   cancelled?: boolean;
   status?: string;
   error?: string;
+  reasoning?: string;
+  toolResults?: Array<{ name: string; result: string }>;
+  toolStep?: number;
+  currentTool?: string;
 }
 
 export interface ConversationDoc {

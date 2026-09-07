@@ -187,6 +187,10 @@ export interface StoredMessage {
   cancelled?: boolean;
   status?: string;
   error?: string;
+  reasoning?: string;
+  toolResults?: Array<{ name: string; result: string }>;
+  toolStep?: number;
+  currentTool?: string;
 }
 
 export interface ConversationDto {

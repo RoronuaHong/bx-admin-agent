@@ -11,6 +11,7 @@ import ResultChart from "../components/ResultChart.vue";
 import ToolResultCard from "../components/ToolResultCard.vue";
 import CapabilitiesHelp from "../components/CapabilitiesHelp.vue";
 import type { ChatFileRef, TableView, ChartView } from "../types";
+import { getUiLocale, toggleUiLocale } from "../ui-locale";
 
 // 轻量 Markdown 渲染：把模型返回的 **加粗**/`代码`/列表/标题渲染成富文本，
 // 避免用户看到原始 ** 与反引号。默认 html:false 关闭 HTML，防止 XSS。
@@ -97,6 +98,9 @@ interface Bubble {
 }
 
 const router = useRouter();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
+const uiLocaleLabel = computed(() => (uiLocale.value === "en" ? "中文" : "English"));
 const me = shallowRef<Me | null>(null);
 const input = ref("");
 const sending = ref(false);
@@ -259,7 +263,7 @@ function newId() {
 
 function makeTitle(messages: Bubble[]): string {
   const first = messages.find((m) => m.role === "user")?.text.trim();
-  return (first || "新对话").replace(/\s+/g, " ").slice(0, 24);
+  return (first || tx("新对话", "New Chat")).replace(/\s+/g, " ").slice(0, 24);
 }
 
 // 序列化：仅保留需要持久化的字段（避免把响应式/临时字段写进存储）
@@ -274,6 +278,12 @@ function slimConversations() {
         ...(m.tables?.length ? { tables: m.tables } : {}),
         ...(m.charts?.length ? { charts: m.charts } : {}),
         ...(m.files?.length ? { files: m.files } : {}),
+        ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+        ...(m.toolResults?.length ? { toolResults: m.toolResults } : {}),
+        ...(typeof m.toolStep === "number" ? { toolStep: m.toolStep } : {}),
+        ...(m.currentTool ? { currentTool: m.currentTool } : {}),
+        ...(m.status ? { status: m.status } : {}),
+        ...(m.error ? { error: m.error } : {}),
         ...(m.cancelled ? { cancelled: true } : {}),
       }))
       .filter(
@@ -287,6 +297,9 @@ function slimConversations() {
           Boolean(m.tables?.length) ||
           Boolean((m as { charts?: unknown[] }).charts?.length) ||
           Boolean(m.files?.length) ||
+          Boolean((m as { toolResults?: unknown[] }).toolResults?.length) ||
+          Boolean((m as { reasoning?: string }).reasoning?.trim()) ||
+          Boolean((m as { error?: string }).error) ||
           Boolean((m as { cancelled?: boolean }).cancelled),
       ),
   }));
@@ -396,6 +409,12 @@ function migrateLegacy(): Conversation | null {
 
 function sanitizeBubble(m: Bubble): Bubble {
   const text = typeof m.text === "string" ? m.text.slice(0, 20000) : "";
+  const reasoning = typeof m.reasoning === "string" ? m.reasoning.slice(0, 20000) : undefined;
+  const toolResults = Array.isArray(m.toolResults)
+    ? m.toolResults
+      .slice(0, 20)
+      .map((item) => ({ name: String(item?.name || "").slice(0, 120), result: String(item?.result || "").slice(0, 12000) }))
+    : undefined;
   const tables = Array.isArray(m.tables)
     ? m.tables.slice(0, 3).map((t) => ({
         ...t,
@@ -421,6 +440,8 @@ function sanitizeBubble(m: Bubble): Bubble {
     // 若保留 finished:false，刷新后打字光标会永远闪烁。恢复即视为已完成，
     // 仅在确实被打断且无任何产出时标记为 error（避免空气泡假完成）。
     ...(m.role === "assistant" ? { finished: true } : {}),
+    ...(reasoning ? { reasoning, reasoningExpanded: false } : {}),
+    ...(toolResults?.length ? { toolResults } : {}),
     ...(tables?.length ? { tables } : {}),
     ...(charts?.length ? { charts } : {}),
   };
@@ -452,7 +473,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
       .slice(0, 20)
       .map((c) => ({
         id: c.id,
-        title: c.title || "新对话",
+        title: c.title || tx("新对话", "New Chat"),
         messages: (c.messages as Bubble[])
           .filter((m) => m && (m.role === "user" || m.role === "assistant"))
           .slice(-80)
@@ -470,7 +491,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
 // 新建一个空会话并设为当前。
 function newConversation() {
   const now = Date.now();
-  const conv: Conversation = { id: newId(), title: "新对话", messages: [], createdAt: now, updatedAt: now };
+  const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
   conversations.value.push(conv);
   activeId.value = conv.id;
   saveConversations();
@@ -506,7 +527,7 @@ function openTabMenu(ev: MouseEvent, convId: string, idx: number) {
 
 function ensureBlankConversation() {
   const now = Date.now();
-  const conv: Conversation = { id: newId(), title: "新对话", messages: [], createdAt: now, updatedAt: now };
+  const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
   conversations.value.push(conv);
   activeId.value = conv.id;
   createConversation({ id: conv.id, title: conv.title }).catch(() => {});
@@ -664,7 +685,7 @@ onMounted(async () => {
 
   if (!activeId.value) {
     const now = Date.now();
-    const conv: Conversation = { id: newId(), title: "新对话", messages: [], createdAt: now, updatedAt: now };
+    const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
     conversations.value.push(conv);
     activeId.value = conv.id;
   }
@@ -765,7 +786,7 @@ async function restoreConversations() {
       .slice(0, 20)
       .map((c) => ({
         id: c.id,
-        title: c.title || "新对话",
+        title: c.title || tx("新对话", "New Chat"),
         messages: (c.messages as Bubble[])
           .filter((m) => m && (m.role === "user" || m.role === "assistant"))
           .slice(-80)
@@ -871,23 +892,25 @@ function startComposerDrag(e: PointerEvent | MouseEvent | TouchEvent) {
 /** 工具名 → 实时活动状态文案（工具调用阶段显示“正在做什么”）。
  * 2026-08-26 改：显示真实工具中文动作，让用户看到当前在调用哪个工具（避免黑盒卡顿感）。
  * 映射表只含通用工具语义，不含任何业务词（符合红线）。 */
-const TOOL_STATUS_MAP: Record<string, string> = {
-  submit_understood_intent: "正在理解你的意图…",
-  search_api_module: "正在搜索业务模块…",
-  read_api_module: "正在读取接口定义…",
-  grep_codebase: "正在检索代码…",
-  read_file: "正在读取文件…",
-  list_dir: "正在列出目录…",
-  call_api: "正在调用接口查询数据…",
-  request_clarification: "正在向你确认…",
-  search_knowledge: "正在检索知识库…",
-  normalize_output: "正在整理输出…",
-  render_table: "正在渲染表格…",
-  export_dataset: "正在导出数据…",
-  get_page_schema: "正在读取页面结构…",
+const TOOL_STATUS_MAP: Record<string, { zh: string; en: string }> = {
+  submit_understood_intent: { zh: "正在理解你的意图…", en: "Understanding your intent…" },
+  search_api_module: { zh: "正在搜索业务模块…", en: "Searching business modules…" },
+  read_api_module: { zh: "正在读取接口定义…", en: "Reading API definitions…" },
+  grep_codebase: { zh: "正在检索代码…", en: "Searching the codebase…" },
+  read_file: { zh: "正在读取文件…", en: "Reading files…" },
+  list_dir: { zh: "正在列出目录…", en: "Listing directories…" },
+  call_api: { zh: "正在调用接口查询数据…", en: "Querying data via API…" },
+  request_clarification: { zh: "正在向你确认…", en: "Requesting clarification…" },
+  search_knowledge: { zh: "正在检索知识库…", en: "Searching the knowledge base…" },
+  normalize_output: { zh: "正在整理输出…", en: "Formatting output…" },
+  render_table: { zh: "正在渲染表格…", en: "Rendering table…" },
+  export_dataset: { zh: "正在导出数据…", en: "Exporting data…" },
+  get_page_schema: { zh: "正在读取页面结构…", en: "Reading page schema…" },
 };
 function toolStatusText(name: string): string {
-  return TOOL_STATUS_MAP[name] || `正在调用工具：${name}…`;
+  const item = TOOL_STATUS_MAP[name];
+  if (item) return uiLocale.value === "en" ? item.en : item.zh;
+  return uiLocale.value === "en" ? `Calling tool: ${name}…` : `正在调用工具：${name}…`;
 }
 
 async function send() {
@@ -896,7 +919,7 @@ async function send() {
   const imageIds = pastingImages.value.map((item) => item.id);
   const files = pastingFiles.value.map((item) => item.id);
   const attachCount = imageIds.length + files.length;
-  const titleText = text || `[${imageIds.length ? `图片 ${imageIds.length} 张` : `附件 ${attachCount} 个`}]`;
+  const titleText = text || `[${imageIds.length ? tx(`图片 ${imageIds.length} 张`, `${imageIds.length} image(s)`) : tx(`附件 ${attachCount} 个`, `${attachCount} attachment(s)`)}]`;
   stopVoice();
   input.value = "";
   const bubbleImages = pastingImages.value.map((item) => ({ id: item.id, name: item.name }));
@@ -958,14 +981,14 @@ async function send() {
           assistant.text += event.text;
           // 走工具链后（已调用工具或已 done），模型开始流式输出总结时，状态条保持可见并切到「生成回答」态，
           // 避免「正在调用接口…」一闪而过、用户只看到「正在思考…」。首轮纯思考（无工具）不在此列。
-          if (toolCount > 0 || gotDone) assistant.status = "正在生成回答…";
+          if (toolCount > 0 || gotDone) assistant.status = tx("正在生成回答…", "Generating reply…");
         }
       }
       if (event.type === "model") {
         modelNotice.value =
           event.reason === "fallback"
-            ? `模型调用异常，已自动降级为 ${event.label} 处理`
-            : `当前模型不支持图片，本次已自动切换为 ${event.label} 处理`;
+            ? tx(`模型调用异常，已自动降级为 ${event.label} 处理`, `Model fallback applied automatically: ${event.label}`)
+            : tx(`当前模型不支持图片，本次已自动切换为 ${event.label} 处理`, `The current model does not support images. Switched to ${event.label}.`);
       }
       if (event.type === "tool_call") {
         toolCount += 1;
@@ -993,7 +1016,7 @@ async function send() {
         assistant.currentTool = undefined;
         assistant.finished = true;
         // 工具链完成后保留「已调用 N 个工具」回显，避免快模型进度瞬间消失黑盒感
-        if (toolCount > 0) assistant.status = `已调用 ${toolCount} 个工具，正在生成回答…`;
+        if (toolCount > 0) assistant.status = tx(`已调用 ${toolCount} 个工具，正在生成回答…`, `${toolCount} tools called, generating reply…`);
       }
       if (event.type === "error") assistant.error = event.message;
       if (event.type === "table") {
@@ -1019,7 +1042,7 @@ async function send() {
       assistant.cancelled = true;
     } else {
       const status = (err as Error & { status?: number }).status;
-      assistant.error = err instanceof Error ? err.message : "发送失败";
+      assistant.error = err instanceof Error ? err.message : tx("发送失败", "Send failed");
       if (status === 401) await router.replace("/login");
     }
   } finally {
@@ -1027,7 +1050,7 @@ async function send() {
     activeController.value = null;
     // 取消时不再给兜底提示；正常结束（done）但无任何有效产出时提示。
     if (!assistant.cancelled && gotDone && !assistant.text && !assistant.error && !assistant.tables?.length && !assistant.charts?.length && !assistant.files?.length && !assistant.toolResults?.length) {
-      assistant.error = "本次未返回有效结果，请换个说法再试。";
+      assistant.error = tx("本次未返回有效结果，请换个说法再试。", "No valid result was returned. Please try rephrasing.");
     }
     await scrollBottom();
   }
@@ -1062,7 +1085,7 @@ async function onLogout() {
 const copiedId = ref<number | null>(null);
 
 // 登录者显示名：优先中文名，回退登录账号；未登录时显示「你」。
-const meName = computed(() => me.value?.user?.name || me.value?.user?.loginName || "你");
+const meName = computed(() => me.value?.user?.name || me.value?.user?.loginName || tx("你", "You"));
 
 // 输入框能力探测：环境/权限不满足的功能，对应按钮直接隐藏。
 interface Capabilities {
@@ -1287,7 +1310,7 @@ function toggleVoice() {
     recognitionRef.value = initVoice();
   }
   if (!recognitionRef.value) {
-    alert("当前浏览器不支持语音输入");
+    alert(tx("当前浏览器不支持语音输入", "Voice input is not supported in this browser"));
     return;
   }
   if (recording.value) {
@@ -1506,7 +1529,7 @@ async function copyBody(item: Bubble) {
       if (copiedId.value === item.id) copiedId.value = null;
     }, 1200);
   } else {
-    alert("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。");
+    alert(tx("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。", "Copy failed: clipboard access is not available in this browser."));
   }
 }
 
@@ -1537,7 +1560,7 @@ async function onClearContext() {
     const active = conversations.value.find((c) => c.id === activeId.value);
     if (active) {
       active.messages = [];
-      active.title = "新对话";
+      active.title = tx("新对话", "New Chat");
       active.updatedAt = Date.now();
       saveConversations();
       // 服务端同步清空当前会话消息（保留会话壳）。
@@ -1555,7 +1578,7 @@ async function onClearContext() {
       await router.replace("/login");
       return;
     }
-    alert(err instanceof Error ? err.message : "重置对话失败");
+    alert(err instanceof Error ? err.message : tx("重置对话失败", "Failed to reset conversation"));
   }
 }
 </script>
@@ -1564,7 +1587,7 @@ async function onClearContext() {
   <div class="booth">
     <header class="top">
       <div class="identity">
-        <div class="brand-mark">小助手</div>
+        <div class="brand-mark">{{ tx("小助手", "Assistant") }}</div>
       </div>
       <div class="actions">
         <div class="meta">
@@ -1574,17 +1597,18 @@ async function onClearContext() {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
+        <button class="ghost" type="button" @click="toggleUiLocale">{{ uiLocaleLabel }}</button>
         <ThemeToggle />
-        <RouterLink class="ghost" to="/trace">调用观察</RouterLink>
-        <button class="ghost" type="button" @click="helpOpen = true">操作说明</button>
-        <button class="ghost" type="button" :disabled="sending" @click="onClearContext">重置对话</button>
-        <button class="ghost" type="button" @click="onLogout">退出</button>
+        <RouterLink class="ghost" to="/trace">{{ tx("调用观察", "Trace") }}</RouterLink>
+        <button class="ghost" type="button" @click="helpOpen = true">{{ tx("操作说明", "Help") }}</button>
+        <button class="ghost" type="button" :disabled="sending" @click="onClearContext">{{ tx("重置对话", "Reset Chat") }}</button>
+        <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout") }}</button>
       </div>
     </header>
 
     <CapabilitiesHelp v-model:open="helpOpen" @use-example="useHelpExample" />
 
-    <nav class="tabs" aria-label="会话切换">
+    <nav class="tabs" :aria-label="tx('会话切换', 'Conversation Tabs')">
       <button
         v-for="(conv, idx) in conversations"
         :key="conv.id"
@@ -1596,9 +1620,9 @@ async function onClearContext() {
       >
         <span class="tab-index">{{ idx + 1 }}</span>
         <span class="tab-title">{{ conv.title }}</span>
-        <span class="tab-close" title="关闭会话" @click.stop="closeConversation(conv.id)">×</span>
+        <span class="tab-close" :title="tx('关闭会话', 'Close conversation')" @click.stop="closeConversation(conv.id)">×</span>
       </button>
-      <button class="tab-new" type="button" title="新建会话" @click="newConversation">＋</button>
+      <button class="tab-new" type="button" :title="tx('新建会话', 'New conversation')" @click="newConversation">＋</button>
     </nav>
 
     <Teleport to="body">
@@ -1611,7 +1635,7 @@ async function onClearContext() {
           @click.stop
         >
           <li role="none">
-            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">关闭</button>
+            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">{{ tx("关闭", "Close") }}</button>
           </li>
           <li role="none">
             <button
@@ -1620,7 +1644,7 @@ async function onClearContext() {
               :disabled="conversations.length <= 1"
               @click="closeOtherConversations(tabMenu.convId)"
             >
-              关闭其他
+              {{ tx("关闭其他", "Close Others") }}
             </button>
           </li>
           <li role="none">
@@ -1630,7 +1654,7 @@ async function onClearContext() {
               :disabled="tabMenu.idx <= 0"
               @click="closeLeftConversations(tabMenu.convId)"
             >
-              关闭左侧
+              {{ tx("关闭左侧", "Close Left") }}
             </button>
           </li>
           <li role="none">
@@ -1640,12 +1664,12 @@ async function onClearContext() {
               :disabled="tabMenu.idx >= conversations.length - 1"
               @click="closeRightConversations(tabMenu.convId)"
             >
-              关闭右侧
+              {{ tx("关闭右侧", "Close Right") }}
             </button>
           </li>
           <li class="tab-ctx-sep" role="separator" />
           <li role="none">
-            <button type="button" role="menuitem" @click="closeAllConversations">全部关闭</button>
+            <button type="button" role="menuitem" @click="closeAllConversations">{{ tx("全部关闭", "Close All") }}</button>
           </li>
         </ul>
       </template>
@@ -1657,7 +1681,7 @@ async function onClearContext() {
         <article v-for="{ item, cards } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
         <div class="who" :class="{ me: item.role === 'user' }">
           <span class="dot" />
-          {{ item.role === "user" ? meName : "助手" }}
+          {{ item.role === "user" ? meName : tx("助手", "Assistant") }}
         </div>
         <div v-if="item.text || item.images?.length || item.tables?.length || item.charts?.length || item.files?.length || item.toolResults?.length" class="body-wrap">
           <div v-if="item.images?.length" class="msg-images" :class="item.images.length > 1 ? 'grid' : 'single'">
@@ -1686,9 +1710,9 @@ async function onClearContext() {
               :aria-expanded="item.reasoningExpanded"
               @click="item.reasoningExpanded = !item.reasoningExpanded"
             >
-              <span class="reasoning-tag" aria-hidden="true">推理</span>
-              <span class="reasoning-title">模型推理过程</span>
-              <span class="reasoning-toggle" aria-hidden="true">{{ item.reasoningExpanded ? "收起" : "展开" }}</span>
+              <span class="reasoning-tag" aria-hidden="true">{{ tx("推理", "Reasoning") }}</span>
+              <span class="reasoning-title">{{ tx("模型推理过程", "Model reasoning") }}</span>
+              <span class="reasoning-toggle" aria-hidden="true">{{ item.reasoningExpanded ? tx("收起", "Collapse") : tx("展开", "Expand") }}</span>
             </button>
             <div v-if="item.reasoningExpanded" class="reasoning-body">
               <p v-for="(line, ri) in item.reasoning.trim().split('\n')" :key="ri" class="reasoning-line">{{ line }}</p>
@@ -1716,7 +1740,7 @@ async function onClearContext() {
                     :disabled="cards.every(Boolean)"
                     @click="setAllCards(cards, true)"
                   >
-                    全部展开
+                    {{ tx("全部展开", "Expand All") }}
                   </button>
                   <button
                     type="button"
@@ -1724,7 +1748,7 @@ async function onClearContext() {
                     :disabled="cards.every((v) => !v)"
                     @click="setAllCards(cards, false)"
                   >
-                    全部折叠
+                    {{ tx("全部折叠", "Collapse All") }}
                   </button>
                 </div>
                 <ToolResultCard
@@ -1750,7 +1774,7 @@ async function onClearContext() {
                 <span>{{ f.kind.toUpperCase() }} · {{ Math.max(1, Math.round(f.size / 1024)) }} KB</span>
               </div>
               <div class="file-actions">
-                <a class="file-btn" :href="downloadUrl(f.id, false)" download>{{ f.kind === 'pdf' ? '下载 PDF' : '下载 Excel' }}</a>
+                <a class="file-btn" :href="downloadUrl(f.id, false)" download>{{ f.kind === 'pdf' ? tx('下载 PDF', 'Download PDF') : tx('下载 Excel', 'Download Excel') }}</a>
               </div>
               <iframe
                 v-if="f.kind === 'pdf'"
@@ -1764,7 +1788,7 @@ async function onClearContext() {
             <button
               type="button"
               class="act"
-              title="编辑"
+              :title="tx('编辑', 'Edit')"
               @click="editInComposer(item)"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -1781,7 +1805,7 @@ async function onClearContext() {
             <button
               type="button"
               class="act"
-              :title="copiedId === item.id ? '已复制' : '复制'"
+              :title="copiedId === item.id ? tx('已复制', 'Copied') : tx('复制', 'Copy')"
               @click="copyBody(item)"
             >
               <svg v-if="copiedId !== item.id" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -1813,13 +1837,13 @@ async function onClearContext() {
           v-if="item.role === 'assistant' && !item.error && !item.cancelled && !item.finished && (!item.text || item.toolActive || (item.toolStep && item.toolStep > 0))"
           class="loading status-line"
           role="status"
-          aria-label="正在回复"
+          :aria-label="tx('正在回复', 'Replying')"
         >
           <span class="loading-dot" />
-          <span class="loading-text">{{ item.status || '正在思考…' }}</span>
+          <span class="loading-text">{{ item.status || tx('正在思考…', 'Thinking…') }}</span>
         </div>
         <p v-if="item.error" class="error">{{ item.error }}</p>
-        <div v-else-if="item.cancelled" class="cancelled-note">已取消</div>
+        <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled") }}</div>
         </article>
       </main>
       <div class="thread-scrollbar" ref="threadTrackEl">
@@ -1832,7 +1856,7 @@ async function onClearContext() {
         v-if="scrollTop > 300"
         class="back-top-btn"
         type="button"
-        title="返回顶部"
+        :title="tx('返回顶部', 'Back to top')"
         @click="scrollToTop"
       >
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -1845,7 +1869,7 @@ async function onClearContext() {
       v-if="lightboxUrl"
       class="lightbox"
       role="dialog"
-      aria-label="图片预览"
+      :aria-label="tx('图片预览', 'Image preview')"
       @click.self="lightboxUrl = ''"
     >
       <img :src="lightboxUrl" alt="图片大图" />
@@ -1867,7 +1891,7 @@ async function onClearContext() {
             <button
               type="button"
               class="image-remove"
-              title="移除图片"
+              :title="tx('移除图片', 'Remove image')"
               :disabled="sending"
               @click="removePastedImage(index)"
             >
@@ -1879,7 +1903,7 @@ async function onClearContext() {
             <button
               type="button"
               class="image-remove"
-              title="移除文件"
+              :title="tx('移除文件', 'Remove file')"
               :disabled="sending"
               @click="removePastedFile(index)"
             >
@@ -1896,7 +1920,7 @@ async function onClearContext() {
           :disabled="sending"
           rows="1"
           enterkeyhint="send"
-          :placeholder="recording ? '正在聆听…' : '输入内容，回车发送；支持直接粘贴图片'"
+          :placeholder="recording ? tx('正在聆听…', 'Listening…') : tx('输入内容，回车发送；支持直接粘贴图片', 'Type your message and press Enter to send; pasting images is supported')"
           @keydown="onComposerKeydown"
           @input="resizeComposer"
           @paste="onComposerPaste"
@@ -1935,8 +1959,8 @@ async function onClearContext() {
                 @click.stop
               >
                 <div class="model-menu-header">
-                  <div class="model-menu-title">选择模型</div>
-                  <span class="model-menu-count">{{ availableModels.length }} 个可用</span>
+                  <div class="model-menu-title">{{ tx("选择模型", "Choose Model") }}</div>
+                  <span class="model-menu-count">{{ uiLocale === "en" ? `${availableModels.length} available` : `${availableModels.length} 个可用` }}</span>
                 </div>
                 <button
                   type="button"
@@ -1951,7 +1975,7 @@ async function onClearContext() {
                 </button>
                 <template v-if="textModels.length">
                   <div class="model-group">
-                    <div class="model-group-title">文本对话</div>
+                    <div class="model-group-title">{{ tx("文本对话", "Text Chat") }}</div>
                     <div class="model-list">
                       <button
                         v-for="m in textModels"
@@ -1970,7 +1994,7 @@ async function onClearContext() {
                 </template>
                 <template v-if="visionModels.length">
                   <div class="model-group">
-                    <div class="model-group-title">视觉 / 多模态</div>
+                    <div class="model-group-title">{{ tx("视觉 / 多模态", "Vision / Multimodal") }}</div>
                     <div class="model-list">
                       <button
                         v-for="m in visionModels"
@@ -1982,7 +2006,7 @@ async function onClearContext() {
                         @click="selectModel(m.id)"
                       >
                         <span class="model-label">{{ m.label }}</span>
-                        <span class="model-badge">视觉</span>
+                        <span class="model-badge">{{ tx("视觉", "Vision") }}</span>
                         <span class="model-provider">{{ m.source || m.provider }}</span>
                       </button>
                     </div>
@@ -1998,7 +2022,7 @@ async function onClearContext() {
             <button
               type="button"
               class="tool-btn"
-              title="上传文件（txt/md/json/csv，或图片）"
+              :title="tx('上传文件（txt/md/json/csv，或图片）', 'Upload files (txt/md/json/csv or images)')"
               :disabled="sending"
               @click="fileInput?.click()"
             >
@@ -2025,7 +2049,7 @@ async function onClearContext() {
               type="button"
               class="tool-btn"
               :class="{ active: recording }"
-              title="语音输入"
+              :title="tx('语音输入', 'Voice input')"
               @click="toggleVoice"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -2051,7 +2075,7 @@ async function onClearContext() {
               type="submit"
               class="send-btn"
               :class="{ stopping: sending }"
-              :title="sending ? '停止生成' : '发送'"
+              :title="sending ? tx('停止生成', 'Stop generating') : tx('发送', 'Send')"
               @click="sending && cancelSend()"
             >
               <svg v-if="sending" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">

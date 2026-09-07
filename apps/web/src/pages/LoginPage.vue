@@ -3,8 +3,11 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { fetchCountries, login, type Country } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
+import { getUiLocale, toggleUiLocale } from "../ui-locale";
 
 const router = useRouter();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 const countries = ref<Country[]>([]);
 const country = ref("");
 const username = ref("");
@@ -24,7 +27,7 @@ async function submit() {
     await login({ country: country.value, username: username.value, password: password.value });
     await router.replace("/chat");
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "登录失败";
+    error.value = err instanceof Error ? err.message : tx("登录失败", "Login failed");
   } finally {
     loading.value = false;
   }
@@ -34,32 +37,35 @@ async function submit() {
 <template>
   <main class="stage">
     <header class="top">
-      <p class="kicker">运营助手</p>
-      <ThemeToggle />
+      <p class="kicker">{{ tx("运营助手", "Ops Assistant") }}</p>
+      <div class="top-actions">
+        <button class="locale-toggle" type="button" @click="toggleUiLocale">{{ uiLocale === "en" ? "中文" : "English" }}</button>
+        <ThemeToggle />
+      </div>
     </header>
 
     <section class="sheet">
-      <h1 class="brand-mark">小助手</h1>
-      <p class="lead">登录后用自然语言查询与管理运营后台各业务模块，可用的页面与操作以登录后为准。</p>
+      <h1 class="brand-mark">{{ tx("小助手", "Assistant") }}</h1>
+      <p class="lead">{{ tx("登录后用自然语言查询与管理运营后台各业务模块，可用的页面与操作以登录后为准。", "After login, you can query and manage backend modules in natural language. Available pages and actions depend on your account.") }}</p>
       <form class="form" @submit.prevent="submit">
         <label>
-          国家 / 环境
+          {{ tx("国家 / 环境", "Country / Environment") }}
           <select v-model="country" required>
             <option v-for="item in countries" :key="item.id" :value="item.id">{{ item.label }}</option>
           </select>
         </label>
         <label>
-          账号
+          {{ tx("账号", "Username") }}
           <input v-model="username" autocomplete="username" inputmode="text" required />
         </label>
         <label>
-          密码
+          {{ tx("密码", "Password") }}
           <input v-model="password" type="password" autocomplete="current-password" required />
         </label>
         <p v-if="error" class="error">{{ error }}</p>
-        <button type="submit" :disabled="loading">{{ loading ? "登录中…" : "进入" }}</button>
+        <button type="submit" :disabled="loading">{{ loading ? tx("登录中…", "Signing in…") : tx("进入", "Enter") }}</button>
       </form>
-      <p class="hint">使用原运营账号登录对应国家线。</p>
+      <p class="hint">{{ tx("使用原运营账号登录对应国家线。", "Use your existing operations account for the selected country.") }}</p>
     </section>
   </main>
 </template>
@@ -79,12 +85,28 @@ async function submit() {
   margin-bottom: 28px;
 }
 
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .kicker {
   margin: 0;
   color: var(--muted);
   font-size: 11px;
   letter-spacing: 0.28em;
   text-transform: uppercase;
+}
+
+.locale-toggle {
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+  color: var(--ink);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
 }
 
 .sheet {
