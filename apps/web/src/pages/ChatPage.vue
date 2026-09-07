@@ -262,9 +262,22 @@ function newId() {
   return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function defaultConversationTitle() {
+  return tx("新对话", "New Chat", "Novo Chat", "नई चैट");
+}
+
+function isDefaultConversationTitle(title?: string | null) {
+  const value = String(title || "").trim();
+  return !value || value === "新对话" || value === "New Chat" || value === "Novo Chat" || value === "नई चैट";
+}
+
+function displayConversationTitle(conv: { title?: string | null }) {
+  return isDefaultConversationTitle(conv.title) ? defaultConversationTitle() : String(conv.title || "").trim();
+}
+
 function makeTitle(messages: Bubble[]): string {
   const first = messages.find((m) => m.role === "user")?.text.trim();
-  return (first || tx("新对话", "New Chat")).replace(/\s+/g, " ").slice(0, 24);
+  return (first || defaultConversationTitle()).replace(/\s+/g, " ").slice(0, 24);
 }
 
 // 序列化：仅保留需要持久化的字段（避免把响应式/临时字段写进存储）
@@ -474,7 +487,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
       .slice(0, 20)
       .map((c) => ({
         id: c.id,
-        title: c.title || tx("新对话", "New Chat"),
+        title: isDefaultConversationTitle(c.title) ? defaultConversationTitle() : String(c.title || ""),
         messages: (c.messages as Bubble[])
           .filter((m) => m && (m.role === "user" || m.role === "assistant"))
           .slice(-80)
@@ -492,7 +505,7 @@ function loadConversations(): { conversations: Conversation[]; activeId: string 
 // 新建一个空会话并设为当前。
 function newConversation() {
   const now = Date.now();
-  const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
+  const conv: Conversation = { id: newId(), title: defaultConversationTitle(), messages: [], createdAt: now, updatedAt: now };
   conversations.value.push(conv);
   activeId.value = conv.id;
   saveConversations();
@@ -528,7 +541,7 @@ function openTabMenu(ev: MouseEvent, convId: string, idx: number) {
 
 function ensureBlankConversation() {
   const now = Date.now();
-  const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
+  const conv: Conversation = { id: newId(), title: defaultConversationTitle(), messages: [], createdAt: now, updatedAt: now };
   conversations.value.push(conv);
   activeId.value = conv.id;
   createConversation({ id: conv.id, title: conv.title }).catch(() => {});
@@ -686,7 +699,7 @@ onMounted(async () => {
 
   if (!activeId.value) {
     const now = Date.now();
-    const conv: Conversation = { id: newId(), title: tx("新对话", "New Chat"), messages: [], createdAt: now, updatedAt: now };
+    const conv: Conversation = { id: newId(), title: defaultConversationTitle(), messages: [], createdAt: now, updatedAt: now };
     conversations.value.push(conv);
     activeId.value = conv.id;
   }
@@ -787,7 +800,7 @@ async function restoreConversations() {
       .slice(0, 20)
       .map((c) => ({
         id: c.id,
-        title: c.title || tx("新对话", "New Chat"),
+        title: isDefaultConversationTitle(c.title) ? defaultConversationTitle() : String(c.title || ""),
         messages: (c.messages as Bubble[])
           .filter((m) => m && (m.role === "user" || m.role === "assistant"))
           .slice(-80)
@@ -1561,7 +1574,7 @@ async function onClearContext() {
     const active = conversations.value.find((c) => c.id === activeId.value);
     if (active) {
       active.messages = [];
-      active.title = tx("新对话", "New Chat");
+      active.title = defaultConversationTitle();
       active.updatedAt = Date.now();
       saveConversations();
       // 服务端同步清空当前会话消息（保留会话壳）。
@@ -1609,7 +1622,7 @@ async function onClearContext() {
 
     <CapabilitiesHelp v-model:open="helpOpen" @use-example="useHelpExample" />
 
-    <nav class="tabs" :aria-label="tx('会话切换', 'Conversation Tabs')">
+    <nav class="tabs" :aria-label="tx('会话切换', 'Conversation Tabs', 'Abas de Conversa', 'वार्तालाप टैब')">
       <button
         v-for="(conv, idx) in conversations"
         :key="conv.id"
@@ -1620,10 +1633,10 @@ async function onClearContext() {
         @contextmenu.prevent="openTabMenu($event, conv.id, idx)"
       >
         <span class="tab-index">{{ idx + 1 }}</span>
-        <span class="tab-title">{{ conv.title }}</span>
-        <span class="tab-close" :title="tx('关闭会话', 'Close conversation')" @click.stop="closeConversation(conv.id)">×</span>
+        <span class="tab-title">{{ displayConversationTitle(conv) }}</span>
+        <span class="tab-close" :title="tx('关闭会话', 'Close conversation', 'Fechar conversa', 'वार्तालाप बंद करें')" @click.stop="closeConversation(conv.id)">×</span>
       </button>
-      <button class="tab-new" type="button" :title="tx('新建会话', 'New conversation')" @click="newConversation">＋</button>
+      <button class="tab-new" type="button" :title="tx('新建会话', 'New conversation', 'Nova conversa', 'नई वार्तालाप')" @click="newConversation">＋</button>
     </nav>
 
     <Teleport to="body">
