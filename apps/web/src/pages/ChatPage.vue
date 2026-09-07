@@ -10,8 +10,9 @@ import ResultTable from "../components/ResultTable.vue";
 import ResultChart from "../components/ResultChart.vue";
 import ToolResultCard from "../components/ToolResultCard.vue";
 import CapabilitiesHelp from "../components/CapabilitiesHelp.vue";
+import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import type { ChatFileRef, TableView, ChartView } from "../types";
-import { getUiLocale, toggleUiLocale } from "../ui-locale";
+import { getUiLocale } from "../ui-locale";
 
 // 轻量 Markdown 渲染：把模型返回的 **加粗**/`代码`/列表/标题渲染成富文本，
 // 避免用户看到原始 ** 与反引号。默认 html:false 关闭 HTML，防止 XSS。
@@ -100,7 +101,6 @@ interface Bubble {
 const router = useRouter();
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
-const uiLocaleLabel = computed(() => (uiLocale.value === "en" ? "中文" : "English"));
 const me = shallowRef<Me | null>(null);
 const input = ref("");
 const sending = ref(false);
@@ -1597,7 +1597,7 @@ async function onClearContext() {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
-        <button class="ghost" type="button" @click="toggleUiLocale">{{ uiLocaleLabel }}</button>
+        <UiLocaleSelect />
         <ThemeToggle />
         <RouterLink class="ghost" to="/trace">{{ tx("调用观察", "Trace") }}</RouterLink>
         <button class="ghost" type="button" @click="helpOpen = true">{{ tx("操作说明", "Help") }}</button>

@@ -12,7 +12,8 @@ import {
   type TraceSpanDto,
 } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
-import { getUiLocale, toggleUiLocale } from "../ui-locale";
+import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
 const uiLocale = getUiLocale();
@@ -115,7 +116,7 @@ onMounted(async () => {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
-        <button class="ghost" type="button" @click="toggleUiLocale">{{ uiLocale === "en" ? "中文" : "English" }}</button>
+        <UiLocaleSelect />
         <ThemeToggle />
         <RouterLink class="ghost" to="/chat">{{ tx("对话", "Chat") }}</RouterLink>
         <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh") }}</button>

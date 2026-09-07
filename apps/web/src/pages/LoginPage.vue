@@ -3,7 +3,8 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { fetchCountries, login, type Country } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
-import { getUiLocale, toggleUiLocale } from "../ui-locale";
+import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
 const uiLocale = getUiLocale();
@@ -39,7 +40,7 @@ async function submit() {
     <header class="top">
       <p class="kicker">{{ tx("运营助手", "Ops Assistant") }}</p>
       <div class="top-actions">
-        <button class="locale-toggle" type="button" @click="toggleUiLocale">{{ uiLocale === "en" ? "中文" : "English" }}</button>
+        <UiLocaleSelect />
         <ThemeToggle />
       </div>
     </header>
@@ -99,15 +100,6 @@ async function submit() {
   text-transform: uppercase;
 }
 
-.locale-toggle {
-  height: 36px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  background: var(--fill);
-  color: var(--ink);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
 
 .sheet {
   width: min(420px, 100%);
