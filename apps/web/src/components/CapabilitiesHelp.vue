@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { nextTick, onUnmounted, ref, watch } from "vue";
+import { getUiLocale } from "../ui-locale";
 
 const open = defineModel<boolean>("open", { default: false });
 
 const emit = defineEmits<{
   "use-example": [text: string];
 }>();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 
 const dialogRef = ref<HTMLElement | null>(null);
 
@@ -42,13 +45,13 @@ onUnmounted(() => {
 
 /** 覆盖全场景：列表 / 详情 / 报表 / 导出 / 写操作 / 知识库（与 CAPABILITY_MATCH 验收话术对齐） */
 const examples = [
-  "需要看白名单管理的列表",
-  "用户列表，10038557464768004，看详情",
-  "登录数据统计，近7天，google登录方式和图表",
-  "看平台收入趋势",
-  "把白名单列表导出成 Excel",
-  "帮我下架某部影片",
-  "查一下报销流程",
+  { zh: "需要看白名单管理的列表", en: "Show me the whitelist management list" },
+  { zh: "用户列表，10038557464768004，看详情", en: "User list, ID 10038557464768004, show details" },
+  { zh: "登录数据统计，近7天，google登录方式和图表", en: "Login stats for the last 7 days, Google login method, with chart" },
+  { zh: "看平台收入趋势", en: "Show platform revenue trend" },
+  { zh: "把白名单列表导出成 Excel", en: "Export the whitelist list to Excel" },
+  { zh: "帮我下架某部影片", en: "Help me unpublish a movie" },
+  { zh: "查一下报销流程", en: "Check the reimbursement process" },
 ];
 </script>
 
@@ -63,85 +66,83 @@ const examples = [
         aria-labelledby="cap-title"
       >
         <header class="cap-head">
-          <h2 id="cap-title">助手能力与用法</h2>
-          <button type="button" class="cap-x" aria-label="关闭" @click="close">×</button>
+          <h2 id="cap-title">{{ tx("助手能力与用法", "Capabilities and Usage") }}</h2>
+          <button type="button" class="cap-x" :aria-label="tx('关闭', 'Close')" @click="close">×</button>
         </header>
 
         <div class="cap-body">
           <!-- 总：一句话定位 -->
           <p class="cap-intro">
-            我是后台业务助手：把你的自然语言，变成对后台数据的<strong>查询、报表、导出和写操作</strong>，
-            字段与口径均对齐 PC 后台。用「模块 + 动作」说清要什么即可，缺信息我会反问，写操作会先跟你确认。
+            {{ tx("我是后台业务助手：把你的自然语言，变成对后台数据的", "I am a backend operations assistant that turns your natural language into") }}<strong>{{ tx("查询、报表、导出和写操作", "queries, reports, exports, and write actions") }}</strong>{{ tx("，字段与口径均对齐 PC 后台。用「模块 + 动作」说清要什么即可，缺信息我会反问，写操作会先跟你确认。", ". Field labels and result semantics stay aligned with the PC admin. Just describe the module and action. If information is missing, I will ask. Write actions always require confirmation first.") }}
           </p>
 
           <!-- 分：查数据 -->
           <section>
-            <h3>查数据（列表 / 详情）</h3>
+            <h3>{{ tx("查数据（列表 / 详情）", "Query Data (List / Detail)") }}</h3>
             <ul>
-              <li><b>列表</b>：说清模块 + 动作，如「白名单列表」→ 中文表格，字段对齐 PC 后台</li>
-              <li><b>详情</b>：尽量带 ID，如「用户 10038557464768004 详情」→ 分块展示</li>
-              <li><b>树表 / 表尾</b>：有层级或汇总需求时自动缩进、出合计/均值行</li>
+              <li>{{ tx("列表：说清模块 + 动作，如「白名单列表」→ 中文表格，字段对齐 PC 后台", "List: specify module + action, for example 'whitelist list' → aligned table output") }}</li>
+              <li>{{ tx("详情：尽量带 ID，如「用户 10038557464768004 详情」→ 分块展示", "Detail: include an ID when possible, for example 'user 10038557464768004 details'") }}</li>
+              <li>{{ tx("树表 / 表尾：有层级或汇总需求时自动缩进、出合计/均值行", "Tree / footer: hierarchical and summary-style outputs get indentation and total/average rows automatically") }}</li>
             </ul>
           </section>
 
           <!-- 分：报表与图表 -->
           <section>
-            <h3>报表 / 趋势 / 图表</h3>
+            <h3>{{ tx("报表 / 趋势 / 图表", "Reports / Trends / Charts") }}</h3>
             <ul>
-              <li>登录统计、收入趋势等：给周期与维度（如「近7天」「Google 登录」）→ 折线图 + 数据表</li>
-              <li>通用报表按 PC 口径自动对齐表头并出图，不再手拼序列</li>
+              <li>{{ tx("登录统计、收入趋势等：给周期与维度（如「近7天」「Google 登录」）→ 折线图 + 数据表", "For login stats or revenue trends, provide a time range and dimensions (for example, 'last 7 days' or 'Google login') → chart plus data table") }}</li>
+              <li>{{ tx("通用报表按 PC 口径自动对齐表头并出图，不再手拼序列", "Generic reports align headers with the PC admin and generate charts automatically") }}</li>
             </ul>
           </section>
 
           <!-- 分：导出 -->
           <section>
-            <h3>导出 Excel / PDF</h3>
+            <h3>{{ tx("导出 Excel / PDF", "Export Excel / PDF") }}</h3>
             <ul>
-              <li>说「导出 Excel / PDF」→ 聊天内预览，可下载，支持树表与表尾汇总</li>
+              <li>{{ tx("说「导出 Excel / PDF」→ 聊天内预览，可下载，支持树表与表尾汇总", "Say 'export Excel / PDF' → preview in chat, downloadable, supports tree tables and footer summaries") }}</li>
             </ul>
           </section>
 
           <!-- 分：写操作 -->
           <section>
-            <h3>写操作（新增 / 修改 / 删除 / 审核）</h3>
+            <h3>{{ tx("写操作（新增 / 修改 / 删除 / 审核）", "Write Actions (Create / Update / Delete / Review)") }}</h3>
             <ul>
-              <li>如「下架影片」「新增配置」「更新状态」→ 先弹确认再执行，执行后回读结果</li>
+              <li>{{ tx("如「下架影片」「新增配置」「更新状态」→ 先弹确认再执行，执行后回读结果", "For actions like unpublishing a movie, adding config, or updating status, confirmation is required before execution and results are read back afterwards") }}</li>
             </ul>
           </section>
 
           <!-- 分：知识库 -->
           <section>
-            <h3>公司知识库（规范 / 流程 / 制度）</h3>
+            <h3>{{ tx("公司知识库（规范 / 流程 / 制度）", "Company Knowledge Base (Guidelines / Process / Policy)") }}</h3>
             <ul>
-              <li>问报销、部署、制度等 → 检索本地知识库并标注来源回答，不凭空编造</li>
+              <li>{{ tx("问报销、部署、制度等 → 检索本地知识库并标注来源回答，不凭空编造", "Questions about reimbursement, deployment, policy, and similar topics are answered from the local knowledge base with cited sources") }}</li>
             </ul>
           </section>
 
           <!-- 分：示例 -->
           <section>
-            <h3>示例（点一下填入输入框）</h3>
+            <h3>{{ tx("示例（点一下填入输入框）", "Examples (click to fill the composer)") }}</h3>
             <div class="cap-chips">
               <button
                 v-for="ex in examples"
-                :key="ex"
+                :key="ex.zh"
                 type="button"
                 class="cap-chip"
-                @click="pickExample(ex)"
+                @click="pickExample(uiLocale === 'en' ? ex.en : ex.zh)"
               >
-                {{ ex }}
+                {{ uiLocale === "en" ? ex.en : ex.zh }}
               </button>
             </div>
           </section>
 
           <!-- 总：边界与约定 -->
           <p class="cap-note">
-            真数据需有效登录；一次一件事，缺信息会反问，写操作必须确认。
-            视频 / BI / 富文本只给摘要或链接，不内嵌播放器或完整 HTML；图片会自动切换视觉模型识别。
+            {{ tx("真数据需有效登录；一次一件事，缺信息会反问，写操作必须确认。视频 / BI / 富文本只给摘要或链接，不内嵌播放器或完整 HTML；图片会自动切换视觉模型识别。", "Real data requires a valid login. Please ask for one thing at a time. Missing information will trigger clarification, and write actions must be confirmed. Video / BI / rich text content is returned as summaries or links rather than embedded full content. Images can trigger an automatic switch to a vision-capable model.") }}
           </p>
         </div>
 
         <footer class="cap-foot">
-          <button type="button" class="cap-ok" @click="close">知道了</button>
+          <button type="button" class="cap-ok" @click="close">{{ tx("知道了", "Got it") }}</button>
         </footer>
       </div>
     </div>

@@ -1728,7 +1728,7 @@ async function onClearContext() {
               >
                 <span class="tool-group__icon" aria-hidden="true">⚙</span>
                 <span class="tool-group__title">
-                  {{ item.currentTool ? `正在调用：${toolStatusText(item.currentTool).replace(/…$/, "")}` : `工具调用细节（${cards.length}）` }}
+                  {{ item.currentTool ? `${tx("正在调用：", "Calling: ")}${toolStatusText(item.currentTool).replace(/…$/, "")}` : tx(`工具调用细节（${cards.length}）`, `Tool details (${cards.length})`) }}
                 </span>
                 <span class="tool-group__toggle" aria-hidden="true">{{ groupOpenOf(item.id) ? "▾" : "▸" }}</span>
               </button>
@@ -1932,7 +1932,7 @@ async function onClearContext() {
               type="button"
               class="model-btn"
               :class="{ active: modelMenuOpen }"
-              title="切换模型"
+              :title="tx('切换模型', 'Switch model')"
               :disabled="sending"
               @click="modelMenuOpen = !modelMenuOpen"
             >
@@ -1966,12 +1966,12 @@ async function onClearContext() {
                   type="button"
                   class="model-item model-item-auto"
                   :class="{ selected: selectedModel === null }"
-                  title="Auto（服务端自动）· 智能路由"
+                  :title="tx('Auto（服务端自动）· 智能路由', 'Auto (server managed) · Smart routing')"
                   @click="selectModel(null)"
                 >
                   <span class="model-auto-dot"></span>
-                  <span class="model-label">Auto（服务端自动）</span>
-                  <span class="model-provider">智能路由</span>
+                  <span class="model-label">{{ tx("Auto（服务端自动）", "Auto (server managed)") }}</span>
+                  <span class="model-provider">{{ tx("智能路由", "Smart routing") }}</span>
                 </button>
                 <template v-if="textModels.length">
                   <div class="model-group">

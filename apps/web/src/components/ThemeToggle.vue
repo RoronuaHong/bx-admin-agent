@@ -1,19 +1,22 @@
 <script setup lang="ts">
 import { useTheme } from "../theme";
+import { getUiLocale } from "../ui-locale";
 
 const { theme, toggle } = useTheme();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 </script>
 
 <template>
   <button
     class="theme-toggle"
     type="button"
-    :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
-    :title="theme === 'dark' ? '浅色' : '深色'"
+    :aria-label="theme === 'dark' ? tx('切换到浅色', 'Switch to light mode') : tx('切换到深色', 'Switch to dark mode')"
+    :title="theme === 'dark' ? tx('浅色', 'Light') : tx('深色', 'Dark')"
     @click="toggle"
   >
     <span class="icon" aria-hidden="true">{{ theme === "dark" ? "○" : "●" }}</span>
-    <span class="label">{{ theme === "dark" ? "浅色" : "深色" }}</span>
+    <span class="label">{{ theme === "dark" ? tx("浅色", "Light") : tx("深色", "Dark") }}</span>
   </button>
 </template>
 

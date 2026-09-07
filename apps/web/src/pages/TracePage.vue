@@ -105,7 +105,7 @@ onMounted(async () => {
   <main class="stage">
     <header class="top">
       <div class="identity">
-        <RouterLink class="brand-mark" to="/chat">小助手</RouterLink>
+        <RouterLink class="brand-mark" to="/chat">{{ tx("小助手", "Assistant") }}</RouterLink>
         <span class="sep">/</span>
         <span class="page-title">{{ tx("调用观察", "Trace") }}</span>
       </div>

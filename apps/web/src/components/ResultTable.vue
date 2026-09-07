@@ -2,8 +2,11 @@
 import { computed, ref } from "vue";
 import type { TableView, TableColumnView } from "../types";
 import { copyText } from "../clipboard";
+import { getUiLocale } from "../ui-locale";
 
 const props = defineProps<{ table: TableView }>();
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 const expanded = ref<Set<number>>(new Set());
 const copied = ref<string | null>(null);
 
@@ -30,7 +33,7 @@ const displayRows = computed(() => {
       _depth: 0,
     };
     const first = props.table.columns[0]?.key;
-    if (first && !fr[first]) fr[first] = "合计";
+    if (first && !fr[first]) fr[first] = tx("合计", "Total");
     rows.push(fr);
   }
   return rows;
@@ -138,11 +141,11 @@ const cellCopied = (text: string) => copied.value === text;
     <div class="caption">
       <span class="caption__title">{{ table.title }}</span>
       <span class="caption__meta">
-        <span class="total">{{ table.total }} 条</span>
-        <template v-if="table.tree"><span class="chip">树表</span></template>
-        <template v-if="table.footer"><span class="chip">含汇总</span></template>
-        <button type="button" class="copy-btn" :class="{ copied: copiedTable }" :title="copiedTable ? '已复制' : '复制表格'" @click="copyTable()">
-          {{ copiedTable ? "已复制" : "复制" }}
+        <span class="total">{{ uiLocale === "en" ? `${table.total} rows` : `${table.total} 条` }}</span>
+        <template v-if="table.tree"><span class="chip">{{ tx("树表", "Tree") }}</span></template>
+        <template v-if="table.footer"><span class="chip">{{ tx("含汇总", "Summary") }}</span></template>
+        <button type="button" class="copy-btn" :class="{ copied: copiedTable }" :title="copiedTable ? tx('已复制', 'Copied') : tx('复制表格', 'Copy table')" @click="copyTable()">
+          {{ copiedTable ? tx("已复制", "Copied") : tx("复制", "Copy") }}
         </button>
       </span>
     </div>
@@ -164,7 +167,7 @@ const cellCopied = (text: string) => copied.value === text;
           <tr v-if="!displayRows.length">
             <td :colspan="table.columns.length" class="empty">
               <span class="empty__mark">∅</span>
-              <span>暂无数据</span>
+              <span>{{ tx("暂无数据", "No data") }}</span>
             </td>
           </tr>
           <tr
@@ -396,7 +399,7 @@ td .cell:not(.cell-empty):not(.cell-ellipsis) {
 /* 复制反馈 */
 .copy-btn.copied,
 .cell-copied::after {
-  content: "已复制";
+  content: "✓";
   margin-left: 6px;
   font-size: 11px;
   color: var(--ok);

@@ -6,6 +6,7 @@
  * 不传时退回内部自管理，保持向后兼容。
  */
 import { computed, ref } from "vue";
+import { getUiLocale } from "../ui-locale";
 
 const props = defineProps<{
   name: string;
@@ -16,6 +17,8 @@ const props = defineProps<{
 const emit = defineEmits<{ "update:expanded": [value: boolean] }>();
 
 const internal = ref(false);
+const uiLocale = getUiLocale();
+const tx = (zh: string, en: string) => (uiLocale.value === "en" ? en : zh);
 
 /** 受控模式下由父组件决定，否则用内部状态 */
 const expanded = computed(() => props.expanded ?? internal.value);
@@ -36,24 +39,25 @@ const summary = computed(() => {
     .trim();
   s = s.replace(/\s+/g, " ").trim();
   // 摘要过长时不再展示截断的残文（尤其中途断掉的 JSON 无意义），改为占位提示，完整内容点击展开查看
-  if (s.length > 160) return "(内容较长，点击展开查看完整结果)";
-  return s || "(空结果)";
+  if (s.length > 160) return tx("(内容较长，点击展开查看完整结果)", "(Long content, expand to view full result)");
+  return s || tx("(空结果)", "(Empty result)");
 });
 
 const toolLabel = computed(() => {
-  const names: Record<string, string> = {
-    call_api: "接口调用",
-    search_api_module: "检索接口",
-    read_api_module: "读取接口源码",
-    read_file: "读取文件",
-    grep_codebase: "检索代码",
-    normalize_output: "字段对齐",
-    render_table: "渲染表格",
-    get_list_columns: "读取列定义",
-    submit_understood_intent: "意图理解",
-    parse_intent: "规则校验",
+  const names: Record<string, { zh: string; en: string }> = {
+    call_api: { zh: "接口调用", en: "API Call" },
+    search_api_module: { zh: "检索接口", en: "Search API" },
+    read_api_module: { zh: "读取接口源码", en: "Read API Source" },
+    read_file: { zh: "读取文件", en: "Read File" },
+    grep_codebase: { zh: "检索代码", en: "Search Code" },
+    normalize_output: { zh: "字段对齐", en: "Normalize Output" },
+    render_table: { zh: "渲染表格", en: "Render Table" },
+    get_list_columns: { zh: "读取列定义", en: "Read Columns" },
+    submit_understood_intent: { zh: "意图理解", en: "Intent Understanding" },
+    parse_intent: { zh: "规则校验", en: "Rule Validation" },
   };
-  return names[props.name] || props.name;
+  const item = names[props.name];
+  return item ? (uiLocale.value === "en" ? item.en : item.zh) : props.name;
 });
 </script>
 
