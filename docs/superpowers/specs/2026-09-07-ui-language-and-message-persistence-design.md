@@ -1,14 +1,13 @@
 # UI Language And Message Persistence Design
 
-## Scope
+## Goal
 
-This design covers three related follow-up improvements for `bx-admin-agent`:
+Add two capabilities to `bx-admin-agent` without introducing a new storage subsystem:
 
-1. Stabilize the remaining `knowledge / explain / clarify / backend` validation work on the current `main` branch.
-2. Allow the web frontend UI to switch languages without changing the assistant reply language.
-3. Persist assistant reasoning and tool-call details with each assistant message so they survive refresh and can be restored from database-backed conversation history.
+1. the web frontend UI can switch languages
+2. assistant `reasoning` and `toolResults` persist with each assistant message and survive refresh
 
-The goal is to extend existing conversation storage and chat UI flows with the smallest viable change set that matches current architecture.
+The design must stay aligned with the current conversation-based storage model and chat bubble rendering flow.
 
 ## Decisions
 
@@ -40,35 +39,46 @@ Instead, extend the existing stored conversation message structure on both front
 
 ## Data Model
 
+### UI locale state
+
+UI language is **not** stored on each chat message. That would be redundant and does not affect model behavior.
+
+Store UI locale as frontend-level state with refresh persistence. The first implementation can keep this state local to the frontend.
+
+### Stored assistant message
+
 Extend stored assistant messages with optional fields:
 
-- `uiLanguage?: string`
 - `reasoning?: string`
 - `toolResults?: Array<{ name: string; result: string }>`
 - `toolStep?: number`
 - `currentTool?: string`
 
-Do not persist `reasoningExpanded`. That is view-local interaction state and can continue to use frontend defaults on reload.
+Do not persist `reasoningExpanded`. It is view-local state and should continue to use frontend defaults on reload.
 
-Compatibility rules:
+### Contract alignment note
 
-- old messages missing these fields must remain valid
-- backend APIs must treat them as optional
-- frontend restore logic must default to empty reasoning/tool details
+The current frontend and backend `StoredMessage` contracts are not fully aligned, especially around `images`.
+
+This feature should align the message DTO at the same time:
+
+- keep existing message payloads backward compatible
+- make backend and frontend agree on the shape used for persisted `images`
+- treat new `reasoning/toolResults/toolStep/currentTool` fields as optional
 
 ## Data Flow
 
 ### Frontend language state
 
-Frontend stores a lightweight UI locale state and restores it on load. It should be independent from assistant reply-language preferences.
+Frontend stores a lightweight UI locale state and restores it on load. It is independent from assistant reply-language preferences.
 
-Recommended storage order:
+For the first implementation:
 
-1. local UI state
-2. local persistence for refresh survival
-3. optional future sync to user preference APIs if needed later
+1. keep UI locale in frontend state
+2. persist it locally for refresh survival
+3. apply it to page chrome only
 
-For this implementation, local persistence is sufficient.
+Syncing UI locale to backend user preferences is out of scope for this change.
 
 ### Assistant message persistence
 
@@ -78,52 +88,42 @@ Persist timing:
 
 1. create or update user message locally when send starts
 2. stream assistant message in memory as events arrive
-3. on `done`, `error`, or `cancel`, save the completed message snapshot through existing conversation save API
+3. on `done`, `error`, or `cancel`, save the completed conversation snapshot through the existing conversation save API
 
-If mid-stream durability becomes necessary later, add throttled checkpoint writes. It is intentionally out of scope for the first implementation.
+The first implementation does **not** require mid-stream checkpoint writes. If the page refreshes before completion, losing unfinished reasoning/tool details is acceptable for now.
 
 ### Refresh restore
 
 On page load:
 
-1. restore UI language
+1. restore UI locale
 2. fetch conversations from backend
 3. hydrate assistant bubbles from stored message fields
 4. initialize fold states with frontend defaults
 
 No separate trace lookup is required for normal refresh recovery.
 
-## Validation Work
-
-The current validation follow-up should continue on `main` and focus on the remaining unstable intent-routing cases:
-
-- `knowledge` should not be swallowed by explain short-circuit
-- `clarify` evaluation should match the new server-side clarify exit
-- `how-to` prompts should converge on `explain-capability` before extra tool drift
-
-Validation artifacts should be updated to reflect current behavior rather than legacy expectations such as requiring `request_clarification` tool events.
-
 ## Error Handling
 
 - Missing persisted `reasoning` or `toolResults` must not break bubble rendering.
 - If backend returns older message documents, frontend treats absent fields as empty.
-- If conversation save fails, keep the current local in-memory UI and show existing error handling; do not discard the rendered assistant output.
-- Language-switch failure in local persistence should degrade to the current session language without blocking chat.
+- If conversation save fails, keep the current local in-memory UI and existing rendered assistant output.
+- If UI locale persistence fails, fall back to the default frontend locale without blocking chat.
 
-## Testing
+## Validation
 
 Minimum verification:
 
 1. frontend UI language switch updates core visible chrome and survives refresh
 2. assistant reasoning and tool detail blocks appear after refresh for completed messages
 3. old stored conversations still render normally
-4. targeted routing validation still covers `knowledge`, `clarify`, `explain`, and `backend`
-5. existing `m1-instance-check` remains green
+4. frontend and backend message DTOs remain compatible for existing conversation history
+5. existing routing checks that are part of this branch continue to pass
 
 ## Out Of Scope
 
 - changing assistant reply language together with UI language
 - historical message body translation
 - dedicated trace explorer UI
-- fine-grained mid-stream persistence checkpoints
-- separate analytics schema for reasoning/tool telemetry
+- mid-stream checkpoint persistence for unfinished assistant output
+- separate analytics or telemetry schema for reasoning/tool events
