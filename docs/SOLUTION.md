@@ -37,12 +37,17 @@ apps/web ──► /agent/* ──► apps/agent-server
 env 注册多个模型，运行时任意切换，无需重启：
 
 ```env
-MODEL_PROVIDERS=hy3,ollama          # 注册模型 id，逗号分隔；第一个为默认
+MODEL_PROVIDERS=hy3,glm52,ollama    # 注册模型 id，逗号分隔；第一个为默认
 MODEL_HY3_PROVIDER=anthropic        # 协议：anthropic | openai | ollama
 MODEL_HY3_NAME=hy3
 MODEL_HY3_BASE_URL=https://tokenhub.tencentmaas.com
 MODEL_HY3_API_KEY=xxx
 MODEL_HY3_VISION=ocr                # 图片处理：direct | ocr | none
+MODEL_GLM52_PROVIDER=openai
+MODEL_GLM52_NAME=glm-5.2
+MODEL_GLM52_BASE_URL=https://tokenhub.tencentmaas.com/v1
+MODEL_GLM52_API_KEY=xxx
+MODEL_GLM52_VISION=none
 MODEL_OLLAMA_PROVIDER=ollama
 MODEL_OLLAMA_NAME=qwen3:8b
 MODEL_OLLAMA_BASE_URL=http://localhost:11434

@@ -831,6 +831,9 @@ function buildModuleCapabilitiesText(moduleId: string): string {
 export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise<OrchestrateResult> {
   const { userText, llmIntent } = ctx;
   if (llmIntent && !llmIntent.isBusinessRequest) return { kind: "skip" };
+  if (llmIntent?.responseMode === "clarify" || llmIntent?.responseMode === "explain-capability") {
+    return { kind: "skip" };
+  }
 
   // 前端偶发带 HTML 富文本（<div...><p>..</p></div>）。业务编排的 grep 定位 / parse_intent 解析
   // 必须基于纯文本，否则会把 <divdata-v-32b89 当成业务词 grep（永远命中不到 → module 为空 → 误报未找到接口）。

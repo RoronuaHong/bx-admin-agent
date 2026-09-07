@@ -244,14 +244,14 @@
   <div class="masthead">
     <div class="kicker">Business Requirement · Mind Map</div>
     <h1>bx-admin-agent 业务需求思维导图</h1>
-    <p>一个助手 · 两个方向 · 查数据 / 读知识</p>
+    <p>一个主助手 · Worker 路由 · 查数据 / 读知识 / 结构化理解</p>
   </div>
 
   <div class="tree">
     <!-- 根节点 -->
     <div class="root">
       <div class="r-name">bx-admin-agent 业务助手</div>
-      <div class="r-sub">自然语言 · 查数据 · 读知识</div>
+      <div class="r-sub">自然语言 · M1 路由 · 结构化意图 · 查数据 · 读知识</div>
     </div>
 
     <!-- SVG 曲线连接：根 → 两个方向 -->
@@ -270,7 +270,7 @@
         <div class="dir blue">
           <span class="emoji">📊</span>
           <span class="t">项目查询类</span>
-          <span class="pill">4 验证中 · 1 暂缓 · 1 规划</span>
+          <span class="pill">5 已落地 · 1 暂缓</span>
         </div>
         <div class="dir-conn"></div>
         <div class="children">
@@ -281,7 +281,7 @@
               <div>表格上屏</div>
               <div>字段中文化</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child green">
             <div class="head"><div class="icon">2</div><div><div class="name">详情查询</div><div class="ext">detail-query.md</div></div></div>
@@ -290,34 +290,34 @@
               <div>单条详情</div>
               <div>字段映射</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child amber">
-            <div class="head"><div class="icon">3</div><div><div class="name">条件筛选</div><div class="ext">filter-query.md</div></div></div>
+            <div class="head"><div class="icon">3</div><div><div class="name">M1 Worker 路由</div><div class="ext">route-to-agent.md</div></div></div>
             <div class="desc">
-              <div>多条件组合</div>
-              <div>时间范围</div>
-              <div>状态过滤</div>
+              <div>先 route_to_agent</div>
+              <div>未路由仅 META 工具</div>
+              <div>test / prod 环境切换</div>
             </div>
-            <div class="status wait">规划中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child violet">
-            <div class="head"><div class="icon">4</div><div><div class="name">统计报表</div><div class="ext">report-stat.md</div></div></div>
+            <div class="head"><div class="icon">4</div><div><div class="name">结构化意图识别</div><div class="ext">understood-intent.md</div></div></div>
             <div class="desc">
-              <div>图表分析</div>
-              <div>趋势对比</div>
-              <div>多维透视</div>
+              <div>responseMode 分类</div>
+              <div>confidence 置信度</div>
+              <div>missingSlots 缺槽位</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child cyan">
-            <div class="head"><div class="icon">5</div><div><div class="name">数据导出</div><div class="ext">export-data.md</div></div></div>
+            <div class="head"><div class="icon">5</div><div><div class="name">说明型问法防误执行</div><div class="ext">explain-capability.md</div></div></div>
             <div class="desc">
-              <div>Excel 导出</div>
-              <div>批量下载</div>
-              <div>文件直链</div>
+              <div>how-to 问题先解释</div>
+              <div>避免误调 call_api</div>
+              <div>缺实体时先澄清</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child red">
             <div class="head"><div class="icon">6</div><div><div class="name">写操作</div><div class="ext">write-op.md</div></div></div>
@@ -335,7 +335,7 @@
         <div class="dir green">
           <span class="emoji">📚</span>
           <span class="t">文档类 RAG</span>
-          <span class="pill">2 验证中 · 3 规划 · 1 阻塞</span>
+          <span class="pill">2 已落地 · 2 规划 · 1 阻塞 · 1 暂缓</span>
         </div>
         <div class="dir-conn"></div>
         <div class="children">
@@ -346,7 +346,7 @@
               <div>md / txt / html</div>
               <div>全文检索</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child green">
             <div class="head"><div class="icon">2</div><div><div class="name">多格式解析</div><div class="ext">multi-format.md</div></div></div>
@@ -364,7 +364,7 @@
               <div>RRF 融合</div>
               <div>引用出处</div>
             </div>
-            <div class="status ok">验证中</div>
+            <div class="status ok">已落地</div>
           </div>
           <div class="child violet">
             <div class="head"><div class="icon">4</div><div><div class="name">钉钉接入</div><div class="ext">dingtalk-doc.md</div></div></div>
@@ -385,13 +385,13 @@
             <div class="status wait">规划中</div>
           </div>
           <div class="child red">
-            <div class="head"><div class="icon">6</div><div><div class="name">权限过滤</div><div class="ext">access-filter.md</div></div></div>
+            <div class="head"><div class="icon">6</div><div><div class="name">多语种评测集</div><div class="ext">eval-routing-natural.md</div></div></div>
             <div class="desc">
-              <div>按角色隔离</div>
-              <div>按项目隔离</div>
-              <div>可见性控制</div>
+              <div>runner + cases 已搭好</div>
+              <div>默认跳过不执行</div>
+              <div>后续按需再开启</div>
             </div>
-            <div class="status wait">规划中</div>
+            <div class="status todo">暂时不做</div>
           </div>
         </div>
       </div>
@@ -400,7 +400,7 @@
 
   <!-- 图例 -->
   <div class="legend">
-    <span><i class="dot ok"></i> 验证中</span>
+    <span><i class="dot ok"></i> 已落地</span>
     <span><i class="dot wait"></i> 规划中</span>
     <span><i class="dot block"></i> 阻塞（等凭证）</span>
     <span><i class="dot todo"></i> 暂时不做</span>
@@ -411,8 +411,8 @@
   <table>
     <tr><th>维度</th><th>项目查询类</th><th>文档类 RAG</th></tr>
     <tr><td>数据源</td><td>后台 API（实时接口）</td><td>文档文件（本地 / 钉钉）</td></tr>
-    <tr><td>检索方式</td><td>源码定位接口 + 工具调用</td><td>语义 + 词法双路融合</td></tr>
-    <tr><td>输出形态</td><td>表格 / 图表 / Excel</td><td>答案 + 引用出处</td></tr>
+    <tr><td>检索方式</td><td>先结构化理解，再 Worker 路由，最后源码定位接口 + 工具调用</td><td>语义 + 词法双路融合</td></tr>
+    <tr><td>输出形态</td><td>表格 / 文字说明 / 澄清问题</td><td>答案 + 引用出处</td></tr>
     <tr><td>写操作</td><td>增 / 改 / 删（带确认）</td><td>仅读（文档不动）</td></tr>
     <tr><td>阻塞</td><td>无</td><td>钉钉需企业凭证</td></tr>
   </table>

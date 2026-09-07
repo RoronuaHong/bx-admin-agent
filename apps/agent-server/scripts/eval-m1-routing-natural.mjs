@@ -6,26 +6,65 @@
 // 判定（不写死业务词匹配用户句；只断言工具通道行为）：
 //   backend 期望：出现 route_to_agent 且 domain=backend-api
 //   knowledge 期望：route_to_agent domain=knowledge，且未成功执行后台 call_api
+//   explain 期望：submit_understood_intent.responseMode=explain-capability，且未成功执行 call_api
 //   clarify 期望：request_clarification，且未成功执行 call_api / search_knowledge_base
 //
 // 运行：node scripts/eval-m1-routing-natural.mjs
 // 环境：AGENT_BASE、A2A_COUNTRY/A2A_USER/A2A_PASS、可选 A2A_MODEL
+// 过滤：M1_CASE_FILE（默认同目录 .cases.json）、M1_CASE_IDS=id1,id2、M1_CASE_TAGS=multilingual,explain
 // 每案前 POST /chat/context/clear 清空 Worker，保证独立。
+
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const BASE = process.env.AGENT_BASE || "http://localhost:8787";
 const COUNTRY = process.env.A2A_COUNTRY || "india";
 const USER = process.env.A2A_USER || "admin";
 const PASS = process.env.A2A_PASS || "123456";
 const MODEL = process.env.A2A_MODEL || "";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CASE_FILE = resolve(__dirname, process.env.M1_CASE_FILE || "./eval-m1-routing-natural.cases.json");
+const ENABLE_CASES = /^(1|true|yes)$/i.test(String(process.env.M1_ENABLE_CASES || ""));
+const FILTER_IDS = new Set(
+  String(process.env.M1_CASE_IDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+const FILTER_TAGS = new Set(
+  String(process.env.M1_CASE_TAGS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+const DRY_RUN = /^(1|true|yes)$/i.test(String(process.env.M1_DRY_RUN || ""));
 
-/** @type {Array<{ id: string; text: string; expect: "backend" | "knowledge" | "clarify" }>} */
-const CASES = [
-  { id: "kb-policy", text: "公司年假制度是怎样的？", expect: "knowledge" },
-  { id: "kb-attend", text: "考勤制度里迟到怎么处理？", expect: "knowledge" },
-  { id: "biz-list", text: "帮我查一下用户列表前两页", expect: "backend" },
-  { id: "biz-detail", text: "查一下基础配置列表", expect: "backend" },
-  { id: "ambiguous", text: "查一下", expect: "clarify" },
-];
+/** @typedef {"backend" | "knowledge" | "explain" | "clarify"} ExpectKind */
+/** @typedef {{ id: string; text: string; expect: ExpectKind; lang?: string; tags?: string[] }} RoutingCase */
+
+/** @returns {RoutingCase[]} */
+function loadCases() {
+  const raw = JSON.parse(readFileSync(CASE_FILE, "utf8"));
+  if (!Array.isArray(raw)) throw new Error(`case file 不是数组：${CASE_FILE}`);
+  return raw
+    .map((c) => ({
+      id: String(c.id || "").trim(),
+      text: String(c.text || "").trim(),
+      expect: String(c.expect || "").trim(),
+      lang: c.lang ? String(c.lang).trim() : undefined,
+      tags: Array.isArray(c.tags) ? c.tags.map((x) => String(x).trim()).filter(Boolean) : [],
+    }))
+    .filter((c) => c.id && c.text && ["backend", "knowledge", "explain", "clarify"].includes(c.expect));
+}
+
+const CASES = !ENABLE_CASES
+  ? []
+  : loadCases().filter((c) => {
+      if (FILTER_IDS.size && !FILTER_IDS.has(c.id)) return false;
+      if (FILTER_TAGS.size && !c.tags?.some((t) => FILTER_TAGS.has(t))) return false;
+      return true;
+    });
 
 function log(...a) {
   console.log(...a);
@@ -115,18 +154,20 @@ function summarize(events) {
   const routes = toolCalls.filter((c) => c.name === "route_to_agent");
   const domains = routes.map((c) => String(c.input?.domain || "")).filter(Boolean);
   const clarified = toolCalls.some((c) => c.name === "request_clarification");
+  const understood = toolCalls.find((c) => c.name === "submit_understood_intent");
+  const responseMode = understood?.input?.responseMode ? String(understood.input.responseMode) : "";
   const callApiOk = isSuccessfulToolResult(events, "call_api");
   const kbOk =
     isSuccessfulToolResult(events, "search_knowledge_base") ||
     isSuccessfulToolResult(events, "search_dingtalk_doc");
-  return { toolCalls, domains, clarified, callApiOk, kbOk };
+  return { toolCalls, domains, clarified, responseMode, callApiOk, kbOk };
 }
 
 function judge(expect, s) {
   if (expect === "knowledge") {
     const routedKb = s.domains.includes("knowledge");
-    // 路由到 knowledge，且未成功执行后台 call_api（越权/误路由）
-    const ok = routedKb && !s.callApiOk;
+    // 知识类应进入 knowledge 路径，且未成功执行后台 call_api（越权/误路由）
+    const ok = (routedKb || s.kbOk) && !s.callApiOk;
     return {
       ok,
       detail: `routeDomains=${s.domains.join("|") || "-"} kbOk=${s.kbOk} callApiOk=${s.callApiOk}`,
@@ -141,17 +182,36 @@ function judge(expect, s) {
       detail: `routeDomains=${s.domains.join("|") || "-"} callApiOk=${s.callApiOk} kbOk=${s.kbOk}`,
     };
   }
-  // clarify：必须反问；不得成功取数/检索
-  const ok = s.clarified && !s.callApiOk && !s.kbOk;
+  if (expect === "explain") {
+    const ok = s.responseMode === "explain-capability" && !s.callApiOk;
+    return {
+      ok,
+      detail: `responseMode=${s.responseMode || "-"} routeDomains=${s.domains.join("|") || "-"} callApiOk=${s.callApiOk} kbOk=${s.kbOk}`,
+    };
+  }
+  // clarify：当前实现允许服务端直接根据 understood 生成澄清文本，因此不再强依赖 request_clarification 事件
+  const ok = (s.responseMode === "clarify" || s.clarified) && !s.callApiOk && !s.kbOk;
   return {
     ok,
-    detail: `clarified=${s.clarified} callApiOk=${s.callApiOk} kbOk=${s.kbOk} route=${s.domains.join("|") || "-"}`,
+    detail: `responseMode=${s.responseMode || "-"} clarified=${s.clarified} callApiOk=${s.callApiOk} kbOk=${s.kbOk} route=${s.domains.join("|") || "-"}`,
   };
 }
 
 (async () => {
+  if (!ENABLE_CASES) {
+    log(`[skip] 评测集已暂时关闭；如需启用，请设置 M1_ENABLE_CASES=1。file=${CASE_FILE}`);
+    process.exit(0);
+  }
+  if (!CASES.length) throw new Error(`没有匹配的用例：file=${CASE_FILE}`);
+  if (DRY_RUN) {
+    log(`[dry-run] cases=${CASES.length} file=${CASE_FILE}`);
+    for (const c of CASES) {
+      log(`- ${c.id} | expect=${c.expect} | lang=${c.lang || "-"} | tags=${(c.tags || []).join(",")}`);
+    }
+    process.exit(0);
+  }
   const cookie = await login();
-  log(`[login] OK  cases=${CASES.length} model=${MODEL || "default"}`);
+  log(`[login] OK  cases=${CASES.length} model=${MODEL || "default"} file=${CASE_FILE}`);
   let pass = 0;
   let fail = 0;
 

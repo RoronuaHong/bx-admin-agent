@@ -138,11 +138,14 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   submit_understood_intent:
     "把你对用户这句话的理解提交给规则引擎。只做语义理解，不要查代码、不要调接口。" +
     "字段：isBusinessRequest（是否要查/改后台业务数据）、project、module（业务模块英文 id，来自源码路径）、" +
-    "value（id/名称等）、operationType（read/write/unknown）、operationHint（列表/详情/新增等）、summary、" +
+    "value（id/名称等）、operationType（read/write/unknown）、responseMode（execute/clarify/explain-capability）、confidence（0~1）、missingSlots（仍缺哪些槽位）、operationHint（列表/详情/新增等）、summary、" +
     "operation（可选，推荐：你选定的完整接口 id module.func——按 api-interface-routing 技能读 read_api_module 源码精确选出，留空则服务端按命名惯例兜底）。" +
     "注意：分页/多条数据需求（如\"前3页\"\"前20条\"）不在本工具表达——由你后续在 tool-loop 里多次调 call_api 拉取拼接（每次传对应分页参数），服务端不做分页循环。" +
     "module 给英文 id（来自源码路径）。能根据菜单名/源码路径直接确定可调用的英文模块 id 就直接填，不要为了确认多做一轮检索；" +
     "只有确实拿不准时才调 search_api_module / grep_codebase 检索 PC 端源码确认。填错会收到 MODULE_RETRY 提示，届时按提示重新检索即可。" +
+    "responseMode 含义：execute=需要继续取数/执行；clarify=缺关键对象，应反问；explain-capability=用户是在问如何操作/系统是否支持/需要哪些信息，可基于模块能力说明直接回答，不要调用 call_api。" +
+    "若问题属于知识库/制度/文档检索（需要 search_knowledge_base 后再回答），responseMode 也应填 execute，不要误填 explain-capability；随后 route_to_agent(domain=knowledge)。" +
+    "confidence 用 0~1 表示把握度；missingSlots 填仍缺失的结构化槽位名（如 module / operation / value / parentId / parentName）。" +
     "不确定的槽位留空，operationType 用 unknown，不要猜测。",
   search_dingtalk_doc:
     "查询公司内部钉钉文档（alidocs.dingtalk.com）的内容。" +
@@ -285,6 +288,23 @@ export function getSubmitUnderstoodIntentTool(): AgentToolDef {
           type: "string",
           enum: ["read", "write", "unknown"],
           description: "读/写；吃不准用 unknown，不要猜",
+        },
+        responseMode: {
+          type: "string",
+          enum: ["execute", "clarify", "explain-capability"],
+          description:
+            "回答模式：execute=继续取数/执行；clarify=缺关键对象先反问；explain-capability=说明系统支持方式/操作步骤，不应继续 call_api",
+        },
+        confidence: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description: "模型对本次理解的把握度，范围 0~1；越不确定值越低",
+        },
+        missingSlots: {
+          type: "array",
+          items: { type: "string" },
+          description: "当前仍缺失的结构化槽位名，如 module / operation / value / parentId / parentName",
         },
         operationHint: { type: "string", description: "更细的动作，如 列表、详情、新增" },
         summary: { type: "string", description: "一句话复述你理解的用户意图" },

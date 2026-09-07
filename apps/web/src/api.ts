@@ -94,6 +94,15 @@ export async function fetchModels(): Promise<ModelInfo[]> {
   return data.models || [];
 }
 
+export interface TaskStatusDto {
+  running: { taskId: string; startedAt: number; eventCount: number; userText: string } | null;
+  last: { taskId: string; settled: boolean; startedAt: number; userText: string } | null;
+}
+
+export async function fetchTaskStatus(): Promise<TaskStatusDto> {
+  return (await jsonFetch("/agent/chat/task/status")) as TaskStatusDto;
+}
+
 export async function streamChat(
   text: string,
   opts: { model?: string; images?: string[]; files?: string[] },

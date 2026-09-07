@@ -22,7 +22,11 @@ mcpServer.registerTool(
       project: z.string().optional(),
       module: z.string().optional(),
       value: z.string().optional(),
+      operation: z.string().optional(),
       operationType: z.enum(["read", "write", "unknown"]),
+      responseMode: z.enum(["execute", "clarify", "explain-capability"]).optional(),
+      confidence: z.number().min(0).max(1).optional(),
+      missingSlots: z.array(z.string()).optional(),
       operationHint: z.string().optional(),
       summary: z.string().optional(),
     }),
@@ -60,6 +64,20 @@ mcpServer.registerTool(
   },
   async ({ projectKey, projectLabel }) =>
     toolResult("set_project", { projectKey, projectLabel }),
+);
+
+mcpServer.registerTool(
+  "route_to_agent",
+  {
+    title: "切换 Worker 路由上下文",
+    description: TOOL_DESCRIPTIONS.route_to_agent,
+    inputSchema: z.object({
+      domain: z.enum(["backend-api", "knowledge", "common", "finance", "customer-service", "database"]),
+      project: z.string().optional(),
+      environment: z.enum(["test", "prod"]).optional(),
+    }),
+  },
+  async (input) => toolResult("route_to_agent", input as Record<string, unknown>),
 );
 
 mcpServer.registerTool(
@@ -156,10 +174,33 @@ mcpServer.registerTool(
       method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).describe("HTTP 方法"),
       operation: z.string().optional(),
       path: z.string().optional(),
-      base: z.enum(["backend", "user", "film"]).optional(),
+      base: z.enum(["backend", "user", "film", "gather"]).optional(),
       url: z.string().optional(),
       params: z.record(z.string(), z.unknown()).optional(),
+      intent: z
+        .object({
+          target: z.string().optional(),
+          filters: z
+            .array(
+              z.object({
+                field: z.string(),
+                op: z.string().optional(),
+                value: z.string(),
+              }),
+            )
+            .optional(),
+          paging: z.object({ wantPages: z.number().optional(), wantRows: z.number().optional() }).optional(),
+        })
+        .optional(),
+      log: z
+        .object({
+          menuId: z.string().optional(),
+          module: z.string().optional(),
+          operator: z.string().optional(),
+        })
+        .optional(),
       confirm: z.boolean().optional(),
+      environment: z.enum(["test", "prod"]).optional(),
       description: z.string().optional(),
     }),
   },

@@ -193,7 +193,68 @@
     </div>
 
     <div class="card">
-        <h2>三、两种访问数据库方案对比</h2>
+        <h2>三、当前项目落地形态（bx-admin-agent）</h2>
+        <p>当前项目已经落到可运行的 M1 形态：<strong>一个主聊天编排 + 多个 Worker 配置</strong>，而不是多个完全独立进程中的子 Agent 同时协作。</p>
+        <ul>
+            <li><strong>Supervisor 负责总控</strong>：接收用户问题，先做结构化理解，再决定是否需要路由。</li>
+            <li><strong>Worker 负责领域上下文</strong>：例如 <code>backend-api</code>、<code>knowledge</code>；每个 Worker 都带自己的 system prompt、工具白名单和环境约束。</li>
+            <li><strong>未路由时只开放 META 工具</strong>：让模型先明确方向，再进入领域工具，避免一开始就误调接口。</li>
+            <li><strong>环境显式化</strong>：<code>test</code> / <code>prod</code> 会话态持久化，生产写操作继续要求确认。</li>
+        </ul>
+
+        <div class="info">
+            <strong>M1目标：</strong>先保证路由、权限、环境和工具边界稳定，再推进真正独立进程化的多 Agent 架构。
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>四、结构化意图层：不要只靠模型“看起来懂了”</h2>
+        <p>企业 Agent 的关键不是让模型会说，而是让执行层拿到<strong>稳定、可消费、可拦截</strong>的结构化信号。当前项目通过 <code>submit_understood_intent</code> 承接这层能力。</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>字段</th>
+                    <th>含义</th>
+                    <th>作用</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>isBusinessRequest</code></td>
+                    <td>是否属于业务请求</td>
+                    <td>区分闲聊 / 业务处理</td>
+                </tr>
+                <tr>
+                    <td><code>operationType</code></td>
+                    <td>read / write / unknown</td>
+                    <td>与写操作确认策略联动</td>
+                </tr>
+                <tr>
+                    <td><code>responseMode</code></td>
+                    <td>execute / clarify / explain-capability</td>
+                    <td>决定继续执行、先澄清，还是只做能力说明</td>
+                </tr>
+                <tr>
+                    <td><code>confidence</code></td>
+                    <td>0~1 置信度</td>
+                    <td>给后续重试提示和观测稳定性提供信号</td>
+                </tr>
+                <tr>
+                    <td><code>missingSlots</code></td>
+                    <td>当前缺失的关键槽位</td>
+                    <td>帮助执行层提示模型先补问题，不盲目 <code>call_api</code></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="warning">
+            <strong>典型例子：</strong>“我想找某个影片的剧集，该怎么做？” 这种问法应识别为 <code>explain-capability</code>，优先说明系统支持方式，或提示还需要影片名称 / ID，而不是直接调列表接口。
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>五、两种访问数据库方案对比</h2>
 
         <h3>方案1：Skill调用业务API（业务操作首选）</h3>
         <p>LLM输出action+业务参数；Skill调用预开发HTTP/gRPC接口；SQL由后端开发预写ORM/模板。</p>
@@ -266,7 +327,7 @@
     </div>
 
     <div class="card">
-        <h2>四、AI Agent主要应用方向与前景</h2>
+        <h2>六、AI Agent主要应用方向与前景</h2>
         <h3>1）企业内部数字员工（当前最大市场）</h3>
         <ul>
             <li>自然语言取数助手(NL2SQL只读)</li>
@@ -298,7 +359,7 @@
     </div>
 
     <div class="card">
-        <h2>五、现实瓶颈 &amp; 哪些场景不适合Agent</h2>
+        <h2>七、现实瓶颈 &amp; 哪些场景不适合Agent</h2>
         <ul>
             <li>幻觉没有彻底解决，安全逻辑必须代码硬写，不能依赖Prompt。</li>
             <li>多步Agent Token消耗高；简单固定流程优先传统接口。</li>
@@ -314,7 +375,17 @@
     </div>
 
     <div class="card">
-        <h2>六、面试口述速记</h2>
+        <h2>八、项目当前进度说明</h2>
+        <ul>
+            <li>M1 路由链路已接通：Worker 选择、工具白名单、环境透传、会话态记忆已落地。</li>
+            <li><code>submit_understood_intent</code> 已扩展支持 <code>responseMode</code>、<code>confidence</code>、<code>missingSlots</code>。</li>
+            <li>针对说明型问法已增加防误执行策略：当模型判为 <code>clarify</code> 或 <code>explain-capability</code> 时，不应继续 <code>call_api</code>。</li>
+            <li>多语种评测脚手架已预留，但目前按迭代安排默认关闭，不作为当前主线交付项。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>九、面试口述速记</h2>
         <div class="info">
             <p>企业Agent核心是利用编排框架做有状态任务，Skill作为安全层。<br>
                 访问数据库分两种模式：业务操作用API模式；数据分析可以NL2SQL只读，做多层AST防护，禁止写SQL。<br>

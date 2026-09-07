@@ -22,6 +22,14 @@ const check = (name, ok, extra = "") => {
 // 1. route_to_agent 已注册进 listAgentTools
 const names = listAgentTools().map((t) => t.name);
 check("route_to_agent 在工具清单中", names.includes("route_to_agent"), `共 ${names.length} 个工具`);
+const submitTool = listAgentTools().find((t) => t.name === "submit_understood_intent");
+check("submit_understood_intent 已注册", !!submitTool);
+check("submit_understood_intent 含 operation", !!submitTool?.inputSchema?.properties?.operation);
+check("submit_understood_intent 含 responseMode", !!submitTool?.inputSchema?.properties?.responseMode);
+check("submit_understood_intent 含 confidence", !!submitTool?.inputSchema?.properties?.confidence);
+check("submit_understood_intent 含 missingSlots", !!submitTool?.inputSchema?.properties?.missingSlots);
+const routeTool = listAgentTools().find((t) => t.name === "route_to_agent");
+check("route_to_agent 已注册", !!routeTool);
 
 // 2. resolveWorker 命中 backend-api（测试 / 生产）
 const wTest = resolveWorker("backend-api", "bx-film-admin", "test");
@@ -46,7 +54,6 @@ check("裁剪后不含 common 工具", !filtered.some((t) => t.name === "request
 // META 合并后应可见 route_to_agent（chat.ts 执行层策略的镜像）
 const META = new Set([
   "submit_understood_intent",
-  "parse_intent",
   "set_project",
   "request_clarification",
   "route_to_agent",

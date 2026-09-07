@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } fr
 import { useRouter } from "vue-router";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
-import { clearChatContext, downloadUrl, fetchMe, fetchModels, logout, streamChat, uploadFiles, fetchConversations, createConversation, saveConversationMessages, deleteConversation as apiDeleteConversation, clearConversation as apiClearConversation, type ChatEvent, type Me, type ModelInfo, type UploadResult } from "../api";
+import { clearChatContext, downloadUrl, fetchMe, fetchModels, fetchTaskStatus, logout, streamChat, uploadFiles, fetchConversations, createConversation, saveConversationMessages, deleteConversation as apiDeleteConversation, clearConversation as apiClearConversation, type ChatEvent, type Me, type ModelInfo, type UploadResult } from "../api";
 import { copyText } from "../clipboard";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import ResultTable from "../components/ResultTable.vue";
@@ -670,6 +670,7 @@ onMounted(async () => {
   }
   // me.value 已就绪，用正确的 storageKey 做一次全量持久化（覆盖 restoreConversations 期间可能写错 key 的数据）
   saveConversations();
+  await syncBackgroundTaskStatus();
   // 初次进入时立即按 130px 下限计算输入框高度，避免默认高度偏离。
   resizeComposer();
   await scrollBottom();
@@ -702,6 +703,7 @@ onMounted(async () => {
   window.addEventListener("click", onClickAway);
 
   onUnmounted(() => {
+    stopTaskStatusPolling();
     stopVoice();
     recognitionRef.value = null;
     onThumbUp();
@@ -1103,6 +1105,76 @@ function useHelpExample(text: string) {
 }
 const lightboxUrl = ref("");
 const activeController = ref<AbortController | null>(null);
+let taskStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopTaskStatusPolling() {
+  if (!taskStatusTimer) return;
+  clearTimeout(taskStatusTimer);
+  taskStatusTimer = null;
+}
+
+function scheduleTaskStatusPoll(delayMs = 1200) {
+  stopTaskStatusPolling();
+  taskStatusTimer = setTimeout(() => {
+    void syncBackgroundTaskStatus();
+  }, delayMs);
+}
+
+function findLastUserMessage(conv: Conversation): Bubble | undefined {
+  for (let i = conv.messages.length - 1; i >= 0; i--) {
+    if (conv.messages[i]?.role === "user") return conv.messages[i];
+  }
+  return undefined;
+}
+
+function ensureBackgroundAssistant(conv: Conversation, userText: string) {
+  const last = conv.messages[conv.messages.length - 1];
+  if (last?.role === "assistant" && !last.finished && !last.cancelled && !last.error) {
+    last.status = "该会话已有任务在后台执行，完成后会自动恢复…";
+    last.toolActive = true;
+    last.currentTool = undefined;
+    last.finished = false;
+    return;
+  }
+  const lastUser = findLastUserMessage(conv);
+  if (!lastUser || lastUser.text !== userText) return;
+  conv.messages.push({
+    id: ++seq,
+    role: "assistant",
+    text: "",
+    status: "该会话已有任务在后台执行，完成后会自动恢复…",
+    toolActive: true,
+    currentTool: undefined,
+    toolStep: 0,
+    finished: false,
+  });
+}
+
+async function syncBackgroundTaskStatus() {
+  stopTaskStatusPolling();
+  if (!me.value) return;
+  try {
+    const status = await fetchTaskStatus();
+    const active = conversations.value.find((c) => c.id === activeId.value);
+    if (status.running) {
+      if (active) {
+        ensureBackgroundAssistant(active, status.running.userText);
+        active.updatedAt = Date.now();
+      }
+      // 仅刷新重进场景使用：恢复“后台有任务”的体感，不与当前页 send() 的 activeController 混淆。
+      if (!activeController.value) sending.value = true;
+      scheduleTaskStatusPoll();
+      return;
+    }
+    if (!activeController.value) sending.value = false;
+    if (status.last?.settled) {
+      await restoreConversations();
+      await scrollBottom();
+    }
+  } catch {
+    /* 状态接口失败时静默；不影响正常聊天 */
+  }
+}
 
 function openLightbox(id: string) {
   lightboxUrl.value = `/agent/chat/upload/${id}`;
@@ -1579,12 +1651,10 @@ async function onClearContext() {
       </template>
     </Teleport>
 
-    <main ref="scroller" class="thread" @scroll.passive="onThreadScroll">
-      <div class="thread-scrollbar" ref="threadTrackEl">
-        <div class="thread-scrollbar-thumb" ref="threadThumbEl"></div>
-      </div>
-      <div v-if="modelNotice" class="auto-model-notice">{{ modelNotice }}</div>
-      <article v-for="{ item, cards } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
+    <div class="thread-frame">
+      <main ref="scroller" class="thread" @scroll.passive="onThreadScroll">
+        <div v-if="modelNotice" class="auto-model-notice">{{ modelNotice }}</div>
+        <article v-for="{ item, cards } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
         <div class="who" :class="{ me: item.role === 'user' }">
           <span class="dot" />
           {{ item.role === "user" ? meName : "助手" }}
@@ -1750,8 +1820,12 @@ async function onClearContext() {
         </div>
         <p v-if="item.error" class="error">{{ item.error }}</p>
         <div v-else-if="item.cancelled" class="cancelled-note">已取消</div>
-      </article>
-    </main>
+        </article>
+      </main>
+      <div class="thread-scrollbar" ref="threadTrackEl">
+        <div class="thread-scrollbar-thumb" ref="threadThumbEl"></div>
+      </div>
+    </div>
 
     <Transition name="back-top">
       <button
@@ -2300,8 +2374,14 @@ async function onClearContext() {
   background: var(--line);
 }
 
+.thread-frame {
+  position: relative;
+  min-height: 0;
+}
+
 .thread {
   position: relative;
+  height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 28px var(--pad) 24px;

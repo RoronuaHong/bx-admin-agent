@@ -209,7 +209,6 @@ const CODE_TOOLS = new Set(["write_code_file", "git_commit_push"]);
 /** 提交/会话/澄清类（非业务数据动作） */
 const META_TOOLS = new Set([
   "submit_understood_intent",
-  "parse_intent",
   "set_project",
   "request_clarification",
   "route_to_agent", // M1 Supervisor 路由：切换 Worker 上下文，属通用调度层，非业务数据动作
@@ -217,13 +216,57 @@ const META_TOOLS = new Set([
   "get_user_preferences",
   "get_current_time",
 ]);
+/** explain-capability 下允许保留的工具：可继续探查能力，但不能进入执行链。 */
+const EXPLAIN_ALLOWED_TOOLS = new Set([
+  "submit_understood_intent",
+  "request_clarification",
+  "route_to_agent",
+  "set_project",
+  "update_user_preference",
+  "get_user_preferences",
+  "get_current_time",
+  "search_api_module",
+  "read_api_module",
+  "grep_codebase",
+  "get_page_schema",
+  "get_list_columns",
+  "read_field_mapping",
+]);
+/** clarify 下只保留收敛范围所需的调度类工具。 */
+const CLARIFY_ALLOWED_TOOLS = new Set([
+  "submit_understood_intent",
+  "request_clarification",
+  "route_to_agent",
+  "set_project",
+  "update_user_preference",
+  "get_user_preferences",
+  "get_current_time",
+]);
+/** 未提交 understood intent 前，模型只能先完成意图理解，不直接路由/探查/执行。 */
+const PRE_UNDERSTOOD_TOOLS = new Set([
+  "submit_understood_intent",
+]);
 /** 业务工具 = 数据产出 + 探索定位（模型真做业务动作的判定集） */
 const BUSINESS_TOOLS = new Set([...DATA_OUTPUT_TOOLS, ...EXPLORE_TOOLS]);
+const EXPLAIN_EVIDENCE_TOOLS = new Set([
+  "search_api_module",
+  "read_api_module",
+  "grep_codebase",
+  "get_page_schema",
+  "get_list_columns",
+  "read_field_mapping",
+]);
+/** 仅供服务端规则编排/守卫使用，不暴露给模型的内部工具。 */
+const INTERNAL_TOOLS = new Set(["parse_intent"]);
 /** 启动自检：分类并集必须覆盖注册表全部工具，新增工具未归类时立即告警（防漏网） */
 {
   const missing = AGENT_TOOL_NAMES.filter(
     (n) =>
-      !DATA_OUTPUT_TOOLS.has(n) && !EXPLORE_TOOLS.has(n) && !META_TOOLS.has(n) && !CODE_TOOLS.has(n),
+      !DATA_OUTPUT_TOOLS.has(n) &&
+      !EXPLORE_TOOLS.has(n) &&
+      !META_TOOLS.has(n) &&
+      !CODE_TOOLS.has(n) &&
+      !INTERNAL_TOOLS.has(n),
   );
   if (missing.length) {
     console.warn("[chat:tools] 注册了但未归类的新工具（请补分类）:", missing.join(", "));
@@ -454,7 +497,7 @@ export function buildStaticGuide(session: Session, ownerKey?: string, worker?: W
   const parts: string[] = [];
   parts.push(
     "[workflow/agent] 你是影视后台管理系统的智能助手。需要业务数据时调用可用工具（工具自带完整使用规范）：" +
-      "业务请求第一步调用 submit_understood_intent 提交理解，再按需 search_api_module / read_api_module 定位接口并 call_api；" +
+      "业务请求第一步调用 submit_understood_intent 提交理解，并尽量填写 responseMode、confidence、missingSlots，再按需 search_api_module / read_api_module 定位接口并 call_api；" +
       "可多轮调用工具直至拿到数据；取到数据后组织自然语言总结，不向用户复述内部工具调用过程。\n" +
       "[workflow/tool-calling]（对齐 Cursor agent，最高优先级）：\n" +
       "1. 所有工具调用必须通过函数调用通道（tool_calls）发起；禁止以任何文本形式模拟工具调用" +
@@ -558,6 +601,8 @@ export function buildStaticGuide(session: Session, ownerKey?: string, worker?: W
   parts.push(
     "[workflow/chit-chat] 若用户询问公司内部规范、制度、流程、报销、考勤、部署等**知识库文档类**问题，" +
       "可调用 search_knowledge_base 检索本地知识库后基于检索结果回答（仅此一个工具可用）。" +
+      "这类问题若需要检索知识库，请在 submit_understood_intent 里把 responseMode 设为 execute，随后 route_to_agent(domain=knowledge)；" +
+      "只有“如何操作/系统是否支持/要准备什么信息”这类纯说明问题，才用 explain-capability。" +
       "回答必须是普通文本：禁止输出 JSON、禁止输出工具调用描述，一段话说清即收束。" +
       "注意：任意语种的有效自然语言输入均视为正常请求（可能含业务/知识库/闲聊意图），不要当作乱码或测试内容。",
   );
@@ -1184,6 +1229,29 @@ function hasSuccessfulApiCall(steps: AgentStep[]): boolean {
   return false;
 }
 
+function hasSuccessfulToolResult(steps: AgentStep[], toolNames: Set<string>): boolean {
+  const callNames = new Map<string, string>();
+  for (const s of steps) {
+    if (s.kind === "toolCalls") for (const c of s.calls) callNames.set(c.id, c.name);
+  }
+  for (const s of steps) {
+    if (s.kind !== "toolResult") continue;
+    const name = callNames.get(s.toolCallId);
+    if (!name || !toolNames.has(name)) continue;
+    const c = s.content || "";
+    if (
+      c &&
+      !c.startsWith("错误：") &&
+      !c.startsWith("MODULE_RETRY") &&
+      !c.startsWith("CLARIFICATION_REQUIRED") &&
+      !c.startsWith("[workflow/")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** 从已执行步骤里取最近一次大模型理解结果 */
 function findLastUnderstood(steps: AgentStep[]): UnderstoodIntent | null {
   for (let i = steps.length - 1; i >= 0; i--) {
@@ -1202,6 +1270,77 @@ function findLastUnderstood(steps: AgentStep[]): UnderstoodIntent | null {
     }
   }
   return null;
+}
+
+function hasUnderstoodIntent(steps: AgentStep[] | undefined): boolean {
+  return Boolean(findLastUnderstood(steps || []));
+}
+
+function buildExplainCapabilityReply(intent: UnderstoodIntent | null | undefined): string {
+  const summary = intent?.summary?.trim();
+  const project = intent?.project?.trim();
+  const module = intent?.module?.trim();
+  const subject = summary || "这个需求";
+  const projectText = project ? `在「${project}」里，` : "";
+  const moduleText = module ? `如果你已经知道模块是「${module}」，我也可以继续说明对应入口或页面。` : "";
+  return (
+    `${projectText}关于“${subject}”，这更适合先做说明而不是直接执行查询。\n\n` +
+    "你可以这样继续：\n" +
+    "1. 先告诉我你要查看的具体业务对象，例如名称、ID，或你想进入的页面/模块。\n" +
+    "2. 如果你只是想知道系统里应该怎么操作，我可以直接继续说明入口、查询路径和所需信息。\n" +
+    "3. 如果你希望我直接帮你执行查询，再补充具体对象后我就继续处理。\n\n" +
+    moduleText
+  ).trim();
+}
+
+function buildClarificationPayloadFromIntent(intent: UnderstoodIntent | null | undefined): string {
+  const missingSlots = Array.isArray(intent?.missingSlots) && intent?.missingSlots?.length
+    ? intent.missingSlots
+    : ["module", "operation"];
+  const summary = intent?.summary?.trim() || "请补充你的具体需求";
+  const question =
+    missingSlots.length === 1
+      ? `需要你再补充【${missingSlots[0]}】后我才能继续。`
+      : `需要你再补充【${missingSlots.join("、")}】后我才能继续。`;
+  return JSON.stringify({
+    intent: summary,
+    missingSlots,
+    question,
+    options: [{ label: "我来补充更多信息", value: "provide_more_context" }],
+    riskLevel: "read",
+  });
+}
+
+function shouldPromoteToExplain(intent: UnderstoodIntent | null | undefined, userText: string): boolean {
+  if (!intent) return false;
+  if (intent.responseMode !== "clarify" && intent.responseMode !== "execute") return false;
+  if (intent.isBusinessRequest !== true) return false;
+  if (intent.operationType !== "read") return false;
+  const missing = new Set(intent.missingSlots || []);
+  if (!missing.size) return false;
+  const onlyExecutionSlotsMissing = [...missing].every((x) => x === "module" || x === "value" || x === "operation");
+  if (!onlyExecutionSlotsMissing) return false;
+  const text = `${userText}\n${intent.summary || ""}`.toLowerCase();
+  return /how\b|how to\b|how can\b|what should i do\b|como\b|como devo\b|como posso\b|如何|怎么|怎样|应该怎么做|怎么办|कैसे|क्या करना चाहिए/u.test(text);
+}
+
+function shouldPromoteExplainToKnowledgeExecute(intent: UnderstoodIntent | null | undefined): boolean {
+  if (!intent || intent.responseMode !== "explain-capability") return false;
+  if (intent.isBusinessRequest === true) return false;
+  const text = `${intent.summary || ""}\n${intent.operationHint || ""}`.toLowerCase();
+  return /知识库|文档|制度|规范|流程|手册|wiki|policy|handbook|knowledge\s*base|knowledge|kb|manual|guideline/u.test(text);
+}
+
+function responseModeOf(intent: UnderstoodIntent | null | undefined): "execute" | "clarify" | "explain-capability" | "" {
+  return intent?.responseMode || "";
+}
+
+function confidenceOf(intent: UnderstoodIntent | null | undefined): number | undefined {
+  return intent?.confidence;
+}
+
+function missingSlotsOf(intent: UnderstoodIntent | null | undefined): string[] {
+  return Array.isArray(intent?.missingSlots) ? intent!.missingSlots! : [];
 }
 
 /**
@@ -1726,15 +1865,21 @@ export async function* chatStream(
         if (
           (state.understandAttempts || 0) > 0 &&
           !hasSuccessfulApiCall(steps) &&
-          lastUnderstood?.isBusinessRequest === true
+          lastUnderstood?.isBusinessRequest === true &&
+          responseModeOf(lastUnderstood) !== "clarify" &&
+          responseModeOf(lastUnderstood) !== "explain-capability"
         ) {
           const routedAlready = Boolean(state.activeWorkerId);
+          const missing = missingSlotsOf(lastUnderstood);
+          const conf = confidenceOf(lastUnderstood);
           steps.push({
             kind: "system",
             text: routedAlready
               ? "[workflow/retry] 你已提交业务理解，但尚未调用取数工具（call_api），用户拿不到数据。" +
                 "请继续：用 search_api_module / read_api_module 定位模块接口（候选可能已在上文给出），" +
-                "然后调用 call_api 获取真实数据；服务端会自动渲染。若确实无法定位接口，再用自然语言明确告知原因。"
+                `然后调用 call_api 获取真实数据；服务端会自动渲染。${missing.length ? `当前你标记仍缺：${missing.join(", ")}；` : ""}` +
+                `${typeof conf === "number" ? `当前 confidence=${conf.toFixed(2)}。` : ""}` +
+                "若确实无法定位接口，再用自然语言明确告知原因。"
               : "[workflow/retry] 你已提交业务理解，但尚未选定 Worker，领域取数工具不可用。" +
                 "请先 route_to_agent（后台数据用 domain=backend-api；文档/制度用 domain=knowledge），" +
                 "再定位接口并 call_api / 检索知识库。",
@@ -1746,17 +1891,34 @@ export async function* chatStream(
         // - 已命中 Worker → 白名单 ∪ META_TOOLS
         // - 未路由 → 仅 META_TOOLS（机制强制先 route_to_agent，杜绝默认全量工具绕过路由）
         const worker = state.activeWorkerId ? resolveWorkerById(state.activeWorkerId) : null;
+        const understoodExists = hasUnderstoodIntent(state.steps || []);
         const workerNames = workerToolNames(worker);
         const allTools = listAgentTools();
-        const routedTools: AgentToolDef[] = workerNames
-          ? allTools.filter((t) => workerNames.has(t.name) || META_TOOLS.has(t.name))
-          : allTools.filter((t) => META_TOOLS.has(t.name));
+        const routedTools: AgentToolDef[] = !understoodExists
+          ? allTools.filter((t) => PRE_UNDERSTOOD_TOOLS.has(t.name))
+          : workerNames
+            ? allTools.filter((t) => workerNames.has(t.name) || META_TOOLS.has(t.name))
+            : allTools.filter((t) => META_TOOLS.has(t.name));
+        const latestUnderstood = findLastUnderstood(state.steps || []);
+        const latestResponseMode = responseModeOf(latestUnderstood);
+        const forceExplainAnswer =
+          latestResponseMode === "explain-capability" &&
+          understoodExists;
         const needsRoute = !worker;
         // 输出已就绪却还在空转：禁止再调工具，强制给用户最终答复
-        const forceAnswer = state.outputReady === true;
+        const forceAnswer = state.outputReady === true || forceExplainAnswer;
         // 探索 cap 已 skip 且尚未 call_api：摘掉探索工具，避免 skip→再 skip 空烧轮次（i18n es G1）
-        const stripExplore = !forceAnswer && !needsRoute && shouldStripExploreTools(steps);
+        const stripExplore =
+          !forceAnswer &&
+          !needsRoute &&
+          latestResponseMode !== "explain-capability" &&
+          shouldStripExploreTools(steps);
         let llmTools = forceAnswer ? [] : routedTools;
+        if (!forceAnswer && latestResponseMode === "explain-capability") {
+          llmTools = llmTools.filter((t) => EXPLAIN_ALLOWED_TOOLS.has(t.name));
+        } else if (!forceAnswer && latestResponseMode === "clarify") {
+          llmTools = llmTools.filter((t) => CLARIFY_ALLOWED_TOOLS.has(t.name));
+        }
         if (stripExplore) {
           llmTools = llmTools.filter((t) => !PRE_CALL_EXPLORE_TOOLS.has(t.name));
           console.log(`[chat:explore-cap] 工具菜单已摘探索类（剩 ${llmTools.map((t) => t.name).join(",") || "无"}）`);
@@ -1803,8 +1965,30 @@ export async function* chatStream(
               ]
             : compactedSteps;
         // M1：已路由 → 注入领域提示；未路由 → 注入「须先 route_to_agent」引导（与 META-only 工具菜单配套）
+        const mustSubmitUnderstood = !understoodExists;
         const llmStepsWithWorker: AgentStep[] = worker
-          ? [...llmSteps, { kind: "system", text: formatWorkerGuide(worker) }]
+          ? [
+              ...llmSteps,
+              { kind: "system", text: formatWorkerGuide(worker) },
+              ...(mustSubmitUnderstood
+                ? [{
+                    kind: "system" as const,
+                    text:
+                      "[workflow/understood-required] 当前已完成路由，但你还没有调用 submit_understood_intent。" +
+                      "进入任何领域工具前，先调用 submit_understood_intent 提交本轮结构化理解" +
+                      "（至少填写 isBusinessRequest、operationType；并尽量填写 responseMode、confidence、missingSlots）。",
+                  }]
+                : []),
+              ...(forceExplainAnswer
+                ? [{
+                    kind: "system" as const,
+                    text:
+                      "[workflow/explain-finalize] 你已经拿到足够的页面/接口能力信息。" +
+                      "现在直接面向用户回答“应该怎么做/系统是否支持/还需要什么信息”，" +
+                      "不要再调用任何工具，也不要进入执行链。",
+                  }]
+                : []),
+            ]
           : needsRoute && !forceAnswer
             ? [
                 ...llmSteps,
@@ -1842,7 +2026,7 @@ export async function* chatStream(
         // 调 submit_understood_intent 提交理解（杜绝首轮空转文本→重试空转失败路径）；模型提交理解后
         // 自主决定续探还是纯文本收束。闲聊句首轮也会调 submit_understood_intent，但模型不调后续业务
         // 工具即自然收束，延迟增加可忽略。后续轮次 auto（模型自主决定继续调工具或总结）。
-        const toolChoice: "auto" | "required" = isFirstRound ? "required" : "auto";
+        const toolChoice: "auto" | "required" = mustSubmitUnderstood ? "required" : "auto";
         try {
           result = await callAgentSafe(activeModel, turns, rawImages, llmTools, llmStepsWithWorker, signal, {
             toolChoice,
@@ -2114,7 +2298,44 @@ export async function* chatStream(
 
           let content: string;
 
+          const understoodBeforeCall = findLastUnderstood(nextSteps);
+          if (call.name === "parse_intent") {
+            const responseMode = responseModeOf(understoodBeforeCall);
+            if (responseMode === "clarify" || responseMode === "explain-capability") {
+              const missing = missingSlotsOf(understoodBeforeCall);
+              const conf = confidenceOf(understoodBeforeCall);
+              content =
+                responseMode === "clarify"
+                  ? "[workflow/response-mode] 当前意图为 clarify：请直接向用户澄清缺失信息，不要继续 parse_intent 规则编排。" +
+                    `${missing.length ? `建议围绕缺失槽位提问：${missing.join(", ")}。` : ""}` +
+                    `${typeof conf === "number" ? `当前 confidence=${conf.toFixed(2)}。` : ""}`
+                  : "[workflow/response-mode] 当前意图为 explain-capability：用户是在问如何操作/系统是否支持/需要什么信息。" +
+                    `请直接基于已知能力说明回答，不要继续 parse_intent 进入执行链路。${typeof conf === "number" ? `当前 confidence=${conf.toFixed(2)}。` : ""}`;
+              emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(content) });
+              nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+              toolStatus = "skip";
+              toolNote = `responseMode=${responseMode}`;
+              continue;
+            }
+          }
           if (call.name === CALL_API_TOOL) {
+            const responseMode = responseModeOf(understoodBeforeCall);
+            if (responseMode === "clarify" || responseMode === "explain-capability") {
+              const missing = missingSlotsOf(understoodBeforeCall);
+              const conf = confidenceOf(understoodBeforeCall);
+              content =
+                responseMode === "clarify"
+                  ? "[workflow/response-mode] 当前意图为 clarify：说明还缺关键对象/条件，禁止直接 call_api。" +
+                    `请改用 request_clarification 向用户补充必要信息后再执行。${missing.length ? `建议反问缺失槽位：${missing.join(", ")}。` : ""}` +
+                    `${typeof conf === "number" ? `当前 confidence=${conf.toFixed(2)}。` : ""}`
+                  : "[workflow/response-mode] 当前意图为 explain-capability：用户是在问如何操作/系统是否支持/需要什么信息。" +
+                    `请基于已拿到的模块/页面/接口能力说明直接回答，不要调用 call_api 取数。${typeof conf === "number" ? `当前 confidence=${conf.toFixed(2)}。` : ""}`;
+              emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(content) });
+              nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+              toolStatus = "skip";
+              toolNote = `responseMode=${responseMode}`;
+              continue;
+            }
             const gate = await rulesGateBeforeCallApi({
               userText,
               call,
@@ -2239,6 +2460,77 @@ export async function* chatStream(
           const persisted = persistToolOutput(call.name, content, call.input);
           if (persisted) content = persisted;
           nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+          if (call.name === SUBMIT_UNDERSTOOD_INTENT) {
+            const understood = parseUnderstoodIntent(call.input || {});
+            const understoodStepIndex = nextSteps.length - 1;
+            if (shouldPromoteToExplain(understood, userText)) {
+              understood.responseMode = "explain-capability";
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/normalize] 当前问法属于“如何操作/如何查找”类说明型问题，已归一化为 explain-capability。",
+              });
+            }
+            if (shouldPromoteExplainToKnowledgeExecute(understood)) {
+              understood.responseMode = "execute";
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/normalize] 当前 understood 更接近知识库/制度/文档检索，已从 explain-capability 调整为 execute，请继续 route_to_agent(domain=knowledge) 并检索知识库。",
+              });
+            }
+            nextSteps[understoodStepIndex] = {
+              kind: "toolResult",
+              toolCallId: call.id,
+              content: JSON.stringify({ _understood: true, ...understood }, null, 2),
+            };
+            if (responseModeOf(understood) === "explain-capability") {
+              forcedReply = buildExplainCapabilityReply(understood);
+              outputReady = true;
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/stop] 当前为 explain-capability，已生成说明型答复，请直接结束，不再调用其他工具。",
+              });
+              return {
+                steps: nextSteps,
+                toolCalls: [],
+                round: state.round + 1,
+                needsClarification: false,
+                clarificationText: "",
+                outputReady,
+                forcedReply,
+                pageKind,
+                pendingTables,
+                lastToolSignature,
+                toolSignatureStreak,
+                doomLoopExhausted: toolSignatureStreak >= 3,
+                exploreCapExhausted,
+                activeWorkerId: activeWorkerId ?? state.activeWorkerId,
+              };
+            }
+            if (responseModeOf(understood) === "clarify") {
+              clarificationText = buildClarificationPayloadFromIntent(understood);
+              outputReady = true;
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/stop] 当前为 clarify，已生成澄清问题，请直接结束，不再调用其他工具。",
+              });
+              return {
+                steps: nextSteps,
+                toolCalls: [],
+                round: state.round + 1,
+                needsClarification: true,
+                clarificationText,
+                outputReady,
+                forcedReply,
+                pageKind,
+                pendingTables,
+                lastToolSignature,
+                toolSignatureStreak,
+                doomLoopExhausted: toolSignatureStreak >= 3,
+                exploreCapExhausted,
+                activeWorkerId: activeWorkerId ?? state.activeWorkerId,
+              };
+            }
+          }
           // 成功取数后清探索熔断（允许取错模块后再定位）；取消/错误不清理
           if (
             call.name === CALL_API_TOOL &&
@@ -2261,7 +2553,7 @@ export async function* chatStream(
           if (!outputReady && !content.startsWith("错误：")) {
             if (EXPLORE_TOOLS.has(call.name)) {
               const understood = findLastUnderstood(nextSteps);
-              if (understood?.isBusinessRequest === true) {
+              if (understood?.isBusinessRequest === true && responseModeOf(understood) === "execute") {
                 nextSteps.push({
                   kind: "system",
                   text:
@@ -2530,6 +2822,9 @@ export async function* chatStream(
         // （写 session.lastTable，导出延续场景同样拿全量数据）。任何收束路径都先落盘，避免模型中途
         // 被迫收束时用户已获取的页丢失。
         flushPendingTables(state.pendingTables, session, emitEvent);
+        const lastUnderstood = findLastUnderstood(state.steps || []);
+        const finalResponseMode = responseModeOf(lastUnderstood);
+        const looksLikeUnderstoodEcho = /_understood|isBusinessRequest|responseMode|missingSlots/.test(state.text || "");
         if (state.needsClarification && state.clarificationText) {
           return { text: renderClarificationForUser(`CLARIFICATION_REQUIRED\n${state.clarificationText}`) };
         }
@@ -2539,6 +2834,9 @@ export async function* chatStream(
         // 禁止把未加工内容上屏；有工具结果则走 synthesized 合成兜底。
         if (state.text?.trim()) {
           const hasToolResults = (state.steps || []).some((s) => s.kind === "toolResult");
+          if (finalResponseMode === "explain-capability" && looksLikeUnderstoodEcho) {
+            return { text: buildExplainCapabilityReply(lastUnderstood) };
+          }
           const v = validateFinalText(state.text);
           if (v === "tool-call" && !hasToolResults) {
             // 原始 JSON 是工具调用描述，但未被执行 → 清空，走下面的 synthesized 兜底
@@ -2623,9 +2921,20 @@ export async function* chatStream(
           return {};
           }
         }
+        const callNames = new Map<string, string>();
+        for (const s of state.steps || []) {
+          if (s.kind === "toolCalls") for (const c of s.calls) callNames.set(c.id, c.name);
+        }
         const toolResults = (state.steps || [])
           .filter((s): s is Extract<AgentStep, { kind: "toolResult" }> => s.kind === "toolResult")
+          .filter((s) => {
+            const name = callNames.get(s.toolCallId) || "";
+            return name !== "submit_understood_intent" && name !== "parse_intent";
+          })
           .map((s) => s.content);
+        if (finalResponseMode === "explain-capability") {
+          return { text: buildExplainCapabilityReply(lastUnderstood) };
+        }
         const synthesized = synthesizeReplyFromToolResults([
           ...toolResults,
           ...((state.steps || [])
@@ -2696,6 +3005,8 @@ export async function* chatStream(
           const understood = findLastUnderstood(state.steps || []);
           const businessPending =
             understood?.isBusinessRequest === true &&
+            responseModeOf(understood) !== "clarify" &&
+            responseModeOf(understood) !== "explain-capability" &&
             !hasSuccessfulApiCall(state.steps || []) &&
             !state.outputReady &&
             !state.forcedReply;
@@ -2842,13 +3153,16 @@ export async function* chatStream(
       // 或显式 write 意图（writeForce）才走服务端 fallback。纯闲聊句首轮 required 仅调
       // submit_understood_intent 后文本收束，businessToolCalled 为 false → 不进兜底（避免多一次模型延迟、
       // 且对"你好"等落"未能理解"怪文案）。意图判别 100% 交模型，服务端不再用中文动词白名单抢路由。
+      const lastUnderstood = findLastUnderstood(ls.steps || []);
+      const responseMode = responseModeOf(lastUnderstood);
       const businessToolCalled = (ls.toolCalls || []).some((tc) => BUSINESS_TOOLS.has(tc.name));
       // 写意图判定（模型信号驱动，2026-08-24 去写死）：模型在 submit_understood_intent 提交的
       // operationType==="write" 即视为写操作（服务端不再用中文写词预判）。
-      const writeForce = findLastUnderstood(ls.steps || [])?.operationType === "write";
+      const writeForce = lastUnderstood?.operationType === "write";
       // 伪调用耗尽 / Doom Loop / 探索熔断（确定性回退）：模型多次文本模拟工具调用未走 function calling，
       // 或同一工具+入参连续重复空转，或取数前 search/read 超预算 → 即使 businessToolCalled 为 false 也强制服务端规则编排兜底。
-      if (businessToolCalled || writeForce || ls.pseudoPlanExhausted || ls.doomLoopExhausted || ls.exploreCapExhausted) {
+      const forbidExecutionFallback = responseMode === "clarify" || responseMode === "explain-capability";
+      if (!forbidExecutionFallback && (businessToolCalled || writeForce || ls.pseudoPlanExhausted || ls.doomLoopExhausted || ls.exploreCapExhausted)) {
         // 有无「API 数据产出」：必须是成功 call_api（勿把 search/read 的 JSON 候选当产出——
         // 2026-09-04 复测：explore-cap 后 search 结果以 `{` 开头误判 hasApiData，跳过编排，
         // 落「已完成若干工具调用」且 G6 无 call_api）。
@@ -2934,9 +3248,14 @@ export async function* chatStream(
     // 静默无输出兜底：模型 text 为空（伪计划被清空）、KB 未接管、fallback 返回 skip 时，
     // 必须给用户一句可读回复，禁止空转（前端只收到 done 会误以为卡死）。
     if (!text) {
-      text = ls.modelError
-        ? "模型服务暂时不可用，请稍后重试或更换模型。"
-        : "未能理解你的需求，请换种说法重试（例如直接说清模块名与要查的列表/详情）。";
+      const fallbackIntent = findLastUnderstood(ls.steps || []);
+      if (responseModeOf(fallbackIntent) === "explain-capability") {
+        text = buildExplainCapabilityReply(fallbackIntent);
+      } else {
+        text = ls.modelError
+          ? "模型服务暂时不可用，请稍后重试或更换模型。"
+          : "未能理解你的需求，请换种说法重试（例如直接说清模块名与要查的列表/详情）。";
+      }
     }
     // 方案 B 兜底（2026-08-26）：若模型仍把完整表格写进最终文本，而本轮已上屏 UI_TABLE → 折叠重复的 markdown 表格。
     text = collapseDuplicateTable(text, session);
