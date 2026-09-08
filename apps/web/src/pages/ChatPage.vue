@@ -1,107 +1,53 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { useRouter } from "vue-router";
-import MarkdownIt from "markdown-it";
-import DOMPurify from "dompurify";
-import { clearChatContext, downloadUrl, fetchMe, fetchModels, fetchTaskStatus, logout, streamChat, uploadFiles, fetchConversations, createConversation, saveConversationMessages, deleteConversation as apiDeleteConversation, clearConversation as apiClearConversation, type ChatEvent, type Me, type ModelInfo, type UploadResult } from "../api";
+import { clearChatContext, downloadUrl, fetchMe, fetchModels, fetchTaskStatus, getApiErrorToken, logout, streamChat, uploadFiles, fetchConversations, createConversation, saveConversationMessages, deleteConversation as apiDeleteConversation, clearConversation as apiClearConversation, type ChatEvent, type Me, type ModelInfo, type UploadResult } from "../api";
+import { createBackgroundTaskSync } from "../chat-background-sync";
+import { resizeComposerBox, startComposerResizeDrag } from "../chat-composer";
+import { renderChatMarkdown } from "../chat-richtext";
+import { applyChatStreamEvent, toolStatusTextForLocale } from "../chat-stream-events";
+import {
+  TASK_RESULTS_ID,
+  clearIdentityCache,
+  dedupeConversationList,
+  displayAssistantTextForLocale,
+  displayConversationTitleForLocale,
+  isDefaultConversationTitle,
+  isLegacyTaskConversation,
+  loadClosedIds,
+  loadConversationsFromStorage,
+  makeConversationTitle,
+  migrateLegacyConversation,
+  newConversationId,
+  persistClosedIds as persistClosedIdsToStorage,
+  readIdentityCache,
+  readModelCache,
+  sanitizeBubble,
+  slimConversations,
+  writeIdentityCache,
+  writeModelCache,
+  type Bubble,
+  type Conversation,
+  type Identity,
+} from "../chat-storage";
+import { createTabMenuPosition, type TabMenuState } from "../chat-tab-menu";
+import { bindCustomScrollbar } from "../custom-scrollbar";
 import { copyText } from "../clipboard";
+import { localizeToken } from "../localize";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import ResultTable from "../components/ResultTable.vue";
-import ResultChart from "../components/ResultChart.vue";
 import ToolResultCard from "../components/ToolResultCard.vue";
 import CapabilitiesHelp from "../components/CapabilitiesHelp.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
-import type { ChatFileRef, TableView, ChartView } from "../types";
 import { getUiLocale } from "../ui-locale";
 
-// 轻量 Markdown 渲染：把模型返回的 **加粗**/`代码`/列表/标题渲染成富文本，
-// 避免用户看到原始 ** 与反引号。默认 html:false 关闭 HTML，防止 XSS。
-const md = new MarkdownIt({
-  html: true,   // 允许渲染 HTML 标签（如文件中的 <a style=...>），防 XSS 由 DOMPurify 负责
-  linkify: true,
-  breaks: true,
-});
-// 外链一律加 noopener noreferrer 并新窗口打开。
-const defaultLinkOpen =
-  md.renderer.rules.link_open ||
-  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
-md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
-  tokens[idx].attrSet("target", "_blank");
-  tokens[idx].attrSet("rel", "noopener noreferrer");
-  return defaultLinkOpen(tokens, idx, options, env, self);
-};
-// DOMPurify 钩子：强制保留 style 属性原值，避免 CSS 值被截断
-DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
-  if (data.attrName === "style") {
-    data.forceKeepAttr = true;
-  }
-});
-
-const mdCache = new Map<string, string>();
-
-function renderMarkdown(text: string): string {
-  const key = text.length > 240 ? `${text.length}:${text.slice(0, 120)}:${text.slice(-80)}` : text;
-  const hit = mdCache.get(key);
-  if (hit) return hit;
-  const raw = md.render(text)
-    // 把 <table> 包一层 table-wrapper，实现横向滚动而不溢出气泡
-    .replace(/<table>/g, '<div class="table-wrapper"><table>')
-    .replace(/<\/table>/g, '</table></div>');
-  // DOMPurify：允许常见展示标签和属性，过滤 script / on* 等危险内容
-  // ALLOWED_URI_REGEXP 放宽以支持相对路径（./LICENSE 等），仅阻断 javascript: / data: 等危险协议
-  const html = DOMPurify.sanitize(raw, {
-    ALLOWED_TAGS: [
-      "p","br","hr","strong","em","b","i","s","del","ins","u","sup","sub","mark",
-      "h1","h2","h3","h4","h5","h6",
-      "ul","ol","li","dl","dt","dd",
-      "blockquote","pre","code","kbd","samp",
-      "table","thead","tbody","tfoot","tr","th","td","colgroup","col",
-      "div","span","details","summary",
-      "a","img",
-    ],
-    ALLOWED_ATTR: ["href","src","alt","title","class","style","target","rel","width","height","align","id","name","type","start","colspan","rowspan"],
-    ALLOW_DATA_ATTR: false,
-    FORCE_BODY: true,
-    // 允许 https/http/ftp/mailto 及相对路径，阻断 javascript: / data: / vbscript:
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
-  });
-  if (mdCache.size > 80) mdCache.clear();
-  mdCache.set(key, html);
-  return html;
-}
-
-interface Bubble {
-  id: number;
-  role: "user" | "assistant";
-  text: string;
-  error?: string;
-  cancelled?: boolean;
-  /** 工具调用阶段的实时活动状态文案（如“正在检索代码…”） */
-  status?: string;
-  /** 工具链进行中标志：收到 tool_call 后置 true，done 后置 false；用于状态条在模型吐字期间仍常驻 */
-  toolActive?: boolean;
-  /** 当前正在调用的工具名（实时显示到工具细节卡片标题） */
-  currentTool?: string;
-  /** 工具调用累计步骤数（实时显示「第 N 步」进度） */
-  toolStep?: number;
-  /** SSE 流是否结束（done 事件后），用于状态条最终隐藏 */
-  finished?: boolean;
-  images?: Array<{ id: string; name: string }>;
-  tables?: TableView[];
-  charts?: ChartView[];
-  files?: ChatFileRef[];
-  /** 工具调用结果卡片（对齐 Cursor「工具结果即产出」实时上屏） */
-  toolResults?: Array<{ name: string; result: string }>;
-  /** 思考过程（对齐 DeepSeek「深度思考」折叠）：agent 操作链的实时可读摘要流 */
-  reasoning?: string;
-  /** 思考过程是否曾展开过（用于控制默认折叠/展开） */
-  reasoningExpanded?: boolean;
-}
+const ResultChart = defineAsyncComponent(() => import("../components/ResultChart.vue"));
 
 const router = useRouter();
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
+const renderMarkdown = renderChatMarkdown;
 const me = shallowRef<Me | null>(null);
 const input = ref("");
 const sending = ref(false);
@@ -116,92 +62,21 @@ let seq = 0;
 
 // ---- 多会话（多 Tab）数据层 ----
 // 每个会话独立对话，在 localStorage 持久化历史，刷新后恢复。
-interface Conversation {
-  id: string;
-  title: string;
-  messages: Bubble[];
-  createdAt: number;
-  updatedAt: number;
-}
-
 const LEGACY_KEY = "bx-admin-agent-chat";
 const STORAGE_KEY = "bx-admin-agent-chat-v2";
 /** 已关闭会话 id（跨刷新），避免 DELETE 与 upsert 竞态后刷新又把 tab 拉回来。 */
 const CLOSED_KEY = "bx-admin-agent-closed-v1";
-const CLOSED_IDS_CAP = 100;
-/** 与服务端一致：断线兜底会话的稳定 id；旧版 task-<sessionId> 视为孤儿。 */
-const TASK_RESULTS_ID = "task-results";
 // 身份缓存：持久化最近一次成功的登录身份，用于刷新时、fetchMe 未返回/失败时
 // 也能拼出正确的 storageKey 来恢复本地会话，避免落到 ":x:anon" 导致记录"消失"。
 const IDENTITY_CACHE_KEY = "bx-admin-agent-identity-v1";
 const MODEL_CACHE_KEY = "bx-admin-agent-model-v1";
-
-interface Identity {
-  countryId: string;
-  loginName: string;
-}
-
-function readIdentityCache(): Identity | null {
-  try {
-    const raw = localStorage.getItem(IDENTITY_CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<Identity>;
-    if (!parsed.countryId || !parsed.loginName) return null;
-    return { countryId: parsed.countryId, loginName: parsed.loginName };
-  } catch {
-    return null;
-  }
-}
-
-function writeIdentityCache(identity: Identity) {
-  try {
-    localStorage.setItem(IDENTITY_CACHE_KEY, JSON.stringify(identity));
-  } catch {
-    /* 忽略配额/隐私模式错误 */
-  }
-}
-
-function clearIdentityCache() {
-  try {
-    localStorage.removeItem(IDENTITY_CACHE_KEY);
-  } catch {
-    /* 忽略 */
-  }
-}
-
-// 选中的模型：持久化到 localStorage，刷新后保留。同时存 id 与 label，
-// 以便刷新瞬间直接用缓存的 label 渲染按钮文字，避免先显示 Auto 再跳变（闪动）。
-interface ModelCache {
-  id: string | null;
-  label: string;
-}
-function readModelCache(): ModelCache | null {
-  try {
-    const raw = localStorage.getItem(MODEL_CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<ModelCache>;
-    if (typeof parsed.label !== "string") return null;
-    return { id: parsed.id ?? null, label: parsed.label };
-  } catch {
-    return null;
-  }
-}
-
-function writeModelCache(id: string | null, label: string) {
-  try {
-    if (id === null) localStorage.removeItem(MODEL_CACHE_KEY);
-    else localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({ id, label }));
-  } catch {
-    /* 忽略配额/隐私模式错误 */
-  }
-}
 
 // 当前生效的登录身份：优先实时登录态，回退到身份缓存，避免回落到匿名校验不到数据。
 function currentIdentity(): Identity {
   if (me.value?.user?.loginName && me.value?.country?.id) {
     return { countryId: me.value.country.id, loginName: me.value.user.loginName };
   }
-  const cached = readIdentityCache();
+  const cached = readIdentityCache(IDENTITY_CACHE_KEY);
   if (cached) return cached;
   return { countryId: "x", loginName: "anon" };
 }
@@ -217,10 +92,6 @@ function legacyStorageKey() {
 function closedStorageKey() {
   const id = currentIdentity();
   return `${CLOSED_KEY}:${id.countryId}:${id.loginName}`;
-}
-
-function isLegacyTaskConversation(id: string) {
-  return id.startsWith("task-") && id !== TASK_RESULTS_ID;
 }
 
 const conversations = ref<Conversation[]>([]);
@@ -259,70 +130,27 @@ const messagesWithCards = computed(() =>
 );
 
 function newId() {
-  return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return newConversationId();
 }
 
 function defaultConversationTitle() {
   return tx("新对话", "New Chat", "Novo Chat", "नई चैट");
 }
 
-function isDefaultConversationTitle(title?: string | null) {
-  const value = String(title || "").trim();
-  return !value || value === "新对话" || value === "New Chat" || value === "Novo Chat" || value === "नई चैट";
+function displayConversationTitleOf(conv: { title?: string | null }) {
+  return displayConversationTitleForLocale(conv.title, defaultConversationTitle(), uiLocale.value);
 }
 
-function displayConversationTitle(conv: { title?: string | null }) {
-  return isDefaultConversationTitle(conv.title) ? defaultConversationTitle() : String(conv.title || "").trim();
-}
-
-function makeTitle(messages: Bubble[]): string {
-  const first = messages.find((m) => m.role === "user")?.text.trim();
-  return (first || defaultConversationTitle()).replace(/\s+/g, " ").slice(0, 24);
-}
-
-// 序列化：仅保留需要持久化的字段（避免把响应式/临时字段写进存储）
-function slimConversations() {
-  return conversations.value.map((c) => ({
-    ...c,
-    messages: c.messages
-      .map((m) => ({
-        role: m.role,
-        text: m.text,
-        ...(m.images?.length ? { images: m.images } : {}),
-        ...(m.tables?.length ? { tables: m.tables } : {}),
-        ...(m.charts?.length ? { charts: m.charts } : {}),
-        ...(m.files?.length ? { files: m.files } : {}),
-        ...(m.reasoning ? { reasoning: m.reasoning } : {}),
-        ...(m.toolResults?.length ? { toolResults: m.toolResults } : {}),
-        ...(typeof m.toolStep === "number" ? { toolStep: m.toolStep } : {}),
-        ...(m.currentTool ? { currentTool: m.currentTool } : {}),
-        ...(m.status ? { status: m.status } : {}),
-        ...(m.error ? { error: m.error } : {}),
-        ...(m.cancelled ? { cancelled: true } : {}),
-      }))
-      .filter(
-        (m) =>
-          // 用户消息一律保留（即便暂空，也是对话骨架）
-          m.role === "user" ||
-          // 助手消息：有可见内容（文本/图片/表格/图表/文件）或被用户取消的都保留，
-          // 避免「正在思考…」阶段取消、或工具链中途被打断的助手消息因 text 为空被误删。
-          m.text.trim().length > 0 ||
-          Boolean(m.images?.length) ||
-          Boolean(m.tables?.length) ||
-          Boolean((m as { charts?: unknown[] }).charts?.length) ||
-          Boolean(m.files?.length) ||
-          Boolean((m as { toolResults?: unknown[] }).toolResults?.length) ||
-          Boolean((m as { reasoning?: string }).reasoning?.trim()) ||
-          Boolean((m as { error?: string }).error) ||
-          Boolean((m as { cancelled?: boolean }).cancelled),
-      ),
-  }));
+function displayAssistantText(item: Bubble) {
+  return item.role === "assistant"
+    ? displayAssistantTextForLocale(item.text, uiLocale.value)
+    : item.text;
 }
 
 // 本地离线兜底（服务端不可达时仍保留一份），非主存储。
 function cacheLocally() {
   try {
-    localStorage.setItem(storageKey(), JSON.stringify({ activeId: activeId.value, conversations: slimConversations() }));
+    localStorage.setItem(storageKey(), JSON.stringify({ activeId: activeId.value, conversations: slimConversations(conversations.value) }));
   } catch {
     /* 忽略配额/隐私模式错误 */
   }
@@ -333,37 +161,14 @@ const deletedConversationIds = new Set<string>();
 /** 批量关闭期间禁止 deep-watch 触发的自动保存。 */
 let suppressConversationSave = false;
 
-function loadClosedIds(): string[] {
-  try {
-    const raw = localStorage.getItem(closedStorageKey());
-    if (!raw) return [];
-    const arr = JSON.parse(raw) as unknown;
-    if (!Array.isArray(arr)) return [];
-    return arr.filter((x): x is string => typeof x === "string").slice(-CLOSED_IDS_CAP);
-  } catch {
-    return [];
-  }
-}
-
-function persistClosedIds() {
-  try {
-    localStorage.setItem(
-      closedStorageKey(),
-      JSON.stringify([...deletedConversationIds].slice(-CLOSED_IDS_CAP)),
-    );
-  } catch {
-    /* 忽略配额/隐私模式错误 */
-  }
-}
-
 function hydrateClosedIds() {
   deletedConversationIds.clear();
-  for (const id of loadClosedIds()) deletedConversationIds.add(id);
+  for (const id of loadClosedIds(closedStorageKey())) deletedConversationIds.add(id);
 }
 
 function markConversationsClosed(ids: string[]) {
   for (const id of ids) deletedConversationIds.add(id);
-  persistClosedIds();
+  persistClosedIdsToStorage(closedStorageKey(), deletedConversationIds);
 }
 
 function shouldHideConversation(id: string) {
@@ -390,115 +195,10 @@ function saveConversations() {
     cacheLocally();
     return;
   }
-  const slim = slimConversations().filter((c) => !shouldHideConversation(c.id));
+  const slim = slimConversations(conversations.value).filter((c) => !shouldHideConversation(c.id));
   cacheLocally();
   for (const c of slim) {
     persistConversation(c.id, c.messages, c.title);
-  }
-}
-
-// 从旧 v1 单会话迁移：读旧 key 数组，迁为第一个会话。
-function migrateLegacy(): Conversation | null {
-  try {
-    const raw = localStorage.getItem(legacyStorageKey());
-    if (!raw) return null;
-    const arr = JSON.parse(raw) as Array<{ role: string; text: string }>;
-    if (!Array.isArray(arr)) return null;
-    const bubbles: Bubble[] = arr
-      .filter((item) => item.role === "user" || item.role === "assistant")
-      .map((item) => ({ id: ++seq, role: item.role as Bubble["role"], text: item.text }));
-    if (!bubbles.length) return null;
-    const now = Date.now();
-    return {
-      id: newId(),
-      title: makeTitle(bubbles),
-      messages: bubbles,
-      createdAt: now,
-      updatedAt: now,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function sanitizeBubble(m: Bubble): Bubble {
-  const text = typeof m.text === "string" ? m.text.slice(0, 20000) : "";
-  const reasoning = typeof m.reasoning === "string" ? m.reasoning.slice(0, 20000) : undefined;
-  const toolResults = Array.isArray(m.toolResults)
-    ? m.toolResults
-      .slice(0, 20)
-      .map((item) => ({ name: String(item?.name || "").slice(0, 120), result: String(item?.result || "").slice(0, 12000) }))
-    : undefined;
-  const tables = Array.isArray(m.tables)
-    ? m.tables.slice(0, 3).map((t) => ({
-        ...t,
-        rows: Array.isArray(t.rows) ? t.rows.slice(0, 200) : [],
-      }))
-    : undefined;
-  const charts = Array.isArray(m.charts)
-    ? m.charts.slice(0, 3).map((c) => ({
-        ...c,
-        categories: Array.isArray(c.categories) ? c.categories.slice(0, 93) : [],
-        series: Array.isArray(c.series)
-          ? c.series.slice(0, 8).map((s) => ({
-              ...s,
-              data: Array.isArray(s.data) ? s.data.slice(0, 93).map((n) => Number(n) || 0) : [],
-            }))
-          : [],
-      }))
-    : undefined;
-  return {
-    ...m,
-    text,
-    // 从持久化/服务端恢复的气泡没有活动 SSE 流，不可能再收到 done 事件。
-    // 若保留 finished:false，刷新后打字光标会永远闪烁。恢复即视为已完成，
-    // 仅在确实被打断且无任何产出时标记为 error（避免空气泡假完成）。
-    ...(m.role === "assistant" ? { finished: true } : {}),
-    ...(reasoning ? { reasoning, reasoningExpanded: false } : {}),
-    ...(toolResults?.length ? { toolResults } : {}),
-    ...(tables?.length ? { tables } : {}),
-    ...(charts?.length ? { charts } : {}),
-  };
-}
-
-function dedupeConversationList(list: Conversation[]): Conversation[] {
-  const byId = new Map<string, Conversation>();
-  for (const conv of list) {
-    const prev = byId.get(conv.id);
-    if (!prev || (conv.updatedAt || 0) >= (prev.updatedAt || 0)) byId.set(conv.id, conv);
-  }
-  return [...byId.values()].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-}
-
-// 从 v2 多会话恢复。
-function loadConversations(): { conversations: Conversation[]; activeId: string } {
-  try {
-    const raw = localStorage.getItem(storageKey());
-    if (!raw) return { conversations: [], activeId: "" };
-    // 历史过大（上次卡死留下）直接丢弃，避免一打开就卡死
-    if (raw.length > 2_500_000) {
-      localStorage.removeItem(storageKey());
-      return { conversations: [], activeId: "" };
-    }
-    const parsed = JSON.parse(raw) as { activeId?: string; conversations?: Conversation[] };
-    if (!Array.isArray(parsed.conversations)) return { conversations: [], activeId: "" };
-    const convs = dedupeConversationList(parsed.conversations
-      .filter((c) => c && Array.isArray(c.messages))
-      .slice(0, 20)
-      .map((c) => ({
-        id: c.id,
-        title: isDefaultConversationTitle(c.title) ? defaultConversationTitle() : String(c.title || ""),
-        messages: (c.messages as Bubble[])
-          .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-          .slice(-80)
-          .map((m) => sanitizeBubble({ ...m, id: m.id || ++seq })),
-        createdAt: c.createdAt || 0,
-        updatedAt: c.updatedAt || 0,
-      })));
-    const activeId = convs.some((c) => c.id === parsed.activeId) ? String(parsed.activeId) : convs[0]?.id || "";
-    return { conversations: convs, activeId };
-  } catch {
-    return { conversations: [], activeId: "" };
   }
 }
 
@@ -518,12 +218,7 @@ function newConversation() {
 }
 
 /** 标签右键菜单：对齐浏览器/IDE 关标签行为。 */
-const tabMenu = ref<{
-  convId: string;
-  idx: number;
-  x: number;
-  y: number;
-} | null>(null);
+const tabMenu = ref<TabMenuState | null>(null);
 
 function hideTabMenu() {
   tabMenu.value = null;
@@ -531,12 +226,7 @@ function hideTabMenu() {
 
 function openTabMenu(ev: MouseEvent, convId: string, idx: number) {
   // 不切会话，仅弹出菜单；坐标稍后钳制到视口内。
-  const pad = 8;
-  const menuW = 168;
-  const menuH = 220;
-  const x = Math.min(ev.clientX, window.innerWidth - menuW - pad);
-  const y = Math.min(ev.clientY, window.innerHeight - menuH - pad);
-  tabMenu.value = { convId, idx, x: Math.max(pad, x), y: Math.max(pad, y) };
+  tabMenu.value = { convId, idx, ...createTabMenuPosition(ev) };
 }
 
 function ensureBlankConversation() {
@@ -662,7 +352,7 @@ onMounted(async () => {
 
   // 第一步：先用身份缓存恢复本地会话，不依赖 fetchMe 是否成功，
   // 避免 fetchMe 瞬时失败/401 时直接丢弃用户已存的聊天记录。
-  const cachedIdentity = readIdentityCache();
+  const cachedIdentity = readIdentityCache(IDENTITY_CACHE_KEY);
   if (cachedIdentity) {
     await restoreConversations();
   }
@@ -673,7 +363,7 @@ onMounted(async () => {
   if (fetched) {
     caps.value = detectCapabilities();
     // 先同步恢复上次选中的模型（含缓存 label），避免刷新瞬间先显示 Auto 再跳变的闪动。
-    const cached = readModelCache();
+    const cached = readModelCache(MODEL_CACHE_KEY);
     if (cached) {
       selectedModel.value = cached.id;
       selectedModelLabel.value = cached.label;
@@ -683,9 +373,9 @@ onMounted(async () => {
     if (selectedModel.value && !availableModels.value.some((m) => m.id === selectedModel.value)) {
       selectedModel.value = null;
       selectedModelLabel.value = "Auto";
-      writeModelCache(null, "Auto");
+      writeModelCache(MODEL_CACHE_KEY, null, "Auto");
     }
-    writeIdentityCache({ countryId: fetched.country.id, loginName: fetched.user.loginName });
+    writeIdentityCache(IDENTITY_CACHE_KEY, { countryId: fetched.country.id, loginName: fetched.user.loginName });
     // 服务端记录按登录用户归属：登录态就绪后始终从服务端拉权威数据（覆盖本地缓存）。
     // 身份切换（缓存身份 ≠ 真实身份）时也必须重新拉取，避免串用户数据。
     if (!cachedIdentity || cachedIdentity.countryId !== fetched.country.id || cachedIdentity.loginName !== fetched.user.loginName) {
@@ -741,8 +431,8 @@ onMounted(async () => {
     stopTaskStatusPolling();
     stopVoice();
     recognitionRef.value = null;
-    onThumbUp();
-    cleanupScrollbar();
+    modelScrollbarCleanup?.();
+    modelScrollbarCleanup = null;
     threadScrollbarCleanup?.();
     threadScrollbarCleanup = null;
     window.removeEventListener("keydown", onEsc);
@@ -759,7 +449,7 @@ async function restoreConversations() {
   hydrateClosedIds();
 
   // 本地兜底（旧 localStorage / 离线），先渲染。
-  const local = loadConversations();
+  const local = loadConversationsFromStorage(storageKey(), defaultConversationTitle(), () => ++seq);
   const localVisible = local.conversations.filter((c) => !shouldHideConversation(c.id));
   if (localVisible.length) {
     conversations.value = localVisible;
@@ -767,7 +457,7 @@ async function restoreConversations() {
       ? local.activeId
       : localVisible[0]?.id || "";
   } else {
-    const migrated = migrateLegacy();
+    const migrated = migrateLegacyConversation(legacyStorageKey(), defaultConversationTitle(), () => ++seq);
     if (migrated) {
       conversations.value = [migrated];
       activeId.value = migrated.id;
@@ -793,14 +483,14 @@ async function restoreConversations() {
         closedChanged = true;
       }
     }
-    if (closedChanged) persistClosedIds();
+    if (closedChanged) persistClosedIdsToStorage(closedStorageKey(), deletedConversationIds);
 
     const convs: Conversation[] = dedupeConversationList(remote
       .filter((c) => c && c.id && !shouldHideConversation(c.id))
       .slice(0, 20)
       .map((c) => ({
         id: c.id,
-        title: isDefaultConversationTitle(c.title) ? defaultConversationTitle() : String(c.title || ""),
+        title: displayConversationTitle(c.title, defaultConversationTitle()),
         messages: (c.messages as Bubble[])
           .filter((m) => m && (m.role === "user" || m.role === "assistant"))
           .slice(-80)
@@ -835,96 +525,25 @@ function onThreadScroll() {
   scrollTop.value = scroller.value?.scrollTop ?? 0;
 }
 
-// 输入框自动高度上限：随视口缩放，小屏不溢出。
-function composerMaxH() {
-  return Math.min(Math.round(window.innerHeight * 0.7), 520);
-}
-
 // 手动拖拽设定的输入框高度（px）；null 表示自动高度。
 const composerH = ref<number | null>(null);
 
 function resizeComposer() {
-  const el = composerInput.value;
-  if (!el) return;
-  el.style.height = "auto";
-  // 最低高度 130px：默认（未拖拽）时也保持 130，拖拽后以此为下限，内容超长再增高。
-  const floor = Math.max(composerH.value ?? 0, 130);
-  const target = Math.min(Math.max(el.scrollHeight, floor), composerMaxH());
-  el.style.height = `${target}px`;
-  document.documentElement.style.setProperty("--composer-max", `${target}px`);
-  el.scrollTop = 0;
+  resizeComposerBox(composerInput, composerH);
 }
-
-// 拖拽手势进行中标记：避免 pointer/mouse/touch 同时触发导致重复启动。
-let dragActive = false;
 
 // 按住输入框顶部的拖拽把手，上拉放大 / 下拉缩小输入框。
 function startComposerDrag(e: PointerEvent | MouseEvent | TouchEvent) {
-  if (dragActive) return;
-  const isTouch = "touches" in e;
-  if (!isTouch && e.button !== 0) return;
-  if (isTouch) e.preventDefault();
-  dragActive = true;
-  const startY = isTouch ? e.touches[0]!.clientY : e.clientY;
-  const el = composerInput.value;
-  const startH = composerH.value ?? el?.clientHeight ?? 0;
-  const maxH = Math.min(Math.round(window.innerHeight * 0.85), 640);
-  document.documentElement.style.setProperty("--composer-max", "none");
-  const onMove = (ev: PointerEvent | MouseEvent | TouchEvent) => {
-    const y = "touches" in ev ? ev.touches[0]!.clientY : ev.clientY;
-    const h = startH + (startY - y);
-    // 下限 130px（容纳单行输入 + 工具栏），上限受视口约束。
-    composerH.value = Math.min(Math.max(h, 130), maxH);
-  };
-  const end = () => {
-    if (!dragActive) return;
-    dragActive = false;
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", end);
-    window.removeEventListener("pointercancel", end);
-    window.removeEventListener("mousemove", onMove);
-    window.removeEventListener("mouseup", end);
-    window.removeEventListener("touchmove", onMove);
-    window.removeEventListener("touchend", end);
-    window.removeEventListener("touchcancel", end);
-    document.documentElement.style.setProperty(
-      "--composer-max",
-      composerH.value != null ? `${composerH.value}px` : ""
-    );
-    if (composerH.value != null) resizeComposer();
-  };
-  window.addEventListener("pointermove", onMove);
-  window.addEventListener("pointerup", end);
-  window.addEventListener("pointercancel", end);
-  window.addEventListener("mousemove", onMove);
-  window.addEventListener("mouseup", end);
-  window.addEventListener("touchmove", onMove);
-  window.addEventListener("touchend", end);
-  window.addEventListener("touchcancel", end);
+  startComposerResizeDrag({
+    event: e,
+    composerInput,
+    composerHeight: composerH,
+    resizeComposer,
+  });
 }
 
-/** 工具名 → 实时活动状态文案（工具调用阶段显示“正在做什么”）。
- * 2026-08-26 改：显示真实工具中文动作，让用户看到当前在调用哪个工具（避免黑盒卡顿感）。
- * 映射表只含通用工具语义，不含任何业务词（符合红线）。 */
-const TOOL_STATUS_MAP: Record<string, { zh: string; en: string; pt?: string; hi?: string }> = {
-  submit_understood_intent: { zh: "正在理解你的意图…", en: "Understanding your intent…", pt: "Entendendo sua intencao…", hi: "आपका अभिप्राय समझा जा रहा है…" },
-  search_api_module: { zh: "正在搜索业务模块…", en: "Searching business modules…", pt: "Buscando modulos de negocio…", hi: "बिजनेस मॉड्यूल खोजे जा रहे हैं…" },
-  read_api_module: { zh: "正在读取接口定义…", en: "Reading API definitions…", pt: "Lendo definicoes de API…", hi: "API परिभाषाएँ पढ़ी जा रही हैं…" },
-  grep_codebase: { zh: "正在检索代码…", en: "Searching the codebase…", pt: "Buscando no codigo…", hi: "कोडबेस खोजा जा रहा है…" },
-  read_file: { zh: "正在读取文件…", en: "Reading files…", pt: "Lendo arquivos…", hi: "फ़ाइलें पढ़ी जा रही हैं…" },
-  list_dir: { zh: "正在列出目录…", en: "Listing directories…", pt: "Listando diretorios…", hi: "डायरेक्टरी सूचीबद्ध की जा रही हैं…" },
-  call_api: { zh: "正在调用接口查询数据…", en: "Querying data via API…", pt: "Consultando dados via API…", hi: "API से डेटा क्वेरी किया जा रहा है…" },
-  request_clarification: { zh: "正在向你确认…", en: "Requesting clarification…", pt: "Solicitando esclarecimento…", hi: "स्पष्टीकरण मांगा जा रहा है…" },
-  search_knowledge: { zh: "正在检索知识库…", en: "Searching the knowledge base…", pt: "Buscando na base de conhecimento…", hi: "ज्ञान आधार खोजा जा रहा है…" },
-  normalize_output: { zh: "正在整理输出…", en: "Formatting output…", pt: "Formatando saida…", hi: "आउटपुट व्यवस्थित किया जा रहा है…" },
-  render_table: { zh: "正在渲染表格…", en: "Rendering table…", pt: "Renderizando tabela…", hi: "तालिका रेंडर की जा रही है…" },
-  export_dataset: { zh: "正在导出数据…", en: "Exporting data…", pt: "Exportando dados…", hi: "डेटा निर्यात किया जा रहा है…" },
-  get_page_schema: { zh: "正在读取页面结构…", en: "Reading page schema…", pt: "Lendo schema da pagina…", hi: "पेज स्कीमा पढ़ा जा रहा है…" },
-};
 function toolStatusText(name: string): string {
-  const item = TOOL_STATUS_MAP[name];
-  if (item) return uiLocale.value === "zh" ? item.zh : uiLocale.value === "pt-BR" ? (item.pt || item.en) : uiLocale.value === "hi" ? (item.hi || item.en) : item.en;
-  return uiLocale.value === "zh" ? `正在调用工具：${name}…` : `Calling tool: ${name}…`;
+  return toolStatusTextForLocale(uiLocale.value, name);
 }
 
 async function send() {
@@ -933,7 +552,11 @@ async function send() {
   const imageIds = pastingImages.value.map((item) => item.id);
   const files = pastingFiles.value.map((item) => item.id);
   const attachCount = imageIds.length + files.length;
-  const titleText = text || `[${imageIds.length ? tx(`图片 ${imageIds.length} 张`, `${imageIds.length} image(s)`) : tx(`附件 ${attachCount} 个`, `${attachCount} attachment(s)`)}]`;
+  const titleText = text || `[${
+    imageIds.length
+      ? tx(`图片 ${imageIds.length} 张`, `${imageIds.length} image(s)`, `${imageIds.length} imagem(ns)`, `${imageIds.length} छवि`)
+      : tx(`附件 ${attachCount} 个`, `${attachCount} attachment(s)`, `${attachCount} anexo(s)`, `${attachCount} संलग्नक`)
+  }]`;
   stopVoice();
   input.value = "";
   const bubbleImages = pastingImages.value.map((item) => ({ id: item.id, name: item.name }));
@@ -948,7 +571,7 @@ async function send() {
   if (!active) newConversation();
   const target = conversations.value.find((c) => c.id === activeId.value)!;
   target.messages.push({ id: ++seq, role: "user", text: titleText, images: bubbleImages });
-  target.title = makeTitle(target.messages);
+  target.title = makeConversationTitle(target.messages, defaultConversationTitle());
   // 注意：push 进 reactive/ref 数组后，数组里存的是「响应式代理」，
   // 局部原始对象 assistant 与代理不是同一个引用——直接改原始对象不会触发视图更新。
   // 必须取回代理（target.messages 末尾项）再 mutate，状态栏进度才能实时上屏。
@@ -966,87 +589,24 @@ async function send() {
   try {
     await streamChat(
       text,
-      { model: selectedModel.value ?? undefined, images: imageIds, files },
+      { model: selectedModel.value ?? undefined, images: imageIds, files, uiLocale: uiLocale.value },
       (event: ChatEvent) => {
-      // 过滤：若文本是模型误输出的工具调用 JSON（{"tool_calls": [...]} 或 {"tool": "...", "parameters": {...}}，
-      // 可能被 ```json 围栏包裹），不显示——真实结果由服务端兜底编排输出
-      const isToolCallJson = (t: string) => {
-        if (/"tool_calls"\s*:/.test(t) && /"name"\s*:/.test(t)) return true;
-        if (/"tool"\s*:\s*["']/.test(t) && /"parameters"\s*:/.test(t)) return true;
-        return false;
-      };
-
-      if (event.type === "text") {
-        if (!isToolCallJson(event.text)) {
-          assistant.text = event.text;
-          // 工具链进行中（toolActive）或已完成（gotDone）时保留状态文案（含「已调用 N 个工具」回显），
-          // 不被最终总结文本覆盖回「正在思考…」；仅在首轮纯思考（无工具、未 done）时清空。
-          if (!assistant.toolActive && !gotDone) assistant.status = undefined;
-          suppressDelta = false;
-        }
-      }
-      if (event.type === "text_delta") {
-        // 累积后检测（含围栏场景）：若 assistant.text + 新 chunk 构成工具调用 JSON，跳过。
-        // 命中后置 suppressDelta，后续分块（可能仍在同一段 JSON 内）一律跳过，直到 text 事件权威覆盖。
-        const combined = assistant.text + event.text;
-        if (suppressDelta || isToolCallJson(combined) || isToolCallJson(event.text)) {
-          suppressDelta = true;
-        } else {
-          assistant.text += event.text;
-          // 走工具链后（已调用工具或已 done），模型开始流式输出总结时，状态条保持可见并切到「生成回答」态，
-          // 避免「正在调用接口…」一闪而过、用户只看到「正在思考…」。首轮纯思考（无工具）不在此列。
-          if (toolCount > 0 || gotDone) assistant.status = tx("正在生成回答…", "Generating reply…");
-        }
-      }
-      if (event.type === "model") {
-        modelNotice.value =
-          event.reason === "fallback"
-            ? tx(`模型调用异常，已自动降级为 ${event.label} 处理`, `Model fallback applied automatically: ${event.label}`)
-            : tx(`当前模型不支持图片，本次已自动切换为 ${event.label} 处理`, `The current model does not support images. Switched to ${event.label}.`);
-      }
-      if (event.type === "tool_call") {
-        toolCount += 1;
-        assistant.toolStep = toolCount;
-        const base = toolStatusText(event.name);
-        // 多步工具链时显示「第 N 步」，让快模型也能看到实时进度（避免一闪而过黑盒感）
-        assistant.status = toolCount > 1 ? `${base}（第 ${toolCount} 步）` : base;
-        assistant.currentTool = event.name;
-        assistant.toolActive = true;
-      }
-      if (event.type === "tool_result") {
-        // 工具结果实时上屏（折叠卡片）；只保留前 20 条，避免长对话刷屏
-        if (!assistant.toolResults) assistant.toolResults = [];
-        if (assistant.toolResults.length < 20) {
-          assistant.toolResults.push({ name: event.name, result: event.result });
-        }
-      }
-      if (event.type === "reasoning") {
-        // 思考过程（对齐 DeepSeek「深度思考」）：累积可读摘要；首条到达即默认展开折叠块
-        assistant.reasoning = (assistant.reasoning || "") + event.text + "\n";
-        if (assistant.reasoningExpanded === undefined) assistant.reasoningExpanded = true;
-      }
-      if (event.type === "done") {
-        assistant.toolActive = false;
-        assistant.currentTool = undefined;
-        assistant.finished = true;
-        // 工具链完成后保留「已调用 N 个工具」回显，避免快模型进度瞬间消失黑盒感
-        if (toolCount > 0) assistant.status = tx(`已调用 ${toolCount} 个工具，正在生成回答…`, `${toolCount} tools called, generating reply…`);
-      }
-      if (event.type === "error") assistant.error = event.message;
-      if (event.type === "table") {
-        if (!assistant.tables) assistant.tables = [];
-        // 深拷贝，避免后续组件/库改写响应式数据
-        assistant.tables.push(JSON.parse(JSON.stringify(event.table)) as TableView);
-      }
-      if (event.type === "chart") {
-        if (!assistant.charts) assistant.charts = [];
-        assistant.charts.push(JSON.parse(JSON.stringify(event.chart)) as ChartView);
-      }
-      if (event.type === "file") {
-        if (!assistant.files) assistant.files = [];
-        assistant.files.push(event.file);
-      }
-      if (event.type === "done") gotDone = true;
+        const state = applyChatStreamEvent({
+          event,
+          assistant,
+          state: {
+            suppressDelta,
+            gotDone,
+            toolCount,
+            modelNotice: modelNotice.value,
+          },
+          locale: uiLocale.value,
+          tx,
+        });
+        suppressDelta = state.suppressDelta;
+        gotDone = state.gotDone;
+        toolCount = state.toolCount;
+        modelNotice.value = state.modelNotice;
       },
       controller.signal,
     );
@@ -1056,7 +616,7 @@ async function send() {
       assistant.cancelled = true;
     } else {
       const status = (err as Error & { status?: number }).status;
-      assistant.error = err instanceof Error ? err.message : tx("发送失败", "Send failed");
+      assistant.error = localizeToken(uiLocale.value, getApiErrorToken(err), "CHAT_STREAM_FAILED");
       if (status === 401) await router.replace("/agents/admin/login");
     }
   } finally {
@@ -1064,7 +624,7 @@ async function send() {
     activeController.value = null;
     // 取消时不再给兜底提示；正常结束（done）但无任何有效产出时提示。
     if (!assistant.cancelled && gotDone && !assistant.text && !assistant.error && !assistant.tables?.length && !assistant.charts?.length && !assistant.files?.length && !assistant.toolResults?.length) {
-      assistant.error = tx("本次未返回有效结果，请换个说法再试。", "No valid result was returned. Please try rephrasing.");
+      assistant.error = tx("本次未返回有效结果，请换个说法再试。", "No valid result was returned. Please try rephrasing.", "Nenhum resultado valido foi retornado. Tente reformular.", "कोई वैध परिणाम वापस नहीं आया। कृपया अलग तरह से पूछें।");
     }
     await scrollBottom();
   }
@@ -1090,7 +650,7 @@ function onComposerKeydown(e: KeyboardEvent) {
 
 async function onLogout() {
   await logout();
-  clearIdentityCache();
+  clearIdentityCache(IDENTITY_CACHE_KEY);
   me.value = null;
   await router.replace("/agents/admin/login");
 }
@@ -1142,76 +702,18 @@ function useHelpExample(text: string) {
 }
 const lightboxUrl = ref("");
 const activeController = ref<AbortController | null>(null);
-let taskStatusTimer: ReturnType<typeof setTimeout> | null = null;
-
-function stopTaskStatusPolling() {
-  if (!taskStatusTimer) return;
-  clearTimeout(taskStatusTimer);
-  taskStatusTimer = null;
-}
-
-function scheduleTaskStatusPoll(delayMs = 1200) {
-  stopTaskStatusPolling();
-  taskStatusTimer = setTimeout(() => {
-    void syncBackgroundTaskStatus();
-  }, delayMs);
-}
-
-function findLastUserMessage(conv: Conversation): Bubble | undefined {
-  for (let i = conv.messages.length - 1; i >= 0; i--) {
-    if (conv.messages[i]?.role === "user") return conv.messages[i];
-  }
-  return undefined;
-}
-
-function ensureBackgroundAssistant(conv: Conversation, userText: string) {
-  const last = conv.messages[conv.messages.length - 1];
-  if (last?.role === "assistant" && !last.finished && !last.cancelled && !last.error) {
-    last.status = "该会话已有任务在后台执行，完成后会自动恢复…";
-    last.toolActive = true;
-    last.currentTool = undefined;
-    last.finished = false;
-    return;
-  }
-  const lastUser = findLastUserMessage(conv);
-  if (!lastUser || lastUser.text !== userText) return;
-  conv.messages.push({
-    id: ++seq,
-    role: "assistant",
-    text: "",
-    status: "该会话已有任务在后台执行，完成后会自动恢复…",
-    toolActive: true,
-    currentTool: undefined,
-    toolStep: 0,
-    finished: false,
-  });
-}
-
-async function syncBackgroundTaskStatus() {
-  stopTaskStatusPolling();
-  if (!me.value) return;
-  try {
-    const status = await fetchTaskStatus();
-    const active = conversations.value.find((c) => c.id === activeId.value);
-    if (status.running) {
-      if (active) {
-        ensureBackgroundAssistant(active, status.running.userText);
-        active.updatedAt = Date.now();
-      }
-      // 仅刷新重进场景使用：恢复“后台有任务”的体感，不与当前页 send() 的 activeController 混淆。
-      if (!activeController.value) sending.value = true;
-      scheduleTaskStatusPoll();
-      return;
-    }
-    if (!activeController.value) sending.value = false;
-    if (status.last?.settled) {
-      await restoreConversations();
-      await scrollBottom();
-    }
-  } catch {
-    /* 状态接口失败时静默；不影响正常聊天 */
-  }
-}
+const { stopTaskStatusPolling, syncBackgroundTaskStatus } = createBackgroundTaskSync({
+  me,
+  conversations,
+  activeId,
+  sending,
+  activeController,
+  fetchTaskStatus,
+  restoreConversations,
+  scrollBottom,
+  nextBubbleId: () => ++seq,
+  backgroundStatusText: () => localizeToken(uiLocale.value, { code: "CHAT_TASK_RUNNING" }),
+});
 
 function openLightbox(id: string) {
   lightboxUrl.value = `/agent/chat/upload/${id}`;
@@ -1242,11 +744,11 @@ async function onComposerPaste(e: ClipboardEvent) {
     const file = item.getAsFile();
     if (!file) continue;
     if (!IMAGE_TYPES.includes(file.type)) {
-      alert(`不支持的图片格式：${file.type}，仅支持 png/jpeg/webp`);
+      alert(tx(`不支持的图片格式：${file.type}，仅支持 png/jpeg/webp`, `Unsupported image format: ${file.type}. Only png/jpeg/webp are supported.`, `Formato de imagem nao suportado: ${file.type}. Apenas png/jpeg/webp sao aceitos.`, `असमर्थित छवि प्रारूप: ${file.type}। केवल png/jpeg/webp समर्थित हैं।`));
       continue;
     }
     if (file.size > 5 * 1024 * 1024) {
-      alert("图片过大，单张不超过 5MB");
+      alert(tx("图片过大，单张不超过 5MB", "The image is too large. Each image must be 5 MB or smaller.", "A imagem e grande demais. Cada imagem deve ter no maximo 5 MB.", "छवि बहुत बड़ी है। प्रत्येक छवि 5 MB या उससे कम होनी चाहिए।"));
       continue;
     }
     files.push(file);
@@ -1263,13 +765,43 @@ async function onComposerPaste(e: ClipboardEvent) {
     pastingImages.value.push(...itemsToAdd);
     nextTick(scrollBottom);
   } catch (err) {
-    alert(err instanceof Error ? err.message : "图片上传失败");
+    alert(localizeToken(uiLocale.value, getApiErrorToken(err), "UPLOAD_FAILED"));
   }
 }
 
 // ---- 文件上传 ----
 const pastingFiles = ref<UploadResult[]>([]);
 const fileInput = ref<HTMLInputElement | null>(null);
+const attachmentSummary = computed(() => {
+  const imageCount = pastingImages.value.length;
+  const fileCount = pastingFiles.value.length;
+  const total = imageCount + fileCount;
+  if (!total) {
+    return tx("未附加文件", "No attachments", "Nenhum anexo", "कोई अटैचमेंट नहीं");
+  }
+  if (imageCount && fileCount) {
+    return tx(
+      `已附加 ${imageCount} 张图片和 ${fileCount} 个文件`,
+      `${imageCount} image(s) and ${fileCount} file(s) attached`,
+      `${imageCount} imagem(ns) e ${fileCount} arquivo(s) anexados`,
+      `${imageCount} छवि और ${fileCount} फ़ाइल अटैच की गई`,
+    );
+  }
+  if (imageCount) {
+    return tx(
+      `已附加 ${imageCount} 张图片`,
+      `${imageCount} image(s) attached`,
+      `${imageCount} imagem(ns) anexadas`,
+      `${imageCount} छवि अटैच की गई`,
+    );
+  }
+  return tx(
+    `已附加 ${fileCount} 个文件`,
+    `${fileCount} file(s) attached`,
+    `${fileCount} arquivo(s) anexados`,
+    `${fileCount} फ़ाइल अटैच की गई`,
+  );
+});
 
 function removePastedFile(index: number) {
   pastingFiles.value.splice(index, 1);
@@ -1285,7 +817,7 @@ async function onFileChange(e: Event) {
     pastingFiles.value.push(...saved);
     nextTick(scrollBottom);
   } catch (err) {
-    alert(err instanceof Error ? err.message : "文件上传失败");
+    alert(localizeToken(uiLocale.value, getApiErrorToken(err), "UPLOAD_FAILED"));
   }
 }
 
@@ -1339,7 +871,7 @@ function selectModel(id: string | null) {
   selectedModel.value = id;
   const label = id ? availableModels.value.find((m) => m.id === id)?.label ?? id : "Auto";
   selectedModelLabel.value = label;
-  writeModelCache(id, label);
+  writeModelCache(MODEL_CACHE_KEY, id, label);
   modelMenuOpen.value = false;
 }
 
@@ -1351,188 +883,22 @@ function closeModelMenu() {
 const modelMenuEl = ref<HTMLElement | null>(null);
 const scrollbarTrackEl = ref<HTMLElement | null>(null);
 const scrollbarThumbEl = ref<HTMLElement | null>(null);
-
-function updateScrollbar() {
-  const el = modelMenuEl.value;
-  const track = scrollbarTrackEl.value;
-  const thumb = scrollbarThumbEl.value;
-  if (!el || !track || !thumb) return;
-  const canScroll = el.scrollHeight > el.clientHeight + 1;
-  track.classList.toggle("is-off", !canScroll);
-  const trackH = track.clientHeight;
-  const thumbH = Math.max(28, Math.min(trackH, (el.clientHeight / el.scrollHeight) * trackH));
-  thumb.style.height = `${thumbH}px`;
-  const maxScroll = el.scrollHeight - el.clientHeight;
-  const maxTop = trackH - thumbH;
-  thumb.style.top = `${maxScroll > 0 ? (el.scrollTop / maxScroll) * maxTop : 0}px`;
-}
-
-let scrollbarBound = false;
-function bindScrollbar() {
-  const el = modelMenuEl.value;
-  if (!el || scrollbarBound) return;
-  scrollbarBound = true;
-  el.addEventListener("scroll", updateScrollbar, { passive: true });
-  window.addEventListener("resize", updateScrollbar);
-}
-
-function cleanupScrollbar() {
-  const el = modelMenuEl.value;
-  if (el && scrollbarBound) {
-    el.removeEventListener("scroll", updateScrollbar);
-    window.removeEventListener("resize", updateScrollbar);
-  }
-  scrollbarBound = false;
-}
-
-let thumbDragging = false;
-let thumbStartY = 0;
-let thumbStartScroll = 0;
-
-function onScrollbarThumbDown(e: MouseEvent) {
-  e.preventDefault();
-  e.stopPropagation();
-  thumbDragging = true;
-  thumbStartY = e.clientY;
-  thumbStartScroll = modelMenuEl.value?.scrollTop ?? 0;
-  scrollbarTrackEl.value?.classList.add("is-dragging");
-  window.addEventListener("mousemove", onThumbMove);
-  window.addEventListener("mouseup", onThumbUp);
-}
-
-function onThumbMove(e: MouseEvent) {
-  if (!thumbDragging) return;
-  const el = modelMenuEl.value;
-  const track = scrollbarTrackEl.value;
-  const thumb = scrollbarThumbEl.value;
-  if (!el || !track || !thumb) return;
-  const maxScroll = el.scrollHeight - el.clientHeight;
-  const maxTop = track.clientHeight - thumb.offsetHeight;
-  if (maxTop <= 0) return;
-  el.scrollTop = thumbStartScroll + ((e.clientY - thumbStartY) / maxTop) * maxScroll;
-}
-
-function onThumbUp() {
-  if (!thumbDragging) return;
-  thumbDragging = false;
-  scrollbarTrackEl.value?.classList.remove("is-dragging");
-  window.removeEventListener("mousemove", onThumbMove);
-  window.removeEventListener("mouseup", onThumbUp);
-}
-
-function onScrollbarTrackClick(e: MouseEvent) {
-  if ((e.target as HTMLElement).closest(".model-scrollbar-thumb")) return;
-  const el = modelMenuEl.value;
-  const track = scrollbarTrackEl.value;
-  if (!el || !track) return;
-  const rect = track.getBoundingClientRect();
-  const ratio = (e.clientY - rect.top) / rect.height;
-  el.scrollTop = ratio * (el.scrollHeight - el.clientHeight);
-}
+let modelScrollbarCleanup: (() => void) | null = null;
 
 watch(modelMenuOpen, async (open) => {
   if (!open) {
-    cleanupScrollbar();
+    modelScrollbarCleanup?.();
+    modelScrollbarCleanup = null;
     return;
   }
   await nextTick();
-  bindScrollbar();
-  updateScrollbar();
+  modelScrollbarCleanup?.();
+  modelScrollbarCleanup = bindCustomScrollbar(
+    () => modelMenuEl.value,
+    () => scrollbarTrackEl.value,
+    () => scrollbarThumbEl.value,
+  );
 });
-
-// —— 通用自定义滚动条：给任意滚动容器绑定 div 模拟滚动条，返回解绑函数 ——
-// 覆盖滚轮/拖拽/点轨道/内容变化（流式输出、图片加载等）全场景。
-function bindCustomScrollbar(
-  getScroller: () => HTMLElement | null,
-  getTrack: () => HTMLElement | null,
-  getThumb: () => HTMLElement | null,
-): () => void {
-  const scroller = getScroller();
-  const track = getTrack();
-  const thumb = getThumb();
-  if (!scroller || !track || !thumb) return () => {};
-
-  const update = () => {
-    const canScroll = scroller.scrollHeight > scroller.clientHeight + 1;
-    track.classList.toggle("is-off", !canScroll);
-    const trackH = track.clientHeight;
-    const thumbH = Math.max(28, Math.min(trackH, (scroller.clientHeight / scroller.scrollHeight) * trackH));
-    thumb.style.height = `${thumbH}px`;
-    const maxScroll = scroller.scrollHeight - scroller.clientHeight;
-    const maxTop = trackH - thumbH;
-    thumb.style.top = `${maxScroll > 0 ? (scroller.scrollTop / maxScroll) * maxTop : 0}px`;
-  };
-
-  let dragging = false;
-  let startY = 0;
-  let startScroll = 0;
-
-  const onMove = (e: MouseEvent) => {
-    if (!dragging) return;
-    const maxScroll = scroller.scrollHeight - scroller.clientHeight;
-    const maxTop = track.clientHeight - thumb.offsetHeight;
-    if (maxTop <= 0) return;
-    scroller.scrollTop = startScroll + ((e.clientY - startY) / maxTop) * maxScroll;
-  };
-
-  const onUp = () => {
-    if (!dragging) return;
-    dragging = false;
-    // 恢复容器原本的滚动行为（聊天区 scroll-behavior: smooth）
-    scroller.style.removeProperty("scroll-behavior");
-    track.classList.remove("is-dragging");
-    window.removeEventListener("mousemove", onMove);
-    window.removeEventListener("mouseup", onUp);
-  };
-
-  const onThumbDown = (e: MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dragging = true;
-    startY = e.clientY;
-    startScroll = scroller.scrollTop;
-    // 拖拽期间禁用平滑滚动，保证滑块跟手
-    scroller.style.scrollBehavior = "auto";
-    track.classList.add("is-dragging");
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  const onTrackClick = (e: MouseEvent) => {
-    if ((e.target as HTMLElement).closest(".model-scrollbar-thumb, .thread-scrollbar-thumb")) return;
-    const rect = track.getBoundingClientRect();
-    const ratio = (e.clientY - rect.top) / rect.height;
-    scroller.scrollTop = ratio * (scroller.scrollHeight - scroller.clientHeight);
-  };
-
-  thumb.addEventListener("mousedown", onThumbDown);
-  track.addEventListener("click", onTrackClick);
-  scroller.addEventListener("scroll", update, { passive: true });
-  window.addEventListener("resize", update);
-  // 内容/尺寸变化时自动重算（流式输出、图片加载、字体/主题切换等）
-  const ro = new ResizeObserver(update);
-  ro.observe(scroller);
-  const mo = new MutationObserver(update);
-  mo.observe(scroller, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ["style", "class"],
-  });
-
-  update();
-
-  return () => {
-    onUp();
-    thumb.removeEventListener("mousedown", onThumbDown);
-    track.removeEventListener("click", onTrackClick);
-    scroller.removeEventListener("scroll", update);
-    window.removeEventListener("resize", update);
-    ro.disconnect();
-    mo.disconnect();
-  };
-}
 
 async function copyBody(item: Bubble) {
   if (!item.text) return;
@@ -1543,7 +909,7 @@ async function copyBody(item: Bubble) {
       if (copiedId.value === item.id) copiedId.value = null;
     }, 1200);
   } else {
-    alert(tx("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。", "Copy failed: clipboard access is not available in this browser.", "Falha ao copiar: o acesso a area de transferencia nao esta disponivel neste navegador.", "कॉपी विफल: इस ब्राउज़र में क्लिपबोर्ड एक्सेस उपलब्ध नहीं है।"));
+    alert(tx("复制失败：当前浏览器环境不允许访问剪贴板，请手动选中文本复制。", "Copy failed: clipboard access is not available in this browser.", "Falha ao copiar: o acesso a area de transferencia nao esta disponivel neste navegador.", "कॉपी विफल: इस ब्राउज़र में क्लिपबोर्ड की अनुमति उपलब्ध नहीं है।"));
   }
 }
 
@@ -1561,7 +927,7 @@ function editInComposer(item: Bubble) {
 
 async function switchCountry() {
   await logout();
-  clearIdentityCache();
+  clearIdentityCache(IDENTITY_CACHE_KEY);
   me.value = null;
   await router.replace("/agents/admin/login");
 }
@@ -1592,7 +958,7 @@ async function onClearContext() {
       await router.replace("/agents/admin/login");
       return;
     }
-    alert(err instanceof Error ? err.message : tx("重置对话失败", "Failed to reset conversation", "Falha ao redefinir a conversa", "चैट रीसेट नहीं हो सका"));
+    alert(localizeToken(uiLocale.value, getApiErrorToken(err), "CHAT_CONTEXT_CLEAR_FAILED"));
   }
 }
 </script>
@@ -1613,7 +979,7 @@ async function onClearContext() {
         </div>
         <UiLocaleSelect />
         <ThemeToggle />
-        <RouterLink class="ghost" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
+        <RouterLink v-if="me?.permissions?.entries?.trace" class="ghost" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
         <button class="ghost" type="button" @click="helpOpen = true">{{ tx("操作说明", "Help", "Ajuda", "सहायता") }}</button>
         <button class="ghost" type="button" :disabled="sending" @click="onClearContext">{{ tx("重置对话", "Reset Chat", "Redefinir Chat", "चैट रीसेट करें") }}</button>
         <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
@@ -1623,19 +989,32 @@ async function onClearContext() {
     <CapabilitiesHelp v-model:open="helpOpen" @use-example="useHelpExample" />
 
     <nav class="tabs" :aria-label="tx('会话切换', 'Conversation Tabs', 'Abas de Conversa', 'वार्तालाप टैब')">
-      <button
+      <div
         v-for="(conv, idx) in conversations"
         :key="conv.id"
         class="tab"
         :class="{ active: conv.id === activeId }"
-        type="button"
-        @click="switchConversation(conv.id)"
         @contextmenu.prevent="openTabMenu($event, conv.id, idx)"
       >
-        <span class="tab-index">{{ idx + 1 }}</span>
-        <span class="tab-title">{{ displayConversationTitle(conv) }}</span>
-        <span class="tab-close" :title="tx('关闭会话', 'Close conversation', 'Fechar conversa', 'वार्तालाप बंद करें')" @click.stop="closeConversation(conv.id)">×</span>
-      </button>
+        <button
+          class="tab-main"
+          :class="{ active: conv.id === activeId }"
+          type="button"
+          @click="switchConversation(conv.id)"
+        >
+          <span class="tab-index">{{ idx + 1 }}</span>
+          <span class="tab-title">{{ displayConversationTitleOf(conv) }}</span>
+        </button>
+        <button
+          class="tab-close"
+          type="button"
+          :aria-label="tx('关闭会话', 'Close conversation', 'Fechar conversa', 'वार्तालाप बंद करें')"
+          :title="tx('关闭会话', 'Close conversation', 'Fechar conversa', 'वार्तालाप बंद करें')"
+          @click.stop="closeConversation(conv.id)"
+        >
+          ×
+        </button>
+      </div>
       <button class="tab-new" type="button" :title="tx('新建会话', 'New conversation', 'Nova conversa', 'नई वार्तालाप')" @click="newConversation">＋</button>
     </nav>
 
@@ -1779,7 +1158,7 @@ async function onClearContext() {
           <div v-if="item.tables?.length" class="msg-tables">
             <ResultTable v-for="(tb, ti) in item.tables" :key="ti" :table="tb" />
           </div>
-          <div v-if="item.text" class="body" v-html="renderMarkdown(item.text)" />
+          <div v-if="item.text" class="body" v-html="renderMarkdown(displayAssistantText(item))" />
           <span v-if="item.role === 'assistant' && item.text && !item.finished && !item.cancelled && !item.error" class="stream-caret" aria-hidden="true" />
           <div v-if="item.files?.length" class="msg-files">
             <div v-for="f in item.files" :key="f.id" class="file-card">
@@ -1788,13 +1167,13 @@ async function onClearContext() {
                 <span>{{ f.kind.toUpperCase() }} · {{ Math.max(1, Math.round(f.size / 1024)) }} KB</span>
               </div>
               <div class="file-actions">
-                <a class="file-btn" :href="downloadUrl(f.id, false)" download>{{ f.kind === 'pdf' ? tx('下载 PDF', 'Download PDF') : tx('下载 Excel', 'Download Excel') }}</a>
+                <a class="file-btn" :href="downloadUrl(f.id, false)" download>{{ f.kind === 'pdf' ? tx('下载 PDF', 'Download PDF', 'Baixar PDF', 'PDF डाउनलोड करें') : tx('下载 Excel', 'Download Excel', 'Baixar Excel', 'Excel डाउनलोड करें') }}</a>
               </div>
               <iframe
                 v-if="f.kind === 'pdf'"
                 class="pdf-preview"
                 :src="downloadUrl(f.id, true)"
-                title="PDF 预览"
+                :title="tx('PDF 预览', 'PDF preview', 'Pre-visualizacao do PDF', 'PDF पूर्वावलोकन')"
               />
             </div>
           </div>
@@ -1802,7 +1181,7 @@ async function onClearContext() {
             <button
               type="button"
               class="act"
-              :title="tx('编辑', 'Edit')"
+              :title="tx('编辑', 'Edit', 'Editar', 'संपादित करें')"
               @click="editInComposer(item)"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -1819,7 +1198,7 @@ async function onClearContext() {
             <button
               type="button"
               class="act"
-              :title="copiedId === item.id ? tx('已复制', 'Copied') : tx('复制', 'Copy')"
+              :title="copiedId === item.id ? tx('已复制', 'Copied', 'Copiado', 'कॉपी हो गया') : tx('复制', 'Copy', 'Copiar', 'कॉपी करें')"
               @click="copyBody(item)"
             >
               <svg v-if="copiedId !== item.id" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -1851,10 +1230,10 @@ async function onClearContext() {
           v-if="item.role === 'assistant' && !item.error && !item.cancelled && !item.finished && (!item.text || item.toolActive || (item.toolStep && item.toolStep > 0))"
           class="loading status-line"
           role="status"
-          :aria-label="tx('正在回复', 'Replying')"
+          :aria-label="tx('正在回复', 'Replying', 'Respondendo', 'उत्तर दिया जा रहा है')"
         >
           <span class="loading-dot" />
-          <span class="loading-text">{{ item.status || tx('正在思考…', 'Thinking…') }}</span>
+          <span class="loading-text">{{ item.status || tx('正在思考…', 'Thinking…', 'Pensando…', 'सोच रहा है…') }}</span>
         </div>
         <p v-if="item.error" class="error">{{ item.error }}</p>
         <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled", "Cancelado", "रद्द") }}</div>
@@ -1870,7 +1249,7 @@ async function onClearContext() {
         v-if="scrollTop > 300"
         class="back-top-btn"
         type="button"
-        :title="tx('返回顶部', 'Back to top')"
+        :title="tx('返回顶部', 'Back to top', 'Voltar ao topo', 'शीर्ष पर वापस जाएं')"
         @click="scrollToTop"
       >
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -1883,17 +1262,17 @@ async function onClearContext() {
       v-if="lightboxUrl"
       class="lightbox"
       role="dialog"
-      :aria-label="tx('图片预览', 'Image preview')"
+      :aria-label="tx('图片预览', 'Image preview', 'Pre-visualizacao da imagem', 'छवि पूर्वावलोकन')"
       @click.self="lightboxUrl = ''"
     >
-      <img :src="lightboxUrl" alt="图片大图" />
+      <img :src="lightboxUrl" :alt="tx('图片大图', 'Large preview image', 'Imagem ampliada', 'बड़ी पूर्वावलोकन छवि')" />
     </div>
 
     <form class="composer" @submit.prevent="send()">
       <div class="composer-card">
         <div
           class="composer-grip"
-          title="上下拖动调整输入框高度"
+          :title="tx('上下拖动调整输入框高度', 'Drag up or down to resize the composer', 'Arraste para cima ou para baixo para redimensionar a caixa de entrada', 'कंपोज़र का आकार बदलने के लिए ऊपर या नीचे खींचें')"
           @pointerdown="startComposerDrag"
           @mousedown="startComposerDrag"
           @touchstart="startComposerDrag"
@@ -1901,11 +1280,11 @@ async function onClearContext() {
 
         <div v-if="pastingImages.length || pastingFiles.length" class="image-preview">
           <div v-for="(item, index) in pastingImages" :key="item.id" class="image-chip">
-            <img :src="item.previewUrl" alt="粘贴的图片" />
+            <img :src="item.previewUrl" :alt="tx('粘贴的图片', 'Pasted image', 'Imagem colada', 'चिपकाई गई छवि')" />
             <button
               type="button"
               class="image-remove"
-              :title="tx('移除图片', 'Remove image')"
+              :title="tx('移除图片', 'Remove image', 'Remover imagem', 'छवि हटाएं')"
               :disabled="sending"
               @click="removePastedImage(index)"
             >
@@ -1917,7 +1296,7 @@ async function onClearContext() {
             <button
               type="button"
               class="image-remove"
-              :title="tx('移除文件', 'Remove file')"
+              :title="tx('移除文件', 'Remove file', 'Remover arquivo', 'फ़ाइल हटाएं')"
               :disabled="sending"
               @click="removePastedFile(index)"
             >
@@ -1934,7 +1313,7 @@ async function onClearContext() {
           :disabled="sending"
           rows="1"
           enterkeyhint="send"
-          :placeholder="recording ? tx('正在聆听…', 'Listening…') : tx('输入内容，回车发送；支持直接粘贴图片', 'Type your message and press Enter to send; pasting images is supported')"
+          :placeholder="recording ? tx('正在聆听…', 'Listening…', 'Ouvindo…', 'सुन रहा है…') : tx('输入内容，回车发送；支持直接粘贴图片', 'Type your message and press Enter to send; pasting images is supported', 'Digite sua mensagem e pressione Enter para enviar; colar imagens e suportado', 'अपना संदेश टाइप करें और भेजने के लिए Enter दबाएं; चित्र पेस्ट करना समर्थित है')"
           @keydown="onComposerKeydown"
           @input="resizeComposer"
           @paste="onComposerPaste"
@@ -1946,7 +1325,7 @@ async function onClearContext() {
               type="button"
               class="model-btn"
               :class="{ active: modelMenuOpen }"
-              :title="tx('切换模型', 'Switch model')"
+              :title="tx('切换模型', 'Switch model', 'Trocar modelo', 'मॉडल बदलें')"
               :disabled="sending"
               @click="modelMenuOpen = !modelMenuOpen"
             >
@@ -1970,26 +1349,36 @@ async function onClearContext() {
               <div
                 v-if="modelMenuOpen && availableModels.length"
                 class="model-menu"
+                ref="modelMenuEl"
                 @click.stop
               >
                 <div class="model-menu-header">
-                  <div class="model-menu-title">{{ tx("选择模型", "Choose Model") }}</div>
-                  <span class="model-menu-count">{{ uiLocale === "en" ? `${availableModels.length} available` : `${availableModels.length} 个可用` }}</span>
+                  <div class="model-menu-title">{{ tx("选择模型", "Choose Model", "Escolher modelo", "मॉडल चुनें") }}</div>
+                  <span class="model-menu-count">
+                    {{
+                      tx(
+                        `${availableModels.length} 个可用`,
+                        `${availableModels.length} available`,
+                        `${availableModels.length} disponiveis`,
+                        `${availableModels.length} उपलब्ध`,
+                      )
+                    }}
+                  </span>
                 </div>
                 <button
                   type="button"
                   class="model-item model-item-auto"
                   :class="{ selected: selectedModel === null }"
-                  :title="tx('Auto（服务端自动）· 智能路由', 'Auto (server managed) · Smart routing')"
+                  :title="tx('Auto（服务端自动）· 智能路由', 'Auto (server managed) · Smart routing', 'Auto (gerenciado pelo servidor) · Roteamento inteligente', 'Auto (सर्वर प्रबंधित) · स्मार्ट रूटिंग')"
                   @click="selectModel(null)"
                 >
                   <span class="model-auto-dot"></span>
-                  <span class="model-label">{{ tx("Auto（服务端自动）", "Auto (server managed)") }}</span>
-                  <span class="model-provider">{{ tx("智能路由", "Smart routing") }}</span>
+                  <span class="model-label">{{ tx("Auto（服务端自动）", "Auto (server managed)", "Auto (gerenciado pelo servidor)", "Auto (सर्वर प्रबंधित)") }}</span>
+                  <span class="model-provider">{{ tx("智能路由", "Smart routing", "Roteamento inteligente", "स्मार्ट रूटिंग") }}</span>
                 </button>
                 <template v-if="textModels.length">
                   <div class="model-group">
-                    <div class="model-group-title">{{ tx("文本对话", "Text Chat") }}</div>
+                    <div class="model-group-title">{{ tx("文本对话", "Text Chat", "Chat de texto", "टेक्स्ट चैट") }}</div>
                     <div class="model-list">
                       <button
                         v-for="m in textModels"
@@ -2008,7 +1397,7 @@ async function onClearContext() {
                 </template>
                 <template v-if="visionModels.length">
                   <div class="model-group">
-                    <div class="model-group-title">{{ tx("视觉 / 多模态", "Vision / Multimodal") }}</div>
+                    <div class="model-group-title">{{ tx("视觉 / 多模态", "Vision / Multimodal", "Visao / Multimodal", "विज़न / मल्टीमॉडल") }}</div>
                     <div class="model-list">
                       <button
                         v-for="m in visionModels"
@@ -2020,14 +1409,14 @@ async function onClearContext() {
                         @click="selectModel(m.id)"
                       >
                         <span class="model-label">{{ m.label }}</span>
-                        <span class="model-badge">{{ tx("视觉", "Vision") }}</span>
+                        <span class="model-badge">{{ tx("视觉", "Vision", "Visao", "विज़न") }}</span>
                         <span class="model-provider">{{ m.source || m.provider }}</span>
                       </button>
                     </div>
                   </div>
                 </template>
-                <div class="model-scrollbar" ref="scrollbarTrackEl" @click="onScrollbarTrackClick">
-                  <div class="model-scrollbar-thumb" ref="scrollbarThumbEl" @mousedown="onScrollbarThumbDown"></div>
+                <div class="model-scrollbar" ref="scrollbarTrackEl">
+                  <div class="model-scrollbar-thumb" ref="scrollbarThumbEl"></div>
                 </div>
               </div>
             </Transition>
@@ -2036,7 +1425,8 @@ async function onClearContext() {
             <button
               type="button"
               class="tool-btn"
-              :title="tx('上传文件（txt/md/json/csv，或图片）', 'Upload files (txt/md/json/csv or images)')"
+              :title="tx('上传文件（txt/md/json/csv，或图片）', 'Upload files (txt/md/json/csv or images)', 'Enviar arquivos (txt/md/json/csv ou imagens)', 'फ़ाइलें अपलोड करें (txt/md/json/csv या चित्र)')"
+              :aria-label="tx('上传文件', 'Upload files', 'Enviar arquivos', 'फ़ाइलें अपलोड करें')"
               :disabled="sending"
               @click="fileInput?.click()"
             >
@@ -2055,15 +1445,18 @@ async function onClearContext() {
               ref="fileInput"
               type="file"
               multiple
-              class="visually-hidden"
+              class="hidden-file-input"
+              tabindex="-1"
+              aria-hidden="true"
               @change="onFileChange"
             />
+            <span class="attachment-status" :title="attachmentSummary">{{ attachmentSummary }}</span>
             <button
               v-if="caps.voice"
               type="button"
               class="tool-btn"
               :class="{ active: recording }"
-              :title="tx('语音输入', 'Voice input')"
+              :title="tx('语音输入', 'Voice input', 'Entrada por voz', 'वॉइस इनपुट')"
               @click="toggleVoice"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -2089,8 +1482,8 @@ async function onClearContext() {
               type="submit"
               class="send-btn"
               :class="{ stopping: sending }"
-              :title="sending ? tx('停止生成', 'Stop generating') : tx('发送', 'Send')"
-              @click="sending && cancelSend()"
+              :title="sending ? tx('停止生成', 'Stop generating', 'Parar geracao', 'जनरेशन रोकें') : tx('发送', 'Send', 'Enviar', 'भेजें')"
+              @click.prevent="sending ? cancelSend() : send()"
             >
               <svg v-if="sending" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
                 <rect x="7" y="7" width="10" height="10" rx="3" fill="currentColor" />
@@ -2246,10 +1639,8 @@ async function onClearContext() {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 7px;
   max-width: 200px;
   flex-shrink: 0;
-  padding: 8px 14px;
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
@@ -2257,7 +1648,6 @@ async function onClearContext() {
   color: var(--muted);
   font-size: 12.5px;
   letter-spacing: 0.01em;
-  cursor: pointer;
   transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
 }
 
@@ -2285,6 +1675,27 @@ async function onClearContext() {
 .tab:not(.active):hover {
   background: color-mix(in srgb, var(--ink) 5%, transparent);
   color: var(--ink);
+}
+
+.tab-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 8px 8px 14px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.tab-main:focus-visible,
+.tab-close:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ink) 24%, transparent);
+  outline-offset: -1px;
 }
 
 .tab-title {
@@ -2319,8 +1730,13 @@ async function onClearContext() {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: none;
   width: 18px;
   height: 18px;
+  margin-right: 10px;
+  padding: 0;
+  border: none;
+  background: transparent;
   border-radius: 5px;
   font-size: 13px;
   line-height: 1;
@@ -3536,16 +2952,18 @@ async function onClearContext() {
   transform: translateY(4px);
 }
 
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
+.hidden-file-input {
+  display: none;
+}
+
+.attachment-status {
+  min-width: 0;
+  max-width: 180px;
+  color: var(--muted);
+  font-size: 11px;
   white-space: nowrap;
-  border: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 用户消息里的图片（飞书式：靠边贴齐气泡、无边框、小圆角） */

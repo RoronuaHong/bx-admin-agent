@@ -34,7 +34,7 @@ const displayRows = computed(() => {
       _depth: 0,
     };
     const first = props.table.columns[0]?.key;
-    if (first && !fr[first]) fr[first] = tx("合计", "Total");
+    if (first && !fr[first]) fr[first] = tx("合计", "Total", "Total", "कुल");
     rows.push(fr);
   }
   return rows;
@@ -142,11 +142,11 @@ const cellCopied = (text: string) => copied.value === text;
     <div class="caption">
       <span class="caption__title">{{ table.title }}</span>
       <span class="caption__meta">
-        <span class="total">{{ uiLocale === "en" ? `${table.total} rows` : `${table.total} 条` }}</span>
-        <template v-if="table.tree"><span class="chip">{{ tx("树表", "Tree") }}</span></template>
-        <template v-if="table.footer"><span class="chip">{{ tx("含汇总", "Summary") }}</span></template>
-        <button type="button" class="copy-btn" :class="{ copied: copiedTable }" :title="copiedTable ? tx('已复制', 'Copied') : tx('复制表格', 'Copy table')" @click="copyTable()">
-          {{ copiedTable ? tx("已复制", "Copied") : tx("复制", "Copy") }}
+        <span class="total">{{ uiLocale === "zh" ? `${table.total} 条` : uiLocale === "pt-BR" ? `${table.total} linhas` : uiLocale === "hi" ? `${table.total} पंक्तियां` : `${table.total} rows` }}</span>
+        <template v-if="table.tree"><span class="chip">{{ tx("树表", "Tree", "Arvore", "ट्री") }}</span></template>
+        <template v-if="table.footer"><span class="chip">{{ tx("含汇总", "Summary", "Resumo", "सारांश") }}</span></template>
+        <button type="button" class="copy-btn" :class="{ copied: copiedTable }" :title="copiedTable ? tx('已复制', 'Copied', 'Copiado', 'कॉपी हो गया') : tx('复制表格', 'Copy table', 'Copiar tabela', 'तालिका कॉपी करें')" @click="copyTable()">
+          {{ copiedTable ? tx("已复制", "Copied", "Copiado", "कॉपी हो गया") : tx("复制", "Copy", "Copiar", "कॉपी करें") }}
         </button>
       </span>
     </div>
@@ -168,7 +168,7 @@ const cellCopied = (text: string) => copied.value === text;
           <tr v-if="!displayRows.length">
             <td :colspan="table.columns.length" class="empty">
               <span class="empty__mark">∅</span>
-              <span>{{ tx("暂无数据", "No data") }}</span>
+              <span>{{ tx("暂无数据", "No data", "Sem dados", "कोई डेटा नहीं") }}</span>
             </td>
           </tr>
           <tr
@@ -208,9 +208,9 @@ const cellCopied = (text: string) => copied.value === text;
       </table>
     </div>
 
-    <div v-if="viewerUrl" class="table-viewer" role="dialog" aria-label="图片预览" @click.self="closeViewer()">
-      <img :src="viewerUrl" alt="图片大图" />
-      <button type="button" class="table-viewer__close" aria-label="关闭预览" @click="closeViewer()">×</button>
+    <div v-if="viewerUrl" class="table-viewer" role="dialog" :aria-label="tx('图片预览', 'Image preview', 'Pre-visualizacao da imagem', 'छवि पूर्वावलोकन')" @click.self="closeViewer()">
+      <img :src="viewerUrl" :alt="tx('图片大图', 'Large preview image', 'Imagem ampliada', 'बड़ी पूर्वावलोकन छवि')" />
+      <button type="button" class="table-viewer__close" :aria-label="tx('关闭预览', 'Close preview', 'Fechar pre-visualizacao', 'पूर्वावलोकन बंद करें')" @click="closeViewer()">×</button>
     </div>
   </div>
 </template>

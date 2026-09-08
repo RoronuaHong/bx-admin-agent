@@ -1,3 +1,4 @@
+import { errorTokenResult, okTokenResult } from "../tool-result-contract.js";
 /**
  * 钉钉文档检索（方案 A 骨架）
  * ----------------------------------------------------------------
@@ -73,16 +74,10 @@ export async function searchDingtalkDoc(
   input: SearchDingtalkDocInput,
 ): Promise<string> {
   const query = String(input.query || "").trim();
-  if (!query) return "错误：query 为必填参数，请传入要搜索的文档关键词。";
+  if (!query) return errorTokenResult("TOOL_DINGTALK_SEARCH_MISSING_QUERY");
 
   if (!isDingtalkConfigured()) {
-    return [
-      "提示：钉钉文档检索尚未配置企业应用凭证。",
-      "请在 agent-server/.env 配置：",
-      "  DINGTALK_CLIENT_ID=你的应用ClientID",
-      "  DINGTALK_CLIENT_SECRET=你的应用ClientSecret",
-      "并向公司钉钉管理员申请文档读权限后，本工具即可查询公司内部文档。",
-    ].join("\n");
+    return okTokenResult("TOOL_DINGTALK_SEARCH_NOT_CONFIGURED");
   }
 
   try {
@@ -99,22 +94,30 @@ export async function searchDingtalkDoc(
       message?: string;
     };
     if (data.code && data.code !== 0) {
-      return `钉钉文档搜索失败：${data.message || data.code}`;
+      return errorTokenResult("TOOL_DINGTALK_SEARCH_FAILED", undefined, { detail: String(data.message || data.code) });
     }
     const items = data.result || [];
     if (!items.length) {
-      return `未找到与「${query}」相关的钉钉文档。`;
+      return okTokenResult("TOOL_DINGTALK_SEARCH_NO_MATCH", { query }, { noResults: true, query });
     }
-    return items
-      .map((it, i) => {
-        const lines = [`[${i + 1}] ${it.name || "(无标题)"}`];
-        if (it.url) lines.push(`链接：${it.url}`);
-        if (it.snippet) lines.push(`摘要：${it.snippet}`);
-        return lines.join("\n");
-      })
-      .join("\n\n");
+    return JSON.stringify(
+      {
+        ok: true,
+        count: items.length,
+        items: items.map((it, i) => ({
+          index: i + 1,
+          title: it.name || "",
+          untitled: !it.name,
+          url: it.url || "",
+          snippet: it.snippet || "",
+          docId: it.docId || "",
+        })),
+      },
+      null,
+      2,
+    );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return `钉钉文档搜索出错：${msg}`;
+    return errorTokenResult("TOOL_DINGTALK_SEARCH_FAILED", undefined, { detail: msg });
   }
 }

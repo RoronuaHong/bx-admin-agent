@@ -5,6 +5,7 @@ import { PORTAL_CARDS, PORTAL_KICKER, PORTAL_LEAD, PORTAL_TITLE } from "../agent
 import { fetchMe, type Me } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { hasPortalEntryAccess } from "../portal-permissions";
 import { getUiLocale } from "../ui-locale";
 import { pickLocalized } from "../localize";
 
@@ -20,15 +21,21 @@ onMounted(async () => {
 
 const cards = computed(() =>
   PORTAL_CARDS.map((card) => ({
+    enabled: card.entry ? !me.value || hasPortalEntryAccess(me.value.permissions.entries, card.entry) : true,
     key: card.key,
     title: pickLocalized(uiLocale.value, card.title),
     desc: pickLocalized(uiLocale.value, card.desc),
     chip: pickLocalized(uiLocale.value, card.chip),
     cta:
       card.key === "admin" && me.value
-        ? tx("进入工作台", "Open workspace", "Abrir workspace", "वर्कस्पेस खोलें")
+        ? tx("进入工作台", "Open workspace", "Abrir espaco de trabalho", "वर्कस्पेस खोलें")
         : pickLocalized(uiLocale.value, card.cta),
-    to: me.value && card.authHref ? card.authHref : card.href || "",
+    to:
+      card.entry && me.value && !hasPortalEntryAccess(me.value.permissions.entries, card.entry)
+        ? ""
+        : me.value && card.authHref
+          ? card.authHref
+          : card.href || "",
     tone: card.tone,
   })),
 );
@@ -39,13 +46,22 @@ const deniedFrom = computed(() => (typeof route.query.deniedFrom === "string" ? 
 const traceAccessHint = computed(() => {
   const source = me.value?.permissions.traceAccessSource;
   if (source === "owner-allowlist") {
-    return tx("来源：Trace 白名单已命中", "Source: Trace allowlist matched", "Origem: allowlist de Trace correspondente", "स्रोत: Trace allowlist matched");
+    return tx("来源：Trace 白名单已命中", "Source: Trace allowlist matched", "Origem: allowlist de Trace correspondente", "स्रोत: Trace allowlist मेल खा गई");
+  }
+  if (source === "country-allowlist") {
+    return tx("来源：当前国家线已开通 Trace", "Source: Trace is enabled for this country", "Origem: Trace liberado para este pais", "स्रोत: इस देश लाइन के लिए Trace सक्षम है");
+  }
+  if (source === "owner-denylist") {
+    return tx("来源：当前账号命中 Trace 黑名单", "Source: this account is in the Trace denylist", "Origem: esta conta esta na denylist do Trace", "स्रोत: यह खाता Trace denylist में है");
+  }
+  if (source === "country-denylist") {
+    return tx("来源：当前国家线未开通 Trace", "Source: Trace is not enabled for this country", "Origem: Trace nao esta liberado para este pais", "स्रोत: इस देश लाइन के लिए Trace सक्षम नहीं है");
   }
   if (source === "denied-allowlist") {
     return tx("来源：当前账号未命中 Trace 白名单", "Source: this account is not in the Trace allowlist", "Origem: esta conta nao esta na allowlist do Trace", "स्रोत: यह खाता Trace allowlist में नहीं है");
   }
   if (source === "default-login") {
-    return tx("来源：当前未配置 Trace 白名单，默认按登录态开放", "Source: no Trace allowlist configured, access follows login state", "Origem: nenhuma allowlist de Trace configurada; acesso segue o login", "स्रोत: कोई Trace allowlist कॉन्फ़िगर नहीं है, access login state पर आधारित है");
+    return tx("来源：当前未配置 Trace 白名单，默认按登录态开放", "Source: no Trace allowlist configured, access follows login state", "Origem: nenhuma allowlist de Trace configurada; acesso segue o login", "स्रोत: कोई Trace allowlist कॉन्फ़िगर नहीं है, पहुंच लॉगिन स्थिति पर आधारित है");
   }
   return "";
 });
@@ -59,7 +75,7 @@ const traceAccessHint = computed(() => {
         <h1>{{ pickLocalized(uiLocale, PORTAL_TITLE) }}</h1>
       </div>
       <div class="top-actions">
-        <RouterLink v-if="me?.permissions.canViewTrace" class="ghost-link" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
+        <RouterLink v-if="me?.permissions?.entries?.trace" class="ghost-link" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
         <UiLocaleSelect />
         <ThemeToggle />
       </div>
@@ -71,9 +87,13 @@ const traceAccessHint = computed(() => {
 
     <p v-if="traceDenied" class="notice warn">
       {{
-        deniedSource === "denied-allowlist"
+        deniedSource === "owner-denylist"
+          ? tx("当前账号命中 Trace 黑名单，已从受控页面返回门户。请联系管理员处理。", "This account is in the Trace denylist and was returned from a protected page to the portal. Contact an administrator if this is unexpected.", "Esta conta esta na denylist do Trace e foi redirecionada de uma pagina protegida ao portal. Fale com um administrador se isso estiver incorreto.", "यह खाता Trace denylist में है और सुरक्षित पेज से पोर्टल पर वापस भेज दिया गया है। यदि यह गलत है तो एडमिन से संपर्क करें।")
+          : deniedSource === "country-denylist"
+            ? tx("当前国家线未开通 Trace，已从受控页面返回门户。", "Trace is not enabled for this country and you were returned from a protected page to the portal.", "Trace nao esta liberado para este pais e voce foi redirecionado de uma pagina protegida ao portal.", "इस देश लाइन के लिए Trace सक्षम नहीं है और आपको सुरक्षित पेज से पोर्टल पर वापस भेज दिया गया है।")
+            : deniedSource === "denied-allowlist"
           ? tx("当前账号未命中 Trace 白名单，已从受控页面返回门户。请联系管理员开通。", "This account is not in the Trace allowlist and was returned from a protected page to the portal. Contact an administrator to enable access.", "Esta conta nao esta na allowlist do Trace e foi redirecionada de uma pagina protegida ao portal. Fale com um administrador para liberar o acesso.", "यह खाता Trace allowlist में नहीं है और सुरक्षित पेज से पोर्टल पर वापस भेज दिया गया है। एक्सेस सक्षम करने के लिए एडमिन से संपर्क करें।")
-          : tx("当前账号没有 Trace 查看权限，请联系管理员开通。", "Your account does not have Trace access. Contact an administrator to enable it.", "Sua conta nao tem acesso ao Trace. Fale com um administrador para liberar.", "आपके खाते में Trace access नहीं है। इसे सक्षम करने के लिए एडमिन से संपर्क करें।")
+          : tx("当前账号没有 Trace 查看权限，请联系管理员开通。", "Your account does not have Trace access. Contact an administrator to enable it.", "Sua conta nao tem acesso ao Trace. Fale com um administrador para liberar.", "आपके खाते में Trace देखने की अनुमति नहीं है। इसे सक्षम करने के लिए एडमिन से संपर्क करें।")
       }}
       <span v-if="deniedFrom" class="notice-extra">
         {{ tx("来源页面：", "Requested page: ", "Pagina solicitada: ", "अनुरोधित पृष्ठ: ") }}{{ deniedFrom }}
@@ -83,8 +103,8 @@ const traceAccessHint = computed(() => {
     <p v-if="me" class="session-pill">
       {{ tx("当前登录：", "Current session: ", "Sessao atual: ", "वर्तमान सत्र: ") }}{{ me.country.label }} · {{ me.user.name || me.user.loginName }}
       <span class="session-sep">·</span>
-      <span :class="['perm-chip', me.permissions.canViewTrace ? 'ok' : 'muted']">
-        {{ me.permissions.canViewTrace ? tx("Trace 已开通", "Trace enabled", "Trace liberado", "Trace सक्षम") : tx("Trace 未开通", "Trace unavailable", "Trace indisponivel", "Trace उपलब्ध नहीं") }}
+      <span :class="['perm-chip', me.permissions.entries.trace ? 'ok' : 'muted']">
+        {{ me.permissions.entries.trace ? tx("Trace 已开通", "Trace enabled", "Trace liberado", "Trace सक्षम") : tx("Trace 未开通", "Trace unavailable", "Trace indisponivel", "Trace उपलब्ध नहीं") }}
       </span>
     </p>
     <p v-if="me && traceAccessHint" class="notice subtle">{{ traceAccessHint }}</p>
@@ -98,7 +118,7 @@ const traceAccessHint = computed(() => {
         v-for="card in cards"
         :key="card.title"
         class="card"
-        :class="[`tone-${card.tone}`, { 'is-static': !card.to }]"
+        :class="[`tone-${card.tone}`, { 'is-static': !card.to, 'is-disabled': !card.enabled }]"
       >
         <div class="card-head">
           <h2 class="card-title">
@@ -288,6 +308,10 @@ h1 {
 
 .card.is-static {
   cursor: default;
+}
+
+.card.is-disabled {
+  opacity: 0.72;
 }
 
 .card.is-static:hover {

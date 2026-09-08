@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { fetchCountries, login, type Country } from "../api";
+import { fetchCountries, getApiErrorToken, login, type Country } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { localizeToken } from "../localize";
 import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
@@ -31,7 +32,7 @@ async function submit() {
     const nextPath = typeof route.query.next === "string" && route.query.next.startsWith("/") ? route.query.next : "/agents/admin/chat";
     await router.replace(nextPath);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("登录失败", "Login failed", "Falha no login", "लॉगिन विफल");
+    error.value = localizeToken(uiLocale.value, getApiErrorToken(err), "AUTH_LOGIN_FAILED");
   } finally {
     loading.value = false;
   }
@@ -51,7 +52,7 @@ async function submit() {
 
     <section class="sheet">
       <h1 class="brand-mark">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</h1>
-      <p class="lead">{{ tx("登录后进入后台管理 Agent 工作台，用自然语言查询与管理运营后台各业务模块。", "Sign in to enter the admin agent workspace and manage backend operations in natural language.", "Faca login para entrar no workspace do agente de backoffice e operar o painel com linguagem natural.", "लॉगिन करके एडमिन एजेंट वर्कस्पेस में प्रवेश करें और प्राकृतिक भाषा में बैकएंड ऑपरेशंस संभालें।") }}</p>
+      <p class="lead">{{ tx("登录后进入后台管理 Agent 工作台，用自然语言查询与管理运营后台各业务模块。", "Sign in to enter the admin agent workspace and manage backend operations in natural language.", "Faca login para entrar no espaco de trabalho do agente de backoffice e operar o painel com linguagem natural.", "लॉगिन करके एडमिन एजेंट वर्कस्पेस में प्रवेश करें और प्राकृतिक भाषा में बैकएंड ऑपरेशंस संभालें।") }}</p>
       <form class="form" @submit.prevent="submit">
         <label>
           {{ tx("国家 / 环境", "Country / Environment", "Pais / Ambiente", "देश / वातावरण") }}

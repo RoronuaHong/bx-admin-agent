@@ -1,4 +1,5 @@
 import "vue-router";
+import type { PortalEntryKey } from "./portal-permissions";
 
 declare module "vue-router" {
   interface RouteMeta {
@@ -7,6 +8,7 @@ declare module "vue-router" {
     loginPath?: string;
     agent?: "portal" | "admin" | "knowledge" | "viewing";
     requiredPermission?: "canViewTrace";
+    requiredPortalEntry?: PortalEntryKey;
   }
 }
 

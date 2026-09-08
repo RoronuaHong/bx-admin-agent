@@ -215,7 +215,7 @@
         </div>
 
         <div class="note">
-            <strong>补充说明（2026-09-07）：</strong>当前项目已经把 Trace 从“后台管理 Agent 二级页”收敛为“门户级观测入口 + 权限控制”。也就是说，<code>/trace</code> 的产品归属在门户层，但是否显示、是否可进入、接口是否返回数据，都统一由 <code>canViewTrace</code> 控制。当前这层权限先通过服务端投影输出，默认可基于 <code>TRACE_ALLOWED_OWNERS</code> 做白名单收紧。
+            <strong>补充说明（2026-09-07）：</strong>当前项目已经把 Trace 从“后台管理 Agent 二级页”收敛为“门户级观测入口 + 权限控制”。也就是说，<code>/trace</code> 的产品归属在门户层，但是否显示、是否可进入、接口是否返回数据，都统一由 <code>canViewTrace</code> 控制。当前这层权限先通过服务端投影输出，支持 <code>TRACE_ALLOWED_OWNERS</code>（账号白名单）、<code>TRACE_DENIED_OWNERS</code>（账号黑名单）与 <code>TRACE_ALLOWED_COUNTRIES</code>（国家线白名单）做组合收紧；判定顺序为<strong>黑名单优先，其次 owner / country 任一 allow 命中即可放行</strong>。同时权限返回结构已开始抽象为门户级 <code>entries</code> 视图，为后续 Knowledge / Viewing / 更多 Agent 入口复用做准备。前端也补了登录回跳（<code>next=/trace</code>）与拒绝原因回传（<code>deniedSource</code> / <code>deniedFrom</code>），避免“被挡回去但不知道为什么”。
         </div>
     </div>
 
@@ -394,6 +394,10 @@
             <li>针对说明型问法已增加防误执行策略：当模型判为 <code>clarify</code> 或 <code>explain-capability</code> 时，不应继续 <code>call_api</code>。</li>
             <li>多语种评测脚手架已预留，但目前按迭代安排默认关闭，不作为当前主线交付项。</li>
             <li>门户 Header 已增加按权限显示的 <code>Trace</code> 入口；独立路由为 <code>/trace</code>，不是 <code>/agents/admin/trace</code> 的产品主入口。</li>
+            <li><code>Trace</code> 权限链路已经闭环：服务端投影 <code>canViewTrace</code>，并支持账号白名单 / 黑名单、国家线白名单；前端按权限显示、受控页未登录时登录后回跳、无权限时回门户并展示拒绝原因。</li>
+            <li>前端工作台已开始做低风险拆分：聊天页的富文本渲染、会话存储恢复、后台任务恢复、标签菜单定位等逻辑已抽成独立模块，目标是降低单文件复杂度而不改原有交互。</li>
+            <li>前端包体已同步治理：聊天页图表改按需异步加载，<code>echarts</code> / <code>zrender</code> / 富文本依赖已拆为独立 chunk，避免聊天首屏被观测与图表能力拖慢。</li>
+            <li>前端最小回归闸门也已补上：<code>apps/web/scripts/chat-helpers.test.ts</code> 覆盖标题回退、缓存读写、消息清洗和流式事件归并；根 <code>pnpm test</code> 已串上这条前端回归。</li>
         </ul>
     </div>
 

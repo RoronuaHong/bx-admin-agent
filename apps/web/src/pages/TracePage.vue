@@ -3,6 +3,7 @@ import { computed, onMounted, ref, shallowRef } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import {
   fetchMe,
+  getApiErrorToken,
   fetchTraceRun,
   fetchTraceRuns,
   logout,
@@ -13,6 +14,7 @@ import {
 } from "../api";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { localizeToken } from "../localize";
 import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
@@ -66,6 +68,10 @@ function shortText(t?: string, n = 48) {
   return one.length > n ? `${one.slice(0, n)}…` : one;
 }
 
+function traceText(tokenLike?: { code: string; params?: Record<string, string | number | boolean | null> } | null, fallbackCode = "TRACE_DEGRADE_GENERIC") {
+  return localizeToken(uiLocale.value, tokenLike, fallbackCode);
+}
+
 async function loadRuns() {
   loading.value = true;
   error.value = "";
@@ -78,7 +84,7 @@ async function loadRuns() {
       spans.value = [];
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("加载失败", "Load failed", "Falha ao carregar", "लोड विफल");
+    error.value = localizeToken(uiLocale.value, getApiErrorToken(err), "GENERIC_UNKNOWN_ERROR");
     const status = (err as Error & { status?: number }).status;
     if (status === 401 || status === 403) {
       await redirectTraceAccessFallback(status);
@@ -98,7 +104,7 @@ async function selectRun(runId: string) {
     spans.value = data.spans;
     spanRelease.value = data.release || "";
   } catch (err) {
-    error.value = err instanceof Error ? err.message : tx("加载 run 失败", "Failed to load run", "Falha ao carregar execucao", "रन लोड नहीं हो सका");
+    error.value = localizeToken(uiLocale.value, getApiErrorToken(err), "GENERIC_UNKNOWN_ERROR");
     const status = (err as Error & { status?: number }).status;
     if (status === 401 || status === 403) {
       await redirectTraceAccessFallback(status);
@@ -121,7 +127,7 @@ onMounted(async () => {
     await redirectTraceAccessFallback(401);
     return;
   }
-  if (!me.value.permissions.canViewTrace) {
+  if (!me.value.permissions.entries.trace) {
     await redirectTraceAccessFallback(403);
     return;
   }
@@ -145,7 +151,7 @@ onMounted(async () => {
         </div>
         <UiLocaleSelect />
         <ThemeToggle />
-        <RouterLink class="ghost" :to="me ? '/agents/admin/chat' : '/agents/admin/login'">{{ me ? tx("工作台", "Workspace", "Workspace", "वर्कस्पेस") : tx("登录后台 Agent", "Sign in to Admin Agent", "Entrar no Admin Agent", "एडमिन एजेंट में साइन इन") }}</RouterLink>
+        <RouterLink class="ghost" :to="me ? '/agents/admin/chat' : '/agents/admin/login'">{{ me ? tx("工作台", "Workspace", "Espaco de trabalho", "वर्कस्पेस") : tx("登录后台 Agent", "Sign in to Admin Agent", "Entrar no Admin Agent", "एडमिन एजेंट में साइन इन") }}</RouterLink>
         <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh", "Atualizar", "रीफ्रेश") }}</button>
         <button v-if="me" class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
       </div>
@@ -155,32 +161,32 @@ onMounted(async () => {
 
     <section v-if="stats" class="stats" :aria-label="tx('汇总', 'Summary', 'Resumo', 'सारांश')">
       <div class="stat">
-        <span class="stat-k">runs</span>
+        <span class="stat-k">{{ tx("运行数", "Runs", "Execucoes", "रन") }}</span>
         <span class="stat-v">{{ stats.runs }}</span>
       </div>
       <div class="stat">
-        <span class="stat-k">avgRounds</span>
+        <span class="stat-k">{{ tx("平均轮次", "Avg rounds", "Media de rodadas", "औसत राउंड") }}</span>
         <span class="stat-v">{{ stats.avgRounds }}</span>
       </div>
       <div class="stat">
-        <span class="stat-k">tokens</span>
+        <span class="stat-k">{{ tx("Token", "Tokens", "Tokens", "टोकन") }}</span>
         <span class="stat-v">{{ fmtTokens(stats.tokens) }}</span>
       </div>
       <div class="stat" :class="{ warn: stats.emptyRoundRate >= 0.2 }">
-        <span class="stat-k">emptyRoundRate</span>
+        <span class="stat-k">{{ tx("空轮率", "Empty round rate", "Taxa de rodadas vazias", "खाली राउंड दर") }}</span>
         <span class="stat-v">{{ stats.emptyRoundRate }}</span>
       </div>
       <div class="stat" :class="{ warn: stats.shortCircuitRuns > 0 }">
-        <span class="stat-k">shortCircuit</span>
+        <span class="stat-k">{{ tx("短路次数", "Short circuit", "Curto-circuito", "शॉर्ट सर्किट") }}</span>
         <span class="stat-v">{{ stats.shortCircuitRuns }}</span>
       </div>
       <div class="stat">
-        <span class="stat-k">emptyRetries</span>
+        <span class="stat-k">{{ tx("空轮重试", "Empty retries", "Tentativas vazias", "खाली पुनःप्रयास") }}</span>
         <span class="stat-v">{{ stats.emptyRetries }}</span>
       </div>
     </section>
 
-    <p v-if="stats?.degradeHint" class="hint warn-hint">{{ stats.degradeHint }}</p>
+    <p v-if="stats?.degradeHintToken || stats?.degradeHint" class="hint warn-hint">{{ traceText(stats?.degradeHintToken, "TRACE_DEGRADE_GENERIC") }}</p>
     <p v-else class="hint">{{ tx("门户级只读视图 · 展示主 Agent 的 trace run 与 span 树 · 数据来自 /trace/runs", "Portal-level read-only view · shows main agent trace runs and span trees · data from /trace/runs", "Visualizacao somente leitura em nivel de portal · mostra execucoes trace e arvores de span do agente principal · dados de /trace/runs", "पोर्टल-स्तरीय केवल-पढ़ने योग्य दृश्य · मुख्य एजेंट के ट्रेस रन और स्पैन ट्री दिखाता है · डेटा /trace/runs से") }}</p>
 
     <div class="split">
@@ -197,7 +203,7 @@ onMounted(async () => {
                 <th>{{ tx("模型", "Model", "Modelo", "मॉडल") }}</th>
                 <th>{{ tx("轮次", "Rounds", "Rodadas", "राउंड") }}</th>
                 <th>{{ tx("空轮", "Empty", "Vazio", "खाली") }}</th>
-                <th>token</th>
+                <th>{{ tx("Token", "Tokens", "Tokens", "टोकन") }}</th>
                 <th>{{ tx("耗时", "Duration", "Duracao", "अवधि") }}</th>
                 <th>{{ tx("输入", "Input", "Entrada", "इनपुट") }}</th>
               </tr>
@@ -244,8 +250,8 @@ onMounted(async () => {
             <span class="name">{{ s.name }}</span>
             <span class="dur">{{ fmtMs(s.durationMs) }}</span>
             <span v-if="s.usage?.totalTokens" class="tok">{{ fmtTokens(s.usage.totalTokens) }}</span>
-            <span v-if="s.note" class="note">{{ s.note }}</span>
-            <span v-if="s.error" class="err-txt">{{ s.error }}</span>
+            <span v-if="s.noteToken || s.note" class="note">{{ traceText(s.noteToken, "TRACE_DEGRADE_GENERIC") }}</span>
+            <span v-if="s.errorToken || s.error" class="err-txt">{{ traceText(s.errorToken, "GENERIC_UNKNOWN_ERROR") }}</span>
           </li>
         </ol>
         <p v-else-if="selectedId" class="muted">{{ tx("无 span", "No span", "Sem span", "कोई स्पैन नहीं") }}</p>

@@ -8,6 +8,7 @@ import nodePath from "node:path";
 import { resolveLocalDoc } from "./sources.js";
 import { defaultFieldMappingPath } from "./agent-docs.js";
 import { resolveCodebaseRoot } from "./project-context.js";
+import { errorTokenResult } from "./tool-result-contract.js";
 
 function codebaseRoot(): string {
   return resolveCodebaseRoot();
@@ -245,7 +246,7 @@ function extractFormOptionsEnums(src: string): Record<string, Record<string, str
  *  替代 field-mapping.json 的 enumMap（2026-08-24 起字段/枚举映射不再配置维护）。 */
 export function execGetFieldMapping(input: Record<string, unknown>): string {
   const moduleHint = String(input.module || input.query || "").trim();
-  if (!moduleHint) return "错误：参数缺失；module 为必填（英文模块 id 或接口文件相对路径）";
+  if (!moduleHint) return errorTokenResult("TOOL_GET_FIELD_MAPPING_MISSING_MODULE");
   const root = codebaseRoot();
   const files = findConfigFiles(moduleHint);
   const enumMap: Record<string, Record<string, string>> = {};
@@ -277,7 +278,7 @@ export function execGetFieldMapping(input: Record<string, unknown>): string {
       found: Object.keys(enumMap).length > 0,
       sourceFiles,
       enumMap,
-      hint: "枚举映射从当前项目源码提取（configs.data.tsx customRender / useFormSchema options），非配置表维护；提取不到的值可调 render_table 前由 pc-column-mapping 技能读源码翻译。",
+      hintCode: "TOOL_GET_FIELD_MAPPING_HINT",
     },
     null,
     2,
@@ -617,7 +618,7 @@ export function execGetListColumns(input: Record<string, unknown>): string {
   const moduleHint = String(input.module || input.query || "").trim();
   const explicitPath = String(input.path || "").trim();
   if (!moduleHint && !explicitPath) {
-    return "错误：参数缺失；module（或 path）为必填；请传入菜单/模块名（英文模块 id 或中文菜单名）";
+    return errorTokenResult("TOOL_GET_LIST_COLUMNS_MISSING_TARGET");
   }
 
   const files = explicitPath
@@ -628,7 +629,7 @@ export function execGetListColumns(input: Record<string, unknown>): string {
     // 2026-08-25 去写死：不再按模块名正则返回手写列（登录数据统计等）。
     // 列定义一律实时读 PC configs.data.tsx（findConfigFiles + extractColumnsFromSource）；
     // 匹配不到时提示改用 path 显式指定，交模型（pc-column-mapping skill）继续定位。
-    return `未找到与「${moduleHint}」相关的 configs.data.tsx；可改用 path 指定，如 src/views/account/whiteList/configs.data.tsx 或 src/views/dataReport/loginDataTotal/configs.data.tsx`;
+    return errorTokenResult("TOOL_GET_LIST_COLUMNS_NOT_FOUND", { module: moduleHint || explicitPath });
   }
 
   const results: unknown[] = [];
@@ -648,7 +649,7 @@ export function execGetListColumns(input: Record<string, unknown>): string {
       _tool: "get_list_columns",
       module: moduleHint || null,
       results,
-      _hint: "展示列表前用这些 title 作为表头；call_api 后可配合 render_table / normalize_output",
+      _hintCode: "TOOL_GET_LIST_COLUMNS_HINT",
     },
     null,
     2,
@@ -754,7 +755,7 @@ function extractFormFields(dir: string): Array<Record<string, unknown>> {
 export function execGetPageSchema(input: Record<string, unknown>): string {
   const moduleHint = String(input.module || input.query || "").trim();
   if (!moduleHint) {
-    return "错误：参数缺失；module 为必填；请传入英文模块 id 或中文菜单名";
+    return errorTokenResult("TOOL_GET_PAGE_SCHEMA_MISSING_MODULE");
   }
   const root = codebaseRoot();
   const views = nodePath.join(root, "src", "views");
@@ -802,21 +803,21 @@ export function execGetPageSchema(input: Record<string, unknown>): string {
       ...(has("Edit.vue")
         ? { formFields: extractFormFields(dir) }
         : {}),
-      outputHint:
+      outputHintCode:
         primary === "list"
-          ? "用 Markdown 表；先 get_list_columns → call_api → normalize_output / render_table"
+          ? "TOOL_GET_PAGE_SCHEMA_HINT_LIST"
           : primary === "analysis_chart"
-            ? "图表页：summarize_chart_data 出摘要+关键点表，勿假装画 ECharts"
+            ? "TOOL_GET_PAGE_SCHEMA_HINT_ANALYSIS"
             : primary === "bi_iframe"
-              ? "BI：说明报告入口，不伪造数据"
+              ? "TOOL_GET_PAGE_SCHEMA_HINT_BI"
               : primary === "edit"
-                ? "详情/编辑：分块描述；多 Tab 按块输出。写操作（新增/编辑）缺参时按 formFields 澄清必填项"
-                : "按 types 选择输出形态",
+                ? "TOOL_GET_PAGE_SCHEMA_HINT_EDIT"
+                : "TOOL_GET_PAGE_SCHEMA_HINT_DEFAULT",
     });
   }
 
   if (!pages.length) {
-    return `未识别「${moduleHint}」对应页面；请换更具体的目录名或中文菜单名`;
+    return errorTokenResult("TOOL_GET_PAGE_SCHEMA_NOT_FOUND", { module: moduleHint });
   }
 
   return JSON.stringify({ _tool: "get_page_schema", module: moduleHint, pages }, null, 2);
@@ -940,7 +941,7 @@ export function execRenderTable(input: Record<string, unknown>): string {
 
   let rows = toRows(input.data ?? input.rows);
   if (!rows.length) {
-    return "错误：无数据；请传入 data（数组或 {list:[...]}）";
+    return errorTokenResult("TOOL_RENDER_TABLE_NO_DATA");
   }
 
   const isTree = Boolean(input.tree) || rows.some((r) => Array.isArray(r.children));
@@ -1045,7 +1046,7 @@ export function execSummarizeChartData(input: Record<string, unknown>): string {
     : [];
 
   const raw = input.data ?? input.series;
-  if (raw == null) return "错误：参数缺失；data 为必填";
+  if (raw == null) return errorTokenResult("TOOL_SUMMARIZE_CHART_MISSING_DATA");
 
   let points: Array<{ x: string; y: number; series?: string }> = [];
 
@@ -1131,7 +1132,7 @@ export function execSummarizeChartData(input: Record<string, unknown>): string {
   }
 
   if (!points.length) {
-    return "错误：无法解析为数值序列；请传 number[] 或含 cycle/successCount 等报表行，或 {date,value}[] / {categories,series}";
+    return errorTokenResult("TOOL_SUMMARIZE_CHART_INVALID_SERIES");
   }
 
   // 主趋势用默认序列（无 series 或第一个 series / metricLabel 匹配）
@@ -1186,17 +1187,17 @@ export function execSummarizeChartData(input: Record<string, unknown>): string {
 
 export function execReadFieldMapping(input: Record<string, unknown>): string {
   const moduleName = String(input.module || "").trim().toLowerCase();
-  if (!moduleName) return "错误：参数缺失；module 为必填（如 <模块> 等英文模块 key）";
+  if (!moduleName) return errorTokenResult("TOOL_READ_FIELD_MAPPING_MISSING_MODULE");
 
   const mappingRaw = resolveLocalDoc(fieldMappingPath());
   if (!("note" in mappingRaw)) {
-    return `错误：无法读取 field-mapping.json；${(mappingRaw as { error: string }).error}`;
+    return errorTokenResult("TOOL_READ_FIELD_MAPPING_READ_FAILED", undefined, { detail: (mappingRaw as { error: string }).error });
   }
   let mapping: Record<string, unknown> = {};
   try {
     mapping = JSON.parse(mappingRaw.note.text);
   } catch {
-    return "错误：field-mapping.json 不是合法 JSON";
+    return errorTokenResult("TOOL_READ_FIELD_MAPPING_INVALID_JSON");
   }
   const modules = (mapping.modules || {}) as Record<string, unknown>;
   let key = moduleName;
@@ -1216,7 +1217,7 @@ export function execReadFieldMapping(input: Record<string, unknown>): string {
         found: false,
         module: moduleName,
         availableModules: Object.keys(modules).slice(0, 40),
-        hint: "该模块无渲染规则配置。字段/枚举中文映射已不在配置表维护：请按 pc-column-mapping 技能到当前项目源码找中文映射（configs.data.tsx 列 title / useFormSchema options / locale zh-CN），不要编造",
+        hintCode: "TOOL_READ_FIELD_MAPPING_HINT_MISSING",
       },
       null,
       2,
@@ -1228,7 +1229,7 @@ export function execReadFieldMapping(input: Record<string, unknown>): string {
       found: true,
       module: key,
       config: modules[key],
-      hint: "renderRules 为渲染行为定义（位掩码位值/图片/数组分隔等），非字段映射。字段/枚举中文映射请按 pc-column-mapping 技能到当前项目源码找",
+      hintCode: "TOOL_READ_FIELD_MAPPING_HINT_FOUND",
     },
     null,
     2,

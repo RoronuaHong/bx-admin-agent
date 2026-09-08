@@ -1,3 +1,4 @@
+import { isToolErrorResult } from "./tool-result-contract.js";
 /**
  * 通用报表图表呈现（PC 报表页统一入口）。
  * 登录数据统计渲染不再特判：实时读 PC configs.data.tsx + resolveI18nTitle 可还原中文列
@@ -470,9 +471,10 @@ function looksLikeListJson(c: string): boolean {
  *  ① 图表/表格类（图表摘要/表格输出/UI_TABLE）直接复用原结果；
  *  ② 列表/详情类（normalize_output 的「[已对齐 PC 端字段」、call_api 的裸 JSON）转 Markdown 表格——
  *     模型收尾超时/失败时用户仍能看到已查到的数据（对齐 Cursor「工具结果即产出」）。 */
-export function synthesizeReplyFromToolResults(toolResults: string[]): string | null {
+export function synthesizeReplyFromToolResults(toolResults: string[], uiLocale = "zh"): string | null {
   const prefer = [...toolResults].reverse().find(
     (c) =>
+      c.includes("UI_FILE") ||
       c.includes("【图表摘要") ||
       c.includes("【表格输出】") ||
       c.includes("UI_TABLE") ||
@@ -480,20 +482,39 @@ export function synthesizeReplyFromToolResults(toolResults: string[]): string | 
       looksLikeMarkdownTable(c) ||
       looksLikeListJson(c),
   );
-  if (!prefer || prefer.startsWith("错误：")) return null;
+  if (!prefer || isToolErrorResult(prefer)) return null;
+
+  const uiText = (zh: string, en: string, pt: string, hi: string) =>
+    uiLocale === "pt-BR" ? pt : uiLocale === "hi" ? hi : uiLocale === "zh" ? zh : en;
+  if (prefer.includes("UI_FILE")) {
+    return uiText(
+      "结构化文件结果已在上方聊天附件中生成。",
+      "Structured file output is available in the chat attachments above.",
+      "A saida estruturada do arquivo esta disponivel nos anexos acima.",
+      "संरचित फ़ाइल आउटपुट ऊपर चैट अटैचमेंट्स में उपलब्ध है।",
+    );
+  }
+
+  if (prefer.includes("UI_TABLE")) {
+    return uiText(
+      "结构化表格结果已在上方生成。",
+      "Structured table output is available above.",
+      "A saida estruturada da tabela esta disponivel acima.",
+      "संरचित तालिका आउटपुट ऊपर उपलब्ध है।",
+    );
+  }
 
   // ① 图表/表格类：原样复用（render_table / summarize_chart_data / renderListForAgent 的产物）
   if (
     prefer.includes("【图表摘要") ||
     prefer.includes("【表格输出】") ||
-    prefer.includes("UI_TABLE") ||
     looksLikeMarkdownTable(prefer)
   ) {
     const cleaned = prefer
       .replace(/^UI_TABLE\n[^\n]+\n\n?/, "")
       .replace(/^UI_FILE\n[^\n]+\n\n?/, "")
       .trim();
-    if (!cleaned || cleaned.startsWith("错误：")) return null;
+    if (!cleaned || isToolErrorResult(cleaned)) return null;
     return cleaned.slice(0, 6000);
   }
 

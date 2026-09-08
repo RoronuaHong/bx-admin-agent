@@ -39,17 +39,23 @@ export interface Session {
   activeEnvironment?: "test" | "prod";
   /** M1：最近一次 route_to_agent 命中的 Worker id；新一轮 chatStream 可从此恢复裁剪上下文。 */
   activeWorkerId?: string | null;
+  /** 最近一次面向用户的最终回复语种（BCP-47 粗粒度标签），用于短输入/模糊跟进时兜底。 */
+  lastReplyLanguage?: string;
 }
 
 export interface PendingClarificationOption {
   label: string;
   value: string;
+  labelCode?: string;
+  labelParams?: Record<string, string | number | boolean | null>;
 }
 
 export interface PendingClarification {
   id: string;
   intent: string;
   question: string;
+  questionCode?: string;
+  questionParams?: Record<string, string | number | boolean | null>;
   options: PendingClarificationOption[];
   missingSlots: string[];
   riskLevel: "read" | "write";

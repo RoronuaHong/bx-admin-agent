@@ -16,6 +16,7 @@
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import ts from "typescript";
+import { errorTokenResult } from "./tool-result-contract.js";
 
 // 2026-08-25 去写死：符号索引生成源不再硬编码 D:/Code/bx-film-admin-in2/src/api，
 // 改由 project-registry 按当前项目解析（与 grep/渲染/索引的 resolveCodebaseRoot 同一来源，
@@ -220,7 +221,7 @@ export function buildSymbolIndex(root = PC_API_ROOT): SymbolEntry[] {
 export function searchSymbol(query: string, limit = 8): string {
   const idx = loadSymbolIndex();
   if (!idx.length) {
-    return "符号索引未构建（运行 npm run build-symbol-index 生成 data/symbol-index.json）。可改用 grep_codebase 做文本检索。";
+    return errorTokenResult("TOOL_SEARCH_SYMBOL_INDEX_MISSING");
   }
   const q = query.toLowerCase();
   const scored = idx
@@ -239,7 +240,7 @@ export function searchSymbol(query: string, limit = 8): string {
     .slice(0, limit);
 
   if (!scored.length) {
-    return `符号索引未命中「${query}」。可尝试函数名片段、中文动作、或 URL 片段；也可用 grep_codebase 做模糊文本检索。`;
+    return errorTokenResult("TOOL_SEARCH_SYMBOL_NO_MATCH", { query });
   }
   return scored
     .map(({ e }) =>

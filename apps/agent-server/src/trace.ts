@@ -39,7 +39,9 @@ export interface TraceSpan {
   durationMs: number;
   usage?: TokenUsage;
   error?: string;
+  errorToken?: { code: string; params?: Record<string, string | number | boolean | null> };
   note?: string;
+  noteToken?: { code: string; params?: Record<string, string | number | boolean | null> };
   meta?: Record<string, unknown>;
 }
 
@@ -289,6 +291,7 @@ export interface RunSummary {
   toolCalls: number;
   totalTokens: number;
   error?: string;
+  errorToken?: { code: string; params?: Record<string, string | number | boolean | null> };
 }
 
 /** 空响应轮签名：无 totalTokens（含 usage 缺失 / tok=0）。 */
@@ -327,6 +330,7 @@ export interface TraceRunsStats {
   shortCircuitRuns: number;
   /** 超阈值时非空；提示切换模型 / 稍后重试（零业务词） */
   degradeHint: string | null;
+  degradeHintToken?: { code: string; params?: Record<string, string | number | boolean | null> } | null;
 }
 
 /** 空轮率告警阈值（0–1）。可用 TRACE_EMPTY_ROUND_RATE_WARN 覆盖，默认 0.2。 */
@@ -379,6 +383,7 @@ export function listRunSummaries(
       toolCalls: spans.filter((s) => s.kind === "tool").length,
       totalTokens: roundTokens,
       error: errSpan?.error,
+      errorToken: errSpan?.errorToken,
     });
     if (out.length >= limit) break;
   }
@@ -387,6 +392,7 @@ export function listRunSummaries(
   const emptyRoundRate = attempts ? Number(((emptyRounds + emptyRetries) / attempts).toFixed(3)) : 0;
   const warn = emptyRoundRateWarnThreshold();
   let degradeHint: string | null = null;
+  let degradeHintToken: { code: string; params?: Record<string, string | number | boolean | null> } | null = null;
   if (emptyRoundRate >= warn || shortCircuitRuns > 0) {
     const alts = String(process.env.TRACE_DEGRADE_HINT_MODELS || "")
       .split(",")
@@ -397,6 +403,10 @@ export function listRunSummaries(
     if (emptyRoundRate >= warn) parts.push(`emptyRoundRate=${emptyRoundRate}≥${warn}`);
     if (shortCircuitRuns > 0) parts.push(`shortCircuitRuns=${shortCircuitRuns}`);
     degradeHint = `上游疑似劣化（${parts.join(", ")}）${altPart}`;
+    degradeHintToken = {
+      code: "TRACE_DEGRADE_GENERIC",
+      params: { emptyRoundRate, warnThreshold: warn, shortCircuitRuns },
+    };
   }
   return {
     runs: out,
@@ -410,6 +420,7 @@ export function listRunSummaries(
       emptyRoundRate,
       shortCircuitRuns,
       degradeHint,
+      degradeHintToken,
     },
   };
 }

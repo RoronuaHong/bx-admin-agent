@@ -46,7 +46,7 @@
 
 > **Worker = 工具子集（whitelist）+ 领域系统提示 + 环境/项目配置的声明式组合。** 所有 Worker 共享同一个模型池、同一个 LangGraph 执行引擎，只是每次请求按路由结果「装配」不同的上下文。
 
-> **补充边界（2026-09-07）**：前端产品层现在可以是「多 Agent 门户」, 例如先展示后台管理 Agent、知识库 / RAG Agent、观影助手 Agent 等入口；`Trace` 已调整为门户 Header 中的独立观测入口，按权限展示与访问控制，但仍不等于服务端已经进入“总 Agent + 多个独立子 Agent”运行时。门户层解决的是用户入口与产品编排，本文讨论的是后台管理 Agent 内部的运行时编排。
+> **补充边界（2026-09-07）**：前端产品层现在可以是「多 Agent 门户」, 例如先展示后台管理 Agent、知识库 / RAG Agent、观影助手 Agent 等入口；`Trace` 已调整为门户 Header 中的独立观测入口，按权限展示与访问控制。当前权限策略已支持账号白名单 / 黑名单与国家线白名单收紧，但仍不等于服务端已经进入“总 Agent + 多个独立子 Agent”运行时。门户层解决的是用户入口与产品编排，本文讨论的是后台管理 Agent 内部的运行时编排。
 
 这个设计带来：
 - **零新增常驻服务**（不破现有 PM2 单进程哲学）
@@ -217,7 +217,7 @@ interface WorkerDef {
 - [ ] 确认生产环境 token 来源（与测试环境是否同一登录体系）
 - [ ] 数据库 Agent 语义确认：直查 SQL 还是归后台 API Agent
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
-- [x] 门户级 Trace 权限投影（2026-09-07）：`/trace` 改为门户级入口；前后端统一使用 `canViewTrace` 控制“是否显示 / 是否可进 / 是否可读”；当前支持 `TRACE_ALLOWED_OWNERS` 白名单收紧，未接入完整 RBAC
+- [x] 门户级 Trace 权限投影（2026-09-07）：`/trace` 改为门户级入口；前后端统一使用 `canViewTrace` 控制“是否显示 / 是否可进 / 是否可读”；当前支持 `TRACE_ALLOWED_OWNERS`、`TRACE_DENIED_OWNERS`、`TRACE_ALLOWED_COUNTRIES` 做组合收紧，未接入完整 RBAC
 - [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
 - [x] M1 实现 worker 级模型切换（`preferredModel`）：命中后 understand 优先用该模型；未配则沿用默认（代码已挂钩；默认注册表暂未配具体模型 id）
 - [x] **M1 收尾（2026-09-05）**：`systemPrompt` 注入 + `backend-api-…-prod` + `session.activeEnvironment` / `call_api.environment` + `resolveBaseUrl(country×env)` + META 始终可见

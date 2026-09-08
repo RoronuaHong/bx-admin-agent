@@ -21,7 +21,7 @@ import { getModel as legacyModel } from "./legacy.js";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { getRouterPolicy } from "./router-policy.js";
 import { ownerKeyOf } from "./conversations.js";
-import { formatReplyLanguageReminder, formatUserPrefsGuide, loadUserPreferences } from "./user-prefs.js";
+import { formatReplyLanguageReminder, formatUserPrefsGuide, loadUserPreferences, resolveReplyLanguage, type UserPreferences } from "./user-prefs.js";
 import { auditEvent } from "./audit.js";
 import {
   promptGuardAuditEnabled,
@@ -49,6 +49,11 @@ import {
   synthesizeReplyFromToolResults,
 } from "./report-pc-parity.js";
 import * as trace from "./trace.js";
+import { isToolErrorResult } from "./tool-result-contract.js";
+
+function token(code: string, params?: Record<string, string | number | boolean | null>, defaultMessage?: string) {
+  return { code, params, defaultMessage };
+}
 
 // ---- 工具分类（英文契约名，非业务词；全部从注册表派生，集中一处，杜绝散落清单漂移）----
 // AGENT_TOOL_NAMES 从工具注册表动态生成（listAgentTools 是唯一事实来源），
@@ -123,7 +128,7 @@ function countExploreToolsSinceLastCallApi(steps: AgentStep[], toolSet: Set<stri
       const c = s.content || "";
       if (
         c &&
-        !c.startsWith("错误：") &&
+        !isToolErrorResult(c) &&
         !c.startsWith("MODULE_RETRY") &&
         !c.startsWith("CLARIFICATION_REQUIRED") &&
         !c.startsWith("[workflow/")
@@ -160,7 +165,7 @@ function lastCallApiNeedsRelocate(steps: AgentStep[]): boolean {
     if (idToName.get(s.toolCallId) !== CALL_API_TOOL) continue;
     const c = s.content || "";
     return (
-      c.startsWith("错误：") ||
+      isToolErrorResult(c) ||
       c.startsWith("MODULE_RETRY") ||
       c.startsWith("CLARIFICATION_REQUIRED") ||
       c.startsWith("[workflow/")
@@ -184,7 +189,7 @@ function hasExploreCapSkipSinceLastCallApi(steps: AgentStep[]): boolean {
       const c = s.content || "";
       if (
         c &&
-        !c.startsWith("错误：") &&
+        !isToolErrorResult(c) &&
         !c.startsWith("MODULE_RETRY") &&
         !c.startsWith("CLARIFICATION_REQUIRED") &&
         !c.startsWith("[workflow/")
@@ -493,7 +498,12 @@ function estimateTurnsChars(turns: ModelTurn[]): number {
  * preprocess 节点与「模型级门槛轻量路径」共用——同一请求多轮循环中前缀一致，
  * OpenAI 兼容端点可命中 prompt cache。不注入任何业务词/功能词判定（语义 100% 交模型）。
  */
-export function buildStaticGuide(session: Session, ownerKey?: string, worker?: WorkerDef | null): string {
+export function buildStaticGuide(
+  session: Session,
+  ownerKey?: string,
+  worker?: WorkerDef | null,
+  runtime?: { userText?: string; uiLocale?: string },
+): string {
   const parts: string[] = [];
   parts.push(
     "[workflow/agent] 你是影视后台管理系统的智能助手。需要业务数据时调用可用工具（工具自带完整使用规范）：" +
@@ -616,7 +626,13 @@ export function buildStaticGuide(session: Session, ownerKey?: string, worker?: W
   }
 
   // 回复语种硬条款放末尾（recency）：压过前文中文系统提示 / 中文表头对最终回复语种的牵引。
-  parts.push(formatReplyLanguageReminder(prefs));
+  const replyLanguage = resolveReplyLanguage({
+    prefs,
+    userText: runtime?.userText || "",
+    sessionLastReplyLanguage: session.lastReplyLanguage,
+    uiLocale: runtime?.uiLocale,
+  });
+  parts.push(formatReplyLanguageReminder(prefs, replyLanguage));
 
   return parts.join("\n\n");
 }
@@ -754,11 +770,22 @@ function parseClarificationPayload(raw: string): Omit<PendingClarification, "id"
     const normalized = options
       .map((x) => (x && typeof x === "object" ? x as Record<string, unknown> : null))
       .filter(Boolean)
-      .map((x) => ({ label: String(x!.label || ""), value: String(x!.value || "") }))
+      .map((x) => ({
+        label: String(x!.label || ""),
+        value: String(x!.value || ""),
+        ...(typeof x!.labelCode === "string" ? { labelCode: String(x!.labelCode) } : {}),
+        ...(x!.labelParams && typeof x!.labelParams === "object"
+          ? { labelParams: x!.labelParams as Record<string, string | number | boolean | null> }
+          : {}),
+      }))
       .filter((x) => x.label);
     return {
       intent: String(parsed.intent || "调用业务接口"),
       question: String(parsed.question || ""),
+      ...(typeof parsed.questionCode === "string" ? { questionCode: String(parsed.questionCode) } : {}),
+      ...(parsed.questionParams && typeof parsed.questionParams === "object"
+        ? { questionParams: parsed.questionParams as Record<string, string | number | boolean | null> }
+        : {}),
       missingSlots: Array.isArray(parsed.missingSlots) ? parsed.missingSlots.map((x) => String(x)) : [],
       options: normalized,
       riskLevel: String(parsed.riskLevel || "read") === "write" ? "write" : "read",
@@ -773,40 +800,82 @@ function parseClarificationPayload(raw: string): Omit<PendingClarification, "id"
 }
 
 // 槽位 → 自然语言提示词映射
-const SLOT_LABELS: Record<string, string> = {
-  project: "项目",
-  module: "模块",
-  value: "操作对象",
-  operation: "操作",
-  "module.operation": "模块/操作",
-  "operation_or_path_or_url": "模块",
+function clarificationText(
+  uiLocale: string | undefined,
+  code: string,
+  params: Record<string, string | number | boolean | null> = {},
+): string {
+  const uiText = (zh: string, en: string, pt: string, hi: string) =>
+    uiLocale === "pt-BR" ? pt : uiLocale === "hi" ? hi : uiLocale === "zh" ? zh : en;
+  switch (code) {
+    case "CLARIFY_SLOT_PROJECT": return uiText("项目", "project", "projeto", "प्रोजेक्ट");
+    case "CLARIFY_SLOT_MODULE": return uiText("模块", "module", "modulo", "मॉड्यूल");
+    case "CLARIFY_SLOT_VALUE": return uiText("操作对象", "target", "alvo", "लक्ष्य");
+    case "CLARIFY_SLOT_OPERATION": return uiText("操作", "operation", "operacao", "ऑपरेशन");
+    case "CLARIFY_SLOT_MODULE_OPERATION": return uiText("模块/操作", "module/operation", "modulo/operacao", "मॉड्यूल/ऑपरेशन");
+    case "CLARIFY_SLOT_PATH_OR_URL": return uiText("模块", "module", "modulo", "मॉड्यूल");
+    case "CLARIFY_NEED_CONFIRM": return uiText(`需要确认【${params.missingLabel || ""}】，${params.question || ""}`, `Need to confirm [${params.missingLabel || ""}]: ${params.question || ""}`, `Preciso confirmar [${params.missingLabel || ""}]: ${params.question || ""}`, `पुष्टि चाहिए [${params.missingLabel || ""}]: ${params.question || ""}`);
+    case "CLARIFY_REPLY_WITH_INDEX": return uiText("请回复序号，或直接描述你的需求。", "Reply with the option number, or describe your request directly.", "Responda com o numero da opcao ou descreva diretamente sua solicitacao.", "विकल्प संख्या से जवाब दें, या अपनी आवश्यकता सीधे बताएं।");
+    case "CLARIFY_DESCRIBE_DIRECTLY": return uiText("请直接描述你要操作的内容。", "Describe what you want to do directly.", "Descreva diretamente o que voce quer fazer.", "आप जो करना चाहते हैं उसे सीधे बताएं।");
+    case "CLARIFY_FALLBACK_RETRY": return uiText("请补充信息后重试。", "Please add more information and try again.", "Adicione mais informacoes e tente novamente.", "कृपया और जानकारी दें और फिर से प्रयास करें।");
+    case "CLARIFY_MORE_INFO_REQUIRED": return uiText("需要补充更多信息后我才能继续。", "I need more information before I can continue.", "Preciso de mais informacoes antes de continuar.", "आगे बढ़ने से पहले मुझे और जानकारी चाहिए।");
+    case "CLARIFY_OPERATION_MATCH_CANDIDATES": return uiText(`你要操作哪个模块？「${params.operation || ""}」匹配到以下候选：`, `Which module do you want to operate on? "${params.operation || ""}" matched these candidates:`, `Qual modulo voce quer operar? "${params.operation || ""}" corresponde a estas opcoes:`, `आप किस मॉड्यूल पर काम करना चाहते हैं? "${params.operation || ""}" इन विकल्पों से मेल खाता है:`);
+    case "CLARIFY_OPERATION_MODULE_UNKNOWN": return uiText(`未能识别「${params.operation || ""}」对应的模块，请确认你要操作的业务模块：`, `The module for "${params.operation || ""}" could not be identified. Please confirm the business module you want.`, `Nao foi possivel identificar o modulo para "${params.operation || ""}". Confirme o modulo de negocio desejado.`, `"${params.operation || ""}" के लिए मॉड्यूल पहचाना नहीं जा सका। कृपया इच्छित बिज़नेस मॉड्यूल की पुष्टि करें।`);
+    case "CLARIFY_OPERATION_NAME_REQUIRED": return uiText("已理解你的业务意图，但还缺可调用的接口操作名。请补充菜单下的列表/详情，或直接给出“模块名+操作”后重试。", "The business intent is understood, but an actionable API operation name is still missing. Provide the list/detail under the menu, or give module plus operation and retry.", "A intencao de negocio foi entendida, mas ainda falta um nome de operacao de API executavel. Informe a lista/detalhe do menu ou forneca modulo e operacao para tentar novamente.", "व्यावसायिक आशय समझ लिया गया है, लेकिन चलाने योग्य API ऑपरेशन नाम अभी भी चाहिए। मेनू के अंतर्गत सूची/विवरण बताएं या मॉड्यूल और ऑपरेशन देकर फिर से प्रयास करें।");
+    case "CLARIFY_CALL_STYLE_REQUIRED": return uiText("你希望我按哪种方式调用接口？", "How should I call the API?", "Como devo chamar a API?", "मुझे API किस तरीके से कॉल करनी चाहिए?");
+    case "CLARIFY_PROJECT_REQUIRED": return uiText("你要操作哪个项目？", "Which project do you want to use?", "Qual projeto voce quer usar?", "आप कौन सा प्रोजेक्ट उपयोग करना चाहते हैं?");
+    case "CLARIFY_UNDERSTOOD_MODULE_NOT_FOUND": return uiText(`未找到模块「${params.module || ""}」对应的接口，请确认你要操作哪个模块？`, `No callable API was found for module "${params.module || ""}". Please confirm which module you want.`, `Nenhuma API utilizavel foi encontrada para o modulo "${params.module || ""}". Confirme qual modulo voce deseja.`, `मॉड्यूल "${params.module || ""}" के लिए कोई callable API नहीं मिली। कृपया बताएं कि आप कौन सा मॉड्यूल चाहते हैं।`);
+    case "CLARIFY_MODULE_REQUIRED": return uiText("你要操作哪个模块？", "Which module do you want to use?", "Qual modulo voce quer usar?", "आप कौन सा मॉड्यूल उपयोग करना चाहते हैं?");
+    case "CLARIFY_PROJECT_OPERATION_REQUIRED": return uiText(`你想对「${params.project || ""}」做什么操作？`, `What operation do you want on "${params.project || ""}"?`, `Que operacao voce quer fazer em "${params.project || ""}"?`, `"${params.project || ""}" पर आप कौन सा ऑपरेशन करना चाहते हैं?`);
+    case "CLARIFY_OPTION_SEARCH_BY_MODULE": return uiText("按模块检索", "Search by module", "Buscar por modulo", "मॉड्यूल के आधार पर खोजें");
+    case "CLARIFY_OPTION_RETRY_MODULE_SEARCH": return uiText("按模块名重新检索后重试", "Search by module name again, then retry", "Busque novamente pelo nome do modulo e tente outra vez", "मॉड्यूल नाम से फिर खोजें और दोबारा प्रयास करें");
+    case "CLARIFY_OPTION_CALL_LIST": return uiText("直接调用列表接口（module.getList）", "Call the list API directly (module.getList)", "Chamar diretamente a API de lista (module.getList)", "सूची API सीधे कॉल करें (module.getList)");
+    case "CLARIFY_OPTION_CALL_DETAIL": return uiText("直接调用详情接口（module.getById）", "Call the detail API directly (module.getById)", "Chamar diretamente a API de detalhe (module.getById)", "डिटेल API सीधे कॉल करें (module.getById)");
+    case "CLARIFY_OPTION_PROVIDE_OPERATION": return uiText("提供 operation（推荐）", "Provide operation (recommended)", "Fornecer operation (recomendado)", "operation दें (अनुशंसित)");
+    case "CLARIFY_OPTION_PROVIDE_PATH_BASE": return uiText("提供 path + base", "Provide path + base", "Fornecer path + base", "path + base दें");
+    case "CLARIFY_OPTION_PROVIDE_URL": return uiText("提供完整 url", "Provide the full URL", "Fornecer a URL completa", "पूरा URL दें");
+    case "CLARIFY_OPTION_READ": return uiText("查询类", "Read", "Consulta", "रीड");
+    case "CLARIFY_OPTION_READ_LIST_DETAIL": return uiText("查询 / 查看详情 / 列表", "Read / detail / list", "Consulta / detalhe / lista", "रीड / विवरण / सूची");
+    case "CLARIFY_OPTION_PROVIDE_MORE_CONTEXT": return uiText("我来补充更多信息", "I will provide more details", "Vou fornecer mais detalhes", "मैं और जानकारी दूंगा");
+    default:
+      return String(params.fallback || code);
+  }
+}
+
+const SLOT_LABEL_CODES: Record<string, string> = {
+  project: "CLARIFY_SLOT_PROJECT",
+  module: "CLARIFY_SLOT_MODULE",
+  value: "CLARIFY_SLOT_VALUE",
+  operation: "CLARIFY_SLOT_OPERATION",
+  "module.operation": "CLARIFY_SLOT_MODULE_OPERATION",
+  "operation_or_path_or_url": "CLARIFY_SLOT_PATH_OR_URL",
 };
 
-function renderClarificationForUser(raw: string): string {
+export function renderClarificationForUser(raw: string, uiLocale?: string): string {
   const parsed = parseClarificationPayload(raw);
-  if (!parsed) return "请补充信息后重试。";
+  if (!parsed) return clarificationText(uiLocale, "CLARIFY_FALLBACK_RETRY");
 
-  // 缺失槽位的自然语言描述
   const missingLabel = parsed.missingSlots
-    .map((s) => SLOT_LABELS[s] || s)
+    .map((s) => clarificationText(uiLocale, SLOT_LABEL_CODES[s] || "", { fallback: s }))
     .join("、");
-
-  // 选项列表（有 label 即展示；value 可为空表示“请用户自由输入”）
   const hasRealOptions = parsed.options.some((o) => o.label);
   const optionLines = hasRealOptions
     ? parsed.options
         .filter((o) => o.label)
-        .map((o, i) => `  ${i + 1}. ${o.label}`)
+      .map((o, i) => `  ${i + 1}. ${("labelCode" in o && o.labelCode) ? clarificationText(uiLocale, o.labelCode, ("labelParams" in o ? o.labelParams : undefined) || {}) : o.label}`)
         .join("\n")
     : "";
 
   const lines: string[] = [];
-  lines.push(`需要确认【${missingLabel}】，${parsed.question}`);
+  const question = ("questionCode" in parsed && parsed.questionCode)
+    ? clarificationText(uiLocale, parsed.questionCode, { ...(("questionParams" in parsed ? parsed.questionParams : undefined) || {}) })
+    : parsed.question;
+  lines.push(clarificationText(uiLocale, "CLARIFY_NEED_CONFIRM", { missingLabel, question }));
   if (optionLines) {
     lines.push(optionLines);
-    lines.push("请回复序号，或直接描述你的需求。");
+    lines.push(clarificationText(uiLocale, "CLARIFY_REPLY_WITH_INDEX"));
   } else {
-    lines.push("请直接描述你要操作的内容。");
+    lines.push(clarificationText(uiLocale, "CLARIFY_DESCRIBE_DIRECTLY"));
   }
   return lines.join("\n");
 }
@@ -1217,7 +1286,7 @@ function hasSuccessfulApiCall(steps: AgentStep[]): boolean {
     const c = s.content;
     if (
       c &&
-      !c.startsWith("错误：") &&
+      !isToolErrorResult(c) &&
       !c.startsWith("MODULE_RETRY") &&
       !c.startsWith("CLARIFICATION_REQUIRED") &&
       !c.startsWith("[workflow/") &&
@@ -1241,7 +1310,7 @@ function hasSuccessfulToolResult(steps: AgentStep[], toolNames: Set<string>): bo
     const c = s.content || "";
     if (
       c &&
-      !c.startsWith("错误：") &&
+      !isToolErrorResult(c) &&
       !c.startsWith("MODULE_RETRY") &&
       !c.startsWith("CLARIFICATION_REQUIRED") &&
       !c.startsWith("[workflow/")
@@ -1276,19 +1345,84 @@ function hasUnderstoodIntent(steps: AgentStep[] | undefined): boolean {
   return Boolean(findLastUnderstood(steps || []));
 }
 
-function buildExplainCapabilityReply(intent: UnderstoodIntent | null | undefined): string {
+type FallbackLocale = "zh" | "en" | "pt-BR" | "hi";
+
+function inferFallbackLocale(userText: string, prefs?: UserPreferences): FallbackLocale {
+  const tag = resolveReplyLanguage({ prefs, userText }).tag.toLowerCase();
+  if (tag.startsWith("zh")) return "zh";
+  if (tag.startsWith("pt")) return "pt-BR";
+  if (tag.startsWith("hi")) return "hi";
+  return "en";
+}
+
+function pickFallbackCopy(
+  locale: FallbackLocale,
+  text: { zh: string; en: string; pt?: string; hi?: string },
+): string {
+  if (locale === "zh") return text.zh;
+  if (locale === "pt-BR") return text.pt || text.en;
+  if (locale === "hi") return text.hi || text.en;
+  return text.en;
+}
+
+function buildExplainCapabilityReply(userText: string, intent: UnderstoodIntent | null | undefined, prefs?: UserPreferences): string {
   const summary = intent?.summary?.trim();
   const project = intent?.project?.trim();
   const module = intent?.module?.trim();
-  const subject = summary || "这个需求";
-  const projectText = project ? `在「${project}」里，` : "";
-  const moduleText = module ? `如果你已经知道模块是「${module}」，我也可以继续说明对应入口或页面。` : "";
+  const locale = inferFallbackLocale(userText, prefs);
+  const subject = summary || pickFallbackCopy(locale, {
+    zh: "这个需求",
+    en: "this request",
+    pt: "esta solicitacao",
+    hi: "इस अनुरोध",
+  });
+  const projectText = project
+    ? pickFallbackCopy(locale, {
+        zh: `在「${project}」里，`,
+        en: `In "${project}", `,
+        pt: `Em "${project}", `,
+        hi: `"${project}" में, `,
+      })
+    : "";
+  const moduleText = module
+    ? pickFallbackCopy(locale, {
+        zh: `如果你已经知道模块是「${module}」，我也可以继续说明对应入口或页面。`,
+        en: `If you already know the module is "${module}", I can also explain the matching entry point or page.`,
+        pt: `Se voce ja souber que o modulo e "${module}", tambem posso explicar a pagina ou entrada correspondente.`,
+        hi: `अगर आपको पता है कि मॉड्यूल "${module}" है, तो मैं उससे जुड़ा एंट्री पॉइंट या पेज भी बता सकता हूं।`,
+      })
+    : "";
   return (
-    `${projectText}关于“${subject}”，这更适合先做说明而不是直接执行查询。\n\n` +
-    "你可以这样继续：\n" +
-    "1. 先告诉我你要查看的具体业务对象，例如名称、ID，或你想进入的页面/模块。\n" +
-    "2. 如果你只是想知道系统里应该怎么操作，我可以直接继续说明入口、查询路径和所需信息。\n" +
-    "3. 如果你希望我直接帮你执行查询，再补充具体对象后我就继续处理。\n\n" +
+    `${projectText}${pickFallbackCopy(locale, {
+      zh: `关于“${subject}”，这更适合先做说明而不是直接执行查询。`,
+      en: `About "${subject}", it is better to explain the path first instead of running a query right away.`,
+      pt: `Sobre "${subject}", faz mais sentido explicar o caminho primeiro em vez de executar uma consulta imediatamente.`,
+      hi: `"${subject}" के बारे में, सीधे क्वेरी चलाने से पहले तरीका समझाना अधिक उपयुक्त है।`,
+    })}\n\n` +
+    `${pickFallbackCopy(locale, {
+      zh: "你可以这样继续：",
+      en: "You can continue like this:",
+      pt: "Voce pode continuar assim:",
+      hi: "आप इस तरह आगे बढ़ सकते हैं:",
+    })}\n` +
+    `1. ${pickFallbackCopy(locale, {
+      zh: "先告诉我你要查看的具体业务对象，例如名称、ID，或你想进入的页面/模块。",
+      en: "Tell me the exact business object you want to check, such as a name, an ID, or the page/module you want to open.",
+      pt: "Diga qual objeto de negocio voce quer verificar, como nome, ID ou a pagina/modulo que deseja abrir.",
+      hi: "पहले यह बताइए कि आप कौन-सा विशिष्ट व्यावसायिक ऑब्जेक्ट देखना चाहते हैं, जैसे नाम, ID, या वह पेज/मॉड्यूल जिसे आप खोलना चाहते हैं।",
+    })}\n` +
+    `2. ${pickFallbackCopy(locale, {
+      zh: "如果你只是想知道系统里应该怎么操作，我可以直接继续说明入口、查询路径和所需信息。",
+      en: "If you only want to know how to do it in the system, I can explain the entry point, query path, and required information.",
+      pt: "Se voce so quiser saber como fazer isso no sistema, eu posso explicar a entrada, o caminho da consulta e as informacoes necessarias.",
+      hi: "अगर आप सिर्फ यह जानना चाहते हैं कि सिस्टम में यह कैसे करना है, तो मैं सीधे एंट्री पॉइंट, क्वेरी पथ और आवश्यक जानकारी समझा सकता हूं।",
+    })}\n` +
+    `3. ${pickFallbackCopy(locale, {
+      zh: "如果你希望我直接帮你执行查询，再补充具体对象后我就继续处理。",
+      en: "If you want me to run the query for you, send the specific object and I will continue from there.",
+      pt: "Se quiser que eu execute a consulta para voce, envie o objeto especifico e eu continuo a partir dai.",
+      hi: "अगर आप चाहते हैं कि मैं आपके लिए सीधे क्वेरी चलाऊं, तो विशिष्ट ऑब्जेक्ट भेजें, मैं वहीं से आगे बढ़ूंगा।",
+    })}\n\n` +
     moduleText
   ).trim();
 }
@@ -1306,7 +1440,8 @@ function buildClarificationPayloadFromIntent(intent: UnderstoodIntent | null | u
     intent: summary,
     missingSlots,
     question,
-    options: [{ label: "我来补充更多信息", value: "provide_more_context" }],
+    options: [{ label: "我来补充更多信息", value: "provide_more_context", labelCode: "CLARIFY_OPTION_PROVIDE_MORE_CONTEXT" }],
+    questionCode: "CLARIFY_MORE_INFO_REQUIRED",
     riskLevel: "read",
   });
 }
@@ -1540,13 +1675,25 @@ async function rulesGateBeforeCallApi(opts: {
 export async function* chatStream(
   session: Session,
   userText: string,
-  opts: { model?: string; images?: string[]; files?: string[] } = {},
+  opts: { model?: string; images?: string[]; files?: string[]; uiLocale?: string } = {},
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
+  const uiText = (zh: string, en: string, pt: string, hi: string) =>
+    opts.uiLocale === "pt-BR" ? pt : opts.uiLocale === "hi" ? hi : opts.uiLocale === "zh" ? zh : en;
   // M0 traces：开一次请求的追踪上下文（runId 贯穿各节点 span）
   // P2 溯源：操作者归属（countryId:loginName）先于 beginRun 计算，贯穿 trace/审计/成本
   const ownerKey = ownerKeyOf(session.user, session.country.id);
+  const prefs = loadUserPreferences(ownerKey);
+  const resolvedReplyLanguage = resolveReplyLanguage({
+    prefs,
+    userText,
+    sessionLastReplyLanguage: session.lastReplyLanguage,
+    uiLocale: opts.uiLocale,
+  });
   const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model, ownerKey });
+  const rememberAssistantReplyLanguage = () => {
+    session.lastReplyLanguage = resolvedReplyLanguage.tag;
+  };
   // 待澄清状态不在服务端用词形/序号匹配续跑：一律丢弃，本轮当新消息进主 LLM，
   // 由模型结合会话历史理解用户回复。避免 isLikelyFreshRequest / pickClarificationOption 写死判断。
   if (session.pendingClarification) {
@@ -1578,7 +1725,12 @@ export async function* chatStream(
   if (!model) {
     yield {
       type: "text",
-      text: "未配置任何模型。请在服务端 .env 设置 MODEL_PROVIDERS 或旧的 MODEL_PROVIDER/ANTHROPIC_AUTH_TOKEN 后重启。",
+      text: uiText(
+        "未配置任何模型。请在服务端 .env 设置 MODEL_PROVIDERS 或旧的 MODEL_PROVIDER/ANTHROPIC_AUTH_TOKEN 后重启。",
+        "No model is configured. Set MODEL_PROVIDERS or the legacy MODEL_PROVIDER/ANTHROPIC_AUTH_TOKEN in the server .env and restart.",
+        "Nenhum modelo foi configurado. Defina MODEL_PROVIDERS ou o legado MODEL_PROVIDER/ANTHROPIC_AUTH_TOKEN no .env do servidor e reinicie.",
+        "कोई मॉडल कॉन्फ़िगर नहीं है। सर्वर के .env में MODEL_PROVIDERS या legacy MODEL_PROVIDER/ANTHROPIC_AUTH_TOKEN सेट करें और फिर रीस्टार्ट करें।",
+      ),
     };
     yield { type: "done" };
     touchSession(session);
@@ -1595,6 +1747,7 @@ export async function* chatStream(
         type: "error",
         message: `当前模型（${model.label}）不支持图片，且模型库中没有支持图片的模型。请配置 MODEL_<ID>_VISION=direct 或 ocr 的模型。`,
         code: "VISION_DISABLED",
+        error: token("VISION_DISABLED"),
       };
       yield { type: "done" };
       touchSession(session);
@@ -1606,6 +1759,7 @@ export async function* chatStream(
       type: "error",
       message: `当前模型（${model.label}）不支持图片（MODEL_${model.id.toUpperCase()}_VISION=none）。请去掉图片后重试，或切换支持图片的模型。`,
       code: "VISION_DISABLED",
+      error: token("VISION_DISABLED"),
     };
     yield { type: "done" };
     touchSession(session);
@@ -1828,7 +1982,7 @@ export async function* chatStream(
         // [workflow/observe] 反馈）仍走 steps 以 user 消息追加，不污染前缀。
         // 拼接逻辑抽为 buildStaticGuide()（preprocess 与「模型级门槛轻量路径」共用，见模块级定义）。
         // M1：常规多轮路径里的 Worker 提示走 understand 动态注入，避免首轮重复注入同一 systemPrompt。
-        const staticGuide = buildStaticGuide(session, ownerKey);
+        const staticGuide = buildStaticGuide(session, ownerKey, undefined, { userText, uiLocale: opts.uiLocale });
         // 2026-08-24：删除 [workflow/superpower]（与已删的 llm-first 重复；列表一次取全已下沉 call_api
         // description，自动渲染/output-align 已下沉 normalize_output / render_table description，不反问
         // 已下沉 request_clarification description + resident rule #3，见 PROMPT_ARCHITECTURE.md §4）。
@@ -2429,6 +2583,13 @@ export async function* chatStream(
               name: call.name,
               input: call.input,
               description: desc,
+              descriptionToken: token(
+                call.name === "write_code_file"
+                  ? "CONFIRM_WRITE_CODE_FILE"
+                  : call.name === "git_commit_push"
+                    ? "CONFIRM_GIT_COMMIT_PUSH"
+                    : "CONFIRM_CALL_API_WRITE",
+              ),
               impact: codeImpact || buildConfirmationImpact(userText, call.input, method),
             });
             // P1 安全审计：确认请求与结论三态（granted/denied/timeout）留痕
@@ -2518,7 +2679,7 @@ export async function* chatStream(
               };
             }
             if (responseModeOf(understood) === "explain-capability") {
-              forcedReply = buildExplainCapabilityReply(understood);
+              forcedReply = buildExplainCapabilityReply(userText, understood, loadUserPreferences(ownerKey));
               outputReady = true;
               nextSteps.push({
                 kind: "system",
@@ -2570,7 +2731,7 @@ export async function* chatStream(
           if (
             call.name === CALL_API_TOOL &&
             content &&
-            !content.startsWith("错误：") &&
+            !isToolErrorResult(content) &&
             !content.startsWith("MODULE_RETRY") &&
             !content.startsWith("CLARIFICATION_REQUIRED") &&
             !content.startsWith("[workflow/") &&
@@ -2585,7 +2746,7 @@ export async function* chatStream(
           // 业务数据请求下，search/read/grep 返回的只是「候选/接口信息」，仍须 call_api 取数才能作答。
           // 避免弱模型把候选清单/接口源码当最终答案中途收束（2026-08-24 优惠活动配置实测：
           // submit→search 后即结束，未 read/call，34s 内没拿到任何数据）。
-          if (!outputReady && !content.startsWith("错误：")) {
+          if (!outputReady && !isToolErrorResult(content)) {
             if (EXPLORE_TOOLS.has(call.name)) {
               const understood = findLastUnderstood(nextSteps);
               if (understood?.isBusinessRequest === true && responseModeOf(understood) === "execute") {
@@ -2600,7 +2761,7 @@ export async function* chatStream(
             }
           }
 
-          if (call.name === "get_page_schema" && !content.startsWith("错误：")) {
+          if (call.name === "get_page_schema" && !isToolErrorResult(content)) {
             try {
               const parsed = JSON.parse(content) as { pages?: Array<{ primary?: string }> };
               const primary = parsed.pages?.[0]?.primary;
@@ -2614,7 +2775,7 @@ export async function* chatStream(
 
           if (
             (call.name === "normalize_output" || call.name === "render_table" || call.name === "export_dataset") &&
-            !content.startsWith("错误：")
+            !isToolErrorResult(content)
           ) {
             outputReady = call.name !== "normalize_output";
             if (call.name === "normalize_output") {
@@ -2636,7 +2797,7 @@ export async function* chatStream(
           // 图表摘要：成功/失败都收束，禁止空转
           if (call.name === "summarize_chart_data") {
             outputReady = true;
-            if (content.startsWith("错误：")) {
+            if (isToolErrorResult(content)) {
               nextSteps.push({
                 kind: "system",
                 text:
@@ -2652,7 +2813,7 @@ export async function* chatStream(
           }
 
           // call_api 失败：禁止反复换接口空转，下一轮必须向用户说明失败原因
-          if (call.name === CALL_API_TOOL && content.startsWith("错误：")) {
+          if (call.name === CALL_API_TOOL && isToolErrorResult(content)) {
             outputReady = true;
             nextSteps.push({
               kind: "system",
@@ -2670,7 +2831,7 @@ export async function* chatStream(
           }
           if (
             call.name === CALL_API_TOOL &&
-            !content.startsWith("错误：") &&
+            !isToolErrorResult(content) &&
             !content.startsWith("CLARIFICATION_REQUIRED")
           ) {
             const op = String(call.input.operation || "");
@@ -2861,7 +3022,7 @@ export async function* chatStream(
         const finalResponseMode = responseModeOf(lastUnderstood);
         const looksLikeUnderstoodEcho = /_understood|isBusinessRequest|responseMode|missingSlots/.test(state.text || "");
         if (state.needsClarification && state.clarificationText) {
-          return { text: renderClarificationForUser(`CLARIFICATION_REQUIRED\n${state.clarificationText}`) };
+          return { text: renderClarificationForUser(`CLARIFICATION_REQUIRED\n${state.clarificationText}`, opts.uiLocale) };
         }
         if (state.forcedReply?.trim()) return { text: state.forcedReply };
 
@@ -2870,7 +3031,7 @@ export async function* chatStream(
         if (state.text?.trim()) {
           const hasToolResults = (state.steps || []).some((s) => s.kind === "toolResult");
           if (finalResponseMode === "explain-capability" && looksLikeUnderstoodEcho) {
-            return { text: buildExplainCapabilityReply(lastUnderstood) };
+            return { text: buildExplainCapabilityReply(userText, lastUnderstood, loadUserPreferences(ownerKey)) };
           }
           const v = validateFinalText(state.text);
           if (v === "tool-call" && !hasToolResults) {
@@ -2881,7 +3042,7 @@ export async function* chatStream(
             // 模型把 parse_intent 的 CLARIFICATION_REQUIRED JSON 当最终文本输出（未走 request_clarification 工具）：
             // {"intent":"解析用户意图","missingSlots":["module"],"question":"你要操作哪个模块？",...}
             // 应渲染成友好澄清问题，而不是把裸 JSON 展示给用户。
-            return { text: renderClarificationForUser(`CLARIFICATION_REQUIRED\n${state.text}`) };
+            return { text: renderClarificationForUser(`CLARIFICATION_REQUIRED\n${state.text}`, opts.uiLocale) };
           }
           if (v === "bare-json") {
             // 其他裸 JSON（如接口原始返回被模型直接透传）：一律清空，走 synthesized 合成兜底
@@ -2921,13 +3082,29 @@ export async function* chatStream(
                   // UI 块（表格预览 + 下载文件）上屏
                   emitUiPayloadsFromToolResult(out, emitEvent);
                   return {
-                    text: `已根据最近查询的数据自动生成 Excel 文件（共 ${lt.total} 条），可在聊天中预览与下载。`,
+                    text: uiText(
+                      `已根据最近查询的数据自动生成 Excel 文件（共 ${lt.total} 条），可在聊天中预览与下载。`,
+                      `An Excel file was generated from the most recent query data (${lt.total} rows). You can preview and download it in the chat.`,
+                      `Um arquivo Excel foi gerado a partir dos dados da consulta mais recente (${lt.total} linhas). Voce pode visualizar e baixar no chat.`,
+                      `हाल की क्वेरी के डेटा से एक Excel फ़ाइल बनाई गई है (${lt.total} पंक्तियां)। आप इसे चैट में प्रीव्यू और डाउनलोड कर सकते हैं।`,
+                    ),
                   };
                 } catch (e) {
-                  return { text: "导出失败：" + (e instanceof Error ? e.message : String(e)).slice(0, 300) };
+                  return {
+                    text:
+                      uiText("导出失败：", "Export failed: ", "Falha na exportacao: ", "निर्यात विफल हुआ: ") +
+                      (e instanceof Error ? e.message : String(e)).slice(0, 300),
+                  };
                 }
               }
-              return { text: "请先查询数据（如「XX列表」）获取表格后，再说「导出 Excel」即可生成文件。" };
+              return {
+                text: uiText(
+                  "请先查询数据（如「XX列表」）获取表格后，再说「导出 Excel」即可生成文件。",
+                  "Query data first to get a table, then ask to export Excel.",
+                  "Consulte os dados primeiro para obter uma tabela e depois peca para exportar Excel.",
+                  "पहले डेटा क्वेरी करके तालिका प्राप्त करें, फिर Excel निर्यात करने को कहें।",
+                ),
+              };
             }
             if (businessToolCalled) return { text: "" };
           } else {
@@ -2947,7 +3124,12 @@ export async function* chatStream(
               });
               emitUiPayloadsFromToolResult(out, emitEvent);
               return {
-                text: `已根据最近查询的数据自动生成 Excel 文件（共 ${session.lastTable.total} 条），可在聊天中预览与下载。`,
+                text: uiText(
+                  `已根据最近查询的数据自动生成 Excel 文件（共 ${session.lastTable.total} 条），可在聊天中预览与下载。`,
+                  `An Excel file was generated from the most recent query data (${session.lastTable.total} rows). You can preview and download it in the chat.`,
+                  `Um arquivo Excel foi gerado a partir dos dados da consulta mais recente (${session.lastTable.total} linhas). Voce pode visualizar e baixar no chat.`,
+                  `हाल की क्वेरी के डेटा से एक Excel फ़ाइल बनाई गई है (${session.lastTable.total} पंक्तियां)। आप इसे चैट में प्रीव्यू और डाउनलोड कर सकते हैं।`,
+                ),
               };
             } catch (e) {
               console.error("[chat:export] 自动导出失败:", e instanceof Error ? e.message : String(e));
@@ -2968,20 +3150,25 @@ export async function* chatStream(
           })
           .map((s) => s.content);
         if (finalResponseMode === "explain-capability") {
-          return { text: buildExplainCapabilityReply(lastUnderstood) };
+          return { text: buildExplainCapabilityReply(userText, lastUnderstood, loadUserPreferences(ownerKey)) };
         }
         const synthesized = synthesizeReplyFromToolResults([
           ...toolResults,
           ...((state.steps || [])
             .filter((s): s is Extract<AgentStep, { kind: "system" }> => s.kind === "system")
             .map((s) => s.text)),
-        ]);
+        ], opts.uiLocale);
         if (synthesized) return { text: synthesized };
 
-        const lastApiErr = [...toolResults].reverse().find((c) => c.startsWith("错误："));
+        const lastApiErr = [...toolResults].reverse().find((c) => isToolErrorResult(c));
         if (lastApiErr) {
           return {
-            text: `接口调用未成功：${lastApiErr.replace(/^错误：/, "").slice(0, 400)}。请检查登录状态或换种说法重试。`,
+            text: uiText(
+              "接口调用未成功，请检查登录状态或换种说法重试。",
+              "The API call did not succeed. Check your login state or try a different phrasing.",
+              "A chamada de API nao foi bem-sucedida. Verifique o estado de login ou tente outra formulacao.",
+              "API कॉल सफल नहीं हुआ। अपनी लॉगिन स्थिति जांचें या अलग तरह से पूछें।",
+            ),
           };
         }
         const hasTools = toolResults.length > 0;
@@ -2989,11 +3176,21 @@ export async function* chatStream(
         // 避免误导（非业务走到这里同样是无结果，统一友好兜底）。
         if (hasTools) {
           return {
-            text: "已完成若干工具调用，但未能生成最终说明。请换种说法重试，或直接指定模块与操作（如：XX模块列表）。",
+            text: uiText(
+              "已完成若干工具调用，但未能生成最终说明。请换种说法重试，或直接指定模块与操作。",
+              "Some tool calls completed, but a final explanation could not be produced. Try a different phrasing or specify the module and operation directly.",
+              "Algumas chamadas de ferramenta foram concluídas, mas nao foi possivel gerar a explicacao final. Tente outra formulacao ou especifique diretamente o modulo e a operacao.",
+              "कुछ टूल कॉल पूरे हुए, लेकिन अंतिम व्याख्या तैयार नहीं हो सकी। अलग तरह से पूछें या मॉड्यूल और ऑपरेशन सीधे बताएं।",
+            ),
           };
         }
         return {
-          text: "抱歉，我暂时无法回答这个问题。如需查询业务数据，请明确模块与操作（如：XX列表、XX统计）。",
+          text: uiText(
+            "抱歉，我暂时无法回答这个问题。如需查询业务数据，请明确模块与操作。",
+            "I cannot answer this question right now. If you need business data, specify the module and operation.",
+            "Nao consigo responder a esta pergunta agora. Se voce precisa de dados de negocio, especifique o modulo e a operacao.",
+            "मैं अभी इस प्रश्न का उत्तर नहीं दे सकता। यदि आपको व्यावसायिक डेटा चाहिए, तो मॉड्यूल और ऑपरेशन स्पष्ट करें।",
+          ),
         };
       })
       .addEdge(START, "preprocess")
@@ -3084,11 +3281,12 @@ export async function* chatStream(
     if (!model.agentCapable) {
       console.log(`[chat:agent] 模型 ${model.id} 无 agent 能力（MODEL_${model.id.toUpperCase()}_AGENT=false），走纯问答`);
       const light = await callAgentSafe(model, turns, rawImages, [], [], signal, {
-        systemExtra: buildStaticGuide(session, ownerKey, resolveWorkerById(getActiveWorkerId(session.id) || "")),
+        systemExtra: buildStaticGuide(session, ownerKey, resolveWorkerById(getActiveWorkerId(session.id) || ""), { userText, uiLocale: opts.uiLocale }),
         traceRunId: runId,
       });
       const text = (light.text || "（模型未返回有效回复，请重试或更换模型。）").slice(0, config.contextMaxChars);
       session.messages.push({ role: "assistant", text });
+      rememberAssistantReplyLanguage();
       touchSession(session);
       yield { type: "text", text };
       return; // finally 统一发 done
@@ -3162,13 +3360,15 @@ export async function* chatStream(
           "模型服务调用失败：HTTP 402，免费体验额度已耗尽且未开启后付费（401008）。" +
           "请前往腾讯云 TokenHub 控制台（https://console.cloud.tencent.com/tokenhub/inference，广州地域）为模型开启后付费计费后重试。";
         session.messages.push({ role: "assistant", text: quotaMsg });
-        yield { type: "error", message: quotaMsg, code: "MODEL_QUOTA_EXHAUSTED" };
+        rememberAssistantReplyLanguage();
+        yield { type: "error", message: quotaMsg, code: "MODEL_QUOTA_EXHAUSTED", error: token("MODEL_QUOTA_EXHAUSTED") };
         return;
       }
       // 非额度类模型错误（如网络异常）：也直接如实返回，不走误导性的业务反问
       const errMsg = `模型服务调用失败：${ls.modelError.slice(0, 300)}`;
       session.messages.push({ role: "assistant", text: errMsg });
-      yield { type: "error", message: errMsg, code: "MODEL_CALL_FAILED" };
+      rememberAssistantReplyLanguage();
+      yield { type: "error", message: errMsg, code: "MODEL_CALL_FAILED", error: token("MODEL_CALL_FAILED") };
       return;
     }
 
@@ -3220,6 +3420,7 @@ export async function* chatStream(
               name: CALL_API_TOOL,
               input: { operation: "server-fallback-write", description: userText },
               description: userText,
+              descriptionToken: token("CONFIRM_CALL_API_WRITE"),
               impact: buildConfirmationImpact(userText, {}, "POST"),
             };
             // P1 安全审计：服务端兜底路径的写确认同样留痕
@@ -3246,7 +3447,12 @@ export async function* chatStream(
             confirmed = confirmOutcome.confirmed;
           }
           if (!confirmed) {
-            text = "你取消了该操作，未执行。";
+          text = uiText(
+            "你取消了该操作，未执行。",
+            "You cancelled the operation, so it was not executed.",
+            "Voce cancelou a operacao, entao ela nao foi executada.",
+            "आपने यह ऑपरेशन रद्द कर दिया, इसलिए इसे चलाया नहीं गया।",
+          );
           } else {
             const result = await runServerFallback({
               userText,
@@ -3262,7 +3468,7 @@ export async function* chatStream(
               ls.clarificationText = result.clarificationText;
               // 澄清直接作为最终回答展示给用户（而非模型计划文本/裸 JSON）：
               // 用 renderClarificationForUser 渲染成友好问题（缺槽位 + 可选项列表），禁止把 parse_intent JSON 上屏。
-              text = renderClarificationForUser(`CLARIFICATION_REQUIRED\n${result.clarificationText}`);
+              text = renderClarificationForUser(`CLARIFICATION_REQUIRED\n${result.clarificationText}`, opts.uiLocale);
             }
           }
         }
@@ -3285,26 +3491,37 @@ export async function* chatStream(
     if (!text) {
       const fallbackIntent = findLastUnderstood(ls.steps || []);
       if (responseModeOf(fallbackIntent) === "explain-capability") {
-        text = buildExplainCapabilityReply(fallbackIntent);
+        text = buildExplainCapabilityReply(userText, fallbackIntent, loadUserPreferences(ownerKey));
       } else {
         text = ls.modelError
-          ? "模型服务暂时不可用，请稍后重试或更换模型。"
-          : "未能理解你的需求，请换种说法重试（例如直接说清模块名与要查的列表/详情）。";
+          ? uiText(
+              "模型服务暂时不可用，请稍后重试或更换模型。",
+              "The model service is temporarily unavailable. Try again later or switch models.",
+              "O servico do modelo esta temporariamente indisponivel. Tente novamente mais tarde ou troque de modelo.",
+              "मॉडल सेवा अस्थायी रूप से उपलब्ध नहीं है। बाद में फिर कोशिश करें या मॉडल बदलें।",
+            )
+          : uiText(
+              "未能理解你的需求，请换种说法重试，或直接说清模块名与要查的列表/详情。",
+              "I could not understand the request. Try a different phrasing or specify the module and the list/detail you want.",
+              "Nao foi possivel entender a solicitacao. Tente outra formulacao ou especifique o modulo e a lista/detalhe desejado.",
+              "मैं अनुरोध को समझ नहीं सका। अलग तरह से पूछें या मॉड्यूल और वांछित सूची/विवरण स्पष्ट करें।",
+            );
       }
     }
     // 方案 B 兜底（2026-08-26）：若模型仍把完整表格写进最终文本，而本轮已上屏 UI_TABLE → 折叠重复的 markdown 表格。
     text = collapseDuplicateTable(text, session);
     session.messages.push({ role: "assistant", text });
+    rememberAssistantReplyLanguage();
     // 最终完整文本：作为 text_delta 增量后的校正/兜底；前端对 text 事件采用覆盖式，避免与增量重复。
     if (text) yield { type: "text", text };
     if (visionErrors.length) {
-      yield { type: "error", message: `图片转录失败：${visionErrors.join("；")}`, code: "VISION_OCR_FAILED" };
+      yield { type: "error", message: `图片转录失败：${visionErrors.join("；")}`, code: "VISION_OCR_FAILED", error: token("VISION_OCR_FAILED") };
     }
   } catch (error) {
     console.error(`[chat:catch] "${userText}" 模型调用失败:`, error instanceof Error ? error.message : String(error));
     console.error(`[chat:catch] stack 前4行:`, error instanceof Error ? error.stack?.split("\n").slice(0, 4).join("\n") : "n/a");
     if (signal?.aborted) {
-      yield { type: "error", message: "已取消", code: "CANCELLED" };
+      yield { type: "error", message: "已取消", code: "CANCELLED", error: token("CANCELLED") };
     } else {
       // 模型调用失败（如额度 402、网络抖动）时：仅当显式写意图（writeForce）且尚无任何工具结果，
       // 改走服务端规则编排兜底执行写操作（写操作必须经用户确认，不能因模型失败就丢错）。
@@ -3325,6 +3542,7 @@ export async function* chatStream(
             name: CALL_API_TOOL,
             input: { operation: "server-fallback-write", description: userText },
             description: userText,
+              descriptionToken: token("CONFIRM_CALL_API_WRITE"),
             impact: buildConfirmationImpact(userText, {}, "POST"),
           };
           // P1 安全审计：catch 兜底路径的写确认同样留痕
@@ -3351,8 +3569,15 @@ export async function* chatStream(
           confirmed = confirmOutcome.confirmed;
         }
         if (!confirmed) {
-          session.messages.push({ role: "assistant", text: "你取消了该操作，未执行。" });
-          yield { type: "text", text: "你取消了该操作，未执行。" };
+          const cancelledText = uiText(
+            "你取消了该操作，未执行。",
+            "You cancelled the operation, so it was not executed.",
+            "Voce cancelou a operacao, entao ela nao foi executada.",
+            "आपने यह ऑपरेशन रद्द कर दिया, इसलिए इसे चलाया नहीं गया।",
+          );
+          session.messages.push({ role: "assistant", text: cancelledText });
+          rememberAssistantReplyLanguage();
+          yield { type: "text", text: cancelledText };
           return;
         }
         try {
@@ -3366,6 +3591,7 @@ export async function* chatStream(
           // 空串也视为无输出：fallback 返回空 text 时给可读兜底，禁止静默
           if (fb.text != null && String(fb.text).trim()) {
             session.messages.push({ role: "assistant", text: fb.text });
+            rememberAssistantReplyLanguage();
             yield { type: "text", text: fb.text };
             // 排空兜底期间事件
             while (eventQueue.length) yield eventQueue.shift()!;
@@ -3404,12 +3630,13 @@ export async function* chatStream(
                 "模型服务调用失败：HTTP 402，免费体验额度已耗尽且未开启后付费（401008）。" +
                 "请前往腾讯云 TokenHub 控制台（https://console.cloud.tencent.com/tokenhub/inference，广州地域）为模型开启后付费计费后重试。";
               session.messages.push({ role: "assistant", text: quotaMsg });
-              yield { type: "error", message: quotaMsg, code: "MODEL_QUOTA_EXHAUSTED" };
+              rememberAssistantReplyLanguage();
+              yield { type: "error", message: quotaMsg, code: "MODEL_QUOTA_EXHAUSTED", error: token("MODEL_QUOTA_EXHAUSTED") };
               return;
             }
             // 其他非额度错误：与主 fallback 分支一致，澄清必须走 renderClarificationForUser 渲染成友好中文，
             // 禁止把 parse_intent 的裸 JSON 当 error 上屏（前端会原样显示 <p class="error">）。
-            const clarText = renderClarificationForUser(`CLARIFICATION_REQUIRED\n${fb.clarificationText}`);
+            const clarText = renderClarificationForUser(`CLARIFICATION_REQUIRED\n${fb.clarificationText}`, opts.uiLocale);
             const parsedClar = parseClarificationPayload(`CLARIFICATION_REQUIRED\n${fb.clarificationText}`);
             if (parsedClar) {
               session.pendingClarification = {
@@ -3420,6 +3647,7 @@ export async function* chatStream(
               };
             }
             session.messages.push({ role: "assistant", text: clarText });
+            rememberAssistantReplyLanguage();
             yield { type: "text", text: clarText };
             return;
           }
@@ -3434,7 +3662,7 @@ export async function* chatStream(
       yield {
         type: "error",
         message,
-        ...( /recursion limit/i.test(raw) ? { code: "RECURSION_LIMIT" } : {}),
+        ...( /recursion limit/i.test(raw) ? { code: "RECURSION_LIMIT", error: token("RECURSION_LIMIT") } : { code: "MODEL_CALL_FAILED", error: token("MODEL_CALL_FAILED") }),
       };
     }
   } finally {

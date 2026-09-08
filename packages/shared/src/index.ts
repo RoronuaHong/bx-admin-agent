@@ -75,20 +75,38 @@ export interface ChatChartView {
   height?: number;
 }
 
+export interface LocalizedToken {
+  code: string;
+  params?: Record<string, string | number | boolean | null>;
+  defaultMessage?: string;
+}
+
+export interface ApiErrorPayload {
+  error: LocalizedToken;
+}
+
 // SSE 事件契约（server → web）。
 export type ChatEvent =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "model"; id: string; label: string; reason?: "image" | "fallback" }
-  | { type: "error"; message: string; code?: string | number }
+  | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name: string; result: string }
-  | { type: "confirmation_required"; callId: string; name: string; input: Record<string, unknown>; description: string; impact?: { highRisk: boolean; target: string; count: number } }
+  | {
+      type: "confirmation_required";
+      callId: string;
+      name: string;
+      input: Record<string, unknown>;
+      description?: string;
+      descriptionToken?: LocalizedToken;
+      impact?: { highRisk: boolean; target: string; count: number };
+    }
   | { type: "confirmation_response"; callId: string; confirmed: boolean }
   | { type: "table"; table: ChatTableView }
   | { type: "file"; file: ChatFileRef }
   | { type: "chart"; chart: ChatChartView }
   /** P2 异步：该会话已有任务在后台执行，本连接为进度回放（重连/并发保护语义） */
-  | { type: "task_running"; taskId: string; startedAt: number; note?: string }
+  | { type: "task_running"; taskId: string; startedAt: number; note?: string; noteToken?: LocalizedToken }
   | { type: "done" };

@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { getUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 
 const uiLocale = getUiLocale();
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const root = ref<HTMLElement | null>(null);
 const open = ref(false);
 
@@ -52,12 +54,12 @@ onBeforeUnmount(() => {
       aria-haspopup="listbox"
       @click="toggleOpen"
     >
-      <span class="sr-only">UI language</span>
+      <span class="sr-only">{{ tx("界面语言", "UI language", "Idioma da interface", "इंटरफ़ेस भाषा") }}</span>
       <span class="locale-value">{{ currentOption?.label }}</span>
       <span class="locale-caret" aria-hidden="true"></span>
     </button>
     <div v-if="open" class="locale-menu-wrap">
-      <ul class="locale-menu" role="listbox" aria-label="UI language">
+      <ul class="locale-menu" role="listbox" :aria-label="tx('界面语言', 'UI language', 'Idioma da interface', 'इंटरफ़ेस भाषा')">
         <li v-for="item in options" :key="item.value">
           <button
             type="button"

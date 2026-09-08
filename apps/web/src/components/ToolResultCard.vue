@@ -7,6 +7,7 @@
  */
 import { computed, ref } from "vue";
 import { getUiLocale } from "../ui-locale";
+import { presentToolLabel, presentToolResult } from "../tool-result-presenter";
 
 const props = defineProps<{
   name: string;
@@ -30,8 +31,10 @@ function toggle() {
 }
 
 /** 提取可读摘要：去掉 UI_TABLE/【表格输出】等结构标记，取前 160 字符 */
+const displayResult = computed(() => presentToolResult(props.name, props.result || "", uiLocale.value));
+
 const summary = computed(() => {
-  const raw = props.result || "";
+  const raw = displayResult.value;
   let s = raw
     .replace(/^UI_TABLE\n[\s\S]*?\n(?:\n|$)/, "")
     .replace(/^UI_FILE\n[\s\S]*?\n(?:\n|$)/, "")
@@ -40,26 +43,11 @@ const summary = computed(() => {
     .trim();
   s = s.replace(/\s+/g, " ").trim();
   // 摘要过长时不再展示截断的残文（尤其中途断掉的 JSON 无意义），改为占位提示，完整内容点击展开查看
-  if (s.length > 160) return tx("(内容较长，点击展开查看完整结果)", "(Long content, expand to view full result)");
-  return s || tx("(空结果)", "(Empty result)");
+  if (s.length > 160) return tx("(内容较长，点击展开查看完整结果)", "(Long content, expand to view full result)", "(Conteudo longo, expanda para ver o resultado completo)", "(सामग्री लंबी है, पूरा परिणाम देखने के लिए विस्तार करें)");
+  return s || tx("(空结果)", "(Empty result)", "(Resultado vazio)", "(खाली परिणाम)");
 });
 
-const toolLabel = computed(() => {
-  const names: Record<string, { zh: string; en: string }> = {
-    call_api: { zh: "接口调用", en: "API Call" },
-    search_api_module: { zh: "检索接口", en: "Search API" },
-    read_api_module: { zh: "读取接口源码", en: "Read API Source" },
-    read_file: { zh: "读取文件", en: "Read File" },
-    grep_codebase: { zh: "检索代码", en: "Search Code" },
-    normalize_output: { zh: "字段对齐", en: "Normalize Output" },
-    render_table: { zh: "渲染表格", en: "Render Table" },
-    get_list_columns: { zh: "读取列定义", en: "Read Columns" },
-    submit_understood_intent: { zh: "意图理解", en: "Intent Understanding" },
-    parse_intent: { zh: "规则校验", en: "Rule Validation" },
-  };
-  const item = names[props.name];
-  return item ? (uiLocale.value === "en" ? item.en : item.zh) : props.name;
-});
+const toolLabel = computed(() => presentToolLabel(props.name, uiLocale.value));
 </script>
 
 <template>
@@ -75,7 +63,7 @@ const toolLabel = computed(() => {
       <span class="tool-card__summary">{{ summary }}</span>
       <span class="tool-card__toggle" aria-hidden="true">{{ expanded ? "▾" : "▸" }}</span>
     </button>
-    <pre v-if="expanded" class="tool-card__body">{{ result }}</pre>
+    <pre v-if="expanded" class="tool-card__body">{{ displayResult }}</pre>
   </div>
 </template>
 

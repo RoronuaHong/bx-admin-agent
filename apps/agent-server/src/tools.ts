@@ -56,6 +56,7 @@ import { defaultClarificationPolicyPath, defaultFieldMappingPath } from "./agent
 import { searchDingtalkDoc, type SearchDingtalkDocInput } from "./tools/dingtalk-doc.js";
 import { formatSearchResults, searchKnowledgeBase } from "./tools/knowledge-base.js";
 import { searchSymbol } from "./symbol-index.js";
+import { errorTokenResult, okTokenResult } from "./tool-result-contract.js";
 // 工具参数里常有局部变量 path；勿与 node:path 同名，否则 TDZ（Cannot access 'path2' before initialization）
 
 
@@ -897,17 +898,17 @@ function checkApiHost(url: string): string | null {
   try {
     parsed = new URL(url);
   } catch {
-    return "错误：URL 格式无效；请提供完整的 http/https URL（如 http://localhost:3100/api/...）";
+    return errorTokenResult("TOOL_CALL_API_INVALID_URL");
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return "错误：协议不支持；call_api 仅支持 http/https 协议";
+    return errorTokenResult("TOOL_CALL_API_UNSUPPORTED_PROTOCOL");
   }
   const allowed = config.allowedApiHosts;
   if (allowed.length > 0) {
     const host = parsed.host; // 含端口，如 localhost:3100
     const hostname = parsed.hostname; // 不含端口
     if (!allowed.some((h) => h === host || h === hostname)) {
-      return `错误：目标主机 ${host} 不在白名单内；请在 ALLOWED_API_HOSTS 中添加（当前白名单：${allowed.join(", ")}）`;
+      return errorTokenResult("TOOL_CALL_API_HOST_NOT_ALLOWED", { host });
     }
   }
   return null;
@@ -941,7 +942,14 @@ interface ClarificationPayload {
   intent: string;
   missingSlots: string[];
   question: string;
-  options: Array<{ label: string; value: string }>;
+  questionCode?: string;
+  questionParams?: Record<string, string | number | boolean | null>;
+  options: Array<{
+    label: string;
+    value: string;
+    labelCode?: string;
+    labelParams?: Record<string, string | number | boolean | null>;
+  }>;
   riskLevel: "read" | "write";
   resumeTool: "call_api";
   resumeInput: Record<string, unknown>;
@@ -1232,6 +1240,8 @@ export async function execCallApi(
         intent: "调用业务接口",
         missingSlots: ["module"],
         question: `你要操作哪个模块？「${operation}」匹配到以下候选：`,
+        questionCode: "CLARIFY_OPERATION_MATCH_CANDIDATES",
+        questionParams: { operation },
         options,
         riskLevel: method === "GET" ? "read" : "write",
         resumeTool: "call_api",
@@ -1244,8 +1254,10 @@ export async function execCallApi(
       missingSlots: ["module"],
       question: `未能识别「${operation}」对应的模块，请确认你要操作的业务模块：`,
       options: [
-        { label: "按模块检索", value: "__search__" },
+        { label: "按模块检索", value: "__search__", labelCode: "CLARIFY_OPTION_SEARCH_BY_MODULE" },
       ],
+      questionCode: "CLARIFY_OPERATION_MODULE_UNKNOWN",
+      questionParams: { operation },
       riskLevel: method === "GET" ? "read" : "write",
       resumeTool: "call_api",
       resumeInput: { ...input, method, params },
@@ -1265,17 +1277,18 @@ export async function execCallApi(
         "已理解你的业务意图，但还缺可调用的接口操作名。请补充：要查的是哪个菜单下的列表/详情，" +
         "或直接给出「模块名+操作」（格式 module.func，如 <模块>.getList），由你确认后重试。",
       options: [
-        { label: "按模块名重新检索后重试", value: "search_api_module" },
-        { label: "直接调用列表接口（module.getList）", value: "list" },
-        { label: "直接调用详情接口（module.getById）", value: "detail" },
+        { label: "按模块名重新检索后重试", value: "search_api_module", labelCode: "CLARIFY_OPTION_RETRY_MODULE_SEARCH" },
+        { label: "直接调用列表接口（module.getList）", value: "list", labelCode: "CLARIFY_OPTION_CALL_LIST" },
+        { label: "直接调用详情接口（module.getById）", value: "detail", labelCode: "CLARIFY_OPTION_CALL_DETAIL" },
       ],
+      questionCode: "CLARIFY_OPERATION_NAME_REQUIRED",
       riskLevel: method === "GET" ? "read" : "write",
       resumeTool: "call_api",
       resumeInput: { ...input, method, params },
     });
   }
   if (policy.guards.denyUnknownOperation && !resolvedOp && operation) {
-    return `错误：operation 不在索引中：${operation}`;
+    return errorTokenResult("TOOL_CALL_API_UNKNOWN_OPERATION", { operation });
   }
   // 2026-08-25 彻底去参数别名：paramAliases 已随 project-aliases.json 删除（全交给大模型），
   // 参数名由模型按 api-interface-routing skill 读接口源码后直接填 call_api.params，不做任何映射。
@@ -1304,12 +1317,12 @@ export async function execCallApi(
           apiPath = guessedOp.path;
           if (guessedOp.method) method = guessedOp.method.toUpperCase();
         } else {
-          return `错误：path ${apiPath} 未在接口索引中登记；请改用 operation 调用，或先更新 api-operation-index.json`;
+          return errorTokenResult("TOOL_CALL_API_PATH_NOT_INDEXED", { path: apiPath });
         }
       }
     }
     if (!opts.country) {
-      return "错误：未获取登录国家线；请重新登录后再调用接口";
+      return errorTokenResult("AUTH_SESSION_EXPIRED");
     }
 
     // ⚠️【临时只读模式】apiPath 分支写操作拦截（置于 mock 分支前，真实与 mock 语义一致）：
@@ -1333,8 +1346,8 @@ export async function execCallApi(
     const baseUrl = resolveBaseUrl(opts.country, base, apiEnvironment);
     if (!baseUrl) {
       return apiEnvironment === "prod"
-        ? `错误：生产环境未配置 ${base} 地址；请在服务端设置 COUNTRY_<ID>_PROD_*_URL（当前环境=prod）`
-        : `错误：当前国家线未配置 ${base} 地址；请在服务端 COUNTRY_* 环境变量中配置`;
+        ? errorTokenResult("TOOL_CALL_API_BASE_URL_MISSING_PROD", { base })
+        : errorTokenResult("TOOL_CALL_API_BASE_URL_MISSING", { base });
     }
     const fullUrl = `${baseUrl}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`;
     const hostErr = checkApiHost(fullUrl);
@@ -1384,7 +1397,7 @@ export async function execCallApi(
       }
       return resultText;
     } catch (e) {
-      return `错误：请求失败；${(e as Error).message}`;
+      return errorTokenResult("TOOL_CALL_API_REQUEST_FAILED", undefined, { detail: (e as Error).message });
     }
   }
 
@@ -1399,10 +1412,11 @@ export async function execCallApi(
       missingSlots: ["path_or_url"],
       question: "你希望我按哪种方式调用接口？",
       options: [
-        { label: "提供 operation（推荐）", value: "operation" },
-        { label: "提供 path + base", value: "path_base" },
-        { label: "提供完整 url", value: "url" },
+        { label: "提供 operation（推荐）", value: "operation", labelCode: "CLARIFY_OPTION_PROVIDE_OPERATION" },
+        { label: "提供 path + base", value: "path_base", labelCode: "CLARIFY_OPTION_PROVIDE_PATH_BASE" },
+        { label: "提供完整 url", value: "url", labelCode: "CLARIFY_OPTION_PROVIDE_URL" },
       ],
+      questionCode: "CLARIFY_CALL_STYLE_REQUIRED",
       riskLevel: method === "GET" ? "read" : "write",
       resumeTool: "call_api",
       resumeInput: { ...input, method, params },
@@ -1456,12 +1470,12 @@ export async function execCallApi(
     const hint = url.startsWith("https://") && /\.xxbbc\.com/i.test(url)
       ? "；内网域名请改用 path+base 或 http:// 协议"
       : "";
-    return `错误：请求失败；${msg}${hint}；请检查目标服务是否可达`;
+    return errorTokenResult("TOOL_CALL_API_REQUEST_FAILED", undefined, { detail: `${msg}${hint}` });
   }
 
   const text = await response.text();
   if (!response.ok) {
-    return `错误：HTTP ${response.status}；${text.slice(0, 500)}`;
+    return errorTokenResult("TOOL_CALL_API_HTTP_ERROR", { status: response.status }, { detail: text.slice(0, 500) });
   }
 
   await appendOperationLog({
@@ -1501,10 +1515,10 @@ function grepSingleFile(pattern: string, file: string, maxResults: number): stri
     for (let i = 0; i < lines.length && hits.length < maxResults; i++) {
       if (re.test(lines[i])) hits.push(`${file}:${i + 1}:${lines[i].slice(0, 200)}`);
     }
-    if (!hits.length) return `未找到匹配 "${pattern}" 的结果（文件: ${file}）`;
+    if (!hits.length) return okTokenResult("TOOL_GREP_NO_MATCH_FILE", { pattern, file }, { noResults: true, pattern, file });
     return `搜索关键词: ${pattern}\n文件: ${file}\n结果 ${hits.length} 条:\n\n` + hits.join("\n");
   } catch (err: unknown) {
-    return `错误：读取文件失败；${(err as Error).message}`;
+    return errorTokenResult("TOOL_GREP_READ_FILE_FAILED", undefined, { detail: (err as Error).message });
   }
 }
 
@@ -1579,40 +1593,48 @@ export async function runAgentTool(
   if (name === "set_project") {
     const projectKey = String(input.projectKey || "").trim();
     const projectLabel = String(input.projectLabel || "").trim();
-    if (!projectKey || !projectLabel) return "错误：参数缺失；projectKey 和 projectLabel 均为必填；请传入项目标识和展示名";
+    if (!projectKey || !projectLabel) return errorTokenResult("TOOL_SET_PROJECT_MISSING_FIELDS");
     // P2 多项目 ACL：项目必须在注册表内；allowOwners 配置时仅名单内操作者可切换
     //（未配置 = 开放）。判定先于会话写入，拒绝时不产生任何副作用。
     const cfg = getProjectConfig(projectKey);
-    if (!cfg) return `错误：未知项目标识 ${projectKey}；可用项目清单见澄清策略配置`;
+    if (!cfg) return errorTokenResult("TOOL_SET_PROJECT_UNKNOWN", { projectKey });
     if (!projectAccessibleBy(cfg, opts.ownerKey)) {
-      return `错误：当前账号无权访问该项目（${projectKey}）；如需开通请联系管理员在项目配置的 allowOwners 中加入该账号`;
+      return errorTokenResult("TOOL_SET_PROJECT_FORBIDDEN", { projectKey });
     }
     const sid = opts.sessionId;
-    if (!sid) return "错误：无法读取会话 ID；请重新登录";
+    if (!sid) return errorTokenResult("AUTH_SESSION_EXPIRED");
     const ok = setActiveProject(sid, { key: projectKey, label: cfg.label || projectLabel, setAt: Date.now() });
-    if (!ok) return "错误：会话不存在；请重新登录";
-    return `已切换全局项目上下文：${cfg.label || projectLabel}（${projectKey}）。后续所有请求均默认在此项目范围内执行，无需重复声明。`;
+    if (!ok) return errorTokenResult("AUTH_SESSION_EXPIRED");
+    return okTokenResult("TOOL_SET_PROJECT_OK", { projectKey, projectLabel: cfg.label || projectLabel }, {
+      project: { key: projectKey, label: cfg.label || projectLabel },
+    });
   }
 
   if (name === "write_code_file") {
     const rawPath = String(input.path || "").trim();
     const content = String(input.content ?? "");
-    if (!rawPath) return "错误：参数缺失；path 为必填参数";
-    if (content.length > 1024 * 1024) return "错误：文件内容超过 1MB，禁止写入";
+    if (!rawPath) return errorTokenResult("TOOL_WRITE_FILE_MISSING_PATH");
+    if (content.length > 1024 * 1024) return errorTokenResult("TOOL_WRITE_FILE_TOO_LARGE");
     const res = resolveCodebasePath(rawPath);
     if (!res.ok) return res.error;
     try {
       mkdirSync(nodePath.dirname(res.full), { recursive: true });
       writeFileSync(res.full, content, "utf8");
-      return `已写入 ${res.full.replace(/\\/g, "/")}（${content.length} 字符）`;
+      return okTokenResult("TOOL_WRITE_FILE_OK", {
+        path: res.full.replace(/\\/g, "/"),
+        charCount: content.length,
+      }, {
+        path: res.full.replace(/\\/g, "/"),
+        charCount: content.length,
+      });
     } catch (e: unknown) {
-      return `错误：写入失败；${(e as Error).message}`;
+      return errorTokenResult("TOOL_WRITE_FILE_FAILED", undefined, { detail: (e as Error).message });
     }
   }
 
   if (name === "git_commit_push") {
     const message = String(input.message || "").trim();
-    if (!message) return "错误：参数缺失；message（提交信息）为必填参数";
+    if (!message) return errorTokenResult("TOOL_GIT_COMMIT_MISSING_MESSAGE");
     const root = resolveCodebaseRoot();
     const branch = String(input.branch || "").trim();
     const push = input.push !== false;
@@ -1626,7 +1648,7 @@ export async function runAgentTool(
       // 避免先 checkout 出本地 master 分支造成副作用。
       const targetBranch = branch || curBranch;
       if ((targetBranch === "master" || targetBranch === "main") && !allowMaster) {
-        return "错误：禁止直接提交/推送生产分支 master/main；请先切换到 dev 或功能分支（确需推生产请显式 allowMaster=true 并二次确认）";
+        return errorTokenResult("TOOL_GIT_COMMIT_PROTECTED_BRANCH");
       }
       let cur = curBranch;
       if (branch && branch !== cur) {
@@ -1636,13 +1658,13 @@ export async function runAgentTool(
           try {
             sh(["checkout", "-B", branch, `origin/${branch}`]);
           } catch {
-            return `错误：分支 ${branch} 本地与远程均不存在，无法切换`;
+            return errorTokenResult("TOOL_GIT_BRANCH_NOT_FOUND", { branch });
           }
         }
         cur = branch;
       }
       const status = sh(["status", "--porcelain"]);
-      if (!status) return `提交跳过：${root} 无任何改动`;
+      if (!status) return okTokenResult("TOOL_GIT_COMMIT_NO_CHANGES", { root }, { root });
       sh(["add", "-A"]);
       let identity: string[] = [];
       try {
@@ -1657,11 +1679,22 @@ export async function runAgentTool(
       const files = status.split("\n").slice(0, 30).map((l) => `  ${l}`).join("\n");
       if (push) {
         sh(["push", "origin", cur]);
-        return `已提交并推送 ${cur} @ ${head}：${message}\n改动文件：\n${files}`;
+        return okTokenResult("TOOL_GIT_COMMIT_PUSH_OK", { branch: cur, sha: head }, {
+          branch: cur,
+          sha: head,
+          commitMessage: message,
+          files: files.split("\n").filter(Boolean),
+        });
       }
-      return `已提交 ${cur} @ ${head}：${message}（push=false 未推送）\n改动文件：\n${files}`;
+      return okTokenResult("TOOL_GIT_COMMIT_OK", { branch: cur, sha: head }, {
+        branch: cur,
+        sha: head,
+        commitMessage: message,
+        pushed: false,
+        files: files.split("\n").filter(Boolean),
+      });
     } catch (e: unknown) {
-      return `错误：git 操作失败；${(e as Error).message}`;
+      return errorTokenResult("TOOL_GIT_COMMIT_FAILED", undefined, { detail: (e as Error).message });
     }
   }
 
@@ -1669,13 +1702,13 @@ export async function runAgentTool(
     const domain = String(input.domain || "").trim();
     const project = input.project ? String(input.project).trim() : undefined;
     const environment = input.environment ? String(input.environment).trim() : "test";
-    if (!domain) return "错误：参数缺失；domain 为必填（可选值见工具描述）";
+    if (!domain) return errorTokenResult("TOOL_ROUTE_WORKER_MISSING_DOMAIN");
     const worker = resolveWorker(domain, project, environment);
     if (!worker) {
       const available = DEFAULT_WORKERS.map(
         (w) => `${w.id}(${w.domain}${w.project ? "/" + w.project : ""}${w.environment ? "/" + w.environment : ""})`,
       ).join(", ");
-      return `未找到匹配 Worker（domain=${domain} project=${project ?? "-"} env=${environment}）。已注册：${available}`;
+      return errorTokenResult("TOOL_ROUTE_WORKER_NOT_FOUND", { domain, project: project ?? "-", environment }, { available });
     }
     // 会话级持久化：环境 + worker id（跨用户轮次恢复；与 activeProject 同生命周期）
     if (opts.sessionId) {
@@ -1687,15 +1720,20 @@ export async function runAgentTool(
       }
     }
     const envNote = worker.environment ? ` environment=${worker.environment}` : "";
-    return (
-      `已切换到 Worker「${worker.label}」（id=${worker.id}${envNote}）。` +
-      `后续工具调用将限定在该 Worker 上下文（工具子集 + 领域提示）。\n[ACTIVE_WORKER:${worker.id}]`
-    );
+    return okTokenResult("TOOL_ROUTE_WORKER_OK", {
+      workerLabel: worker.label,
+      workerId: worker.id,
+      environment: worker.environment || environment,
+    }, {
+      activeWorker: worker.id,
+      marker: `[ACTIVE_WORKER:${worker.id}]`,
+      note: envNote.trim(),
+    });
   }
 
   if (name === "parse_intent") {
     const userInput = String(input.userInput || "").trim();
-    if (!userInput) return "错误：参数缺失；userInput 为必填参数";
+    if (!userInput) return errorTokenResult("TOOL_PARSE_INTENT_MISSING_INPUT");
 
     // 从 session 读取已有的全局项目上下文（superpower 层：跨轮记忆）
     const sid = opts.sessionId;
@@ -1776,6 +1814,7 @@ export async function runAgentTool(
         intent: "解析用户意图",
         missingSlots: ["project"],
         question: "你要操作哪个项目？",
+        questionCode: "CLARIFY_PROJECT_REQUIRED",
         options: optionsList,
         riskLevel: "read",
         resumeTool: "call_api",
@@ -1821,7 +1860,9 @@ export async function runAgentTool(
           intent: "解析用户意图",
           missingSlots: ["module"],
           question: `未找到模块「${understoodModule}」对应的接口，请确认你要操作哪个模块？`,
-          options: [{ label: "查询类", value: "read" }],
+          questionCode: "CLARIFY_UNDERSTOOD_MODULE_NOT_FOUND",
+          questionParams: { module: understoodModule },
+          options: [{ label: "查询类", value: "read", labelCode: "CLARIFY_OPTION_READ" }],
           riskLevel: "read",
           resumeTool: "call_api",
           resumeInput: { _pendingInput: userInput, project: resolvedProject },
@@ -1837,7 +1878,8 @@ export async function runAgentTool(
         intent: "解析用户意图",
         missingSlots: ["module"],
         question: "你要操作哪个模块？",
-        options: [{ label: "查询类", value: "read" }],
+        questionCode: "CLARIFY_MODULE_REQUIRED",
+        options: [{ label: "查询类", value: "read", labelCode: "CLARIFY_OPTION_READ" }],
         riskLevel: "read",
         resumeTool: "call_api",
         resumeInput: { _pendingInput: userInput, project: resolvedProject },
@@ -1880,7 +1922,8 @@ export async function runAgentTool(
           intent: "解析用户意图",
           missingSlots: ["module"],
           question: "你要操作哪个模块？",
-          options: [{ label: "查询类", value: "read" }],
+          questionCode: "CLARIFY_MODULE_REQUIRED",
+          options: [{ label: "查询类", value: "read", labelCode: "CLARIFY_OPTION_READ" }],
           riskLevel: "read",
           resumeTool: "call_api",
           resumeInput: { _pendingInput: userInput, project: resolvedProject },
@@ -1893,7 +1936,9 @@ export async function runAgentTool(
         intent: "解析用户意图",
         missingSlots: ["operation"],
         question: `你想对「${resolvedProjectLabel}」做什么操作？`,
-        options: [{ label: "查询 / 查看详情 / 列表", value: "read" }],
+        questionCode: "CLARIFY_PROJECT_OPERATION_REQUIRED",
+        questionParams: { project: resolvedProjectLabel },
+        options: [{ label: "查询 / 查看详情 / 列表", value: "read", labelCode: "CLARIFY_OPTION_READ_LIST_DETAIL" }],
         riskLevel: "read",
         resumeTool: "call_api",
         resumeInput: { _pendingInput: userInput, project: resolvedProject },
@@ -1956,8 +2001,8 @@ export async function runAgentTool(
     }
     const fieldsFilter = Array.isArray(input.fields) ? input.fields.map((f) => String(f)) : null;
 
-    if (!moduleName) return "错误：参数缺失；module 为必填参数；请传入业务模块名（如 <模块>）";
-    if (rawData === undefined || rawData === null) return "错误：参数缺失；data 为必填参数；请传入 API 原始返回数据";
+    if (!moduleName) return errorTokenResult("TOOL_NORMALIZE_OUTPUT_MISSING_MODULE");
+    if (rawData === undefined || rawData === null) return errorTokenResult("TOOL_NORMALIZE_OUTPUT_MISSING_DATA");
 
     try {
       // 读取字段映射配置（superpower 层）
@@ -2010,12 +2055,12 @@ export async function runAgentTool(
 
       return `[已对齐 PC 端字段 - 模块: ${moduleName}]\n${JSON.stringify(normalized, null, 2)}`;
     } catch (err: unknown) {
-      return `错误：normalize_output 执行失败；${(err as Error).message}`;
+      return errorTokenResult("TOOL_NORMALIZE_OUTPUT_FAILED", undefined, { detail: (err as Error).message });
     }
   }
   if (name === "grep_codebase") {
     const pattern = String(input.pattern || "").trim();
-    if (!pattern) return "错误：参数缺失；pattern 为必填参数；请传入要搜索的关键词或正则";
+    if (!pattern) return errorTokenResult("TOOL_GREP_MISSING_PATTERN");
     const maxResults = Number(input.maxResults || 40);
     const root = resolveCodebaseRoot();
     const rawDir = String(input.dir || root).trim();
@@ -2040,27 +2085,27 @@ export async function runAgentTool(
         output = grepCodebaseNative(pattern, searchDir, fileGlob, maxResults);
       }
       const lines = output.split("\n").filter(Boolean);
-      if (!lines.length) return `未找到匹配 "${pattern}" 的结果（搜索目录: ${searchDir}）`;
+      if (!lines.length) return okTokenResult("TOOL_GREP_NO_MATCH_DIR", { pattern, dir: searchDir }, { noResults: true, pattern, dir: searchDir });
       const truncated = lines.slice(0, maxResults);
       const note = lines.length > maxResults ? `\n（共 ${lines.length} 条，已截断至 ${maxResults} 条，可缩小 fileGlob 或 dir 精确搜索）` : "";
       return `搜索关键词: ${pattern}\n目录: ${searchDir}\n结果 ${truncated.length} 条:\n\n` + truncated.join("\n") + note;
     } catch (err: unknown) {
-      return `错误：grep_codebase 执行失败；${(err as Error).message}；请确认 rg（ripgrep）已安装`;
+      return errorTokenResult("TOOL_GREP_FAILED", undefined, { detail: (err as Error).message });
     }
   }
   if (name === "search_symbol") {
     const query = String(input.query || "").trim();
-    if (!query) return "错误：参数缺失；query 为必填参数（函数名片段/中文动作/URL 片段/模块名）";
+    if (!query) return errorTokenResult("TOOL_SEARCH_SYMBOL_MISSING_QUERY");
     const limit = Number(input.limit || 8);
     try {
       return searchSymbol(query, limit);
     } catch (err: unknown) {
-      return `错误：search_symbol 执行失败；${(err as Error).message}；可改用 grep_codebase 做文本检索`;
+      return errorTokenResult("TOOL_SEARCH_SYMBOL_FAILED", undefined, { detail: (err as Error).message });
     }
   }
   if (name === "search_api_module") {
     const query = String(input.query || "").trim();
-    if (!query) return "错误：参数缺失；query 为必填参数；请传入业务模块名";
+    if (!query) return errorTokenResult("TOOL_SEARCH_API_MODULE_MISSING_QUERY");
     // 方案 A（2026-08-22）：模块定位以「实时 grep 源码」为主，不再强依赖索引。
     // 模型从 PC 端源码（bx-film-admin-in2）直接理解模块与接口的对应关系（近义词/别名由模型语义判断），
     // 避免索引快照过期/缺别名导致定位失败（如「影片采集员」在索引里只有「影片采集源」）。
@@ -2199,11 +2244,11 @@ export async function runAgentTool(
     if (grepResults.length) {
       return `[源码定位]「${query}」在 PC 端源码命中：\n\n${grepResults.join("\n\n")}\n\n建议：用 read_api_module 读取接口源码（返回完整函数名与参数），确认后直接 call_api；不要 grep / list_dir 反复绕路。`;
     }
-    return `未找到与「${query}」匹配的模块：业务源码（src/api、src/views、src/router）中未直接命中该关键词，索引中亦无对应术语。请换更准确的关键词，或说明业务场景；也可以用 grep_codebase 在 src 下精确搜索。`;
+    return errorTokenResult("TOOL_SEARCH_API_MODULE_NOT_FOUND", { query });
   }
   if (name === "read_api_module") {
     const moduleParam = String(input.module || "").trim();
-    if (!moduleParam) return "错误：参数缺失；module 为必填参数；可传模块名或接口文件相对路径";
+    if (!moduleParam) return errorTokenResult("TOOL_READ_API_MODULE_MISSING_MODULE");
 
     const apiDir = process.env.API_MODULE_DIR || nodePath.join(resolveCodebaseRoot(), "src", "api");
     const tokens = moduleParam.split(",").map((m) => m.trim()).filter(Boolean);
@@ -2369,13 +2414,13 @@ export async function runAgentTool(
   if (name === "fetch_url") {
     const url = String(input.url || "").trim();
     if (!/^https?:\/\//i.test(url)) {
-      return "错误：参数无效；url 必须以 http:// 或 https:// 开头；请确认链接格式后重试";
+      return errorTokenResult("TOOL_FETCH_URL_INVALID");
     }
     const result = await fetchLink(url);
     if (typeof result === "string") {
       if (result.startsWith("抓取失败")) {
         const reason = result.replace(/^抓取失败[:：]?\s*/, "");
-        return `错误：抓取失败；${reason}；请检查 URL 是否正确、目标是否可达，或改用 fetch_url 抓取其他链接`;
+        return errorTokenResult("TOOL_FETCH_URL_FAILED", undefined, { detail: reason });
       }
       return `抓取结果：${result}`;
     }
@@ -2388,37 +2433,40 @@ export async function runAgentTool(
   if (name === "search_knowledge_base") {
     // 本地知识库检索（方案 B）：docs/knowledge/ 下的文档，混合检索（词法 TF-IDF + embedding 语义 RRF 融合）+ 引用出处。
     const query = String(input.query || "").trim();
-    if (!query) return "错误：参数缺失；query（搜索关键词或问题）为必填";
+    if (!query) return errorTokenResult("TOOL_SEARCH_KB_MISSING_QUERY");
     const maxResults = Math.min(Math.max(Number(input.maxResults) || 5, 1), 10);
     const results = await searchKnowledgeBase(query, maxResults);
     return formatSearchResults(results, query);
   }
   if (name === "update_user_preference") {
     if (!opts.ownerKey) {
-      return "错误：无法识别当前用户，偏好未保存";
+      return errorTokenResult("TOOL_PREF_NO_OWNER");
     }
     const key = String(input.key || "").trim();
     const result = updateUserPreference(opts.ownerKey, key, input.value);
-    if (!result.ok) return `错误：${result.error}`;
+    if (!result.ok) return errorTokenResult("TOOL_PREF_SAVE_FAILED", undefined, { detail: result.error });
     return JSON.stringify({
+      ok: true,
+      _i18n: { code: "TOOL_PREF_SAVED", params: { key } },
       saved: true,
       preferences: {
         replyLanguage: result.prefs.replyLanguage ?? null,
         updatedAt: result.prefs.updatedAt,
       },
-      hint: "偏好已持久化，后续会话自动生效。面向用户说明时遵守新偏好。",
-    });
+    }, null, 2);
   }
   if (name === "get_user_preferences") {
     if (!opts.ownerKey) {
-      return "错误：无法识别当前用户";
+      return errorTokenResult("TOOL_PREF_NO_OWNER");
     }
     const prefs = loadUserPreferences(opts.ownerKey);
     return JSON.stringify({
+      ok: true,
+      _i18n: { code: "TOOL_PREF_READ" },
       replyLanguage: prefs.replyLanguage ?? null,
       updatedAt: prefs.updatedAt || null,
-      guide: formatUserPrefsGuide(prefs),
-    });
+      guideCode: "TOOL_PREF_GUIDE",
+    }, null, 2);
   }
   if (name === "get_current_time") {
     // 通用时间能力工具（2026-08-26，对齐 Claude Code「模型自查环境时间」机制）：返回服务器当前日期/时间，
@@ -2464,11 +2512,11 @@ export async function runAgentTool(
   }
   const filePath = String(input.path || "").trim();
   if (!filePath) {
-    return "错误：参数缺失；path 为必填参数；请提供文件或目录的本地绝对路径（如 D:\\Code\\project）";
+    return errorTokenResult("TOOL_READ_LOCAL_MISSING_PATH");
   }
   const result = resolveLocalDoc(filePath);
   if ("note" in result) {
     return `[${result.note.label}]\n${result.note.text}`;
   }
-  return `错误：读取失败；${result.error}；请检查路径是否正确，或先用 list_dir 浏览目录结构确认路径`;
+  return errorTokenResult("TOOL_READ_LOCAL_FAILED", undefined, { detail: result.error });
 }

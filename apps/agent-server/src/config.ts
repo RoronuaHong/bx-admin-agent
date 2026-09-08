@@ -15,7 +15,6 @@ export function listCountries(): CountryConfig[] {
   return [
     readCountry("india", "INDIA"),
     readCountry("brazil", "BRAZIL"),
-    readCountry("mexico", "MEXICO"),
   ].filter((item): item is CountryConfig => Boolean(item));
 }
 
@@ -153,6 +152,16 @@ export const config = {
   // Trace 门户权限白名单；空=允许所有已登录用户查看。
   get traceAllowedOwners(): string[] {
     const raw = process.env.TRACE_ALLOWED_OWNERS || "";
+    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  },
+  // Trace 门户权限黑名单；命中后优先拒绝。
+  get traceDeniedOwners(): string[] {
+    const raw = process.env.TRACE_DENIED_OWNERS || "";
+    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  },
+  // Trace 门户国家线白名单；空=不按国家线收紧。
+  get traceAllowedCountries(): string[] {
+    const raw = process.env.TRACE_ALLOWED_COUNTRIES || "";
     return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
   },
   // OCR 转录器：本地 ollama 视觉模型

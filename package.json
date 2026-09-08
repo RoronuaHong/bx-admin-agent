@@ -6,10 +6,11 @@
     "dev": "pnpm --parallel --filter @bx/agent-server --filter @bx/web dev",
     "dev:server": "pnpm --filter @bx/agent-server dev",
     "dev:web": "pnpm --filter @bx/web dev",
-    "test": "pnpm --filter @bx/agent-server test",
+    "test": "pnpm --filter @bx/agent-server test && pnpm --filter @bx/web test",
     "eval": "pnpm --filter @bx/agent-server eval",
     "eval:core": "pnpm --filter @bx/agent-server eval:core",
     "eval:full": "pnpm --filter @bx/agent-server eval:full",
+    "eval:ui-locale": "pnpm --filter @bx/agent-server eval:ui-locale",
     "eval:trace-gate": "pnpm --filter @bx/agent-server eval:trace-gate",
     "build": "pnpm --filter @bx/web build"
   }

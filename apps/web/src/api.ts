@@ -1,4 +1,15 @@
 import type { TableView, ChatFileRef, ChartView } from "./types";
+import type { PortalEntries, TraceAccessSource } from "./portal-permissions";
+
+export interface LocalizedToken {
+  code: string;
+  params?: Record<string, string | number | boolean | null>;
+  defaultMessage?: string;
+}
+
+export interface ApiErrorPayload {
+  error: LocalizedToken;
+}
 
 export interface Country {
   id: string;
@@ -10,7 +21,43 @@ export interface Me {
   country: Country;
   permissions: {
     canViewTrace: boolean;
-    traceAccessSource: "anonymous" | "default-login" | "owner-allowlist" | "denied-allowlist";
+    traceAccessSource: TraceAccessSource;
+    entries: PortalEntries;
+  };
+}
+
+function normalizePortalEntries(
+  entries: Partial<PortalEntries> | null | undefined,
+  canViewTrace: boolean,
+): PortalEntries {
+  return {
+    admin: entries?.admin ?? true,
+    knowledge: entries?.knowledge ?? true,
+    viewing: entries?.viewing ?? true,
+    trace: entries?.trace ?? canViewTrace,
+  };
+}
+
+function normalizeMe(data: unknown): Me {
+  const raw = (data && typeof data === "object" ? data : {}) as Partial<Me>;
+  const rawPermissions = (raw.permissions && typeof raw.permissions === "object"
+    ? raw.permissions
+    : {}) as Partial<Me["permissions"]>;
+  const canViewTrace = Boolean(rawPermissions.canViewTrace);
+  return {
+    user: {
+      loginName: String(raw.user?.loginName || ""),
+      name: String(raw.user?.name || raw.user?.loginName || ""),
+    },
+    country: {
+      id: String(raw.country?.id || ""),
+      label: String(raw.country?.label || raw.country?.id || ""),
+    },
+    permissions: {
+      canViewTrace,
+      traceAccessSource: (rawPermissions.traceAccessSource || "default-login") as TraceAccessSource,
+      entries: normalizePortalEntries(rawPermissions.entries, canViewTrace),
+    },
   };
 }
 
@@ -21,18 +68,55 @@ export type ChatEvent =
   | { type: "model"; id: string; label: string; reason?: "image" | "fallback" }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name: string; result: string }
-  | { type: "confirmation_required"; callId: string; name: string; input: Record<string, unknown>; description: string; impact?: { highRisk: boolean; target: string; count: number } }
+  | { type: "confirmation_required"; callId: string; name: string; input: Record<string, unknown>; description?: string; descriptionToken?: LocalizedToken; impact?: { highRisk: boolean; target: string; count: number } }
+  | { type: "confirmation_response"; callId: string; confirmed: boolean }
   | { type: "table"; table: TableView }
   | { type: "file"; file: ChatFileRef }
   | { type: "chart"; chart: ChartView }
-  | { type: "error"; message: string; code?: string | number }
+  | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
+  | { type: "task_running"; taskId: string; startedAt: number; note?: string; noteToken?: LocalizedToken }
   | { type: "done" };
+
+export class ApiError extends Error {
+  status?: number;
+  token?: LocalizedToken;
+  code?: string;
+  constructor(message: string, options?: { status?: number; token?: LocalizedToken; code?: string }) {
+    super(message);
+    this.name = "ApiError";
+    this.status = options?.status;
+    this.token = options?.token;
+    this.code = options?.code || options?.token?.code;
+  }
+}
+
+export function getApiErrorToken(error: unknown): LocalizedToken | undefined {
+  return error instanceof ApiError ? error.token : undefined;
+}
+
+function normalizeToken(data: unknown, fallbackCode?: string): LocalizedToken | undefined {
+  const raw = (data && typeof data === "object" ? data : {}) as Partial<LocalizedToken>;
+  const code = typeof raw.code === "string" && raw.code.trim()
+    ? raw.code.trim()
+    : fallbackCode;
+  if (!code) return undefined;
+  return {
+    code,
+    params: raw.params && typeof raw.params === "object" ? raw.params as Record<string, string | number | boolean | null> : undefined,
+    defaultMessage: typeof raw.defaultMessage === "string" ? raw.defaultMessage : undefined,
+  };
+}
 
 async function parseJson(res: Response) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error((data as { message?: string }).message || `HTTP ${res.status}`);
-    (err as Error & { status?: number }).status = res.status;
+    const payload = data as Partial<ApiErrorPayload> & { message?: string; code?: string };
+    const token = normalizeToken(payload.error, payload.code);
+    const err = new ApiError(payload.message || token?.defaultMessage || `HTTP ${res.status}`, {
+      status: res.status,
+      token,
+      code: payload.code,
+    });
     throw err;
   }
   return data;
@@ -51,7 +135,7 @@ export async function login(payload: { country: string; username: string; passwo
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return parseJson(res) as Promise<Me>;
+  return normalizeMe(await parseJson(res));
 }
 
 export async function logout() {
@@ -61,7 +145,7 @@ export async function logout() {
 export async function fetchMe(): Promise<Me | null> {
   const res = await fetch("/agent/auth/me", { credentials: "include" });
   if (res.status === 401) return null;
-  return (await parseJson(res)) as Me;
+  return normalizeMe(await parseJson(res));
 }
 
 export interface ModelInfo {
@@ -109,7 +193,7 @@ export async function fetchTaskStatus(): Promise<TaskStatusDto> {
 
 export async function streamChat(
   text: string,
-  opts: { model?: string; images?: string[]; files?: string[] },
+  opts: { model?: string; images?: string[]; files?: string[]; uiLocale?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ) {
@@ -121,10 +205,22 @@ export async function streamChat(
     signal,
   });
   console.log("[API_DIAG] fetch returned ok=", res.ok, "hasBody=", !!res.body, "status=", res.status);
-  if (res.status === 401) throw Object.assign(new Error("会话失效，请重新登录"), { status: 401 });
+  if (res.status === 401) {
+    throw new ApiError("Unauthorized", {
+      status: 401,
+      token: { code: "AUTH_SESSION_EXPIRED" },
+      code: "AUTH_SESSION_EXPIRED",
+    });
+  }
   if (!res.ok || !res.body) {
     const data = await res.json().catch(() => ({}));
-    throw new Error((data as { message?: string }).message || "请求失败");
+    const payload = data as Partial<ApiErrorPayload> & { message?: string; code?: string };
+    const token = normalizeToken(payload.error, payload.code || "CHAT_STREAM_FAILED");
+    throw new ApiError(payload.message || token?.defaultMessage || "Request failed", {
+      status: res.status,
+      token,
+      code: payload.code,
+    });
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -281,6 +377,7 @@ export interface TraceRunSummary {
   toolCalls: number;
   totalTokens: number;
   error?: string;
+  errorToken?: LocalizedToken;
 }
 
 export interface TraceRunsStats {
@@ -293,6 +390,7 @@ export interface TraceRunsStats {
   emptyRoundRate: number;
   shortCircuitRuns: number;
   degradeHint: string | null;
+  degradeHintToken?: LocalizedToken | null;
 }
 
 export interface TraceSpanDto {
@@ -307,7 +405,9 @@ export interface TraceSpanDto {
   durationMs: number;
   usage?: { totalTokens?: number; promptTokens?: number; completionTokens?: number };
   error?: string;
+  errorToken?: LocalizedToken;
   note?: string;
+  noteToken?: LocalizedToken;
   meta?: Record<string, unknown>;
 }
 

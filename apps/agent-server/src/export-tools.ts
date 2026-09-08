@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import type { ChatFileRef, ChatTableView } from "@bx/shared";
 import { saveDownload } from "./downloads.js";
 import { execRenderTable } from "./output-tools.js";
+import { errorTokenResult } from "./tool-result-contract.js";
 
 const WIN_FONTS = [
   "C:\\Windows\\Fonts\\msyh.ttc",
@@ -161,7 +162,7 @@ export async function execExportDataset(input: Record<string, unknown>): Promise
   const fileBase = String(input.filename || title).replace(/[\\/:*?"<>|]+/g, "_").slice(0, 60);
 
   let rawRows = normalizeRows(input.data ?? input.rows);
-  if (!rawRows.length) return "错误：无数据；请传入 data（数组或 {list:[]}）";
+  if (!rawRows.length) return errorTokenResult("TOOL_EXPORT_DATASET_NO_DATA");
 
   const isTree = Boolean(input.tree) || rawRows.some((r) => Array.isArray(r.children));
   const flat = isTree ? flattenTree(rawRows) : rawRows.map((r) => ({ ...r, _depth: 0 }));

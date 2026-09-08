@@ -1,7 +1,9 @@
 import type { LocalizedText } from "./localize";
+import type { PortalEntryKey } from "./portal-permissions";
 
 export type PortalCard = {
   key: string;
+  entry?: PortalEntryKey;
   title: LocalizedText;
   desc: LocalizedText;
   chip: LocalizedText;
@@ -35,6 +37,7 @@ export const PORTAL_LEAD: LocalizedText = {
 export const PORTAL_CARDS: PortalCard[] = [
   {
     key: "admin",
+    entry: "admin",
     title: { zh: "后台管理 Agent", en: "Admin Agent", pt: "Agent de Backoffice", hi: "एडमिन एजेंट" },
     desc: {
       zh: "面向运营后台的自然语言查询、工具调用与会话工作台。",
@@ -42,7 +45,7 @@ export const PORTAL_CARDS: PortalCard[] = [
       pt: "Consultas em linguagem natural, uso de ferramentas e area de trabalho para operacoes de backoffice.",
       hi: "बैकएंड ऑपरेशंस के लिए प्राकृतिक भाषा क्वेरी, टूल उपयोग और वर्कस्पेस।",
     },
-    chip: { zh: "Agent", en: "Agent" },
+    chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
     cta: {
       zh: "登录后进入",
       en: "Sign in to continue",
@@ -55,6 +58,7 @@ export const PORTAL_CARDS: PortalCard[] = [
   },
   {
     key: "knowledge",
+    entry: "knowledge",
     title: { zh: "知识库 / RAG Agent", en: "Knowledge / RAG Agent", pt: "Agent de Conhecimento / RAG", hi: "नॉलेज / RAG एजेंट" },
     desc: {
       zh: "面向知识库、制度、流程与文档检索的独立 Agent 入口，当前先展示方案与能力范围。",
@@ -62,13 +66,14 @@ export const PORTAL_CARDS: PortalCard[] = [
       pt: "Entrada independente para base de conhecimento, politicas, processos e busca documental. Esta versao apresenta o escopo e as capacidades planejadas.",
       hi: "नॉलेज बेस, नीति, प्रक्रिया और दस्तावेज़ खोज के लिए स्वतंत्र प्रवेश। यह संस्करण फिलहाल दायरा और नियोजित क्षमताएं दिखाता है।",
     },
-    chip: { zh: "Agent", en: "Agent" },
+    chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
     cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
     href: "/agents/knowledge",
     tone: "default",
   },
   {
     key: "viewing",
+    entry: "viewing",
     title: { zh: "观影助手 Agent", en: "Viewing Agent", pt: "Agent de Visualizacao", hi: "व्यूइंग एजेंट" },
     desc: {
       zh: "面向观影场景的独立 Agent 入口，当前先展示方案与能力范围。",
@@ -76,7 +81,7 @@ export const PORTAL_CARDS: PortalCard[] = [
       pt: "Entrada independente para o agente de visualizacao. Esta versao apresenta o escopo e as capacidades planejadas.",
       hi: "व्यूइंग असिस्टेंट के लिए स्वतंत्र प्रवेश। यह संस्करण फिलहाल दायरा और नियोजित क्षमताएं दिखाता है।",
     },
-    chip: { zh: "Agent", en: "Agent" },
+    chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
     cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
     href: "/agents/viewing",
     tone: "default",

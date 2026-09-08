@@ -19,6 +19,7 @@ import { truncateToolResultForUi } from "./ui-truncate.js";
 import { resolveLocalDoc } from "./sources.js";
 import { defaultFieldMappingPath } from "./agent-docs.js";
 import { getSession } from "./session.js";
+import { isToolErrorResult } from "./tool-result-contract.js";
 import type { UnderstoodIntent } from "./understood-intent.js";
 
 export type OrchestrateResult =
@@ -1019,7 +1020,7 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
     };
   }
 
-  if (api.content.startsWith("错误：")) {
+  if (isToolErrorResult(api.content)) {
     steps.push({
       kind: "system",
       text: `查询失败：${api.content.slice(0, 300)}。请核对记录是否存在或稍后重试。`,
@@ -1034,7 +1035,7 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
   let pageShape = "unknown";
   const shape = await runOrchestrateTool("get_page_schema", { module: moduleKey }, ctx, steps);
   steps = shape.steps;
-  if (!shape.content.startsWith("错误：") && !shape.content.startsWith("未识别")) {
+  if (!isToolErrorResult(shape.content) && !shape.content.startsWith("未识别")) {
     pageShape = extractPageShape(shape.content);
   }
 
@@ -1052,7 +1053,7 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
   );
   steps = normalized.steps;
 
-  if (normalized.content.startsWith("错误：")) {
+  if (isToolErrorResult(normalized.content)) {
     steps.push({
       kind: "system",
       text: `查询结果处理失败：\n${api.content.slice(0, 2000)}`,

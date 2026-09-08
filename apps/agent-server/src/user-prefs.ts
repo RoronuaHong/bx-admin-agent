@@ -21,6 +21,11 @@ export interface UserPreferences {
   version: 1;
 }
 
+export interface ReplyLanguageResolution {
+  tag: string;
+  source: "preference" | "input" | "session" | "ui";
+}
+
 function safeFileName(ownerKey: string): string {
   const raw = String(ownerKey || "").trim() || "anonymous";
   return raw.replace(/[^a-zA-Z0-9._:@-]+/g, "_").replace(/:/g, "__") + ".json";
@@ -137,7 +142,17 @@ export function formatUserPrefsGuide(prefs: UserPreferences): string {
  * staticGuide 末尾收束硬条款（recency）：压过中文系统提示与中文表头对回复语种的牵引。
  * 不写死语种词典，语种判定仍交模型。
  */
-export function formatReplyLanguageReminder(prefs: UserPreferences): string {
+export function formatReplyLanguageReminder(
+  prefs: UserPreferences,
+  resolved?: ReplyLanguageResolution,
+): string {
+  if (resolved?.tag) {
+    return (
+      `[workflow/reply-language]（收束硬条款，优先于系统提示语种与工具回喂语种）：` +
+      `面向用户的最终自然语言必须使用 ${resolved.tag}（来源=${resolved.source}）。` +
+      `工具结果、表头、字段中文映射、数据单元格语种均不得改变回复语种。`
+    );
+  }
   if (prefs.replyLanguage && prefs.replyLanguage !== "follow_input") {
     return (
       `[workflow/reply-language]（收束硬条款，优先于系统提示语种与工具回喂语种）：` +
@@ -151,6 +166,33 @@ export function formatReplyLanguageReminder(prefs: UserPreferences): string {
     `系统提示、工具名、表头、字段映射、数据单元格即使为其他语种，也不得改用语种；` +
     `结构化表格可中立展示，说明文字须跟用户输入语种。`
   );
+}
+
+export function detectReplyLanguageFromInput(userText: string): string | undefined {
+  if (/[\u0900-\u097F]/u.test(userText)) return "hi";
+  if (/[\u3400-\u9FFF\uF900-\uFAFF]/u.test(userText)) return "zh";
+  const latin = /[A-Za-z\u00C0-\u024F]/u.test(userText);
+  if (!latin) return undefined;
+  // Very short Latin snippets like "ok" or ids are too ambiguous to override session memory.
+  const letters = (userText.match(/[A-Za-z\u00C0-\u024F]/gu) || []).length;
+  return letters >= 4 ? "en" : undefined;
+}
+
+export function resolveReplyLanguage(args: {
+  prefs?: UserPreferences;
+  userText: string;
+  sessionLastReplyLanguage?: string;
+  uiLocale?: string;
+}): ReplyLanguageResolution {
+  const pref = normalizeReplyLanguage(args.prefs?.replyLanguage || "");
+  if (pref && pref !== "follow_input") return { tag: pref, source: "preference" };
+  const inputTag = detectReplyLanguageFromInput(args.userText);
+  if (inputTag) return { tag: inputTag, source: "input" };
+  const last = normalizeReplyLanguage(args.sessionLastReplyLanguage || "");
+  if (last && last !== "follow_input") return { tag: last, source: "session" };
+  const ui = normalizeReplyLanguage(args.uiLocale || "");
+  if (ui) return { tag: ui, source: "ui" };
+  return { tag: "en", source: "ui" };
 }
 
 /** 测试用：覆盖 prefs 目录（仅单测） */

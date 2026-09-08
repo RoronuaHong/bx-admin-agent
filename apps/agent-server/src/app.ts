@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ChatEvent } from "@bx/shared";
+import type { ApiErrorPayload, ChatEvent, LocalizedToken } from "@bx/shared";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { config, getCountry, listModels, listPublicCountries } from "./config.js";
@@ -29,8 +29,30 @@ import { listRunSummaries, getRun, getRelease } from "./trace.js";
 import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 import { notifyAlerts } from "./alert-notify.js";
 import { promptGuardAuditEnabled, sanitizeUserInput } from "./prompt-guard.js";
+import { resolvePortalPermissions } from "./permissions.js";
 
 const COOKIE = "bx_agent_sid";
+
+function token(code: string, params?: Record<string, string | number | boolean | null>, defaultMessage?: string): LocalizedToken {
+  return { code, params, defaultMessage };
+}
+
+function errorJson(c: Context, status: number, code: string, params?: Record<string, string | number | boolean | null>, defaultMessage?: string, extras?: Record<string, unknown>) {
+  const body: ApiErrorPayload & { message?: string; code?: string; [key: string]: unknown } = {
+    error: token(code, params, defaultMessage),
+    code,
+    ...(defaultMessage ? { message: defaultMessage } : {}),
+    ...(extras || {}),
+  };
+  return c.json(body, status as never);
+}
+
+function uiText(uiLocale: string | undefined, zh: string, en: string, pt: string, hi: string): string {
+  if (uiLocale === "pt-BR") return pt;
+  if (uiLocale === "hi") return hi;
+  if (uiLocale === "zh") return zh;
+  return en;
+}
 
 function cookieOpts() {
   return {
@@ -121,27 +143,16 @@ export function createApp() {
   }
 
   function permissionsOf(session: { menus?: unknown[]; user?: Parameters<typeof ownerKeyOf>[0]; country?: { id?: string } } | null) {
-    // 预留权限投影层：当前先支持按 ownerKey 白名单收紧 Trace；
-    // 若未配置白名单，则保持“已登录可看”的默认体验。后续上游若补 RBAC / 菜单编码，
-    // 只需在这里替换判定，前端与路由结构无需再改。
-    const ownerKey = session ? ownerKeyOf(session.user, session.country?.id || "") : "";
-    const allowlist = config.traceAllowedOwners;
-    const matchedAllowlist = Boolean(ownerKey && allowlist.includes(ownerKey));
-    return {
-      canViewTrace: Boolean(session) && (!allowlist.length || matchedAllowlist),
-      traceAccessSource: !session
-        ? "anonymous"
-        : !allowlist.length
-          ? "default-login"
-          : matchedAllowlist
-            ? "owner-allowlist"
-            : "denied-allowlist",
-    };
+    return resolvePortalPermissions(session, {
+      allowedOwners: config.traceAllowedOwners,
+      deniedOwners: config.traceDeniedOwners,
+      allowedCountries: config.traceAllowedCountries,
+    });
   }
 
   app.get("/models", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "未登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_NOT_LOGGED_IN", undefined, "未登录");
     return c.json({
       models: listModels().map((m) => ({
         id: m.id,
@@ -155,7 +166,7 @@ export function createApp() {
   });
 
   app.post("/auth/login", async (c) => {
-    const ip = clientIpFromHeaders(c.req.raw.headers);
+    const ip = clientIpFromHeaders({ get: (name) => c.req.raw.headers.get(name) ?? undefined });
     const loginRl = checkRateLimit({ bucket: "login", key: ip });
     if (!loginRl.allowed) {
       auditEvent({
@@ -167,7 +178,8 @@ export function createApp() {
       return c.json(
         {
           message: "登录尝试过于频繁，请稍后再试",
-          code: "RATE_LIMITED",
+          code: "AUTH_LOGIN_RATE_LIMITED",
+          error: token("AUTH_LOGIN_RATE_LIMITED"),
           retryAfterSec: loginRl.retryAfterSec,
         },
         429,
@@ -178,11 +190,11 @@ export function createApp() {
     const username = (body.username || "").trim();
     const password = body.password || "";
     if (!countryId || !username || !password) {
-      return c.json({ message: "请填写国家线、账号和密码" }, 400);
+      return errorJson(c, 400, "AUTH_LOGIN_MISSING_FIELDS", undefined, "请填写国家线、账号和密码");
     }
     try {
       const country = getCountry(countryId);
-      if (!country) return c.json({ message: "未知或未配置的国家线" }, 400);
+      if (!country) return errorJson(c, 400, "AUTH_COUNTRY_UNKNOWN", undefined, "未知或未配置的国家线");
       const auth = config.mockUpstream
         ? { country, ...mockLogin(username) }
         : await realLogin(countryId, username, password);
@@ -199,7 +211,7 @@ export function createApp() {
         permissions: permissionsOf(session),
       });
     } catch (error) {
-      return c.json({ message: error instanceof Error ? error.message : "登录失败" }, 401);
+      return errorJson(c, 401, "AUTH_LOGIN_FAILED", undefined, error instanceof Error ? error.message : "登录失败");
     }
   });
 
@@ -211,7 +223,7 @@ export function createApp() {
 
   app.get("/auth/me", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "未登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_NOT_LOGGED_IN", undefined, "未登录");
     return c.json({
       user: session.user,
       country: { id: session.country.id, label: session.country.label },
@@ -292,12 +304,12 @@ export function createApp() {
   app.post("/chat/stream", async (c) => {
     try {
       const session = getSession(getCookie(c, COOKIE));
-      if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
-      const body = await c.req.json<{ text?: string; model?: string; images?: string[]; files?: string[] }>();
+      if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
+      const body = await c.req.json<{ text?: string; model?: string; images?: string[]; files?: string[]; uiLocale?: string }>();
       const ownerKey = ownerKeyOf(session.user, session.country.id);
       const cleaned = preprocess(body.text || "");
       const text = cleaned.text;
-      if (!text) return c.json({ message: "请输入内容" }, 400);
+      if (!text) return errorJson(c, 400, "CHAT_EMPTY_INPUT", undefined, "请输入内容");
       if (promptGuardAuditEnabled() && (cleaned.strippedCount > 0 || cleaned.truncated)) {
         auditEvent({
           kind: "prompt_guard",
@@ -319,7 +331,14 @@ export function createApp() {
             type: "task_running",
             taskId: existing.taskId,
             startedAt: existing.startedAt,
-            note: "该会话已有任务在后台执行，本连接为进度回放；任务完成后结果自动落入会话历史",
+            note: uiText(
+              typeof body.uiLocale === "string" ? body.uiLocale : undefined,
+              "该会话已有任务在后台执行，本连接为进度回放；任务完成后结果自动落入会话历史。",
+              "A task for this conversation is already running in the background. This connection is replaying progress and the result will be saved to conversation history.",
+              "Ja existe uma tarefa em execucao em segundo plano para esta conversa. Esta conexao apenas reproduz o progresso, e o resultado sera salvo no historico.",
+              "इस वार्तालाप के लिए एक कार्य पहले से बैकग्राउंड में चल रहा है। यह कनेक्शन केवल प्रगति दिखा रहा है, और परिणाम वार्तालाप इतिहास में सहेजा जाएगा।",
+            ),
+            noteToken: token("CHAT_TASK_RUNNING"),
           });
         });
       }
@@ -337,7 +356,8 @@ export function createApp() {
         return c.json(
           {
             message: "请求过于频繁，请稍后再试",
-            code: "RATE_LIMITED",
+            code: "CHAT_RATE_LIMITED",
+            error: token("CHAT_RATE_LIMITED"),
             retryAfterSec: chatRl.retryAfterSec,
           },
           429,
@@ -372,6 +392,7 @@ export function createApp() {
               model: typeof body.model === "string" ? body.model : undefined,
               images: pickIds(body.images),
               files: pickIds(body.files),
+              uiLocale: typeof body.uiLocale === "string" ? body.uiLocale : undefined,
             },
             task.controller.signal,
           )) {
@@ -383,6 +404,7 @@ export function createApp() {
             type: "error",
             message: error instanceof Error ? error.message : "任务执行异常",
             code: "TASK_FAILED",
+            error: token("CHAT_TASK_FAILED"),
           });
         } finally {
           // 保险收束：chatStream 正常路径自带 done；异常路径（含取消）这里确保 done 必达
@@ -433,16 +455,16 @@ export function createApp() {
       });
     } catch (error) {
       console.error("[chat/stream] error:", error);
-      return c.json({ message: error instanceof Error ? error.message : "请求失败" }, 500);
+      return errorJson(c, 500, "CHAT_STREAM_FAILED", undefined, error instanceof Error ? error.message : "请求失败");
     }
   });
 
   // 显式取消进行中任务（对齐前端「停止」按钮语义；客户端断开不再等于取消）
   app.post("/chat/cancel", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const task = runningTasks.get(session.id);
-    if (!task || task.settled) return c.json({ ok: false, message: "当前没有进行中的任务" }, 404);
+    if (!task || task.settled) return errorJson(c, 404, "CHAT_NO_RUNNING_TASK", undefined, "当前没有进行中的任务", { ok: false });
     task.controller.abort();
     return c.json({ ok: true, taskId: task.taskId });
   });
@@ -450,7 +472,7 @@ export function createApp() {
   // 任务状态查询（刷新后前端可据此展示「上一任务仍在后台执行」或最近一次结果）
   app.get("/chat/task/status", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const running = runningTasks.get(session.id);
     const last = lastTasks.get(session.id);
     return c.json({
@@ -467,8 +489,8 @@ export function createApp() {
   // 最近 N 个 run 摘要 + 统计（轮次/token/版本分布），供 Web 可视化/巡检接入
   app.get("/trace/runs", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
-    if (!permissionsOf(session).canViewTrace) return c.json({ message: "无权限查看 Trace" }, 403);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
+    if (!permissionsOf(session).canViewTrace) return errorJson(c, 403, "TRACE_FORBIDDEN", undefined, "无权限查看 Trace");
     const limit = Math.min(Number(c.req.query("limit")) || 20, 50);
     const out = listRunSummaries(limit);
     if (out.stats?.degradeHint) {
@@ -480,20 +502,20 @@ export function createApp() {
   // 单个 run 的完整 span 树；门户级 trace 仍受权限控制
   app.get("/trace/run/:runId", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
-    if (!permissionsOf(session).canViewTrace) return c.json({ message: "无权限查看 Trace" }, 403);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
+    if (!permissionsOf(session).canViewTrace) return errorJson(c, 403, "TRACE_FORBIDDEN", undefined, "无权限查看 Trace");
     const spans = getRun(c.req.param("runId"));
     const runSpan = spans.find((s) => s.kind === "run");
-    if (!runSpan) return c.json({ message: "不存在" }, 404);
+    if (!runSpan) return errorJson(c, 404, "TRACE_RUN_NOT_FOUND", undefined, "不存在");
     return c.json({ release: getRelease(), spans });
   });
 
   // 写操作确认回调：前端点"确认/取消"后调用此接口，唤醒 chatStream 里的 waitForConfirmation
   app.post("/chat/confirm", async (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const body = await c.req.json<{ callId?: string; confirmed?: boolean }>();
-    if (!body.callId) return c.json({ message: "缺少 callId" }, 400);
+    if (!body.callId) return errorJson(c, 400, "CHAT_CONFIRM_MISSING_CALL_ID", undefined, "缺少 callId");
     const found = resolveConfirmWaiter(session.id, body.callId, body.confirmed ?? false);
     return c.json({ ok: found });
   });
@@ -502,7 +524,7 @@ export function createApp() {
   app.post("/chat/context/clear", (c) => {
     const sid = getCookie(c, COOKIE);
     const session = getSession(sid);
-    if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const ok = clearSessionContext(sid);
     return c.json({ ok });
   });
@@ -521,7 +543,7 @@ export function createApp() {
   // 会话列表（按 updatedAt 倒序）
   app.get("/chat/conversations", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const list = await listConversations(ctx.ownerKey);
     return c.json({ conversations: list });
   });
@@ -529,7 +551,7 @@ export function createApp() {
   // 新建会话（body: { id?, title? }；id 缺省由服务端生成）
   app.post("/chat/conversations", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const body = await readJson<{ id?: string; title?: string }>(c);
     const id = body.id || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const doc = await createConversation({
@@ -545,18 +567,18 @@ export function createApp() {
   // 单会话详情
   app.get("/chat/conversations/:id", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const doc = await getConversation(ctx.ownerKey, c.req.param("id"));
-    if (!doc) return c.json({ message: "会话不存在" }, 404);
+    if (!doc) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", undefined, "会话不存在");
     return c.json({ conversation: doc });
   });
 
   // 保存整段消息（upsert；body: { messages, title? }）
   app.post("/chat/conversations/:id/messages", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const body = await readJson<{ messages?: StoredMessage[]; title?: string }>(c);
-    if (!Array.isArray(body.messages)) return c.json({ message: "messages 必须为数组" }, 400);
+    if (!Array.isArray(body.messages)) return errorJson(c, 400, "CHAT_CONVERSATION_INVALID_MESSAGES", undefined, "messages 必须为数组");
     await upsertMessages({
       ownerKey: ctx.ownerKey,
       countryId: ctx.session.country.id,
@@ -571,9 +593,9 @@ export function createApp() {
   // 重命名
   app.put("/chat/conversations/:id", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const body = await readJson<{ title?: string }>(c);
-    if (!body.title?.trim()) return c.json({ message: "标题不能为空" }, 400);
+    if (!body.title?.trim()) return errorJson(c, 400, "CHAT_CONVERSATION_EMPTY_TITLE", undefined, "标题不能为空");
     await renameConversation(ctx.ownerKey, c.req.param("id"), body.title.trim());
     return c.json({ ok: true });
   });
@@ -581,7 +603,7 @@ export function createApp() {
   // 删除会话
   app.delete("/chat/conversations/:id", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     await deleteConversation(ctx.ownerKey, c.req.param("id"));
     return c.json({ ok: true });
   });
@@ -589,7 +611,7 @@ export function createApp() {
   // 清空会话消息（保留会话壳）
   app.post("/chat/conversations/:id/clear", async (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     await clearConversation(ctx.ownerKey, c.req.param("id"));
     return c.json({ ok: true });
   });
@@ -598,7 +620,7 @@ export function createApp() {
   // （ownerKey 过滤）；全局视角走服务端 CLI（inspect-cost.mjs）。
   app.get("/cost/summary", (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const report = aggregateCost({
       fromDay: c.req.query("from") || undefined,
       toDay: c.req.query("to") || undefined,
@@ -618,7 +640,7 @@ export function createApp() {
   // 自己（ownerKey）的审计事件；全局视角走服务端 CLI（inspect-audit.mjs）。
   app.get("/audit/list", (c) => {
     const ctx = requireOwner(c);
-    if (!ctx) return c.json({ message: "会话失效，请重新登录" }, 401);
+    if (!ctx) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     const events = listAuditEvents({
       fromDay: c.req.query("from") || undefined,
       toDay: c.req.query("to") || undefined,
@@ -632,7 +654,7 @@ export function createApp() {
   app.post("/chat/upload", async (c) => {
     try {
       const session = getSession(getCookie(c, COOKIE));
-      if (!session) return c.json({ message: "会话失效，请重新登录" }, 401);
+      if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
       const form = await c.req.formData();
       const files = form.getAll("files") as Array<{
         name: string;
@@ -640,9 +662,9 @@ export function createApp() {
         size: number;
         arrayBuffer(): Promise<ArrayBuffer>;
       }>;
-      if (!files.length) return c.json({ message: "未收到文件" }, 400);
+      if (!files.length) return errorJson(c, 400, "UPLOAD_NO_FILES", undefined, "未收到文件");
       if (files.length > MAX_AT_ONCE) {
-        return c.json({ message: `一次最多上传 ${MAX_AT_ONCE} 个文件` }, 400);
+        return errorJson(c, 400, "UPLOAD_TOO_MANY_FILES", { maxCount: MAX_AT_ONCE }, `一次最多上传 ${MAX_AT_ONCE} 个文件`);
       }
       const saved = [];
       for (const file of files) {
@@ -650,7 +672,7 @@ export function createApp() {
           saved.push(await saveUpload(file));
         } catch (error) {
           return c.json(
-            { message: error instanceof Error ? error.message : "文件保存失败" },
+            { message: error instanceof Error ? error.message : "文件保存失败", code: "UPLOAD_SAVE_FAILED", error: token("UPLOAD_SAVE_FAILED") },
             400,
           );
         }
@@ -658,15 +680,15 @@ export function createApp() {
       return c.json({ files: saved });
     } catch (error) {
       console.error("[chat/upload] error:", error);
-      return c.json({ message: "上传失败" }, 500);
+      return errorJson(c, 500, "UPLOAD_FAILED", undefined, "上传失败");
     }
   });
 
   app.get("/chat/upload/:id", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "未登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_NOT_LOGGED_IN", undefined, "未登录");
     const image = getUploadImage(c.req.param("id"));
-    if (!image) return c.json({ message: "图片不存在或已过期" }, 404);
+    if (!image) return errorJson(c, 404, "UPLOAD_IMAGE_NOT_FOUND", undefined, "图片不存在或已过期");
     return new Response(new Uint8Array(image.data), {
       headers: {
         "Content-Type": image.mediaType,
@@ -678,9 +700,9 @@ export function createApp() {
   // 导出文件下载 / PDF 预览（xlsx、pdf）
   app.get("/chat/download/:id", (c) => {
     const session = getSession(getCookie(c, COOKIE));
-    if (!session) return c.json({ message: "未登录" }, 401);
+    if (!session) return errorJson(c, 401, "AUTH_NOT_LOGGED_IN", undefined, "未登录");
     const packed = readDownloadBytes(c.req.param("id"));
-    if (!packed) return c.json({ message: "文件不存在或已过期" }, 404);
+    if (!packed) return errorJson(c, 404, "DOWNLOAD_FILE_NOT_FOUND", undefined, "文件不存在或已过期");
     const { rec, bytes } = packed;
     const disposition = c.req.query("preview") === "1" && rec.kind === "pdf"
       ? "inline"
@@ -725,7 +747,7 @@ function streamSse(run: (send: (event: unknown) => void) => Promise<void>) {
         const message = error instanceof Error ? error.message : "请求失败";
         try {
           controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify({ type: "error", message, code: "STREAM_ERROR" })}\n\n`),
+            encoder.encode(`data: ${JSON.stringify({ type: "error", message, code: "STREAM_ERROR", error: token("STREAM_ERROR") })}\n\n`),
           );
         } catch {
           /* controller 已关闭则忽略 */
