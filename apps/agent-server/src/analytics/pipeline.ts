@@ -2,6 +2,7 @@ import { config, listModels } from "../config.js";
 import { runNativeDataset } from "./metabase-client.js";
 import { loadAnalyticsPack, type AnalyticsPack } from "./semantic-layer.js";
 import {
+  assertReadonlySingleSelect,
   assertTablesWhitelisted,
   lintSql,
   normalizeDistinctCount,
@@ -113,6 +114,11 @@ function collectIssues(nl: string, sqls: string[], allowedTables: string[]): str
   const issues: string[] = [];
   for (const sql of sqls) {
     try {
+      assertReadonlySingleSelect(sql);
+    } catch (e) {
+      issues.push(e instanceof Error ? e.message : String(e));
+    }
+    try {
       assertTablesWhitelisted(sql, allowedTables);
     } catch (e) {
       issues.push(e instanceof Error ? e.message : String(e));
@@ -143,6 +149,12 @@ async function rewriteSqls(
   ].join("\n\n");
   const text = await llmText(system, user);
   return parseSqlsFromLlm(text);
+}
+
+function ensureMaxRows(sql: string, maxRows: number): string {
+  if (!Number.isFinite(maxRows) || maxRows <= 0) return sql;
+  if (/\blimit\s+\d+\b/i.test(sql)) return sql;
+  return `${sql.trim().replace(/;+\s*$/, "")}\nLIMIT ${Math.floor(maxRows)}`;
 }
 
 async function mapPool<T, R>(
@@ -244,7 +256,9 @@ export async function analyticsAsk(
     }
 
     const dbId = pack.datasource.metabaseDatabaseId;
-    let results = await mapPool(sqls, pack.guards.parallelism, (sql) =>
+    const maxRows = pack.guards.maxRows;
+    let execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
+    let results = await mapPool(execSqls, pack.guards.parallelism, (sql) =>
       runNativeDataset(sql, dbId),
     );
 
@@ -255,7 +269,8 @@ export async function analyticsAsk(
         sqls = normalizeSqls(rewritten);
         const emptyIssues = collectIssues(nl, sqls, allowedTables);
         if (!emptyIssues.length) {
-          results = await mapPool(sqls, pack.guards.parallelism, (sql) =>
+          execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
+          results = await mapPool(execSqls, pack.guards.parallelism, (sql) =>
             runNativeDataset(sql, dbId),
           );
         }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from "vue";
-import { RouterLink, useRouter } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   askAnalytics,
   fetchMe,
@@ -22,6 +22,7 @@ import type { TableView } from "../types";
 import { getUiLocale } from "../ui-locale";
 
 const router = useRouter();
+const route = useRoute();
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
@@ -163,6 +164,19 @@ async function runScan() {
 }
 
 onMounted(() => {
+  const q = typeof route.query.q === "string" ? route.query.q.trim() : "";
+  const from = typeof route.query.from === "string" ? route.query.from.trim() : "";
+  const to = typeof route.query.to === "string" ? route.query.to.trim() : "";
+  if (q) {
+    input.value = q;
+  } else if (from && to) {
+    input.value = tx(
+      `${from}到${to}按天观看人数`,
+      `daily users from ${from} to ${to}`,
+    );
+  } else if (from) {
+    input.value = tx(`${from}观看人数`, `users on ${from}`);
+  }
   void refreshScanJobs();
 });
 

@@ -62,11 +62,15 @@ export function createJob(input: CreateScanJobInput): ScanJob {
   const key = jobKey(scanDate, ruleSetId);
 
   for (const job of map.values()) {
-    if (job.scanDate === scanDate && job.ruleSetId === ruleSetId && job.status === "running") {
+    if (
+      job.scanDate === scanDate &&
+      job.ruleSetId === ruleSetId &&
+      (job.status === "running" || job.status === "queued")
+    ) {
       if (!forceRerun) {
         throw new ScanJobStoreError(
           SCAN_JOB_RUNNING,
-          `scan job already running for ${key}`,
+          `scan job already ${job.status} for ${key}`,
         );
       }
       break;
@@ -122,6 +126,11 @@ export function transition(
   const prev = map.get(jobId);
   if (!prev) {
     throw new ScanJobStoreError("scan_job_not_found", `scan job not found: ${jobId}`);
+  }
+
+  // Do not revive a terminal job (e.g. timeout failed → late succeeded).
+  if (TERMINAL.has(prev.status) && prev.status !== status) {
+    return { ...prev };
   }
 
   const ts = isoNow(patch?.now);

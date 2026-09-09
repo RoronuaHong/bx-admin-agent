@@ -4,6 +4,12 @@
  */
 import { analyticsAsk } from "../analytics/pipeline.js";
 import { runNativeDataset } from "../analytics/metabase-client.js";
+import { loadAnalyticsPack } from "../analytics/semantic-layer.js";
+import {
+  assertReadonlySingleSelect,
+  assertTablesWhitelisted,
+  normalizeDistinctCount,
+} from "../analytics/sql-guard.js";
 import { config } from "../config.js";
 
 /** NL → full analytics pipeline (time resolve → Probe → SQL → verify → exec). */
@@ -21,16 +27,34 @@ export async function execAnalyticsAsk(input: Record<string, unknown>): Promise<
   return JSON.stringify(result);
 }
 
-/** Execute a single native SQL via Metabase `/api/dataset`. */
+/** Execute a single native SQL via Metabase `/api/dataset` (readonly + pack whitelist). */
 export async function execMetabaseRunDataset(input: Record<string, unknown>): Promise<string> {
-  const sql = String(input.sql ?? input.query ?? "").trim();
-  if (!sql) {
+  const sqlRaw = String(input.sql ?? input.query ?? "").trim();
+  if (!sqlRaw) {
     return JSON.stringify({ ok: false, cols: [], rows: [], error: "missing sql" });
   }
-  const rawDb = input.databaseId != null ? Number(input.databaseId) : config.metabase.databaseId;
-  const databaseId = Number.isFinite(rawDb) ? rawDb : config.metabase.databaseId;
-  const result = await runNativeDataset(sql, databaseId);
-  return JSON.stringify(result);
+  const packId = String(input.packId ?? "watch-detail").trim() || "watch-detail";
+  try {
+    const pack = loadAnalyticsPack(packId);
+    let sql = normalizeDistinctCount(sqlRaw, config.metabase.distinctCountFn);
+    assertReadonlySingleSelect(sql);
+    assertTablesWhitelisted(
+      sql,
+      pack.tables.map((t) => t.name),
+    );
+    const rawDb =
+      input.databaseId != null ? Number(input.databaseId) : pack.datasource.metabaseDatabaseId;
+    const databaseId = Number.isFinite(rawDb) ? rawDb : pack.datasource.metabaseDatabaseId;
+    const result = await runNativeDataset(sql, databaseId);
+    return JSON.stringify(result);
+  } catch (e) {
+    return JSON.stringify({
+      ok: false,
+      cols: [],
+      rows: [],
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
 }
 
 /** Saved-question runner — stub in M1. */

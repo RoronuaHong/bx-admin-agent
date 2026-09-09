@@ -116,15 +116,13 @@ export const DEFAULT_WORKERS: WorkerDef[] = [
     toolWhitelist: [
       "analytics_ask",
       "metabase_run_dataset",
-      "metabase_run_question",
-      "metabase_explain_estimate",
       "render_table",
       "summarize_chart_data",
       "export_dataset",
       "request_clarification",
     ],
     systemPrompt:
-      "[workflow/worker] Analytics BI。只通过 analytics_ask / metabase_* 取数；禁止 call_api；日期必须用已 resolve 区间；异 grain 多 SQL 用 --- 分隔。",
+      "[workflow/worker] Analytics BI。优先 analytics_ask；必要时 metabase_run_dataset（只读+表白名单）；禁止 call_api；日期必须用已 resolve 区间；异 grain 多 SQL 用 --- 分隔。",
     writeConfirmPolicy: "always",
   },
 ];

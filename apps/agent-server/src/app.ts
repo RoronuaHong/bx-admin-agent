@@ -490,10 +490,10 @@ export function createApp() {
     return c.json({ ok: true, taskId: task.taskId });
   });
 
-  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数；鉴权与 /chat/stream 一致）
+  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数；鉴权与 scan 一致：session + analytics 入口）
   app.post("/analytics/ask", async (c) => {
-    const session = getSession(getCookie(c, COOKIE));
-    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
+    const gate = requireAnalyticsSession(c);
+    if ("error" in gate && gate.error) return gate.error;
     const body = await c.req.json<{ text?: string }>().catch(() => ({ text: "" }));
     const text = String(body.text || "").trim();
     if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");

@@ -1,3 +1,4 @@
+import { config } from "../../config.js";
 import { runNativeDataset } from "../metabase-client.js";
 import { loadAnalyticsPack } from "../semantic-layer.js";
 import {
@@ -151,9 +152,9 @@ export async function fetchChannelDailyUsers(
     wowDate,
     table,
     movieTypes: pack.guards.defaultMovieTypes,
-    distinctCountFn: pack.guards.distinctCountFn,
+    distinctCountFn: config.metabase.distinctCountFn,
   });
-  sql = normalizeDistinctCount(sql, pack.guards.distinctCountFn);
+  sql = normalizeDistinctCount(sql, config.metabase.distinctCountFn);
   assertReadonlySingleSelect(sql);
   assertTablesWhitelisted(sql, allowedTables);
 

@@ -49,6 +49,19 @@ resetJobStoreForTests();
 
 {
   resetJobStoreForTests();
+  createJob({ ruleSetId: "watch-users", scanDate: "2026-09-08" }); // stays queued
+  let threwQueued: unknown;
+  try {
+    createJob({ ruleSetId: "watch-users", scanDate: "2026-09-08" });
+  } catch (e) {
+    threwQueued = e;
+  }
+  assert.ok(threwQueued instanceof ScanJobStoreError);
+  assert.equal((threwQueued as ScanJobStoreError).code, SCAN_JOB_RUNNING);
+}
+
+{
+  resetJobStoreForTests();
   const first = createJob({ ruleSetId: "watch-users", scanDate: "2026-09-08" });
   assert.equal(first.rerunSeq, 0);
   transition(first.jobId, "running");
@@ -86,6 +99,17 @@ resetJobStoreForTests();
   assert.equal(timed?.status, "failed");
   assert.equal(timed?.errorCode, SCAN_JOB_TIMEOUT);
   assert.match(timed?.errorMessage ?? "", /巡检未跑成/);
+}
+
+{
+  resetJobStoreForTests();
+  const job = createJob({ ruleSetId: "watch-users", scanDate: "2026-09-08" });
+  transition(job.jobId, "failed", { errorCode: "scan_job_timeout", errorMessage: "timeout" });
+  const revived = transition(job.jobId, "succeeded", {
+    resultSummary: { entityCount: 1 },
+  });
+  assert.equal(revived.status, "failed");
+  assert.equal(revived.errorCode, "scan_job_timeout");
 }
 
 console.log("analytics-scan-job-store.test.ts OK");

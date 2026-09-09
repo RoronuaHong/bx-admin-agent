@@ -1,5 +1,11 @@
 # 通用数据分析 Agent 方案（投放渠道 ROI 异常监控为首个场景）
 
+> **状态（2026-09-10）：历史草案。** 现行实现与验收以  
+> `docs/superpowers/specs/2026-09-09-metabase-analytics-agent-design.md`、  
+> M1/M3 计划与 `docs/analytics/*-acceptance.md` 为准。  
+> **M3 默认巡检指标是 `channel_daily_users`（渠道日活），不是 ROI。** ROI 待业务对齐后再换 ruleset。
+
+
 > **已降级为历史草案。** 定稿请以 [2026-09-09-metabase-analytics-agent-design.md](./superpowers/specs/2026-09-09-metabase-analytics-agent-design.md) 为准（权威取数改为 Metabase；主链路 NL→SQL；**发版须 EX≥85% 且拒答召回≥95%**，见定稿 §8）。
 >
 > 文档状态：需求 + 可行性分析 + 落地路线（草案，已废止为主路径）

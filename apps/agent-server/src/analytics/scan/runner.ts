@@ -4,6 +4,7 @@
 
 import {
   SCAN_JOB_RUNNING,
+  SCAN_JOB_TIMEOUT,
   ScanJobStoreError,
   createJob,
   getJob,
@@ -12,6 +13,7 @@ import {
   transition,
   type ListJobsOpts,
 } from "./job-store.js";
+import { notifyAlerts } from "../../alert-notify.js";
 import { checkFreshness } from "./freshness.js";
 import { fetchChannelDailyUsers } from "./metrics.js";
 import { notifyScanAlerts } from "./notify.js";
@@ -81,18 +83,40 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
   const fetchUsers = deps?.fetchChannelDailyUsers ?? fetchChannelDailyUsers;
   const notify = deps?.notifyScanAlerts ?? notifyScanAlerts;
 
+  let ruleSet: RuleSet | undefined;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+
   try {
     transition(jobId, "running");
-    const ruleSet = loadRuleset(job.ruleSetId);
+    ruleSet = loadRuleset(job.ruleSetId);
     const window = resolveScanWindow({
       clock: new Date(),
       tz: ruleSet.businessTimezone,
       scanDate: job.scanDate,
     });
 
+    watchdog = setTimeout(() => {
+      const cur = getJob(jobId);
+      if (!cur || cur.status !== "running") return;
+      transition(jobId, "failed", {
+        errorCode: SCAN_JOB_TIMEOUT,
+        errorMessage: "巡检未跑成：超过 jobTimeout",
+      });
+      if (job.dryRun) return;
+      void notifyAlerts({
+        kind: "analytics",
+        title: "[bx-agent] 数据分析巡检",
+        messages: [
+          `运维：巡检未跑成 scan_job_timeout ruleSet=${job.ruleSetId} scanDate=${job.scanDate} jobId=${jobId}`,
+        ],
+      });
+    }, Math.max(1, ruleSet.jobTimeoutMs));
+
     markTimeoutIfNeeded(jobId, ruleSet.jobTimeoutMs);
+    if (getJob(jobId)?.status === "failed") return;
 
     const freshness = await checkFr(ruleSet, window.scanDate);
+    if (getJob(jobId)?.status === "failed") return;
     if (!freshness.ok) {
       transition(jobId, "skipped", {
         errorCode: "data_not_ready",
@@ -112,6 +136,7 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
     const rows = await fetchUsers(window.scanDate, window.dodDate, window.wowDate, {
       packId: ruleSet.packId,
     });
+    if (getJob(jobId)?.status === "failed") return;
 
     const threshold = evaluateThreshold(ruleSet, rows);
     const alerts = buildAlerts(ruleSet, metric, threshold);
@@ -133,7 +158,7 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
       },
     });
 
-    if (!job.dryRun) {
+    if (!job.dryRun && getJob(jobId)?.status === "succeeded") {
       await notify({
         ruleSetId: ruleSet.id,
         scanDate: window.scanDate,
@@ -153,6 +178,8 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
     } catch {
       /* job may already be terminal */
     }
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
   }
 }
 
