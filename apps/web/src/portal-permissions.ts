@@ -1,4 +1,4 @@
-export type PortalEntryKey = "admin" | "knowledge" | "viewing" | "trace";
+export type PortalEntryKey = "admin" | "knowledge" | "viewing" | "analytics" | "trace";
 
 export type TraceAccessSource =
   | "anonymous"

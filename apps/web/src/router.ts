@@ -11,6 +11,12 @@ export const router = createRouter({
     { path: "/agents/admin/trace", redirect: "/trace" },
     { path: "/agents/knowledge", component: () => import("./pages/KnowledgeAgentPage.vue"), meta: { agent: "knowledge" } },
     { path: "/agents/viewing", component: () => import("./pages/ViewingAgentPage.vue"), meta: { agent: "viewing" } },
+    {
+      path: "/analytics",
+      component: () => import("./pages/AnalyticsAgentPage.vue"),
+      meta: { auth: true, loginPath: "/agents/admin/login", agent: "analytics", requiredPortalEntry: "analytics" },
+    },
+    { path: "/agents/analytics", redirect: "/analytics" },
     { path: "/login", redirect: "/agents/admin/login" },
     { path: "/chat", redirect: "/agents/admin/chat" },
   ],

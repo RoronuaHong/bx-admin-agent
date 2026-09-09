@@ -87,6 +87,21 @@ export const PORTAL_CARDS: PortalCard[] = [
     tone: "default",
   },
   {
+    key: "analytics",
+    entry: "analytics",
+    title: { zh: "数据分析 Agent", en: "Analytics Agent", pt: "Agent de Analise", hi: "एनालिटिक्स एजेंट" },
+    desc: {
+      zh: "基于 Metabase 的自然语言问数：时间解析、SQL 生成与表格结果，独立于后台管理会话。",
+      en: "Natural-language analytics via Metabase: time resolve, SQL generation, and table results — separate from the admin chat session.",
+      pt: "Analise em linguagem natural via Metabase: resolucao de tempo, geracao de SQL e tabelas — separado do chat de admin.",
+      hi: "Metabase के माध्यम से प्राकृतिक भाषा एनालिटिक्स: समय रिज़ॉल्व, SQL जनरेशन और टेबल परिणाम — एडमिन चैट से अलग।",
+    },
+    chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
+    cta: { zh: "进入问数", en: "Open analytics", pt: "Abrir analise", hi: "एनालिटिक्स खोलें" },
+    href: "/analytics",
+    tone: "default",
+  },
+  {
     key: "more",
     title: { zh: "更多 Agent 即将上线", en: "More Agents Soon", pt: "Mais agentes em breve", hi: "और एजेंट जल्द आ रहे हैं" },
     desc: {

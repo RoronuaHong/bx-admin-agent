@@ -41,7 +41,7 @@ assert(
       deniedOwners: [],
       allowedCountries: [],
     });
-    return r.canViewTrace && r.entries.admin && r.entries.knowledge && r.entries.viewing && r.entries.trace && r.traceAccessSource === "default-login";
+    return r.canViewTrace && r.entries.admin && r.entries.knowledge && r.entries.viewing && r.entries.analytics && r.entries.trace && r.traceAccessSource === "default-login";
   })(),
 );
 

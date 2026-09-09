@@ -18,6 +18,7 @@ export interface PortalPermissions {
     admin: boolean;
     knowledge: boolean;
     viewing: boolean;
+    analytics: boolean;
     trace: boolean;
   };
 }
@@ -38,7 +39,7 @@ export function resolvePortalPermissions(
     return {
       canViewTrace: false,
       traceAccessSource: "anonymous",
-      entries: { admin: false, knowledge: true, viewing: true, trace: false },
+      entries: { admin: false, knowledge: true, viewing: true, analytics: true, trace: false },
     };
   }
 
@@ -53,33 +54,33 @@ export function resolvePortalPermissions(
     return {
       canViewTrace: false,
       traceAccessSource: "owner-denylist",
-      entries: { admin: true, knowledge: true, viewing: true, trace: false },
+      entries: { admin: true, knowledge: true, viewing: true, analytics: true, trace: false },
     };
   }
   if (ownerAllowed) {
     return {
       canViewTrace: true,
       traceAccessSource: "owner-allowlist",
-      entries: { admin: true, knowledge: true, viewing: true, trace: true },
+      entries: { admin: true, knowledge: true, viewing: true, analytics: true, trace: true },
     };
   }
   if (countryAllowed) {
     return {
       canViewTrace: true,
       traceAccessSource: "country-allowlist",
-      entries: { admin: true, knowledge: true, viewing: true, trace: true },
+      entries: { admin: true, knowledge: true, viewing: true, analytics: true, trace: true },
     };
   }
   if (hasAllowScope) {
     return {
       canViewTrace: false,
       traceAccessSource: policy.allowedOwners.length > 0 ? "denied-allowlist" : "country-denylist",
-      entries: { admin: true, knowledge: true, viewing: true, trace: false },
+      entries: { admin: true, knowledge: true, viewing: true, analytics: true, trace: false },
     };
   }
   return {
     canViewTrace: true,
     traceAccessSource: "default-login",
-    entries: { admin: true, knowledge: true, viewing: true, trace: true },
+    entries: { admin: true, knowledge: true, viewing: true, analytics: true, trace: true },
   };
 }

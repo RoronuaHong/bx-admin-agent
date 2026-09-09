@@ -6,7 +6,7 @@ declare module "vue-router" {
     auth?: boolean;
     guestRedirectAuth?: string;
     loginPath?: string;
-    agent?: "portal" | "admin" | "knowledge" | "viewing";
+    agent?: "portal" | "admin" | "knowledge" | "viewing" | "analytics";
     requiredPermission?: "canViewTrace";
     requiredPortalEntry?: PortalEntryKey;
   }

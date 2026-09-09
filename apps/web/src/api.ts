@@ -37,6 +37,7 @@ function normalizePortalEntries(
     admin: entries?.admin ?? true,
     knowledge: entries?.knowledge ?? true,
     viewing: entries?.viewing ?? true,
+    analytics: entries?.analytics ?? true,
     trace: entries?.trace ?? canViewTrace,
   };
 }
@@ -430,4 +431,42 @@ export async function fetchTraceRun(runId: string): Promise<{ release?: string; 
     spans: TraceSpanDto[];
   };
   return { release: data.release, spans: data.spans || [] };
+}
+
+// ---- Metabase 数据分析 Agent ----
+export interface AnalyticsAskTable {
+  title: string;
+  cols: string[];
+  rows: unknown[][];
+  grain?: string;
+}
+
+export interface AnalyticsAskResult {
+  status: "ok" | "clarify" | "refuse" | "error";
+  message: string;
+  timeEcho?: string;
+  sqls?: string[];
+  tables?: AnalyticsAskTable[];
+  probeSummary?: string;
+  error?: string;
+}
+
+export async function askAnalytics(text: string): Promise<AnalyticsAskResult> {
+  const resp = await fetch("/agent/analytics/ask", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    const payload = data as Partial<ApiErrorPayload> & { message?: string; code?: string };
+    const token = normalizeToken(payload.error, payload.code);
+    throw new ApiError(payload.message || token?.defaultMessage || `analytics ask ${resp.status}`, {
+      status: resp.status,
+      token,
+      code: payload.code,
+    });
+  }
+  return resp.json() as Promise<AnalyticsAskResult>;
 }
