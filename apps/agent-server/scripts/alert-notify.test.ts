@@ -144,6 +144,47 @@ function mockSender(bag: Array<{ title: string; body: string }>): AlertSender {
   assert("失败后可重试", r2.sent === 1 && bag.length === 1);
 }
 
+// ---- analytics kind：独立开关与 dedup 命名空间 ----
+{
+  resetAlertDedupState();
+  const bag: Array<{ title: string; body: string }> = [];
+  const sender = mockSender(bag);
+  process.env.ALERT_DEDUP_MS = "60000";
+  const r1 = await notifyAlerts({
+    kind: "analytics",
+    messages: ["ROI 破线 IndiaA"],
+    webhook: "http://mock",
+    now: 10_000,
+    sender,
+  });
+  assert(
+    "analytics 推送",
+    r1.sent === 1 && bag[0]?.title.includes("数据分析巡检"),
+    `sent=${r1.sent} title=${bag[0]?.title || ""}`,
+  );
+  // 同文案不同 kind 不共享 dedup
+  const rBudget = await notifyAlerts({
+    kind: "budget",
+    messages: ["ROI 破线 IndiaA"],
+    webhook: "http://mock",
+    now: 10_500,
+    sender,
+  });
+  assert("analytics/budget 去重隔离", rBudget.sent === 1 && bag.length === 2);
+  process.env.ALERT_ANALYTICS_NOTIFY = "0";
+  assert("analytics 开关关", !alertNotifyEnabled("analytics"));
+  const rOff = await notifyAlerts({
+    kind: "analytics",
+    messages: ["另一条"],
+    webhook: "http://mock",
+    now: 11_000,
+    sender,
+  });
+  assert("analytics 关闭后不推", rOff.skippedDisabled && rOff.sent === 0);
+  delete process.env.ALERT_ANALYTICS_NOTIFY;
+  delete process.env.ALERT_DEDUP_MS;
+}
+
 resetAlertDedupState();
 
 const failed = results.filter((r) => !r.ok);

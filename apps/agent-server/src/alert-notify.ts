@@ -2,11 +2,13 @@
  * 运维告警推送（钉钉自定义机器人 Webhook）。
  *
  * - 未配 ALERT_DINGTALK_WEBHOOK → 静默 no-op（不抛错）。
- * - 触发源：预算告警文案 / 劣化 degradeHint（调用方传入 messages）。
- * - 去重：同 fingerprint 在 ALERT_DEDUP_MS（默认 30min）内只推一次。
- * - 开关：ALERT_BUDGET_NOTIFY / ALERT_DEGRADE_NOTIFY（默认 true；设 0/false 关）。
+ * - 触发源：预算告警 / 劣化 degradeHint / 数据分析巡检（调用方传入 messages）。
+ * - 去重：同 fingerprint 在 ALERT_DEDUP_MS（默认 30min）内只推一次；kind 进入 fingerprint，互不串扰。
+ * - 开关：ALERT_BUDGET_NOTIFY / ALERT_DEGRADE_NOTIFY / ALERT_ANALYTICS_NOTIFY（默认 true；设 0/false 关）。
  * - 零业务词；零新依赖；推送失败只打日志。
  */
+
+export type AlertKind = "budget" | "degrade" | "analytics";
 
 export interface AlertNotifyResult {
   attempted: boolean;
@@ -28,8 +30,14 @@ export function getAlertWebhook(): string {
   return (process.env.ALERT_DINGTALK_WEBHOOK || "").trim();
 }
 
-export function alertNotifyEnabled(kind: "budget" | "degrade"): boolean {
-  const envName = kind === "budget" ? "ALERT_BUDGET_NOTIFY" : "ALERT_DEGRADE_NOTIFY";
+const KIND_NOTIFY_ENV: Record<AlertKind, string> = {
+  budget: "ALERT_BUDGET_NOTIFY",
+  degrade: "ALERT_DEGRADE_NOTIFY",
+  analytics: "ALERT_ANALYTICS_NOTIFY",
+};
+
+export function alertNotifyEnabled(kind: AlertKind): boolean {
+  const envName = KIND_NOTIFY_ENV[kind];
   const raw = (process.env[envName] ?? "true").trim().toLowerCase();
   return raw !== "0" && raw !== "false" && raw !== "off" && raw !== "no";
 }
@@ -37,6 +45,12 @@ export function alertNotifyEnabled(kind: "budget" | "degrade"): boolean {
 export function getAlertDedupMs(): number {
   const n = Number(process.env.ALERT_DEDUP_MS);
   return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000;
+}
+
+function defaultTitle(kind: AlertKind): string {
+  if (kind === "budget") return "[bx-agent] 预算告警";
+  if (kind === "degrade") return "[bx-agent] 上游劣化告警";
+  return "[bx-agent] 数据分析巡检";
 }
 
 /** 可注入的 sender（单测用）；默认 POST 钉钉机器人 text。 */
@@ -81,7 +95,7 @@ async function defaultDingTalkSender(webhook: string, title: string, body: strin
  * 推送一组告警文案（已去重）。返回统计；永不抛到调用方。
  */
 export async function notifyAlerts(opts: {
-  kind: "budget" | "degrade";
+  kind: AlertKind;
   title?: string;
   messages: string[];
   now?: number;
@@ -104,7 +118,7 @@ export async function notifyAlerts(opts: {
 
   const now = opts.now ?? Date.now();
   const dedupMs = getAlertDedupMs();
-  const title = opts.title || (opts.kind === "budget" ? "[bx-agent] 预算告警" : "[bx-agent] 上游劣化告警");
+  const title = opts.title || defaultTitle(opts.kind);
   let sent = 0;
   let skippedDedup = 0;
   const toSend: string[] = [];
