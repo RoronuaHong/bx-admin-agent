@@ -1,4 +1,11 @@
 import type { ChartView, ChatFileRef, TableView } from "./types";
+import type { UiLocale } from "./ui-locale";
+import type { LocalizedToken } from "./api";
+import {
+  contentLanguageMismatchesTarget,
+  hiddenContentPlaceholder,
+  type HiddenContentCategory,
+} from "./content-language";
 
 export interface Bubble {
   id: number;
@@ -11,6 +18,7 @@ export interface Bubble {
   currentTool?: string;
   toolStep?: number;
   finished?: boolean;
+  errorToken?: LocalizedToken;
   images?: Array<{ id: string; name: string }>;
   tables?: TableView[];
   charts?: ChartView[];
@@ -107,44 +115,47 @@ export function displayConversationTitle(title: string | null | undefined, defau
   return isDefaultConversationTitle(title) ? defaultTitle : String(title || "").trim();
 }
 
-function containsCjk(text: string) {
-  return /[\u3400-\u9FFF\uF900-\uFAFF]/u.test(text);
-}
-
-function localeText(locale: string, zh: string, en: string, pt: string, hi: string) {
-  return locale === "pt-BR" ? pt : locale === "hi" ? hi : locale === "zh" ? zh : en;
-}
-
 export function displayConversationTitleForLocale(
   title: string | null | undefined,
   defaultTitle: string,
   locale: string,
+  targetContentLanguage?: string | null,
 ) {
   const shown = displayConversationTitle(title, defaultTitle);
-  if (locale !== "zh" && containsCjk(shown)) {
-    return localeText(
-      locale,
-      shown,
-      "(Stored title in another language)",
-      "(Titulo salvo em outro idioma)",
-      "(दूसरी भाषा में सहेजा गया शीर्षक)",
-    );
+  if (contentLanguageMismatchesTarget(shown, targetContentLanguage)) {
+    return hiddenContentPlaceholder(locale as UiLocale, "stored-title");
   }
   return shown;
 }
 
-export function displayAssistantTextForLocale(text: string | null | undefined, locale: string) {
+export function displayMessageTextForLocale(
+  text: string | null | undefined,
+  role: Bubble["role"],
+  locale: string,
+  targetContentLanguage?: string | null,
+) {
   const shown = String(text || "");
-  if (locale !== "zh" && containsCjk(shown)) {
-    return localeText(
-      locale,
-      shown,
-      "Stored assistant text in another language is hidden in this UI locale.",
-      "O texto salvo do assistente em outro idioma foi ocultado neste locale da interface.",
-      "दूसरी भाषा में सहेजा गया सहायक पाठ इस UI locale में छिपा दिया गया है।",
-    );
+  if (contentLanguageMismatchesTarget(shown, targetContentLanguage)) {
+    const category: HiddenContentCategory = role === "user" ? "stored-user-text" : "stored-assistant-text";
+    return hiddenContentPlaceholder(locale as UiLocale, category);
   }
   return shown;
+}
+
+export function displayAssistantTextForLocale(
+  text: string | null | undefined,
+  locale: string,
+  targetContentLanguage?: string | null,
+) {
+  return displayMessageTextForLocale(text, "assistant", locale, targetContentLanguage);
+}
+
+export function displayReasoningTextForLocale(
+  text: string | null | undefined,
+  locale: string,
+  targetContentLanguage?: string | null,
+) {
+  return displayMessageTextForLocale(text, "assistant", locale, targetContentLanguage);
 }
 
 export function makeConversationTitle(messages: Bubble[], defaultTitle: string) {
@@ -169,6 +180,7 @@ export function slimConversations(conversations: Conversation[]) {
         ...(m.currentTool ? { currentTool: m.currentTool } : {}),
         ...(m.status ? { status: m.status } : {}),
         ...(m.error ? { error: m.error } : {}),
+        ...(m.errorToken ? { errorToken: m.errorToken } : {}),
         ...(m.cancelled ? { cancelled: true } : {}),
       }))
       .filter(
@@ -182,6 +194,7 @@ export function slimConversations(conversations: Conversation[]) {
           Boolean((m as { toolResults?: unknown[] }).toolResults?.length) ||
           Boolean((m as { reasoning?: string }).reasoning?.trim()) ||
           Boolean((m as { error?: string }).error) ||
+          Boolean((m as { errorToken?: LocalizedToken }).errorToken?.code) ||
           Boolean((m as { cancelled?: boolean }).cancelled),
       ),
   }));

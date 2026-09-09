@@ -43,6 +43,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { truncateToolResultForUi, describeCallForReasoning } from "./ui-truncate.js";
 import {
+  drillListRows,
   extractListRowsFromContent,
   extractReportRows,
   presentGenericChart,
@@ -1503,11 +1504,38 @@ async function runServerFallback(opts: {
   // 从纯文本 parseUnderstoodFromText 解析的不算——模型噪音文本（“请稍等”/计划）会被误当成理解，
   // 导致 understodFromLlm=true 而让 parse_intent 走模型分支、丢失 write 关键词推断（如“新增/删除”）。
   const llmIntent = findLastUnderstood(llmSteps) || undefined;
+  // 2026-09-08 「输入输出对不上」根因修复：模型本轮真实 call_api 的 operation（guard PASS）
+  // 是最强接口信号——模型已做过语义判断，兜底禁止再按命名惯例重新推导（同模块多接口时
+  // 会选错接口，产出与用户要求完全无关的数据）。取最近一次 call_api 的 operation 注入意图
+  // （成败都复用：请求失败可能是瞬时网络/参数名错，但接口选择本身仍是模型语义判断的结果）。
+  const lastApiOp = (() => {
+    for (const s of [...llmSteps].reverse()) {
+      if (s.kind !== "toolCalls") continue;
+      const call = s.calls.find(
+        (c) => c.name === CALL_API_TOOL && String(c.input.operation || "").trim(),
+      );
+      if (call) return String(call.input.operation).trim();
+    }
+    return "";
+  })();
+  const intentForFallback =
+    lastApiOp && llmIntent?.operation !== lastApiOp
+      ? {
+          ...(llmIntent || {
+            isBusinessRequest: true,
+            operationType: "read" as const,
+            value: userText,
+            summary: userText,
+          }),
+          operation: lastApiOp,
+          module: lastApiOp.split(".")[0] || llmIntent?.module || "",
+        }
+      : llmIntent;
   let orch: Awaited<ReturnType<typeof orchestrateBusinessQuery>>;
   try {
     orch = await orchestrateBusinessQuery({
       userText,
-      llmIntent,
+      llmIntent: intentForFallback,
       priorSteps: llmSteps,
       emitEvent: opts.onEvents,
       token: session.token,
@@ -2308,6 +2336,11 @@ export async function* chatStream(
         };
         const seenCallKeys = new Map<string, string>();
         const duplicateNotes = new Map<string, string>();
+        // 同轮重复意图提交去重（2026-09-09，与 callApiKey 同范式）：模型同轮并行提交多个
+        // submit_understood_intent 时（实测 dsflash 一次吐 7 个占位调用——模型对并行结果
+        // 未知的占位填充），只有第一个是真实理解，其余纯浪费执行轮。仅执行第一个，
+        // 其余 skip 回喂；跨轮 doom-loop 之外补齐「同轮并行 META」盲区。纯协议护栏。
+        let seenSubmit = false;
         // 跨轮 Doom Loop 熔断（对齐 OpenCode doom_loop）：连续 ≥3 次「同一业务工具 + 同一入参」→ 判空转
         let lastToolSignature = state.lastToolSignature || "";
         let toolSignatureStreak = state.toolSignatureStreak || 0;
@@ -2321,6 +2354,18 @@ export async function* chatStream(
           return `${c.name}|${JSON.stringify(c.input || {})}`;
         };
         for (const c of state.toolCalls) {
+          if (c.name === SUBMIT_UNDERSTOOD_INTENT) {
+            if (seenSubmit) {
+              duplicateNotes.set(
+                c.id,
+                "[workflow/observe] 你同轮并行提交了多个 submit_understood_intent，系统已合并执行第一个（见上一条返回）。" +
+                  "请基于其结果继续决策，不要重复提交。",
+              );
+            } else {
+              seenSubmit = true;
+            }
+            continue;
+          }
           const key = callApiKey(c);
           if (!key) continue;
           if (seenCallKeys.has(key)) {
@@ -2622,6 +2667,37 @@ export async function* chatStream(
             content = await runAgentTool(call.name, call.input, toolOpts);
           }
 
+          // 2026-09-08 图表出口（语义判定交模型、渲染由服务端执行，对齐 Cursor）：
+          // 模型提交 render_table pageKind=analysis_chart 时，用其真实 data 自动推断
+          // X 轴与数值序列，渲染 ECharts 折线图+数据表（presentGenericChart 通用链路），
+          // 替换纯表格结果并收束；数据无数值序列时静默降级为普通表格结果。
+          if (call.name === "render_table" && String(call.input.pageKind || "") === "analysis_chart") {
+            let chartData: unknown = call.input.data ?? call.input.rows;
+            if (typeof chartData === "string") {
+              try {
+                chartData = JSON.parse(chartData);
+              } catch {
+                /* 保留原值，由 drillListRows 返回 null 走降级 */
+              }
+            }
+            const chartRows = drillListRows(chartData);
+            const chartPresented =
+              Array.isArray(chartRows) && chartRows.length
+                ? presentGenericChart(chartRows as Record<string, unknown>[], String(call.input.module || ""))
+                : null;
+            if (chartPresented) {
+              emitUiPayloadsFromToolResult(chartPresented.tableBlock, emitEvent);
+              emitUiPayloadsFromToolResult(chartPresented.chartUiBlock, emitEvent);
+              content = chartPresented.reply;
+              forcedReply = chartPresented.reply;
+              outputReady = true;
+              nextSteps.push({
+                kind: "system",
+                text: "[workflow/pc-parity] 已按报表口径渲染 ECharts 折线图与数据表，请直接基于该总结收束，勿再重复取数。",
+              });
+            }
+          }
+
           emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(content) });
           // UI 块（表格/图表）先解析上屏（不依赖 steps 是否截断）
           emitUiPayloadsFromToolResult(content, emitEvent);
@@ -2812,14 +2888,17 @@ export async function* chatStream(
             }
           }
 
-          // call_api 失败：禁止反复换接口空转，下一轮必须向用户说明失败原因
+          // call_api 失败（Cursor 语义：observe → re-act）：错误如实回喂，模型自主排查——
+          // 自己 grep/读取对应页面源码确认参数组装与必填字段，修正后重试；确认无法解决再如实收束。
+          // 强模型具备自主排查能力，服务端不预取源码、不代写排查路径；doom-loop 签名护栏防死循环。
           if (call.name === CALL_API_TOOL && isToolErrorResult(content)) {
-            outputReady = true;
             nextSteps.push({
               kind: "system",
               text:
-                `[workflow/stop] call_api 已失败：${content.slice(0, 240)}。` +
-                "请直接把失败原因告知用户（如登录过期/参数错误），禁止继续盲目 grep 或反复 call_api。",
+                `[workflow/observe] call_api 已失败：${content.slice(0, 400)}。\n` +
+                `请基于失败原因自主排查后决定下一步：可 grep/读取该接口对应页面源码（确认入参组装逻辑、` +
+                `参数传输值格式、必填字段及默认值），修正后重新 call_api；或换用正确接口。` +
+                `确认无法解决时，直接把失败原因如实告知用户。禁止未排查就原参数重试。`,
             });
           }
 
@@ -2927,8 +3006,15 @@ export async function* chatStream(
                     kind: "system",
                     text:
                       `[workflow/output] 用户原始要求：${userText}\n` +
-                      `以上是服务端按 PC 列定义渲染的真实数据表格（共 ${rendered.view.total} 条），已上屏展示。` +
-                      `请用与用户原始要求相同语种的自然语言简要总结即可（勿因表头/数据单元格语种改用语种）；` +
+                      `以上是服务端按 PC 列定义渲染的真实数据表格（共 ${rendered.view.total} 条明细，本次筛选参数：${filterSummary || "无"}），已上屏展示。\n` +
+                      `总结前必须逐项校验：` +
+                      `①返回数据的取值范围（日期/键值等）必须与筛选参数一致——不一致说明参数可能未生效，必须如实向用户说明或换参数重查，禁止无视差异直接总结；` +
+                      `②时间序列类数据检查连续性，缺失的日期/周期必须向用户指出；` +
+                      `③若用户原始要求是趋势/图表展示而当前仅表格，请调用 render_table（传 pageKind="analysis_chart"、data=上方表格真实行数据${resolvedModule ? `、module="${resolvedModule}"` : ""}）补出 ECharts 折线图后再总结。` +
+                      (rendered.summaryRows?.length
+                        ? `\n接口另返回 ${rendered.summaryRows.length} 条汇总行（已从明细表剔除，字段与数值见回喂表格末尾「汇总行」说明），总结时请引用其合计值。`
+                        : "") +
+                      `\n请用与用户原始要求相同语种的自然语言简要总结即可（勿因表头/数据单元格语种改用语种）；` +
                       `最终回复不要再重复输出表格明细；禁止编造数据。`,
                   });
                   // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束

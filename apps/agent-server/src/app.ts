@@ -30,6 +30,8 @@ import { checkRateLimit, clientIpFromHeaders } from "./rate-limit.js";
 import { notifyAlerts } from "./alert-notify.js";
 import { promptGuardAuditEnabled, sanitizeUserInput } from "./prompt-guard.js";
 import { resolvePortalPermissions } from "./permissions.js";
+import { loadUserPreferences } from "./user-prefs.js";
+import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -224,10 +226,14 @@ export function createApp() {
   app.get("/auth/me", (c) => {
     const session = getSession(getCookie(c, COOKIE));
     if (!session) return errorJson(c, 401, "AUTH_NOT_LOGGED_IN", undefined, "未登录");
+    const prefs = loadUserPreferences(ownerKeyOf(session.user, session.country));
     return c.json({
       user: session.user,
       country: { id: session.country.id, label: session.country.label },
       permissions: permissionsOf(session),
+      preferences: {
+        replyLanguage: prefs.replyLanguage ?? null,
+      },
     });
   });
 
@@ -256,8 +262,7 @@ export function createApp() {
   // 任务收束后把结果落库：仅当客户端未收到 done（刷新/断网）时，把
   // (userText, 最终答复) 追加到该用户的「后台任务结果」专用会话（稳定 id=task-results，
   // 按 ownerKey 一份，避免 session 轮换刷出一堆同名 tab）。title 为通用词，无业务语义。
-  async function persistTaskOutcome(ownerKey: string, countryId: string, loginName: string, userText: string, finalText: string): Promise<void> {
-    if (!finalText.trim()) return;
+  async function persistTaskOutcome(ownerKey: string, countryId: string, loginName: string, userText: string, assistantMessage: StoredMessage): Promise<void> {
     try {
       const existing = await getConversation(ownerKey, TASK_RESULTS_CONV_ID);
       await upsertMessages({
@@ -269,7 +274,7 @@ export function createApp() {
         messages: [
           ...(existing?.messages || []),
           { role: "user", text: userText },
-          { role: "assistant", text: finalText },
+          assistantMessage,
         ],
       });
       console.log(`[chat/task] 结果已落库 ${TASK_RESULTS_CONV_ID}（累计 ${(existing?.messages.length || 0) + 2} 条）`);
@@ -326,11 +331,15 @@ export function createApp() {
       const existing = runningTasks.get(session.id);
       if (existing && !existing.settled) {
         return streamSse(async (send) => {
-          for (const ev of [...existing.events]) send(ev);
+          // 先发 task_running（携带回放任务的原始输入 userText），再回放事件：
+          // 前端据此判断回放内容与本条发送是否匹配，不匹配立即断开——
+          // 防止旧任务的答案流进新问题的气泡（输入输出错配），且断开后旧任务
+          // 收不到 done 会把结果落「后台任务结果」会话，不丢数据。
           send({
             type: "task_running",
             taskId: existing.taskId,
             startedAt: existing.startedAt,
+            userText: existing.userText,
             note: uiText(
               typeof body.uiLocale === "string" ? body.uiLocale : undefined,
               "该会话已有任务在后台执行，本连接为进度回放；任务完成后结果自动落入会话历史。",
@@ -340,6 +349,7 @@ export function createApp() {
             ),
             noteToken: token("CHAT_TASK_RUNNING"),
           });
+          for (const ev of [...existing.events]) send(ev);
         });
       }
 
@@ -414,14 +424,14 @@ export function createApp() {
           // 有 SSE 订阅则等其刷完 done；已断线（listeners=0）立即落「后台任务结果」
           const delivered = await waitForClientDelivery(task);
           if (!delivered) {
-            const finalText = [...task.events].reverse().find((e) => e.type === "text");
-            if (finalText && finalText.type === "text") {
+            const assistantMessage = buildStoredAssistantMessageFromEvents(task.events);
+            if (assistantMessage) {
               await persistTaskOutcome(
                 ownerKey,
                 session.country.id,
                 session.user?.loginName || "anon",
                 text,
-                finalText.text,
+                assistantMessage,
               );
             }
           }

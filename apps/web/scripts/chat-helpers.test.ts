@@ -3,6 +3,8 @@ import {
   displayAssistantTextForLocale,
   displayConversationTitle,
   displayConversationTitleForLocale,
+  displayMessageTextForLocale,
+  displayReasoningTextForLocale,
   isDefaultConversationTitle,
   loadConversationsFromStorage,
   loadClosedIds,
@@ -55,12 +57,20 @@ assert(
     displayConversationTitle("自定义标题", "新对话") === "自定义标题",
 );
 assert(
-  "标题展示会隐藏非中文界面下的历史中文标题",
-  displayConversationTitleForLocale("你好", "新对话", "hi") === "(दूसरी भाषा में सहेजा गया शीर्षक)",
+  "标题展示会按目标内容语种隐藏历史标题",
+  displayConversationTitleForLocale("你好", "新对话", "hi", "en") === "(भाषा नीति द्वारा छिपाया गया सहेजा गया शीर्षक)",
 );
 assert(
-  "助手正文会隐藏非中文界面下的历史中文文本",
-  displayAssistantTextForLocale("你好，旧内容", "en") === "Stored assistant text in another language is hidden in this UI locale.",
+  "助手正文会按目标内容语种隐藏历史文本",
+  displayAssistantTextForLocale("你好，旧内容", "en", "pt-BR") === "Stored assistant text is hidden by the language policy.",
+);
+assert(
+  "用户正文也会按目标内容语种隐藏历史文本",
+  displayMessageTextForLocale("你好，旧需求", "user", "pt-BR", "en") === "O texto salvo do usuario foi ocultado pela politica de idioma.",
+);
+assert(
+  "reasoning 也会按目标内容语种隐藏历史文本",
+  displayReasoningTextForLocale("你好，旧推理", "en", "pt-BR") === "Stored assistant text is hidden by the language policy.",
 );
 
 assert(
@@ -186,10 +196,11 @@ const understoodShown = presentToolResult(
     summary: "用户打招呼闲聊",
   }),
   "en",
+  "en",
 );
 assert(
-  "submit_understood_intent 结果在英文下不展示中文摘要",
-  understoodShown.includes('"summary": "User is greeting or chatting"') &&
+  "submit_understood_intent 结果会按目标内容语种隐藏中文摘要",
+  understoodShown.includes('"summary": "The raw business text is hidden by the language policy."') &&
     understoodShown.includes('"responseMode": "explain capability/path"') &&
     !understoodShown.includes("用户打招呼闲聊"),
 );
@@ -201,6 +212,7 @@ const prefShown = presentToolResult(
     _i18n: { code: "TOOL_PREF_SAVED" },
     preferences: { replyLanguage: "pt-BR" },
   }),
+  "pt-BR",
   "pt-BR",
 );
 assert(
@@ -222,6 +234,7 @@ const guideShown = presentToolResult(
     guideCode: "TOOL_PREF_GUIDE",
   }),
   "en",
+  "en",
 );
 assert(
   "tool result 会本地化 guideCode",
@@ -235,6 +248,7 @@ const grepNoMatchShown = presentToolResult(
     _i18n: { code: "TOOL_GREP_NO_MATCH_DIR" },
     noResults: true,
   }),
+  "en",
   "en",
 );
 assert(
@@ -250,10 +264,11 @@ const hiddenHintShown = presentToolResult(
     hint: "原始中文提示",
   }),
   "en",
+  "en",
 );
 assert(
   "tool result 会隐藏诊断字段中的原始中文",
-  hiddenHintShown.includes('"hint": "Hidden raw localized diagnostic text."'),
+  hiddenHintShown.includes('"hint": "The diagnostic text is hidden by the language policy."'),
 );
 
 const hiddenEnglishDetailShown = presentToolResult(
@@ -264,10 +279,59 @@ const hiddenEnglishDetailShown = presentToolResult(
     detail: "upstream gateway timeout while requesting report list",
   }),
   "pt-BR",
+  "hi",
 );
 assert(
-  "tool result 会在非英文界面隐藏英文诊断字段",
-  hiddenEnglishDetailShown.includes('"detail": "Texto bruto de diagnostico em outro idioma foi ocultado."'),
+  "tool result 会按目标内容语种隐藏英文诊断字段",
+  hiddenEnglishDetailShown.includes('"detail": "O texto de diagnostico foi ocultado pela politica de idioma."'),
+);
+
+const englishDetailShown = presentToolResult(
+  "call_api",
+  JSON.stringify({
+    ok: false,
+    _i18n: { code: "TOOL_CALL_API_REQUEST_FAILED" },
+    detail: "upstream gateway timeout while requesting report list",
+  }),
+  "pt-BR",
+  "en",
+);
+assert(
+  "tool result 的诊断字段不再仅因 uiLocale 不是英文而被隐藏",
+  englishDetailShown.includes('"detail": "upstream gateway timeout while requesting report list"'),
+);
+
+const hiddenKnowledgeShown = presentToolResult(
+  "search_knowledge_base",
+  JSON.stringify({
+    ok: true,
+    _i18n: { code: "TOOL_SEARCH_KB_FOUND" },
+    items: [{ title: "制度", snippet: "这是中文知识摘要", sourcePath: "docs/knowledge/rules.md" }],
+  }),
+  "en",
+  "pt-BR",
+);
+assert(
+  "knowledge snippet 会按目标内容语种隐藏",
+  hiddenKnowledgeShown.includes('"snippet": "The knowledge or document snippet is hidden by the language policy."') &&
+    hiddenKnowledgeShown.includes('"sourcePath": "docs/knowledge/rules.md"'),
+);
+
+const legacyStructuredShown = presentToolResult(
+  "call_api",
+  JSON.stringify({
+    ok: false,
+    message: "历史中文业务结果",
+    detail: "legacy chinese diagnostic detail",
+    path: "/api/report/list",
+  }),
+  "en",
+  "pt-BR",
+);
+assert(
+  "无 _i18n 的结构化结果也会走 fail-closed",
+  legacyStructuredShown.includes('"message": "The raw business text is hidden by the language policy."') &&
+    legacyStructuredShown.includes('"path": "/api/report/list"'),
 );
 
 const pageHintShown = presentToolResult(
@@ -277,6 +341,7 @@ const pageHintShown = presentToolResult(
     _i18n: { code: "TOOL_GET_PAGE_SCHEMA_NOT_FOUND" },
     pages: [{ primaryType: "list", outputHintCode: "TOOL_GET_PAGE_SCHEMA_HINT_LIST" }],
   }),
+  "en",
   "en",
 );
 assert(
@@ -288,6 +353,7 @@ const uiTransportShown = presentToolResult(
   "export_dataset",
   `UI_TABLE\n{"title":"表格","total":2}\nUI_FILE\n{"name":"report.xlsx","size":123}\n\n已生成 XLSX：report.xlsx`,
   "en",
+  "pt-BR",
 );
 assert(
   "tool result 会去掉 UI transport 的原始包装文本",
@@ -359,6 +425,21 @@ applyChatStreamEvent({
   tx,
 });
 assert("stream event 会更新模型降级提示", fallbackState.modelNotice.includes("GPT-X"));
+
+const errorAssistant: Bubble = { id: 13, role: "assistant", text: "", finished: false };
+const errorState = { suppressDelta: false, gotDone: false, toolCount: 0, modelNotice: "" };
+applyChatStreamEvent({
+  event: { type: "error", error: { code: "CHAT_STREAM_FAILED" } },
+  assistant: errorAssistant,
+  state: errorState,
+  locale: "en",
+  tx,
+});
+assert(
+  "stream event 会同时保留 error token 与本地化错误",
+  errorAssistant.errorToken?.code === "CHAT_STREAM_FAILED" &&
+    errorAssistant.error === "Operation failed. Please try again later.",
+);
 
 const failed = results.filter((item) => !item.ok);
 console.log(`\nweb-chat: ${results.length - failed.length}/${results.length} PASS`);

@@ -130,6 +130,7 @@ export function applyChatStreamEvent(args: {
   }
 
   if (event.type === "error") {
+    assistant.errorToken = event.error;
     assistant.error = localizeToken(locale, event.error, "GENERIC_UNKNOWN_ERROR");
     return state;
   }
@@ -149,6 +150,15 @@ export function applyChatStreamEvent(args: {
   if (event.type === "file") {
     if (!assistant.files) assistant.files = [];
     assistant.files.push(event.file);
+  }
+
+  if (event.type === "task_running") {
+    // 进度回放/后台任务提示：以状态条文案呈现（noteToken 优先走多语言词典）。
+    // 回放内容与新输入不匹配的拦截在 send() 的 onEvent 层处理（见 ChatPage.vue）。
+    assistant.status = event.noteToken
+      ? localizeToken(locale, event.noteToken, event.note || "")
+      : event.note || assistant.status;
+    return state;
   }
 
   return state;

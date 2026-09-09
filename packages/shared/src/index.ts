@@ -107,6 +107,7 @@ export type ChatEvent =
   | { type: "table"; table: ChatTableView }
   | { type: "file"; file: ChatFileRef }
   | { type: "chart"; chart: ChatChartView }
-  /** P2 异步：该会话已有任务在后台执行，本连接为进度回放（重连/并发保护语义） */
-  | { type: "task_running"; taskId: string; startedAt: number; note?: string; noteToken?: LocalizedToken }
+  /** P2 异步：该会话已有任务在后台执行，本连接为进度回放（重连/并发保护语义）。
+   *  userText=回放任务的原始输入，前端据此判断回放内容与新输入是否匹配（防旧答案配错新问题） */
+  | { type: "task_running"; taskId: string; startedAt: number; userText?: string; note?: string; noteToken?: LocalizedToken }
   | { type: "done" };

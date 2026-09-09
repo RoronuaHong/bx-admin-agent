@@ -176,6 +176,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   render_table:
     "把数组或 {list:[]} 渲染成 Markdown 表格，并推送到聊天界面结构化预览。" +
     "支持 tree（children 层级缩进）与 footer（sum/avg 表尾）。" +
+    "用户要求趋势/图表时传 pageKind=\"analysis_chart\"（data 必须是真实行数据，禁止编造），服务端会自动推断 X 轴与数值序列渲染 ECharts 折线图+数据表。" +
     "columns 的 title 传中文（用 get_list_columns 的 PC title，或按 pc-column-mapping 技能从当前项目源码取；key 必须与数据字段一致）。" +
     "注意：call_api 成功后服务端会自动受控渲染表格，通常无需调用本工具；" +
     "仅当服务端提示 [workflow/output-align] 时才手动调用。需要下载文件时再用 export_dataset。",
@@ -718,6 +719,11 @@ export function listAgentTools(): AgentToolDef[] {
           },
           maxRows: { type: "number", description: "最多行数，默认 50，上限 200" },
           title: { type: "string" },
+          pageKind: {
+            type: "string",
+            description: "输出形态：table（默认）| analysis_chart——analysis_chart 时服务端用 data 真实行自动推断 X 轴与数值序列，渲染 ECharts 折线图+数据表",
+          },
+          module: { type: "string", description: "模块 key（analysis_chart 时用于表头中文化）" },
           tree: { type: "boolean", description: "按 children 展平为树表" },
           footer: { description: "{sum:['amount'], label:'合计'} 或 footer 行对象" },
         },

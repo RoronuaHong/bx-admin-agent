@@ -12,6 +12,7 @@ import { presentToolLabel, presentToolResult } from "../tool-result-presenter";
 const props = defineProps<{
   name: string;
   result: string;
+  targetContentLanguage?: string | null;
   expanded?: boolean;
 }>();
 
@@ -31,7 +32,12 @@ function toggle() {
 }
 
 /** 提取可读摘要：去掉 UI_TABLE/【表格输出】等结构标记，取前 160 字符 */
-const displayResult = computed(() => presentToolResult(props.name, props.result || "", uiLocale.value));
+const displayResult = computed(() => presentToolResult(
+  props.name,
+  props.result || "",
+  uiLocale.value,
+  props.targetContentLanguage,
+));
 
 const summary = computed(() => {
   const raw = displayResult.value;

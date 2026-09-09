@@ -20,6 +20,7 @@ import { resolveLocalDoc } from "./sources.js";
 import { defaultFieldMappingPath } from "./agent-docs.js";
 import { getSession } from "./session.js";
 import { isToolErrorResult } from "./tool-result-contract.js";
+import { splitSummaryRows } from "./report-pc-parity.js";
 import type { UnderstoodIntent } from "./understood-intent.js";
 
 export type OrchestrateResult =
@@ -619,6 +620,8 @@ const TERMINAL_FLAG_BITS: Array<{ bit: number; label: string }> = [
   { bit: 64, label: "Android TV" },
 ];
 const TERMINAL_FLAG_KEY_RE = /^terminalFlag$/i;
+// 比率/百分比字段名（通用数值语义词缀，非业务词；匹配前需先做 camelCase 拆分）
+const RATE_KEY_RE = /\b(rate|ratio|percent|percentage)\b/i;
 
 function renderCell(
   record: Record<string, unknown>,
@@ -700,6 +703,14 @@ function renderCell(
   }
   if (typeof v === "boolean") return v ? "是" : "否";
   if (typeof v === "object") return "{…}";
+
+  // 比率/百分比字段通用格式化（2026-09-08，对齐 PC customRender 惯例）：
+  // 字段名含 rate/ratio/percent 通用数值语义词缀（camelCase 先拆分再匹配，避免 grate/generate 误伤）
+  // 且值 ∈ [0,1] → 百分比显示（0.0408 → 4.08%）；>1 的值不转换（可能是次数/得分等非比率语义）。
+  if (RATE_KEY_RE.test(key.replace(/([a-z0-9])([A-Z])/g, "$1 $2"))) {
+    const n = typeof v === "number" ? v : Number(String(v).replace(/[%,%\s]/g, ""));
+    if (Number.isFinite(n) && n >= 0 && n <= 1) return `${(n * 100).toFixed(2)}%`;
+  }
 
   // 位掩码字段（位或组合 → 解析出命中项列表）：优先用 field-mapping.json 的 renderRules.bitmask 配置
   // （对齐 PC 端 options.ts getClientType*ByOperatorOptions，banner 等不同掩码集须显式配置）；
@@ -1064,8 +1075,13 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
   // 5.1 渲染：列表/明细 → 按 PC 列定义裁剪排序输出 Markdown 表格（不再推送 ResultTable 事件，
   // 避免同一份数据在 text 与 tables 双轨重复渲染；最终结果统一由 Markdown 承载）。
   // 数据源用 call_api 原始行（英文 dataIndex），与 PC 列定义对齐；枚举/时间在渲染层转换，避免 key 中文化错位。
-  const rawTableRows = extractTableRows(payload);
-  const tableRows = rawTableRows.length ? rawTableRows : extractTableRows(extractJsonFromNormalized(normalized.content));
+  // 通用汇总行识别（2026-09-08，与 renderListForAgent 同口径）：合计行（维度=0/空、指标=明细之和）
+  // 不进明细表，附 md 末尾说明，避免「统计日期=0」假数据行上屏。
+  const extractedRows = rawTableRows.length
+    ? rawTableRows
+    : extractTableRows(extractJsonFromNormalized(normalized.content));
+  const { detailRows: rawDetailRows, summaryRows: orchSummaryRows } = splitSummaryRows(extractedRows);
+  const tableRows = rawDetailRows;
   if (tableRows.length) {
     const { rows: cleanRows, headers, keys } = pickRowsByPcColumns(tableRows, pcColumns);
     const { enums, rules, fieldMap } = loadModuleRenderConfig(moduleKey);
@@ -1078,10 +1094,22 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
     const mdRows = cleanRows.map((r) =>
       keys.map((k) => renderCell(r as Record<string, unknown>, k, enums[k], rules)),
     );
+    const summaryNoteMd = orchSummaryRows.length
+      ? "\n\n" +
+        orchSummaryRows
+          .map(
+            (r) =>
+              `汇总行：${Object.entries(r)
+                .map(([k, v]) => `${k}=${String(v ?? "")}`)
+                .join("，")}`,
+          )
+          .join("\n")
+      : "";
     const md =
       `| ${finalHeaders.join(" | ")} |\n` +
       `| ${finalHeaders.map(() => "---").join(" | ")} |\n` +
-      mdRows.map((row) => `| ${row.map(mdCellEscape).join(" | ")} |`).join("\n");
+      mdRows.map((row) => `| ${row.map(mdCellEscape).join(" | ")} |`).join("\n") +
+      summaryNoteMd;
 
     steps.push({
       kind: "system",
@@ -1224,12 +1252,16 @@ export async function renderListForAgent(
   payload: unknown,
   moduleKey: string,
   filterSummary?: string,
-): Promise<{ md: string; view: ChatTableView; needsModelMapping?: string[]; needsValueMapping?: string[]; fieldDiff?: { pcMissing: string[]; dataExtra: string[] } }> {
+): Promise<{ md: string; view: ChatTableView; needsModelMapping?: string[]; needsValueMapping?: string[]; summaryRows?: Record<string, unknown>[]; fieldDiff?: { pcMissing: string[]; dataExtra: string[] } }> {
   const rawTableRows = extractTableRows(payload);
   if (!rawTableRows.length) {
     throw new Error(`payload 不是列表数据（module=${moduleKey}）`);
   }
-  const tableRows = rawTableRows.slice(0, 100);
+  // 通用汇总行识别（2026-09-08，数值校验零词形写死）：报表接口的合计行（维度字段=0/空、
+  // 指标列=明细之和）不进明细表格——原样上屏会出现「统计日期=0」假数据行；改为剔除后
+  // 附在回喂模型 md 末尾作「汇总行」说明，由模型在总结中引用合计值。
+  const { detailRows, summaryRows } = splitSummaryRows(rawTableRows);
+  const tableRows = detailRows.slice(0, 100);
   // 取 PC 列定义：与 orchestrate 同款 get_list_columns → 行数据交集
   let pcColumns: Array<{ title: string; dataIndex: string }> = [];
   try {
@@ -1275,10 +1307,23 @@ export async function renderListForAgent(
     return keys.map((k) => renderCell(rec, k, enums[k], rules));
   });
   const mdRows = cellRenderCache;
+  // 汇总行说明（回喂模型）：不进表格 rows，仅以文字行附在 md 末尾，交模型在总结中引用
+  const summaryNote = summaryRows.length
+    ? "\n\n" +
+      summaryRows
+        .map(
+          (r) =>
+            `汇总行：${Object.entries(r)
+              .map(([k, v]) => `${k}=${String(v ?? "")}`)
+              .join("，")}`,
+        )
+        .join("\n")
+    : "";
   const md =
     `| ${finalHeaders.join(" | ")} |\n` +
     `| ${finalHeaders.map(() => "---").join(" | ")} |\n` +
-    mdRows.map((row) => `| ${row.map(mdCellEscape).join(" | ")} |`).join("\n");
+    mdRows.map((row) => `| ${row.map(mdCellEscape).join(" | ")} |`).join("\n") +
+    summaryNote;
 
   // 值英文检测（2026-08-24）：单元格仍有「短数字枚举」且该列源码枚举未翻译 → 交模型按 skill 翻值。
   // 排除数值语义列（count/total/amount/price/timeLimit/cycle/days 等，其值本就该是数字/时长/周期）。
@@ -1330,6 +1375,7 @@ export async function renderListForAgent(
     view,
     ...(needsModelMapping.length ? { needsModelMapping } : {}),
     ...(needsValueMapping.length ? { needsValueMapping } : {}),
+    ...(summaryRows.length ? { summaryRows } : {}),
     ...(fieldDiff ? { fieldDiff } : {}),
   };
 }

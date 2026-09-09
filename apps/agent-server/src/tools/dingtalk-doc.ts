@@ -110,6 +110,7 @@ export async function searchDingtalkDoc(
           untitled: !it.name,
           url: it.url || "",
           snippet: it.snippet || "",
+          snippetType: "knowledge-snippet",
           docId: it.docId || "",
         })),
       },

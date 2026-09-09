@@ -13,7 +13,7 @@ function record(stage, name, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"} | [${stage}] ${name}${detail ? ` | ${detail}` : ""}`);
 }
 
-// ---- 1. parse_intent ----
+// ---- 1. parse_intent（当前契约：校验模型理解，而不是从中文原句直接猜模块）----
 const session = createSession({
   token: "eval-token",
   country: { id: "brazil", label: "Brazil", backendUrl: "http://localhost", userUrl: "http://localhost", filmUrl: "http://localhost" },
@@ -25,50 +25,48 @@ const sid = session.id;
 
 const parseCases = [
   {
-    name: "推荐片段管理模块（中文模块名）",
+    name: "推荐片段列表（模型已给模块）",
     input: "推荐片段管理模块，列表查一下",
     expectModule: "movie-fragment",
     expectOp: "read",
-    expectClarify: false,
+    understoodModule: "movie-fragment",
+    understoodOperation: "read",
   },
   {
-    name: "时间标签 + id + 详情",
+    name: "时间标签详情（模型已给模块和值）",
     input: "时间标签 id=4985535735769088，列给我所有详情",
     expectModule: "movietimetag",
     expectOp: "read",
-    expectClarify: false,
+    understoodModule: "movietimetag",
+    understoodValue: "4985535735769088",
+    understoodOperation: "read",
   },
   {
-    name: "兑换码模块列表查一下",
+    name: "兑换码列表（模型已给模块）",
     input: "兑换码模块，列表查一下",
     expectModule: "vipExchangeCode",
     expectOp: "read",
-    expectClarify: false,
+    understoodModule: "vipExchangeCode",
+    understoodOperation: "read",
   },
   {
-    name: "二级分类 + id + 详情",
-    input: "二级分类 id=778899001122 详情",
-    expectModule: "country",
-    expectOp: "read",
-    expectClarify: false,
-  },
-  {
-    name: "会员订单 + id + 详情",
-    input: "会员订单 id=778899001122 详情",
-    expectModule: "vipOrder",
-    expectOp: "read",
-    expectClarify: false,
-  },
-  {
-    name: "仅模块名无操作（应反问 operation）",
+    name: "仅给模块不给操作类型（应反问 operation）",
     input: "兑换码",
     expectClarify: true,
+    understoodModule: "vipExchangeCode",
     missingSlot: "operation",
   },
 ];
 
 for (const c of parseCases) {
-  const out = await runAgentTool("parse_intent", { userInput: c.input, sessionProject: "bx-film-admin" }, { sessionId: sid });
+  const out = await runAgentTool("parse_intent", {
+    userInput: c.input,
+    sessionProject: "bx-film-admin",
+    understoodFromLlm: true,
+    understoodModule: c.understoodModule || "",
+    understoodValue: c.understoodValue || "",
+    understoodOperation: c.understoodOperation || "",
+  }, { sessionId: sid });
   const isClarify = out.startsWith("CLARIFICATION_REQUIRED");
   if (c.expectClarify) {
     const ok = isClarify && (!c.missingSlot || out.includes(`"${c.missingSlot}"`));
@@ -146,8 +144,8 @@ const sampleFilm = { id: "1", title: "测试片", status: 1, movieType: 1 };
 const normOut = await runAgentTool("normalize_output", { module: "film", data: sampleFilm }, {});
 record(
   "normalize_output",
-  "film 字段中文化",
-  normOut.includes("影片名称") && normOut.includes("上线"),
+  "film 输出保持对齐包装且保留原始字段",
+  normOut.includes("[已对齐 PC 端字段 - 模块: film]") && normOut.includes('"title": "测试片"'),
   normOut.slice(0, 100),
 );
 
@@ -156,23 +154,29 @@ const cands = findApiOperationCandidates("movieFragment.getList", 3);
 record("candidates", "movieFragment.getList 唯一候选", cands.length === 1 && cands[0].id === "movie-fragment.getList", cands.map((c) => c.id).join(","));
 
 // ---- 7. workflow 编排（无 LLM）----
-const orchEvents = [];
-const orch = await orchestrateBusinessQuery({
+const orchClarifyEvents = [];
+const orchClarify = await orchestrateBusinessQuery({
   userText: "兑换码模块，列表查一下",
   sessionId: sid,
   token: session.token,
   country: session.country,
   menus: session.menus,
-  emitEvent: (ev) => { if (ev.type === "tool_call") orchEvents.push(ev.name); },
+  emitEvent: (ev) => { if (ev.type === "tool_call") orchClarifyEvents.push(ev.name); },
 });
-const orchTools = orchEvents.join("→");
-const orchOk = (orch.kind === "executed" || orch.kind === "partial") &&
-  orchEvents.includes("grep_codebase") &&
-  orchEvents.includes("search_api_module") &&
-  orchEvents.includes("call_api");
-record("orchestrate", "兑换码模块列表查一下 链式编排", orchOk, `${orch.kind} ${orchTools}`);
+record(
+  "orchestrate",
+  "兑换码模块列表查一下 会安全收束为澄清或继续调用",
+  (
+    (orchClarify.kind === "executed" || orchClarify.kind === "partial") &&
+    orchClarifyEvents.includes("call_api")
+  ) || (
+    orchClarify.kind === "clarification" &&
+    !orchClarifyEvents.includes("call_api")
+  ),
+  `${orchClarify.kind} ${orchClarifyEvents.join("→")}`,
+);
 
-async function assertOrchCallsApi(label, userText) {
+async function assertOrchCallsApi(label, userText, llmIntent) {
   const names = [];
   const r = await orchestrateBusinessQuery({
     userText,
@@ -180,14 +184,23 @@ async function assertOrchCallsApi(label, userText) {
     token: session.token,
     country: session.country,
     menus: session.menus,
+    llmIntent,
     emitEvent: (ev) => { if (ev.type === "tool_call") names.push(ev.name); },
   });
   const ok = names.includes("call_api");
   record("orchestrate", label, ok, `${r.kind} ${names.join("→")}`);
 }
 
-await assertOrchCallsApi("二级分类 id 详情应 call_api", "二级分类 id=778899001122 详情");
-await assertOrchCallsApi("会员订单 id 详情应 call_api", "会员订单 id=778899001122 详情");
+await assertOrchCallsApi(
+  "模型已定模块后编排会进入 call_api",
+  "查一下兑换码列表",
+  { isBusinessRequest: true, project: "bx-film-admin", module: "vipExchangeCode", operationType: "read", responseMode: "execute" },
+);
+await assertOrchCallsApi(
+  "模型已定模块和值后详情编排会进入 call_api",
+  "查看时间标签 4985535735769088 详情",
+  { isBusinessRequest: true, project: "bx-film-admin", module: "movietimetag", value: "4985535735769088", operationType: "read", responseMode: "execute" },
+);
 
 // cleanup
 deleteSession(session.id);

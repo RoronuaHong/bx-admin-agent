@@ -10,8 +10,9 @@ import {
   TASK_RESULTS_ID,
   clearIdentityCache,
   dedupeConversationList,
-  displayAssistantTextForLocale,
   displayConversationTitleForLocale,
+  displayMessageTextForLocale,
+  displayReasoningTextForLocale,
   isDefaultConversationTitle,
   isLegacyTaskConversation,
   loadClosedIds,
@@ -40,6 +41,7 @@ import ToolResultCard from "../components/ToolResultCard.vue";
 import CapabilitiesHelp from "../components/CapabilitiesHelp.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { getUiLocale } from "../ui-locale";
+import { normalizeContentLanguage } from "../content-language";
 
 const ResultChart = defineAsyncComponent(() => import("../components/ResultChart.vue"));
 
@@ -138,13 +140,35 @@ function defaultConversationTitle() {
 }
 
 function displayConversationTitleOf(conv: { title?: string | null }) {
-  return displayConversationTitleForLocale(conv.title, defaultConversationTitle(), uiLocale.value);
+  return displayConversationTitleForLocale(
+    conv.title,
+    defaultConversationTitle(),
+    uiLocale.value,
+    normalizeContentLanguage(me.value?.preferences?.replyLanguage),
+  );
 }
 
-function displayAssistantText(item: Bubble) {
-  return item.role === "assistant"
-    ? displayAssistantTextForLocale(item.text, uiLocale.value)
-    : item.text;
+function displayMessageText(item: Bubble) {
+  return displayMessageTextForLocale(
+    item.text,
+    item.role,
+    uiLocale.value,
+    normalizeContentLanguage(me.value?.preferences?.replyLanguage),
+  );
+}
+
+function displayReasoningText(item: Bubble) {
+  return displayReasoningTextForLocale(
+    item.reasoning,
+    uiLocale.value,
+    normalizeContentLanguage(me.value?.preferences?.replyLanguage),
+  );
+}
+
+function displayErrorText(item: Bubble) {
+  return item.errorToken
+    ? localizeToken(uiLocale.value, item.errorToken, "GENERIC_UNKNOWN_ERROR")
+    : String(item.error || "");
 }
 
 // 本地离线兜底（服务端不可达时仍保留一份），非主存储。
@@ -567,6 +591,26 @@ async function send() {
   document.documentElement.style.setProperty("--composer-max", "");
   await nextTick();
   resizeComposer();
+  // 发送前预检：已有后台任务在跑时，服务端对本请求只会做「旧任务回放」（不开新任务），
+  // 旧答案会流进新问题的气泡（输入输出错配）。这里直接拦截，把输入还原，等任务完成。
+  sending.value = true; // 预检期间占住发送态，防止双击并发两次 send
+  try {
+    const taskStatus = await fetchTaskStatus();
+    if (taskStatus.running) {
+      input.value = text;
+      sending.value = false;
+      modelNotice.value = tx(
+        `上一个任务仍在后台执行（${taskStatus.running.userText.slice(0, 40)}），请等它完成或点停止后再发送`,
+        `The previous task is still running (${taskStatus.running.userText.slice(0, 40)}). Please wait for it to finish or stop it first.`,
+        `A tarefa anterior ainda esta em execucao (${taskStatus.running.userText.slice(0, 40)}). Aguarde a conclusao ou interrompa antes de enviar.`,
+        `पिछला कार्य अभी बैकग्राउंड में चल रहा है (${taskStatus.running.userText.slice(0, 40)})। कृपया प्रतीक्षा करें या पहले इसे रोकें।`,
+      );
+      resizeComposer();
+      return;
+    }
+  } catch {
+    /* 状态查询失败：不拦截，走原有流程（回放不匹配时有断开兜底） */
+  }
   const active = conversations.value.find((c) => c.id === activeId.value);
   if (!active) newConversation();
   const target = conversations.value.find((c) => c.id === activeId.value)!;
@@ -584,6 +628,9 @@ async function send() {
   await scrollBottom();
   let gotDone = false;
   let toolCount = 0; // 累计工具调用次数，实时展示进度（第 N 步）
+  // 回放不匹配兜底（与发送前预检构成双保险）：服务端 task_running 带回放任务的原始输入，
+  // 与本条发送不一致 → 立即断开，防止旧任务答案流进新问题气泡
+  let replayMismatch = false;
   const controller = new AbortController();
   activeController.value = controller;
   try {
@@ -591,6 +638,11 @@ async function send() {
       text,
       { model: selectedModel.value ?? undefined, images: imageIds, files, uiLocale: uiLocale.value },
       (event: ChatEvent) => {
+        if (event.type === "task_running" && event.userText && event.userText !== text) {
+          replayMismatch = true;
+          controller.abort(); // 断开后服务端收不到 done，旧任务结果会落「后台任务结果」会话
+          return;
+        }
         const state = applyChatStreamEvent({
           event,
           assistant,
@@ -612,11 +664,26 @@ async function send() {
     );
   } catch (err) {
     if ((err as Error).name === "AbortError") {
-      // 用户主动取消：保留已收到的文本，标记为已取消。
-      assistant.cancelled = true;
+      if (replayMismatch) {
+        // 旧任务回放与新输入不匹配：撤回本次 user+assistant 气泡，还原输入并提示
+        const idx = target.messages.indexOf(assistant);
+        if (idx >= 1) target.messages.splice(idx - 1, 2);
+        if (!input.value.trim()) input.value = text;
+        modelNotice.value = tx(
+          "上一任务仍在后台执行，本次输入未提交；其结果完成后会进入「后台任务结果」会话",
+          "The previous task is still running and this message was not submitted; its result will appear in the background-task-results conversation.",
+          "A tarefa anterior ainda esta em execucao e esta mensagem nao foi enviada; o resultado aparecera na conversa de resultados de tarefas.",
+          "पिछला कार्य अभी चल रहा है और यह संदेश भेजा नहीं गया; इसका परिणाम बैकग्राउंड-कार्य-परिणाम वार्तालाप में दिखेगा।",
+        );
+        resizeComposer();
+      } else {
+        // 用户主动取消：保留已收到的文本，标记为已取消。
+        assistant.cancelled = true;
+      }
     } else {
       const status = (err as Error & { status?: number }).status;
-      assistant.error = localizeToken(uiLocale.value, getApiErrorToken(err), "CHAT_STREAM_FAILED");
+      assistant.errorToken = getApiErrorToken(err) || { code: "CHAT_STREAM_FAILED" };
+      assistant.error = localizeToken(uiLocale.value, assistant.errorToken, "CHAT_STREAM_FAILED");
       if (status === 401) await router.replace("/agents/admin/login");
     }
   } finally {
@@ -624,7 +691,8 @@ async function send() {
     activeController.value = null;
     // 取消时不再给兜底提示；正常结束（done）但无任何有效产出时提示。
     if (!assistant.cancelled && gotDone && !assistant.text && !assistant.error && !assistant.tables?.length && !assistant.charts?.length && !assistant.files?.length && !assistant.toolResults?.length) {
-      assistant.error = tx("本次未返回有效结果，请换个说法再试。", "No valid result was returned. Please try rephrasing.", "Nenhum resultado valido foi retornado. Tente reformular.", "कोई वैध परिणाम वापस नहीं आया। कृपया अलग तरह से पूछें।");
+      assistant.errorToken = { code: "CHAT_EMPTY_RESULT" };
+      assistant.error = localizeToken(uiLocale.value, assistant.errorToken);
     }
     await scrollBottom();
   }
@@ -1108,7 +1176,7 @@ async function onClearContext() {
               <span class="reasoning-toggle" aria-hidden="true">{{ item.reasoningExpanded ? tx("收起", "Collapse", "Recolher", "समेटें") : tx("展开", "Expand", "Expandir", "विस्तार करें") }}</span>
             </button>
             <div v-if="item.reasoningExpanded" class="reasoning-body">
-              <p v-for="(line, ri) in item.reasoning.trim().split('\n')" :key="ri" class="reasoning-line">{{ line }}</p>
+              <p v-for="(line, ri) in displayReasoningText(item).trim().split('\n')" :key="ri" class="reasoning-line">{{ line }}</p>
             </div>
           </div>
               <div v-if="item.toolResults?.length" class="msg-tool-results">
@@ -1149,6 +1217,7 @@ async function onClearContext() {
                   :key="ti"
                   :name="tr.name"
                   :result="tr.result"
+                  :target-content-language="normalizeContentLanguage(me?.preferences?.replyLanguage)"
                   :expanded="cards[ti]"
                   @update:expanded="(v: boolean) => { cards[ti] = v }"
                 />
@@ -1158,7 +1227,7 @@ async function onClearContext() {
           <div v-if="item.tables?.length" class="msg-tables">
             <ResultTable v-for="(tb, ti) in item.tables" :key="ti" :table="tb" />
           </div>
-          <div v-if="item.text" class="body" v-html="renderMarkdown(displayAssistantText(item))" />
+          <div v-if="item.text" class="body" v-html="renderMarkdown(displayMessageText(item))" />
           <span v-if="item.role === 'assistant' && item.text && !item.finished && !item.cancelled && !item.error" class="stream-caret" aria-hidden="true" />
           <div v-if="item.files?.length" class="msg-files">
             <div v-for="f in item.files" :key="f.id" class="file-card">
@@ -1235,7 +1304,7 @@ async function onClearContext() {
           <span class="loading-dot" />
           <span class="loading-text">{{ item.status || tx('正在思考…', 'Thinking…', 'Pensando…', 'सोच रहा है…') }}</span>
         </div>
-        <p v-if="item.error" class="error">{{ item.error }}</p>
+        <p v-if="item.error || item.errorToken" class="error">{{ displayErrorText(item) }}</p>
         <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled", "Cancelado", "रद्द") }}</div>
         </article>
       </main>

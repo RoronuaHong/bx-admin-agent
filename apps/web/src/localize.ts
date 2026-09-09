@@ -119,6 +119,12 @@ const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
     hi: "वार्तालाप रीसेट नहीं हो सका।",
   },
   CHAT_STREAM_FAILED: GENERIC_FALLBACKS.GENERIC_UNKNOWN_ERROR,
+  CHAT_EMPTY_RESULT: {
+    zh: "本次未返回有效结果，请换个说法再试。",
+    en: "No valid result was returned. Please try rephrasing.",
+    pt: "Nenhum resultado valido foi retornado. Tente reformular.",
+    hi: "कोई वैध परिणाम वापस नहीं आया। कृपया अलग तरह से पूछें।",
+  },
   CHAT_TASK_FAILED: {
     zh: "后台任务执行失败。",
     en: "The background task failed.",
@@ -557,6 +563,18 @@ const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
     en: "Knowledge base search failed because the query is missing.",
     pt: "A busca na base de conhecimento falhou porque a consulta esta ausente.",
     hi: "नॉलेज बेस खोज विफल हुई क्योंकि query गायब है।",
+  },
+  TOOL_SEARCH_KB_NO_MATCH: {
+    zh: "本地知识库中未找到相关内容。",
+    en: "No relevant content was found in the local knowledge base.",
+    pt: "Nenhum conteudo relevante foi encontrado na base de conhecimento local.",
+    hi: "स्थानीय नॉलेज बेस में कोई संबंधित सामग्री नहीं मिली।",
+  },
+  TOOL_SEARCH_KB_FOUND: {
+    zh: "已返回知识库检索结果。",
+    en: "Knowledge base results have been returned.",
+    pt: "Os resultados da base de conhecimento foram retornados.",
+    hi: "नॉलेज बेस परिणाम लौटाए गए हैं।",
   },
   TOOL_GET_FIELD_MAPPING_MISSING_MODULE: {
     zh: "读取字段映射失败，缺少模块参数。",

@@ -9,6 +9,7 @@
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 import type { SessionUser } from "@bx/shared";
+import type { LocalizedToken } from "./i18n";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -30,6 +31,7 @@ export interface StoredMessage {
   cancelled?: boolean;
   status?: string;
   error?: string;
+  errorToken?: LocalizedToken;
   reasoning?: string;
   toolResults?: Array<{ name: string; result: string }>;
   toolStep?: number;

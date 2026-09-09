@@ -1,81 +1,111 @@
-# Strict Cross-Locale Content Guard Design
+# 严格跨语种内容防漏设计
 
-## Goal
+## 目标
 
-Extend the existing i18n runtime work so that, under strict mode, non-target UI locales do not directly display raw source-language content that falls outside localized system chrome.
+在现有 i18n 运行时治理的基础上，继续补齐“严格模式”下的内容展示约束：当用户明确设置的目标回复语种/内容语种策略与当前原始内容语种不一致时，任何不属于系统本地化界面的原始源语言内容，都不应直接显示在页面上。
 
-This design focuses on display governance for:
+本设计重点治理以下内容的展示：
 
-- stored user message bodies
-- stored assistant message bodies
-- knowledge and document snippets
-- source code and file-content excerpts
-- tool-result fields that contain free-form natural-language text
+- 已存储的用户消息正文
+- 已存储的助手消息正文
+- 已存储的 reasoning / 思考过程文本
+- 知识库和文档命中的摘要片段
+- 源码片段与文件内容摘录
+- 工具结果中包含自由文本自然语言的字段
 
-The target behavior is intentionally strict for `pt-BR` and `hi`: system text remains localized, while source-language content is hidden behind localized placeholders unless the UI locale is `zh`.
+目标行为是：系统文案继续按 UI locale 严格本地化；而原始源语言内容是否允许展示，不再由 UI 选择决定，而是由“用户明确设置的目标回复语种/内容语种策略”决定。若原始内容语种与目标语种策略不一致，则默认不直出，而是替换为对应语种的占位提示。
 
-## Decisions
+## 核心决策
 
-### 1. Separate system text from source content
+### 0. 这是严格模式下的产品策略，不是通用 i18n 默认规则
 
-The product now treats these as different classes of output:
+通用多语言最佳实践通常强调：
 
-- `system`: product-authored runtime text, errors, labels, status, and guidance
-- `source content`: user-authored text, assistant-authored historical text, snippets from knowledge/doc sources, file contents, source code, and free-form diagnostic text
+- 尊重用户明确选择的语言偏好
+- 不要让浏览器语言、地理位置或界面语言覆盖用户明确选择
+- 尽量把系统文案与内容语言分开治理
 
-System text must always be localized to the active UI locale. Source content must not be silently translated or allowed to leak into non-target locales under strict mode.
+但“当内容语种与目标语种不一致时，默认直接隐藏原文”并不是所有多语言产品都会默认采用的通用规则，而是本项目在“100% 杜绝混入其他语言”目标下采用的更严格产品策略。
 
-### 2. Enforce at render time first
+因此，本设计中的内容隐藏规则仅适用于 `strict mode`，不应被表述为所有 i18n 场景的默认实现方式。
 
-Primary enforcement happens in the frontend display layer, not only at content creation time.
+### 1. 明确区分系统文案与源内容
 
-This ensures:
+产品输出统一分为两大类：
 
-- historical stored messages are governed without migration
-- old tool results are still covered
-- newly added backend tools still have a frontend fail-closed path if they forget to add explicit metadata
+- `system`：产品自身编写的运行时文案、错误、标签、状态、指引
+- `source content`：用户输入、历史助手正文、知识/文档摘要、文件正文、源码片段、自由诊断文本
 
-### 3. Add lightweight content classification for new outputs
+系统文案必须始终按当前 UI locale 本地化。源内容在严格模式下不得静默翻译，也不得在与目标语种策略不一致时直接泄漏原文。
 
-Backend tool results should carry enough field semantics for the frontend to distinguish:
+### 2. 以前端渲染时裁决为第一优先级
 
-- structural identifiers such as `id`, `url`, `path`, `module`, `status`
-- display text such as `snippet`, `summary`, `content`, `detail`, `answer`
+主防线放在前端最终展示层，而不是只依赖内容生成时处理。
 
-The first implementation does not require a new universal schema. It extends existing result payloads with clearer field naming and, where useful, explicit type hints.
+这样可以保证：
 
-### 4. Hide rather than translate raw source content
+- 历史存量消息无需迁移也能受控
+- 老的工具结果结构也能被兜住
+- 后续新增工具即使忘记补元数据，前端仍有 fail-closed 兜底，不会直接漏出原文
 
-Strict mode does not auto-translate hidden raw content. Instead it replaces it with localized placeholder text that explains what was hidden.
+### 3. 后端对新增输出补充轻量内容分类
 
-This avoids:
+后端返回的新工具结果应尽量携带足够的字段语义，方便前端区分：
 
-- incorrect or partial machine translation
-- fallback leakage when translation is unavailable
-- mixing verified UI locale text with lossy translated source evidence
+- 结构化标识字段：如 `id`、`url`、`path`、`module`、`status`
+- 展示型自由文本字段：如 `snippet`、`summary`、`content`、`detail`、`answer`
 
-## Scope
+首期不引入全新统一协议，只在现有 JSON 结构上通过更清晰的字段命名和必要的类型提示来补足语义。
 
-### In scope
+### 4. 原始内容隐藏，不自动翻译
 
-- chat-history title and message-body display rules
-- tool-result presentation rules for natural-language fields
-- knowledge/doc snippet presentation
-- source-code and file-content excerpt presentation
-- localized placeholder text for each hidden content category
-- tests and smoke checks for the strict-mode behavior
+严格模式下，不对被拦截的原始内容做自动翻译，而是替换为本地化占位文案，明确告知“该类内容已被隐藏”。
 
-### Out of scope
+这样可以避免：
 
-- translating historical user or assistant content
-- rewriting upstream business data at the API layer
-- deleting hidden raw content from storage
-- building a user-facing "show original text" override in this phase
-- changing the LLM reply-language precedence already implemented
+- 机器翻译失真或不完整
+- 翻译失败时再次回退泄漏源语言
+- 已校验过的系统本地化文案与未经验证的翻译内容混杂展示
 
-## Content Model
+## 范围
 
-The display layer should reason about content in the following categories:
+### 本次纳入范围
+
+- 聊天历史标题与消息正文的展示规则
+- 工具结果中自然语言字段的展示规则
+- 知识库/文档摘要的展示
+- 源码/文件摘录的展示
+- 各类隐藏占位文案的本地化
+- 对应测试与 smoke 验证
+
+### 本次明确不做
+
+- 历史用户或助手内容的自动翻译
+- 在 API 层重写上游业务数据
+- 从存储中删除被隐藏的原始内容
+- 本期提供“在前端一键显示原文”的交互
+- 改动已经定下来的 LLM reply-language 优先级策略
+
+## 判定基准
+
+本设计将“界面语言”和“内容准入语言”明确拆开：
+
+- `UI locale`：只负责按钮、标签、错误、状态、提示等系统界面文案的本地化显示
+- `target content language`：负责决定哪些原始内容可以直接展示，哪些需要隐藏
+
+`target content language` 的唯一判定基准为用户明确设置的目标回复语种/内容语种策略，而不是当前界面下拉框选择的 UI 语言。
+
+这意味着：
+
+- 用户把 UI 切到 `pt-BR`，但内容策略仍设为 `zh` 时，中文原始内容可以显示
+- 用户把 UI 保持中文，但内容策略设为 `pt-BR` 时，中文原始内容也应被隐藏
+- UI 语言和内容准入语言可以一致，但不是同一个概念，也不能互相替代
+
+这符合最佳实践中“用户显式语言偏好高于自动推断与环境信号”的原则，只是本项目额外把它延伸为严格内容准入控制。
+
+## 内容模型
+
+展示层统一按以下内容类别进行判断：
 
 - `system`
 - `user-authored`
@@ -86,129 +116,152 @@ The display layer should reason about content in the following categories:
 - `business-text`
 - `identifier-or-structured-value`
 
-`identifier-or-structured-value` includes values that are not natural-language copy and should remain visible even in strict mode, such as:
+其中 `identifier-or-structured-value` 指不属于自然语言文案、应当继续可见的值，例如：
 
-- ids
-- enum-like statuses
-- URLs
-- file names
-- module ids
-- API paths
-- numbers, booleans, timestamps
+- id
+- 枚举型状态值
+- URL
+- 文件名
+- 模块 id
+- API path
+- 数字、布尔值、时间戳
 
-## Rendering Rules
+## 渲染规则
 
-### Locale gate
+### 语种门禁
 
-When `uiLocale === "zh"`, raw stored/source content may render normally.
+当原始内容语种与 `target content language` 一致时，原始存储/源内容允许显示。
 
-When `uiLocale !== "zh"` and strict mode is active:
+当原始内容语种与 `target content language` 不一致，且严格模式开启时：
 
-- `system` content must render localized
-- `identifier-or-structured-value` remains visible
-- all other source-content categories are hidden by default
+- `system` 内容仍按 `UI locale` 显示为目标界面语种
+- `identifier-or-structured-value` 保持可见
+- 其他源内容类别默认隐藏，不直接展示原文
 
-### Per-category behavior
+### 按类别的处理方式
 
-- `user-authored`: replace with a localized placeholder indicating historical user text was hidden
-- `assistant-authored`: replace with a localized placeholder indicating historical assistant text was hidden
-- `knowledge-snippet`: replace with a localized placeholder indicating a knowledge/document snippet was hidden
-- `code-snippet`: replace with a localized placeholder indicating source code was hidden
-- `file-content`: replace with a localized placeholder indicating file content was hidden
-- `business-text`: replace with a localized placeholder indicating raw business text was hidden
+- `user-authored`：替换为“历史用户文本已隐藏”的本地化占位
+- `assistant-authored`：替换为“历史助手文本已隐藏”的本地化占位
+- `knowledge-snippet`：替换为“知识/文档摘要已隐藏”的本地化占位
+- `code-snippet`：替换为“源码片段已隐藏”的本地化占位
+- `file-content`：替换为“文件内容已隐藏”的本地化占位
+- `business-text`：替换为“业务原始文本已隐藏”的本地化占位
 
-### Object-level behavior
+### 对象级处理规则
 
-For mixed structured objects:
+对于同时包含结构化字段和自然语言字段的对象：
 
-- preserve structural fields
-- hide only the fields judged to be free-form natural-language text
-- do not replace the entire object unless every visible field is hidden
+- 保留结构化字段
+- 仅隐藏被判定为自由自然语言文本的字段
+- 除非一个对象所有可见字段都属于应隐藏内容，否则不整块替换整个对象
 
-## Frontend Changes
+## 前端改动方案
 
 ### `apps/web/src/chat-storage.ts`
 
-Generalize the existing historical-content masking helpers so they can:
+将现有历史内容隐藏 helper 泛化为统一能力，使其能够：
 
-- distinguish user vs assistant stored content
-- handle more than CJK-only detection when needed
-- return category-specific localized placeholders
+- 区分用户历史文本与助手历史文本
+- 覆盖历史 reasoning 文本
+- 不再只依赖 CJK 检测
+- 返回按内容类别区分的本地化占位文案
 
 ### `apps/web/src/tool-result-presenter.ts`
 
-Add a stricter presentation pass that:
+增加更严格的展示裁决层，用于：
 
-- recognizes natural-language fields such as `snippet`, `summary`, `content`, `detail`, `question`, `answer`
-- hides source-language prose for non-`zh` locales
-- preserves identifiers, URLs, paths, file names, counts, and other structured values
-- treats obvious code or file text as hidden content categories rather than raw display text
+- 识别 `snippet`、`summary`、`content`、`detail`、`question`、`answer` 等自然语言字段
+- 在内容语种与 `target content language` 不一致时隐藏源语言长文本
+- 保留 id、URL、path、文件名、计数等结构化值
+- 将明显属于源码或文件正文的内容归类为隐藏类别，而不是继续按普通文本直出
+- 对没有 `_i18n` 的旧结构化 JSON 结果继续执行字段级 fail-closed，而不是整包原样透传
 
-This remains fail-closed for unstructured raw text: if a payload is not safely classifiable and looks like source-language prose, it should be hidden in non-`zh` locales.
+对无法安全分类的非结构化原始文本，仍保持 fail-closed：只要它看起来像源语言自然语言内容，且与 `target content language` 不一致，就隐藏。
 
 ### `apps/web/src/pages/ChatPage.vue`
 
-Consume the stricter helpers instead of introducing page-local masking rules. The page should render the already-judged text, keeping policy centralized.
+页面层不新增散落的本地策略判断，只消费统一裁决后的结果，保持策略集中在公共 helper 中维护。
 
-## Backend Changes
+## 后端改动方案
 
-### Tool result semantics
+### 工具结果语义补强
 
-Update backend tools that commonly return raw snippets or excerpts so their payloads make the frontend decision easier.
+对那些经常返回摘要、摘录、源码或文件正文的工具结果，补充更明确的字段语义，降低前端误判概率。
 
-Primary targets:
+优先治理对象：
 
 - `search_knowledge_base`
 - `search_dingtalk_doc`
 - `read_local`
-- other tool results that emit file bodies, snippets, or free-form summaries
+- 其他会返回文件正文、摘要片段、自由文本总结的工具
 
-Preferred approach:
+推荐做法：
 
-- keep structured payloads as JSON
-- use field names that reflect semantics
-- add explicit content-type markers when the field name alone is not enough
+- 继续返回结构化 JSON
+- 尽量使用语义明确的字段名
+- 仅在字段名不足以表达内容类型时增加显式 content-type 标记
 
-### Backward compatibility
+### 后台任务断线落库一致性
 
-Do not break old stored results or current clients. The frontend strict-render pass must still handle legacy payloads heuristically.
+后台任务在前端连接中断后写回会话历史时，不应退化成只保存最终 `text`。
 
-## Placeholder Copy
+至少应尽量保留以下助手消息结构，以保证刷新后和前台在线路径看到的是同一份语义：
 
-Add localized placeholders for at least:
+- `reasoning`
+- `toolResults`
+- `tables` / `charts` / `files`
+- `errorToken` 与兼容性 `error`
 
-- hidden stored user text
-- hidden stored assistant text
-- hidden knowledge snippet
-- hidden source code
-- hidden file content
-- hidden raw business text
+这样才能保证：
 
-The placeholders must be explicit about what category was hidden, so the UI stays understandable even when many raw snippets are suppressed.
+- 历史错误可按当前 `uiLocale` 重本地化
+- 历史 reasoning 同样受 `target content language` 门禁
+- 结构化工具输出在断线恢复后仍能复用同一套前端展示与隐藏策略
 
-## Validation
+### 向后兼容要求
 
-Minimum validation for this design:
+不得破坏旧会话历史和现有客户端。前端严格展示层仍必须对旧数据和旧结构保留启发式兜底。
 
-1. historical user messages do not leak raw Chinese or English in `pt-BR` and `hi`
-2. historical assistant messages do not leak raw Chinese or English in `pt-BR` and `hi`
-3. knowledge/doc snippets are replaced with localized placeholders in non-`zh` locales
-4. code/file excerpts are replaced with localized placeholders in non-`zh` locales
-5. structured identifiers such as URL, file name, path, status, id remain visible
-6. existing system-text localization still passes
-7. web tests, agent-server tests, web typecheck, and workspace build continue to pass
+## 占位文案要求
 
-## Risks And Guardrails
+至少补齐以下几类本地化占位文案：
 
-- Over-hiding: a heuristic may classify useful structured text as prose. Mitigation: prefer field-based classification before heuristic detection.
-- Under-hiding: a new backend field may carry prose without metadata. Mitigation: keep fail-closed rendering for suspicious raw text.
-- UX confusion: users may not understand why content disappeared. Mitigation: use category-specific placeholders instead of a generic hidden marker.
-- Drift between backend and frontend: future tools may invent inconsistent fields. Mitigation: document the category rules and reuse existing presenter helpers.
+- 已隐藏历史用户文本
+- 已隐藏历史助手文本
+- 已隐藏知识摘要
+- 已隐藏源码片段
+- 已隐藏文件内容
+- 已隐藏业务原始文本
 
-## Implementation Order
+占位文案必须说明“隐藏的是什么”，不能全部退化成一个模糊的统一提示，否则用户无法判断当前被隐藏的是消息、摘要、还是源码。
 
-1. extend frontend masking helpers for category-specific strict placeholders
-2. expand tool-result presenter classification and fail-closed handling
-3. add backend field semantics for knowledge/doc/file/code-like outputs
-4. add and update tests
-5. run smoke checks, typecheck, and build
+## 验证要求
+
+本设计最小验证集包括：
+
+1. 当目标内容语种设为 `pt-BR` 或 `hi` 时，历史用户消息不再直接显示中文或英文原文
+2. 当目标内容语种设为 `pt-BR` 或 `hi` 时，历史助手消息不再直接显示中文或英文原文
+3. 当目标内容语种设为 `pt-BR` 或 `hi` 时，历史 reasoning 不再直接显示中文或英文原文
+4. 当知识库/文档摘要语种与目标内容语种不一致时，会被替换为本地化占位
+5. 当源码片段和文件正文摘录语种与目标内容语种不一致时，会被替换为本地化占位
+6. URL、文件名、path、status、id 等结构化标识保持可见
+7. 历史错误在切换 `uiLocale` 后会基于 `errorToken` 重本地化，而不是冻结旧语种
+8. 无 `_i18n` 的旧结构化工具结果仍会做字段级 fail-closed
+9. UI locale 仅影响系统文案，不影响内容准入判定
+10. 已完成的系统文案本地化链路不回退
+11. `web` 测试、`agent-server` 测试、`web` typecheck、`eval:ui-locale`、`eval:full` 与工作区构建继续通过
+
+## 风险与护栏
+
+- 过度隐藏：启发式可能把本来有用的结构化文本误判成自然语言。缓解方式是优先按字段语义判断，再使用启发式。
+- 隐藏不足：后续新增字段可能携带自由文本但没打标。缓解方式是对可疑原始文本保持 fail-closed。
+- 用户困惑：内容突然不见可能影响理解。缓解方式是用分类明确的占位文案，而不是统一“已隐藏”。
+- 前后端漂移：后续工具随意定义字段会造成策略失配。缓解方式是把字段分类规则写入文档，并复用统一展示 helper。
+
+## 实施顺序
+
+1. 扩展前端历史内容 masking helper，支持按类别输出严格占位文案
+2. 扩展 `tool-result-presenter` 的内容分类与 fail-closed 逻辑
+3. 给知识/文档/文件/源码类工具结果补充更明确的字段语义
+4. 补充并更新测试
+5. 运行 smoke、typecheck 与 build 做回归验证

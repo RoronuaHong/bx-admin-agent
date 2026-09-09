@@ -40,6 +40,7 @@ run("nested tool result code fields are localized", () => {
       pages: [{ primaryType: "list", outputHintCode: "TOOL_GET_PAGE_SCHEMA_HINT_LIST" }],
     }),
     "en",
+    "en",
   );
   assert.match(shown, /"outputHint": "List pages should usually present results as a table\."/);
 });
@@ -48,6 +49,7 @@ run("UI transport wrapper text is omitted in non-zh locale", () => {
   const shown = presentToolResult(
     "export_dataset",
     `UI_TABLE\n{"title":"表格","total":2}\nUI_FILE\n{"name":"report.xlsx","size":123}\n\n已生成 XLSX：report.xlsx`,
+    "pt-BR",
     "pt-BR",
   );
   assert.doesNotMatch(shown, /已生成 XLSX/);
@@ -84,6 +86,20 @@ ${JSON.stringify({
   );
   assert.doesNotMatch(text, /你要操作哪个模块|查询类|请回复序号/);
   assert.match(text, /Qual modulo voce quer usar\?/);
+});
+
+run("content hiding follows reply language instead of ui locale", () => {
+  const shown = presentToolResult(
+    "search_knowledge_base",
+    JSON.stringify({
+      ok: true,
+      _i18n: { code: "TOOL_SEARCH_KB_FOUND" },
+      items: [{ title: "制度", snippet: "这是中文知识摘要", sourcePath: "docs/knowledge/rules.md" }],
+    }),
+    "zh",
+    "pt-BR",
+  );
+  assert.match(shown, /"snippet": "知识\/文档摘要已按语言策略隐藏。"/);
 });
 
 console.log("ui-locale smoke: PASS");

@@ -1,5 +1,6 @@
 import type { UiLocale } from "./ui-locale";
 import { localizeToken, pickLocalized } from "./localize";
+import { contentLanguageMismatchesTarget, hiddenContentPlaceholder, looksLikeCodeSnippet } from "./content-language";
 
 type UnderstoodIntentResult = {
   isBusinessRequest?: boolean;
@@ -53,29 +54,6 @@ function parseUiTransport(raw: string): { table?: unknown; file?: unknown } | nu
   return out.table || out.file ? out : null;
 }
 
-function sanitizeDiagnosticStrings(locale: UiLocale, value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((item) => sanitizeDiagnosticStrings(locale, item));
-  if (!value || typeof value !== "object") return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (
-      typeof item === "string" &&
-      shouldHideDiagnosticString(locale, item) &&
-      /^(hint|_hint|outputHint|guide|question|detail)$/i.test(key)
-    ) {
-      out[key] = pickLocalized(locale, {
-        zh: item,
-        en: "Hidden raw localized diagnostic text.",
-        pt: "Texto bruto de diagnostico em outro idioma foi ocultado.",
-        hi: "दूसरी भाषा का कच्चा डायग्नोस्टिक पाठ छिपा दिया गया है।",
-      });
-      continue;
-    }
-    out[key] = sanitizeDiagnosticStrings(locale, item);
-  }
-  return out;
-}
-
 function localizeCodeFields(locale: UiLocale, value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => localizeCodeFields(locale, item));
   if (!value || typeof value !== "object") return value;
@@ -101,16 +79,39 @@ function containsCjk(text: string): boolean {
   return /[\u3400-\u9FFF\uF900-\uFAFF]/u.test(text);
 }
 
-function containsLatinSentence(text: string): boolean {
-  const letters = (text.match(/[A-Za-z]/g) || []).length;
-  return letters >= 8 && /\s/.test(text);
+function keyCategoryOf(
+  key: string,
+  text: string,
+): "knowledge-snippet" | "code-snippet" | "file-content" | "business-text" | "diagnostic-text" | null {
+  if (/^(snippet|excerpt)$/i.test(key)) return "knowledge-snippet";
+  if (/^(detail|question|guide|hint|_hint|outputHint)$/i.test(key)) return "diagnostic-text";
+  if (/^(content|body|text|source|raw)$/i.test(key)) {
+    if (looksLikeCodeSnippet(text)) return "code-snippet";
+    return /^(content|body)$/i.test(key) ? "file-content" : "business-text";
+  }
+  if (/^(message|summary|answer|description)$/i.test(key)) return "business-text";
+  return null;
 }
 
-function shouldHideDiagnosticString(locale: UiLocale, text: string): boolean {
-  if (locale === "zh") return false;
-  if (containsCjk(text)) return true;
-  if ((locale === "pt-BR" || locale === "hi") && containsLatinSentence(text)) return true;
-  return false;
+function sanitizeStructuredText(locale: UiLocale, targetContentLanguage: string | null | undefined, value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => sanitizeStructuredText(locale, targetContentLanguage, item));
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") {
+      const category = keyCategoryOf(key, item);
+      if (category === "diagnostic-text" && contentLanguageMismatchesTarget(item, targetContentLanguage)) {
+        out[key] = hiddenContentPlaceholder(locale, "diagnostic-text");
+        continue;
+      }
+      if (category && category !== "diagnostic-text" && contentLanguageMismatchesTarget(item, targetContentLanguage)) {
+        out[key] = hiddenContentPlaceholder(locale, category);
+        continue;
+      }
+    }
+    out[key] = sanitizeStructuredText(locale, targetContentLanguage, item);
+  }
+  return out;
 }
 
 function translateResponseMode(locale: UiLocale, value: string): string {
@@ -171,11 +172,11 @@ function fallbackIntentSummary(locale: UiLocale, item: UnderstoodIntentResult): 
     zh: "已完成意图理解",
     en: "Intent parsed",
     pt: "Intencao interpretada",
-    hi: "आशय समझ लिया गया",
+    hi: "आशय理解 किया गया",
   });
 }
 
-function normalizeUnderstoodIntentResult(raw: string, locale: UiLocale): string {
+function normalizeUnderstoodIntentResult(raw: string, locale: UiLocale, targetContentLanguage?: string | null): string {
   const parsed = parseJsonObject(raw);
   if (!parsed) return raw;
   const item = parsed as UnderstoodIntentResult;
@@ -186,14 +187,22 @@ function normalizeUnderstoodIntentResult(raw: string, locale: UiLocale): string 
       locale === "zh" || !item.responseMode
         ? item.responseMode
         : translateResponseMode(locale, item.responseMode),
-    summary:
-      locale === "zh"
-        ? summary || fallbackIntentSummary(locale, item)
-        : !summary || containsCjk(summary)
-          ? fallbackIntentSummary(locale, item)
-          : summary,
+    summary: !summary
+      ? fallbackIntentSummary(locale, item)
+      : contentLanguageMismatchesTarget(summary, targetContentLanguage)
+        ? hiddenContentPlaceholder(locale, "business-text")
+        : locale === "zh" || !containsCjk(summary)
+          ? summary
+          : fallbackIntentSummary(locale, item),
   };
   return JSON.stringify(next, null, 2);
+}
+
+function rawTextCategoryForTool(name: string, text: string): "knowledge-snippet" | "code-snippet" | "file-content" | "business-text" {
+  if (name === "search_knowledge_base" || name === "search_dingtalk_doc") return "knowledge-snippet";
+  if (name === "read_local" || name === "read_file") return looksLikeCodeSnippet(text) ? "code-snippet" : "file-content";
+  if (name === "grep_codebase" || name === "read_api_module") return "code-snippet";
+  return looksLikeCodeSnippet(text) ? "code-snippet" : "business-text";
 }
 
 export function presentToolLabel(name: string, locale: UiLocale): string {
@@ -222,8 +231,8 @@ export function presentToolLabel(name: string, locale: UiLocale): string {
   return item ? pickLocalized(locale, item) : name;
 }
 
-export function presentToolResult(name: string, raw: string, locale: UiLocale): string {
-  if (name === "submit_understood_intent") return normalizeUnderstoodIntentResult(raw, locale);
+export function presentToolResult(name: string, raw: string, locale: UiLocale, targetContentLanguage?: string | null): string {
+  if (name === "submit_understood_intent") return normalizeUnderstoodIntentResult(raw, locale, targetContentLanguage);
   const text = String(raw || "");
   const uiTransport = parseUiTransport(text);
   if (uiTransport) {
@@ -242,13 +251,12 @@ export function presentToolResult(name: string, raw: string, locale: UiLocale): 
     );
   }
   const parsed = parseJsonObject(text) as LocalizedResultPayload | null;
-  if (parsed?._i18n?.code) {
-    const messageToken = { code: parsed._i18n.code, params: parsed._i18n.params };
-    const next = localizeCodeFields(locale, sanitizeDiagnosticStrings(locale, {
-      ...parsed,
-      message: localizeToken(locale, messageToken),
-    })) as Record<string, unknown>;
-    delete next._i18n;
+  if (parsed) {
+    const next = localizeCodeFields(locale, sanitizeStructuredText(locale, targetContentLanguage, parsed)) as Record<string, unknown>;
+    if (parsed._i18n?.code) {
+      next.message = localizeToken(locale, { code: parsed._i18n.code, params: parsed._i18n.params });
+      delete next._i18n;
+    }
     return JSON.stringify(next, null, 2);
   }
   if (/^错误[:：]/.test(text.trimStart())) {
@@ -259,17 +267,8 @@ export function presentToolResult(name: string, raw: string, locale: UiLocale): 
       hi: "टूल विफल हुआ। पूरा परिणाम देखने के लिए विस्तार करें।",
     });
   }
-  if (
-    locale !== "zh" &&
-    !isStructuredPayload(text) &&
-    (containsCjk(text) || ((locale === "pt-BR" || locale === "hi") && containsLatinSentence(text)))
-  ) {
-    return pickLocalized(locale, {
-      zh: text,
-      en: "The tool returned raw localized text that is hidden in this UI locale. Expand to inspect the original result.",
-      pt: "A ferramenta retornou texto bruto em outro idioma, ocultado neste locale da interface. Expanda para ver o resultado original.",
-      hi: "टूल ने किसी अन्य भाषा में कच्चा पाठ लौटाया है, जो इस UI locale में छिपाया गया है। मूल परिणाम देखने के लिए विस्तार करें।",
-    });
+  if (!isStructuredPayload(text) && contentLanguageMismatchesTarget(text, targetContentLanguage)) {
+    return hiddenContentPlaceholder(locale, rawTextCategoryForTool(name, text));
   }
   return raw;
 }

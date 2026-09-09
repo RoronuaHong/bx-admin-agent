@@ -19,6 +19,9 @@ export interface Country {
 export interface Me {
   user: { loginName: string; name: string };
   country: Country;
+  preferences: {
+    replyLanguage: string | null;
+  };
   permissions: {
     canViewTrace: boolean;
     traceAccessSource: TraceAccessSource;
@@ -53,6 +56,9 @@ function normalizeMe(data: unknown): Me {
       id: String(raw.country?.id || ""),
       label: String(raw.country?.label || raw.country?.id || ""),
     },
+    preferences: {
+      replyLanguage: typeof raw.preferences?.replyLanguage === "string" ? raw.preferences.replyLanguage : null,
+    },
     permissions: {
       canViewTrace,
       traceAccessSource: (rawPermissions.traceAccessSource || "default-login") as TraceAccessSource,
@@ -74,7 +80,7 @@ export type ChatEvent =
   | { type: "file"; file: ChatFileRef }
   | { type: "chart"; chart: ChartView }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
-  | { type: "task_running"; taskId: string; startedAt: number; note?: string; noteToken?: LocalizedToken }
+  | { type: "task_running"; taskId: string; startedAt: number; userText?: string; note?: string; noteToken?: LocalizedToken }
   | { type: "done" };
 
 export class ApiError extends Error {
@@ -287,6 +293,7 @@ export interface StoredMessage {
   cancelled?: boolean;
   status?: string;
   error?: string;
+  errorToken?: LocalizedToken;
   reasoning?: string;
   toolResults?: Array<{ name: string; result: string }>;
   toolStep?: number;

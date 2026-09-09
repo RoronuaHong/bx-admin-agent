@@ -452,18 +452,27 @@ export function formatSearchResults(
   query: string,
 ): string {
   if (!results.length) {
-    return (
-      `未在本地知识库（docs/knowledge/）中找到与「${query}」相关的文档。\n` +
-      `可尝试：1) 更换关键词；2) 联系管理员确认文档是否已导入知识库（运行索引构建脚本）。`
-    );
+    return JSON.stringify({
+      ok: true,
+      noResults: true,
+      query,
+      source: "knowledge-base",
+      _i18n: { code: "TOOL_SEARCH_KB_NO_MATCH", params: { query } },
+    }, null, 2);
   }
-  const lines: string[] = [`根据企业知识库（docs/knowledge/），「${query}」的相关内容如下：\n`];
-  for (const r of results) {
-    const title = r.chunk.sectionTitle ? `${r.chunk.docTitle} / ${r.chunk.sectionTitle}` : r.chunk.docTitle;
-    lines.push(`### ${title}（相关度 ${r.score}）`);
-    lines.push(r.chunk.text.length > 200 ? `${r.chunk.text.slice(0, 200)}…` : r.chunk.text);
-    lines.push(`> 来源：docs/knowledge/${r.chunk.docPath}`);
-    lines.push("");
-  }
-  return lines.join("\n");
+  return JSON.stringify({
+    ok: true,
+    query,
+    source: "knowledge-base",
+    _i18n: { code: "TOOL_SEARCH_KB_FOUND", params: { query, count: results.length } },
+    items: results.map((r, i) => ({
+      index: i + 1,
+      title: r.chunk.sectionTitle ? `${r.chunk.docTitle} / ${r.chunk.sectionTitle}` : r.chunk.docTitle,
+      score: Number(r.score.toFixed(3)),
+      snippet: r.chunk.text.length > 200 ? `${r.chunk.text.slice(0, 200)}...` : r.chunk.text,
+      snippetType: "knowledge-snippet",
+      sourcePath: `docs/knowledge/${r.chunk.docPath}`,
+      matched: r.matched,
+    })),
+  }, null, 2);
 }

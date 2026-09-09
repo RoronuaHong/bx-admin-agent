@@ -142,11 +142,10 @@ export function presentGenericChart(
   // 其次 field-mapping.json 手工配置，最后 humanize 兜底
   const fieldMap = loadFieldMap(moduleName, rows);
 
-  // 排除「汇总」行（与 PC Analysis filter 一致；覆盖所有候选 X 字段）
-  const chartRows = rows
-    .filter((r) =>
-      !X_FIELD_CANDIDATES.some((k) => String(r[k] ?? "") === "汇总"),
-    )
+  // 排除「汇总」行（与 PC Analysis filter 一致，2026-09-08 升级为数值校验：
+  // 覆盖维度字段=0/空 的合计行，不再只认字符串「汇总」标签）
+  const { detailRows: nonSummaryRows } = splitSummaryRows(rows);
+  const chartRows = nonSummaryRows
     .slice()
     .sort((a, b) =>
       String(pickXKey(a)).localeCompare(String(pickXKey(b))),
@@ -228,6 +227,50 @@ export function presentGenericChart(
     .trim();
 
   return { tableBlock, chartBlock, chartUiBlock, reply };
+}
+
+/**
+ * 通用汇总行识别（2026-09-08，纯数值校验，零业务词零词形写死）：
+ * 报表接口常用「维度字段=0/空 + 指标列=各明细之和」的行表示合计（如日期字段给 0）。
+ * 判定规则（同时满足才算汇总行）：
+ * ① 行内所有候选维度字段（X_FIELD_CANDIDATES）取值均无效（0/空/汇总类标签）；
+ * ② ≥2 个数值列的值等于其余行对应列之和（浮点容差），且命中列占该行数值列 ≥60%
+ *    （比率列加权平均≠算术和，天然不命中，靠多数列命中兜住）。
+ * 汇总行不进明细渲染（PC 报表口径：明细表/图表剔除汇总，只作合计说明），
+ * 避免出现「统计日期=0」这类假数据行上屏。
+ */
+const SUMMARY_LABEL_RE = /^(汇总|合计|总计|total|sum|summary)$/i;
+
+export function splitSummaryRows(
+  rows: Record<string, unknown>[],
+): { detailRows: Record<string, unknown>[]; summaryRows: Record<string, unknown>[] } {
+  if (rows.length < 2) return { detailRows: rows, summaryRows: [] };
+  const isSummary = rows.map((r) => {
+    // ① 维度标签有效性：存在任一有效标签（非 0/空/汇总类）→ 明细行
+    const hasValidDim = X_FIELD_CANDIDATES.some((k) => {
+      const v = r[k];
+      if (v == null) return false;
+      const s = String(v).trim();
+      return s !== "" && s !== "0" && !SUMMARY_LABEL_RE.test(s);
+    });
+    if (hasValidDim) return false;
+    // ② 数值列求和校验
+    const numericKeys = Object.keys(r).filter((k) => Number.isFinite(toNum(r[k])));
+    if (numericKeys.length < 2) return false;
+    const others = rows.filter((o) => o !== r);
+    let matched = 0;
+    for (const k of numericKeys) {
+      const sum = others.reduce((acc, o) => acc + (toNum(o[k]) || 0), 0);
+      if (Math.abs(sum - toNum(r[k])) < 1e-6) matched++;
+    }
+    return matched >= 2 && matched / numericKeys.length >= 0.6;
+  });
+  const summaryRows = rows.filter((_, i) => isSummary[i]);
+  // 全部被判为汇总 = 误判（明细不可能为空），放弃拆分
+  if (!summaryRows.length || summaryRows.length >= rows.length) {
+    return { detailRows: rows, summaryRows: [] };
+  }
+  return { detailRows: rows.filter((_, i) => !isSummary[i]), summaryRows };
 }
 
 /** 候选 X 轴字段（按优先级） */

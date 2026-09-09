@@ -18,6 +18,8 @@ module.exports = {
       error_file: "./logs/agent-server.err.log",
       time: true,
       env: {
+        // 避免继承 IDE/扩展注入的失效 preload，导致 PM2 启动时 MODULE_NOT_FOUND。
+        NODE_OPTIONS: "",
         NODE_ENV: "production",
       },
     },
