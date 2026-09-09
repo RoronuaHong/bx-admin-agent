@@ -34,7 +34,7 @@ import { resolvePortalPermissions } from "./permissions.js";
 import { loadUserPreferences } from "./user-prefs.js";
 import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
 import { analyticsAsk } from "./analytics/pipeline.js";
-import { enqueueScan, getScanJob } from "./analytics/scan/runner.js";
+import { enqueueScan, getScanJob, listScanJobs } from "./analytics/scan/runner.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -501,6 +501,70 @@ export function createApp() {
     return c.json(result);
   });
 
+  // M3 登录态巡检：session + analytics 门户入口权限；入队仅 scan worker
+  function requireAnalyticsSession(c: Context) {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return { error: errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录") };
+    if (!permissionsOf(session).entries.analytics) {
+      return { error: errorJson(c, 403, "ANALYTICS_FORBIDDEN", undefined, "无权限使用数据分析") };
+    }
+    return { session };
+  }
+
+  app.post("/analytics/scan/run", async (c) => {
+    const gate = requireAnalyticsSession(c);
+    if ("error" in gate && gate.error) return gate.error;
+    if (!config.scan.workerEnabled) {
+      return errorJson(c, 403, "SCAN_WORKER_DISABLED", undefined, "本实例未启用 scan worker（ANALYTICS_SCAN_WORKER≠1）");
+    }
+    const body = await c.req
+      .json<{
+        ruleSetId?: string;
+        scanDate?: string;
+        forceRerun?: boolean;
+        dryRun?: boolean;
+      }>()
+      .catch(() => ({} as {
+        ruleSetId?: string;
+        scanDate?: string;
+        forceRerun?: boolean;
+        dryRun?: boolean;
+      }));
+    const ruleSetId = String(body.ruleSetId || "watch-users").trim() || "watch-users";
+    const result = await enqueueScan({
+      ruleSetId,
+      scanDate: body.scanDate,
+      forceRerun: body.forceRerun === true,
+      dryRun: body.dryRun === true,
+    });
+    if ("error" in result) {
+      if (result.error === "scan_job_running") {
+        return errorJson(c, 409, "scan_job_running", undefined, "同 scanDate+ruleSet 已有 running 任务", {
+          error: "scan_job_running",
+        });
+      }
+      return errorJson(c, 400, "SCAN_ENQUEUE_FAILED", undefined, result.error);
+    }
+    return c.json({ jobId: result.jobId }, 202);
+  });
+
+  app.get("/analytics/scan/jobs", (c) => {
+    const gate = requireAnalyticsSession(c);
+    if ("error" in gate && gate.error) return gate.error;
+    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 20, 1), 50);
+    return c.json({ jobs: listScanJobs({ limit }) });
+  });
+
+  app.get("/analytics/scan/jobs/:jobId", (c) => {
+    const gate = requireAnalyticsSession(c);
+    if ("error" in gate && gate.error) return gate.error;
+    const job = getScanJob(c.req.param("jobId"));
+    if (!job) {
+      return errorJson(c, 404, "SCAN_JOB_NOT_FOUND", undefined, "scan job 不存在");
+    }
+    return c.json(job);
+  });
+
   // M3 巡检内部 API：Bearer SCAN_INTERNAL_TOKEN + ANALYTICS_SCAN_WORKER=1
   function assertScanInternalAuth(c: Context) {
     if (!config.scan.workerEnabled) {
@@ -526,7 +590,12 @@ export function createApp() {
         forceRerun?: boolean;
         dryRun?: boolean;
       }>()
-      .catch(() => ({} as { ruleSetId?: string }));
+      .catch(() => ({} as {
+        ruleSetId?: string;
+        scanDate?: string;
+        forceRerun?: boolean;
+        dryRun?: boolean;
+      }));
     const ruleSetId = String(body.ruleSetId || "").trim();
     if (!ruleSetId) {
       return errorJson(c, 400, "SCAN_MISSING_RULESET", undefined, "ruleSetId 必填");

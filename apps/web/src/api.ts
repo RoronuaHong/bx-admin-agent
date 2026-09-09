@@ -470,3 +470,72 @@ export async function askAnalytics(text: string): Promise<AnalyticsAskResult> {
   }
   return resp.json() as Promise<AnalyticsAskResult>;
 }
+
+// ---- Analytics scan jobs (M3) ----
+export type AnalyticsScanJobStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "partial"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+export type AnalyticsScanAlertSeverity = "info" | "warn" | "critical";
+
+export interface AnalyticsScanAlert {
+  severity: AnalyticsScanAlertSeverity;
+  metric?: string;
+  entityKey?: string;
+  message: string;
+  parent?: boolean;
+}
+
+export interface AnalyticsScanJobResultSummary {
+  entityCount?: number;
+  warnCount?: number;
+  criticalCount?: number;
+  skippedReason?: string;
+  [key: string]: unknown;
+}
+
+export interface AnalyticsScanJob {
+  jobId: string;
+  ruleSetId: string;
+  scanDate: string;
+  status: AnalyticsScanJobStatus;
+  dryRun: boolean;
+  forceRerun: boolean;
+  rerunSeq: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  resultSummary?: AnalyticsScanJobResultSummary;
+  alerts?: AnalyticsScanAlert[];
+}
+
+export async function runAnalyticsScan(payload?: {
+  ruleSetId?: string;
+  scanDate?: string;
+  forceRerun?: boolean;
+  dryRun?: boolean;
+}): Promise<{ jobId: string }> {
+  return (await jsonFetch("/agent/analytics/scan/run", {
+    method: "POST",
+    body: JSON.stringify(payload || {}),
+  })) as { jobId: string };
+}
+
+export async function listAnalyticsScanJobs(limit = 20): Promise<AnalyticsScanJob[]> {
+  const data = (await jsonFetch(`/agent/analytics/scan/jobs?limit=${Math.min(limit, 50)}`)) as {
+    jobs: AnalyticsScanJob[];
+  };
+  return data.jobs || [];
+}
+
+export async function getAnalyticsScanJob(jobId: string): Promise<AnalyticsScanJob> {
+  return (await jsonFetch(`/agent/analytics/scan/jobs/${encodeURIComponent(jobId)}`)) as AnalyticsScanJob;
+}
