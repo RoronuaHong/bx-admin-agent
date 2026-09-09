@@ -1,0 +1,41 @@
+{
+  "version": "2026-09-09.1",
+  "id": "watch-detail",
+  "datasource": {
+    "engine": "clickhouse",
+    "metabaseDatabaseId": 2
+  },
+  "tables": [
+    {
+      "name": "elt_watch_detail",
+      "fields": [
+        "lastWatchTime",
+        "channel",
+        "contentLang",
+        "watchSecond",
+        "guid",
+        "movieType"
+      ]
+    }
+  ],
+  "probeDimensions": ["channel", "contentLang"],
+  "required_filters": ["time_range"],
+  "time": {
+    "businessTimezone": "Asia/Shanghai",
+    "missingYearDefault": "clock_year"
+  },
+  "guards": {
+    "distinctCountFn": "uniq",
+    "maxRows": 5000,
+    "maxProbeRounds": 3,
+    "maxRewriteRounds": 2,
+    "parallelism": 4,
+    "defaultMovieTypes": [1, 2, 3, 4, 10, 11]
+  },
+  "examples": [
+    {
+      "nl": "IndiaA 按天观看人数",
+      "sqlHint": "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' AND toDate(lastWatchTime) BETWEEN {start} AND {end} AND movieType IN (1,2,3,4,10,11) GROUP BY d"
+    }
+  ]
+}
