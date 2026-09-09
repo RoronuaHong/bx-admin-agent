@@ -1,0 +1,23 @@
+{
+  "id": "watch-users",
+  "metrics": ["channel_daily_users"],
+  "baselines": ["dod", "wow"],
+  "baselineLogic": "any",
+  "thresholdRatio": 0.9,
+  "minAbsDelta": 0,
+  "minSample": 100,
+  "criticalEntityCount": 3,
+  "dimensions": {
+    "rollup": "channel"
+  },
+  "maxChildAlerts": 5,
+  "businessTimezone": "Asia/Shanghai",
+  "jobTimeoutMs": 600000,
+  "freshnessCheck": {
+    "type": "max_business_date",
+    "table": "elt_watch_detail",
+    "column": "lastWatchTime"
+  },
+  "packId": "watch-detail",
+  "persistCard": false
+}
