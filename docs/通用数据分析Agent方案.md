@@ -1,6 +1,6 @@
 # 通用数据分析 Agent 方案（投放渠道 ROI 异常监控为首个场景）
 
-> **已降级为历史草案。** 定稿请以 [2026-09-09-metabase-analytics-agent-design.md](./superpowers/specs/2026-09-09-metabase-analytics-agent-design.md) 为准（权威取数改为 Metabase MCP/自研 `metabase_*`，主链路为 NL→SQL 并行执行，而非 `call_api`）。
+> **已降级为历史草案。** 定稿请以 [2026-09-09-metabase-analytics-agent-design.md](./superpowers/specs/2026-09-09-metabase-analytics-agent-design.md) 为准（权威取数改为 Metabase；主链路 NL→SQL；**发版须 EX≥85% 且拒答召回≥95%**，见定稿 §8）。
 >
 > 文档状态：需求 + 可行性分析 + 落地路线（草案，已废止为主路径）
 > 适用系统：bx-admin-agent（agent-server + web 前端）

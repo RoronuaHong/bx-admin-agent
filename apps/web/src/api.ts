@@ -210,7 +210,6 @@ export async function streamChat(
     body: JSON.stringify({ text, ...opts }),
     signal,
   });
-  console.log("[API_DIAG] fetch returned ok=", res.ok, "hasBody=", !!res.body, "status=", res.status);
   if (res.status === 401) {
     throw new ApiError("Unauthorized", {
       status: 401,
@@ -243,7 +242,6 @@ export async function streamChat(
         if (!line) continue;
         try {
           const ev = JSON.parse(line.slice(6)) as ChatEvent;
-          console.log("[API_DIAG] onEvent type=", ev.type);
           onEvent(ev);
         } catch {
           // 单条事件数据非法时跳过，不中断整个流式响应
