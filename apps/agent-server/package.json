@@ -22,7 +22,7 @@
     "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
     "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",
     "eval": "tsx scripts/eval-core.test.ts",
-    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-pipeline-unit.test.ts"
+    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-pipeline-unit.test.ts && tsx scripts/analytics-scan-window.test.ts && tsx scripts/analytics-scan-job-store.test.ts && tsx scripts/analytics-scan-threshold.test.ts && tsx scripts/analytics-scan-freshness-metrics.test.ts && tsx scripts/analytics-scan-notify.test.ts && tsx scripts/analytics-scan-runner-unit.test.ts"
   },
   "dependencies": {
     "@bx/shared": "workspace:*",
