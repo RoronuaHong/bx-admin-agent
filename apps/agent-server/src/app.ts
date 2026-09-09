@@ -32,6 +32,7 @@ import { promptGuardAuditEnabled, sanitizeUserInput } from "./prompt-guard.js";
 import { resolvePortalPermissions } from "./permissions.js";
 import { loadUserPreferences } from "./user-prefs.js";
 import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
+import { analyticsAsk } from "./analytics/pipeline.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -477,6 +478,17 @@ export function createApp() {
     if (!task || task.settled) return errorJson(c, 404, "CHAT_NO_RUNNING_TASK", undefined, "当前没有进行中的任务", { ok: false });
     task.controller.abort();
     return c.json({ ok: true, taskId: task.taskId });
+  });
+
+  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数；鉴权与 /chat/stream 一致）
+  app.post("/analytics/ask", async (c) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
+    const body = await c.req.json<{ text?: string }>().catch(() => ({ text: "" }));
+    const text = String(body.text || "").trim();
+    if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
+    const result = await analyticsAsk(text);
+    return c.json(result);
   });
 
   // 任务状态查询（刷新后前端可据此展示「上一任务仍在后台执行」或最近一次结果）

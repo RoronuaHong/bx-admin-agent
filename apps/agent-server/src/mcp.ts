@@ -72,7 +72,15 @@ mcpServer.registerTool(
     title: "切换 Worker 路由上下文",
     description: TOOL_DESCRIPTIONS.route_to_agent,
     inputSchema: z.object({
-      domain: z.enum(["backend-api", "knowledge", "common", "finance", "customer-service", "database"]),
+      domain: z.enum([
+        "backend-api",
+        "knowledge",
+        "common",
+        "finance",
+        "customer-service",
+        "database",
+        "analytics",
+      ]),
       project: z.string().optional(),
       environment: z.enum(["test", "prod"]).optional(),
     }),
@@ -425,6 +433,32 @@ mcpServer.registerTool(
     inputSchema: z.object({}),
   },
   async (input) => toolResult("get_user_preferences", input as Record<string, unknown>),
+);
+
+mcpServer.registerTool(
+  "analytics_ask",
+  {
+    title: "自然语言问数（Metabase 流水线）",
+    description: TOOL_DESCRIPTIONS.analytics_ask,
+    inputSchema: z.object({
+      text: z.string().describe("自然语言问数问题"),
+      packId: z.string().optional().describe("语义包 id，默认 watch-detail"),
+    }),
+  },
+  async (input) => toolResult("analytics_ask", input as Record<string, unknown>),
+);
+
+mcpServer.registerTool(
+  "metabase_run_dataset",
+  {
+    title: "执行 Metabase 原生 SQL",
+    description: TOOL_DESCRIPTIONS.metabase_run_dataset,
+    inputSchema: z.object({
+      sql: z.string().describe("原生 SQL（单条 SELECT/WITH）"),
+      databaseId: z.number().optional().describe("Metabase database id"),
+    }),
+  },
+  async (input) => toolResult("metabase_run_dataset", input as Record<string, unknown>),
 );
 
 async function toolResult(name: string, input: Record<string, unknown>) {

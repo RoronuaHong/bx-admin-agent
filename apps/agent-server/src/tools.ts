@@ -55,6 +55,12 @@ import { execExportDataset } from "./export-tools.js";
 import { defaultClarificationPolicyPath, defaultFieldMappingPath } from "./agent-docs.js";
 import { searchDingtalkDoc, type SearchDingtalkDocInput } from "./tools/dingtalk-doc.js";
 import { formatSearchResults, searchKnowledgeBase } from "./tools/knowledge-base.js";
+import {
+  execAnalyticsAsk,
+  execMetabaseExplainEstimate,
+  execMetabaseRunDataset,
+  execMetabaseRunQuestion,
+} from "./tools/analytics-tools.js";
 import { searchSymbol } from "./symbol-index.js";
 import { errorTokenResult, okTokenResult } from "./tool-result-contract.js";
 // 工具参数里常有局部变量 path；勿与 node:path 同名，否则 TDZ（Cannot access 'path2' before initialization）
@@ -207,9 +213,21 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   // M1（Supervisor 路由）：模型主动选择 Worker 上下文（领域×项目×环境）。服务端校验命中后装配工具子集与领域提示；
   // 路由判定完全交模型，工具仅描述可选值，无业务逻辑写死。
   route_to_agent:
-    "切换当前 Agent 执行的 Worker（上下文域）。传入 domain（必填，可选值 backend-api/knowledge/common/finance/customer-service/database）" +
+    "切换当前 Agent 执行的 Worker（上下文域）。传入 domain（必填，可选值 backend-api/knowledge/common/finance/customer-service/database/analytics）" +
     "与可选 project（项目标识，如 bx-film-admin）、environment（test/prod，缺省 test）。服务端校验是否存在匹配 Worker，" +
     "命中后后续工具调用被限定在该 Worker 上下文（工具子集 + 领域提示），实现「按类型分 Agent」的路由。若不确定用哪个域，先用 request_clarification 收敛。",
+  analytics_ask:
+    "自然语言问数：走 Metabase 分析流水线（时间 resolve → Probe → SQL → lint/verify → 并行执行），返回表格与来源条。" +
+    "用户问观看人数、渠道分布、按天指标等 BI 问题时优先使用；不要用 call_api 代替。" +
+    "参数：text（自然语言问题，必填）、packId（可选语义包 id，默认 watch-detail）。",
+  metabase_run_dataset:
+    "在 Metabase 上执行一条原生 SQL（ClickHouse），返回 cols/rows。" +
+    "Probe DISTINCT / 已校验 SQL 取数时使用；禁止 DDL/DML；异 grain 请多次调用而非多语句。" +
+    "参数：sql（必填）、databaseId（可选，默认 METABASE_DATABASE_ID）。",
+  metabase_run_question:
+    "按 Metabase saved question / card id 取数（M1 未实现，调用将返回 not implemented）。",
+  metabase_explain_estimate:
+    "对 SQL 做扫描估计（EXPLAIN ESTIMATE 类，M1 未实现，调用将返回说明信息）。",
 };
 
 // ---- M0（工具领域分组）：工具→领域标注（通用分类词，非业务词，符合「禁止写死」红线）----
@@ -219,6 +237,7 @@ export type ToolDomain =
   | "finance"            // 财务（M1+ 预留）
   | "customer-service"   // 客服咨询（M1+ 预留）
   | "database"           // 数据库直查（M1+ 预留）
+  | "analytics"          // Metabase / BI 问数
   | "common";            // 通用：意图/反问/项目切换/时间
 
 // 唯一事实来源；listAgentTools 自动附带 domain，新增工具漏标会在启动时告警（见 checkToolDomainCoverage）。
@@ -254,6 +273,11 @@ export const TOOL_DOMAIN: Record<string, ToolDomain> = {
   get_user_preferences: "common",
   // 路由工具（M1 Supervisor 选 Worker 上下文）本就属于通用调度层
   route_to_agent: "common",
+  // Metabase / BI 分析域
+  analytics_ask: "analytics",
+  metabase_run_dataset: "analytics",
+  metabase_run_question: "analytics",
+  metabase_explain_estimate: "analytics",
 };
 
 export function getSubmitUnderstoodIntentTool(): AgentToolDef {
@@ -325,7 +349,7 @@ export function getRouteToAgentTool(): AgentToolDef {
       properties: {
         domain: {
           type: "string",
-          enum: ["backend-api", "knowledge", "common", "finance", "customer-service", "database"],
+          enum: ["backend-api", "knowledge", "common", "finance", "customer-service", "database", "analytics"],
           description: "目标领域/上下文域（必填）",
         },
         project: { type: "string", description: "项目标识（如 bx-film-admin），backend-api 类通常需要" },
@@ -840,6 +864,52 @@ export function listAgentTools(): AgentToolDef[] {
         properties: {},
       },
     },
+    {
+      name: "analytics_ask",
+      description: TOOL_DESCRIPTIONS.analytics_ask,
+      inputSchema: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "自然语言问数问题（必填）" },
+          packId: { type: "string", description: "语义包 id，默认 watch-detail" },
+        },
+        required: ["text"],
+      },
+    },
+    {
+      name: "metabase_run_dataset",
+      description: TOOL_DESCRIPTIONS.metabase_run_dataset,
+      inputSchema: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "原生 SQL（单条 SELECT/WITH，必填）" },
+          databaseId: { type: "number", description: "Metabase database id，可选" },
+        },
+        required: ["sql"],
+      },
+    },
+    {
+      name: "metabase_run_question",
+      description: TOOL_DESCRIPTIONS.metabase_run_question,
+      inputSchema: {
+        type: "object",
+        properties: {
+          questionId: { type: "number", description: "Metabase card / question id" },
+        },
+        required: ["questionId"],
+      },
+    },
+    {
+      name: "metabase_explain_estimate",
+      description: TOOL_DESCRIPTIONS.metabase_explain_estimate,
+      inputSchema: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "待估计的 SQL" },
+        },
+        required: ["sql"],
+      },
+    },
     getRouteToAgentTool(),
   ];
   // M0（工具领域分组）：附 domain 元数据；漏标回退 common，未覆盖工具在启动时告警一次（见 checkToolDomainCoverage）。
@@ -863,7 +933,15 @@ export function toolCatalogByDomain(): string {
     const d = (t.domain as ToolDomain) ?? "common";
     (groups[d] ??= []).push(t.name);
   }
-  const order: ToolDomain[] = ["backend-api", "knowledge", "finance", "customer-service", "database", "common"];
+  const order: ToolDomain[] = [
+    "backend-api",
+    "knowledge",
+    "finance",
+    "customer-service",
+    "database",
+    "analytics",
+    "common",
+  ];
   const lines = order
     .filter((d) => groups[d]?.length)
     .map((d) => `- ${d}：${groups[d]!.join("、")}`);
@@ -2443,6 +2521,18 @@ export async function runAgentTool(
     const maxResults = Math.min(Math.max(Number(input.maxResults) || 5, 1), 10);
     const results = await searchKnowledgeBase(query, maxResults);
     return formatSearchResults(results, query);
+  }
+  if (name === "analytics_ask") {
+    return execAnalyticsAsk(input);
+  }
+  if (name === "metabase_run_dataset") {
+    return execMetabaseRunDataset(input);
+  }
+  if (name === "metabase_run_question") {
+    return execMetabaseRunQuestion(input);
+  }
+  if (name === "metabase_explain_estimate") {
+    return execMetabaseExplainEstimate(input);
   }
   if (name === "update_user_preference") {
     if (!opts.ownerKey) {
