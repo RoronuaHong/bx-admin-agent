@@ -1,32 +1,32 @@
-# Connect OpenClaw (小龙虾) to Analytics M1
+# 将 OpenClaw（小龙虾）接入 Analytics M1
 
-> **Design reference:** [Metabase 数据分析 Agent 设计 §4.2](../superpowers/specs/2026-09-09-metabase-analytics-agent-design.md#42-与小龙虾openclaw的接入关系可选通道非替代主产品) — OpenClaw 可选接入通道、facade 边界与 `tools.allow` 隔离要求。
+> **设计参考：** [Metabase 数据分析 Agent 设计 §4.2](../superpowers/specs/2026-09-09-metabase-analytics-agent-design.md#42-与小龙虾openclaw的接入关系可选通道非替代主产品) — OpenClaw 为可选接入通道；须遵守门面边界与 `tools.allow` 隔离要求。
 
-## Operator steps
+## 运维步骤
 
-1. **Ensure `agent-server` `/mcp` exposes `analytics_ask`.**  
-   Start agent-server (default `PORT=8787`). Confirm the tool is listed on the MCP endpoint, e.g. `http://127.0.0.1:8787/mcp` (Streamable HTTP; localhost-only).
+1. **确认 `agent-server` 的 `/mcp` 已暴露 `analytics_ask`。**  
+   启动 agent-server（默认 `PORT=8787`）。在 MCP 端点确认工具已列出，例如 `http://127.0.0.1:8787/mcp`（Streamable HTTP；仅本机）。
 
-2. **Register the MCP server in OpenClaw.**
+2. **在 OpenClaw 中注册该 MCP 服务。**
 
    ```bash
    openclaw mcp add analytics --url http://127.0.0.1:8787/mcp
    ```
 
-   Use your deployed agent-server URL if not running locally. See [OpenClaw MCP](https://docs.openclaw.ai/cli/mcp).
+   非本机部署时换成实际 agent-server URL。参见 [OpenClaw MCP](https://docs.openclaw.ai/cli/mcp)。
 
-3. **Restrict the analytics agent tool allowlist.**
+3. **收紧 analytics Agent 的工具白名单。**
 
    ```json
    "tools.allow": ["analytics_ask"]
    ```
 
-   Do **not** mix `call_api` or other backend write tools — analytics must go through this facade only (design §4.2.3).
+   **不要**混入 `call_api` 或其他后台写工具 — 取数必须只走本门面（设计 §4.2.3）。
 
-4. **Smoke test in an OpenClaw session.**
+4. **在 OpenClaw 会话中冒烟验证。**
 
-   Ask in natural language:
+   用自然语言提问：
 
    > 八月二十到二十一印度A按天人数
 
-   Expect a table/summary from the full P0 pipeline (time resolve → SQL → verify → Metabase), not a raw SQL guess.
+   期望得到完整 P0 流水线结果（时间解析 → SQL → Verify → Metabase）的表格/摘要，而不是模型直接猜的裸 SQL。

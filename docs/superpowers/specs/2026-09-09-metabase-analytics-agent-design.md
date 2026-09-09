@@ -1,11 +1,12 @@
 # Metabase 数据分析 Agent 设计（定稿）
 
-> **状态**：设计定稿（待实现计划）  
+> **状态**：设计定稿（**待实现**；仓内产品链路尚未端到端可跑，见 §12.1）  
 > **日期**：2026-09-09  
 > **宿主**：bx-admin-agent（`apps/web` + `apps/agent-server`）  
 > **关联**：取代 [`docs/通用数据分析Agent方案.md`](../../通用数据分析Agent方案.md) 中「以 `call_api` 为权威取数」的路径；Multi-Agent Worker 装配见 `docs/agent/MULTI_AGENT_ARCHITECTURE.md`  
 > **产品范围**：对话取数 + 自动巡检预警（交付按 M1→M2→M3 切分，范围不砍）  
-> **质量硬门槛**：发版须同时满足 **正确率 EX ≥ 85%** 与 **拒答召回 ≥ 95%**（CWR ≤ 10%）；详见 §8。禁止以「查询能跑通」替代。
+> **质量硬门槛**：发版须同时满足 **正确率 EX ≥ 85%** 与 **拒答召回 ≥ 95%**（CWR ≤ 10%）；详见 §8。禁止以「查询能跑通」替代。  
+> **实现就绪**：截至 2026-09-09，**仅 Metabase 连通冒烟可跑**；`/analytics`、Worker、`metabase_*`、P0 流水线、巡检、GATE 均未落地（§12.1）。
 
 ---
 
@@ -29,7 +30,7 @@
   - **正确率（EX）**：可答题结果与 gold 对齐，发版默认 **≥ 85%**（M2 争取 ≥ 90%）；
   - **拒答召回（RefuseRecall）**：应拒答/反问题未执行查数，发版默认 **≥ 95%**；
   - 同步约束 **CWR（静默错）≤ 10%**；二者缺一不可（§8.1.1–§8.1.2）。
-- 质量手段：语义层钉口径、执行前护栏、执行后校对（含确定性 lint）、自纠错、离线评测 CI、审计回流。
+- 质量手段：**结构口径（§5.5）+ 全局引擎默认**、执行前护栏/Verify、执行后校对、自纠错、离线评测 CI、审计回流（**非**手维逐指标公式表）。
 
 ### 2.2 非目标（V1）
 
@@ -119,6 +120,62 @@
 | `metabase_fetch_viz` | 拉取临时/已有 card 可视化信息 |
 | （可选）list_questions / schema_introspect | 发现与对账 |
 
+### 4.2 与小龙虾（OpenClaw）的接入关系（可选通道，非替代主产品）
+
+> **小龙虾** = [OpenClaw](https://docs.openclaw.ai/)（社区俗称）。  
+> **结论**：**可以**用小龙虾侧的**任意接入手段**（MCP 注册表、Plugin `registerTool`、Skill、Channel、HTTP 壳等）接到本分析能力；**本仓分析内核与护栏不必为小龙虾改架构**。  
+> **前提**：小龙虾只作入口/宿主，**一律调用本仓受控出口**；禁止用裸社区 Metabase MCP / 自写 SQL 工具绕过 §7/§8 还宣称达标。  
+> 参考：[OpenClaw MCP](https://docs.openclaw.ai/cli/mcp)、[插件 Agent 工具](https://docs.openclaw.ai/zh-CN/plugins/building-plugins)、[Tools 总览](https://docs.openclaw.ai/tools)。
+
+| 问题 | 答案 |
+|------|------|
+| 要不要为小龙虾改主架构？ | **不用。** `/analytics` + `analytics-bi` + `metabase_*` + P0 流水线仍是唯一权威内核 |
+| 小龙虾侧能否「随便用哪种工具接」？ | **能**，只要最终打到本仓 **稳定 facade**（见下） |
+| 今天能否接好用？ | **不能端到端**（§12.1）；先 M1 再联调 |
+| 是否替代 `/analytics`？ | **否**；小龙虾是可选入口 |
+
+#### 4.2.1 本仓须提供的稳定 facade（实现约束，一次做对）
+
+为兼容小龙虾多种接法，M1/M2 在本仓至少落地其一（推荐两者都有）：
+
+| Facade | 形态 | 供小龙虾怎么用 |
+|--------|------|----------------|
+| **A. MCP 工具出口** | 现有 `/mcp` 或独立 `analytics` MCP：暴露受控 `metabase_*` +（推荐）聚合工具 `analytics_ask`（NL→本仓全流水线→表摘要） | `openclaw mcp add`；或插件里再包一层 MCP client |
+| **B. HTTP 会话/一问一答 API** | 与 `/analytics` 同源编排；鉴权后 `POST` NL，返回表/拒答/来源条 | Skill / Plugin `execute` / Channel bot 直接 HTTP |
+
+**推荐再提供**：`analytics_ask`（或等价）**单工具封装整条 P0 流水线**，这样小龙虾用 Plugin、Skill、MCP 任一方式都只需调一个入口，避免在小龙虾侧散落「自己拼 Probe/Verify」。
+
+#### 4.2.2 小龙虾侧可用的接入方式（均允许，不绑定一种）
+
+| 小龙虾手段 | 怎么接到本仓 | 本仓改动？ |
+|------------|--------------|------------|
+| **MCP 注册表**（`openclaw mcp add/set`） | 指向本仓 MCP（facade A） | 无架构变更；实现期暴露 MCP |
+| **Plugin `api.registerTool`** | `execute` 内调本仓 HTTP（B）或 MCP（A）；`optional: true`；清单 `contracts.tools` | 可选：另发一个薄插件包（npm/ClawHub/本地），**非**本仓内核必改 |
+| **Skill** | 教模型「问数必须调 `analytics_ask` / 本仓 MCP」 | 文档/skill 文件即可 |
+| **Channel / Gateway 会话** | 用户在 IM 说话 → 该 agent 的 tools.allow 含上述工具 | 配置项；内核不变 |
+| **`openclaw mcp serve`** | 外部 IDE 读小龙虾频道 | 与取数正交，不替代 facade |
+
+**原则**：「任何小龙虾工具」= 入口形态任意；**不允许**入口形态绕过本仓护栏另起炉灶。
+
+#### 4.2.3 必须守住的边界（与接入手段无关）
+
+1. **护栏留在本仓**：只读、表白名单、`required_filters`、时间 resolve、`distinctCountFn`、grain/列 Verify、结构化回写。  
+2. **凭证**：Metabase 服务账号只在本仓；小龙虾只持本仓 MCP/API 调用凭据。  
+3. **工具隔离**：小龙虾 analytics agent 的 `tools.allow` 勿混入后台写操作 `call_api`。  
+4. **巡检**：仍走本仓 `/internal/analytics/scan`；小龙虾最多转发告警。  
+5. **验收**：任一入口的结果仍按 §8 同一套 EX/拒答口径。
+
+#### 4.2.4 落地顺序
+
+```
+M1：本仓内核 + facade A 和/或 B（建议含 analytics_ask）
+  → 小龙虾任选：mcp add  /  薄 plugin  /  skill+allow
+  → 联调一口语问数
+  → （可选）发布 ClawHub/npm 薄插件，降低配置成本
+```
+
+**一句话**：**架构不用为小龙虾重构**；实现上补齐 **MCP/HTTP facade（最好带一问一答聚合工具）**，即可用小龙虾任意工具面接入。未实现 facade 前，不宣称「已用小龙虾接入可分析」。
+
 ---
 
 ## 5. 语义层
@@ -176,7 +233,9 @@
 | **缺年 / 相对时间** | **确定性 resolve**（§6.3）：请求时 clock + `businessTimezone`；「八月十九」默认年=today 年；禁止模型自猜 2023/24/25 | 口语 NL 缺年时 EX 从可答跌到 ~22%（空表静默错） |
 | **按日 grain** | 槽位含「按天/每天」→ SQL 必须按日 `GROUP BY toDate(...)`（机器 Verify） | 用户要按天却只按语言汇总（静默 grain 错） |
 | **维/对照 grain** | 槽位点名的主维度（如多渠道对照、按语言）→ 须出现在 `GROUP BY` 或等价展开；机器 Verify | 「三渠道对照」却合成一行日汇总（超复杂 X01） |
-| **列意图** | 主 SELECT 仅含问句要求的指标/维度；环比/「谁更高」→ 解读旁路或二次查询，不塞进主表冒充核心列 | 核心数对但多算差列 → EX 形状失败（X05/X08） |
+| **列意图** | 主 SELECT 仅含问句要求的指标/维度；环比/「谁更高」→ 解读旁路或二次查询 | 核心数对但多算差列 → 形状失败（X05/X08）；评测可用 soft-EX |
+| **空语言默认** | 按语言统计默认含 `contentLang=''`；禁止 `contentLang!=''`，除非用户明确排除空/未标语言 | 排行题丢掉空语言 → 人数差一个数量级（并行套 P05） |
+| **完整列表** | 排行/对照默认全量；禁止无请求 `LIMIT 1`（除非只要第一名） | Top1 截断导致漏渠道（P05 回归） |
 | 人均时长（结构提示） | 推荐 `round(sum(watchSecond)/{distinctCountFn}(guid), 0)`；**不**维护逐指标手维表 | 缺 `round` 易与展示不一致 |
 | **去重（全局默认）** | 引擎配置 **`distinctCountFn=uniq`（默认）或 `uniqExact`** 二选一；生成后 **AST 规范化**（§7.2）；**禁止**手维「观看人数用哪个函数」指标表 | `uniq` vs `uniqExact` 静默差数百人（C04 实测） |
 | 缺日期等必选槽 | `required_filters` 服务端拦截 | 仅靠模型拒答时召回约 50% |
@@ -205,16 +264,16 @@
        仅有「最近」等无法定界 → 反问，禁止执行
   → ⓪ Probe（工具）：对不确定的维度取值，先用 metabase_run_dataset 拉 Top/DISTINCT 真值
        （探哪列由槽位/模型决定，禁止用例级写死业务同义词；控 maxProbeRounds）
-  → 生成 1..N 条 SQL；若命中 questionBinding 可直接 run_question
+  → 生成 1..N 条 SQL（异 grain / 分表对照用 --- 或多候选规划；每条单语句）；若命中 questionBinding 可直接 run_question
        （生成侧注入已 resolve 的 ISO 区间，禁止再让模型自由填年）
-  → ① 确定性护栏（见 §7）：缺 required_filters → 反问并停止；非 SELECT → 拒绝
-  → ①b SQL lint（日粒度 toDate 等，见 §7.1）
-  → ①b2 **全局去重规范化**（§7.2）：按 `distinctCountFn` 改写 uniq/uniqExact 等，再执行
+  → ① 确定性护栏（见 §7）：**逐条**校验；缺 required_filters → 反问并停止；非 SELECT → 拒绝
+  → ①b SQL lint（§7.1：toDate、空语言、渠道、LIMIT 1 等）
+  → ①b2 **全局去重规范化**（§7.2）
   → ①c 槽位/grain Verify（机器，对齐 PV-SQL Verify）：
        · 按日 → 须按日 `GROUP BY`；time_range 须进 WHERE
        · 点名主维度/对照维 → 须在 GROUP BY 或等价展开，否则 fail→重写
-       · 列意图：主查询禁止未请求的派生列（差/排名标签）；复杂对比/Top-N 优先拆多 SQL（§6.1）
-  → 并行在 Metabase 执行（并行度上限 + 限流退避）
+       · 列意图：主查询禁止未请求的派生列；复杂对比优先拆多 SQL（§6.1）
+  → **并行**在 Metabase 执行（并行度上限 + 限流退避）
   → 状态区分：success | empty | error
        empty ≠ 业务零；禁止把无数据说成「转化率为 0」或编造
        empty → 优先触发再 Probe / 检查年份或枚举对齐 / 反问，勿当成功交付（可 ≤1 轮空结果重写）
@@ -240,7 +299,8 @@
 - **槽位→SQL（日）**：用户明示「按天/每天/按日」时，生成 SQL **必须**含日粒度 `GROUP BY toDate(...)`（或等价）；机器 Verify 失败则重写，不得交付错 grain。
 - **槽位→SQL（维）**：用户明示多实体对照（如「三渠道」「按语言并排」）时，点名维 **必须**进入 `GROUP BY`/结果列；漏维 = Verify fail→重写（禁止聚成单行冒充对照）。
 - **列意图**：主结果表 = 问句要求的维度 + 指标；「环比 / 谁更高 / 差值」默认进 **解读文案或旁路列**，不挤占 EX 核心列；生成提示禁止无请求派生列。
-- **复杂意图分解（P0/P1）**：`comparisons`、`top_n`、多维交叉 → 规划为 2..N 条 SQL 再按 grain 规则合并；对齐 DIN/MAC「先分解再合并」，降低一次生成写崩（如非法嵌套聚合）。
+- **复杂意图分解（P0）**：`comparisons`、异 grain、多渠道「各自一张表」、`top_n` 列表 → 规划为 **2..N 条独立 SELECT**，经 Metabase **并行**执行，再按 grain 规则合并展示；对齐 DIN/MAC。  
+- **禁止**：把异 grain 硬拼成一条多语句 SQL 字符串；每条请求仍是单语句（见 §7）。
 
 ### 6.2 展示策略（唯一叙述）
 
@@ -297,26 +357,32 @@
 
 ## 7. 确定性护栏（执行前，强制）
 
-使用 SQL 解析（如 sqlglot 思路），fail-closed：
+使用 SQL 解析（如 sqlglot 思路），fail-closed。对 **每一条** 待执行 SQL 分别校验（并行多查 = 多条各自过闸，不是一条字符串里塞多语句）：
 
-1. 单条 `SELECT` / `WITH … SELECT`；禁止 DDL/DML/多语句。  
+1. **单语句** `SELECT` / `WITH … SELECT`；禁止 DDL/DML；**禁止同一请求体多语句**（`;` 拼接）。异 grain / 分表对照 → **多次** `metabase_run_dataset`（或等价）并行，而非一条多语句。  
 2. 引用表 ∈ 表白名单。  
 3. 满足 `required_filters`（缺则拦截并反问，不执行）。  
-4. 服务端强制 `LIMIT`（可配置上限）+ 语句超时。  
+4. 服务端强制 `LIMIT`（可配置上限）+ 语句超时；**注意**：此 LIMIT 是护栏上限，**不等于**允许模型用 `LIMIT 1` 擅自截断排行（见 §7.1）。  
 5. **扫描估计**：经 `EXPLAIN ESTIMATE`（或 Metabase 侧等价信息）检查估计 rows/marks/parts。  
    - **局限（必须写进实现与对用户文案）**：ClickHouse **无**精确 CPU/费用 dry-run；`EXPLAIN ESTIMATE` **可能忽略 LIMIT、偏高估**。  
    - V1 策略：估计阈值拒绝明显全表狂扫 + 硬超时 + 强制 LIMIT，不宣称「精确费用拦截」。  
 6. Metabase 服务账号只读权限为第二道防线。
+7. 并行度：受全局/每用户并行上限约束（§11）。
 
 ### 7.1 SQL Lint（执行前，与 §5.5 / §8.6 对齐）
 
-在解析通过后、调用 Metabase 前增加确定性检查（失败则重写或 `guard_reject` / 触发自纠错，**不默默执行**）：
+在解析通过后、调用 Metabase 前增加确定性检查（失败则 **结构化**重写或 `guard_reject`，**不默默执行**）：
 
 | 检查 | 规则 |
 |------|------|
 | 日粒度等式 | 若查询按日过滤/分组，禁止 `DateTime` 列与 `'YYYY-MM-DD'` 直接 `=`（须 `toDate(col)`） |
 | 必选过滤落 SQL | `required_filters` 对应谓词须出现在 SQL 中（不仅槽位有值） |
+| 点名渠道落 SQL | 单渠道题（NL 仅点名 IndiaA 等）→ 每条 SQL 的 WHERE 须含该 `channel` |
+| 空语言 | 按语言聚合且用户未要求排除空语言 → 禁止 `contentLang!=''` / `<>''` |
+| 擅自 Top1 | 排行/对照列表题 → 禁止无请求的 `LIMIT 1` |
 | 写语句 | 已由 §7 第 1 条覆盖；lint 再确认无 `INTO OUTFILE` 等方言写旁路 |
+
+**回写边界（评测已踩坑）**：允许针对 **lint / 执行报错 / 空结果** 的结构化回喂；**避免**无约束的「结果不对齐再让模型随便改」——易把已对齐子查询改坏（并行套回归）。
 
 ### 7.2 全局去重规范化（P0，消 C04；非手维指标表）
 
@@ -353,9 +419,11 @@
 样例字段：`id | NL | gold_sql? | expected_result_or_hash | scenario_pack | should_refuse | difficulty | tags[]`
 
 - **对齐优先级（Q3）**：以 **执行结果对齐** 为主（行/列排序、数值/日期类型规范化；可选结果 hash）。`gold_sql` 为辅（便于人工阅读与调试），**不作**主门禁 Exact Match。  
+- **soft-EX（P0 评测约定）**：允许 pred 列为 gold 的**超集**（`gold 行值 ⊆ pred 行值`），宽表/长表数值等价可判 soft 通过；**交付路径仍约束列意图**（超额列可进解读，不默认塞主表）。百分比等比对允许小容差（如 0.015）。  
 - 无仓库快照时：允许用例自带 **frozen result / hash**，评测跑 candidate SQL 后与冻结结果比；不硬依赖每次打生产库。  
 - 有快照时：candidate 与 gold SQL 同快照执行再比结果（仍做规范化）。  
-- 指标若声明需 `round(n)`（examples/评测约定）：比对前按同规则取整；**去重函数**与全局 `distinctCountFn` 一致（§7.2），不得 `uniq`/`uniqExact` 模糊等价。
+- 指标若声明需 `round(n)`（examples/评测约定）：比对前按同规则取整；**去重函数**与全局 `distinctCountFn` 一致（§7.2），不得 `uniq`/`uniqExact` 模糊等价。  
+- **多查（`multi_query`）**：gold 可为 SQL 数组；各表结果与 pred 表集合做匹配（顺序不敏感）；要求 pred SQL 条数 ≥ gold 条数（禁止塌成单表硬拼）。
 
 **Tags（Q7）**：如 `aggregation` / `join` / `refuse` / `funnel` / `multi_query` / `date_trap` / `dim_missing`；报告按 tag 分桶。
 
@@ -424,10 +492,12 @@
   - **时间窗**：SQL 中的日期须与已 resolve 的 `time_range` 一致（允许等价写法）；缺年不得再出现与 resolve 结果不同的年份  
   - **grain（日）**：槽位要求按日时，SQL 须含日分组；否则 fail→重写  
   - **grain（维）**：槽位点名的对照维须在 GROUP BY/结果列；漏维 fail→重写  
-  - **列意图**：主 SELECT 不得夹带未请求派生列；超额列 → fail 重写或降级为解读旁路（评测可用 soft-EX，见 §8.6）  
+  - **列意图**：主 SELECT 不得夹带未请求派生列；超额列 → 解读旁路或重写；评测 soft-EX 见 §8.1  
+  - **空语言 / LIMIT 1 / 点名渠道**：与 §7.1 一致  
   - **去重**：执行前须已按 §7.2 规范化；评测 gold 使用同一 `distinctCountFn`  
   - 请求的维度值集合 vs 结果维度集合对账；缺维须明示，不得当对比完成  
   - **空结果**：不默认当业务零；可触发 1 轮「检查年份/枚举」重写或反问  
+  - **回写**：仅 lint/exec/empty 结构化回喂；禁止无约束「EX 不对再瞎改」（§7.1）  
 - 进模型仅摘要/样例行（见主链路截断约定）  
 - 自纠错：默认最多 2 轮，耗尽则拒答并写审计原因  
 
@@ -460,24 +530,17 @@ UI：有用 / 有误 + 错因标签。
 
 | 优先级 | 改进 | 主要抬哪项 |
 |--------|------|------------|
-| P0 | **结构护栏**：日粒度 → `toDate`；SQL lint；只读 + 表白名单 | EX、CWR、拒答 |
-| P0 | **全局 `distinctCountFn` + AST 规范化**（§7.2）；默认 `uniq`；消 C04 | EX、CWR |
-| P0 | **时间确定性 resolve**（§6.3） | EX、CWR |
-| P0 | 服务端 `required_filters` / 「最近」反问 | 拒答召回 |
+| P0 | **结构护栏**：日粒度 → `toDate`；§7.1 lint；只读 + 表白名单 | EX、CWR、拒答 |
+| P0 | **全局 `distinctCountFn` + AST 规范化**（§7.2）；默认 `uniq` | EX、CWR |
+| P0 | **时间确定性 resolve**（§6.3）+ `required_filters` / 「最近」反问 | EX、CWR、拒答 |
 | P0 | **Probe** + **日/维 grain Verify** + 空结果策略 | EX、CWR |
-| P0 | **列意图约束** + 复杂题（对比/Top-N）**强制多 SQL 分解**（§6.1） | EX、CWR（超复杂） |
-| P0 | 评测集含陷阱/拒答/口语/缺年/`uniqExact`/漏维/超额列；CI `GATE_*`；**可执行 gold** | 门禁 |
-| P1 | 维对账；相似成功 few-shot；薄错修记忆；可选 Metabase SQL 统计去重函数作运维建议 | EX、体验 |
-| P1 | 评测 **soft-EX**：`core_cols ⊆ model_cols` 且核心数值对齐即过（降 X05/X08 假失败） | 门禁假阴 |
-| P2 | soft-match（仅声明 round）；Best-of-N / 换模校对 | 降假失败 |
-| **CUT** | 业务同义词 / 枚举 mapping YAML | — |
-| **CUT** | **手维逐指标公式/函数白名单表**作权威 | — |
-| **CUT** | 以「更大模型 / Best-of-N」替代 Verify 硬闸 | — |
+| P0 | **列意图** + **多 SQL 并行分解**（§6.1）+ 空语言/`LIMIT 1`/渠道 lint | EX、CWR |
+| P0 | 评测：**可执行 gold** + **soft-EX** + `multi_query` 套 + `GATE_*` | 门禁 |
+| P1 | 维对账；相似成功 few-shot；薄错修记忆 | EX、体验 |
+| P2 | Best-of-N / 换模校对（非替代 Verify） | 抬上限 |
+| **CUT** | 业务同义词 / 枚举 mapping YAML；手维逐指标公式表；用更大模型替代 Verify；无约束 EX 回写 | — |
 
-**达标路径预期**：弱提示 EX~20% → Probe+时间 resolve+全局去重 → 口语约 85–89%；超复杂在未硬闸 Verify 时约 60%（§17.5）→ **维/列 Verify + 分解 + soft-EX** 目标拉回 ≥85%。拒答召回靠服务端闸 ≥95%。  
-C04：模型写 `uniqExact`、gold 用 `uniq` → 规范化后应对齐。  
-口语缺年：见 §17.4（默认年后 EX≈89% 小样）。
-
+**达标路径（同日真数小样，指导用）**：弱提示 ~20% → Probe+时间+uniq → 口语 ~89%（§17.4）；单 SQL 超复杂未硬闸 ~60%（§17.5）；**并行多 SQL + soft-EX + lint → 10/10**（§17.5.1）。发版仍以 §8.1.2 全量种子集为准。拒答召回靠服务端闸 ≥95%。
 ### 8.7 业界准确度手段与本仓采纳边界（对齐 2026 主流）
 
 #### 8.7.1 业界两条主路线
@@ -512,16 +575,16 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 | 时间 grounding | clock + timezone resolve | **P0**（§6.3） |
 | Probe / value linking | 探库对齐口语枚举 | **P0**（非同义词表） |
 | **规则 Verify checklist** | 漏 DISTINCT / Top-k / 约束（PV-SQL） | **P0**：日/维 grain、列意图、time_range（§6.1/§8.2） |
-| 复杂题分解 | 多 SQL 再合并 | **P0/P1**（对比/Top-N/多维交叉） |
-| 执行回馈 / 空结果重写 / 反问 | 闭环 | **兜底** |
+| 复杂题分解 | 多 SQL 再合并 | **P0**（异 grain / 分表对照并行） |
+| 执行回馈 / 空结果重写 / 反问 | 闭环 | **兜底**（仅结构化；禁无约束 EX 回写） |
 | 相似 few-shot / 薄错修 | 历史成功 SQL、错→修 | **P1** |
-| soft-EX（核心列超集） | 评测降假失败 | **P1**（交付仍约束列意图） |
+| soft-EX（核心列超集） | 评测降假失败 | **P0 评测**；交付仍约束列意图 |
 | Best-of-N / 微调 / RL | 抬上限 | **CUT V1**（贵；先 Verify） |
 | 业务同义词 YAML | 手维 value map | **CUT** |
 | 模型自选 uniq/uniqExact | — | **CUT 作唯一手段** |
 
-**本仓最优增量包（超复杂评测后）**：已有 Probe + 时间 resolve + `uniq` 规范化 + 空结果重写之上，硬闸 **维/grain Verify + 列意图 + 复杂题分解**；评测侧修可执行 gold + soft-EX。  
-**优先顺序**：护栏 → 全局去重规范化 → 时间 resolve → Probe → **日/维/列 Verify** → 分解 → 回喂/反问 → few-shot/薄错修。
+**本仓最优包（已小样验证）**：Probe + 时间 resolve + `uniq` 规范化 + 空结果重写 + **多 SQL 并行** + **日/维/列 Verify** + §7.1 lint（空语言/渠道/`LIMIT 1`）+ soft-EX。  
+**优先顺序**：护栏 → 去重规范化 → 时间 resolve → Probe → 日/维/列 Verify + lint → 分解并行 → 结构化回喂 → few-shot/薄错修。
 ---
 
 ## 9. 巡检预警
@@ -697,27 +760,67 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 
 | 里程碑 | 验收标准 |
 |--------|----------|
-| **M1** | `/analytics` 可对话；时间 resolve → Probe → Generate → **§7.2 去重规范化** → 护栏 → **日/维/列 Verify** → 执行 → 重写；复杂对比可多 SQL；**无手维指标表**；缺日期反问；来源条回显时间窗；种子评测可跑通（门禁可先 warn） |
+| **M1** | `/analytics` 可对话；时间 resolve → Probe → Generate → **§7.2** → §7/§7.1 → **日/维/列 Verify** → **多 SQL 可并行** → 结构化重写；**无手维指标表**；缺日期反问；来源条回显时间窗；**MCP 和/或 HTTP facade 可被小龙虾调用**（建议含 `analytics_ask`）；种子评测可跑通（门禁可先 warn）。**实现计划：** [`docs/superpowers/plans/2026-09-09-metabase-analytics-agent-m1.md`](../plans/2026-09-09-metabase-analytics-agent-m1.md) |
 | **M2** | 校对契约 + 维对账；自纠错；评测 harness；**GATE_*** 阻断发版；tags；version/modelId；候选池入 gold；双轨图；审计点赞 |
 | **M3** | 手工巡检 + 外部 cron 调异步 `/internal/analytics/scan`；freshness→skipped；businessTimezone；job 状态机含 partial/timeout/skipped；相对+绝对阈值；dryRun；钉钉 `analytics` kind + rerunSeq dedup；默认单 scan worker；应用内 job/告警（登录）与 internal API（token）鉴权分流；深链+runbook |
+
+### 12.1 仓内实现就绪度 / 业务流程可跑通性（2026-09-09 对照代码）
+
+> **结论：产品业务流程目前不能端到端跑通。** 定稿可指导实现；离线小样（§17）证明 Probe/并行/lint 方向可行；**运行时 Agent 路径尚未编码。**
+
+#### 12.1.1 按业务流程
+
+| 流程 | 状态 | 说明 |
+|------|------|------|
+| **对话取数主链路**（时间 resolve → Probe → SQL → 规范化/Verify → Metabase → 回写 → 来源条） | **未实现** | 无 Analytics Worker、无 `metabase_*`、无编排 |
+| **拒答 / 反问**（`required_filters`、缺日期、「最近」） | **未实现** | 现有 `request_clarification` 仅服务后台管理 `/chat` |
+| **并行多 SQL** | **未实现** | §6.1/§7 已定；代码无 planner / 并行 `run_dataset` |
+| **表 / 图 / 导出交付** | **仅基建可复用** | `render_table`、ECharts、`export_dataset` 挂在管理聊天；无 `/analytics` 会话与 Metabase→表管道 |
+| **巡检预警**（`/internal/analytics/scan`、钉钉 `analytics`） | **未实现** | `alert-notify` kind 仍为 `budget` / `degrade`；无 scan API |
+| **质量门禁**（EX / 拒答召回 / `GATE_*`） | **未实现** | 阈值仅在本文；实验 `tmp-nl2sql-*` 脚本未留仓，正式 harness 未建 |
+
+#### 12.1.2 组件对照（代码事实）
+
+| 设计项 | 仓内现状 | 位置 / 备注 |
+|--------|----------|-------------|
+| 路由 `/analytics` | **缺失** | `apps/web/src/router.ts`：有 admin / knowledge / viewing，无 analytics |
+| `analytics-bi` Worker | **缺失** | `worker-registry.ts`：backend-api / knowledge / common |
+| `metabase_*` 工具 | **缺失** | `tools.ts` / MCP 无 Metabase Client；取数未进 Agent 循环 |
+| 时间 resolve / Probe / §7.2 / grain·列 Verify | **缺失** | `src/` 无对应模块；`DISTINCT_COUNT_FN` 仅 `.env.example` 注释 |
+| 语义层 pack / `required_filters` | **缺失** | 无配置加载与服务端闸 |
+| `GATE_*` 评测 | **缺失** | 现有 eval 针对管理聊天 / `call_api` |
+| `METABASE_*` 环境变量 | **部分** | `.env` / `.env.example` 可供冒烟；**未**接入 `config` / 运行时 |
+| 表格·图·导出·澄清·Worker 模式·钉钉 | **可复用** | 管理 Agent 路径；接 Analytics 时扩展，非替代实现 |
+
+#### 12.1.3 今天实际能跑的
+
+1. **`node apps/agent-server/scripts/metabase-smoke.mjs`**：登录 → 列库 → 可选 native `/api/dataset`（需 `METABASE_USERNAME` / `PASSWORD`，可选 `METABASE_DATABASE_ID`）。**仅连通，不是 Analytics Agent。**  
+2. **后台管理 Agent**（`/agents/admin/chat` + `call_api`）：与定稿权威路径**无关**，不可冒充本产品已上线。  
+3. **独立页占位模式**（如 `/agents/viewing`）：可作 `/analytics` 模板参考。
+
+#### 12.1.4 完全跑通前的硬阻塞（实现顺序）
+
+1. `/analytics` 页 + 隔离会话  
+2. `analytics-bi` Worker + 工具白名单 + 系统提示  
+3. Metabase REST 客户端与 `metabase_*`（至少 `run_dataset`；按需 temp card）  
+4. 语义层薄配置 + P0 流水线：时间 resolve、Probe、§7/§7.1、§7.2、grain/维/列 Verify、多 SQL 并行、结构化回写  
+5. **M2**：评测 harness + CI `GATE_*`  
+6. **M3**：scan API + job + `analytics` 告警 kind  
+
+**下一步**：按本文做 **实现计划（writing-plans）→ M1 编码**；不以「冒烟 SQL 能跑」或管理聊天能力宣称 Analytics 已交付。  
+**OpenClaw / 小龙虾**：任意工具面可作入口（§4.2）；本仓补 MCP/HTTP facade（建议 `analytics_ask`）即可，**无需为小龙虾改分析内核**；裸 Metabase MCP 不算接入完成。
 
 ---
 
 ## 13. 待业务 / BI 对齐清单（上线前必填）
 
 - 各 pack 的表、字段、**可 Probe 的维度列**；**不**维护中文同义词表、**不**维护逐指标公式表  
-- **`distinctCountFn`**：确认默认 `uniq` 或改 `uniqExact`（全局一次，写入配置/环境变量）  
-- **`businessTimezone`**、缺年默认策略、相对时间是否回显  
-- CTR / CVR / ROI 等若要用，优先 **questionBinding / examples**，禁止为此建大手维指标库  
-- 评测门禁：**GATE_EX_MIN=85%**、**GATE_REFUSE_RECALL_MIN=95%**、**GATE_CWR_MAX=10%**、RefusePrecision≥80%、回退≤3pp（若业务要更高 EX，可上调但须签字）  
-- 去重口径：全局 **`distinctCountFn`**（默认 `uniq`），评测 gold 与之一致；**不**逐指标手维  
-- Metabase `databaseId`、临时 collection、服务账号权限范围  
-- 巡检默认监控对象（渠道集合等）、钉钉通知群、每日跑数时刻（T-1 闭合后）  
-- `businessTimezone`、`freshnessCheck` / watermark、`minSample`、`minAbsDelta`（必填或书面接受 0）、`criticalEntityCount`、连续 N 天 critical、`maxChildAlerts`、`jobTimeout`  
-- 示例 pack 中包体维度的真实取值（原「xxxxxx」占位）  
-- 确认部署为 **默认单 scan worker** 或启用共享指纹  
-- `SCAN_INTERNAL_TOKEN`（或等价）与内网暴露方式
-
+- **`distinctCountFn`**（默认 `uniq`）、**`businessTimezone`**、缺年默认、相对时间是否回显；评测 gold 与 `distinctCountFn` 一致  
+- CTR / CVR / ROI 等若要用，优先 **questionBinding / examples**，禁止大手维指标库  
+- 评测门禁：**GATE_EX_MIN=85%**、**GATE_REFUSE_RECALL_MIN=95%**、**GATE_CWR_MAX=10%**、RefusePrecision≥80%、回退≤3pp  
+- Metabase `databaseId`（连通验证主库多为 `2`）、临时 collection、服务账号权限范围  
+- 巡检：默认监控对象、钉钉群、T-1 跑数时刻、`freshnessCheck` / watermark、`minSample`、`minAbsDelta`（或书面接受 0）、`criticalEntityCount`、连续 N 天 critical、`maxChildAlerts`、`jobTimeout`  
+- 示例 pack 包体真实取值；单 scan worker 或共享指纹；`SCAN_INTERNAL_TOKEN` 与内网暴露方式
 未对齐前：允许绑定已有 Metabase question 跑通编排；**禁止假装口径已定死进代码常量**。
 
 ---
@@ -728,7 +831,7 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 |----|------------|
 | workflow | `/analytics` 会话；Worker 装配；巡检 internal API；M1–M3 编排 |
 | skill | 分析意图槽位、grain/维/列 Verify、复杂题分解、校对/拒答话术模板 |
-| MCP | 自研 `metabase_*` 经 tools 注册并可 MCP 出口暴露；可选社区 Metabase MCP |
+| MCP | 自研 `metabase_*` + 建议 `analytics_ask` 经 MCP/HTTP facade 出口；小龙虾（OpenClaw）MCP/Plugin/Skill/Channel **任选接入**（§4.2）；可选社区 Metabase MCP 仅探索 |
 | tools | `metabase_*`（含 Probe 用的 `metabase_run_dataset`）、`render_table`、`summarize_chart_data`、`export_dataset`、`request_clarification` |
 | superpower | 语义层 JSON、护栏与阈值配置、评测集、告警 dedup 配置 |
 
@@ -739,7 +842,7 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 | 检查 | 结果 |
 |------|------|
 | Placeholder | 业务字段与 pack 细节显式列入 §13；质量阈值已默认填入 §8.1.2 |
-| 内部一致性 | LLM 主生成；按需 card；CH 估计局限；EX/拒答召回双门禁与 §5.5/§6.1/§7.1/§8.6–§8.7 一致；业界 B+确定性、CUT 手维指标库 |
+| 内部一致性 | 多 SQL=多次单语句并行（§7≠禁止并行）；EX/拒答双门禁与 §5.5/§6.1/§7.1/§8 一致；soft-EX 评测 P0；CUT 手维指标库与无约束 EX 回写 |
 | 范围 | 产品含巡检；交付用里程碑切开；质量 P0 从 M1 起铺、M2 卡发版 |
 | 歧义 | 「一张表」用 grain 消歧；「答对」= EX 而非跑通；「业界最佳」= 场景选 A 或 B，本仓明确选 B+Verify |
 
@@ -761,7 +864,10 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 - **REV（对齐主流 Agent「工具+闭环」2026-09-09）**：**CUT** 业务同义词/枚举 mapping 主路径；§6 升格 Probe；Value linking = Probe；§5/§8.6/§8.7/M1/§13 同步。  
 - **ADD（§6.3 时间确定性 resolve 2026-09-09）**：clock + businessTimezone；缺年默认；相对时间 IR；回显区间；禁模型自猜年；grain Verify；§5.5/§8/M1/§17.4 同步。  
 - **REV（去重口径 2026-09-09）**：拍板 **全局 `distinctCountFn` + AST 规范化（§7.2）**；**CUT** 手维逐指标公式/函数表；回喂/反问仅作兜底；消 C04。
-- **REV（业界对齐 + 超复杂评测 2026-09-09）**：§8.7 扩写 A/B 路线与生产共性层；§6.1/§8.2/§8.6 升格 **维 grain、列意图、复杂题分解、soft-EX**；§17.5 记录超复杂 EX≈60% 与失败归类；采纳边界：B 骨架 + A 的确定性，不走手维指标库。
+- **REV（业界对齐 + 超复杂评测 2026-09-09）**：§8.7 A/B 路线；§6.1/§8 维·列·分解；§17.5 单 SQL 60% 基线。  
+- **REV（查缺补漏 2026-09-09）**：§7 修正「单条」与多 SQL 并行矛盾；§7.1 补空语言/渠道/`LIMIT 1`/回写边界；soft-EX 升 P0 评测；§13 去重；§17.5.1 并行套 10/10；§2.1 去掉易误解的「语义层钉口径」。  
+- **ADD（§12.1 实现就绪度 2026-09-09）**：对照代码写明业务流程**不能**端到端跑通；仅冒烟可跑；组件缺失表与硬阻塞；文首状态同步。  
+- **ADD（§4.2 OpenClaw / 小龙虾接入 2026-09-09）**：可接入且**不改主架构**；支持 MCP/Plugin/Skill/Channel 等任意小龙虾工具面；本仓提供稳定 facade（建议 `analytics_ask`）；禁裸 Metabase MCP 冒充达标。
 
 ---
 
@@ -775,6 +881,7 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 | 库 | `database id=2`，名称「主库」，`engine=clickhouse` |
 | 冒烟 | `SELECT 1` OK；人均时长手工 SQL（IndiaA / 2026-08-19～25）OK，约 4s、7 行 |
 | 本仓 MCP | 现有 `/mcp` 为 **工具出口**，不是连 Metabase 的 Client；取数以 **自研 REST `metabase_*`** 为主（与 §4 一致） |
+| 产品链路 | **未实现**；冒烟 ≠ Agent。业务流程可跑通性见 **§12.1** |
 
 ### 17.2 NL→SQL 正确率/召回抽样（指导门禁）
 
@@ -790,7 +897,7 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 
 ### 17.3 Probe 闭环小样本（同日，无同义词表）
 
-脚本：`apps/agent-server/scripts/tmp-nl2sql-probe-eval.mjs`；6 题（含「泰卢固」「印度 A」口语、缺日期、删数陷阱）。
+实验脚本（曾用 `tmp-nl2sql-probe-eval.mjs`，实现阶段并入正式 harness）；6 题（含「泰卢固」「印度 A」口语、缺日期、删数陷阱）。
 
 | 模式 | EX（可答） | 拒答召回 | 静默错 | 均时 |
 |------|------------|----------|--------|------|
@@ -815,24 +922,35 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 「印度A vs FoxA 每天观看人数」：模型 `uniqExact` vs gold `uniq` → 差约 500 人（静默错）。  
 对策（已写入 §7.2）：**全局默认 `uniq` + 执行前 AST 把 `uniqExact` 规范为 `uniq`**，不建手维指标表。
 
-### 17.5 超超复杂口语套（同日，Probe + 默认年 + uniq 规范化）
+### 17.5 超超复杂口语套（同日，单 SQL 路径基线）
 
-脚本同上；10 题（宽表/三维/占比/HAVING/对照/Top-N 等）；模型 `dsflash`；均时 ~43s。
+脚本曾用 `tmp-nl2sql-probe-eval.mjs`（实验）；10 题单查询形态；模型 `dsflash`；均时 ~43s。
 
 | 指标 | 结果 |
 |------|------|
 | EX（含 soft） | **6/10 = 60%** |
 | 严格 ex_ok | 5/10 |
-| 主要失败 | 漏渠道维（X01）；超额差列导致形状失败（X05/X08）；1 题 gold SQL 非法（X07，harness） |
+| 主要失败 | 漏渠道维（X01）；超额差列（X05/X08）；1 题 gold 非法（X07） |
 
-**归类**：枚举/年份已非主因；瓶颈是 **维/grain 遗漏** 与 **列超额**。  
-**对策（写入 §6.1/§8.2/§8.6/§8.7）**：维 Verify 硬闸、列意图约束、对比/Top-N 分解、可执行 gold + soft-EX。  
-说明：样本小，指导增量优先级；正式门禁仍以 §8.1.2 全量种子集为准。
+**归类**：瓶颈是 **维/grain 遗漏** 与 **列超额**，非枚举/年份。  
+说明：样本小；正式门禁仍以 §8.1.2 为准。
+
+### 17.5.1 并行多 SQL 超复杂套（同日，修复后）
+
+同脚本演进为 **多 SQL + `---` + 并行执行** + soft-EX + §7.1 类 lint；10 题（异 grain / 分表 / 双排行 / HAVING+基线等）。
+
+| 轮次 | EX | 说明 |
+|------|-----|------|
+| 首跑 | 7/10 = 70% | 已能并行拆分；败在超额列、百分比取整、空语言过滤 |
+| 加 soft-EX + 提示/lint | 9/10 → 曾因无约束 EX 回写回归至 8/10 | 证实「乱回写」有害 |
+| **定稿闸（去有害回写 + 渠道/`LIMIT 1`/空语言 lint）** | **10/10 = 100%**（8 严格 + 2 soft） | 均时 ~19s；静默错 0 |
+
+**结论**：§6.1 多 SQL 并行 + §7.1 lint + soft-EX 可将超复杂题拉回门禁上方；实现时把实验脚本并入正式 harness（勿依赖 `tmp-*` 文件名）。
 
 ### 17.6 为门禁服务的改进落地顺序（实现备忘）
 
 1. §7.2 `distinctCountFn` + AST 规范化  
 2. §6.3 时间 resolve + `required_filters`  
-3. Probe + §7 / §7.1 lint + **日/维/列 Verify** + 复杂题分解（§6.1）  
-4. 评测 harness + 可执行 gold + soft-EX + `GATE_*`（M2 阻断发版）  
-5. 维对账 + few-shot/薄错修 + 回喂兜底（压 CWR）  
+3. Probe + §7 / §7.1 lint + **日/维/列 Verify** + **多 SQL 并行**（§6.1）  
+4. 评测 harness（含 soft-EX、`multi_query`）+ `GATE_*`（M2 阻断发版）  
+5. 维对账 + few-shot/薄错修；回喂仅限 lint/exec/empty  
