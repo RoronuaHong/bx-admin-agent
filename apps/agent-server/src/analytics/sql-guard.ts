@@ -50,13 +50,20 @@ export function assertReadonlySingleSelect(sql: string): void {
   }
 }
 
-/** Extract bare table names from FROM clauses (simple regex, no subquery awareness). */
+/**
+ * Extract bare table names from FROM / JOIN clauses (simple regex).
+ * Does not resolve subquery aliases; only identifier tokens after FROM|JOIN.
+ */
 export function extractFromTables(sql: string): string[] {
   const tables: string[] = [];
-  const re = /\bfrom\s+([a-zA-Z_][\w]*)/gi;
+  const seen = new Set<string>();
+  const re = /\b(?:from|join)\s+([a-zA-Z_][\w]*)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(sql)) !== null) {
-    tables.push(m[1]);
+    const name = m[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    tables.push(name);
   }
   return tables;
 }

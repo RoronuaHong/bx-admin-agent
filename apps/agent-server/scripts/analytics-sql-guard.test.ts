@@ -109,13 +109,28 @@ assert.equal(
 assert.deepEqual(extractFromTables("SELECT * FROM elt_watch_detail"), ["elt_watch_detail"]);
 assert.deepEqual(extractFromTables("SELECT * FROM elt_watch_detail JOIN other ON 1=1"), [
   "elt_watch_detail",
+  "other",
 ]);
+assert.deepEqual(
+  extractFromTables(
+    "SELECT * FROM elt_watch_detail LEFT JOIN secret_table ON 1=1 RIGHT JOIN other ON 1=1",
+  ),
+  ["elt_watch_detail", "secret_table", "other"],
+);
 
 assert.doesNotThrow(() =>
   assertTablesWhitelisted("SELECT * FROM elt_watch_detail", ["elt_watch_detail"]),
 );
 assert.throws(
   () => assertTablesWhitelisted("SELECT * FROM secret_table", ["elt_watch_detail"]),
+  /whitelist/,
+);
+assert.throws(
+  () =>
+    assertTablesWhitelisted(
+      "SELECT * FROM elt_watch_detail JOIN secret_table ON 1=1",
+      ["elt_watch_detail"],
+    ),
   /whitelist/,
 );
 
