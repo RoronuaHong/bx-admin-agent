@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import type { ApiErrorPayload, ChatEvent, LocalizedToken } from "@bx/shared";
 import { cors } from "hono/cors";
@@ -33,6 +34,7 @@ import { resolvePortalPermissions } from "./permissions.js";
 import { loadUserPreferences } from "./user-prefs.js";
 import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
 import { analyticsAsk } from "./analytics/pipeline.js";
+import { enqueueScan, getScanJob } from "./analytics/scan/runner.js";
 
 const COOKIE = "bx_agent_sid";
 
@@ -48,6 +50,14 @@ function errorJson(c: Context, status: number, code: string, params?: Record<str
     ...(extras || {}),
   };
   return c.json(body, status as never);
+}
+
+/** Constant-time string compare for Bearer tokens (length mismatch → false). */
+function safeTokenEqual(expected: string, provided: string): boolean {
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(provided, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 function uiText(uiLocale: string | undefined, zh: string, en: string, pt: string, hi: string): string {
@@ -489,6 +499,64 @@ export function createApp() {
     if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
     const result = await analyticsAsk(text);
     return c.json(result);
+  });
+
+  // M3 巡检内部 API：Bearer SCAN_INTERNAL_TOKEN + ANALYTICS_SCAN_WORKER=1
+  function assertScanInternalAuth(c: Context) {
+    if (!config.scan.workerEnabled) {
+      return errorJson(c, 403, "SCAN_WORKER_DISABLED", undefined, "本实例未启用 scan worker（ANALYTICS_SCAN_WORKER≠1）");
+    }
+    const expected = config.scan.internalToken;
+    const auth = c.req.header("authorization") || "";
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    const provided = m?.[1]?.trim() || "";
+    if (!expected || !provided || !safeTokenEqual(expected, provided)) {
+      return errorJson(c, 401, "SCAN_UNAUTHORIZED", undefined, "无效或缺失 SCAN_INTERNAL_TOKEN");
+    }
+    return null;
+  }
+
+  app.post("/internal/analytics/scan", async (c) => {
+    const denied = assertScanInternalAuth(c);
+    if (denied) return denied;
+    const body = await c.req
+      .json<{
+        ruleSetId?: string;
+        scanDate?: string;
+        forceRerun?: boolean;
+        dryRun?: boolean;
+      }>()
+      .catch(() => ({} as { ruleSetId?: string }));
+    const ruleSetId = String(body.ruleSetId || "").trim();
+    if (!ruleSetId) {
+      return errorJson(c, 400, "SCAN_MISSING_RULESET", undefined, "ruleSetId 必填");
+    }
+    const result = await enqueueScan({
+      ruleSetId,
+      scanDate: body.scanDate,
+      forceRerun: body.forceRerun === true,
+      dryRun: body.dryRun === true,
+    });
+    if ("error" in result) {
+      if (result.error === "scan_job_running") {
+        return errorJson(c, 409, "scan_job_running", undefined, "同 scanDate+ruleSet 已有 running 任务", {
+          error: "scan_job_running",
+        });
+      }
+      return errorJson(c, 400, "SCAN_ENQUEUE_FAILED", undefined, result.error);
+    }
+    return c.json({ jobId: result.jobId }, 202);
+  });
+
+  app.get("/internal/analytics/scan/:jobId", (c) => {
+    const denied = assertScanInternalAuth(c);
+    if (denied) return denied;
+    const jobId = c.req.param("jobId");
+    const job = getScanJob(jobId);
+    if (!job) {
+      return errorJson(c, 404, "SCAN_JOB_NOT_FOUND", undefined, "scan job 不存在");
+    }
+    return c.json(job);
   });
 
   // 任务状态查询（刷新后前端可据此展示「上一任务仍在后台执行」或最近一次结果）

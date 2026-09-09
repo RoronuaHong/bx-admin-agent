@@ -201,4 +201,14 @@ export const config = {
       return process.env.ANALYTICS_BUSINESS_TIMEZONE || "Asia/Shanghai";
     },
   },
+  // M3 巡检：内部 token + 单 scan worker 开关（惰性读取，便于测试改 env）。
+  scan: {
+    get internalToken() {
+      return (process.env.SCAN_INTERNAL_TOKEN || "").trim();
+    },
+    /** Only instances with ANALYTICS_SCAN_WORKER=1 accept enqueue. */
+    get workerEnabled() {
+      return process.env.ANALYTICS_SCAN_WORKER === "1";
+    },
+  },
 };
