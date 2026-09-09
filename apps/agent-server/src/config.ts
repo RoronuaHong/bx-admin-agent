@@ -178,4 +178,27 @@ export const config = {
       label: (process.env.DEFAULT_PROJECT_LABEL || "影视后台管理系统").trim(),
     };
   },
+  // Metabase Analytics（M1）：惰性读取，便于测试改 env。
+  metabase: {
+    get url() {
+      return (process.env.METABASE_URL || "https://bi.vmovs.com").replace(/\/$/, "");
+    },
+    get username() {
+      return (process.env.METABASE_USERNAME || process.env.METABASE_USER_EMAIL || "").trim();
+    },
+    get password() {
+      return process.env.METABASE_PASSWORD || "";
+    },
+    get databaseId() {
+      const n = Number(process.env.METABASE_DATABASE_ID || 2);
+      return Number.isFinite(n) ? n : 2;
+    },
+    get distinctCountFn() {
+      const v = (process.env.DISTINCT_COUNT_FN || "uniq").toLowerCase();
+      return v === "uniqexact" ? "uniqExact" : "uniq";
+    },
+    get businessTimezone() {
+      return process.env.ANALYTICS_BUSINESS_TIMEZONE || "Asia/Shanghai";
+    },
+  },
 };
