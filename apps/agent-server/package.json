@@ -21,7 +21,8 @@
     "eval:core": "tsx scripts/eval-core.test.ts",
     "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
     "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",
-    "eval": "tsx scripts/eval-core.test.ts"
+    "eval": "tsx scripts/eval-core.test.ts",
+    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-pipeline-unit.test.ts"
   },
   "dependencies": {
     "@bx/shared": "workspace:*",
