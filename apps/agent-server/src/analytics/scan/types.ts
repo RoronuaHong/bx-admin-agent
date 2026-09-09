@@ -60,3 +60,58 @@ export interface ResolveScanWindowOpts {
   /** Explicit closed business day; default = T-1 in `tz`. */
   scanDate?: string;
 }
+
+/** Job lifecycle (§9.2.1): queued → running → terminal. */
+export type ScanJobStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "partial"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+/** Alert severity for scan parent/child alerts (§9.6). */
+export type ScanAlertSeverity = "info" | "warn" | "critical";
+
+/** Thin alert record attached to a job (full notify shape lands in Task 5). */
+export interface ScanAlert {
+  severity: ScanAlertSeverity;
+  metric?: string;
+  entityKey?: string;
+  baseline?: BaselineKind;
+  message: string;
+  fingerprint?: string;
+  parent?: boolean;
+}
+
+/** Optional rollup written when a job finishes. */
+export interface ScanJobResultSummary {
+  entityCount?: number;
+  warnCount?: number;
+  criticalCount?: number;
+  skippedReason?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * In-process scan job record (§9.2.1 / Task 2).
+ * Timestamps are ISO-8601 strings.
+ */
+export interface ScanJob {
+  jobId: string;
+  ruleSetId: string;
+  scanDate: string;
+  status: ScanJobStatus;
+  dryRun: boolean;
+  forceRerun: boolean;
+  rerunSeq: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  resultSummary?: ScanJobResultSummary;
+  alerts?: ScanAlert[];
+}
