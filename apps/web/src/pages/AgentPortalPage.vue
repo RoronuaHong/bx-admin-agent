@@ -37,6 +37,8 @@ const cards = computed(() =>
           ? card.authHref
           : card.href || "",
     tone: card.tone,
+    accent: card.accent,
+    featured: Boolean(card.featured),
   })),
 );
 
@@ -116,10 +118,15 @@ const traceAccessHint = computed(() => {
     <section class="grid" :aria-label="tx('Agent 列表', 'Agent list', 'Lista de agentes', 'एजेंट सूची')">
       <article
         v-for="card in cards"
-        :key="card.title"
+        :key="card.key"
         class="card"
-        :class="[`tone-${card.tone}`, { 'is-static': !card.to, 'is-disabled': !card.enabled }]"
+        :class="[
+          `tone-${card.tone}`,
+          `accent-${card.accent}`,
+          { 'is-static': !card.to, 'is-disabled': !card.enabled, 'is-featured': card.featured },
+        ]"
       >
+        <div class="card-glow" aria-hidden="true" />
         <div class="card-head">
           <h2 class="card-title">
             <RouterLink v-if="card.to" :to="card.to" class="card-link">{{ card.title }}</RouterLink>
@@ -128,7 +135,7 @@ const traceAccessHint = computed(() => {
           <span class="chip">{{ card.chip }}</span>
         </div>
         <p>{{ card.desc }}</p>
-        <span class="cta">{{ card.cta }}</span>
+        <span class="cta">{{ card.cta }} <span class="cta-arrow" aria-hidden="true">→</span></span>
       </article>
     </section>
   </main>
@@ -136,8 +143,32 @@ const traceAccessHint = computed(() => {
 
 <style scoped>
 .stage {
+  --portal-ink: var(--ink);
+  --portal-muted: var(--muted);
+  position: relative;
+  isolation: isolate;
   min-height: 100dvh;
   padding: calc(20px + var(--safe-top)) var(--pad) calc(28px + var(--safe-bottom));
+  overflow: hidden;
+  background:
+    radial-gradient(900px 480px at 8% -10%, color-mix(in srgb, #0d9488 22%, transparent), transparent 60%),
+    radial-gradient(720px 420px at 92% 8%, color-mix(in srgb, #ea580c 16%, transparent), transparent 55%),
+    radial-gradient(640px 380px at 70% 100%, color-mix(in srgb, #0284c7 14%, transparent), transparent 50%),
+    linear-gradient(165deg, color-mix(in srgb, var(--bg) 92%, #ecfdf5) 0%, var(--bg) 48%, color-mix(in srgb, var(--bg) 90%, #fff7ed) 100%);
+}
+
+.stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--ink) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--ink) 5%, transparent) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse 80% 70% at 50% 20%, #000 20%, transparent 75%);
 }
 
 .top {
@@ -154,7 +185,8 @@ const traceAccessHint = computed(() => {
   padding: 6px;
   border: 1px solid color-mix(in srgb, var(--line) 88%, var(--ink) 12%);
   border-radius: calc(var(--radius) + 2px);
-  background: color-mix(in srgb, var(--panel) 88%, var(--fill));
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  backdrop-filter: blur(10px);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, white 18%, transparent),
     0 10px 24px color-mix(in srgb, var(--ink) 6%, transparent);
@@ -194,16 +226,18 @@ const traceAccessHint = computed(() => {
 
 .kicker {
   margin: 0 0 10px;
-  color: var(--muted);
+  color: color-mix(in srgb, #0f766e 70%, var(--muted));
   font-size: 11px;
   letter-spacing: 0.28em;
   text-transform: uppercase;
+  font-weight: 700;
 }
 
 h1 {
   margin: 0;
   font-size: clamp(34px, 6vw, 54px);
   line-height: 0.98;
+  letter-spacing: -0.03em;
 }
 
 .lead {
@@ -223,7 +257,8 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--muted);
-  background: var(--fill-soft);
+  background: color-mix(in srgb, var(--panel) 80%, transparent);
+  backdrop-filter: blur(8px);
   font-size: 12px;
 }
 
@@ -280,30 +315,75 @@ h1 {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 16px;
   margin-top: 28px;
 }
 
 .card {
+  --card-accent: #0d9488;
+  --card-accent-2: #0369a1;
+  --card-surface: color-mix(in srgb, var(--panel) 88%, transparent);
   position: relative;
   display: grid;
   gap: 14px;
-  min-height: 220px;
-  padding: 20px;
-  border: 1px solid var(--line);
-  border-radius: calc(var(--radius) + 4px);
-  background: color-mix(in srgb, var(--panel) 86%, var(--fill));
-  box-shadow: 0 10px 30px color-mix(in srgb, var(--ink) 6%, transparent);
+  grid-column: span 4;
+  min-height: 228px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--card-accent) 22%, var(--line));
+  border-radius: calc(var(--radius) + 6px);
+  background:
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--card-accent) 14%, transparent) 0%,
+      transparent 42%
+    ),
+    var(--card-surface);
+  box-shadow:
+    0 12px 32px color-mix(in srgb, var(--ink) 7%, transparent),
+    inset 0 1px 0 color-mix(in srgb, white 22%, transparent);
   color: inherit;
   text-decoration: none;
-  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+  overflow: hidden;
+  transition:
+    transform 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.card-glow {
+  position: absolute;
+  inset: auto -20% -40% auto;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--card-accent) 28%, transparent), transparent 70%);
+  pointer-events: none;
+  opacity: 0.9;
+  transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
 .card:hover {
-  transform: translateY(-2px);
-  border-color: color-mix(in srgb, var(--ink) 16%, var(--line));
-  box-shadow: 0 16px 36px color-mix(in srgb, var(--ink) 10%, transparent);
+  transform: translateY(-3px);
+  border-color: color-mix(in srgb, var(--card-accent) 48%, var(--line));
+  box-shadow:
+    0 18px 40px color-mix(in srgb, var(--card-accent) 16%, transparent),
+    0 10px 24px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.card:hover .card-glow {
+  opacity: 1;
+  transform: scale(1.12);
+}
+
+.card.is-featured {
+  grid-column: span 8;
+  min-height: 260px;
+  padding: 26px 28px;
+}
+
+.card.is-featured .card-title {
+  font-size: clamp(24px, 3vw, 30px);
 }
 
 .card.is-static {
@@ -312,12 +392,15 @@ h1 {
 
 .card.is-disabled {
   opacity: 0.72;
+  filter: grayscale(0.2);
 }
 
 .card.is-static:hover {
   transform: none;
-  border-color: var(--line);
-  box-shadow: 0 10px 30px color-mix(in srgb, var(--ink) 6%, transparent);
+  border-color: color-mix(in srgb, var(--card-accent) 22%, var(--line));
+  box-shadow:
+    0 12px 32px color-mix(in srgb, var(--ink) 7%, transparent),
+    inset 0 1px 0 color-mix(in srgb, white 22%, transparent);
 }
 
 .card-head {
@@ -325,11 +408,13 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+  z-index: 1;
 }
 
 .card h2 {
   margin: 0;
   font-size: 20px;
+  letter-spacing: -0.02em;
 }
 
 .card-link {
@@ -344,13 +429,15 @@ h1 {
 }
 
 .card-link:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ink) 36%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--card-accent) 55%, transparent);
   outline-offset: 4px;
-  border-radius: calc(var(--radius) + 4px);
+  border-radius: calc(var(--radius) + 6px);
 }
 
 .card p {
   margin: 0;
+  z-index: 1;
+  max-width: 52ch;
   color: var(--muted);
   line-height: 1.7;
 }
@@ -358,30 +445,81 @@ h1 {
 .chip {
   display: inline-flex;
   align-items: center;
-  height: 24px;
-  padding: 0 10px;
+  height: 26px;
+  padding: 0 11px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--ink) 8%, transparent);
-  color: var(--ink);
+  border: 1px solid color-mix(in srgb, var(--card-accent) 28%, transparent);
+  background: color-mix(in srgb, var(--card-accent) 16%, var(--panel));
+  color: color-mix(in srgb, var(--card-accent) 72%, var(--ink));
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .cta {
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   margin-top: auto;
-  color: var(--ink);
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--card-accent) 14%, transparent);
+  color: color-mix(in srgb, var(--card-accent) 78%, var(--ink));
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
-.tone-primary {
-  border-color: color-mix(in srgb, var(--ink) 18%, var(--line));
+.cta-arrow {
+  transition: transform 0.16s ease;
+}
+
+.card:hover .cta-arrow {
+  transform: translateX(3px);
+}
+
+.accent-analytics {
+  --card-accent: #0d9488;
+  --card-accent-2: #0369a1;
+  --card-surface: color-mix(in srgb, #ecfdf5 55%, var(--panel));
+}
+
+.accent-admin {
+  --card-accent: #c2410c;
+  --card-accent-2: #b45309;
+  --card-surface: color-mix(in srgb, #fff7ed 58%, var(--panel));
+}
+
+.accent-knowledge {
+  --card-accent: #4d7c0f;
+  --card-accent-2: #a16207;
+  --card-surface: color-mix(in srgb, #f7fee7 58%, var(--panel));
+}
+
+.accent-viewing {
+  --card-accent: #0369a1;
+  --card-accent-2: #0e7490;
+  --card-surface: color-mix(in srgb, #e0f2fe 55%, var(--panel));
+}
+
+.accent-more {
+  --card-accent: #64748b;
+  --card-accent-2: #475569;
+  --card-surface: color-mix(in srgb, var(--panel) 92%, #e2e8f0);
 }
 
 .tone-muted {
-  opacity: 0.84;
+  opacity: 0.9;
+}
+
+@media (max-width: 960px) {
+  .card,
+  .card.is-featured {
+    grid-column: span 6;
+  }
 }
 
 @media (max-width: 720px) {
@@ -394,8 +532,38 @@ h1 {
     justify-content: space-between;
   }
 
-  .grid {
-    grid-template-columns: 1fr;
+  .card,
+  .card.is-featured {
+    grid-column: span 12;
+    min-height: 200px;
   }
+}
+
+:global(html.dark) .stage {
+  background:
+    radial-gradient(900px 480px at 8% -10%, color-mix(in srgb, #14b8a6 18%, transparent), transparent 60%),
+    radial-gradient(720px 420px at 92% 8%, color-mix(in srgb, #f97316 12%, transparent), transparent 55%),
+    radial-gradient(640px 380px at 70% 100%, color-mix(in srgb, #38bdf8 10%, transparent), transparent 50%),
+    linear-gradient(165deg, color-mix(in srgb, var(--bg) 88%, #042f2e) 0%, var(--bg) 50%, color-mix(in srgb, var(--bg) 90%, #1c1917) 100%);
+}
+
+:global(html.dark) .accent-analytics {
+  --card-surface: color-mix(in srgb, #042f2e 45%, var(--panel));
+}
+
+:global(html.dark) .accent-admin {
+  --card-surface: color-mix(in srgb, #431407 40%, var(--panel));
+}
+
+:global(html.dark) .accent-knowledge {
+  --card-surface: color-mix(in srgb, #1a2e05 40%, var(--panel));
+}
+
+:global(html.dark) .accent-viewing {
+  --card-surface: color-mix(in srgb, #0c4a6e 40%, var(--panel));
+}
+
+:global(html.dark) .kicker {
+  color: color-mix(in srgb, #5eead4 55%, var(--muted));
 }
 </style>

@@ -1,6 +1,9 @@
 import type { LocalizedText } from "./localize";
 import type { PortalEntryKey } from "./portal-permissions";
 
+export type PortalCardTone = "primary" | "default" | "muted";
+export type PortalCardAccent = "analytics" | "admin" | "knowledge" | "viewing" | "more";
+
 export type PortalCard = {
   key: string;
   entry?: PortalEntryKey;
@@ -8,7 +11,9 @@ export type PortalCard = {
   desc: LocalizedText;
   chip: LocalizedText;
   cta: LocalizedText;
-  tone: "primary" | "default" | "muted";
+  tone: PortalCardTone;
+  accent: PortalCardAccent;
+  featured?: boolean;
   href?: string;
   authHref?: string;
 };
@@ -28,13 +33,30 @@ export const PORTAL_KICKER: LocalizedText = {
 };
 
 export const PORTAL_LEAD: LocalizedText = {
-  zh: "当前门户承载多个 Agent 入口。后台管理 Agent 已可用；知识库 / RAG Agent、观影助手 Agent 与更多能力按规划逐步接入。",
-  en: "This portal hosts multiple agent entries. The admin agent is available now, while the knowledge / RAG agent, viewing agent, and more capabilities are being introduced incrementally.",
-  pt: "Este portal concentra varias entradas de agentes. O agente de backoffice ja esta disponivel; o agente de conhecimento / RAG, o agente de visualizacao e outras capacidades serao introduzidos gradualmente.",
-  hi: "यह पोर्टल कई एजेंट प्रवेश बिंदु समेटे हुए है। एडमिन एजेंट अभी उपलब्ध है; नॉलेज / RAG एजेंट, व्यूइंग एजेंट और अन्य क्षमताएं चरणबद्ध रूप से जोड़ी जाएंगी।",
+  zh: "先从数据分析问数开始；后台管理、知识库与观影助手按权限并列接入，统一从本门户进入。",
+  en: "Start with analytics Q&A; admin, knowledge, and viewing agents sit alongside by permission — all from this portal.",
+  pt: "Comece pela analise de dados; backoffice, conhecimento e visualizacao ficam lado a lado conforme a permissao — tudo neste portal.",
+  hi: "एनालिटिक्स प्रश्न से शुरू करें; अनुमति के अनुसार एडमिन, नॉलेज और व्यूइंग एजेंट साथ-साथ — सब इसी पोर्टल से।",
 };
 
 export const PORTAL_CARDS: PortalCard[] = [
+  {
+    key: "analytics",
+    entry: "analytics",
+    title: { zh: "数据分析 Agent", en: "Analytics Agent", pt: "Agent de Analise", hi: "एनालिटिक्स एजेंट" },
+    desc: {
+      zh: "基于 Metabase 的自然语言问数：时间解析、SQL 生成与表格结果，独立于后台管理会话。",
+      en: "Natural-language analytics via Metabase: time resolve, SQL generation, and table results — separate from the admin chat session.",
+      pt: "Analise em linguagem natural via Metabase: resolucao de tempo, geracao de SQL e tabelas — separado do chat de admin.",
+      hi: "Metabase के माध्यम से प्राकृतिक भाषा एनालिटिक्स: समय रिज़ॉल्व, SQL जनरेशन और टेबल परिणाम — एडमिन चैट से अलग।",
+    },
+    chip: { zh: "推荐", en: "Featured", pt: "Destaque", hi: "विशेष" },
+    cta: { zh: "进入问数", en: "Open analytics", pt: "Abrir analise", hi: "एनालिटिक्स खोलें" },
+    href: "/analytics",
+    tone: "primary",
+    accent: "analytics",
+    featured: true,
+  },
   {
     key: "admin",
     entry: "admin",
@@ -54,7 +76,8 @@ export const PORTAL_CARDS: PortalCard[] = [
     },
     authHref: "/agents/admin/chat",
     href: "/agents/admin/login",
-    tone: "primary",
+    tone: "default",
+    accent: "admin",
   },
   {
     key: "knowledge",
@@ -70,6 +93,7 @@ export const PORTAL_CARDS: PortalCard[] = [
     cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
     href: "/agents/knowledge",
     tone: "default",
+    accent: "knowledge",
   },
   {
     key: "viewing",
@@ -85,21 +109,7 @@ export const PORTAL_CARDS: PortalCard[] = [
     cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
     href: "/agents/viewing",
     tone: "default",
-  },
-  {
-    key: "analytics",
-    entry: "analytics",
-    title: { zh: "数据分析 Agent", en: "Analytics Agent", pt: "Agent de Analise", hi: "एनालिटिक्स एजेंट" },
-    desc: {
-      zh: "基于 Metabase 的自然语言问数：时间解析、SQL 生成与表格结果，独立于后台管理会话。",
-      en: "Natural-language analytics via Metabase: time resolve, SQL generation, and table results — separate from the admin chat session.",
-      pt: "Analise em linguagem natural via Metabase: resolucao de tempo, geracao de SQL e tabelas — separado do chat de admin.",
-      hi: "Metabase के माध्यम से प्राकृतिक भाषा एनालिटिक्स: समय रिज़ॉल्व, SQL जनरेशन और टेबल परिणाम — एडमिन चैट से अलग।",
-    },
-    chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
-    cta: { zh: "进入问数", en: "Open analytics", pt: "Abrir analise", hi: "एनालिटिक्स खोलें" },
-    href: "/analytics",
-    tone: "default",
+    accent: "viewing",
   },
   {
     key: "more",
@@ -113,5 +123,6 @@ export const PORTAL_CARDS: PortalCard[] = [
     chip: { zh: "规划中", en: "Planned", pt: "Planejado", hi: "योजना" },
     cta: { zh: "先看规划", en: "See roadmap", pt: "Ver roadmap", hi: "रोडमैप देखें" },
     tone: "muted",
+    accent: "more",
   },
 ];
