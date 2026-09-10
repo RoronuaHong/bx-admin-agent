@@ -1,12 +1,12 @@
 # Metabase 数据分析 Agent 设计（定稿）
 
-> **状态**：设计定稿（**待实现**；仓内产品链路尚未端到端可跑，见 §12.1）  
-> **日期**：2026-09-09  
+> **状态**：设计定稿；**M1 / M2 / M3 已验收**（2026-09-10，见 §12 / 各验收清单）  
+> **日期**：2026-09-09（实现收口 2026-09-10）  
 > **宿主**：bx-admin-agent（`apps/web` + `apps/agent-server`）  
 > **关联**：取代 [`docs/通用数据分析Agent方案.md`](../../通用数据分析Agent方案.md) 中「以 `call_api` 为权威取数」的路径；Multi-Agent Worker 装配见 `docs/agent/MULTI_AGENT_ARCHITECTURE.md`  
 > **产品范围**：对话取数 + 自动巡检预警（交付按 M1→M2→M3 切分，范围不砍）  
 > **质量硬门槛**：发版须同时满足 **正确率 EX ≥ 85%** 与 **拒答召回 ≥ 95%**（CWR ≤ 10%）；详见 §8。禁止以「查询能跑通」替代。  
-> **实现就绪**：截至 2026-09-09，**仅 Metabase 连通冒烟可跑**；`/analytics`、Worker、`metabase_*`、P0 流水线、巡检、GATE 均未落地（§12.1）。
+> **实现就绪**：对话取数 / 质量门禁 / 巡检主路径已落地。可答 EX 门禁待人工将 provisional→gold；§12.1.1–12.1.4 为定稿当日历史快照。
 
 ---
 
@@ -760,15 +760,19 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 
 | 里程碑 | 验收标准 |
 |--------|----------|
-| **M1** | `/analytics` 可对话；时间 resolve → Probe → Generate → **§7.2** → §7/§7.1 → **日/维/列 Verify** → **多 SQL 可并行** → 结构化重写；**无手维指标表**；缺日期反问；来源条回显时间窗；**MCP 和/或 HTTP facade 可被小龙虾调用**（建议含 `analytics_ask`）；种子评测可跑通（门禁可先 warn）。**实现计划：** [`docs/superpowers/plans/2026-09-09-metabase-analytics-agent-m1.md`](../plans/2026-09-09-metabase-analytics-agent-m1.md) |
-| **M2** | 校对契约 + 维对账；自纠错；评测 harness；**GATE_*** 阻断发版；tags；version/modelId；候选池入 gold；双轨图；审计点赞 |
-| **M3** | 手工巡检 + 外部 cron 调异步 `/internal/analytics/scan`；freshness→skipped；businessTimezone；job 状态机含 partial/timeout/skipped；相对+绝对阈值；dryRun；钉钉 `analytics` kind + rerunSeq dedup；默认单 scan worker；应用内 job/告警（登录）与 internal API（token）鉴权分流；深链+runbook |
+| **M1** | `/analytics` 可对话；时间 resolve → Probe → Generate → **§7.2** → §7/§7.1 → **日/维/列 Verify** → **多 SQL 可并行** → 结构化重写；**无手维指标表**；缺日期反问；来源条回显时间窗；**MCP 和/或 HTTP facade 可被小龙虾调用**（建议含 `analytics_ask`）；种子评测可跑通（门禁可先 warn）。**实现计划：** [`docs/superpowers/plans/2026-09-09-metabase-analytics-agent-m1.md`](../plans/2026-09-09-metabase-analytics-agent-m1.md)。**验收：** [`docs/analytics/m1-acceptance.md`](../../analytics/m1-acceptance.md) ✅ |
+| **M2** | 校对契约 + 维对账；自纠错；评测 harness；**GATE_*** 阻断发版；tags；version/modelId；候选池入 gold；双轨图；审计点赞。**实现计划：** [`docs/superpowers/plans/2026-09-09-metabase-analytics-agent-m2.md`](../plans/2026-09-09-metabase-analytics-agent-m2.md)。**验收：** [`docs/analytics/m2-acceptance.md`](../../analytics/m2-acceptance.md) ✅（可答 gold 待人工晋升；当前 GATE_EX=n/a） |
+| **M3** | 手工巡检 + 外部 cron 调异步 `/internal/analytics/scan`；freshness→skipped；businessTimezone；job 状态机含 partial/timeout/skipped；相对+绝对阈值；dryRun；钉钉 `analytics` kind + rerunSeq dedup；默认单 scan worker；应用内 job/告警（登录）与 internal API（token）鉴权分流；深链+runbook。**实现计划：** [`docs/superpowers/plans/2026-09-09-metabase-analytics-agent-m3.md`](../plans/2026-09-09-metabase-analytics-agent-m3.md)。**验收：** [`docs/analytics/m3-acceptance.md`](../../analytics/m3-acceptance.md) ✅ |
 
-### 12.1 仓内实现就绪度 / 业务流程可跑通性（2026-09-09 对照代码）
+### 12.1 仓内实现就绪度 / 业务流程可跑通性
 
-> **结论：产品业务流程目前不能端到端跑通。** 定稿可指导实现；离线小样（§17）证明 Probe/并行/lint 方向可行；**运行时 Agent 路径尚未编码。**
+> **2026-09-10 更新（覆盖文内「2026-09-09 对照」）：**  
+> - **M1** 对话取数：**已验收**（`docs/analytics/m1-acceptance.md`）。  
+> - **M2** 质量闭环 / `GATE_*`：**已验收**（`docs/analytics/m2-acceptance.md`；拒答 GATE + CI；可答 EX 待人工将 provisional→gold）。  
+> - **M3** 巡检：**已验收**（`docs/analytics/m3-acceptance.md`；dryRun smoke `succeeded`）。  
+> 下文 §12.1.1–12.1.4 为定稿当日快照，**勿再当作当前缺口清单**；以各里程碑验收清单为准。
 
-#### 12.1.1 按业务流程
+#### 12.1.1 按业务流程（历史快照 2026-09-09）
 
 | 流程 | 状态 | 说明 |
 |------|------|------|
@@ -807,8 +811,8 @@ NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
 5. **M2**：评测 harness + CI `GATE_*`  
 6. **M3**：scan API + job + `analytics` 告警 kind  
 
-**下一步**：按本文做 **实现计划（writing-plans）→ M1 编码**；不以「冒烟 SQL 能跑」或管理聊天能力宣称 Analytics 已交付。  
-**OpenClaw / 小龙虾**：任意工具面可作入口（§4.2）；本仓补 MCP/HTTP facade（建议 `analytics_ask`）即可，**无需为小龙虾改分析内核**；裸 Metabase MCP 不算接入完成。
+**下一步（2026-09-10）：** M1 / M2 / M3 均已验收。后续可选：人工将 provisional 可答题晋升为 gold 以启用 `GATE_EX`；真实 Metabase `questionId` 绑定；日常 `/analytics` 体验回归。  
+**OpenClaw / 小龙虾**：见 §4.2 与 [openclaw-connect.md](../../analytics/openclaw-connect.md)；裸 Metabase MCP 不算接入完成。
 
 ---
 

@@ -10,6 +10,7 @@ import {
   createJob,
   getJob,
   markTimeoutIfNeeded,
+  purgeJobsOlderThan,
   resetJobStoreForTests,
   transition,
 } from "../src/analytics/scan/job-store.js";
@@ -110,6 +111,34 @@ resetJobStoreForTests();
   });
   assert.equal(revived.status, "failed");
   assert.equal(revived.errorCode, "scan_job_timeout");
+}
+
+{
+  resetJobStoreForTests();
+  const old = createJob({
+    ruleSetId: "watch-users",
+    scanDate: "2026-08-01",
+    now: new Date("2026-08-01T00:00:00.000Z"),
+  });
+  transition(old.jobId, "succeeded", { now: new Date("2026-08-01T00:01:00.000Z") });
+  const fresh = createJob({
+    ruleSetId: "watch-users",
+    scanDate: "2026-09-08",
+    now: new Date("2026-09-09T00:00:00.000Z"),
+  });
+  transition(fresh.jobId, "succeeded", { now: new Date("2026-09-09T00:01:00.000Z") });
+  const running = createJob({
+    ruleSetId: "watch-users",
+    scanDate: "2026-08-02",
+    now: new Date("2026-08-02T00:00:00.000Z"),
+  });
+  transition(running.jobId, "running", { now: new Date("2026-08-02T00:01:00.000Z") });
+
+  const removed = purgeJobsOlderThan(30, new Date("2026-09-10T00:00:00.000Z"));
+  assert.equal(removed, 1);
+  assert.equal(getJob(old.jobId), undefined);
+  assert.ok(getJob(fresh.jobId));
+  assert.equal(getJob(running.jobId)?.status, "running");
 }
 
 console.log("analytics-scan-job-store.test.ts OK");

@@ -22,7 +22,9 @@
     "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
     "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",
     "eval": "tsx scripts/eval-core.test.ts",
-    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-pipeline-unit.test.ts && tsx scripts/analytics-scan-window.test.ts && tsx scripts/analytics-scan-job-store.test.ts && tsx scripts/analytics-scan-threshold.test.ts && tsx scripts/analytics-scan-freshness-metrics.test.ts && tsx scripts/analytics-scan-notify.test.ts && tsx scripts/analytics-scan-runner-unit.test.ts"
+    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-ambiguity-gate.test.ts && tsx scripts/analytics-intent-compile.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-pipeline-unit.test.ts && tsx scripts/analytics-eval-score.test.ts && tsx scripts/analytics-llm-verify.test.ts && tsx scripts/analytics-dim-reconcile.test.ts && tsx scripts/analytics-audit-ledger.test.ts && tsx scripts/analytics-local-chart.test.ts && tsx scripts/analytics-question-binding.test.ts && tsx scripts/analytics-scan-window.test.ts && tsx scripts/analytics-scan-job-store.test.ts && tsx scripts/analytics-scan-threshold.test.ts && tsx scripts/analytics-scan-freshness-metrics.test.ts && tsx scripts/analytics-scan-notify.test.ts && tsx scripts/analytics-scan-runner-unit.test.ts",
+    "test:analytics-gate": "tsx scripts/analytics-eval-score.test.ts && tsx scripts/analytics-eval-harness.mjs --refuse-only",
+    "eval:analytics": "tsx scripts/analytics-eval-harness.mjs"
   },
   "dependencies": {
     "@bx/shared": "workspace:*",

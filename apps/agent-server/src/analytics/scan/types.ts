@@ -37,6 +37,11 @@ export interface RuleSet {
   maxChildAlerts: number;
   businessTimezone: string;
   jobTimeoutMs: number;
+  /**
+   * Purge terminal in-memory jobs older than this many days (default 30).
+   * Non-terminal (queued/running) are never purged.
+   */
+  retentionDays?: number;
   freshnessCheck: FreshnessCheck;
   packId: string;
   persistCard: boolean;

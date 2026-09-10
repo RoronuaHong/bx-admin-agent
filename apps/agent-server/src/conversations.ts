@@ -1,11 +1,10 @@
-// 聊天记录服务端持久化（方案 C）：按登录用户归属，存 MongoDB。
-// 身份由 cookie session 决定（app.ts 的 getSession），归属 key = `${countryId}:${loginName}`，
-// 与前端无关，杜绝 localStorage 时代「身份错位 / 5MB 上限 / filter 误删」导致的记录丢失。
+// 聊天 / Analytics 会话服务端持久化，存 MongoDB。
+// chat：登录 session → ownerKey = `${countryId}:${loginName}`。
+// analytics：登录同 chat；未登录用 bx_analytics_aid → ownerKey = `anon:<aid>`（app.ts resolveAnalyticsOwner）。
 //
 // 设计要点：
-//  - MongoClient 单例懒连接（进程级复用），不每次新建连接。
-//  - 连接/写入失败降级为进程内存 Map（不阻断对话），并打 warn，便于无 Mongo 时本地开发。
-//  - 集合 chat_conversations，文档结构见 ConversationDoc。
+//  - MongoClient 单例懒连接；失败降级进程内存 Map。
+//  - chat → 集合 chat_conversations；analytics → analytics_conversations（互不串台）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 import type { SessionUser } from "@bx/shared";
@@ -13,7 +12,14 @@ import type { LocalizedToken } from "./i18n";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
-const COLL = "chat_conversations";
+
+export type ConversationStore = "chat" | "analytics";
+
+const COLL_BY_STORE: Record<ConversationStore, string> = {
+  chat: "chat_conversations",
+  analytics: "analytics_conversations",
+};
+
 /** 断线兜底会话稳定 id（按 ownerKey 一份）；旧版 task-<sessionId> 为孤儿。 */
 export const TASK_RESULTS_CONV_ID = "task-results";
 
@@ -22,6 +28,7 @@ export function isLegacyTaskConversationId(id: string): boolean {
 }
 
 export interface StoredMessage {
+  id?: string | number;
   role: "user" | "assistant";
   text: string;
   images?: Array<{ id: string; name: string }>;
@@ -36,12 +43,24 @@ export interface StoredMessage {
   toolResults?: Array<{ name: string; result: string }>;
   toolStep?: number;
   currentTool?: string;
+  /** Analytics ask extras */
+  timeEcho?: string;
+  sqls?: string[];
+  probeSummary?: string;
+  askId?: string;
+  modelId?: string;
+  packVersion?: string;
+  userNl?: string;
+  feedback?: string;
+  welcome?: boolean;
+  pending?: boolean;
+  clarifySlot?: string;
 }
 
 export interface ConversationDoc {
   _id?: ObjectId;
-  id: string; // 业务会话 id（前端生成 conv_xxx）
-  ownerKey: string; // `${countryId}:${loginName}`
+  id: string;
+  ownerKey: string;
   countryId: string;
   loginName: string;
   title: string;
@@ -50,7 +69,7 @@ export interface ConversationDoc {
   updatedAt: number;
 }
 
-/** 从 session 用户推导归属 key（国家线 + 登录名，唯一标识一个后端账号）。 */
+/** 从 session 用户推导归属 key（国家线 + 登录名）。 */
 export function ownerKeyOf(user: SessionUser | undefined, countryId: string): string {
   const loginName = user?.loginName || String(user?.id ?? "anon");
   return `${countryId}:${loginName}`;
@@ -59,9 +78,8 @@ export function ownerKeyOf(user: SessionUser | undefined, countryId: string): st
 // ---- Mongo 单例 ----
 let clientPromise: Promise<MongoClient> | null = null;
 let lastConnectFail = 0;
-// 连接失败后的冷却窗口：避免 Mongo 持续不可达时，每次聊天保存都新建连接并阻塞 serverSelectionTimeoutMS(3s)。
-// 冷却期内直接 reject → getColl catch 降级内存，不重复建连。
 const CONNECT_RETRY_COOLDOWN = 30_000;
+
 function getClient(): Promise<MongoClient> {
   if (clientPromise) return clientPromise;
   if (Date.now() - lastConnectFail < CONNECT_RETRY_COOLDOWN) {
@@ -75,7 +93,7 @@ function getClient(): Promise<MongoClient> {
       return c;
     })
     .catch((err) => {
-      clientPromise = null; // 允许冷却后重试
+      clientPromise = null;
       lastConnectFail = Date.now();
       console.warn(`[conversations] MongoDB 连接失败，降级内存存储：${String(err?.message || err)}`);
       throw err;
@@ -83,24 +101,27 @@ function getClient(): Promise<MongoClient> {
   return clientPromise;
 }
 
-async function getColl(): Promise<Collection<ConversationDoc> | null> {
+async function getColl(store: ConversationStore = "chat"): Promise<Collection<ConversationDoc> | null> {
   try {
     const client = await getClient();
     const db: Db = client.db(MONGO_DB);
-    return db.collection<ConversationDoc>(COLL);
+    return db.collection<ConversationDoc>(COLL_BY_STORE[store]);
   } catch {
-    return null; // 降级
+    return null;
   }
 }
 
-// ---- 内存降级（无 Mongo 时） ----
-const memory = new Map<string, ConversationDoc[]>();
+// ---- 内存降级（按 store 分桶） ----
+const memoryByStore: Record<ConversationStore, Map<string, ConversationDoc[]>> = {
+  chat: new Map(),
+  analytics: new Map(),
+};
 
-function memGet(ownerKey: string): ConversationDoc[] {
-  return memory.get(ownerKey) || [];
+function memGet(store: ConversationStore, ownerKey: string): ConversationDoc[] {
+  return memoryByStore[store].get(ownerKey) || [];
 }
-function memSet(ownerKey: string, list: ConversationDoc[]) {
-  memory.set(ownerKey, list);
+function memSet(store: ConversationStore, ownerKey: string, list: ConversationDoc[]) {
+  memoryByStore[store].set(ownerKey, list);
 }
 
 function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
@@ -112,32 +133,44 @@ function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
   return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function resolveStore(store?: ConversationStore): ConversationStore {
+  return store === "analytics" ? "analytics" : "chat";
+}
+
 // ---- CRUD ----
-export async function listConversations(ownerKey: string): Promise<ConversationDoc[]> {
-  const coll = await getColl();
+export async function listConversations(
+  ownerKey: string,
+  store: ConversationStore = "chat",
+): Promise<ConversationDoc[]> {
+  const s = resolveStore(store);
+  const coll = await getColl(s);
   if (!coll) {
-    const list = dedupeDocs(memGet(ownerKey));
-    return purgeLegacyTaskConversations(ownerKey, list);
+    const list = dedupeDocs(memGet(s, ownerKey));
+    return s === "chat" ? purgeLegacyTaskConversations(ownerKey, list) : list;
   }
   const docs = await coll.find({ ownerKey }).sort({ updatedAt: -1 }).toArray();
   const mapped = dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
-  return purgeLegacyTaskConversations(ownerKey, mapped);
+  return s === "chat" ? purgeLegacyTaskConversations(ownerKey, mapped) : mapped;
 }
 
-/** 列表时顺带清掉旧版按 session 拆分的 task-*，避免刷新冒出一堆「后台任务结果」tab。 */
 async function purgeLegacyTaskConversations(
   ownerKey: string,
   list: ConversationDoc[],
 ): Promise<ConversationDoc[]> {
   const legacy = list.filter((d) => isLegacyTaskConversationId(d.id));
   if (!legacy.length) return list;
-  await Promise.all(legacy.map((d) => deleteConversation(ownerKey, d.id).catch(() => {})));
+  await Promise.all(legacy.map((d) => deleteConversation(ownerKey, d.id, "chat").catch(() => {})));
   return list.filter((d) => !isLegacyTaskConversationId(d.id));
 }
 
-export async function getConversation(ownerKey: string, id: string): Promise<ConversationDoc | null> {
-  const coll = await getColl();
-  if (!coll) return dedupeDocs(memGet(ownerKey).filter((c) => c.id === id))[0] || null;
+export async function getConversation(
+  ownerKey: string,
+  id: string,
+  store: ConversationStore = "chat",
+): Promise<ConversationDoc | null> {
+  const s = resolveStore(store);
+  const coll = await getColl(s);
+  if (!coll) return dedupeDocs(memGet(s, ownerKey).filter((c) => c.id === id))[0] || null;
   const doc = await coll.find({ ownerKey, id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
@@ -150,7 +183,9 @@ export async function createConversation(input: {
   loginName: string;
   id: string;
   title: string;
+  store?: ConversationStore;
 }): Promise<ConversationDoc> {
+  const s = resolveStore(input.store);
   const now = Date.now();
   const doc: ConversationDoc = {
     id: input.id,
@@ -162,20 +197,20 @@ export async function createConversation(input: {
     createdAt: now,
     updatedAt: now,
   };
-  const coll = await getColl();
+  const coll = await getColl(s);
   if (!coll) {
-    const list = memGet(input.ownerKey);
+    const list = memGet(s, input.ownerKey);
     const idx = list.findIndex((c) => c.id === input.id);
     if (idx >= 0) {
       const existing = list[idx]!;
       existing.title = input.title || existing.title || "新对话";
       existing.updatedAt = now;
       if (!existing.createdAt) existing.createdAt = now;
-      memSet(input.ownerKey, dedupeDocs(list));
+      memSet(s, input.ownerKey, dedupeDocs(list));
       return existing;
     }
     list.unshift(doc);
-    memSet(input.ownerKey, dedupeDocs(list));
+    memSet(s, input.ownerKey, dedupeDocs(list));
     return doc;
   }
   await coll.updateMany(
@@ -193,7 +228,7 @@ export async function createConversation(input: {
     },
     { upsert: true },
   );
-  const saved = await getConversation(input.ownerKey, input.id);
+  const saved = await getConversation(input.ownerKey, input.id, s);
   return saved || doc;
 }
 
@@ -204,10 +239,12 @@ export async function upsertMessages(input: {
   id: string;
   messages: StoredMessage[];
   title?: string;
+  store?: ConversationStore;
 }): Promise<void> {
-  const coll = await getColl();
+  const s = resolveStore(input.store);
+  const coll = await getColl(s);
   if (!coll) {
-    const list = memGet(input.ownerKey);
+    const list = memGet(s, input.ownerKey);
     let doc = list.find((c) => c.id === input.id);
     if (!doc) {
       doc = {
@@ -225,7 +262,7 @@ export async function upsertMessages(input: {
     doc.messages = input.messages;
     doc.updatedAt = Date.now();
     if (input.title) doc.title = input.title;
-    memSet(input.ownerKey, dedupeDocs(list));
+    memSet(s, input.ownerKey, dedupeDocs(list));
     return;
   }
   await coll.updateMany(
@@ -250,45 +287,58 @@ export async function renameConversation(
   ownerKey: string,
   id: string,
   title: string,
+  store: ConversationStore = "chat",
 ): Promise<void> {
-  const coll = await getColl();
+  const s = resolveStore(store);
+  const coll = await getColl(s);
   if (!coll) {
-    const list = memGet(ownerKey);
+    const list = memGet(s, ownerKey);
     for (const doc of list) {
       if (doc.id === id) {
         doc.title = title;
         doc.updatedAt = Date.now();
       }
     }
-    memSet(ownerKey, dedupeDocs(list));
+    memSet(s, ownerKey, dedupeDocs(list));
     return;
   }
   await coll.updateMany({ ownerKey, id }, { $set: { title, updatedAt: Date.now() } });
 }
 
-export async function deleteConversation(ownerKey: string, id: string): Promise<void> {
-  const coll = await getColl();
+export async function deleteConversation(
+  ownerKey: string,
+  id: string,
+  store: ConversationStore = "chat",
+): Promise<void> {
+  const s = resolveStore(store);
+  const coll = await getColl(s);
   if (!coll) {
     memSet(
+      s,
       ownerKey,
-      memGet(ownerKey).filter((c) => c.id !== id),
+      memGet(s, ownerKey).filter((c) => c.id !== id),
     );
     return;
   }
   await coll.deleteMany({ ownerKey, id });
 }
 
-export async function clearConversation(ownerKey: string, id: string): Promise<void> {
-  const coll = await getColl();
+export async function clearConversation(
+  ownerKey: string,
+  id: string,
+  store: ConversationStore = "chat",
+): Promise<void> {
+  const s = resolveStore(store);
+  const coll = await getColl(s);
   if (!coll) {
-    const list = memGet(ownerKey);
+    const list = memGet(s, ownerKey);
     for (const doc of list) {
       if (doc.id === id) {
         doc.messages = [];
         doc.updatedAt = Date.now();
       }
     }
-    memSet(ownerKey, dedupeDocs(list));
+    memSet(s, ownerKey, dedupeDocs(list));
     return;
   }
   await coll.updateMany({ ownerKey, id }, { $set: { messages: [], updatedAt: Date.now() } });

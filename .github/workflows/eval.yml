@@ -2,12 +2,14 @@ name: eval
 
 # 评测回归闸门（CI）。
 #
-# 分层说明（为什么 CI 只跑 core）：
-#   eval:core        零外部依赖（纯函数，只测红线断言逻辑本身）        → CI 必跑
-#   eval:full        需本地业务源码（CODEBASE_ROOT 指向的后台项目源码） → 仅本地/自托管
-#   eval:trace-gate  需 agent-server 在线（8787）+ 真实模型凭证        → 仅本地/定时
-# CI runner 三者皆无（无业务源码 / 无 .env / 无服务），强行跑只会假红，
-# 故此处只守「地基」：assertTraceGates 逻辑正确，上层评测结论才可信。
+# 分层说明（为什么 CI 只跑 core / analytics refuse）：
+#   eval:core              零外部依赖（纯函数，只测红线断言逻辑本身）        → CI 必跑
+#   test:analytics-gate    拒答门禁（无需 Metabase/LLM；可答题在 --full） → CI 必跑
+#   eval:full              需本地业务源码（CODEBASE_ROOT 指向的后台项目源码） → 仅本地/自托管
+#   eval:trace-gate        需 agent-server 在线（8787）+ 真实模型凭证        → 仅本地/定时
+#   eval:analytics --full  需 Metabase + LLM                               → 仅本地/定时
+# CI runner 无业务源码 / 无 .env / 无服务，强行跑 live 只会假红，
+# 故此处只守「地基」：assertTraceGates + analytics 拒答 GATE_*。
 
 on:
   push:
@@ -36,3 +38,24 @@ jobs:
       - name: Eval core gate (zero-dependency)
         run: pnpm eval:core
         working-directory: .
+
+  analytics-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Analytics unit + refuse GATE_*
+        run: pnpm test:analytics && pnpm test:analytics-gate
+        working-directory: apps/agent-server

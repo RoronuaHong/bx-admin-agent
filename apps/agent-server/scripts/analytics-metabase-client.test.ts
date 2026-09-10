@@ -4,7 +4,13 @@
  */
 import assert from "node:assert/strict";
 import { config } from "../src/config.ts";
-import { maskMetabaseUser, normalizeMetabaseUrl } from "../src/analytics/metabase-client.ts";
+import {
+  clearMetabaseSessionCache,
+  isAbortError,
+  maskMetabaseUser,
+  normalizeMetabaseUrl,
+  runNativeDataset,
+} from "../src/analytics/metabase-client.ts";
 
 const saved: Record<string, string | undefined> = {};
 
@@ -26,6 +32,7 @@ stashEnv([
   "ANALYTICS_BUSINESS_TIMEZONE",
   "METABASE_USERNAME",
   "METABASE_USER_EMAIL",
+  "METABASE_PASSWORD",
 ]);
 
 try {
@@ -42,6 +49,16 @@ try {
   assert.equal(maskMetabaseUser("ab@example.com"), "ab***@example.com");
   assert.equal(maskMetabaseUser("alice@example.com"), "al***@example.com");
   assert.equal(maskMetabaseUser("bob"), "bo***");
+
+  // ---- isAbortError ----
+  {
+    const abort = new Error("This operation was aborted");
+    abort.name = "AbortError";
+    assert.equal(isAbortError(abort), true);
+    assert.equal(isAbortError(new Error("network down")), false);
+    assert.equal(isAbortError({ name: "AbortError" }), true);
+    assert.equal(isAbortError({ code: 20, message: "aborted" }), true);
+  }
 
   // ---- config.metabase.url strips trailing slash ----
   process.env.METABASE_URL = "https://bi.example.com/";
@@ -77,6 +94,54 @@ try {
   assert.equal(config.metabase.username, "primary@example.com");
   delete process.env.METABASE_USERNAME;
   assert.equal(config.metabase.username, "fallback@example.com");
+
+  // ---- abort: signal already aborted → throw (not soft fail) ----
+  {
+    clearMetabaseSessionCache();
+    process.env.METABASE_USERNAME = "u@example.com";
+    process.env.METABASE_PASSWORD = "secret";
+    process.env.METABASE_URL = "https://bi.example.com";
+    const ctrl = new AbortController();
+    ctrl.abort();
+    let threw = false;
+    try {
+      await runNativeDataset("SELECT 1", 2, { signal: ctrl.signal });
+    } catch (e) {
+      threw = true;
+      assert.equal(isAbortError(e) || ctrl.signal.aborted, true);
+    }
+    assert.equal(threw, true);
+  }
+
+  // ---- abort: fetch receives signal and AbortError is rethrown ----
+  {
+    clearMetabaseSessionCache();
+    process.env.METABASE_USERNAME = "u@example.com";
+    process.env.METABASE_PASSWORD = "secret";
+    process.env.METABASE_URL = "https://bi.example.com";
+    const ctrl = new AbortController();
+    const originalFetch = globalThis.fetch;
+    let sawSignal = false;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sawSignal = init?.signal === ctrl.signal;
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      throw err;
+    }) as typeof fetch;
+    try {
+      let threw = false;
+      try {
+        await runNativeDataset("SELECT 1", 2, { signal: ctrl.signal });
+      } catch (e) {
+        threw = true;
+        assert.equal(isAbortError(e), true);
+      }
+      assert.equal(threw, true);
+      assert.equal(sawSignal, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
 
   console.log("analytics-metabase-client.test.ts OK");
 } finally {

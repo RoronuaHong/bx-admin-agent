@@ -9,6 +9,7 @@ import {
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { ChartView } from "../types";
+import { formatDisplayDate } from "../table-columns";
 
 echarts.use([LineChart, BarChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
 
@@ -17,6 +18,15 @@ const elRef = ref<HTMLDivElement | null>(null);
 /** 勿命名为 chart：会与 prop 同名导致模板绑错 */
 let chartInst: echarts.ECharts | null = null;
 let resizing = false;
+
+function formatAxisCategory(v: unknown): string {
+  const raw = String(v ?? "");
+  const formatted = formatDisplayDate(raw);
+  const s = formatted || raw;
+  const reg = /(\d{4})-(\d{2})-(\d{2})至(\d{4})-(\d{2})-(\d{2})/;
+  if (s.match(reg)) return s.replace(reg, "$2-$3至$5-$6");
+  return s;
+}
 
 /** 与 PC `components2/chartOptions.js` 一致 */
 const PC_X_AXIS = {
@@ -33,11 +43,7 @@ const PC_X_AXIS = {
     color: "#666",
     fontSize: 12,
     formatter(v: string) {
-      const reg = /(\d{4})-(\d{2})-(\d{2})至(\d{4})-(\d{2})-(\d{2})/;
-      if (typeof v === "string" && v.match(reg)) {
-        return v.replace(reg, "$2-$3至$5-$6");
-      }
-      return v;
+      return formatAxisCategory(v);
     },
   },
   axisTick: { show: false },
@@ -48,7 +54,7 @@ const PC_GRID = { left: 34, right: 46, top: 40, bottom: 10, containLabel: true }
 
 function buildOption() {
   const raw = toRaw(props.chart);
-  const categories = [...(raw.categories || [])];
+  const categories = [...(raw.categories || [])].map((c) => formatAxisCategory(c));
   const seriesIn = Array.isArray(raw.series) ? raw.series : [];
 
   const selected: Record<string, boolean> = {};
@@ -84,7 +90,8 @@ function buildOption() {
         const list = Array.isArray(params) ? params : [];
         if (!list.length) return "";
         const first = list[0] as { axisValue?: string };
-        let html = `<div style="padding:2px 4px"><p style="margin:0 0 6px;font-weight:600">${first.axisValue || ""}</p>`;
+        const axisLabel = formatAxisCategory(first.axisValue || "");
+        let html = `<div style="padding:2px 4px"><p style="margin:0 0 6px;font-weight:600">${axisLabel}</p>`;
         for (const p of list) {
           const item = p as { marker?: string; seriesName?: string; value?: number };
           let name = item.seriesName || "";

@@ -20,7 +20,7 @@ function assert(name: string, ok: boolean, detail = "") {
 
 // ---- 基线 fixtures ----
 const baseSpans = [
-  { kind: "run", name: "chat.run", endMs: 1700000000000, durationMs: 1000, model: "m" },
+  { kind: "run", name: "admin.run", endMs: 1700000000000, durationMs: 1000, model: "m" },
   { kind: "llm", name: "m", usage: { totalTokens: 1000 } },
   { kind: "llm", name: "m", usage: { totalTokens: 2000 } },
   { kind: "tool", name: "call_api", status: "ok" },
@@ -150,7 +150,7 @@ assert(
 
 // ---- G6 业务期望（防短路/幻觉直答不调工具却正常收束）----
 const noToolSpans = [
-  { kind: "run", name: "chat.run", endMs: 1700000000000, durationMs: 900, model: "m" },
+  { kind: "run", name: "admin.run", endMs: 1700000000000, durationMs: 900, model: "m" },
   { kind: "llm", name: "m", usage: { totalTokens: 100 } },
 ];
 assert(

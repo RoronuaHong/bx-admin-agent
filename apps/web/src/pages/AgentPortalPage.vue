@@ -114,10 +114,10 @@ const traceAccessHint = computed(() => {
     <p v-else class="notice">
       {{
         tx(
-          "「调用观察 / Trace」跟随后台管理 Agent 的运营账号登录与权限；问数、知识库、观影各自独立鉴权，不混用此账号。",
-          "Trace follows the Admin Agent ops-account session and permissions. Analytics, knowledge, and viewing each use their own auth — not this account.",
-          "Trace segue a sessao e permissoes da conta operacional do Agent de Backoffice. Analise, conhecimento e visualizacao tem auth propria — nao misturam esta conta.",
-          "Trace एडमिन एजेंट के ops खाता सत्र और अनुमतियों पर निर्भर है। एनालिटिक्स, नॉलेज और व्यूइंग अपने auth इस्तेमाल करते हैं — यह खाता साझा नहीं।",
+          "「调用观察」是门户级观测面：各 Agent（后台 / 问数等）各自写入 run，查看走独立的 Trace 观察登录与权限，不与对话 Agent 混鉴权。",
+          "Trace is a portal observer: each agent (admin / analytics / …) writes its own runs. Viewing uses separate Trace observer login and permissions — not mixed with chat-agent auth.",
+          "Trace e observacao de portal: cada agente escreve seus runs. Ver usa login/permissao de Trace separados — nao mistura com auth de chat.",
+          "Trace पोर्टल ऑब्ज़र्वर है: हर एजेंट अपने रन लिखता है। देखने के लिए अलग Trace लॉगिन/अनुमति — चैट auth से नहीं मिलाई जाती।",
         )
       }}
     </p>

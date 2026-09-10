@@ -3,7 +3,7 @@
  * Wired from tools.ts runAgentTool; MCP/HTTP facades reuse the same entry points.
  */
 import { analyticsAsk } from "../analytics/pipeline.js";
-import { runNativeDataset } from "../analytics/metabase-client.js";
+import { runMetabaseQuestion, runNativeDataset } from "../analytics/metabase-client.js";
 import { loadAnalyticsPack } from "../analytics/semantic-layer.js";
 import {
   assertReadonlySingleSelect,
@@ -57,9 +57,36 @@ export async function execMetabaseRunDataset(input: Record<string, unknown>): Pr
   }
 }
 
-/** Saved-question runner — stub in M1. */
-export async function execMetabaseRunQuestion(_input: Record<string, unknown>): Promise<string> {
-  return JSON.stringify({ ok: false, error: "not implemented in M1" });
+/** Saved Metabase question / card runner. */
+export async function execMetabaseRunQuestion(input: Record<string, unknown>): Promise<string> {
+  const rawId = input.questionId ?? input.cardId ?? input.id;
+  const questionId = Number(rawId);
+  if (!Number.isFinite(questionId) || questionId <= 0) {
+    return JSON.stringify({ ok: false, cols: [], rows: [], error: "questionId is required" });
+  }
+  let parameters: Record<string, string> | undefined;
+  if (input.parameters && typeof input.parameters === "object" && !Array.isArray(input.parameters)) {
+    parameters = {};
+    for (const [k, v] of Object.entries(input.parameters as Record<string, unknown>)) {
+      parameters[k] = String(v ?? "");
+    }
+  } else if (input.start != null || input.end != null) {
+    parameters = {
+      start: String(input.start ?? ""),
+      end: String(input.end ?? ""),
+    };
+  }
+  try {
+    const result = await runMetabaseQuestion(questionId, parameters);
+    return JSON.stringify(result);
+  } catch (e) {
+    return JSON.stringify({
+      ok: false,
+      cols: [],
+      rows: [],
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
 }
 
 /** EXPLAIN ESTIMATE — stub in M1. */

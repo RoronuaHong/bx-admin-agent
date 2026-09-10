@@ -18,24 +18,24 @@
 
 ## 功能验收
 
-- [ ] 异步 `POST /internal/analytics/scan` 立即返回 `{ jobId }`，后台跑 runner（Bearer `SCAN_INTERNAL_TOKEN`）
-- [ ] `GET /internal/analytics/scan/:jobId` 同 token 可查状态
-- [ ] 非 scan worker（`ANALYTICS_SCAN_WORKER≠1`）返回 403
-- [ ] freshness 未就绪 → job=`skipped` / `data_not_ready`，不跑阈值、不发业务 warn
-- [ ] `businessTimezone` 下 T-1 / dod / wow 时间窗正确（单测：`2026-09-09` → scan=`2026-09-08`）
-- [ ] Job 状态机含 `queued→running→succeeded|partial|failed|cancelled|skipped`；同日同规则 running 拒绝（除非 `forceRerun`）
-- [ ] 相对 + 绝对阈值 + 安静条件（empty / 基线缺失 / sample&lt;minSample / \|Δ\|&lt;minAbsDelta）
-- [ ] `dryRun=true` 不调用钉钉 `notifyAlerts`
-- [ ] `dryRun=false` 走钉钉 `kind=analytics`；fingerprint 含 `rerunSeq` dedup
-- [ ] 默认单 scan worker；登录态 job 只读 API 与 internal token 鉴权分流
-- [ ] 告警深链 `/analytics?q=...&from=&to=` + 一句话 runbook
-- [ ] `/analytics` 页可触发巡检并看到 job / 告警摘要（登录）
+- [x] 异步 `POST /internal/analytics/scan` 立即返回 `{ jobId }`，后台跑 runner（Bearer `SCAN_INTERNAL_TOKEN`）
+- [x] `GET /internal/analytics/scan/:jobId` 同 token 可查状态
+- [x] 非 scan worker（`ANALYTICS_SCAN_WORKER≠1`）返回 403
+- [x] freshness 未就绪 → job=`skipped` / `data_not_ready`，不跑阈值、不发业务 warn（`freshness.ts` + runner）
+- [x] `businessTimezone` 下 T-1 / dod / wow 时间窗正确（单测：`2026-09-09` → scan=`2026-09-08`）
+- [x] Job 状态机含 `queued→running→succeeded|partial|failed|cancelled|skipped`；同日同规则 running 拒绝（除非 `forceRerun`）
+- [x] 相对 + 绝对阈值 + 安静条件（empty / 基线缺失 / sample&lt;minSample / \|Δ\|&lt;minAbsDelta）
+- [x] `dryRun=true` 不调用钉钉 `notifyAlerts`（notify 单测 + smoke dryRun）
+- [x] `dryRun=false` 走钉钉 `kind=analytics`；fingerprint 含 `rerunSeq` dedup（notify 单测；实推可选 `M3_SMOKE_NOTIFY=1`）
+- [x] 默认单 scan worker；应用内 `/analytics/scan/*` 与 internal Bearer **鉴权分流**（应用内暂不强制运营 session，见计划）
+- [x] 告警深链 `/analytics?q=...&from=&to=` + 一句话 runbook
+- [x] `/analytics` 页可触发巡检并看到 job / 告警摘要（`AnalyticsAgentPage` 巡检对话框）
 
 ## 自动化
 
-- [ ] `pnpm --filter @bx/agent-server test:analytics` 含 scan 单测（window / job-store / threshold / freshness-metrics / notify / runner-unit）
-- [ ] `.\node_modules\.bin\tsx.cmd scripts\analytics-m3-smoke.mjs`：dryRun 入队并到终态（`succeeded|skipped|partial`）
-- [ ] 可选：`M3_SMOKE_NOTIFY=1` 实推钉钉一次
+- [x] `pnpm --filter @bx/agent-server test:analytics` 含 scan 单测（window / job-store / threshold / freshness-metrics / notify / runner-unit）— 2026-09-10 全绿
+- [x] `.\node_modules\.bin\tsx.cmd scripts\analytics-m3-smoke.mjs`：dryRun 入队并到终态 — 2026-09-10 `succeeded`（~36s）
+- [x] 可选：`M3_SMOKE_NOTIFY=1` 实推钉钉一次 — 2026-09-10 `succeeded`（dryRun + notify）
 
 ## 环境变量（`.env.example`）
 

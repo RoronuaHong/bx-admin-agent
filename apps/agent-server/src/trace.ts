@@ -51,6 +51,8 @@ interface RunMeta {
   userText?: string;
   model?: string;
   worker?: string;
+  /** 门户子 Agent 来源：admin / analytics / …（观测页按此过滤） */
+  agentId?: string;
   /** 操作者归属（countryId:loginName，P2 溯源；cost/audit 与 trace 关联靠它） */
   ownerKey?: string;
   /** 版本标识（P3：RELEASE env / git 短 sha），run 落盘时随 meta 持久化 */
@@ -117,6 +119,8 @@ export function beginRun(meta: {
   userText?: string;
   model?: string;
   worker?: string;
+  /** 门户子 Agent：admin | analytics | knowledge | viewing | … */
+  agentId?: string;
   ownerKey?: string;
 }): string {
   const runId = randomUUID();
@@ -126,6 +130,7 @@ export function beginRun(meta: {
     userText: meta.userText,
     model: meta.model,
     worker: meta.worker,
+    agentId: meta.agentId || "admin",
     ownerKey: meta.ownerKey,
     release: getRelease(),
     startMs: Date.now(),
@@ -153,14 +158,20 @@ export function endRun(runId: string): void {
     runId,
     spanId: `run-${runId}`,
     kind: "run",
-    name: "chat.run",
+    name: `${meta.agentId || "admin"}.run`,
     model: meta.model,
     worker: meta.worker,
     status: "ok",
     startMs: meta.startMs,
     endMs,
     durationMs: endMs - meta.startMs,
-    meta: { sessionId: meta.sessionId, userText: meta.userText, ownerKey: meta.ownerKey, release: meta.release },
+    meta: {
+      sessionId: meta.sessionId,
+      userText: meta.userText,
+      ownerKey: meta.ownerKey,
+      release: meta.release,
+      agentId: meta.agentId || "admin",
+    },
   });
 }
 
@@ -282,6 +293,8 @@ export interface RunSummary {
   model?: string;
   userText?: string;
   ownerKey?: string;
+  /** 门户子 Agent 来源；旧数据缺省按 admin */
+  agentId?: string;
   release?: string;
   llmRounds: number;
   /** tok=0 / 无 usage 的 llm span 数（未自愈的空响应轮） */
@@ -342,12 +355,14 @@ export function emptyRoundRateWarnThreshold(): number {
 /**
  * 最近 N 个 run 的摘要 + 统计（P3 可观测：HTTP 面只读视图的数据源）。
  * @param ownerKey 指定时只返回该操作者的 run（最小权限；旧数据无 ownerKey 被排除——不猜测归属）
+ * @param agentId 指定时只返回该门户子 Agent 的 run（旧数据无 agentId 视为 admin）
  */
 export function listRunSummaries(
   limit = 20,
   ownerKey?: string,
+  agentId?: string,
 ): { runs: RunSummary[]; stats: TraceRunsStats } {
-  const cap = Math.max(limit, 1) + 30; // 多读一些文件以补偿 owner 过滤后的空缺
+  const cap = Math.max(limit, 1) + (agentId || ownerKey ? 80 : 30); // 过滤时多读，避免 agent/owner 裁剪后凑不满 limit
   const out: RunSummary[] = [];
   let llmCalls = 0;
   let tokens = 0;
@@ -360,6 +375,10 @@ export function listRunSummaries(
     if (!runSpan) continue;
     const runOwner = (runSpan.meta?.ownerKey as string) || "";
     if (ownerKey && runOwner !== ownerKey) continue;
+    const runAgent =
+      (typeof runSpan.meta?.agentId === "string" && runSpan.meta.agentId) ||
+      (runSpan.name?.startsWith("analytics.") ? "analytics" : "admin");
+    if (agentId && runAgent !== agentId) continue;
     const llm = spans.filter((s) => s.kind === "llm");
     const roundTokens = llm.reduce((a, s) => a + (s.usage?.totalTokens || 0), 0);
     const empty = countEmptySignals(llm);
@@ -376,6 +395,7 @@ export function listRunSummaries(
       model: runSpan.model,
       userText: (runSpan.meta?.userText as string) || undefined,
       ownerKey: runOwner || undefined,
+      agentId: runAgent,
       release: (runSpan.meta?.release as string) || undefined,
       llmRounds: llm.length,
       emptyRounds: empty.emptyRounds,

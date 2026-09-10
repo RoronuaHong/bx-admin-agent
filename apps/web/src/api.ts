@@ -283,6 +283,7 @@ export async function clearChatContext() {
 
 // ---- 聊天记录持久化（方案 C：服务端 MongoDB，按登录用户归属）----
 export interface StoredMessage {
+  id?: string | number;
   role: "user" | "assistant";
   text: string;
   images?: { id: string; name: string }[];
@@ -297,6 +298,17 @@ export interface StoredMessage {
   toolResults?: Array<{ name: string; result: string }>;
   toolStep?: number;
   currentTool?: string;
+  timeEcho?: string;
+  sqls?: string[];
+  probeSummary?: string;
+  askId?: string;
+  modelId?: string;
+  packVersion?: string;
+  userNl?: string;
+  feedback?: string;
+  welcome?: boolean;
+  pending?: boolean;
+  clarifySlot?: string;
 }
 
 export interface ConversationDto {
@@ -376,6 +388,8 @@ export interface TraceRunSummary {
   model?: string;
   userText?: string;
   ownerKey?: string;
+  /** 门户子 Agent：admin | analytics | … */
+  agentId?: string;
   release?: string;
   llmRounds: number;
   emptyRounds: number;
@@ -417,8 +431,13 @@ export interface TraceSpanDto {
   meta?: Record<string, unknown>;
 }
 
-export async function fetchTraceRuns(limit = 20): Promise<{ runs: TraceRunSummary[]; stats: TraceRunsStats }> {
-  const data = (await jsonFetch(`/agent/trace/runs?limit=${Math.min(limit, 50)}`)) as {
+export async function fetchTraceRuns(
+  limit = 20,
+  agentId?: string,
+): Promise<{ runs: TraceRunSummary[]; stats: TraceRunsStats }> {
+  const q = new URLSearchParams({ limit: String(Math.min(limit, 50)) });
+  if (agentId) q.set("agentId", agentId);
+  const data = (await jsonFetch(`/agent/trace/runs?${q}`)) as {
     runs: TraceRunSummary[];
     stats: TraceRunsStats;
   };
@@ -448,7 +467,39 @@ export interface AnalyticsAskResult {
   sqls?: string[];
   tables?: AnalyticsAskTable[];
   probeSummary?: string;
+  clarifySlot?: string;
+  clarifyOptions?: Array<{ id: string; label: string }>;
   error?: string;
+  verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
+  modelId?: string;
+  packVersion?: string;
+  askId?: string;
+  rewriteRounds?: number;
+  charts?: Array<{
+    title: string;
+    categories: string[];
+    series: Array<{ name: string; data: number[]; selected?: boolean; type?: "line" | "bar" }>;
+    height?: number;
+  }>;
+}
+
+export type AnalyticsFeedbackVerdict = "useful" | "wrong";
+
+export async function submitAnalyticsFeedback(input: {
+  askId: string;
+  verdict: AnalyticsFeedbackVerdict;
+  reasonTags?: string[];
+  note?: string;
+  nl?: string;
+  sqls?: string[];
+  status?: AnalyticsAskResult["status"];
+  packVersion?: string;
+  modelId?: string;
+}): Promise<{ ok: boolean; candidateId: string; reviewStatus: string }> {
+  return (await jsonFetch("/agent/analytics/feedback", {
+    method: "POST",
+    body: JSON.stringify(input),
+  })) as { ok: boolean; candidateId: string; reviewStatus: string };
 }
 
 export async function fetchAnalyticsModels(): Promise<ModelInfo[]> {
@@ -458,15 +509,43 @@ export async function fetchAnalyticsModels(): Promise<ModelInfo[]> {
   return data.models || [];
 }
 
+export async function uploadAnalyticsFiles(files: File[]): Promise<UploadResult[]> {
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  const res = await fetch("/agent/analytics/upload", {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  const data = (await parseJson(res)) as { files: UploadResult[] };
+  return data.files || [];
+}
+
+export function analyticsUploadUrl(fileId: string) {
+  return `/agent/analytics/upload/${encodeURIComponent(fileId)}`;
+}
+
 export async function askAnalytics(
   text: string,
-  opts?: { model?: string; signal?: AbortSignal },
+  opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    images?: string[];
+    files?: string[];
+    slotAnswers?: Record<string, string[]>;
+  },
 ): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, model: opts?.model }),
+    body: JSON.stringify({
+      text,
+      model: opts?.model,
+      images: opts?.images,
+      files: opts?.files,
+      slotAnswers: opts?.slotAnswers,
+    }),
     signal: opts?.signal,
   });
   if (!resp.ok) {
@@ -480,6 +559,39 @@ export async function askAnalytics(
     });
   }
   return resp.json() as Promise<AnalyticsAskResult>;
+}
+
+// ---- Analytics 会话持久化（Mongo analytics_conversations，与 chat 隔离）----
+export async function fetchAnalyticsConversations(): Promise<ConversationDto[]> {
+  const data = (await jsonFetch("/agent/analytics/conversations")) as { conversations: ConversationDto[] };
+  return data.conversations || [];
+}
+
+export async function createAnalyticsConversation(payload: { id?: string; title?: string }) {
+  const data = (await jsonFetch("/agent/analytics/conversations", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })) as { conversation: ConversationDto };
+  return data.conversation;
+}
+
+export async function saveAnalyticsConversationMessages(
+  id: string,
+  messages: StoredMessage[],
+  title?: string,
+) {
+  return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ messages, title }),
+  });
+}
+
+export async function deleteAnalyticsConversation(id: string) {
+  return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function clearAnalyticsConversation(id: string) {
+  return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}/clear`, { method: "POST" });
 }
 
 // ---- Analytics scan jobs (M3) ----

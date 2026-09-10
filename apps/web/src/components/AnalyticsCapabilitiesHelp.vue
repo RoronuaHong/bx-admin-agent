@@ -92,6 +92,7 @@ const examples = [
               <li>{{ tx("写清渠道 / 维度 + 指标 + 日期，如「八月二十到二十一印度A按天观看人数」", "Include channel/dimension + metric + dates, e.g. “viewers by day for India A from Aug 20–21”", "Inclua canal/dimensao + metrica + datas, ex.: visualizadores por dia India A de 20–21 ago", "चैनल/आयाम + मेट्रिक + तिथि बताएं, जैसे भारत A 20–21 अगस्त दैनिक व्यूअर्स") }}</li>
               <li>{{ tx("对比或多 grain 会拆成多张表返回", "Comparisons or mixed grains return multiple tables", "Comparacoes ou grains mistos retornam varias tabelas", "तुलना या मिश्रित grain पर कई तालिकाएं मिलेंगी") }}</li>
               <li>{{ tx("可展开「查看 SQL」核对生成语句", "Expand “View SQL” to inspect generated statements", "Expanda “Ver SQL” para inspecionar as queries", "जनरेटेड SQL देखने के लिए “SQL देखें” खोलें") }}</li>
+              <li>{{ tx("支持粘贴/上传图片与 txt/md/json/csv；图片会先转录再问数。可用语音填入输入框", "Paste/upload images or txt/md/json/csv; images are transcribed before asking. Voice can fill the composer", "Cole/envie imagens ou txt/md/json/csv; imagens sao transcritas antes. Voz preenche o campo", "चित्र या txt/md/json/csv पेस्ट/अपलोड करें; चित्र पहले ट्रांसक्राइब होते हैं। वॉइस से इनपुट भर सकते हैं") }}</li>
             </ul>
           </section>
 

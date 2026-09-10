@@ -5,7 +5,16 @@ import { config } from "./config.js";
 
 const TRANSCRIBE_PROMPT = "请用中文简要描述这张图片的内容，如果包含文字请完整转写出来。";
 
-async function transcribeWithOllama(base64: string, mediaType: string): Promise<string> {
+function transcribeSignal(userSignal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(config.modelTimeoutMs);
+  return userSignal ? AbortSignal.any([userSignal, timeout]) : timeout;
+}
+
+async function transcribeWithOllama(
+  base64: string,
+  mediaType: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const url = `${config.visionOllamaUrl.replace(/\/+$/, "")}/api/chat`;
   const response = await fetch(url, {
     method: "POST",
@@ -21,7 +30,7 @@ async function transcribeWithOllama(base64: string, mediaType: string): Promise<
         },
       ],
     }),
-    signal: AbortSignal.timeout(config.modelTimeoutMs),
+    signal: transcribeSignal(signal),
   });
   if (!response.ok) {
     throw new Error(`ollama 转录失败：http ${response.status}`);
@@ -32,7 +41,11 @@ async function transcribeWithOllama(base64: string, mediaType: string): Promise<
   return text;
 }
 
-async function transcribeWithRemote(base64: string, mediaType: string): Promise<string> {
+async function transcribeWithRemote(
+  base64: string,
+  mediaType: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const base = config.visionBaseUrl.replace(/\/+$/, "");
   const response = await fetch(`${base}/chat/completions`, {
     method: "POST",
@@ -53,7 +66,7 @@ async function transcribeWithRemote(base64: string, mediaType: string): Promise<
         },
       ],
     }),
-    signal: AbortSignal.timeout(config.modelTimeoutMs),
+    signal: transcribeSignal(signal),
   });
   if (!response.ok) {
     throw new Error(`视觉端点转录失败：http ${response.status}`);
@@ -65,19 +78,25 @@ async function transcribeWithRemote(base64: string, mediaType: string): Promise<
 }
 
 // 转录一张图片为文字；失败时抛错，由调用方决定降级策略。
-export async function transcribeImage(base64: string, mediaType: string): Promise<string> {
+export async function transcribeImage(
+  base64: string,
+  mediaType: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  signal?.throwIfAborted();
   // 远程端点已配置 key 时优先远程，否则走本地 ollama。
   if (config.visionApiKey) {
     try {
-      return await transcribeWithRemote(base64, mediaType);
+      return await transcribeWithRemote(base64, mediaType, signal);
     } catch (error) {
+      if (signal?.aborted) throw error;
       // 远程失败时尝试本地 ollama 兜底，保留远程错误信息。
       try {
-        return await transcribeWithOllama(base64, mediaType);
+        return await transcribeWithOllama(base64, mediaType, signal);
       } catch {
         throw error;
       }
     }
   }
-  return transcribeWithOllama(base64, mediaType);
+  return transcribeWithOllama(base64, mediaType, signal);
 }

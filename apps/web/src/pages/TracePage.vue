@@ -32,6 +32,14 @@ const selectedId = ref("");
 const spans = shallowRef<TraceSpanDto[]>([]);
 const spanRelease = ref("");
 const detailLoading = ref(false);
+/** 门户多 Agent 过滤：空 = 全部 */
+const agentFilter = ref<"" | "admin" | "analytics">("");
+
+function setAgentFilter(next: "" | "admin" | "analytics") {
+  if (agentFilter.value === next) return;
+  agentFilter.value = next;
+  void loadRuns();
+}
 
 const selected = computed(() => runs.value.find((r) => r.runId === selectedId.value) || null);
 
@@ -45,7 +53,7 @@ const runsCountLabel = computed(() => {
 
 async function redirectTraceAccessFallback(status?: number) {
   if (status === 401) {
-    await router.replace({ path: "/agents/admin/login", query: { next: "/trace" } });
+    await router.replace({ path: "/trace/login", query: { next: "/trace" } });
     return;
   }
   if (status === 403) {
@@ -86,7 +94,7 @@ async function loadRuns() {
   loading.value = true;
   error.value = "";
   try {
-    const data = await fetchTraceRuns(30);
+    const data = await fetchTraceRuns(30, agentFilter.value || undefined);
     stats.value = data.stats;
     runs.value = data.runs;
     if (selectedId.value && !data.runs.some((r) => r.runId === selectedId.value)) {
@@ -149,7 +157,7 @@ onMounted(async () => {
   <ChatShell accent="trace">
     <template #header>
       <div class="identity">
-        <p class="brand-kicker">{{ tx("门户只读 · Trace 观察", "Portal read-only · Trace", "Portal somente leitura · Trace", "पोर्टल रीड-ओनली · ट्रेस") }}</p>
+        <p class="brand-kicker">{{ tx("门户观测 · 多 Agent", "Portal observe · Multi-agent", "Observacao portal · Multiagente", "पोर्टल ऑब्ज़र्व · मल्टी-एजेंट") }}</p>
         <RouterLink class="brand-mark" to="/">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
       </div>
       <div class="actions">
@@ -159,9 +167,7 @@ onMounted(async () => {
           <span>{{ me.user.name || me.user.loginName }}</span>
         </div>
         <button class="ghost" type="button" :disabled="loading" @click="loadRuns">{{ tx("刷新", "Refresh", "Atualizar", "रीफ्रेश") }}</button>
-        <RouterLink class="ghost" :to="me ? '/agents/admin/chat' : '/agents/admin/login'">
-          {{ me ? tx("工作台", "Workspace", "Espaco de trabalho", "वर्कस्पेस") : tx("登录后台 Agent", "Sign in to Admin Agent", "Entrar no Admin Agent", "एडमिन एजेंट में साइन इन") }}
-        </RouterLink>
+        <RouterLink class="ghost" to="/">{{ tx("门户", "Portal", "Portal", "पोर्टल") }}</RouterLink>
         <button v-if="me" class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
         <AgentChromeNav />
         <UiLocaleSelect />
@@ -172,6 +178,39 @@ onMounted(async () => {
     <template #thread>
       <div class="trace-board">
         <p v-if="error" class="error">{{ error }}</p>
+
+        <div class="agent-tabs" role="tablist" :aria-label="tx('按 Agent 过滤', 'Filter by agent', 'Filtrar por agente', 'एजेंट से फ़िल्टर')">
+          <button
+            type="button"
+            role="tab"
+            class="agent-tab"
+            :class="{ active: agentFilter === '' }"
+            :aria-selected="agentFilter === ''"
+            @click="setAgentFilter('')"
+          >
+            {{ tx("全部", "All", "Todos", "सभी") }}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="agent-tab"
+            :class="{ active: agentFilter === 'admin' }"
+            :aria-selected="agentFilter === 'admin'"
+            @click="setAgentFilter('admin')"
+          >
+            {{ tx("后台管理", "Admin", "Admin", "एडमिन") }}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="agent-tab"
+            :class="{ active: agentFilter === 'analytics' }"
+            :aria-selected="agentFilter === 'analytics'"
+            @click="setAgentFilter('analytics')"
+          >
+            {{ tx("问数", "Analytics", "Analise", "एनालिटिक्स") }}
+          </button>
+        </div>
 
         <section v-if="stats" class="stats" :aria-label="tx('汇总', 'Summary', 'Resumo', 'सारांश')">
           <div class="stat">
@@ -204,12 +243,12 @@ onMounted(async () => {
           {{ traceText(stats?.degradeHintToken, "TRACE_DEGRADE_GENERIC") }}
         </p>
         <p v-else class="hint">
-          {{
+            {{
             tx(
-              "门户级只读视图 · 展示主 Agent 的 trace run 与 span 树 · 数据来自 /trace/runs",
-              "Portal-level read-only view · shows main agent trace runs and span trees · data from /trace/runs",
-              "Visualizacao somente leitura em nivel de portal · mostra execucoes trace e arvores de span do agente principal · dados de /trace/runs",
-              "पोर्टल-स्तरीय केवल-पढ़ने योग्य दृश्य · मुख्य एजेंट के ट्रेस रन और स्पैन ट्री दिखाता है · डेटा /trace/runs से",
+              "门户级只读观测 · 汇聚各 Agent 写入的 run / span · 查看权限与对话 Agent 鉴权分离",
+              "Portal read-only observe · aggregates runs/spans written by each agent · view permission is separate from chat-agent auth",
+              "Observacao somente leitura · agrega runs/spans de cada agente · permissao de ver e auth de chat sao separadas",
+              "पोर्टल रीड-ओनली · प्रत्येक एजेंट के रन/स्पैन · देखने की अनुमति चैट auth से अलग",
             )
           }}
         </p>
@@ -225,6 +264,7 @@ onMounted(async () => {
                 <thead>
                   <tr>
                     <th>{{ tx("时间", "Time", "Hora", "समय") }}</th>
+                    <th>{{ tx("Agent", "Agent", "Agente", "एजेंट") }}</th>
                     <th>{{ tx("模型", "Model", "Modelo", "मॉडल") }}</th>
                     <th>{{ tx("轮次", "Rounds", "Rodadas", "राउंड") }}</th>
                     <th>{{ tx("空轮", "Empty", "Vazio", "खाली") }}</th>
@@ -241,6 +281,9 @@ onMounted(async () => {
                     @click="selectRun(r.runId)"
                   >
                     <td class="mono">{{ r.startedAt.slice(11, 19) }}</td>
+                    <td>
+                      <span class="agent-pill" :data-agent="r.agentId || 'admin'">{{ r.agentId || "admin" }}</span>
+                    </td>
                     <td>{{ r.model || "—" }}</td>
                     <td class="num">{{ r.llmRounds }}</td>
                     <td class="num">{{ r.emptyRounds }}{{ r.emptyRetries ? `+${r.emptyRetries}` : "" }}</td>
@@ -249,7 +292,7 @@ onMounted(async () => {
                     <td class="clip">{{ shortText(r.userText) }}</td>
                   </tr>
                   <tr v-if="!runs.length && !loading">
-                    <td colspan="7" class="empty">{{ tx("暂无 trace", "No trace yet", "Ainda sem trace", "अभी तक कोई ट्रेस नहीं") }}</td>
+                    <td colspan="8" class="empty">{{ tx("暂无 trace", "No trace yet", "Ainda sem trace", "अभी तक कोई ट्रेस नहीं") }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -300,6 +343,61 @@ onMounted(async () => {
   min-height: 0;
   flex: 1;
   width: 100%;
+}
+
+.agent-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-tab {
+  appearance: none;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 18%, var(--line));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel) 80%, transparent);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+
+.agent-tab:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--agent-accent) 8%, var(--fill-soft));
+}
+
+.agent-tab.active {
+  color: color-mix(in srgb, var(--agent-accent) 40%, var(--ink));
+  border-color: color-mix(in srgb, var(--agent-accent) 40%, var(--line));
+  background: color-mix(in srgb, var(--agent-accent) 12%, var(--panel));
+  font-weight: 600;
+}
+
+.agent-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: color-mix(in srgb, var(--ink) 8%, var(--fill-soft));
+  color: var(--muted);
+}
+
+.agent-pill[data-agent="admin"] {
+  background: color-mix(in srgb, #c2410c 14%, var(--panel));
+  color: #c2410c;
+}
+
+.agent-pill[data-agent="analytics"] {
+  background: color-mix(in srgb, #0f766e 14%, var(--panel));
+  color: #0f766e;
 }
 
 .stats {

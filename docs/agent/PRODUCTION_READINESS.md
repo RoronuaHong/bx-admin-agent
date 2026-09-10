@@ -113,11 +113,12 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - 遗留：无（版本可回滚=git 语义；版本可观测=release 贯穿）。
 
 ### 2.8 可观测 Observ ✅ P3 已落地（trace 只读视图 + 统计）
-- **端点（当前口径：门户级入口 + 权限控制）**：
-  - `GET /trace/runs?limit=` ——最近 N 个 run 摘要（模型/轮次/token/耗时/ownerKey/release/userText）+ 统计（`{runs, llmCalls, tokens, avgRounds}`），实测 `avgRounds=1.2`；
+- **端点（当前口径：门户级入口 + 多 Agent 写入 + 权限控制）**：
+  - `GET /trace/runs?limit=&agentId=` ——最近 N 个 run 摘要（含 `agentId`：admin/analytics…；模型/轮次/token/耗时/ownerKey/release/userText）+ 统计；
   - `GET /trace/run/:runId` ——完整 span 树，响应带当前 release。
-- **权限口径（2026-09-07 更新）**：`/trace` 是门户级路由，不再挂在 `/agents/admin/trace` 作为产品主入口；但页面入口展示、路由进入、HTTP 数据读取统一受 `canViewTrace` 控制。当前 `canViewTrace` 由服务端权限投影输出，支持 `TRACE_ALLOWED_OWNERS`（账号白名单）、`TRACE_DENIED_OWNERS`（账号黑名单）、`TRACE_ALLOWED_COUNTRIES`（国家线白名单）组合收紧；判定顺序为 deny 优先，其次 owner / country 任一 allow 命中即可放行；未配置时保持“已登录可看”。
-- **前端交互闭环（2026-09-07 更新）**：未登录访问受控页会跳到登录页并保留 `next=/trace`；已登录但无权访问时，会回到门户并携带 `denied=canViewTrace`、`deniedSource`、`deniedFrom`，门户页据此展示拒绝原因与来源页。
+- **写入（2026-09-10）**：后台 chat → `agentId=admin`；问数 `/analytics/ask` → `agentId=analytics`；详见 [PORTAL_TRACE.md](./PORTAL_TRACE.md)。
+- **权限口径（2026-09-07 / 09-10 更新）**：`/trace` 是门户级路由，不再挂在 `/agents/admin/trace` 作为产品主入口；页面入口展示、路由进入、HTTP 数据读取统一受 `canViewTrace` 控制。当前 `canViewTrace` 由服务端权限投影输出，支持 `TRACE_ALLOWED_OWNERS`（账号白名单）、`TRACE_DENIED_OWNERS`（账号黑名单）、`TRACE_ALLOWED_COUNTRIES`（国家线白名单）组合收紧；判定顺序为 deny 优先，其次 owner / country 任一 allow 命中即可放行；未配置时保持“已登录可看”。
+- **前端交互闭环（2026-09-10 更新）**：未登录访问 `/trace` 跳到 **`/trace/login`**（观察者入口，复用运营账密 API，不进后台工作台）并保留 `next=/trace`；已登录但无权访问时，会回到门户并携带 `denied=canViewTrace`、`deniedSource`、`deniedFrom`，门户页据此展示拒绝原因与来源页。
 - **门户通用化准备（2026-09-07 更新）**：权限返回值已开始扩成门户级 `entries` 结构（`admin/knowledge/viewing/trace`），当前真正受控的是 `trace`，其余入口先保持开放，为后续多 Agent 统一权限模型留接口。
 - **前端工作台收口（2026-09-07 更新）**：`ChatPage.vue` 近期已开始按“低风险边界拆分”收口，先后抽出富文本渲染、会话存储恢复、后台任务状态恢复、标签菜单定位等 helper/module；目标是降低单文件复杂度，同时不改现有对话、刷新恢复、多语言标题、模型缓存与工具链展示行为。
 - **前端包体治理（2026-09-07 更新）**：聊天页图表能力改为异步加载，`vite.config.ts` 已对 `echarts` / `zrender` / `markdown-it` / `dompurify` 做 chunk 拆分；当前 `ChatPage` 主 chunk 已从大体量首屏包收敛到约 60k 级，避免因为观测图表能力拖慢聊天首屏。

@@ -13,6 +13,7 @@
   "maxChildAlerts": 5,
   "businessTimezone": "Asia/Shanghai",
   "jobTimeoutMs": 600000,
+  "retentionDays": 30,
   "freshnessCheck": {
     "type": "max_business_date",
     "table": "elt_watch_detail",

@@ -158,7 +158,8 @@ type DispatchResult =
 | `/agents/admin/chat` | 后台子 Agent |
 | `/agents/knowledge` · `/agents/viewing` | 占位子 Agent |
 | `/agents/admin/login` | **仅**后台子域登录（文案已标明不与其它域混用） |
-| `/trace` | 观测，非对话子 Agent |
+| `/trace/login` | **Trace 观察者**登录（复用运营账密 API，不进工作台） |
+| `/trace` | 门户观测（多 Agent run，`agentId` 过滤）；非对话子 Agent |
 
 统一 UI：全部对话面使用既有 `ChatShell`（与 2026-09-10 门户壳统一一致）。
 

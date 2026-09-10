@@ -48,6 +48,7 @@
 
 > **补充边界（2026-09-07）**：前端产品层可以是「多 Agent 门户」；`Trace` 为门户级观测入口。  
 > **产品层主从（2026-09-10 定稿建议）**：门户默认进入**总 Agent**，再分发到各**子 Agent**，且**子 Agent 鉴权相互独立**——详见 **[PORTAL_SUPERVISOR_AGENT.md](./PORTAL_SUPERVISOR_AGENT.md)**。  
+> **门户 Trace（2026-09-10）**：多 Agent 共用观测面（`agentId` 写入 + `/trace/login` 观察者入口）——详见 **[PORTAL_TRACE.md](./PORTAL_TRACE.md)**。  
 > 注意：本文主体讨论的是**后台管理会话内部**的 Supervisor + Worker 运行时装配；**不等于**已经实现门户总台分发。门户总台与进程内 Worker 是两层，可衔接但不可混鉴权。
 
 这个设计带来：

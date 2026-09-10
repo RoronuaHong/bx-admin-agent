@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-09.1",
+  "version": "2026-09-10.3",
   "id": "watch-detail",
   "datasource": {
     "engine": "clickhouse",
@@ -14,7 +14,9 @@
         "contentLang",
         "watchSecond",
         "guid",
-        "movieType"
+        "movieType",
+        "eid",
+        "maxWatchProgress"
       ]
     }
   ],
@@ -32,10 +34,67 @@
     "parallelism": 4,
     "defaultMovieTypes": [1, 2, 3, 4, 10, 11]
   },
+  "enumDimensions": [
+    {
+      "id": "contentLang",
+      "field": "contentLang",
+      "aliases": ["语言", "语种", "小语种", "contentLang"],
+      "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类", "小语种"],
+      "domain": "probe",
+      "valueAliases": {
+        "泰卢固": "te-IN",
+        "泰米尔": "ta-IN",
+        "马拉雅拉姆": "ml-IN",
+        "印地语": "hi-IN",
+        "印地": "hi-IN"
+      }
+    },
+    {
+      "id": "movieType",
+      "field": "movieType",
+      "aliases": ["影片类型", "内容类型", "影片", "movieType"],
+      "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类"],
+      "domain": "pack",
+      "allowedValues": ["1", "2", "3", "4", "10", "11"],
+      "defaultWhenAbsent": true
+    }
+  ],
+  "metricDefs": [
+    {
+      "id": "completion_rate",
+      "aliases": ["完播率", "完播"],
+      "options": [
+        {
+          "id": "avg_max_progress",
+          "label": "最大观看进度平均值",
+          "groundSignals": ["最大进度", "最大观看进度", "maxWatchProgress"],
+          "compile": {
+            "kind": "avg_of_max",
+            "valueField": "maxWatchProgress",
+            "entityKeys": ["guid", "eid"]
+          }
+        },
+        {
+          "id": "pct_ge_threshold",
+          "label": "进度≥阈值占比",
+          "groundSignals": ["阈值", "大于等于", "≥"]
+        }
+      ]
+    }
+  ],
   "examples": [
     {
       "nl": "IndiaA 按天观看人数",
       "sqlHint": "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' AND toDate(lastWatchTime) BETWEEN {start} AND {end} AND movieType IN (1,2,3,4,10,11) GROUP BY d"
+    }
+  ],
+  "questionBindings": [
+    {
+      "id": "indiaA-day-users",
+      "matchAll": ["印度A", "按天观看人数"],
+      "matchNone": ["和", "与", "同时", "各自", "分别", "FoxA", "GoGo"],
+      "sqlTemplate": "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '{start}' AND '{end}' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+      "_comment": "No matching Metabase card in inventory (2026-09-10). When BI saves one, set questionId here or ANALYTICS_BINDING_QID_indiaA_day_users=<id>."
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import type { ApiErrorPayload, ChatEvent, LocalizedToken } from "@bx/shared";
 import { cors } from "hono/cors";
@@ -34,9 +34,17 @@ import { resolvePortalPermissions } from "./permissions.js";
 import { loadUserPreferences } from "./user-prefs.js";
 import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
 import { analyticsAsk } from "./analytics/pipeline.js";
+import {
+  listFeedbackCandidates,
+  reviewFeedbackCandidate,
+  submitFeedback,
+  type FeedbackVerdict,
+} from "./analytics/audit-ledger.js";
 import { enqueueScan, getScanJob, listScanJobs } from "./analytics/scan/runner.js";
 
 const COOKIE = "bx_agent_sid";
+/** Analytics 匿名归属 cookie：未登录也能量把会话写入 Mongo（按浏览器稳定 id）。 */
+const ANALYTICS_AID_COOKIE = "bx_analytics_aid";
 
 function token(code: string, params?: Record<string, string | number | boolean | null>, defaultMessage?: string): LocalizedToken {
   return { code, params, defaultMessage };
@@ -161,6 +169,90 @@ export function createApp() {
       deniedOwners: config.traceDeniedOwners,
       allowedCountries: config.traceAllowedCountries,
     });
+  }
+
+  /** Require logged-in session; ownerKey = countryId:loginName (chat + analytics). */
+  const requireOwner = (c: Context) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (!session) return null;
+    return { session, ownerKey: ownerKeyOf(session.user, session.country.id) };
+  };
+
+  /**
+   * Analytics 会话归属：已登录用账号 ownerKey；未登录发/读 bx_analytics_aid，ownerKey=anon:<aid>。
+   * 问数本身仍可完全匿名；会话落库不再依赖登录。
+   */
+  const resolveAnalyticsOwner = (c: Context) => {
+    const session = getSession(getCookie(c, COOKIE));
+    if (session) {
+      return {
+        ownerKey: ownerKeyOf(session.user, session.country.id),
+        countryId: session.country.id,
+        loginName: session.user.loginName || String(session.user.id ?? "user"),
+        via: "session" as const,
+      };
+    }
+    let aid = String(getCookie(c, ANALYTICS_AID_COOKIE) || "").trim();
+    if (!/^[a-zA-Z0-9_-]{8,64}$/.test(aid)) {
+      aid = randomUUID().replace(/-/g, "");
+      setCookie(c, ANALYTICS_AID_COOKIE, aid, {
+        httpOnly: true,
+        path: "/",
+        sameSite: "Lax",
+        maxAge: 400 * 24 * 3600,
+      });
+    }
+    return {
+      ownerKey: `anon:${aid}`,
+      countryId: "anon",
+      loginName: aid,
+      via: "anon" as const,
+    };
+  };
+
+  async function readJson<T>(c: Context): Promise<T> {
+    return c.req.json<T>().catch(() => ({} as T));
+  }
+
+  /** Shared multipart save for /chat/upload and /analytics/upload (auth gated by callers). */
+  async function saveUploadedFilesFromRequest(c: Context) {
+    const form = await c.req.formData();
+    const files = form.getAll("files") as Array<{
+      name: string;
+      type: string;
+      size: number;
+      arrayBuffer(): Promise<ArrayBuffer>;
+    }>;
+    if (!files.length) return { response: errorJson(c, 400, "UPLOAD_NO_FILES", undefined, "未收到文件") };
+    if (files.length > MAX_AT_ONCE) {
+      return {
+        response: errorJson(
+          c,
+          400,
+          "UPLOAD_TOO_MANY_FILES",
+          { maxCount: MAX_AT_ONCE },
+          `一次最多上传 ${MAX_AT_ONCE} 个文件`,
+        ),
+      };
+    }
+    const saved = [];
+    for (const file of files) {
+      try {
+        saved.push(await saveUpload(file));
+      } catch (error) {
+        return {
+          response: c.json(
+            {
+              message: error instanceof Error ? error.message : "文件保存失败",
+              code: "UPLOAD_SAVE_FAILED",
+              error: token("UPLOAD_SAVE_FAILED"),
+            },
+            400,
+          ),
+        };
+      }
+    }
+    return { files: saved };
   }
 
   app.get("/models", (c) => {
@@ -490,8 +582,7 @@ export function createApp() {
     return c.json({ ok: true, taskId: task.taskId });
   });
 
-  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数）
-  // 各 Agent 独立账密：不复用后台运营 session；独立登录接入前 ask 暂可匿名（内网可控环境）。
+  // Metabase analytics HTTP facade（门户问数可匿名；会话靠登录或匿名 cookie 落库）
   app.get("/analytics/models", (c) => {
     return c.json({
       models: listModels().map((m) => ({
@@ -504,15 +595,211 @@ export function createApp() {
     });
   });
 
+  app.post("/analytics/upload", async (c) => {
+    try {
+      const result = await saveUploadedFilesFromRequest(c);
+      if ("response" in result) return result.response;
+      return c.json({ files: result.files });
+    } catch (error) {
+      console.error("[analytics/upload] error:", error);
+      return errorJson(c, 500, "UPLOAD_FAILED", undefined, "上传失败");
+    }
+  });
+
+  app.get("/analytics/upload/:id", (c) => {
+    const image = getUploadImage(c.req.param("id"));
+    if (!image) return errorJson(c, 404, "UPLOAD_IMAGE_NOT_FOUND", undefined, "图片不存在或已过期");
+    return new Response(new Uint8Array(image.data), {
+      headers: {
+        "Content-Type": image.mediaType,
+        "Cache-Control": "private, max-age=604800",
+      },
+    });
+  });
+
   app.post("/analytics/ask", async (c) => {
     const body = await c.req
-      .json<{ text?: string; model?: string }>()
-      .catch(() => ({ text: "", model: undefined as string | undefined }));
+      .json<{
+        text?: string;
+        model?: string;
+        images?: string[];
+        files?: string[];
+        slotAnswers?: Record<string, string[]>;
+      }>()
+      .catch(() => ({
+        text: "",
+        model: undefined as string | undefined,
+        images: undefined as string[] | undefined,
+        files: undefined as string[] | undefined,
+        slotAnswers: undefined as Record<string, string[]> | undefined,
+      }));
     const text = String(body.text || "").trim();
-    if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
+    const images = Array.isArray(body.images) ? body.images.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
+    const files = Array.isArray(body.files) ? body.files.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
+    if (!text && !images.length && !files.length) {
+      return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
+    }
     const modelId = typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
-    const result = await analyticsAsk(text, { modelId, signal: c.req.raw.signal });
+    const slotAnswers =
+      body.slotAnswers && typeof body.slotAnswers === "object"
+        ? Object.fromEntries(
+            Object.entries(body.slotAnswers)
+              .map(([k, v]) => [k, Array.isArray(v) ? v.map(String).filter(Boolean) : []])
+              .filter(([, v]) => (v as string[]).length > 0),
+          )
+        : undefined;
+    const result = await analyticsAsk(text, {
+      modelId,
+      signal: c.req.raw.signal,
+      images,
+      files,
+      slotAnswers: slotAnswers && Object.keys(slotAnswers).length ? slotAnswers : undefined,
+    });
     return c.json(result);
+  });
+
+  // Analytics 会话持久化（Mongo analytics_conversations；登录账号或匿名 cookie 均可）
+  app.get("/analytics/conversations", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const list = await listConversations(ctx.ownerKey, "analytics");
+    return c.json({ conversations: list, ownerVia: ctx.via });
+  });
+
+  app.post("/analytics/conversations", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const body = await readJson<{ id?: string; title?: string }>(c);
+    const id = body.id || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const doc = await createConversation({
+      ownerKey: ctx.ownerKey,
+      countryId: ctx.countryId,
+      loginName: ctx.loginName,
+      id,
+      title: body.title || "新对话",
+      store: "analytics",
+    });
+    return c.json({ conversation: doc, ownerVia: ctx.via });
+  });
+
+  app.get("/analytics/conversations/:id", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const doc = await getConversation(ctx.ownerKey, c.req.param("id"), "analytics");
+    if (!doc) return errorJson(c, 404, "ANALYTICS_CONVERSATION_NOT_FOUND", undefined, "会话不存在");
+    return c.json({ conversation: doc, ownerVia: ctx.via });
+  });
+
+  app.post("/analytics/conversations/:id/messages", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const body = await readJson<{ messages?: StoredMessage[]; title?: string }>(c);
+    if (!Array.isArray(body.messages)) {
+      return errorJson(c, 400, "ANALYTICS_CONVERSATION_INVALID_MESSAGES", undefined, "messages 必须为数组");
+    }
+    await upsertMessages({
+      ownerKey: ctx.ownerKey,
+      countryId: ctx.countryId,
+      loginName: ctx.loginName,
+      id: c.req.param("id"),
+      messages: body.messages,
+      title: body.title,
+      store: "analytics",
+    });
+    return c.json({ ok: true, ownerVia: ctx.via });
+  });
+
+  app.put("/analytics/conversations/:id", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const body = await readJson<{ title?: string }>(c);
+    if (!body.title?.trim()) {
+      return errorJson(c, 400, "ANALYTICS_CONVERSATION_EMPTY_TITLE", undefined, "标题不能为空");
+    }
+    await renameConversation(ctx.ownerKey, c.req.param("id"), body.title.trim(), "analytics");
+    return c.json({ ok: true, ownerVia: ctx.via });
+  });
+
+  app.delete("/analytics/conversations/:id", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    await deleteConversation(ctx.ownerKey, c.req.param("id"), "analytics");
+    return c.json({ ok: true, ownerVia: ctx.via });
+  });
+
+  app.post("/analytics/conversations/:id/clear", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    await clearConversation(ctx.ownerKey, c.req.param("id"), "analytics");
+    return c.json({ ok: true, ownerVia: ctx.via });
+  });
+
+  // M2 Task 5：有用/有误 → 候选池（无人审不进 gold；可匿名）
+  app.post("/analytics/feedback", async (c) => {
+    const body = await c.req
+      .json<{
+        askId?: string;
+        verdict?: string;
+        reasonTags?: string[];
+        note?: string;
+        nl?: string;
+        sqls?: string[];
+        status?: string;
+        packVersion?: string;
+        modelId?: string;
+      }>()
+      .catch(() => ({} as Record<string, unknown>));
+    const askId = String(body.askId || "").trim();
+    const verdict = String(body.verdict || "").trim() as FeedbackVerdict;
+    if (!askId) {
+      return errorJson(c, 400, "ANALYTICS_FEEDBACK_BAD_ASK", undefined, "缺少 askId");
+    }
+    if (verdict !== "useful" && verdict !== "wrong") {
+      return errorJson(c, 400, "ANALYTICS_FEEDBACK_BAD_VERDICT", undefined, "verdict 须为 useful|wrong");
+    }
+    const candidate = submitFeedback({
+      askId,
+      verdict,
+      reasonTags: Array.isArray(body.reasonTags) ? body.reasonTags.map(String) : undefined,
+      note: typeof body.note === "string" ? body.note : undefined,
+      nl: typeof body.nl === "string" ? body.nl : undefined,
+      sqls: Array.isArray(body.sqls) ? body.sqls.map(String) : undefined,
+      status:
+        body.status === "ok" ||
+        body.status === "clarify" ||
+        body.status === "refuse" ||
+        body.status === "error"
+          ? body.status
+          : undefined,
+      packVersion: typeof body.packVersion === "string" ? body.packVersion : undefined,
+      modelId: typeof body.modelId === "string" ? body.modelId : undefined,
+    });
+    return c.json({ ok: true, candidateId: candidate.id, reviewStatus: candidate.reviewStatus });
+  });
+
+  app.get("/analytics/feedback/candidates", (c) => {
+    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 50, 1), 200);
+    const reviewStatus = c.req.query("reviewStatus") as "pending" | "confirmed" | "rejected" | undefined;
+    const verdict = c.req.query("verdict") as FeedbackVerdict | undefined;
+    return c.json({
+      candidates: listFeedbackCandidates({
+        limit,
+        reviewStatus:
+          reviewStatus === "pending" || reviewStatus === "confirmed" || reviewStatus === "rejected"
+            ? reviewStatus
+            : undefined,
+        verdict: verdict === "useful" || verdict === "wrong" ? verdict : undefined,
+      }),
+    });
+  });
+
+  app.post("/analytics/feedback/candidates/:id/review", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req
+      .json<{ reviewStatus?: string }>()
+      .catch(() => ({ reviewStatus: undefined as string | undefined }));
+    const reviewStatus = String(body.reviewStatus || "").trim();
+    if (reviewStatus !== "confirmed" && reviewStatus !== "rejected") {
+      return errorJson(c, 400, "ANALYTICS_FEEDBACK_BAD_REVIEW", undefined, "reviewStatus 须为 confirmed|rejected");
+    }
+    const updated = reviewFeedbackCandidate(id, reviewStatus);
+    if (!updated) {
+      return errorJson(c, 404, "ANALYTICS_FEEDBACK_NOT_FOUND", undefined, "候选不存在");
+    }
+    return c.json({ ok: true, candidate: updated });
   });
 
   // 应用内巡检：与问数一致，暂不复用后台运营 session；独立登录接入前可匿名（内网可控）。
@@ -651,7 +938,8 @@ export function createApp() {
     if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
     if (!permissionsOf(session).canViewTrace) return errorJson(c, 403, "TRACE_FORBIDDEN", undefined, "无权限查看 Trace");
     const limit = Math.min(Number(c.req.query("limit")) || 20, 50);
-    const out = listRunSummaries(limit);
+    const agentId = String(c.req.query("agentId") || "").trim() || undefined;
+    const out = listRunSummaries(limit, undefined, agentId);
     if (out.stats?.degradeHint) {
       void notifyAlerts({ kind: "degrade", messages: [out.stats.degradeHint] });
     }
@@ -690,14 +978,6 @@ export function createApp() {
 
   // ---- 聊天记录持久化（方案 C：MongoDB，按登录用户归属）----
   // 身份验证：与 /chat/stream 一致，require session；ownerKey = countryId:loginName。
-  const requireOwner = (c: Context) => {
-    const session = getSession(getCookie(c, COOKIE));
-    if (!session) return null;
-    return { session, ownerKey: ownerKeyOf(session.user, session.country.id) };
-  };
-  async function readJson<T>(c: Context): Promise<T> {
-    return c.req.json<T>().catch(() => ({} as T));
-  }
 
   // 会话列表（按 updatedAt 倒序）
   app.get("/chat/conversations", async (c) => {
@@ -814,29 +1094,9 @@ export function createApp() {
     try {
       const session = getSession(getCookie(c, COOKIE));
       if (!session) return errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录");
-      const form = await c.req.formData();
-      const files = form.getAll("files") as Array<{
-        name: string;
-        type: string;
-        size: number;
-        arrayBuffer(): Promise<ArrayBuffer>;
-      }>;
-      if (!files.length) return errorJson(c, 400, "UPLOAD_NO_FILES", undefined, "未收到文件");
-      if (files.length > MAX_AT_ONCE) {
-        return errorJson(c, 400, "UPLOAD_TOO_MANY_FILES", { maxCount: MAX_AT_ONCE }, `一次最多上传 ${MAX_AT_ONCE} 个文件`);
-      }
-      const saved = [];
-      for (const file of files) {
-        try {
-          saved.push(await saveUpload(file));
-        } catch (error) {
-          return c.json(
-            { message: error instanceof Error ? error.message : "文件保存失败", code: "UPLOAD_SAVE_FAILED", error: token("UPLOAD_SAVE_FAILED") },
-            400,
-          );
-        }
-      }
-      return c.json({ files: saved });
+      const result = await saveUploadedFilesFromRequest(c);
+      if ("response" in result) return result.response;
+      return c.json({ files: result.files });
     } catch (error) {
       console.error("[chat/upload] error:", error);
       return errorJson(c, 500, "UPLOAD_FAILED", undefined, "上传失败");

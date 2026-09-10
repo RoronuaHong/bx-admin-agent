@@ -30,3 +30,8 @@
    > 八月二十到二十一印度A按天人数
 
    期望得到完整 P0 流水线结果（时间解析 → SQL → Verify → Metabase）的表格/摘要，而不是模型直接猜的裸 SQL。
+
+## 仓内就绪（2026-09-10）
+
+- `analytics_ask` 已在 agent-server `/mcp` 注册（`apps/agent-server/src/mcp.ts`）。
+- 本机需已安装 OpenClaw CLI 并按上文注册 MCP；**无 OpenClaw 时不算产品缺口**，HTTP `POST /analytics/ask` 与 Web `/analytics` 仍是主入口。

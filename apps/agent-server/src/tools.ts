@@ -229,7 +229,8 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "Probe DISTINCT / 已校验 SQL 取数时使用；禁止 DDL/DML；异 grain 请多次调用而非多语句。" +
     "参数：sql（必填）、databaseId（可选，默认 METABASE_DATABASE_ID）。",
   metabase_run_question:
-    "按 Metabase saved question / card id 取数（M1 未实现，调用将返回 not implemented）。",
+    "按 Metabase saved question / card id 取数（POST /api/card/:id/query）。" +
+    "参数：questionId（必填）、parameters/start/end（可选模板参数）。",
   metabase_explain_estimate:
     "对 SQL 做扫描估计（EXPLAIN ESTIMATE 类，M1 未实现，调用将返回说明信息）。",
 };
@@ -899,6 +900,13 @@ export function listAgentTools(): AgentToolDef[] {
         type: "object",
         properties: {
           questionId: { type: "number", description: "Metabase card / question id" },
+          parameters: {
+            type: "object",
+            description: "可选模板参数（如 start/end）",
+            additionalProperties: { type: "string" },
+          },
+          start: { type: "string", description: "可选：写入 parameters.start" },
+          end: { type: "string", description: "可选：写入 parameters.end" },
         },
         required: ["questionId"],
       },

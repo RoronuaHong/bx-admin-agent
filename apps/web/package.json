@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "tsx scripts/chat-helpers.test.ts",
+    "test": "tsx scripts/chat-helpers.test.ts && tsx scripts/analytics-clarify.test.ts && tsx scripts/table-columns.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tanstack/vue-table": "^9.2.4",
     "dompurify": "^3.4.13",
     "echarts": "^6.1.0",
     "markdown-it": "^15.0.0",

@@ -1,0 +1,464 @@
+{
+  "version": "2026-09-10.6",
+  "packId": "watch-detail",
+  "clock": "2026-09-09T12:00:00+08:00",
+  "notes": "Gate EX only counts reviewStatus=gold answerable. Agent-authored answerable = provisional (smoke). Refuse traps = gold structural product rules (time clarify + Ambiguity Gate filter_set/metric). Promote answerable to gold only after human review. 2026-09-10.6: Ambiguity Gate seeds.",
+  "cases": [
+    {
+      "id": "clarify-三种小语种-完播率",
+      "nl": "统计 IndiaA 渠道 在 2026-08-19 至 2026-08-25 期间，按观看日期 + 渠道 维度，三种小语种用户观看视频最大进度的平均值，也就是完播率",
+      "should_refuse": true,
+      "tags": ["refuse", "ambiguity", "filter_set"],
+      "difficulty": "medium",
+      "reviewStatus": "gold",
+      "reviewNote": "Ambiguity Gate: contentLang filter_set without member list must clarify before SQL"
+    },
+    {
+      "id": "clarify-四种语言",
+      "nl": "IndiaA 在 2026-08-19 到 2026-08-25 四种语言用户按天观看人数",
+      "should_refuse": true,
+      "tags": ["refuse", "ambiguity", "filter_set"],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "cardinality without enum list → clarify contentLang"
+    },
+    {
+      "id": "clarify-多种影片类型",
+      "nl": "IndiaA 在 2026-08-19 到 2026-08-25 多种影片类型观看人数",
+      "should_refuse": true,
+      "tags": ["refuse", "ambiguity", "filter_set"],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "movieType filter_set without members → clarify"
+    },
+    {
+      "id": "clarify-完播率无口径",
+      "nl": "IndiaA 在 2026-08-19 到 2026-08-25 完播率按天",
+      "should_refuse": true,
+      "tags": ["refuse", "ambiguity", "metric"],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "completion_rate alias without grounded option → clarify"
+    },
+    {
+      "id": "refuse-最近-人均",
+      "nl": "最近人均多久",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "date_trap"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-趋势",
+      "nl": "最近数据怎么样",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-异常",
+      "nl": "最近有没有异常",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-观看",
+      "nl": "查一下最近观看",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-印度A",
+      "nl": "最近印度A怎么样",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-一周",
+      "nl": "最近一周人数",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "date_trap"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-渠道对照",
+      "nl": "最近各渠道对比一下",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "refuse-最近-排行",
+      "nl": "最近语言排行",
+      "should_refuse": true,
+      "tags": [
+        "refuse"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "structural product rule: vague time must clarify/refuse"
+    },
+    {
+      "id": "ex-indiaA-day-users",
+      "nl": "八月二十到二十一印度A按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-foxA-day-users",
+      "nl": "八月二十到二十一FoxA按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-indiaA-by-lang",
+      "nl": "八月二十到二十一印度A按语言观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "dimension"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-foxA-by-lang",
+      "nl": "八月二十到二十一FoxA按语言观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "dimension"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-indiaA-total-users",
+      "nl": "八月二十到二十一印度A观看人数合计",
+      "should_refuse": false,
+      "tags": [
+        "aggregation"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-iso-indiaA-day",
+      "nl": "2026-08-20到2026-08-21 IndiaA按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date",
+        "iso"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-single-day-indiaA",
+      "nl": "八月二十印度A观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-20' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-channel-rank",
+      "nl": "八月二十到二十一各渠道观看人数排行",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "rank"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-lang-rank",
+      "nl": "八月二十到二十一按语言观看人数排行",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "rank"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-indiaA-day-avg-watch",
+      "nl": "八月二十到二十一印度A按天人均观看时长秒",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date",
+        "avg"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, sum(watchSecond) / uniq(guid) AS avg_watch_sec FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-gogo-day-users",
+      "nl": "八月二十到二十一GoGo按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-multi-indiaA-day-foxA-lang",
+      "nl": "八月二十到二十一印度A按天观看人数，同时FoxA按语言观看人数",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-multi-foxA-day-indiaA-lang",
+      "nl": "八月二十到二十一FoxA按天观看人数，同时印度A按语言观看人数",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-multi-indiaA-foxA-day",
+      "nl": "八月二十到二十一印度A和FoxA各自按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-indiaA-foxA-channel-pair",
+      "nl": "八月二十到二十一印度A与FoxA观看人数对照",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation",
+        "compare"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)",
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; multi_query totals (model prefers split over GROUP BY channel)"
+    },
+    {
+      "id": "ex-gogo-by-lang",
+      "nl": "八月二十到二十一GoGo按语言观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "dimension"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-foxA-total-users",
+      "nl": "八月二十到二十一FoxA观看人数合计",
+      "should_refuse": false,
+      "tags": [
+        "aggregation"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-indiaA-gogo-channel-pair",
+      "nl": "八月二十到二十一印度A与GoGo观看人数对照",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation",
+        "compare"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)",
+        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; multi_query totals (model prefers split over GROUP BY channel)"
+    },
+    {
+      "id": "ex-indiaA-watch-seconds",
+      "nl": "八月二十到二十一印度A观看总时长秒",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "sum"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT sum(watchSecond) AS watch_sec FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    },
+    {
+      "id": "ex-multi-gogo-foxA-day",
+      "nl": "八月二十到二十一GoGo和FoxA各自按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
+      ],
+      "reviewStatus": "provisional",
+      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+    }
+  ]
+}

@@ -179,6 +179,32 @@ export function listJobs(opts?: ListJobsOpts): ScanJob[] {
   return slice.map((j) => ({ ...j }));
 }
 
+export const DEFAULT_SCAN_RETENTION_DAYS = 30;
+
+/**
+ * Drop terminal jobs whose createdAt is older than retentionDays.
+ * Returns number of jobs removed. Queued/running are kept.
+ */
+export function purgeJobsOlderThan(
+  retentionDays: number = DEFAULT_SCAN_RETENTION_DAYS,
+  now: Date | number = new Date(),
+): number {
+  const days = Number(retentionDays);
+  if (!Number.isFinite(days) || days < 0) return 0;
+  const nowMs = typeof now === "number" ? now : now.getTime();
+  const cutoff = nowMs - days * 86_400_000;
+  const map = jobMap();
+  let removed = 0;
+  for (const [id, job] of map) {
+    if (!TERMINAL.has(job.status)) continue;
+    const created = Date.parse(job.createdAt);
+    if (!Number.isFinite(created) || created >= cutoff) continue;
+    map.delete(id);
+    removed += 1;
+  }
+  return removed;
+}
+
 /**
  * If job is still running past jobTimeoutMs from startedAt, mark failed with scan_job_timeout.
  * Returns the (possibly updated) job, or undefined if missing.

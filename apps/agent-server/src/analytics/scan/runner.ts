@@ -6,10 +6,12 @@ import {
   SCAN_JOB_RUNNING,
   SCAN_JOB_TIMEOUT,
   ScanJobStoreError,
+  DEFAULT_SCAN_RETENTION_DAYS,
   createJob,
   getJob,
   listJobs,
   markTimeoutIfNeeded,
+  purgeJobsOlderThan,
   transition,
   type ListJobsOpts,
 } from "./job-store.js";
@@ -196,6 +198,8 @@ export async function enqueueScan(
       tz: ruleSet.businessTimezone,
       scanDate: input.scanDate,
     });
+
+    purgeJobsOlderThan(ruleSet.retentionDays ?? DEFAULT_SCAN_RETENTION_DAYS, input.clock ?? new Date());
 
     const job = createJob({
       ruleSetId: ruleSet.id,

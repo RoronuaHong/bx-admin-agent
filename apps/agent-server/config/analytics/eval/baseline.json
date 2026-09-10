@@ -1,0 +1,7 @@
+{
+  "seedVersion": "2026-09-10.4",
+  "ex": null,
+  "refuseRecall": 1,
+  "recordedAt": "2026-09-10T09:40:00.000Z",
+  "notes": "No gold answerable yet (EX=null). Refuse gold structural traps only. Promote provisional→gold after human review, then re-run full and ANALYTICS_EVAL_WRITE_BASELINE=1."
+}

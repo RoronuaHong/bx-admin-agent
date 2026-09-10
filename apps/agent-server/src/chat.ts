@@ -1736,7 +1736,7 @@ export async function* chatStream(
     sessionLastReplyLanguage: session.lastReplyLanguage,
     uiLocale: opts.uiLocale,
   });
-  const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model, ownerKey });
+  const runId = trace.beginRun({ sessionId: session.id, userText, model: opts.model, ownerKey, agentId: "admin" });
   const rememberAssistantReplyLanguage = () => {
     session.lastReplyLanguage = resolvedReplyLanguage.tag;
   };
