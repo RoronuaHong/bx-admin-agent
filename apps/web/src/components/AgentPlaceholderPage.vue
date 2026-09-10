@@ -1,16 +1,26 @@
 <script setup lang="ts">
 import { RouterLink } from "vue-router";
+import type { ChatShellAccent } from "./ChatShell.vue";
+import AgentChromeNav from "./AgentChromeNav.vue";
+import ChatShell from "./ChatShell.vue";
 import ThemeToggle from "./ThemeToggle.vue";
 import UiLocaleSelect from "./UiLocaleSelect.vue";
 import { getUiLocale } from "../ui-locale";
 import { pickLocalized, type LocalizedText } from "../localize";
 
-const props = defineProps<{
-  title: LocalizedText;
-  kicker: LocalizedText;
-  lead: LocalizedText;
-  bullets: LocalizedText[];
-}>();
+withDefaults(
+  defineProps<{
+    title: LocalizedText;
+    kicker: LocalizedText;
+    welcome: LocalizedText;
+    lead: LocalizedText;
+    bullets: LocalizedText[];
+    accent?: ChatShellAccent;
+    /** Portal card key for AgentChromeNav (exclude current). */
+    currentKey?: string;
+  }>(),
+  { accent: "default" },
+);
 
 const uiLocale = getUiLocale();
 
@@ -20,139 +30,135 @@ function pickText(item: LocalizedText) {
 </script>
 
 <template>
-  <main class="stage">
-    <header class="top">
+  <ChatShell :accent="accent">
+    <template #header>
       <div class="identity">
-        <RouterLink class="back" to="/">{{ pickText({ zh: "返回门户", en: "Back to portal", pt: "Voltar ao portal", hi: "पोर्टल पर वापस" }) }}</RouterLink>
-        <h1>{{ pickText(title) }}</h1>
+        <p class="brand-kicker">{{ pickText(kicker) }}</p>
+        <RouterLink class="brand-mark" to="/">{{ pickText(title) }}</RouterLink>
       </div>
-      <div class="top-actions">
+      <div class="actions">
+        <AgentChromeNav :current-key="currentKey" />
         <UiLocaleSelect />
         <ThemeToggle />
       </div>
-    </header>
+    </template>
 
-    <section class="panel">
-      <p class="kicker">{{ pickText(kicker) }}</p>
-      <p class="lead">{{ pickText(lead) }}</p>
-      <ul class="list">
-        <li v-for="(item, idx) in bullets" :key="idx">{{ pickText(item) }}</li>
-      </ul>
-      <div class="actions">
-        <RouterLink class="ghost" to="/">{{ pickText({ zh: "返回 Agent 门户", en: "Return to portal", pt: "Voltar ao portal", hi: "पोर्टल पर लौटें" }) }}</RouterLink>
-        <RouterLink class="solid" to="/agents/admin/chat">{{ pickText({ zh: "查看已上线 Agent", en: "Open live agent", pt: "Abrir agente ativo", hi: "सक्रिय एजेंट खोलें" }) }}</RouterLink>
-      </div>
-    </section>
-  </main>
+    <template #thread>
+      <article class="msg">
+        <div class="who">
+          <span class="dot" />
+          {{ pickText({ zh: "助手", en: "Assistant", pt: "Assistente", hi: "सहायक" }) }}
+        </div>
+        <div class="body">
+          <p class="welcome">{{ pickText(welcome) }}</p>
+        </div>
+      </article>
+      <article class="msg">
+        <div class="who">
+          <span class="dot" />
+          {{ pickText({ zh: "助手", en: "Assistant", pt: "Assistente", hi: "सहायक" }) }}
+        </div>
+        <div class="body">
+          <p class="lead">{{ pickText(lead) }}</p>
+          <ul class="list">
+            <li v-for="(item, idx) in bullets" :key="idx">{{ pickText(item) }}</li>
+          </ul>
+          <div class="inline-actions">
+            <RouterLink class="ghost" to="/">{{ pickText({ zh: "返回门户", en: "Back to portal", pt: "Voltar ao portal", hi: "पोर्टल पर लौटें" }) }}</RouterLink>
+            <RouterLink class="ghost" to="/analytics">{{ pickText({ zh: "先去问数", en: "Try analytics", pt: "Ir para analise", hi: "एनालिटिक्स खोलें" }) }}</RouterLink>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <template #composer>
+      <form @submit.prevent>
+        <div class="composer-card is-disabled" aria-disabled="true">
+          <div class="composer-grip" aria-hidden="true" />
+          <textarea
+            class="composer-input"
+            rows="1"
+            disabled
+            name="agent-placeholder-input"
+            :placeholder="pickText({
+              zh: '对话能力即将上线（独立鉴权，不与后台账号混用）',
+              en: 'Chat coming soon (own auth, not shared with admin)',
+              pt: 'Chat em breve (auth propria, nao compartilhada com admin)',
+              hi: 'चैट जल्द (अपना auth, एडमिन से अलग)',
+            })"
+          />
+          <div class="composer-toolbar">
+            <div class="toolbar-right">
+              <button type="button" class="send-btn" disabled :title="pickText({ zh: '暂不可用', en: 'Unavailable' })">
+                <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                  <path
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M12 19V5m-7 7l7-7 7 7"
+                  />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </form>
+    </template>
+  </ChatShell>
 </template>
 
 <style scoped>
-.stage {
-  min-height: 100dvh;
-  padding: calc(20px + var(--safe-top)) var(--pad) calc(24px + var(--safe-bottom));
-}
-
-.top {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
-}
-
-.identity {
-  display: grid;
-  gap: 10px;
-}
-
-.back {
-  color: var(--muted);
-  text-decoration: none;
-  font-size: 12px;
-}
-
-.back:hover {
-  color: var(--ink);
-}
-
-h1 {
+.welcome {
   margin: 0;
-  font-size: clamp(30px, 5vw, 48px);
-}
-
-.top-actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
-.panel {
-  max-width: 760px;
-  margin-top: 28px;
-  padding: 24px;
-  border: 1px solid var(--line);
-  border-radius: calc(var(--radius) + 4px);
-  background: color-mix(in srgb, var(--panel) 88%, var(--fill));
-}
-
-.kicker {
-  margin: 0;
-  color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  line-height: 1.75;
+  white-space: pre-wrap;
 }
 
 .lead {
-  margin: 16px 0 0;
+  margin: 0;
   line-height: 1.75;
-  color: var(--muted);
 }
 
 .list {
-  margin: 18px 0 0;
+  margin: 14px 0 0;
   padding-left: 18px;
-  color: var(--ink);
   line-height: 1.8;
 }
 
-.actions {
+.inline-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 24px;
+  gap: 8px;
+  margin-top: 16px;
 }
 
-.ghost,
-.solid {
+.inline-actions .ghost {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
+  height: 32px;
   padding: 0 14px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent, #4d7c0f) 22%, var(--line));
   border-radius: var(--radius-sm);
-  text-decoration: none;
-  font-size: 13px;
-}
-
-.ghost {
-  border: 1px solid var(--line);
   color: var(--muted);
+  text-decoration: none;
+  font-size: 12.5px;
+  background: transparent;
 }
 
-.ghost:hover {
-  color: var(--ink);
-  background: var(--fill-soft);
+.inline-actions .ghost:hover {
+  color: color-mix(in srgb, var(--agent-accent, #4d7c0f) 55%, var(--ink));
+  background: color-mix(in srgb, var(--agent-accent, #4d7c0f) 10%, var(--fill-soft));
 }
 
-.solid {
-  border: 1px solid var(--ink);
-  background: var(--ink);
-  color: var(--bg);
+.composer-card.is-disabled {
+  opacity: 0.72;
+  pointer-events: none;
 }
 
-@media (max-width: 720px) {
-  .top {
-    flex-direction: column;
-  }
+.composer-card.is-disabled .composer-grip {
+  cursor: default;
 }
 </style>

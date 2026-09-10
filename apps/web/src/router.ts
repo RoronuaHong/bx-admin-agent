@@ -14,7 +14,8 @@ export const router = createRouter({
     {
       path: "/analytics",
       component: () => import("./pages/AnalyticsAgentPage.vue"),
-      meta: { auth: true, loginPath: "/agents/admin/login", agent: "analytics", requiredPortalEntry: "analytics" },
+      // 各 Agent 独立鉴权：问数暂不复用后台运营登录；独立登录接入前页与 ask 可匿名使用
+      meta: { agent: "analytics" },
     },
     { path: "/agents/analytics", redirect: "/analytics" },
     { path: "/login", redirect: "/agents/admin/login" },
@@ -26,7 +27,10 @@ router.beforeEach(async (to) => {
   const needSession = Boolean(to.meta.auth || to.meta.guestRedirectAuth);
   if (!needSession) return true;
   const me = await fetchMe();
-  if (to.meta.guestRedirectAuth && me) return { path: String(to.meta.guestRedirectAuth) };
+  if (to.meta.guestRedirectAuth && me) {
+    const next = typeof to.query.next === "string" && to.query.next.startsWith("/") ? to.query.next : "";
+    return { path: next || String(to.meta.guestRedirectAuth) };
+  }
   if (!to.meta.auth) return true;
   if (!me) return { path: String(to.meta.loginPath || "/agents/admin/login"), query: { next: to.fullPath } };
   if (to.meta.requiredPortalEntry && !me.permissions.entries?.[to.meta.requiredPortalEntry]) {

@@ -4,6 +4,12 @@ import AgentPlaceholderPage from "../components/AgentPlaceholderPage.vue";
 const page = {
   title: { zh: "观影助手 Agent", en: "Viewing Agent", pt: "Agent de Visualizacao", hi: "व्यूइंग एजेंट" },
   kicker: { zh: "方案已定 · 页面先行", en: "Spec Ready · UI Placeholder", pt: "Especificacao pronta · Pagina provisoria", hi: "स्पेक तैयार · UI प्लेसहोल्डर" },
+  welcome: {
+    zh: "你好，我是观影助手 Agent。找片、推荐等对话能力即将上线；当前先展示产品位置与能力边界。",
+    en: "Hi, I'm the Viewing Agent. Title search and recommendations are coming soon — this page covers positioning and scope for now.",
+    pt: "Ola, sou o Agent de Visualizacao. Busca e recomendacao de titulos em breve — por ora veja posicionamento e escopo.",
+    hi: "नमस्ते, मैं व्यूइंग एजेंट हूँ। खोज/सुझाव जल्द आएंगे — अभी स्थिति और दायरा देखें।",
+  },
   lead: {
     zh: "该 Agent 已纳入门户入口，但当前版本先提供能力说明与产品位置，不伪造完整工作台。后续接入真实 Worker、登录策略和交互流程后，再升级为正式页面。",
     en: "This agent is now represented in the portal, but this version intentionally stops at capability overview and product positioning. The full workspace should arrive only after its worker, auth model, and interaction flow are implemented.",
@@ -19,5 +25,5 @@ const page = {
 </script>
 
 <template>
-  <AgentPlaceholderPage v-bind="page" />
+  <AgentPlaceholderPage v-bind="page" accent="viewing" current-key="viewing" />
 </template>

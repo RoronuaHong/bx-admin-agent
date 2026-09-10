@@ -33,6 +33,7 @@ import { resolveCodebaseRoot } from "./project-context.js";
 import { getProjectConfig, projectAccessibleBy } from "./project-registry.js";
 import { lookupTermModules, formatTranslationHits } from "./translation-lookup.js";
 import { runContractSearch } from "./query-contraction.js";
+import { recallByNearTitles, formatNearTitleHits, recallNearFromUserUtterance, recallByContainedLocaleTitles, formatContainedTitleHits } from "./title-near-neighbor.js";
 import {
   DEFAULT_WORKERS,
   resolveWorker,
@@ -98,7 +99,8 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "用户用自然语言描述业务模块、未提供文件路径时使用；找到模块后直接用 read_api_module 读取完整源码并据此 call_api，" +
     "不要反复 grep / list_dir 绕路探索（read_api_module 已返回完整源码）。" +
     "提示：源码/菜单名常为「XX率数据统计」「XX统计」等规范名，口语词整词搜不到时，" +
-    "可直接用 search_api_module 搜核心词（服务端会对查询词做词尾逐字收缩降级重搜，无需手动拆词）。",
+    "可直接用 search_api_module 搜核心词（服务端会先按编辑距离做菜单/翻译标题近邻召回，" +
+    "再对查询词做词尾逐字收缩降级重搜，无需手动拆词或维护同义词）。",
   read_api_module:
     "读取接口定义文件的完整源码。" +
     "可传模块名/别名（用户口语业务词或英文模块 id）或文件路径（如 src/api 下相对路径）；多个用逗号分隔。" +
@@ -110,7 +112,8 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "base 对应前端 base.ts：backend/getUrl、user/getUserUrl、film/getFilmUrl。" +
     "内网域名仅支持 http，不要用 https。写操作 confirm=true 需用户确认。接口调用成功后会自动写操作日志。" +
     "【分页】列表查询如需多页/多条数据，由你按接口契约多次调用 call_api 拉取拼接（每次传对应分页参数，如 page=1/2/3 或 limit），" +
-    "服务端不做分页循环、不提供分页默认值；只取一页就直接传该页参数调用一次。",
+    "服务端不做分页循环、不提供分页默认值；只取一页就直接传该页参数调用一次。" +
+    "【禁止同参连打】同一 operation+params 成功后不要再调；翻页必须改 page。重复调用会被跳过。",
   request_clarification:
     "当请求目标/关键用词语义模糊、无法确定唯一业务含义，或缺少必要槽位（模块名、操作类型、操作对象）时，" +
     "返回结构化反问问题与可选项（提供 1 个或多个带选项的问题，必要时允许多选），让用户收敛范围后再执行。" +
@@ -144,6 +147,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     "本工具不再提供字段中文化（映射已不在配置表维护，改由源码 + pc-column-mapping 技能承担）。",
   submit_understood_intent:
     "把你对用户这句话的理解提交给规则引擎。只做语义理解，不要查代码、不要调接口。" +
+    "【硬性】每个用户回合只调用本工具 1 次；禁止并行多次 submit_understood_intent（重复提交会被丢弃且浪费 token）。" +
     "字段：isBusinessRequest（是否要查/改后台业务数据）、project、module（业务模块英文 id，来自源码路径）、" +
     "value（id/名称等）、operationType（read/write/unknown）、responseMode（execute/clarify/explain-capability）、confidence（0~1）、missingSlots（仍缺哪些槽位）、operationHint（列表/详情/新增等）、summary、" +
     "operation（可选，推荐：你选定的完整接口 id module.func——按 api-interface-routing 技能读 read_api_module 源码精确选出，留空则服务端按命名惯例兜底）。" +
@@ -2195,6 +2199,12 @@ export async function runAgentTool(
     // 避免索引快照过期/缺别名导致定位失败（如「影片采集员」在索引里只有「影片采集源」）。
     // 索引（api-module-index）仅作兜底补充，不参与主路径。
     const root = resolveCodebaseRoot();
+    // 用户原话扩展近邻（优先于短 query 精确 grep）：模型常把「影视列表第一页」缩成 query=「影视」，
+    // 短词会直接命中「影视速递」等子串并绕过 miss→近邻路径。用原话更长片段做编辑距离近邻。
+    try {
+      const fromUtterance = recallNearFromUserUtterance(query, String(opts.userText || ""), root, 12);
+      if (fromUtterance) return fromUtterance;
+    } catch { /* 扩展失败走主路径 */ }
     const srcDir = nodePath.join(root, "src");
     const grepResults: string[] = [];
     try {
@@ -2285,9 +2295,17 @@ export async function runAgentTool(
       }
     } catch { /* rg 失败时走索引兜底 */ }
 
-    // 源码 grep 未命中时，先尝试翻译表反查（2026-08-24 A+ 补缺）：grep 范围是 src/api+src/views（rg 主路径），
-    // 即使回退 grepCodebaseNative 全 src，query 含数字残渣（如「账号合并558523069977」）也可能零命中；
-    // lookupTermModules 内部会剥离数字/英文/标点变体命中翻译表，拿到候选模块交模型裁决。
+    // 源码 grep 未命中时，先尝试「标题子串」再翻译表反查：
+    // 「影片新上线」若先走翻译收缩易落到「影片」；子串「新上线」能命中 status.configs → getNewOnlineList。
+    if (!grepResults.length) {
+      try {
+        const subHits = recallByContainedLocaleTitles(query, root, 8);
+        if (subHits.length) {
+          return formatContainedTitleHits(query, subHits);
+        }
+      } catch { /* 子串召回失败继续 */ }
+    }
+    // 翻译表反查（2026-08-24 A+ 补缺）
     if (!grepResults.length) {
       try {
         const hits = lookupTermModules(query, root);
@@ -2298,6 +2316,16 @@ export async function runAgentTool(
           );
         }
       } catch { /* 反查失败继续索引兜底 */ }
+    }
+    // 近邻标题召回（优先于收缩）：口语与菜单仅差 1～2 字时，收缩成短词会误召回其它模块
+    // （正确答案不进候选集）。用编辑距离在翻译表真实标题语料上找近邻再 grep——零同义词表。
+    if (!grepResults.length) {
+      try {
+        const nearHits = recallByNearTitles(query, root, 8);
+        if (nearHits.length) {
+          return formatNearTitleHits(query, nearHits);
+        }
+      } catch { /* 近邻召回失败继续 */ }
     }
     // 收缩重搜（2026-08-24 引入，2026-08-26 去写死词表）：口语词（如「留存报表」）与源码/菜单命名
     // （「留存率数据统计」）不一致导致整词零命中。词尾逐字收缩（纯算法，无显示词缀词表）后轻量 grep，
@@ -2326,7 +2354,21 @@ export async function runAgentTool(
       }
     }
     if (grepResults.length) {
-      return `[源码定位]「${query}」在 PC 端源码命中：\n\n${grepResults.join("\n\n")}\n\n建议：用 read_api_module 读取接口源码（返回完整函数名与参数），确认后直接 call_api；不要 grep / list_dir 反复绕路。`;
+      // grep 多页噪声时，附上翻译表权威菜单候选（如「二级分类列表」同时命中 advertisingbudget 文案）
+      let transPrefix = "";
+      try {
+        const hits = lookupTermModules(query, root);
+        if (hits.length) {
+          transPrefix =
+            formatTranslationHits(query, hits) +
+            `\n\n（以上为菜单/路由权威候选；下方为源码 grep 命中，请优先按菜单模块 read_api_module。）\n\n`;
+        }
+      } catch { /* ignore */ }
+      return (
+        transPrefix +
+        `[源码定位]「${query}」在 PC 端源码命中：\n\n${grepResults.join("\n\n")}\n\n` +
+        `建议：用 read_api_module 读取接口源码（返回完整函数名与参数），确认后直接 call_api；不要 grep / list_dir 反复绕路。`
+      );
     }
     return errorTokenResult("TOOL_SEARCH_API_MODULE_NOT_FOUND", { query });
   }

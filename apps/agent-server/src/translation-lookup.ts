@@ -90,7 +90,8 @@ function walkFiles(dir: string, exts: RegExp): string[] {
 
 /** 第一步：术语 → 翻译表 key。精确值匹配优先，无精确再包含匹配（避免泛词误伤）。
  *  兼容业务词含用户输入残渣（如 extractGrepPattern 粘连的数字「账号合并558523069977」）：
- *  先生成「剥离数字/英文/标点」的中文变体，逐变体匹配。 */
+ *  先生成「剥离数字/英文/标点」的中文变体，逐变体匹配。
+ *  key 形态兼容：unquoted `mzly…: '账号合并'` 与 quoted `'94F172…': '二级分类'`。 */
 export function findTranslationKeys(term: string, root: string): string[] {
   const base = nodePath.join(root, "src", "locales", "lang", "zh-CN");
   const files = walkFiles(base, /\.(ts|json)$/);
@@ -100,8 +101,13 @@ export function findTranslationKeys(term: string, root: string): string[] {
   ].filter((v, i, arr) => v && arr.indexOf(v) === i);
   const keys: string[] = [];
   for (const v of variants) {
-    const exactRe = new RegExp(`([A-Za-z0-9_]+)\\s*:\\s*(?:['"\`])${escapeRegExp(v)}(?:['"\`])`);
-    const containRe = new RegExp(`([A-Za-z0-9_]+)\\s*:\\s*(?:['"\`])[^'"\`]*${escapeRegExp(v)}[^'"\`]*(?:['"\`])`);
+    // key 可带可选引号；值精确匹配优先
+    const exactRe = new RegExp(
+      `['"]?([A-Za-z0-9_]+)['"]?\\s*:\\s*(?:['"\`])${escapeRegExp(v)}(?:['"\`])`,
+    );
+    const containRe = new RegExp(
+      `['"]?([A-Za-z0-9_]+)['"]?\\s*:\\s*(?:['"\`])[^'"\`]*${escapeRegExp(v)}[^'"\`]*(?:['"\`])`,
+    );
     for (const file of files) {
       const text = cachedRead(file);
       if (!text) continue;
@@ -148,12 +154,23 @@ function extractEnclosingBlock(text: string, index: number, minFields: RegExp[])
   return "";
 }
 
-/** 第二步：翻译表 key → 路由对象块（path/component/title）。只认 src/router/** 下 ts/js */
+/** 第二步：翻译表 key → 路由对象块（path/component/title）。只认 src/router/** 下 ts/js。
+ *  title 引用形态：
+ *  - t('tran40.menus.KEY') / title: KEY
+ *  - t(getTran('KEY', '[中文]', ...))（二级分类等菜单常用） */
 function findRouteRefs(key: string, root: string): Array<{ route: string; component: string; title: string }> {
   const routerDir = nodePath.join(root, "src", "router");
   const files = walkFiles(routerDir, /\.(ts|js)$/);
   const hits: Array<{ route: string; component: string; title: string }> = [];
-  const keyRe = new RegExp(`title\\s*:\\s*(?:t\\s*\\(\\s*['"][^'"]*\\.)?${escapeRegExp(key)}`, "g");
+  const esc = escapeRegExp(key);
+  const keyRe = new RegExp(
+    `(?:` +
+      `title\\s*:\\s*(?:t\\s*\\(\\s*['"][^'"]*\\.)?${esc}` +
+      `|` +
+      `getTran\\(\\s*['"\`]${esc}['"\`]` +
+      `)`,
+    "g",
+  );
   const needFields = [
     /component\s*:\s*\(\)\s*=>\s*import\s*\(\s*['"]/,
     /path\s*:\s*['"]/,
@@ -228,8 +245,11 @@ function moduleFromComponent(component: string, root: string): string | null {
 /**
  * 完整四跳反查：中文术语 → 候选模块列表（按 moduleId 去重）。
  * 返回空数组表示翻译表/路由/组件任一环节未命中或页面无 api import（C3 纯英文由模型 grep 处理）。
+ *
+ * 补缺：hash key 未写入 title: 引用、仅出现在 getTran('KEY','[中文]') 第二参数时，
+ * 按中文回落直接扫路由（二级分类等）。
  */
-export function lookupTermModules(term: string, root: string): TranslationModuleHit[] {
+export function lookupTermModules(term: string, root: string, depth = 0): TranslationModuleHit[] {
   const keys = findTranslationKeys(term, root);
   const hits: TranslationModuleHit[] = [];
   for (const key of keys) {
@@ -245,6 +265,30 @@ export function lookupTermModules(term: string, root: string): TranslationModule
       });
     }
   }
+  if (!hits.length) {
+    for (const route of findRouteRefsByGetTranTitle(term, root)) {
+      const moduleId = moduleFromComponent(route.component, root);
+      if (!moduleId) continue;
+      hits.push({
+        moduleId,
+        route: route.route,
+        component: route.component,
+        title: route.title || term,
+        key: "",
+      });
+    }
+  }
+  // 整词未挂上路由时：仅当本词已命中翻译 key（但 key→路由失败）才词尾收缩一层
+  // （「二级分类列表」→「二级分类」）。无 key 时不收缩成「影片」等短词（交给标题子串/近邻/收缩重搜）。
+  if (!hits.length && keys.length && depth < 1 && Array.from(term).length > 2) {
+    const chars = Array.from(term);
+    for (let i = chars.length - 1; i >= 2; i--) {
+      const shorter = chars.slice(0, i).join("");
+      if (shorter === term) continue;
+      const nested = lookupTermModules(shorter, root, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
   const seen = new Set<string>();
   const out: TranslationModuleHit[] = [];
   for (const h of hits) {
@@ -253,6 +297,37 @@ export function lookupTermModules(term: string, root: string): TranslationModule
     out.push(h);
   }
   return out;
+}
+
+/** getTran('HASH','[中文标题]') 第二参数回落：key 未出现在 title 表达式时仍能挂路由 */
+function findRouteRefsByGetTranTitle(
+  term: string,
+  root: string,
+): Array<{ route: string; component: string; title: string }> {
+  const routerDir = nodePath.join(root, "src", "router");
+  const files = walkFiles(routerDir, /\.(ts|js)$/);
+  const hits: Array<{ route: string; component: string; title: string }> = [];
+  const esc = escapeRegExp(term);
+  const re = new RegExp(`getTran\\(\\s*['"\`][^'"\`]+['"\`]\\s*,\\s*['"\`]\\[?${esc}\\]?['"\`]`, "g");
+  const needFields = [
+    /component\s*:\s*\(\)\s*=>\s*import\s*\(\s*['"]/,
+    /path\s*:\s*['"]/,
+  ];
+  for (const file of files) {
+    const text = cachedRead(file);
+    if (!text) continue;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      const block = extractEnclosingBlock(text, m.index, needFields);
+      if (!block) continue;
+      const comp = block.match(/component\s*:\s*\(\)\s*=>\s*import\s*\(\s*['"](?:\/@\/)?views\/([^'"]+)['"]\s*\)/i);
+      if (!comp) continue;
+      const routePath = block.match(/path\s*:\s*['"]([^'"]+)['"]/)?.[1] || "";
+      const title = resolveRouteTitle(block, root) || term;
+      hits.push({ route: routePath, component: comp[1], title });
+    }
+  }
+  return hits;
 }
 
 /** 格式化候选清单（供 search_api_module / orchestrate 兜底提示展示） */

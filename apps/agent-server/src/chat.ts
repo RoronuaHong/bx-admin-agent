@@ -43,6 +43,16 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { truncateToolResultForUi, describeCallForReasoning } from "./ui-truncate.js";
 import {
+  dedupeParallelToolCalls,
+  formatParallelDedupeObserve,
+  rewriteLastToolCalls,
+  padMissingToolResults,
+  deferSystemStepsPastToolResults,
+  callApiKey,
+  collectSuccessfulCallApiKeys,
+  formatDuplicateCallApiSkip,
+} from "./tool-call-dedupe.js";
+import {
   drillListRows,
   extractListRowsFromContent,
   extractReportRows,
@@ -530,7 +540,9 @@ export function buildStaticGuide(
       "7. 【M1 路由，强制】未选定 Worker 时只能使用调度类工具（route_to_agent / request_clarification / " +
       "submit_understood_intent / set_project / 偏好与时间等）。需要业务取数或知识检索时，" +
       "必须先 route_to_agent(domain=backend-api|knowledge|…) 再调用领域工具；" +
-      "领域不明用 request_clarification 收敛，禁止硬猜。",
+      "领域不明用 request_clarification 收敛，禁止硬猜。\n" +
+      "8. 每轮每个工具只调用一次：submit_understood_intent 整轮至多 1 次，禁止并行重复提交；" +
+      "call_api 同一 operation+参数成功后禁止再调，翻页须改 page；禁止同参连打。",
   );
   // Prompt 注入护栏协议句（固定英文定界名，非攻击词典；用户原文永不拼进本 system 块）
   parts.push(UNTRUSTED_USER_CONTENT_RULE);
@@ -2125,6 +2137,10 @@ export async function* chatStream(
         // 替换占位符，模型只看到最近几轮完整结果——收敛每轮注入量（越到后面越慢的主因）。
         // state.steps 保持完整：返回时写回未压缩 steps（下方 return steps: steps）。
         const compactedSteps = compactStepsForModel(steps);
+        // 配对兜底：压缩不删消息，但历史中若曾有同轮短路漏 result，此处补齐防 400001；
+        // 并把夹在 tool_calls/tool 之间的 system（会编成 user）挪到该轮 tool 齐套之后。
+        padMissingToolResults(compactedSteps as AgentStep[]);
+        deferSystemStepsPastToolResults(compactedSteps as AgentStep[]);
         const beforeChars = estimateStepsChars(steps);
         const afterChars = estimateStepsChars(compactedSteps);
         let collapsedCount = 0;
@@ -2307,7 +2323,22 @@ export async function* chatStream(
         if (signal?.aborted) return { cancelled: true, toolCalls: [], round: state.round };
         const prevSteps: AgentStep[] = Array.isArray(state.steps) ? state.steps : [];
         const nextSteps: AgentStep[] = [...prevSteps];
-        nextSteps.push({ kind: "toolCalls", calls: state.toolCalls });
+        // 同轮并行去重：弱模型常一次吐出数十个 submit_understood_intent / 相同 call_api。
+        // 必须在写入 steps / 推 UI / 执行之前折叠，否则「只执行第一个」仍会刷 N 条 observe 卡片。
+        const deduped = dedupeParallelToolCalls(state.toolCalls);
+        const toolCalls = deduped.kept;
+        nextSteps.push({ kind: "toolCalls", calls: toolCalls });
+        // 注意：去重说明不能插在 toolCalls 与 toolResult 之间（上游要求 tool 消息紧跟
+        // assistant.tool_calls，否则 400001 insufficient tool messages）。observe 延后到本轮结果齐套后。
+        const pendingDedupeObserve =
+          deduped.droppedSubmit > 0 || deduped.droppedCallApi > 0
+            ? formatParallelDedupeObserve(deduped.droppedSubmit, deduped.droppedCallApi)
+            : "";
+        if (pendingDedupeObserve) {
+          console.log(
+            `[chat:parallel-dedupe] submit×${deduped.droppedSubmit} call_api×${deduped.droppedCallApi} 已折叠（保留 ${toolCalls.length}/${state.toolCalls.length}）`,
+          );
+        }
         let clarificationText = "";
         let outputReady = state.outputReady === true;
         let exploreCapExhausted = state.exploreCapExhausted === true;
@@ -2327,25 +2358,6 @@ export async function* chatStream(
           // M1：默认 API 环境（call_api.environment 可覆盖）；与 session.activeEnvironment 同步
           environment: getActiveEnvironment(session.id),
         };
-        // 同轮重复取数调用去重（对齐 Cursor「观察→再决策」循环）：
-        // 弱模型常在未见数据时并行提交多个参数完全相同的取数调用（实测 lagunas 两次 pageNum:1），
-        // 逐个执行只是重复请求。检测「同一 operation/path 且 params 序列化完全相同」的重复 call_api，
-        // 仅执行第一个，其余注入观察提示引导模型基于返回的分页信息（total/页数）递增参数再取。
-        // 纯协议去重（比较 operation/path/params 序列化是否完全相同），不写死任何分页参数名，无业务语义。
-        const callApiKey = (c: { name: string; input: Record<string, unknown> }): string | null => {
-          if (c.name !== CALL_API_TOOL) return null;
-          const op = c.input.operation ? String(c.input.operation) : "";
-          const path = c.input.path ? String(c.input.path) : "";
-          const params = c.input.params ? JSON.stringify(c.input.params) : "";
-          return `${op}|${path}|${params}`;
-        };
-        const seenCallKeys = new Map<string, string>();
-        const duplicateNotes = new Map<string, string>();
-        // 同轮重复意图提交去重（2026-09-09，与 callApiKey 同范式）：模型同轮并行提交多个
-        // submit_understood_intent 时（实测 dsflash 一次吐 7 个占位调用——模型对并行结果
-        // 未知的占位填充），只有第一个是真实理解，其余纯浪费执行轮。仅执行第一个，
-        // 其余 skip 回喂；跨轮 doom-loop 之外补齐「同轮并行 META」盲区。纯协议护栏。
-        let seenSubmit = false;
         // 跨轮 Doom Loop 熔断（对齐 OpenCode doom_loop）：连续 ≥3 次「同一业务工具 + 同一入参」→ 判空转
         let lastToolSignature = state.lastToolSignature || "";
         let toolSignatureStreak = state.toolSignatureStreak || 0;
@@ -2358,40 +2370,18 @@ export async function* chatStream(
           }
           return `${c.name}|${JSON.stringify(c.input || {})}`;
         };
-        for (const c of state.toolCalls) {
-          if (c.name === SUBMIT_UNDERSTOOD_INTENT) {
-            if (seenSubmit) {
-              duplicateNotes.set(
-                c.id,
-                "[workflow/observe] 你同轮并行提交了多个 submit_understood_intent，系统已合并执行第一个（见上一条返回）。" +
-                  "请基于其结果继续决策，不要重复提交。",
-              );
-            } else {
-              seenSubmit = true;
-            }
-            continue;
-          }
-          const key = callApiKey(c);
-          if (!key) continue;
-          if (seenCallKeys.has(key)) {
-            duplicateNotes.set(
-              c.id,
-              "[workflow/observe] 你并行提交了多个参数完全相同的取数调用，系统已合并执行第一个（见上一条返回）。" +
-                "若需更多页数据，请基于返回中的分页信息（如 total/总页数）递增分页参数后再次调用 call_api；" +
-                "不要重复相同参数的调用。",
-            );
-          } else {
-            seenCallKeys.set(key, c.id);
-          }
-        }
+        // 跨轮：已成功过的 call_api 签名，同参直接跳过（演员/速递偶发连打）
+        const succeededCallApiKeys = collectSuccessfulCallApiKeys(nextSteps);
         // M1（Supervisor 路由）同轮隔离短路：本轮 toolCalls 含 route_to_agent 时，
         // 只执行它并立即 return，放弃本轮其余调用（call_api 等），
         // 避免 Worker 上下文切换前误执行「旧 Worker 视角」下的业务工具（同轮捆绑泄漏）。
         // 路由命中后下一轮 understand 会基于新 activeWorkerId 裁剪工具集重新规划。
-        const routeCall = state.toolCalls.find((c) => c.name === "route_to_agent");
+        const routeCall = toolCalls.find((c) => c.name === "route_to_agent");
         if (routeCall) {
           const routeSpan = trace.span(state.traceRunId, "route", "route_to_agent", { worker: activeWorkerId ?? undefined });
           try {
+          // 关键：只保留 route 在本轮 toolCalls 里，避免兄弟调用无 toolResult → 上游 400001
+          rewriteLastToolCalls(nextSteps, [routeCall]);
           emitEvent({ type: "tool_call", name: routeCall.name, input: routeCall.input });
           emitEvent({ type: "reasoning", text: describeCallForReasoning(routeCall) });
           const rc = await runAgentTool(routeCall.name, routeCall.input, toolOpts);
@@ -2399,6 +2389,9 @@ export async function* chatStream(
           nextSteps.push({ kind: "toolResult", toolCallId: routeCall.id, content: rc });
           const rwm = /\[ACTIVE_WORKER:([^\]]+)\]/.exec(rc);
           if (rwm) activeWorkerId = rwm[1];
+          padMissingToolResults(nextSteps);
+          deferSystemStepsPastToolResults(nextSteps);
+          if (pendingDedupeObserve) nextSteps.push({ kind: "system", text: pendingDedupeObserve });
           return {
             steps: nextSteps,
             toolCalls: [],
@@ -2422,7 +2415,7 @@ export async function* chatStream(
         // 白名单外的工具调用一律拒绝执行（返回说明回喂模型），模型须先 route_to_agent 切回对应 Worker。
         const curWorker = activeWorkerId ? resolveWorkerById(activeWorkerId) : null;
         const curWhitelist = workerToolNames(curWorker);
-        for (const call of state.toolCalls) {
+        for (const call of toolCalls) {
           const s = trace.span(state.traceRunId, "tool", call.name, { worker: activeWorkerId ?? undefined });
           let toolStatus: trace.SpanStatus = "ok";
           let toolNote: string | undefined;
@@ -2450,17 +2443,18 @@ export async function* chatStream(
             });
             continue;
           }
+          // 臆造/别名 operation 归一到索引真实 id（account_merge.getList → user/account_merge.getMergeLogs），
+          // 便于 UI/评测与后续模型续调用使用正确 id，避免表格标题落成错误模块名。
+          if (call.name === CALL_API_TOOL && call.input.operation) {
+            const resolvedNorm = resolveApiOperation(String(call.input.operation));
+            if (resolvedNorm?.id && resolvedNorm.id !== String(call.input.operation).trim()) {
+              call.input = { ...call.input, operation: resolvedNorm.id };
+            }
+          }
           emitEvent({ type: "tool_call", name: call.name, input: call.input });
           // 思考过程（对齐 DeepSeek「深度思考」）：把 agent 实际操作链以人类可读摘要流向前端，
           // 折叠块内展示。描述取自工具名 + 关键入参，不编造模型未产生的思维链。
           emitEvent({ type: "reasoning", text: describeCallForReasoning(call) });
-          // 重复调用：不真正执行，回喂观察提示（模型基于第一个调用返回的分页信息自行决定是否递增）
-          if (duplicateNotes.has(call.id)) {
-            const note = duplicateNotes.get(call.id)!;
-            emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(note) });
-            nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: note });
-            continue;
-          }
           // 取数前探索熔断：未 call_api 前反复 search/read 会把 rounds 顶到 G1。
           // 双闸门——定位类 ≤1、探索合计（含 read_api_module）≤2；超额 skip 回喂，不提前 final。
           // 取数后计数清零，允许重定位（对齐 tool-calling#5 取错模块可重搜）。
@@ -2506,6 +2500,20 @@ export async function* chatStream(
           } else {
             lastToolSignature = callSig;
             toolSignatureStreak = 1;
+          }
+
+          // 同参 call_api 已成功过：直接跳过（不二次打上游），省延迟与 token
+          if (call.name === CALL_API_TOOL) {
+            const dupKey = callApiKey(call);
+            if (dupKey && succeededCallApiKeys.has(dupKey)) {
+              const skip = formatDuplicateCallApiSkip(String(call.input.operation || ""));
+              console.log(`[chat:call_api-dedupe] 跳过重复成功签名 ${dupKey.slice(0, 96)}`);
+              emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(skip) });
+              nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: skip });
+              toolStatus = "skip";
+              toolNote = "duplicate successful call_api";
+              continue;
+            }
           }
 
           let content: string;
@@ -2710,6 +2718,17 @@ export async function* chatStream(
           const persisted = persistToolOutput(call.name, content, call.input);
           if (persisted) content = persisted;
           nextSteps.push({ kind: "toolResult", toolCallId: call.id, content });
+          if (call.name === CALL_API_TOOL) {
+            const k = callApiKey(call);
+            if (k) {
+              const body = content || "";
+              const codeM = body.match(/"code"\s*:\s*(-?\d+)/);
+              const failed =
+                /^(错误|ERROR|CLARIFICATION_REQUIRED|MODULE_RETRY)/i.test(body) ||
+                (codeM != null && Number(codeM[1]) !== 0);
+              if (!failed) succeededCallApiKeys.add(k);
+            }
+          }
           if (call.name === SUBMIT_UNDERSTOOD_INTENT) {
             const understood = parseUnderstoodIntent(call.input || {});
             const understoodStepIndex = nextSteps.length - 1;
@@ -2742,6 +2761,9 @@ export async function* chatStream(
               content: JSON.stringify({ _understood: true, ...understood }, null, 2),
             };
             if (routeKnowledge) {
+              padMissingToolResults(nextSteps);
+              deferSystemStepsPastToolResults(nextSteps);
+              if (pendingDedupeObserve) nextSteps.push({ kind: "system", text: pendingDedupeObserve });
               return {
                 steps: nextSteps,
                 toolCalls: [],
@@ -2766,6 +2788,9 @@ export async function* chatStream(
                 kind: "system",
                 text: "[workflow/stop] 当前为 explain-capability，已生成说明型答复，请直接结束，不再调用其他工具。",
               });
+              padMissingToolResults(nextSteps);
+              deferSystemStepsPastToolResults(nextSteps);
+              if (pendingDedupeObserve) nextSteps.push({ kind: "system", text: pendingDedupeObserve });
               return {
                 steps: nextSteps,
                 toolCalls: [],
@@ -2790,6 +2815,9 @@ export async function* chatStream(
                 kind: "system",
                 text: "[workflow/stop] 当前为 clarify，已生成澄清问题，请直接结束，不再调用其他工具。",
               });
+              padMissingToolResults(nextSteps);
+              deferSystemStepsPastToolResults(nextSteps);
+              if (pendingDedupeObserve) nextSteps.push({ kind: "system", text: pendingDedupeObserve });
               return {
                 steps: nextSteps,
                 toolCalls: [],
@@ -3086,6 +3114,9 @@ export async function* chatStream(
             s.end({ status: toolStatus, note: toolNote });
           }
         }
+        padMissingToolResults(nextSteps);
+        deferSystemStepsPastToolResults(nextSteps);
+        if (pendingDedupeObserve) nextSteps.push({ kind: "system", text: pendingDedupeObserve });
         return {
           steps: nextSteps,
           toolCalls: [],

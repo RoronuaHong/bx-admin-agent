@@ -33,10 +33,10 @@ export const PORTAL_KICKER: LocalizedText = {
 };
 
 export const PORTAL_LEAD: LocalizedText = {
-  zh: "先从数据分析问数开始；后台管理、知识库与观影助手按权限并列接入，统一从本门户进入。",
-  en: "Start with analytics Q&A; admin, knowledge, and viewing agents sit alongside by permission — all from this portal.",
-  pt: "Comece pela analise de dados; backoffice, conhecimento e visualizacao ficam lado a lado conforme a permissao — tudo neste portal.",
-  hi: "एनालिटिक्स प्रश्न से शुरू करें; अनुमति के अनुसार एडमिन, नॉलेज और व्यूइंग एजेंट साथ-साथ — सब इसी पोर्टल से।",
+  zh: "先从数据分析问数开始；各 Agent 独立鉴权（后台管理用运营账号，其它入口不混用）。统一从本门户进入。",
+  en: "Start with analytics Q&A. Each agent has its own auth — admin uses ops accounts; others are not shared. All entries live on this portal.",
+  pt: "Comece pela analise. Cada agente tem auth propria — admin usa contas operacionais; as demais nao se misturam. Tudo neste portal.",
+  hi: "एनालिटिक्स से शुरू करें। हर एजेंट का अपना auth — एडमिन ऑप्स खाता; बाकी मिलाए नहीं। सब इसी पोर्टल से।",
 };
 
 export const PORTAL_CARDS: PortalCard[] = [
@@ -90,7 +90,7 @@ export const PORTAL_CARDS: PortalCard[] = [
       hi: "नॉलेज बेस, नीति, प्रक्रिया और दस्तावेज़ खोज के लिए स्वतंत्र प्रवेश। यह संस्करण फिलहाल दायरा और नियोजित क्षमताएं दिखाता है।",
     },
     chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
-    cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
+    cta: { zh: "进入方案聊天框", en: "Open chat shell", pt: "Abrir shell de chat", hi: "चैट शेल खोलें" },
     href: "/agents/knowledge",
     tone: "default",
     accent: "knowledge",
@@ -106,7 +106,7 @@ export const PORTAL_CARDS: PortalCard[] = [
       hi: "व्यूइंग असिस्टेंट के लिए स्वतंत्र प्रवेश। यह संस्करण फिलहाल दायरा और नियोजित क्षमताएं दिखाता है।",
     },
     chip: { zh: "Agent", en: "Agent", pt: "Agente", hi: "एजेंट" },
-    cta: { zh: "查看方案页", en: "View overview", pt: "Ver visao geral", hi: "ओवरव्यू देखें" },
+    cta: { zh: "进入方案聊天框", en: "Open chat shell", pt: "Abrir shell de chat", hi: "चैट शेल खोलें" },
     href: "/agents/viewing",
     tone: "default",
     accent: "viewing",

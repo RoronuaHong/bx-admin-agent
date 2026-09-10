@@ -726,6 +726,18 @@ const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
     pt: "Escolha o formato de resposta de acordo com o tipo da pagina.",
     hi: "पेज प्रकार के अनुसार उपयुक्त उत्तर प्रारूप चुनें।",
   },
+  SCAN_WORKER_DISABLED: {
+    zh: "本实例未启用巡检 worker（ANALYTICS_SCAN_WORKER≠1），无法入队。",
+    en: "Scan worker is disabled on this instance (ANALYTICS_SCAN_WORKER≠1).",
+    pt: "O worker de varredura esta desativado nesta instancia (ANALYTICS_SCAN_WORKER≠1).",
+    hi: "इस इंस्टेंस पर स्कैन वर्कर बंद है (ANALYTICS_SCAN_WORKER≠1)।",
+  },
+  scan_job_running: {
+    zh: "同日期规则集已有进行中的巡检，请稍后再试或刷新列表。",
+    en: "A scan for this date and rule set is already running. Refresh or try again shortly.",
+    pt: "Ja existe uma varredura em andamento para esta data e conjunto de regras.",
+    hi: "इस तिथि और नियम सेट के लिए स्कैन पहले से चल रहा है।",
+  },
   TOOL_READ_FIELD_MAPPING_HINT_MISSING: {
     zh: "当前模块没有渲染规则配置，请继续从源码确认字段和枚举映射。",
     en: "This module has no render-rule config. Continue checking the source for field and enum mappings.",
@@ -747,6 +759,8 @@ function interpolate(template: string, params?: Record<string, string | number |
 export function localizeToken(locale: UiLocale, token?: LocalizedToken | null, fallbackCode = "GENERIC_UNKNOWN_ERROR"): string {
   const item = token?.code ? TOKEN_TEXT[token.code] : undefined;
   if (item) return interpolate(pickStrictLocalized(locale, item), token?.params);
+  // 未录入词典时优先用服务端 defaultMessage，避免把 SCAN_* 等业务错误吞成「操作失败」。
+  if (token?.defaultMessage?.trim()) return interpolate(token.defaultMessage, token?.params);
   const fallback = TOKEN_TEXT[fallbackCode] || GENERIC_FALLBACKS.GENERIC_UNKNOWN_ERROR;
   return interpolate(pickStrictLocalized(locale, fallback), token?.params);
 }

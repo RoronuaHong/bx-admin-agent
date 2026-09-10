@@ -46,7 +46,9 @@
 
 > **Worker = 工具子集（whitelist）+ 领域系统提示 + 环境/项目配置的声明式组合。** 所有 Worker 共享同一个模型池、同一个 LangGraph 执行引擎，只是每次请求按路由结果「装配」不同的上下文。
 
-> **补充边界（2026-09-07）**：前端产品层现在可以是「多 Agent 门户」, 例如先展示后台管理 Agent、知识库 / RAG Agent、观影助手 Agent 等入口；`Trace` 已调整为门户 Header 中的独立观测入口，按权限展示与访问控制。当前权限策略已支持账号白名单 / 黑名单与国家线白名单收紧，但仍不等于服务端已经进入“总 Agent + 多个独立子 Agent”运行时。门户层解决的是用户入口与产品编排，本文讨论的是后台管理 Agent 内部的运行时编排。
+> **补充边界（2026-09-07）**：前端产品层可以是「多 Agent 门户」；`Trace` 为门户级观测入口。  
+> **产品层主从（2026-09-10 定稿建议）**：门户默认进入**总 Agent**，再分发到各**子 Agent**，且**子 Agent 鉴权相互独立**——详见 **[PORTAL_SUPERVISOR_AGENT.md](./PORTAL_SUPERVISOR_AGENT.md)**。  
+> 注意：本文主体讨论的是**后台管理会话内部**的 Supervisor + Worker 运行时装配；**不等于**已经实现门户总台分发。门户总台与进程内 Worker 是两层，可衔接但不可混鉴权。
 
 这个设计带来：
 - **零新增常驻服务**（不破现有 PM2 单进程哲学）
@@ -256,3 +258,4 @@ interface WorkerDef {
 | 2026-09-05 | **观影助手方案定稿（文档 only）**：新增 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)；Worker 清单登记 `consumer-viewing`（高优）；Web 先行 / 不做 App / MVP 必补 / 多语言跟聊；代码未实现 |
 | 2026-09-05 | **M1 收尾落地**：① Worker `systemPrompt` 经 `buildStaticGuide` + understand 动态注入；② 注册 `backend-api-bx-film-admin-prod`（`writeConfirmPolicy=always`）；③ `session.activeEnvironment` / `activeWorkerId` 持久化，`route_to_agent` 写入；④ `call_api.environment` + `resolveBaseUrl(country×env)`（prod 读 `COUNTRY_*_PROD_*_URL`）；⑤ 路由后工具菜单 = 白名单 ∪ META_TOOLS；⑥ `m1-instance-check.mjs` 扩覆盖。独立 `[route]` 节点仍不拆（路由仍在 understand⇄tool） |
 | 2026-09-05 | **M1 路由完善**：未路由时工具菜单收紧为 **仅 META_TOOLS**（机制强制先 `route_to_agent`，杜绝默认全量绕过）；注入 `[workflow/m1-route]` 引导；`/chat/context/clear` 同步清空 Worker；新增自然问法评测 `eval-m1-routing-natural.mjs` |
+| 2026-09-10 | **产品层主从定稿建议**：新增 [PORTAL_SUPERVISOR_AGENT.md](./PORTAL_SUPERVISOR_AGENT.md)——门户总 Agent 分发 + 子 Agent 独立鉴权；总台阶段 A 不登录；结果默认总台气泡；问数不混后台账；与本文进程内 Worker 分界写清；**代码未开工** |

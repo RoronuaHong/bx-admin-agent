@@ -2,6 +2,7 @@
 import { onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { fetchCountries, getApiErrorToken, login, type Country } from "../api";
+import AgentChromeNav from "../components/AgentChromeNav.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { localizeToken } from "../localize";
@@ -42,9 +43,9 @@ async function submit() {
 <template>
   <main class="stage">
     <header class="top">
-      <p class="kicker">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</p>
+      <p class="kicker">{{ tx("后台管理 Agent · 登录", "Admin Agent · Sign in", "Agent de Backoffice · Entrar", "एडमिन एजेंट · साइन इन") }}</p>
       <div class="top-actions">
-        <RouterLink class="ghost-link" to="/">{{ tx("返回门户", "Back to portal", "Voltar ao portal", "पोर्टल पर वापस") }}</RouterLink>
+        <AgentChromeNav current-key="admin" />
         <UiLocaleSelect />
         <ThemeToggle />
       </div>
@@ -52,7 +53,7 @@ async function submit() {
 
     <section class="sheet">
       <h1 class="brand-mark">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</h1>
-      <p class="lead">{{ tx("登录后进入后台管理 Agent 工作台，用自然语言查询与管理运营后台各业务模块。", "Sign in to enter the admin agent workspace and manage backend operations in natural language.", "Faca login para entrar no espaco de trabalho do agente de backoffice e operar o painel com linguagem natural.", "लॉगिन करके एडमिन एजेंट वर्कस्पेस में प्रवेश करें और प्राकृतिक भाषा में बैकएंड ऑपरेशंस संभालें।") }}</p>
+      <p class="lead">{{ tx("仅用于后台管理 Agent。其它 Agent 使用各自独立鉴权，不与此账号混用。", "For the Admin Agent only. Other agents use their own auth and do not share this account.", "Apenas para o Agent de Backoffice. Os demais agentes usam auth propria e nao compartilham esta conta.", "केवल एडमिन एजेंट के लिए। अन्य एजेंट अपना auth इस्तेमाल करते हैं, यह खाता साझा नहीं।") }}</p>
       <form class="form" @submit.prevent="submit">
         <label>
           {{ tx("国家 / 环境", "Country / Environment", "Pais / Ambiente", "देश / वातावरण") }}
@@ -71,17 +72,51 @@ async function submit() {
         <p v-if="error" class="error">{{ error }}</p>
         <button type="submit" :disabled="loading">{{ loading ? tx("登录中…", "Signing in…", "Entrando…", "साइन इन हो रहा है…") : tx("进入", "Enter", "Entrar", "प्रवेश करें") }}</button>
       </form>
-      <p class="hint">{{ tx("该登录仅用于后台管理 Agent，使用原运营账号进入对应国家线。Trace 等受控入口会按账号权限显示。", "This sign-in is for the admin agent only. Use your existing operations account for the selected country. Controlled entries such as Trace are shown by account permission.", "Este login e apenas para o agente de backoffice. Use sua conta operacional existente para o pais selecionado. Entradas controladas, como Trace, aparecem conforme a permissao da conta.", "यह लॉगिन केवल एडमिन एजेंट के लिए है। चुने गए देश के लिए अपना मौजूदा ऑपरेशंस खाता उपयोग करें। Trace जैसे नियंत्रित प्रवेश खाते की अनुमति के अनुसार दिखेंगे।") }}</p>
+      <p class="hint">{{ tx("使用原运营账号进入对应国家线。问数 / 知识库 / 观影不走此登录。", "Use your ops account for the selected country. Analytics / knowledge / viewing do not use this sign-in.", "Use a conta operacional do pais. Analise / conhecimento / visualizacao nao usam este login.", "चुने देश के ops खाते से प्रवेश करें। एनालिटिक्स / नॉलेज / व्यूइंग इस लॉगिन से नहीं।") }}</p>
     </section>
   </main>
 </template>
 
 <style scoped>
 .stage {
+  --agent-accent: #c2410c;
+  --agent-accent-2: #b45309;
+  position: relative;
+  isolation: isolate;
   min-height: 100dvh;
   display: flex;
   flex-direction: column;
   padding: calc(18px + var(--safe-top)) var(--pad) calc(24px + var(--safe-bottom));
+  overflow: hidden;
+  background:
+    radial-gradient(820px 420px at 8% -10%, color-mix(in srgb, #c2410c 22%, transparent), transparent 58%),
+    radial-gradient(640px 380px at 92% 8%, color-mix(in srgb, #b45309 14%, transparent), transparent 55%),
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--bg) 90%, #ffedd5) 0%,
+      var(--bg) 48%,
+      color-mix(in srgb, var(--bg) 92%, #fff7ed) 100%
+    );
+}
+
+.stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.28;
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--ink) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--ink) 5%, transparent) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse 78% 68% at 50% 18%, #000 18%, transparent 72%);
+}
+
+.top,
+.sheet {
+  position: relative;
+  z-index: 1;
 }
 
 .top {
@@ -95,6 +130,11 @@ async function submit() {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 18%, var(--line));
+  border-radius: calc(var(--radius) + 2px);
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  backdrop-filter: blur(10px);
 }
 
 .ghost-link {
@@ -103,7 +143,7 @@ async function submit() {
   justify-content: center;
   height: 32px;
   padding: 0 12px;
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 16%, var(--line));
   border-radius: var(--radius-sm);
   color: var(--muted);
   text-decoration: none;
@@ -111,30 +151,36 @@ async function submit() {
 }
 
 .ghost-link:hover {
-  color: var(--ink);
-  background: var(--fill-soft);
+  color: color-mix(in srgb, var(--agent-accent) 50%, var(--ink));
+  background: color-mix(in srgb, var(--agent-accent) 10%, var(--fill-soft));
 }
 
 .kicker {
   margin: 0;
-  color: var(--muted);
+  color: color-mix(in srgb, var(--agent-accent) 70%, var(--muted));
   font-size: 11px;
   letter-spacing: 0.28em;
   text-transform: uppercase;
+  font-weight: 700;
 }
 
-
 .sheet {
-  width: min(420px, 100%);
+  width: min(440px, 100%);
   margin: auto 0;
+  padding: 24px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 22%, var(--line));
+  border-radius: calc(var(--radius) + 8px);
+  background: color-mix(in srgb, var(--panel) 88%, #ffedd5);
+  box-shadow: 0 18px 48px color-mix(in srgb, var(--agent-accent) 12%, transparent);
   animation: rise 0.55s ease both;
 }
 
 h1 {
   margin: 0;
-  font-size: clamp(40px, 11vw, 64px);
-  line-height: 0.92;
+  font-size: clamp(36px, 9vw, 56px);
+  line-height: 0.95;
   font-weight: 600;
+  color: color-mix(in srgb, var(--agent-accent) 28%, var(--ink));
 }
 
 .lead,
@@ -144,7 +190,7 @@ h1 {
 }
 
 .lead {
-  margin: 16px 0 32px;
+  margin: 16px 0 28px;
   max-width: 28em;
 }
 
@@ -165,13 +211,20 @@ input,
 select,
 button {
   height: 48px;
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 14%, var(--line));
   background: var(--fill);
   color: var(--ink);
   padding: 0 14px;
   font-size: 16px;
   border-radius: var(--radius);
   appearance: none;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--agent-accent) 45%, var(--line));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent-accent) 14%, transparent);
 }
 
 select {
@@ -187,18 +240,18 @@ select {
 
 button {
   margin-top: 6px;
-  background: var(--ink);
-  color: var(--bg);
-  border-color: var(--ink);
+  background: var(--agent-accent);
+  color: #fff;
+  border-color: var(--agent-accent);
   cursor: pointer;
   font-size: 14px;
   font-weight: 600;
-  border-radius: var(--radius-sm);
-  transition: opacity 0.16s ease, transform 0.12s ease;
+  border-radius: 999px;
+  transition: opacity 0.16s ease, transform 0.12s ease, background 0.16s ease;
 }
 
 button:hover:not(:disabled) {
-  opacity: 0.88;
+  background: color-mix(in srgb, var(--agent-accent) 82%, #000);
 }
 
 button:active:not(:disabled) {
@@ -218,6 +271,17 @@ button:disabled {
 .hint {
   margin: 22px 0 0;
   font-size: 12px;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 @media (min-width: 900px) {

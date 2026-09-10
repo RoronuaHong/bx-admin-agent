@@ -15,6 +15,7 @@ import { resolveApiModules } from "./api-index.js";
 import { loadApiOperationIndex, resolveApiOperation } from "./api-operation-index.js";
 import { extractGrepPattern } from "./tool-gate.js";
 import { runContractSearch } from "./query-contraction.js";
+import { recallByNearTitles, formatNearTitleHits } from "./title-near-neighbor.js";
 import { truncateToolResultForUi } from "./ui-truncate.js";
 import { resolveLocalDoc } from "./sources.js";
 import { defaultFieldMappingPath } from "./agent-docs.js";
@@ -936,6 +937,31 @@ export async function orchestrateBusinessQuery(ctx: OrchestrateContext): Promise
   const grep = await runOrchestrateTool("grep_codebase", { pattern, maxResults: 12 }, ctx, steps);
   steps = grep.steps;
   let module = await resolveModuleFromGrep(grep.content, parsedModule, ctx, steps, extractGrepPattern(plainUserText));
+  // 近邻标题召回（优先于收缩）：口语与菜单仅差 1～2 字时，避免收缩短词截胡。纯编辑距离，无同义词表。
+  if (!module) {
+    const term = extractGrepPattern(plainUserText);
+    if (/[\u4e00-\u9fa5]{2,}/.test(term)) {
+      try {
+        const root = resolveCodebaseRoot();
+        const nearHits = recallByNearTitles(term, root, 8);
+        if (nearHits.length === 1) {
+          const h = nearHits[0];
+          steps.push({ kind: "system", text: formatNearTitleHits(term, nearHits) });
+          module = await resolveModuleFromGrep(
+            h.files.join("\n"),
+            parsedModule,
+            ctx,
+            steps,
+            h.title,
+          );
+        } else if (nearHits.length > 1) {
+          // 等距多近邻：交澄清，不硬调、不落到收缩误召回
+          steps.push({ kind: "system", text: formatNearTitleHits(term, nearHits) });
+          return { kind: "clarification", clarificationText: formatNearTitleHits(term, nearHits), steps };
+        }
+      } catch { /* 近邻失败继续收缩 */ }
+    }
+  }
   // 收缩重搜兜底（2026-08-24，方案 A）：口语词「留存报表」≠ 源码命名「留存率数据统计」（retentionTotal），
   // 整词 grep 零命中且模块未解析时，词尾逐字收缩（报表→留存）后轻量 grep api/views，首个命中候选即返回。
   // 命中结果复用 resolveModuleFromGrep 提取模块 id（api 路径直接命中 / views 读页面源码找 api import），

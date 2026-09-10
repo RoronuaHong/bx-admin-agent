@@ -4,6 +4,12 @@ import AgentPlaceholderPage from "../components/AgentPlaceholderPage.vue";
 const page = {
   title: { zh: "知识库 / RAG Agent", en: "Knowledge / RAG Agent", pt: "Agent de Conhecimento / RAG", hi: "नॉलेज / RAG एजेंट" },
   kicker: { zh: "知识检索入口 · 占位页", en: "Knowledge entry · Placeholder", pt: "Entrada de conhecimento · Pagina provisoria", hi: "नॉलेज एंट्री · प्लेसहोल्डर" },
+  welcome: {
+    zh: "你好，我是知识库 / RAG Agent。正式检索对话尚未接入；你可以先了解能力范围，或返回门户使用其它 Agent。",
+    en: "Hi, I'm the Knowledge / RAG Agent. Live retrieval chat is not wired yet — browse the scope below, or return to the portal for other agents.",
+    pt: "Ola, sou o Agent de Conhecimento / RAG. O chat de recuperacao ainda nao esta ligado — veja o escopo abaixo ou volte ao portal.",
+    hi: "नमस्ते, मैं नॉलेज / RAG एजेंट हूँ। लाइव खोज अभी नहीं जुड़ी — नीचे दायरा देखें या पोर्टल पर लौटें।",
+  },
   lead: {
     zh: "该 Agent 用于承接知识库、制度、流程、文档检索类能力。当前版本先占住产品入口，并明确能力范围；等独立工作台、登录策略与检索交互整理完成后，再升级为正式 RAG Agent 页面。",
     en: "This agent is reserved for knowledge-base, policy, process, and document retrieval workflows. For now it exists as a product entry and capability placeholder. It should become a full RAG workspace only after its standalone UX, auth rules, and retrieval flow are ready.",
@@ -19,5 +25,5 @@ const page = {
 </script>
 
 <template>
-  <AgentPlaceholderPage v-bind="page" />
+  <AgentPlaceholderPage v-bind="page" accent="knowledge" current-key="knowledge" />
 </template>

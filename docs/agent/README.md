@@ -16,6 +16,7 @@ PC 后台仓库 `bx-film-admin-in2` 不再维护 `docs/agent` 正文（仅保留
 | [VERIFY_SCENARIOS.md](./VERIFY_SCENARIOS.md) | 多场景端到端验证报告（简单/复杂/超复杂/续聊/错误返回，2026-08-22） |
 | [PROMPT_ARCHITECTURE.md](./PROMPT_ARCHITECTURE.md) | Prompt 分层架构：阶段1（输入→工具返回）零业务 prompt / 阶段2（工具返回→输出）薄 prompt，含去留决策表与可行性检查 |
 | [MULTI_AGENT_ARCHITECTURE.md](./MULTI_AGENT_ARCHITECTURE.md) | Multi-Agent 架构规划（Supervisor 路由 + Worker 配置化上下文；领域 × 环境维度；M0→M3 落地路径，2026-09-02） |
+| [PORTAL_SUPERVISOR_AGENT.md](./PORTAL_SUPERVISOR_AGENT.md) | **门户总 Agent 分发 + 子 Agent 独立鉴权**（产品层主从；阶段 A/B/C；与进程内 Worker 分界，2026-09-10） |
 | [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md) | **高优** 观影助手 Agent 方案（**Web 先行、不做 App**；Worker `consumer-viewing`；Mock/API 占位；对标瑞幸/BOSS 交互，2026-09-05） |
 | [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) | A2A 接入方案（Agent2Agent 标准：对外 A2A Server 暴露 + 挂 M3 的 A2A Client 编排；Agent Card/JSON-RPC/Task→chatStream 映射/只读安全，2026-09-03） |
 

@@ -243,9 +243,10 @@ function resolveByModuleTokenHint(
     const pathHits: ApiOperation[] = [];
     const seenId = new Set<string>();
     const seenPath = new Set<string>();
+    const moduleOps: ApiOperation[] = [];
+    const seenMod = new Set<string>();
     for (const o of index.operations) {
       const idFunc = o.func || o.id.split(".").pop() || "";
-      if (!funcsLooselyRelated(func, idFunc)) continue;
       const pathSegs = normalizeApiPath(o.path)
         .toLowerCase()
         .split("/")
@@ -255,6 +256,11 @@ function resolveByModuleTokenHint(
       const modTailFlat = flattenIdent((o.module || "").split("/").pop() || "");
       const fileFlat = flattenIdent((o.file || "").replace(/\.ts$/i, "").split("/").pop() || "");
       const idMatch = modIdFlat === token || modTailFlat === token || fileFlat === token;
+      if (idMatch && !seenMod.has(o.id)) {
+        seenMod.add(o.id);
+        moduleOps.push(o);
+      }
+      if (!funcsLooselyRelated(func, idFunc)) continue;
       const pathMatch = pathSegs.includes(token);
       if (idMatch) {
         if (!seenId.has(o.id)) {
@@ -271,6 +277,18 @@ function resolveByModuleTokenHint(
     // 优先模块 id/文件名精确命中（避免 sysUser→user 时 path 里多个 /user/ 并集歧义）
     if (idHits.length === 1) return idHits[0];
     if (idHits.length === 0 && pathHits.length === 1) return pathHits[0];
+
+    // 最长模块 token 已对应真实模块，但 func 未宽松命中：只在该模块内二次匹配，
+    // 禁止再落到更短前缀 token（account_merge.getList 不得截胡成 account.getList）。
+    if (token === ordered[0] && moduleOps.length > 0) {
+      const readListish = moduleOps.filter((o) => /^(get|list|query|search)/i.test(o.func || ""));
+      if (readListish.length === 1) return readListish[0];
+      if (/list/i.test(func) && readListish.length > 1) {
+        const prefer = readListish.filter((o) => /list|logs|page|search|query/i.test(o.func || ""));
+        if (prefer.length === 1) return prefer[0];
+      }
+      return null;
+    }
   }
   return null;
 }

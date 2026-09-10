@@ -17,7 +17,7 @@
     "eval-full-chain": "tsx scripts/eval-full-chain.mjs",
     "eval-e2e-chat": "tsx scripts/eval-e2e-chat.mjs",
     "eval:ui-locale": "tsx scripts/eval-ui-locale-smoke.mjs",
-    "test": "tsx scripts/eval-core.test.ts && tsx scripts/rate-limit.test.ts && tsx scripts/alert-notify.test.ts && tsx scripts/prompt-guard.test.ts && tsx scripts/api-op-path-segment.test.ts && tsx scripts/user-prefs.test.ts && tsx scripts/tool-result-contract.test.ts && tsx scripts/permissions.test.ts",
+    "test": "tsx scripts/eval-core.test.ts && tsx scripts/rate-limit.test.ts && tsx scripts/alert-notify.test.ts && tsx scripts/prompt-guard.test.ts && tsx scripts/api-op-path-segment.test.ts && tsx scripts/user-prefs.test.ts && tsx scripts/tool-result-contract.test.ts && tsx scripts/permissions.test.ts && tsx scripts/chat-task-persistence.test.ts && tsx scripts/trace-empty-stats.test.ts",
     "eval:core": "tsx scripts/eval-core.test.ts",
     "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
     "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",

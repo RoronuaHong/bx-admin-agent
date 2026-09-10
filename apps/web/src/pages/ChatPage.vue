@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
-import { useRouter } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 import { clearChatContext, downloadUrl, fetchMe, fetchModels, fetchTaskStatus, getApiErrorToken, logout, streamChat, uploadFiles, fetchConversations, createConversation, saveConversationMessages, deleteConversation as apiDeleteConversation, clearConversation as apiClearConversation, type ChatEvent, type Me, type ModelInfo, type UploadResult } from "../api";
 import { createBackgroundTaskSync } from "../chat-background-sync";
 import { resizeComposerBox, startComposerResizeDrag } from "../chat-composer";
 import { renderChatMarkdown } from "../chat-richtext";
 import { applyChatStreamEvent, toolStatusTextForLocale } from "../chat-stream-events";
+import AgentChromeNav from "../components/AgentChromeNav.vue";
+import ChatShell from "../components/ChatShell.vue";
 import {
   TASK_RESULTS_ID,
   clearIdentityCache,
@@ -53,7 +55,8 @@ const renderMarkdown = renderChatMarkdown;
 const me = shallowRef<Me | null>(null);
 const input = ref("");
 const sending = ref(false);
-const scroller = ref<HTMLElement | null>(null);
+const shellRef = ref<{ threadEl: HTMLElement | null } | null>(null);
+const scroller = computed(() => shellRef.value?.threadEl ?? null);
 const composerInput = ref<HTMLTextAreaElement | null>(null);
 const scrollTop = ref(0);
 // 聊天区自定义滚动条（div 模拟）
@@ -127,9 +130,31 @@ function setAllCards(cards: boolean[], v: boolean) {
 }
 
 // 给每条消息挂上对应卡片展开数组（id 不变的复用旧数组，保持单卡展开状态）
-const messagesWithCards = computed(() =>
-  activeMessages.value.map((item) => ({ item, cards: cardsOf(item.id, item.toolResults?.length ?? 0) })),
-);
+const messagesWithCards = computed(() => {
+  const list = activeMessages.value.map((item) => ({
+    item,
+    cards: cardsOf(item.id, item.toolResults?.length ?? 0),
+    welcome: false,
+  }));
+  if (list.length > 0) return list;
+  return [
+    {
+      item: {
+        id: 0,
+        role: "assistant" as const,
+        text: tx(
+          "你好，我是后台管理 Agent。可以用自然语言查询与操作运营后台：查列表、看详情、改配置前会先确认。直接描述你的目标即可。",
+          "Hi, I'm the Admin Agent. Query and manage the ops backend in natural language — lists, details, and confirmed writes. Just describe your goal.",
+          "Ola, sou o Agent de Backoffice. Consulte e opere o painel em linguagem natural: listas, detalhes e escritas com confirmacao. Descreva seu objetivo.",
+          "नमस्ते, मैं एडमिन एजेंट हूँ। प्राकृतिक भाषा में बैकएंड संभालें — सूची, विवरण, पुष्टि के साथ लेखन। अपना लक्ष्य बताएं।",
+        ),
+        finished: true,
+      },
+      cards: [] as boolean[],
+      welcome: true,
+    },
+  ];
+});
 
 function newId() {
   return newConversationId();
@@ -1032,9 +1057,10 @@ async function onClearContext() {
 </script>
 
 <template>
-  <div class="booth">
-    <header class="top">
+  <ChatShell ref="shellRef" accent="admin" @thread-scroll="onThreadScroll">
+    <template #header>
       <div class="identity">
+        <p class="brand-kicker">{{ tx("运营后台 · 工具工作台", "Ops backend · Tool workspace") }}</p>
         <RouterLink class="brand-mark" to="/">{{ tx("后台管理 Agent", "Admin Agent", "Agent de Backoffice", "एडमिन एजेंट") }}</RouterLink>
       </div>
       <div class="actions">
@@ -1045,6 +1071,7 @@ async function onClearContext() {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
+        <AgentChromeNav current-key="admin" />
         <UiLocaleSelect />
         <ThemeToggle />
         <RouterLink v-if="me?.permissions?.entries?.trace" class="ghost" to="/trace">{{ tx("调用观察", "Trace", "Rastreamento", "ट्रेस") }}</RouterLink>
@@ -1052,10 +1079,9 @@ async function onClearContext() {
         <button class="ghost" type="button" :disabled="sending" @click="onClearContext">{{ tx("重置对话", "Reset Chat", "Redefinir Chat", "चैट रीसेट करें") }}</button>
         <button class="ghost" type="button" @click="onLogout">{{ tx("退出", "Logout", "Sair", "लॉगआउट") }}</button>
       </div>
-    </header>
+    </template>
 
-    <CapabilitiesHelp v-model:open="helpOpen" @use-example="useHelpExample" />
-
+    <template #subnav>
     <nav class="tabs" :aria-label="tx('会话切换', 'Conversation Tabs', 'Abas de Conversa', 'वार्तालाप टैब')">
       <div
         v-for="(conv, idx) in conversations"
@@ -1085,61 +1111,11 @@ async function onClearContext() {
       </div>
       <button class="tab-new" type="button" :title="tx('新建会话', 'New conversation', 'Nova conversa', 'नई वार्तालाप')" @click="newConversation">＋</button>
     </nav>
+    </template>
 
-    <Teleport to="body">
-      <template v-if="tabMenu">
-        <div class="tab-ctx-backdrop" @click="hideTabMenu" @contextmenu.prevent="hideTabMenu" />
-        <ul
-          class="tab-ctx-menu"
-          role="menu"
-          :style="{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }"
-          @click.stop
-        >
-          <li role="none">
-            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">{{ tx("关闭", "Close", "Fechar", "बंद करें") }}</button>
-          </li>
-          <li role="none">
-            <button
-              type="button"
-              role="menuitem"
-              :disabled="conversations.length <= 1"
-              @click="closeOtherConversations(tabMenu.convId)"
-            >
-              {{ tx("关闭其他", "Close Others", "Fechar Outros", "अन्य बंद करें") }}
-            </button>
-          </li>
-          <li role="none">
-            <button
-              type="button"
-              role="menuitem"
-              :disabled="tabMenu.idx <= 0"
-              @click="closeLeftConversations(tabMenu.convId)"
-            >
-              {{ tx("关闭左侧", "Close Left", "Fechar a Esquerda", "बाईं ओर बंद करें") }}
-            </button>
-          </li>
-          <li role="none">
-            <button
-              type="button"
-              role="menuitem"
-              :disabled="tabMenu.idx >= conversations.length - 1"
-              @click="closeRightConversations(tabMenu.convId)"
-            >
-              {{ tx("关闭右侧", "Close Right", "Fechar a Direita", "दाईं ओर बंद करें") }}
-            </button>
-          </li>
-          <li class="tab-ctx-sep" role="separator" />
-          <li role="none">
-            <button type="button" role="menuitem" @click="closeAllConversations">{{ tx("全部关闭", "Close All", "Fechar Tudo", "सभी बंद करें") }}</button>
-          </li>
-        </ul>
-      </template>
-    </Teleport>
-
-    <div class="thread-frame">
-      <main ref="scroller" class="thread" @scroll.passive="onThreadScroll">
+    <template #thread>
         <div v-if="modelNotice" class="auto-model-notice">{{ modelNotice }}</div>
-        <article v-for="{ item, cards } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
+        <article v-for="{ item, cards, welcome } in messagesWithCards" :key="item.id" :class="['msg', item.role]">
         <div class="who" :class="{ me: item.role === 'user' }">
           <span class="dot" />
           {{ item.role === "user" ? meName : tx("助手", "Assistant", "Assistente", "सहायक") }}
@@ -1246,7 +1222,7 @@ async function onClearContext() {
               />
             </div>
           </div>
-          <div class="body-actions">
+          <div v-if="!welcome" class="body-actions">
             <button
               type="button"
               class="act"
@@ -1307,12 +1283,15 @@ async function onClearContext() {
         <p v-if="item.error || item.errorToken" class="error">{{ displayErrorText(item) }}</p>
         <div v-else-if="item.cancelled" class="cancelled-note">{{ tx("已取消", "Cancelled", "Cancelado", "रद्द") }}</div>
         </article>
-      </main>
+    </template>
+
+    <template #thread-aside>
       <div class="thread-scrollbar" ref="threadTrackEl">
         <div class="thread-scrollbar-thumb" ref="threadThumbEl"></div>
       </div>
-    </div>
+    </template>
 
+    <template #float>
     <Transition name="back-top">
       <button
         v-if="scrollTop > 300"
@@ -1336,8 +1315,10 @@ async function onClearContext() {
     >
       <img :src="lightboxUrl" :alt="tx('图片大图', 'Large preview image', 'Imagem ampliada', 'बड़ी पूर्वावलोकन छवि')" />
     </div>
+    </template>
 
-    <form class="composer" @submit.prevent="send()">
+    <template #composer>
+    <form @submit.prevent="send()">
       <div class="composer-card">
         <div
           class="composer-grip"
@@ -1572,66 +1553,65 @@ async function onClearContext() {
         </div>
       </div>
     </form>
-  </div>
+    </template>
+
+    <template #modals>
+    <CapabilitiesHelp v-model:open="helpOpen" @use-example="useHelpExample" />
+
+    <Teleport to="body">
+      <template v-if="tabMenu">
+        <div class="tab-ctx-backdrop" @click="hideTabMenu" @contextmenu.prevent="hideTabMenu" />
+        <ul
+          class="tab-ctx-menu"
+          role="menu"
+          :style="{ left: `${tabMenu.x}px`, top: `${tabMenu.y}px` }"
+          @click.stop
+        >
+          <li role="none">
+            <button type="button" role="menuitem" @click="closeConversation(tabMenu.convId)">{{ tx("关闭", "Close", "Fechar", "बंद करें") }}</button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="conversations.length <= 1"
+              @click="closeOtherConversations(tabMenu.convId)"
+            >
+              {{ tx("关闭其他", "Close Others", "Fechar Outros", "अन्य बंद करें") }}
+            </button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="tabMenu.idx <= 0"
+              @click="closeLeftConversations(tabMenu.convId)"
+            >
+              {{ tx("关闭左侧", "Close Left", "Fechar a Esquerda", "बाईं ओर बंद करें") }}
+            </button>
+          </li>
+          <li role="none">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="tabMenu.idx >= conversations.length - 1"
+              @click="closeRightConversations(tabMenu.convId)"
+            >
+              {{ tx("关闭右侧", "Close Right", "Fechar a Direita", "दाईं ओर बंद करें") }}
+            </button>
+          </li>
+          <li class="tab-ctx-sep" role="separator" />
+          <li role="none">
+            <button type="button" role="menuitem" @click="closeAllConversations">{{ tx("全部关闭", "Close All", "Fechar Tudo", "सभी बंद करें") }}</button>
+          </li>
+        </ul>
+      </template>
+    </Teleport>
+    </template>
+  </ChatShell>
 </template>
 
 <style scoped>
-.booth {
-  height: 100dvh;
-  width: 100%;
-  max-width: 100vw;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto 1fr auto;
-  background: var(--bg);
-  overflow-x: hidden;
-}
-
-.top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  padding: calc(14px + var(--safe-top)) var(--pad) 14px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 88%, transparent);
-  backdrop-filter: blur(20px) saturate(1.2);
-  -webkit-backdrop-filter: blur(20px) saturate(1.2);
-  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 5%, transparent);
-  position: relative;
-  z-index: 20;
-}
-
-.identity {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-}
-
-.brand-mark {
-  font-size: 20px;
-  line-height: 1;
-  letter-spacing: 0.06em;
-  font-weight: 700;
-}
-
-.meta {
-  color: var(--muted);
-  font-size: 12px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-shrink: 0;
-}
-
 .link {
   background: none;
   border: none;
@@ -1650,32 +1630,13 @@ async function onClearContext() {
   color: var(--ink);
 }
 
-.ghost {
-  background: transparent;
-  color: var(--muted);
-  border: 1px solid var(--line);
-  cursor: pointer;
-  height: 32px;
-  padding: 0 14px;
-  font-size: 12.5px;
-  border-radius: var(--radius-sm);
-  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  line-height: 1;
-  text-decoration: none;
+:deep(.chat-shell .thread) {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
-.ghost:hover:not(:disabled) {
-  color: var(--ink);
-  background: var(--fill-soft);
-  border-color: color-mix(in srgb, var(--ink) 20%, var(--line));
-}
-
-.ghost:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+:deep(.chat-shell .thread::-webkit-scrollbar) {
+  display: none;
 }
 
 .tabs {
@@ -1897,34 +1858,6 @@ async function onClearContext() {
   background: var(--line);
 }
 
-.thread-frame {
-  position: relative;
-  min-height: 0;
-}
-
-.thread {
-  position: relative;
-  height: 100%;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 28px var(--pad) 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 26px;
-  width: 100%;
-  min-width: 0;
-  justify-self: stretch;
-  -webkit-overflow-scrolling: touch;
-  scroll-behavior: smooth;
-  /* 隐藏原生滚动条，改用自定义 .thread-scrollbar（div 模拟） */
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-.thread::-webkit-scrollbar {
-  display: none;
-}
-
 /* 聊天区自定义滚动条：默认轻微可见（滚动进度感知），hover/拖拽时高亮 */
 .thread-scrollbar {
   position: absolute;
@@ -1939,7 +1872,7 @@ async function onClearContext() {
   transition: opacity 0.18s ease;
 }
 
-.thread:hover .thread-scrollbar,
+:deep(.thread-frame:hover) .thread-scrollbar,
 .thread-scrollbar.is-dragging {
   opacity: 1;
 }
@@ -1971,81 +1904,11 @@ async function onClearContext() {
   );
 }
 
-.msg {
-  max-width: min(860px, 100%);
-  min-width: 0;
-  align-self: flex-start;
-  width: fit-content;
-  margin-right: auto;
-  animation: rise 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.msg.user {
-  max-width: min(520px, 100%);
-  align-self: flex-end;
-  margin-right: 0;
-  margin-left: auto;
-}
-
-.who {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-
-.who.me {
-  justify-content: flex-end;
-}
-
-.who .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  flex-shrink: 0;
-}
-
-.who.me .dot {
-  background: var(--ink);
-  order: 2;
-}
-
-.body {
-  margin: 0;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  /* 不加 overflow-x: hidden，让内层 .table-wrapper / pre 各自处理横向滚动 */
-  font-family: var(--font-body);
-  font-size: 14.5px;
-  line-height: 1.75;
-  background: var(--fill);
-  border: 1px solid var(--line);
-  padding: 16px 18px;
-  border-radius: var(--radius);
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 3%, transparent);
-}
-
-/* 助手气泡：对齐 DeepSeek——融于背景，无边框无底色，仅用户消息反白（见 .msg.user .body） */
-.msg:not(.user) .body {
-  background: transparent;
-  border-color: transparent;
-  box-shadow: none;
-  padding-left: 4px;
-  padding-right: 4px;
-}
-
+/* Markdown 渲染内容的排版（气泡基础样式在 ChatShell） */
 .msg:not(.user) .body:hover {
   background: color-mix(in srgb, var(--ink) 3%, transparent);
 }
 
-/* Markdown 渲染内容的排版 */
 .body :deep(p) {
   margin: 0 0 10px;
   white-space: pre-wrap;
@@ -2187,18 +2050,6 @@ async function onClearContext() {
   font-weight: 600;
   position: sticky;
   top: 0;
-}
-
-.msg:not(.user) .body:hover {
-  border-color: color-mix(in srgb, var(--ink) 12%, var(--line));
-}
-
-.msg.user .body {
-  background: var(--ink);
-  color: var(--bg);
-  border-color: var(--ink);
-  border-top-right-radius: 4px;
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 12%, transparent);
 }
 
 /* 用户气泡为深色反白底，覆盖部分元素使其可读 */
@@ -2358,7 +2209,7 @@ async function onClearContext() {
   border-top: 1px solid var(--line);
   /* 四周统一 12px，比原 10px 12px 更透气 */
   padding: 12px;
-  animation: rise 0.2s ease both;
+  animation: chat-shell-rise 0.2s ease both;
 }
 
 .reasoning-line {
@@ -2503,104 +2354,6 @@ async function onClearContext() {
   line-height: 1;
 }
 
-.composer {
-  padding: 14px var(--pad) calc(16px + var(--safe-bottom));
-  border-top: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 90%, transparent);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-}
-
-.composer-card {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  width: 100%;
-  border: 1px solid var(--line);
-  background: var(--fill);
-  border-radius: 22px;
-  padding: 4px 8px 4px 14px;
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 4%, transparent);
-  transition: border-color 0.25s ease, box-shadow 0.25s ease;
-}
-
-.composer-card:focus-within {
-  border-color: color-mix(in srgb, var(--ink) 25%, var(--line));
-  box-shadow: 0 2px 12px color-mix(in srgb, var(--ink) 6%, transparent),
-              0 0 0 3px color-mix(in srgb, var(--ink) 4%, transparent);
-}
-
-.composer-grip {
-  flex-shrink: 0;
-  height: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: row-resize;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-.composer-grip::after {
-  content: "";
-  width: 44px;
-  height: 3px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--ink) 16%, transparent);
-  transition: background 0.15s ease, transform 0.15s ease;
-}
-
-.composer-grip:hover::after,
-.composer-grip:active::after {
-  background: color-mix(in srgb, var(--ink) 35%, transparent);
-  transform: scaleX(1.12);
-}
-
-.composer-input {
-  /* 不能用 flex: 1：纵向 flex 中 flex-basis 0% 会接管主轴尺寸，导致 height 内联样式被忽略 */
-  flex: 0 0 auto;
-  min-width: 0;
-  width: 100%;
-  max-height: var(--composer-max, 70vh);
-  min-height: 130px;
-  resize: none;
-  border: 0;
-  background: transparent;
-  padding: 8px 2px 4px;
-  font-size: 15px;
-  line-height: 1.5;
-  font-family: inherit;
-  color: var(--ink);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-
-.composer-input::placeholder {
-  color: color-mix(in srgb, var(--muted) 70%, transparent);
-}
-
-.composer-input:focus,
-.composer-input:focus-visible {
-  outline: none;
-  box-shadow: none;
-}
-
-.composer-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  padding-top: 2px;
-}
-
-.toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .tool-btn {
   display: inline-flex;
   align-items: center;
@@ -2652,114 +2405,6 @@ async function onClearContext() {
   50% {
     opacity: 0.45;
   }
-}
-
-.send-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: linear-gradient(150deg, var(--accent, #4f7cff) 0%, color-mix(in srgb, var(--accent, #4f7cff) 70%, #2f5fe0) 100%);
-  color: #fff;
-  cursor: pointer;
-  transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
-}
-
-.send-btn:not(:disabled) {
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent, #4f7cff) 30%, transparent);
-}
-
-/* 停止生成态：琥珀渐变 + 顶部高光 + 舒缓呼吸光晕，替代刺眼平涂与警示灯式脉冲 */
-.send-btn.stopping {
-  background: linear-gradient(
-    150deg,
-    color-mix(in srgb, var(--stop) 80%, #fff) 0%,
-    var(--stop) 48%,
-    color-mix(in srgb, var(--stop) 70%, #000) 100%
-  );
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #fff 30%, transparent),
-    inset 0 -1px 0 color-mix(in srgb, #000 12%, transparent),
-    0 2px 10px color-mix(in srgb, var(--stop) 30%, transparent);
-  animation: stop-breathe 2.4s ease-in-out infinite;
-}
-
-.send-btn.stopping svg rect {
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: stop-icon-breathe 2.4s ease-in-out infinite;
-}
-
-@keyframes stop-breathe {
-  0%,
-  100% {
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 30%, transparent),
-      inset 0 -1px 0 color-mix(in srgb, #000 12%, transparent),
-      0 2px 8px color-mix(in srgb, var(--stop) 24%, transparent),
-      0 0 0 0 color-mix(in srgb, var(--stop) 0%, transparent);
-  }
-  50% {
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, #fff 34%, transparent),
-      inset 0 -1px 0 color-mix(in srgb, #000 12%, transparent),
-      0 2px 10px color-mix(in srgb, var(--stop) 32%, transparent),
-      0 0 0 7px color-mix(in srgb, var(--stop) 12%, transparent);
-  }
-}
-
-@keyframes stop-icon-breathe {
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-  50% {
-    transform: scale(0.9);
-    opacity: 0.66;
-  }
-}
-
-.send-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--ink) 82%, var(--line-strong));
-}
-
-.send-btn.stopping:hover:not(:disabled) {
-  background: linear-gradient(
-    150deg,
-    color-mix(in srgb, var(--stop) 84%, #fff) 0%,
-    color-mix(in srgb, var(--stop) 92%, #000) 100%
-  );
-  animation: none;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #fff 32%, transparent),
-    0 0 0 4px color-mix(in srgb, var(--stop) 16%, transparent);
-  transform: scale(1.05);
-}
-
-.send-btn.stopping:hover svg rect {
-  animation: none;
-  transform: scale(1);
-  opacity: 1;
-}
-
-.send-btn:active:not(:disabled) {
-  transform: scale(0.92);
-}
-
-.send-btn:disabled {
-  opacity: 0.28;
-  cursor: not-allowed;
-}
-
-.send-btn:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 35%, transparent);
 }
 
 /* 模型切换：按钮 + 下拉菜单 */
@@ -3363,38 +3008,38 @@ textarea {
 }
 
 @media (min-width: 900px) {
-  .thread,
-  .composer,
-  .top {
+  :deep(.chat-shell .thread),
+  :deep(.chat-shell .composer),
+  :deep(.chat-shell .top) {
     padding-left: 8vw;
     padding-right: 8vw;
   }
 
-  .brand-mark {
+  :deep(.chat-shell .brand-mark) {
     font-size: 24px;
   }
 }
 
 @media (max-width: 720px) {
-  .top {
+  :deep(.chat-shell .top) {
     gap: 8px;
     padding-top: calc(10px + var(--safe-top));
     padding-bottom: 10px;
   }
 
-  .actions {
+  :deep(.chat-shell .actions) {
     gap: 6px;
   }
 
-  .meta {
+  :deep(.chat-shell .meta) {
     display: none;
   }
 
-  .brand-mark {
+  :deep(.chat-shell .brand-mark) {
     font-size: 17px;
   }
 
-  .thread {
+  :deep(.chat-shell .thread) {
     padding: 18px var(--pad) 16px;
     gap: 20px;
   }
@@ -3412,18 +3057,8 @@ textarea {
     pointer-events: auto;
   }
 
-  .composer {
+  :deep(.chat-shell .composer) {
     padding-top: 10px;
-  }
-
-  .composer-card {
-    border-radius: 18px;
-    padding: 4px 6px 4px 12px;
-  }
-
-  .composer-input {
-    padding: 8px 2px 4px;
-    font-size: 16px;
   }
 
   .composer-toolbar {
@@ -3440,12 +3075,6 @@ textarea {
     width: 30px;
     height: 30px;
     border-radius: 9px;
-  }
-
-  .send-btn {
-    width: 30px;
-    height: 30px;
-    border-radius: 10px;
   }
 
   /* 移动端：返回顶部按钮抬到输入框(composer)上方，避开底部安全区与键盘顶起时的遮挡 */

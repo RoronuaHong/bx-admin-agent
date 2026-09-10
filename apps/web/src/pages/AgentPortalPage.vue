@@ -116,27 +116,43 @@ const traceAccessHint = computed(() => {
     </p>
 
     <section class="grid" :aria-label="tx('Agent 列表', 'Agent list', 'Lista de agentes', 'एजेंट सूची')">
-      <article
-        v-for="card in cards"
-        :key="card.key"
-        class="card"
-        :class="[
-          `tone-${card.tone}`,
-          `accent-${card.accent}`,
-          { 'is-static': !card.to, 'is-disabled': !card.enabled, 'is-featured': card.featured },
-        ]"
-      >
-        <div class="card-glow" aria-hidden="true" />
-        <div class="card-head">
-          <h2 class="card-title">
-            <RouterLink v-if="card.to" :to="card.to" class="card-link">{{ card.title }}</RouterLink>
-            <span v-else>{{ card.title }}</span>
-          </h2>
-          <span class="chip">{{ card.chip }}</span>
-        </div>
-        <p>{{ card.desc }}</p>
-        <span class="cta">{{ card.cta }} <span class="cta-arrow" aria-hidden="true">→</span></span>
-      </article>
+      <template v-for="card in cards" :key="card.key">
+        <RouterLink
+          v-if="card.to"
+          :to="card.to"
+          class="card is-link"
+          :class="[
+            `tone-${card.tone}`,
+            `accent-${card.accent}`,
+            { 'is-disabled': !card.enabled, 'is-featured': card.featured },
+          ]"
+        >
+          <div class="card-glow" aria-hidden="true" />
+          <div class="card-head">
+            <h2 class="card-title">{{ card.title }}</h2>
+            <span class="chip">{{ card.chip }}</span>
+          </div>
+          <p>{{ card.desc }}</p>
+          <span class="cta">{{ card.cta }} <span class="cta-arrow" aria-hidden="true">→</span></span>
+        </RouterLink>
+        <article
+          v-else
+          class="card is-static"
+          :class="[
+            `tone-${card.tone}`,
+            `accent-${card.accent}`,
+            { 'is-disabled': !card.enabled, 'is-featured': card.featured },
+          ]"
+        >
+          <div class="card-glow" aria-hidden="true" />
+          <div class="card-head">
+            <h2 class="card-title">{{ card.title }}</h2>
+            <span class="chip">{{ card.chip }}</span>
+          </div>
+          <p>{{ card.desc }}</p>
+          <span class="cta">{{ card.cta }} <span class="cta-arrow" aria-hidden="true">→</span></span>
+        </article>
+      </template>
     </section>
   </main>
 </template>
@@ -386,6 +402,15 @@ h1 {
   font-size: clamp(24px, 3vw, 30px);
 }
 
+.card.is-link {
+  cursor: pointer;
+}
+
+.card.is-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--card-accent) 55%, transparent);
+  outline-offset: 3px;
+}
+
 .card.is-static {
   cursor: default;
 }
@@ -393,6 +418,7 @@ h1 {
 .card.is-disabled {
   opacity: 0.72;
   filter: grayscale(0.2);
+  pointer-events: none;
 }
 
 .card.is-static:hover {
@@ -411,27 +437,11 @@ h1 {
   z-index: 1;
 }
 
-.card h2 {
+.card h2,
+.card-title {
   margin: 0;
   font-size: 20px;
   letter-spacing: -0.02em;
-}
-
-.card-link {
-  color: inherit;
-  text-decoration: none;
-}
-
-.card-link::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-}
-
-.card-link:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--card-accent) 55%, transparent);
-  outline-offset: 4px;
-  border-radius: calc(var(--radius) + 6px);
 }
 
 .card p {

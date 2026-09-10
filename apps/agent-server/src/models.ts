@@ -308,6 +308,11 @@ async function callOpenAiAgent(
           // （thinking.type=disabled），从而恢复 tool_choice 的 required/auto 语义，让首轮强制工具
           // 调用机制（方案 C）对其完全生效，且不丢失业务 agent 能力（工具调用链另有 reasoning 事件展示）。
           tool_choice: opts.toolChoice === "required" ? "required" : "auto",
+          // 默认禁止并行 tool_calls：弱模型（dsflash）常一次吐出几十个重复 submit，白白烧 completion token。
+          // 需要并行时设 PARALLEL_TOOL_CALLS=1。不支持该字段的网关一般会忽略。
+          ...(process.env.PARALLEL_TOOL_CALLS === "1" || process.env.PARALLEL_TOOL_CALLS === "true"
+            ? {}
+            : { parallel_tool_calls: false }),
         }
       : {}),
     // 思考模型关闭思考模式：避免与 tool_choice 强制冲突，同时降低 token 消耗（官方推荐）。
@@ -368,6 +373,20 @@ async function callOpenAiAgent(
   const toolAccum = new Map<number, { id?: string; name?: string; arguments: string }>();
   // 从文本 JSON 中提取的额外 tool_calls（模型误将 function calling 输出为纯文本）
   const textParsedToolCalls: ToolCall[] = [];
+  // 流式早停：已见到 ≥2 个 submit_understood_intent，或并行工具槽位过多时取消剩余生成，省 completion token
+  const SUBMIT_NAME = "submit_understood_intent";
+  const MAX_PARALLEL_TOOL_SLOTS = Number(process.env.MAX_PARALLEL_TOOL_SLOTS || 6);
+  let abortStreamForSpam = false;
+
+  const shouldAbortForToolSpam = (): boolean => {
+    let submitCount = 0;
+    for (const acc of toolAccum.values()) {
+      if (acc.name === SUBMIT_NAME) submitCount += 1;
+    }
+    if (submitCount >= 2) return true;
+    if (toolAccum.size >= MAX_PARALLEL_TOOL_SLOTS) return true;
+    return false;
+  };
 
   /** 从一段文本中解析工具调用 JSON。
    *  兼容形态：{"tool_calls":[{name,parameters|input},...]} 对象、
@@ -589,7 +608,23 @@ async function callOpenAiAgent(
         if (tc.function?.name) acc.name = tc.function.name;
         if (tc.function?.arguments) acc.arguments += tc.function.arguments;
         toolAccum.set(idx, acc);
+        if (shouldAbortForToolSpam()) {
+          abortStreamForSpam = true;
+          break;
+        }
       }
+      if (abortStreamForSpam) break;
+    }
+    if (abortStreamForSpam) {
+      console.log(
+        `[models:parallel-abort] 流式早停：submit/并行槽位过多（slots=${toolAccum.size}），取消剩余生成以省 token`,
+      );
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      break;
     }
   }
   if (buffer.trim().startsWith("data:")) {

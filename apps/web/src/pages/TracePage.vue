@@ -12,6 +12,7 @@ import {
   type TraceRunsStats,
   type TraceSpanDto,
 } from "../api";
+import AgentChromeNav from "../components/AgentChromeNav.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { localizeToken } from "../localize";
@@ -149,6 +150,7 @@ onMounted(async () => {
           <span>·</span>
           <span>{{ me?.user.name || me?.user.loginName }}</span>
         </div>
+        <AgentChromeNav />
         <UiLocaleSelect />
         <ThemeToggle />
         <RouterLink class="ghost" :to="me ? '/agents/admin/chat' : '/agents/admin/login'">{{ me ? tx("工作台", "Workspace", "Espaco de trabalho", "वर्कस्पेस") : tx("登录后台 Agent", "Sign in to Admin Agent", "Entrar no Admin Agent", "एडमिन एजेंट में साइन इन") }}</RouterLink>
@@ -303,7 +305,7 @@ onMounted(async () => {
 .actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
@@ -317,19 +319,24 @@ onMounted(async () => {
 
 .ghost {
   appearance: none;
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   background: transparent;
-  color: var(--ink);
-  border-radius: var(--radius-pill);
-  padding: 6px 12px;
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  height: 32px;
+  padding: 0 10px;
   font: inherit;
-  font-size: 0.85rem;
+  font-size: 12.5px;
   cursor: pointer;
   text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .ghost:hover:not(:disabled) {
-  border-color: var(--line-strong);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
 }
 
 .ghost:disabled {

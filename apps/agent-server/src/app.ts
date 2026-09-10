@@ -490,10 +490,9 @@ export function createApp() {
     return c.json({ ok: true, taskId: task.taskId });
   });
 
-  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数；鉴权与 scan 一致：session + analytics 入口）
+  // Metabase analytics HTTP facade（OpenClaw / 门户同步问数）
+  // 各 Agent 独立账密：不复用后台运营 session；独立登录接入前 ask 暂可匿名（内网可控环境）。
   app.post("/analytics/ask", async (c) => {
-    const gate = requireAnalyticsSession(c);
-    if ("error" in gate && gate.error) return gate.error;
     const body = await c.req.json<{ text?: string }>().catch(() => ({ text: "" }));
     const text = String(body.text || "").trim();
     if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
@@ -501,19 +500,9 @@ export function createApp() {
     return c.json(result);
   });
 
-  // M3 登录态巡检：session + analytics 门户入口权限；入队仅 scan worker
-  function requireAnalyticsSession(c: Context) {
-    const session = getSession(getCookie(c, COOKIE));
-    if (!session) return { error: errorJson(c, 401, "AUTH_SESSION_EXPIRED", undefined, "会话失效，请重新登录") };
-    if (!permissionsOf(session).entries.analytics) {
-      return { error: errorJson(c, 403, "ANALYTICS_FORBIDDEN", undefined, "无权限使用数据分析") };
-    }
-    return { session };
-  }
-
+  // 应用内巡检：与问数一致，暂不复用后台运营 session；独立登录接入前可匿名（内网可控）。
+  // cron / 运维仍可用 /internal/analytics/scan + Bearer。
   app.post("/analytics/scan/run", async (c) => {
-    const gate = requireAnalyticsSession(c);
-    if ("error" in gate && gate.error) return gate.error;
     if (!config.scan.workerEnabled) {
       return errorJson(c, 403, "SCAN_WORKER_DISABLED", undefined, "本实例未启用 scan worker（ANALYTICS_SCAN_WORKER≠1）");
     }
@@ -549,15 +538,11 @@ export function createApp() {
   });
 
   app.get("/analytics/scan/jobs", (c) => {
-    const gate = requireAnalyticsSession(c);
-    if ("error" in gate && gate.error) return gate.error;
     const limit = Math.min(Math.max(Number(c.req.query("limit")) || 20, 1), 50);
     return c.json({ jobs: listScanJobs({ limit }) });
   });
 
   app.get("/analytics/scan/jobs/:jobId", (c) => {
-    const gate = requireAnalyticsSession(c);
-    if ("error" in gate && gate.error) return gate.error;
     const job = getScanJob(c.req.param("jobId"));
     if (!job) {
       return errorJson(c, 404, "SCAN_JOB_NOT_FOUND", undefined, "scan job 不存在");
