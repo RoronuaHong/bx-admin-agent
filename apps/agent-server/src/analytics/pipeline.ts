@@ -11,10 +11,16 @@ import { resolveTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { splitSqls, verifyGrainDay, verifyNamedChannel } from "./verify.js";
 
-/** Prefer flash/dsflash if registered, else first model. */
+/** Prefer healthy flash models (dsflash first); skip known EOL ids. */
 async function llmText(system: string, user: string): Promise<string> {
   const models = listModels();
-  const model = models.find((m) => /flash|dsflash/i.test(m.id)) || models[0];
+  const eol = /nvstepflash|step-3\.7-flash|stepflash/i;
+  const preferred =
+    models.find((m) => /dsflash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
+    models.find((m) => /flash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
+    models.find((m) => !eol.test(m.id) && !eol.test(m.name)) ||
+    models[0];
+  const model = preferred;
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
   const resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -34,6 +40,7 @@ async function llmText(system: string, user: string): Promise<string> {
   });
   const data = (await resp.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
+    error?: unknown;
   };
   if (!resp.ok) throw new Error(JSON.stringify(data).slice(0, 300));
   return data.choices?.[0]?.message?.content || "";

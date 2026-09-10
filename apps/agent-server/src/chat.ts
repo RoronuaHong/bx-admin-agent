@@ -72,6 +72,11 @@ const DATA_OUTPUT_TOOLS = new Set([
   "render_table",
   "summarize_chart_data",
   "export_dataset",
+  // Analytics / Metabase（问数取数结果需完整回喂）
+  "analytics_ask",
+  "metabase_run_dataset",
+  "metabase_run_question",
+  "metabase_explain_estimate",
 ]);
 /** 探索/定位类：返回候选/源码/列定义，非真实数据（业务取数护栏：须再 call_api 才算成功取数） */
 const EXPLORE_TOOLS = new Set([
