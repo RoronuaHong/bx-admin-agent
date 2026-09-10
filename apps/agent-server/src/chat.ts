@@ -49,8 +49,9 @@ import {
   padMissingToolResults,
   deferSystemStepsPastToolResults,
   callApiKey,
-  collectSuccessfulCallApiKeys,
-  formatDuplicateCallApiSkip,
+  collectSuccessfulCallApiResults,
+  formatDuplicateCallApiReplay,
+  toolCallSignature,
 } from "./tool-call-dedupe.js";
 import {
   drillListRows,
@@ -2227,17 +2228,12 @@ export async function* chatStream(
         // understand 首轮选定的 model（无「降级成功复用」概念）。
         // M1 增强（§3.8）：Worker 配 preferredModel 时覆盖默认模型，实现「按 Agent 维度切模型」
         const activeModel = worker?.preferredModel ? (getModel(worker.preferredModel) ?? model) : model;
-        // 对齐 Cursor agent 模式：业务请求**首轮**强制工具调用——tool_choice=required 迫使模型
-        // 必须调 submit_understood_intent 提交理解，杜绝「首轮空转文本回复 → 重试仍空转 → final」
-        // 的失败路径（实测稳定性 2/3 的根因）。
-        // **后续轮次必须 auto**：让模型基于已完成探索自主决定「继续调工具 or 总结收束」——
-        // 若续探轮仍 required，模型想收束（gaveFinalText）却被强制调工具，会与收束机制矛盾、
-        // 直到 round 上限才被强制打断（Cursor 语义：首轮强制、续探自主）。
-        // 首轮强制工具调用（方案 C，2026-08-24）：业务/闲聊判别交模型，故首轮恒 required 迫使模型
-        // 调 submit_understood_intent 提交理解（杜绝首轮空转文本→重试空转失败路径）；模型提交理解后
-        // 自主决定续探还是纯文本收束。闲聊句首轮也会调 submit_understood_intent，但模型不调后续业务
-        // 工具即自然收束，延迟增加可忽略。后续轮次 auto（模型自主决定继续调工具或总结）。
-        const toolChoice: "auto" | "required" = mustSubmitUnderstood ? "required" : "auto";
+        // 对齐 Cursor：首轮必须提交理解。用 forced function（恰好调 submit 一次），
+        // 不用裸 required——后者只保证「至少一个工具」，弱模型会复制 N 份同一 submit。
+        // 后续轮次 auto，模型自主决定续探或总结。
+        const toolChoice: CallAgentOptions["toolChoice"] = mustSubmitUnderstood
+          ? { name: SUBMIT_UNDERSTOOD_INTENT }
+          : "auto";
         try {
           result = await callAgentSafe(activeModel, turns, rawImages, llmTools, llmStepsWithWorker, signal, {
             toolChoice,
@@ -2331,12 +2327,16 @@ export async function* chatStream(
         // 注意：去重说明不能插在 toolCalls 与 toolResult 之间（上游要求 tool 消息紧跟
         // assistant.tool_calls，否则 400001 insufficient tool messages）。observe 延后到本轮结果齐套后。
         const pendingDedupeObserve =
-          deduped.droppedSubmit > 0 || deduped.droppedCallApi > 0
-            ? formatParallelDedupeObserve(deduped.droppedSubmit, deduped.droppedCallApi)
+          deduped.dropped > 0
+            ? formatParallelDedupeObserve(
+                deduped.droppedSubmit,
+                deduped.droppedCallApi,
+                Math.max(0, deduped.dropped - deduped.droppedSubmit - deduped.droppedCallApi),
+              )
             : "";
         if (pendingDedupeObserve) {
           console.log(
-            `[chat:parallel-dedupe] submit×${deduped.droppedSubmit} call_api×${deduped.droppedCallApi} 已折叠（保留 ${toolCalls.length}/${state.toolCalls.length}）`,
+            `[chat:parallel-dedupe] submit×${deduped.droppedSubmit} call_api×${deduped.droppedCallApi} other×${Math.max(0, deduped.dropped - deduped.droppedSubmit - deduped.droppedCallApi)} 已折叠（保留 ${toolCalls.length}/${state.toolCalls.length}）`,
           );
         }
         let clarificationText = "";
@@ -2361,17 +2361,10 @@ export async function* chatStream(
         // 跨轮 Doom Loop 熔断（对齐 OpenCode doom_loop）：连续 ≥3 次「同一业务工具 + 同一入参」→ 判空转
         let lastToolSignature = state.lastToolSignature || "";
         let toolSignatureStreak = state.toolSignatureStreak || 0;
-        const TOOL_SIGNATURE = (c: { name: string; input: Record<string, unknown> }): string => {
-          if (c.name === CALL_API_TOOL) {
-            const op = c.input.operation ? String(c.input.operation) : "";
-            const path = c.input.path ? String(c.input.path) : "";
-            const params = c.input.params ? JSON.stringify(c.input.params) : "";
-            return `${c.name}|${op}|${path}|${params}`;
-          }
-          return `${c.name}|${JSON.stringify(c.input || {})}`;
-        };
-        // 跨轮：已成功过的 call_api 签名，同参直接跳过（演员/速递偶发连打）
-        const succeededCallApiKeys = collectSuccessfulCallApiKeys(nextSteps);
+        // 与同轮去重共用规范化签名（键序无关），避免同参不同键序漏检 doom-loop
+        const TOOL_SIGNATURE = toolCallSignature;
+        // 跨轮：已成功过的 call_api 签名 → 结果内容（回放，避免只回 observe 空壳）
+        const succeededCallApiResults = collectSuccessfulCallApiResults(nextSteps);
         // M1（Supervisor 路由）同轮隔离短路：本轮 toolCalls 含 route_to_agent 时，
         // 只执行它并立即 return，放弃本轮其余调用（call_api 等），
         // 避免 Worker 上下文切换前误执行「旧 Worker 视角」下的业务工具（同轮捆绑泄漏）。
@@ -2502,16 +2495,17 @@ export async function* chatStream(
             toolSignatureStreak = 1;
           }
 
-          // 同参 call_api 已成功过：直接跳过（不二次打上游），省延迟与 token
+          // 同参 call_api 已成功过：回放上次结果并跳过上游（通用：按签名，无业务词表）
           if (call.name === CALL_API_TOOL) {
             const dupKey = callApiKey(call);
-            if (dupKey && succeededCallApiKeys.has(dupKey)) {
-              const skip = formatDuplicateCallApiSkip(String(call.input.operation || ""));
-              console.log(`[chat:call_api-dedupe] 跳过重复成功签名 ${dupKey.slice(0, 96)}`);
+            const prior = dupKey ? succeededCallApiResults.get(dupKey) : undefined;
+            if (dupKey && prior) {
+              const skip = formatDuplicateCallApiReplay(String(call.input.operation || ""), prior);
+              console.log(`[chat:call_api-dedupe] 回放跳过重复成功签名 ${dupKey.slice(0, 96)}`);
               emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(skip) });
               nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: skip });
               toolStatus = "skip";
-              toolNote = "duplicate successful call_api";
+              toolNote = "duplicate successful call_api replay";
               continue;
             }
           }
@@ -2726,7 +2720,7 @@ export async function* chatStream(
               const failed =
                 /^(错误|ERROR|CLARIFICATION_REQUIRED|MODULE_RETRY)/i.test(body) ||
                 (codeM != null && Number(codeM[1]) !== 0);
-              if (!failed) succeededCallApiKeys.add(k);
+              if (!failed) succeededCallApiResults.set(k, body);
             }
           }
           if (call.name === SUBMIT_UNDERSTOOD_INTENT) {
@@ -3048,7 +3042,8 @@ export async function* chatStream(
                         ? `\n接口另返回 ${rendered.summaryRows.length} 条汇总行（已从明细表剔除，字段与数值见回喂表格末尾「汇总行」说明），总结时请引用其合计值。`
                         : "") +
                       `\n请用与用户原始要求相同语种的自然语言简要总结即可（勿因表头/数据单元格语种改用语种）；` +
-                      `最终回复不要再重复输出表格明细；禁止编造数据。`,
+                      `最终回复不要再重复输出表格明细；禁止编造数据；` +
+                      `禁止用完全相同的 operation+params 再次 call_api（翻页须改 page）。`,
                   });
                   // 不设 outputReady/forcedReply → 回 understand 由模型自主总结收束
                 } catch (e) {
@@ -3098,9 +3093,18 @@ export async function* chatStream(
                   );
                 }
               } else {
-                nextSteps.push(
-                  outputAlignStep("call_api 已返回数据，先 normalize_output 对齐字段，再用 render_table 推送预览（树表传 tree/children，汇总传 footer）；用户要 Excel/PDF 时调用 export_dataset。", resolvedModule),
-                );
+                // 成功但无列表行/无模块渲染（常见于 mock 空壳）：仍明确禁止同参连打
+                nextSteps.push({
+                  kind: "system",
+                  text:
+                    `[workflow/output] call_api 已成功返回。请基于工具结果如实总结（可说明为空/mock）；` +
+                    `禁止用完全相同的 operation+params 再次调用；若需翻页请改 page，若接口不对请换 operation。`,
+                });
+                if (resolvedModule) {
+                  nextSteps.push(
+                    outputAlignStep("若需表格预览：先 normalize_output 对齐字段，再用 render_table 推送。", resolvedModule),
+                  );
+                }
               }
             }
             } // 列表/详情受控渲染 else 闭合（含 chartPresented 图表优先）

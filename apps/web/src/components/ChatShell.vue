@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, useSlots } from "vue";
 
-export type ChatShellAccent = "analytics" | "admin" | "knowledge" | "viewing" | "home" | "default";
+export type ChatShellAccent = "analytics" | "admin" | "knowledge" | "viewing" | "home" | "trace" | "default";
 
 const props = withDefaults(
   defineProps<{
@@ -134,6 +134,11 @@ defineExpose({ threadEl });
 .chat-shell.accent-home {
   --agent-accent: #0f766e;
   --agent-accent-2: #ea580c;
+}
+
+.chat-shell.accent-trace {
+  --agent-accent: #4338ca;
+  --agent-accent-2: #0e7490;
 }
 
 .chat-shell .top {

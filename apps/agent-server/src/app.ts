@@ -492,11 +492,26 @@ export function createApp() {
 
   // Metabase analytics HTTP facade（OpenClaw / 门户同步问数）
   // 各 Agent 独立账密：不复用后台运营 session；独立登录接入前 ask 暂可匿名（内网可控环境）。
+  app.get("/analytics/models", (c) => {
+    return c.json({
+      models: listModels().map((m) => ({
+        id: m.id,
+        label: m.label,
+        provider: m.provider,
+        source: resolveModelSource(m.baseUrl, m.provider),
+        vision: m.vision,
+      })),
+    });
+  });
+
   app.post("/analytics/ask", async (c) => {
-    const body = await c.req.json<{ text?: string }>().catch(() => ({ text: "" }));
+    const body = await c.req
+      .json<{ text?: string; model?: string }>()
+      .catch(() => ({ text: "", model: undefined as string | undefined }));
     const text = String(body.text || "").trim();
     if (!text) return errorJson(c, 400, "ANALYTICS_EMPTY_INPUT", undefined, "请输入问数内容");
-    const result = await analyticsAsk(text);
+    const modelId = typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
+    const result = await analyticsAsk(text, { modelId, signal: c.req.raw.signal });
     return c.json(result);
   });
 

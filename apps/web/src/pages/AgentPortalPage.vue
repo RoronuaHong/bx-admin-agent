@@ -112,7 +112,14 @@ const traceAccessHint = computed(() => {
     <p v-if="me && traceAccessHint" class="notice subtle">{{ traceAccessHint }}</p>
 
     <p v-else class="notice">
-      {{ tx("登录后会按账号权限显示 Trace 等受控入口。", "Sign in to reveal permission-based entries such as Trace.", "Faca login para ver entradas controladas por permissao, como Trace.", "Trace जैसे permission-based entries देखने के लिए साइन इन करें।") }}
+      {{
+        tx(
+          "「调用观察 / Trace」跟随后台管理 Agent 的运营账号登录与权限；问数、知识库、观影各自独立鉴权，不混用此账号。",
+          "Trace follows the Admin Agent ops-account session and permissions. Analytics, knowledge, and viewing each use their own auth — not this account.",
+          "Trace segue a sessao e permissoes da conta operacional do Agent de Backoffice. Analise, conhecimento e visualizacao tem auth propria — nao misturam esta conta.",
+          "Trace एडमिन एजेंट के ops खाता सत्र और अनुमतियों पर निर्भर है। एनालिटिक्स, नॉलेज और व्यूइंग अपने auth इस्तेमाल करते हैं — यह खाता साझा नहीं।",
+        )
+      }}
     </p>
 
     <section class="grid" :aria-label="tx('Agent 列表', 'Agent list', 'Lista de agentes', 'एजेंट सूची')">

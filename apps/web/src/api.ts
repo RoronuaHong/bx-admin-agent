@@ -451,12 +451,23 @@ export interface AnalyticsAskResult {
   error?: string;
 }
 
-export async function askAnalytics(text: string): Promise<AnalyticsAskResult> {
+export async function fetchAnalyticsModels(): Promise<ModelInfo[]> {
+  const res = await fetch("/agent/analytics/models", { credentials: "include" });
+  if (!res.ok) return [];
+  const data = (await parseJson(res)) as { models: ModelInfo[] };
+  return data.models || [];
+}
+
+export async function askAnalytics(
+  text: string,
+  opts?: { model?: string; signal?: AbortSignal },
+): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, model: opts?.model }),
+    signal: opts?.signal,
   });
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({}));

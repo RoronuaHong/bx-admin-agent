@@ -135,6 +135,8 @@ async function submit() {
   border-radius: calc(var(--radius) + 2px);
   background: color-mix(in srgb, var(--panel) 78%, transparent);
   backdrop-filter: blur(10px);
+  /* Keep chrome controls (nav / locale / theme) on one baseline. */
+  line-height: 1;
 }
 
 .ghost-link {
@@ -207,9 +209,9 @@ label {
   color: var(--muted);
 }
 
-input,
-select,
-button {
+.form input,
+.form select,
+.form button[type="submit"] {
   height: 48px;
   border: 1px solid color-mix(in srgb, var(--agent-accent) 14%, var(--line));
   background: var(--fill);
@@ -220,14 +222,14 @@ button {
   appearance: none;
 }
 
-input:focus,
-select:focus {
+.form input:focus,
+.form select:focus {
   outline: none;
   border-color: color-mix(in srgb, var(--agent-accent) 45%, var(--line));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent-accent) 14%, transparent);
 }
 
-select {
+.form select {
   border-radius: var(--radius);
   background-image: linear-gradient(45deg, transparent 50%, var(--ink) 50%),
     linear-gradient(135deg, var(--ink) 50%, transparent 50%);
@@ -238,7 +240,7 @@ select {
   background-repeat: no-repeat;
 }
 
-button {
+.form button[type="submit"] {
   margin-top: 6px;
   background: var(--agent-accent);
   color: #fff;
@@ -250,15 +252,15 @@ button {
   transition: opacity 0.16s ease, transform 0.12s ease, background 0.16s ease;
 }
 
-button:hover:not(:disabled) {
+.form button[type="submit"]:hover:not(:disabled) {
   background: color-mix(in srgb, var(--agent-accent) 82%, #000);
 }
 
-button:active:not(:disabled) {
+.form button[type="submit"]:active:not(:disabled) {
   transform: translateY(1px);
 }
 
-button:disabled {
+.form button[type="submit"]:disabled {
   opacity: 0.5;
 }
 

@@ -1,4 +1,9 @@
 import type { ModelEntry } from "./config.js";
+import {
+  enforceToolCallContract,
+  parallelToolCallsAllowed,
+  shouldAbortToolCallStream,
+} from "./tool-call-dedupe.js";
 
 // 统一模型调用层：三种协议适配（anthropic / openai / ollama），均返回纯文本。
 // 调用方只需传入模型条目与本轮消息数组（含 OptionImage 时自动按模型能力处理）。
@@ -52,8 +57,13 @@ export interface AgentResult {
 }
 
 export interface CallAgentOptions {
-  /** auto=模型自行决定；required=本轮必须调用至少一个工具（workflow tool-gate 首轮使用） */
-  toolChoice?: "auto" | "required";
+  /**
+   * auto=模型自行决定；
+   * required=本轮必须调用至少一个工具；
+   * {name}=强制恰好调用指定工具一次（OpenAI forced function / Anthropic tool）——
+   * 用于首轮 submit：裸 required 会让弱模型复制 N 份同一工具。
+   */
+  toolChoice?: "auto" | "required" | { name: string };
   /**
    * 静态引导前缀（对齐 Cursor 静态 prompt 缓存）：作为 system 首条消息稳定注入，
    * 同一请求多轮循环中前缀一致 → OpenAI 兼容端点可命中 prompt cache。
@@ -61,6 +71,18 @@ export interface CallAgentOptions {
   systemExtra?: string;
   /** 追踪上下文 runId（由 chat.ts 透传），非空时 callAgentSafe 自动记录一条 llm span。 */
   traceRunId?: string;
+}
+
+function openaiToolChoice(choice: CallAgentOptions["toolChoice"]): unknown {
+  if (!choice || choice === "auto") return "auto";
+  if (choice === "required") return "required";
+  return { type: "function", function: { name: choice.name } };
+}
+
+function anthropicToolChoice(choice: CallAgentOptions["toolChoice"]): unknown {
+  if (!choice || choice === "auto") return { type: "auto" };
+  if (choice === "required") return { type: "any" };
+  return { type: "tool", name: choice.name };
 }
 
 // 带工具能力的模型调用：按协议构建消息（anthropic: tool_use/tool_result；openai: function calling），
@@ -187,7 +209,7 @@ async function callAnthropicAgent(
     ...(tools.length && model.tools !== false
       ? {
           tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })),
-          tool_choice: opts.toolChoice === "required" ? { type: "any" } : { type: "auto" },
+          tool_choice: anthropicToolChoice(opts.toolChoice),
         }
       : {}),
   };
@@ -224,9 +246,15 @@ async function callAnthropicAgent(
     .map((block) => block.text || "")
     .join("")
     .trim();
-  const toolCalls: ToolCall[] = (bodyResult?.content || [])
-    .filter((block) => block.type === "tool_use" && block.id && block.name)
-    .map((block) => ({ id: block.id!, name: block.name!, input: (block.input as Record<string, unknown>) || {} }));
+  const toolCalls = enforceToolCallContract(
+    (bodyResult?.content || [])
+      .filter((block) => block.type === "tool_use" && block.id && block.name)
+      .map((block) => ({ id: block.id!, name: block.name!, input: (block.input as Record<string, unknown>) || {} })),
+    {
+      parallelAllowed: parallelToolCallsAllowed(),
+      maxSlots: Number(process.env.MAX_PARALLEL_TOOL_SLOTS || 6),
+    },
+  );
   return {
     text,
     toolCalls,
@@ -305,14 +333,11 @@ async function callOpenAiAgent(
           })),
           // 思考模型（如 TokenHub DeepSeek-V4-Pro）在 reasoning 模式下不支持 tool_choice != auto，
           // 强制 required 会触发 400001。对齐腾讯云官方 Function Calling 示例做法：显式关闭思考模式
-          // （thinking.type=disabled），从而恢复 tool_choice 的 required/auto 语义，让首轮强制工具
-          // 调用机制（方案 C）对其完全生效，且不丢失业务 agent 能力（工具调用链另有 reasoning 事件展示）。
-          tool_choice: opts.toolChoice === "required" ? "required" : "auto",
-          // 默认禁止并行 tool_calls：弱模型（dsflash）常一次吐出几十个重复 submit，白白烧 completion token。
-          // 需要并行时设 PARALLEL_TOOL_CALLS=1。不支持该字段的网关一般会忽略。
-          ...(process.env.PARALLEL_TOOL_CALLS === "1" || process.env.PARALLEL_TOOL_CALLS === "true"
-            ? {}
-            : { parallel_tool_calls: false }),
+          // （thinking.type=disabled），从而恢复 tool_choice 的 required/forced 语义。
+          // 首轮 submit 用 forced function（{name}），避免裸 required 让弱模型复制 N 份同一工具。
+          tool_choice: openaiToolChoice(opts.toolChoice),
+          // 默认禁止并行 tool_calls；网关若仍吐多槽，流式第 2 槽立刻掐断。
+          ...(parallelToolCallsAllowed() ? {} : { parallel_tool_calls: false }),
         }
       : {}),
     // 思考模型关闭思考模式：避免与 tool_choice 强制冲突，同时降低 token 消耗（官方推荐）。
@@ -373,19 +398,28 @@ async function callOpenAiAgent(
   const toolAccum = new Map<number, { id?: string; name?: string; arguments: string }>();
   // 从文本 JSON 中提取的额外 tool_calls（模型误将 function calling 输出为纯文本）
   const textParsedToolCalls: ToolCall[] = [];
-  // 流式早停：已见到 ≥2 个 submit_understood_intent，或并行工具槽位过多时取消剩余生成，省 completion token
-  const SUBMIT_NAME = "submit_understood_intent";
+  // 流式契约：默认禁止并行 → 第 2 槽立刻取消剩余生成；完全重复本就不该继续吐。
+  const parallelAllowed = parallelToolCallsAllowed();
   const MAX_PARALLEL_TOOL_SLOTS = Number(process.env.MAX_PARALLEL_TOOL_SLOTS || 6);
   let abortStreamForSpam = false;
 
-  const shouldAbortForToolSpam = (): boolean => {
-    let submitCount = 0;
-    for (const acc of toolAccum.values()) {
-      if (acc.name === SUBMIT_NAME) submitCount += 1;
-    }
-    if (submitCount >= 2) return true;
-    if (toolAccum.size >= MAX_PARALLEL_TOOL_SLOTS) return true;
-    return false;
+  const shouldAbortForToolSpam = (): boolean =>
+    shouldAbortToolCallStream({
+      slotCount: toolAccum.size,
+      toolNames: [...toolAccum.values()].map((a) => a.name),
+      parallelAllowed,
+      maxSlots: MAX_PARALLEL_TOOL_SLOTS,
+    });
+
+  const ingestTextParsed = (extracted: ToolCall[]) => {
+    if (!extracted.length) return;
+    textParsedToolCalls.push(...extracted);
+    const capped = enforceToolCallContract(textParsedToolCalls, {
+      parallelAllowed,
+      maxSlots: MAX_PARALLEL_TOOL_SLOTS,
+    });
+    textParsedToolCalls.length = 0;
+    textParsedToolCalls.push(...capped);
   };
 
   /** 从一段文本中解析工具调用 JSON。
@@ -557,7 +591,7 @@ async function callOpenAiAgent(
             // 围栏结束：尝试解析工具调用（兼容 {tool_calls} / 裸数组 / 嵌套数组）
             const extracted = extractToolCallsFromJson(contentPending);
             if (extracted.length) {
-              textParsedToolCalls.push(...extracted);
+              ingestTextParsed(extracted);
             } else {
               // 不是工具调用 JSON → 释放围栏内容给前端
               text += contentPending;
@@ -575,7 +609,7 @@ async function callOpenAiAgent(
           if (parsed !== null) {
             const extracted = extractToolCallsFromJson(contentPending);
             if (extracted.length) {
-              textParsedToolCalls.push(...extracted);
+              ingestTextParsed(extracted);
             } else {
               // 非工具调用形态的普通 JSON → 释放给前端
               text += contentPending;
@@ -610,6 +644,11 @@ async function callOpenAiAgent(
         toolAccum.set(idx, acc);
         if (shouldAbortForToolSpam()) {
           abortStreamForSpam = true;
+          // 契约：只保留最先出现的槽，丢弃后续槽（不把重复当合法并行）
+          const keepIdx = Math.min(...toolAccum.keys());
+          for (const k of [...toolAccum.keys()]) {
+            if (k !== keepIdx) toolAccum.delete(k);
+          }
           break;
         }
       }
@@ -617,7 +656,7 @@ async function callOpenAiAgent(
     }
     if (abortStreamForSpam) {
       console.log(
-        `[models:parallel-abort] 流式早停：submit/并行槽位过多（slots=${toolAccum.size}），取消剩余生成以省 token`,
+        `[models:parallel-abort] 流式早停：违反单工具契约（slots=${toolAccum.size}, parallel=${parallelAllowed}），取消剩余生成`,
       );
       try {
         await reader.cancel();
@@ -644,7 +683,7 @@ async function callOpenAiAgent(
             if (/```\s*$/.test(contentPending)) {
               const extracted = extractToolCallsFromJson(contentPending);
               if (extracted.length) {
-                textParsedToolCalls.push(...extracted);
+                ingestTextParsed(extracted);
               } else {
                 text += contentPending;
                 onDelta?.(contentPending);
@@ -659,7 +698,7 @@ async function callOpenAiAgent(
             if (parsed !== null) {
               const extracted = extractToolCallsFromJson(contentPending);
               if (extracted.length) {
-                textParsedToolCalls.push(...extracted);
+                ingestTextParsed(extracted);
               } else {
                 text += contentPending;
                 onDelta?.(contentPending);
@@ -688,7 +727,7 @@ async function callOpenAiAgent(
     if (contentPending) {
       const extracted = extractToolCallsFromJson(contentPending);
       if (extracted.length) {
-        textParsedToolCalls.push(...extracted);
+        ingestTextParsed(extracted);
       } else {
         text += contentPending;
         onDelta?.(contentPending);
@@ -699,17 +738,28 @@ async function callOpenAiAgent(
     jsonDetect = false;
   }
 
-  // 合并两种来源的 tool_calls：正常 function calling 通道 + 纯文本 JSON 解析
-  const toolCalls: ToolCall[] = [
-    ...[...toolAccum.values()]
-      .filter((acc) => acc.id && acc.name)
-      .map((acc) => ({
+  // 合并两种来源后强制契约：默认禁止并行 → 出口至多 1 条；完全重复不得进入后续轮次。
+  // 流式早停时末条 arguments 可能残缺 → safeParseJson 成 {}；完整槽（低 index）优先。
+  const rawToolCalls: ToolCall[] = [
+    ...[...toolAccum.entries()]
+      .sort(([a], [b]) => a - b)
+      .filter(([, acc]) => acc.id && acc.name)
+      .map(([, acc]) => ({
         id: acc.id!,
         name: acc.name!,
         input: safeParseJson(acc.arguments),
       })),
     ...textParsedToolCalls,
   ];
+  const toolCalls = enforceToolCallContract(rawToolCalls, {
+    parallelAllowed,
+    maxSlots: MAX_PARALLEL_TOOL_SLOTS,
+  });
+  if (toolCalls.length < rawToolCalls.length) {
+    console.log(
+      `[models:tool-contract] 裁剪违规并行/重复 tool_calls（${rawToolCalls.length}→${toolCalls.length}, parallel=${parallelAllowed}）`,
+    );
+  }
 
   return {
     text: text.trim(),

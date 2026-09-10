@@ -11,11 +11,14 @@ import { resolveTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { splitSqls, verifyGrainDay, verifyNamedChannel } from "./verify.js";
 
+type LlmOpts = { modelId?: string; signal?: AbortSignal };
+
 /** Prefer healthy flash models (dsflash first); skip known EOL ids. */
-async function llmText(system: string, user: string): Promise<string> {
+async function llmText(system: string, user: string, opts?: LlmOpts): Promise<string> {
   const models = listModels();
   const eol = /nvstepflash|step-3\.7-flash|stepflash/i;
   const preferred =
+    (opts?.modelId ? models.find((m) => m.id === opts.modelId) : undefined) ||
     models.find((m) => /dsflash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
     models.find((m) => /flash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
     models.find((m) => !eol.test(m.id) && !eol.test(m.name)) ||
@@ -37,6 +40,7 @@ async function llmText(system: string, user: string): Promise<string> {
         { role: "user", content: user },
       ],
     }),
+    signal: opts?.signal,
   });
   const data = (await resp.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
@@ -147,6 +151,7 @@ async function rewriteSqls(
   nl: string,
   sqls: string[],
   feedback: string,
+  llmOpts?: LlmOpts,
 ): Promise<string[] | "REFUSE"> {
   const user = [
     `User question: ${nl}`,
@@ -154,7 +159,7 @@ async function rewriteSqls(
     `Issue codes (fix these only; do not invent unconstrained EX rewrites): ${feedback}`,
     "Return corrected SQL only (or REFUSE).",
   ].join("\n\n");
-  const text = await llmText(system, user);
+  const text = await llmText(system, user, llmOpts);
   return parseSqlsFromLlm(text);
 }
 
@@ -191,9 +196,10 @@ function allEmpty(results: DatasetResult[]): boolean {
  */
 export async function analyticsAsk(
   nl: string,
-  opts?: { clock?: Date; packId?: string },
+  opts?: { clock?: Date; packId?: string; modelId?: string; signal?: AbortSignal },
 ): Promise<AnalyticsAskResult> {
   try {
+    opts?.signal?.throwIfAborted();
     const pack = loadAnalyticsPack(opts?.packId || "watch-detail");
     const clock = opts?.clock || new Date();
     const tz = pack.time.businessTimezone || config.metabase.businessTimezone;
@@ -205,6 +211,7 @@ export async function analyticsAsk(
     const { range } = resolved;
     const system = buildStructuralHint(pack, range);
     const allowedTables = pack.tables.map((t) => t.name);
+    const llmOpts: LlmOpts = { modelId: opts?.modelId, signal: opts?.signal };
 
     let probeSummary = "";
     try {
@@ -212,6 +219,7 @@ export async function analyticsAsk(
     } catch {
       probeSummary = "PROBE_FAILED";
     }
+    opts?.signal?.throwIfAborted();
 
     const genUser = [
       `User question: ${nl}`,
@@ -222,7 +230,7 @@ export async function analyticsAsk(
       .filter(Boolean)
       .join("\n\n");
 
-    let raw = await llmText(system, genUser);
+    let raw = await llmText(system, genUser, llmOpts);
     let parsed = parseSqlsFromLlm(raw);
     if (parsed === "REFUSE") {
       return {
@@ -238,7 +246,7 @@ export async function analyticsAsk(
     let rounds = 0;
     while (issues.length && rounds < pack.guards.maxRewriteRounds) {
       rounds++;
-      const rewritten = await rewriteSqls(system, nl, sqls, issues.join(", "));
+      const rewritten = await rewriteSqls(system, nl, sqls, issues.join(", "), llmOpts);
       if (rewritten === "REFUSE") {
         return {
           status: "refuse",
@@ -262,6 +270,7 @@ export async function analyticsAsk(
       };
     }
 
+    opts?.signal?.throwIfAborted();
     const dbId = pack.datasource.metabaseDatabaseId;
     const maxRows = pack.guards.maxRows;
     let execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
@@ -270,8 +279,9 @@ export async function analyticsAsk(
     );
 
     if (allEmpty(results)) {
+      opts?.signal?.throwIfAborted();
       const yearHint = `All queries returned empty rows for ${range.start}..${range.end}. Consider year mismatch; keep resolved window unless clearly wrong. Rewrite SQL once.`;
-      const rewritten = await rewriteSqls(system, nl, sqls, `empty_result; ${yearHint}`);
+      const rewritten = await rewriteSqls(system, nl, sqls, `empty_result; ${yearHint}`, llmOpts);
       if (rewritten !== "REFUSE" && rewritten.length) {
         sqls = normalizeSqls(rewritten);
         const emptyIssues = collectIssues(nl, sqls, allowedTables);

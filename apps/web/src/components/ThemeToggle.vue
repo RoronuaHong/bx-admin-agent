@@ -23,26 +23,41 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 
 <style scoped>
 .theme-toggle {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 7px;
   height: 32px;
+  min-height: 32px;
   min-width: 32px;
   padding: 0 12px;
-  border: 1px solid var(--line);
-  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--line) 92%, var(--ink) 8%);
+  background: color-mix(in srgb, var(--panel) 84%, var(--fill));
   color: var(--muted);
   cursor: pointer;
-  font-size: 12px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
   border-radius: var(--radius-sm);
-  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 22%, transparent),
+    0 1px 1px color-mix(in srgb, var(--ink) 3%, transparent);
+  transition:
+    color 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .theme-toggle:hover {
   color: var(--ink);
-  background: var(--fill-soft);
-  border-color: color-mix(in srgb, var(--ink) 15%, var(--line));
+  background: color-mix(in srgb, var(--panel) 76%, var(--fill-soft));
+  border-color: color-mix(in srgb, var(--ink) 14%, var(--line));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 28%, transparent),
+    0 2px 8px color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
 .icon {
@@ -66,8 +81,9 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 
   .theme-toggle {
     padding: 0;
-    min-width: 28px;
-    height: 28px;
+    min-width: 32px;
+    width: 32px;
+    height: 32px;
   }
 }
 </style>

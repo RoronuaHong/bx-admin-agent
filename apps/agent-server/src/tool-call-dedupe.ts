@@ -1,72 +1,145 @@
 /**
  * 同轮并行工具调用去重 + tool_calls/result 配对护栏（纯协议，无业务语义）。
  *
- * 弱模型（如 dsflash）常在未见结果时并行吐出大量占位 submit_understood_intent /
- * 参数完全相同的 call_api。若只跳过执行仍向 UI/历史回喂 N 条 observe，会刷屏且污染上下文。
+ * 根因（通用）：
+ * 1) 同轮：tool_choice=required / 弱模型忽略 parallel_tool_calls=false 时，会在一次
+ *    assistant 消息里复制 N 份相同 (name, args) 的 tool_calls，烧 completion token。
+ * 2) 跨轮：成功结果已在历史中，模型仍用相同入参再调（空 mock / 诱导性 prompt）。
  *
- * 正确做法：在写入 steps / 执行 / 推 UI 之前折叠——只保留第一条，其余从本轮 toolCalls 列表移除。
- * 同轮 route 短路或中途 return 时，必须改写/补齐 toolResult，否则上游报 400001
- * insufficient tool messages following tool_calls。
+ * 正常契约：默认禁止并行 → 同轮至多 1 个 tool_call；完全重复本就不该出现。
+ * 流式第 2 槽立刻掐断；响应侧只保留合法槽位。折叠仅作兜底，不是「允许多份再合并」。
  */
 import type { AgentStep, ToolCall } from "./models.js";
 import { SUBMIT_UNDERSTOOD_INTENT } from "./understood-intent.js";
 
 const CALL_API = "call_api";
 
-/** call_api 去重/跨轮跳过用的签名：operation|path|params */
+/** 稳定序列化：键排序，避免同参不同键序被当成两次调用。 */
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+
+/** 任意工具的同轮去重签名。submit 只按工具名（整轮至多 1 次）。 */
+export function toolCallSignature(c: ToolCall): string {
+  if (c.name === SUBMIT_UNDERSTOOD_INTENT) return SUBMIT_UNDERSTOOD_INTENT;
+  return `${c.name}|${stableStringify(c.input || {})}`;
+}
+
+/** call_api 跨轮签名：operation|path|params（与历史兼容） */
 export function callApiKey(c: ToolCall): string | null {
   if (c.name !== CALL_API) return null;
   const op = c.input.operation ? String(c.input.operation) : "";
   const path = c.input.path ? String(c.input.path) : "";
-  const params = c.input.params ? JSON.stringify(c.input.params) : "";
+  const params = c.input.params ? stableStringify(c.input.params) : "";
   return `${op}|${path}|${params}`;
 }
 
 export interface DedupeParallelToolCallsResult {
-  /** 折叠后保留的调用（顺序不变） */
   kept: ToolCall[];
-  /** 丢弃的重复 submit_understood_intent 数量 */
+  /** 按签名折叠掉的重复次数（含 submit / call_api / 其它工具） */
+  dropped: number;
   droppedSubmit: number;
-  /** 丢弃的参数完全相同的 call_api 数量 */
   droppedCallApi: number;
 }
 
+/**
+ * 同轮通用去重：相同 (工具名, 规范化入参) 只保留第一次出现。
+ * submit_understood_intent 不论入参差异整轮只留 1 条（语义上「提交理解」不可并行多份）。
+ */
 export function dedupeParallelToolCalls(calls: ToolCall[]): DedupeParallelToolCallsResult {
-  let seenSubmit = false;
-  const seenCallKeys = new Set<string>();
+  const seen = new Set<string>();
   const kept: ToolCall[] = [];
+  let dropped = 0;
   let droppedSubmit = 0;
   let droppedCallApi = 0;
   for (const c of calls) {
-    if (c.name === SUBMIT_UNDERSTOOD_INTENT) {
-      if (seenSubmit) {
-        droppedSubmit += 1;
-        continue;
-      }
-      seenSubmit = true;
-      kept.push(c);
+    const sig = toolCallSignature(c);
+    if (seen.has(sig)) {
+      dropped += 1;
+      if (c.name === SUBMIT_UNDERSTOOD_INTENT) droppedSubmit += 1;
+      else if (c.name === CALL_API) droppedCallApi += 1;
       continue;
     }
-    const key = callApiKey(c);
-    if (key) {
-      if (seenCallKeys.has(key)) {
-        droppedCallApi += 1;
-        continue;
-      }
-      seenCallKeys.add(key);
-    }
+    seen.add(sig);
     kept.push(c);
   }
-  return { kept, droppedSubmit, droppedCallApi };
+  return { kept, dropped, droppedSubmit, droppedCallApi };
+}
+
+/** 是否允许同轮并行 tool_calls（默认否）。 */
+export function parallelToolCallsAllowed(): boolean {
+  const v = process.env.PARALLEL_TOOL_CALLS;
+  return v === "1" || v === "true";
 }
 
 /**
- * 收集本轮 steps 里已成功执行过的 call_api 签名（跨轮去重用）。
- * 失败 / MODULE_RETRY / 澄清 / 跳过说明不计入，允许模型换参或排错后重试。
+ * 流式早停判定（纯协议）：
+ * - 默认禁止并行：第 2 个槽位一出现即停（不等满槽、不等同名凑齐）
+ * - 允许并行：仅超 maxSlots 才停
+ * - 无论是否并行：submit_understood_intent ≥2 即停（该工具语义上不可并行）
  */
-export function collectSuccessfulCallApiKeys(steps: AgentStep[]): Set<string> {
+export function shouldAbortToolCallStream(opts: {
+  slotCount: number;
+  toolNames: Array<string | undefined>;
+  parallelAllowed: boolean;
+  maxSlots: number;
+}): boolean {
+  if (!opts.parallelAllowed && opts.slotCount >= 2) return true;
+  if (opts.parallelAllowed && opts.slotCount >= opts.maxSlots) return true;
+  let submitCount = 0;
+  for (const n of opts.toolNames) {
+    if (n === SUBMIT_UNDERSTOOD_INTENT) submitCount += 1;
+  }
+  return submitCount >= 2;
+}
+
+/**
+ * 按契约裁剪同轮 tool_calls：禁止并行时只留第一条；允许并行时去重后截断到 maxSlots。
+ * 完全重复在正常路径不应到达这里；此函数保证出口契约成立。
+ */
+export function enforceToolCallContract(
+  calls: ToolCall[],
+  opts: { parallelAllowed: boolean; maxSlots: number },
+): ToolCall[] {
+  if (!calls.length) return calls;
+  if (!opts.parallelAllowed) return [calls[0]];
+  const { kept } = dedupeParallelToolCalls(calls);
+  return kept.slice(0, Math.max(1, opts.maxSlots));
+}
+
+export function formatParallelDedupeObserve(
+  droppedSubmit: number,
+  droppedCallApi: number,
+  droppedOther = 0,
+): string {
+  const parts: string[] = [];
+  if (droppedSubmit > 0) {
+    parts.push(
+      `同轮并行的 ${droppedSubmit} 个重复 submit_understood_intent 已合并，只保留第一条；请基于其结果继续，不要重复提交。`,
+    );
+  }
+  if (droppedCallApi > 0) {
+    parts.push(
+      `同轮并行的 ${droppedCallApi} 个参数完全相同的 call_api 已合并，只保留第一条；` +
+        `若需更多页，请基于返回分页信息递增参数后再调。`,
+    );
+  }
+  if (droppedOther > 0) {
+    parts.push(`同轮另有 ${droppedOther} 个完全相同的工具调用已合并。`);
+  }
+  return parts.length ? `[workflow/observe] ${parts.join(" ")}` : "";
+}
+
+/**
+ * 收集本轮 steps 里已成功执行过的 call_api 签名，以及对应结果内容（供跨轮回放）。
+ */
+export function collectSuccessfulCallApiResults(steps: AgentStep[]): Map<string, string> {
   const idToCall = new Map<string, ToolCall>();
-  const ok = new Set<string>();
+  const ok = new Map<string, string>();
   for (const s of steps) {
     if (s.kind === "toolCalls") {
       for (const c of s.calls) {
@@ -81,20 +154,36 @@ export function collectSuccessfulCallApiKeys(steps: AgentStep[]): Set<string> {
     const key = callApiKey(c);
     if (!key) continue;
     const body = s.content || "";
-    if (
-      /^(错误|ERROR|CLARIFICATION_REQUIRED|MODULE_RETRY)/i.test(body) ||
-      /\[workflow\/observe\].*已跳过重复/.test(body) ||
-      /\[workflow\/response-mode\]/.test(body) ||
-      body.includes('"ok": false')
-    ) {
-      continue;
-    }
-    // 业务失败常见形态：code != 0；宽松：含 code 且非 0 则不当成功
-    const codeM = body.match(/"code"\s*:\s*(-?\d+)/);
-    if (codeM && Number(codeM[1]) !== 0) continue;
-    ok.add(key);
+    if (!isSuccessfulToolBody(body)) continue;
+    ok.set(key, body);
   }
   return ok;
+}
+
+export function collectSuccessfulCallApiKeys(steps: AgentStep[]): Set<string> {
+  return new Set(collectSuccessfulCallApiResults(steps).keys());
+}
+
+function isSuccessfulToolBody(body: string): boolean {
+  if (
+    /^(错误|ERROR|CLARIFICATION_REQUIRED|MODULE_RETRY)/i.test(body) ||
+    /\[workflow\/observe\].*已跳过重复/.test(body) ||
+    /\[workflow\/response-mode\]/.test(body) ||
+    body.includes('"ok": false')
+  ) {
+    return false;
+  }
+  const codeM = body.match(/"code"\s*:\s*(-?\d+)/);
+  if (codeM && Number(codeM[1]) !== 0) return false;
+  return true;
+}
+
+/** 跨轮跳过时回放上次成功结果，避免模型只看到 observe 空壳又去重试。 */
+export function formatDuplicateCallApiReplay(operation: string, priorContent: string): string {
+  const head =
+    `[workflow/observe] 相同 call_api${operation ? `（${operation}）` : ""}与参数已成功执行过，已跳过重复调用。` +
+    `以下回放上次结果；请直接总结，或更换分页/筛选参数后再调。\n\n`;
+  return head + priorContent;
 }
 
 export function formatDuplicateCallApiSkip(operation: string): string {
@@ -102,23 +191,6 @@ export function formatDuplicateCallApiSkip(operation: string): string {
     `[workflow/observe] 相同 call_api${operation ? `（${operation}）` : ""}与参数已成功执行过，已跳过重复调用。` +
     `请基于已有结果总结回复；若需更多数据请更换分页/筛选参数后再调。`
   );
-}
-
-/** 折叠说明（单条 system 回喂，避免 N 条 observe 刷屏）。 */
-export function formatParallelDedupeObserve(droppedSubmit: number, droppedCallApi: number): string {
-  const parts: string[] = [];
-  if (droppedSubmit > 0) {
-    parts.push(
-      `同轮并行的 ${droppedSubmit} 个重复 submit_understood_intent 已合并，只保留第一条；请基于其结果继续，不要重复提交。`,
-    );
-  }
-  if (droppedCallApi > 0) {
-    parts.push(
-      `同轮并行的 ${droppedCallApi} 个参数完全相同的 call_api 已合并，只保留第一条；` +
-        `若需更多页，请基于返回分页信息递增参数后再调。`,
-    );
-  }
-  return parts.length ? `[workflow/observe] ${parts.join(" ")}` : "";
 }
 
 /** 把 steps 里最近一条 toolCalls 的 calls 改写为指定列表（同轮短路时只保留实际执行的调用）。 */
@@ -133,11 +205,8 @@ export function rewriteLastToolCalls(steps: AgentStep[], calls: ToolCall[]): voi
 }
 
 /**
- * 补齐缺失的 toolResult，保证 OpenAI 消息配对：每个 tool_call id 都有一条 tool 消息。
- * 用于同轮短路 / 中途 return 后仍把完整 rounds 写进历史的场景，避免上游 400001。
- *
- * 重要：补丁必须紧跟对应 toolCalls 之后的连续 tool 结果块插入，不能 append 到 steps 末尾——
- * 若末尾已有 role=user（system 步）再补 tool，上游会报 insufficient tool messages。
+ * 补齐缺失的 toolResult，保证 OpenAI 消息配对。
+ * 补丁必须紧跟对应 toolCalls 之后的连续 tool 结果块插入。
  */
 export function padMissingToolResults(
   steps: AgentStep[],
@@ -153,7 +222,6 @@ export function padMissingToolResults(
     if (s.kind !== "toolCalls") continue;
     const missing = s.calls.filter((c) => !have.has(c.id));
     if (!missing.length) continue;
-    // 插入点：本轮 toolCalls 后已有的连续 toolResult 之后（仍在任何 system/user 之前）
     let insertAt = i + 1;
     while (insertAt < steps.length && steps[insertAt].kind === "toolResult") insertAt += 1;
     const pads: AgentStep[] = missing.map((c) => {
@@ -167,10 +235,7 @@ export function padMissingToolResults(
   return added;
 }
 
-/**
- * 把夹在「assistant.tool_calls ↔ 其 tool 结果」之间的 system 步挪到该轮全部 tool 结果之后。
- * models.ts 会把 system 编成 role=user；夹在中间会破坏 OpenAI 配对（400001）。
- */
+/** 把夹在 tool_calls↔tool 结果之间的 system 步挪到该轮全部 tool 结果之后。 */
 export function deferSystemStepsPastToolResults(steps: AgentStep[]): number {
   let moved = 0;
   for (let i = 0; i < steps.length; i++) {
