@@ -335,8 +335,8 @@ h1 {
   background:
     linear-gradient(
       155deg,
-      color-mix(in srgb, var(--card-accent) 14%, transparent) 0%,
-      transparent 42%
+      color-mix(in srgb, var(--card-accent) 22%, transparent) 0%,
+      transparent 48%
     ),
     var(--card-surface);
   box-shadow:
@@ -482,33 +482,33 @@ h1 {
 }
 
 .accent-analytics {
-  --card-accent: #0d9488;
+  --card-accent: #0f766e;
   --card-accent-2: #0369a1;
-  --card-surface: color-mix(in srgb, #ecfdf5 55%, var(--panel));
+  --card-surface: linear-gradient(160deg, #ccfbf1 0%, #ecfeff 42%, color-mix(in srgb, var(--panel) 70%, #fff) 100%);
 }
 
 .accent-admin {
   --card-accent: #c2410c;
   --card-accent-2: #b45309;
-  --card-surface: color-mix(in srgb, #fff7ed 58%, var(--panel));
+  --card-surface: linear-gradient(160deg, #ffedd5 0%, #fff7ed 45%, color-mix(in srgb, var(--panel) 70%, #fff) 100%);
 }
 
 .accent-knowledge {
   --card-accent: #4d7c0f;
   --card-accent-2: #a16207;
-  --card-surface: color-mix(in srgb, #f7fee7 58%, var(--panel));
+  --card-surface: linear-gradient(160deg, #ecfccb 0%, #fef9c3 48%, color-mix(in srgb, var(--panel) 70%, #fff) 100%);
 }
 
 .accent-viewing {
   --card-accent: #0369a1;
   --card-accent-2: #0e7490;
-  --card-surface: color-mix(in srgb, #e0f2fe 55%, var(--panel));
+  --card-surface: linear-gradient(160deg, #bae6fd 0%, #e0f2fe 45%, color-mix(in srgb, var(--panel) 70%, #fff) 100%);
 }
 
 .accent-more {
   --card-accent: #64748b;
   --card-accent-2: #475569;
-  --card-surface: color-mix(in srgb, var(--panel) 92%, #e2e8f0);
+  --card-surface: linear-gradient(160deg, #e2e8f0 0%, #f1f5f9 50%, color-mix(in srgb, var(--panel) 80%, #fff) 100%);
 }
 
 .tone-muted {
@@ -548,19 +548,19 @@ h1 {
 }
 
 :global(html.dark) .accent-analytics {
-  --card-surface: color-mix(in srgb, #042f2e 45%, var(--panel));
+  --card-surface: linear-gradient(160deg, #115e59 0%, color-mix(in srgb, #134e4a 70%, var(--panel)) 55%, var(--panel) 100%);
 }
 
 :global(html.dark) .accent-admin {
-  --card-surface: color-mix(in srgb, #431407 40%, var(--panel));
+  --card-surface: linear-gradient(160deg, #9a3412 0%, color-mix(in srgb, #7c2d12 65%, var(--panel)) 55%, var(--panel) 100%);
 }
 
 :global(html.dark) .accent-knowledge {
-  --card-surface: color-mix(in srgb, #1a2e05 40%, var(--panel));
+  --card-surface: linear-gradient(160deg, #3f6212 0%, color-mix(in srgb, #365314 65%, var(--panel)) 55%, var(--panel) 100%);
 }
 
 :global(html.dark) .accent-viewing {
-  --card-surface: color-mix(in srgb, #0c4a6e 40%, var(--panel));
+  --card-surface: linear-gradient(160deg, #075985 0%, color-mix(in srgb, #0c4a6e 65%, var(--panel)) 55%, var(--panel) 100%);
 }
 
 :global(html.dark) .kicker {
