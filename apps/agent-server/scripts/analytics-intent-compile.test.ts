@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runAmbiguityGate } from "../src/analytics/ambiguity-gate.js";
-import { buildAnalyticsIntent, extractChannelsFromNl } from "../src/analytics/intent.js";
+import { buildAnalyticsIntentFromStructure, extractChannelsFromNl } from "../src/analytics/intent.js";
 import { compileAnalyticsIntent } from "../src/analytics/sql-compile.js";
 import type { AnalyticsPack } from "../src/analytics/semantic-layer.js";
 
@@ -18,19 +17,22 @@ const ORIG =
   assert.deepEqual(extractChannelsFromNl("印度A 按天人数"), ["IndiaA"]);
 }
 
-// Gate 接地 + wide → Intent → 宽表 avg_of_max（sumIf/countIf，无 LLM）
+// structure → Intent → 宽表 avg_of_max
 {
-  const g = runAmbiguityGate(ORIG, pack, {
-    slotAnswers: { contentLang: ["te-IN", "ta-IN", "ml-IN"], result_layout: ["wide"] },
-  });
-  assert.equal(g.ok, true);
-  if (!g.ok) throw new Error("gate");
-
-  const built = buildAnalyticsIntent({
-    nl: ORIG,
-    range: { start: "2026-08-19", end: "2026-08-25" },
-    gate: g,
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: {
+        channel: ["IndiaA"],
+        contentLang: ["te-IN", "ta-IN", "ml-IN"],
+      },
+      outputDims: ["watch_date", "channel"],
+      layout: "wide",
+      pivotDim: "contentLang",
+      metricId: "avg_max_progress",
+    },
     pack,
+    fallbackNl: ORIG,
   });
   assert.equal(built.ok, true);
   if (!built.ok) throw new Error(built.reason);
@@ -53,23 +55,23 @@ const ORIG =
   assert.match(sql, /channel\s*=\s*'IndiaA'/);
   assert.match(sql, /movieType\s+IN\s*\(\s*1\s*,/);
   assert.match(sql, /GROUP BY\s+watchDate\s*,\s*channel\s*$/m);
-  // 外层不得把 contentLang 当输出维
   assert.doesNotMatch(sql, /GROUP BY\s+watchDate\s*,\s*channel\s*,\s*contentLang/i);
   assert.doesNotMatch(sql, /uniq\s*\(\s*guid\s*\)/i);
 }
 
-// long 布局：contentLang 进 GROUP BY，avg(a)
+// long 布局
 {
-  const g = runAmbiguityGate(ORIG, pack, {
-    slotAnswers: { contentLang: ["te-IN", "ta-IN"], result_layout: ["long"] },
-  });
-  assert.equal(g.ok, true);
-  if (!g.ok) throw new Error("gate");
-  const built = buildAnalyticsIntent({
-    nl: ORIG,
-    range: { start: "2026-08-19", end: "2026-08-25" },
-    gate: g,
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["te-IN", "ta-IN"] },
+      outputDims: ["watch_date", "channel"],
+      layout: "long",
+      pivotDim: "contentLang",
+      metricId: "avg_max_progress",
+    },
     pack,
+    fallbackNl: ORIG,
   });
   assert.equal(built.ok, true);
   if (!built.ok) throw new Error(built.reason);
@@ -81,19 +83,19 @@ const ORIG =
   assert.doesNotMatch(compiled.sql, /sumIf/);
 }
 
-// uniq 人数可编译
+// uniq 人数
 {
   const nl = "IndiaA 2026-08-20到21 按天观看人数";
-  const g = runAmbiguityGate(nl, pack);
-  assert.equal(g.ok, true);
-  if (!g.ok) throw new Error("gate");
-  const built = buildAnalyticsIntent({
-    nl,
-    range: { start: "2026-08-20", end: "2026-08-21" },
-    gate: g,
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-20", end: "2026-08-21" },
+      filters: { channel: ["IndiaA"] },
+      outputDims: ["watch_date"],
+      metricId: "uniq_users",
+    },
     pack,
+    fallbackNl: nl,
   });
-  // gate 未接地 metric；infer 从 NL 得 uniq_users
   assert.equal(built.ok, true);
   if (!built.ok) throw new Error(built.reason);
   assert.equal(built.intent.metric.kind, "uniq");
@@ -104,11 +106,20 @@ const ORIG =
   assert.match(compiled.sql, /channel\s*=\s*'IndiaA'/);
 }
 
-// 完播率无口径 → Gate 已拦；若强行走 intent 则 metric not inferred（无 grounded）
+// 完播宽表缺 layout → intent 失败
 {
-  const nl = "IndiaA 2026-08-19到25 完播率按天";
-  const g = runAmbiguityGate(nl, pack);
-  assert.equal(g.ok, false);
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["te-IN", "ta-IN"] },
+      outputDims: ["watch_date", "channel"],
+      pivotDim: "contentLang",
+      metricId: "avg_max_progress",
+    },
+    pack,
+    fallbackNl: ORIG,
+  });
+  assert.equal(built.ok, false);
 }
 
 console.log("analytics-intent-compile.test.ts OK");

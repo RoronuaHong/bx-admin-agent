@@ -1,8 +1,14 @@
+/**
+ * Analytics ask pipeline:
+ * conversation ? schema-agent (probe tools) ? Intent compile ? exec.
+ * Intent/compile/lint/exec ??? LLM ????????????? SQL?
+ */
+
 import { config, listModels } from "../config.js";
 import * as trace from "../trace.js";
 import { getUpload, MAX_AT_ONCE } from "../uploads.js";
 import { transcribeImage } from "../vision.js";
-import { isAbortError, runMetabaseQuestion, runNativeDataset } from "./metabase-client.js";
+import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import { loadAnalyticsPack, type AnalyticsPack } from "./semantic-layer.js";
 import {
   assertReadonlySingleSelect,
@@ -12,35 +18,25 @@ import {
 } from "./sql-guard.js";
 import { resolveTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
-import { splitSqls, verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
-import {
-  buildLlmVerifyPrompt,
-  buildLlmVerifyRetryPrompt,
-  llmVerifyEnabled,
-  parseLlmVerifyResponse,
-  resolveUnclearVerify,
-  sampleTablesForVerify,
-  type LlmVerifyResult,
-} from "./llm-verify.js";
+import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
 import { reconcileNamedDimensions } from "./dim-reconcile.js";
 import { deriveFailureClass, newAskId, recordAskLedger } from "./audit-ledger.js";
 import { buildLocalChartsFromTables } from "./local-chart.js";
-import {
-  applyBindingSqlTemplate,
-  buildBindingParameters,
-  matchQuestionBinding,
-} from "./question-binding.js";
-import {
-  formatGroundedHint,
-  parseProbeValuesForDim,
-  runAmbiguityGate,
-} from "./ambiguity-gate.js";
-import { buildAnalyticsIntent, intentToJson } from "./intent.js";
+import { buildAnalyticsIntentFromStructure, intentToJson } from "./intent.js";
 import { compileAnalyticsIntent } from "./sql-compile.js";
+import {
+  buildStructureSystemPrompt,
+  buildStructureUserPrompt,
+  formatConversationTranscript,
+  impliesLangSetWithoutMembers,
+  parseStructureResponse,
+  type ConversationTurn,
+  type StructuredAskResult,
+} from "./conversation-structure.js";
+import { runSchemaAgent } from "./schema-agent.js";
 
 type LlmOpts = { modelId?: string; signal?: AbortSignal; traceRunId?: string; spanName?: string };
 
-/** Expand uploaded text/images into LLM-readable context (reuses chat upload store + OCR). */
 async function collectAttachmentContext(
   images?: string[],
   files?: string[],
@@ -75,7 +71,7 @@ async function collectAttachmentContext(
         parts.push(`[图片内容]\n${desc.trim()}`);
         usableCount += 1;
       } else {
-        parts.push(`[图片转录为空] id=${id}`);
+        parts.push(`[附件文本为空] id=${id}`);
       }
     } catch (e) {
       if (signal?.aborted || isAbortError(e)) throw e;
@@ -85,7 +81,6 @@ async function collectAttachmentContext(
   return { context: parts.join("\n\n"), usableCount };
 }
 
-/** Prefer explicit modelId; else glm5turbo → dsflash → other flash → first. */
 async function llmText(system: string, user: string, opts?: LlmOpts): Promise<string> {
   const models = listModels();
   const eol = /nvstepflash|step-3\.7-flash|stepflash/i;
@@ -153,45 +148,6 @@ async function llmText(system: string, user: string, opts?: LlmOpts): Promise<st
   }
 }
 
-function extractSqlBlock(text: string): string {
-  const trimmed = text.trim();
-  if (/^REFUSE\b/i.test(trimmed)) return "REFUSE";
-  const fence = trimmed.match(/```(?:sql)?\s*([\s\S]*?)```/i);
-  if (fence) return fence[1].trim();
-  return trimmed;
-}
-
-function parseSqlsFromLlm(text: string): string[] | "REFUSE" {
-  const block = extractSqlBlock(text);
-  if (block === "REFUSE" || /^REFUSE\b/i.test(block)) return "REFUSE";
-  const parts = splitSqls(block);
-  return parts.length ? parts : block ? [block] : [];
-}
-
-function buildStructuralHint(
-  pack: AnalyticsPack,
-  range: { start: string; end: string },
-): string {
-  const table = pack.tables[0];
-  const fields = table?.fields.join(", ") ?? "";
-  const movieTypes = pack.guards.defaultMovieTypes.join(", ");
-  const distinctFn = config.metabase.distinctCountFn;
-  return [
-    "You generate ClickHouse SQL for analytics. STRUCTURAL rules only — no synonym maps.",
-    `Only use table ${table?.name ?? "elt_watch_detail"} with fields: ${fields}.`,
-    "Date filter: use toDate(lastWatchTime) (never lastWatchTime = 'YYYY-MM-DD').",
-    `Distinct count: use ${distinctFn}(...), never uniqExact unless that is the configured default.`,
-    `Always include movieType IN (${movieTypes}) unless the user explicitly overrides.`,
-    `Resolved time window (inclusive UX dates): start=${range.start} end=${range.end}.`,
-    "Inject these ISO dates into WHERE; do not invent other years.",
-    "If multiple SELECT statements are needed (different grain/channel), separate them with a line containing only ---.",
-    "When the user says 各自 / 同时 / 分别 for two or more named entities, you MUST emit ≥2 SELECT statements separated by --- (do not collapse into one query).",
-    "If Grounded slots specify WIDE vs LONG layout, honor that structural shape; do not invent an alternate grain.",
-    "Each statement must be a single read-only SELECT (or WITH … SELECT). No semicolon-separated multi-statements.",
-    "Output only SQL (optionally fenced). If the question cannot be answered safely, reply REFUSE.",
-  ].join("\n");
-}
-
 async function probeDimensions(
   pack: AnalyticsPack,
   range: { start: string; end: string },
@@ -229,6 +185,25 @@ async function probeDimensions(
   return lines.join("\n");
 }
 
+function parseProbeValuesForDim(
+  probeSummary: string,
+  dimField: string,
+): Array<{ id: string; label: string }> {
+  const line = probeSummary
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.toLowerCase().startsWith(dimField.toLowerCase() + ":"));
+  if (!line || /PROBE_FAILED/i.test(line)) return [];
+  const raw = line.slice(line.indexOf(":") + 1).trim();
+  if (!raw || raw === "(empty)") return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 15)
+    .map((v) => ({ id: v, label: v }));
+}
+
 function collectIssues(
   nl: string,
   sqls: string[],
@@ -258,23 +233,6 @@ function collectIssues(
 function normalizeSqls(sqls: string[]): string[] {
   const fn = config.metabase.distinctCountFn;
   return sqls.map((s) => normalizeDistinctCount(s, fn));
-}
-
-async function rewriteSqls(
-  system: string,
-  nl: string,
-  sqls: string[],
-  feedback: string,
-  llmOpts?: LlmOpts,
-): Promise<string[] | "REFUSE"> {
-  const user = [
-    `User question: ${nl}`,
-    `Prior SQL(s):\n${sqls.join("\n---\n")}`,
-    `Issue codes (fix these only; do not invent unconstrained EX rewrites): ${feedback}`,
-    "Return corrected SQL only (or REFUSE).",
-  ].join("\n\n");
-  const text = await llmText(system, user, llmOpts);
-  return parseSqlsFromLlm(text);
 }
 
 function ensureMaxRows(sql: string, maxRows: number): string {
@@ -307,9 +265,47 @@ function allEmpty(results: DatasetResult[]): boolean {
   return results.length > 0 && results.every((r) => r.ok && r.rows.length === 0);
 }
 
+/** Intent/compile/lint/exec ???LLM ????????? SQL? */
+async function diagnoseFailure(
+  input: {
+    transcript: string;
+    stage: string;
+    detail: string;
+    structuredJson?: string;
+    intentJson?: string;
+    sqlPreview?: string;
+  },
+  opts?: LlmOpts,
+): Promise<string> {
+  const system = [
+    "You are an analytics diagnose assistant for a Metabase analytics agent.",
+    "Explain in concise Chinese: why the ask cannot complete, and what the user should clarify next.",
+    "ABSOLUTELY FORBIDDEN: do not write SQL, do not invent tables/schemas, do not propose CREATE/SELECT code blocks.",
+    "If languages are missing, ask for contentLang codes. If wide/long is missing, ask result_layout.",
+    "Plain text only; no markdown headings.",
+  ].join(" ");
+  const user = [
+    `Failure stage: ${input.stage}`,
+    `Technical detail: ${input.detail}`,
+    input.structuredJson ? `Structured JSON:\n${input.structuredJson}` : "",
+    input.intentJson ? `Intent:\n${input.intentJson}` : "",
+    input.sqlPreview ? `SQL preview:\n${input.sqlPreview.slice(0, 2000)}` : "",
+    "Conversation:\n" + input.transcript,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  try {
+    const text = (await llmText(system, user, { ...opts, spanName: "analytics.diagnose" })).trim();
+    if (text && !/```sql|SELECT\s+\w+/i.test(text)) return text;
+  } catch {
+    /* fall through */
+  }
+  return `当前无法完成问数（${input.stage}）：${input.detail}。请补充更明确的时间、渠道、指标或筛选条件后再试。`;
+}
+
 /**
- * NL → time resolve → Ambiguity Gate → Intent compile (优先) / Binding / LLM SQL → lint → exec.
- * 写入门户 Trace（agentId=analytics）；问数鉴权独立，ownerKey 用 analytics:anonymous。
+ * NL ?????? schema-agent?? Intent compile ? lint ? exec?
+ * Trace agentId=analytics; ownerKey analytics:anonymous.
  */
 export async function analyticsAsk(
   nl: string,
@@ -320,8 +316,10 @@ export async function analyticsAsk(
     signal?: AbortSignal;
     images?: string[];
     files?: string[];
-    /** 澄清回合回填，如 { contentLang: ["te-IN","ta-IN","ml-IN"] } */
+    /** ??????????????? schema-agent? */
     slotAnswers?: Record<string, string[]>;
+    /** ?????????????? */
+    messages?: ConversationTurn[];
   },
 ): Promise<AnalyticsAskResult> {
   let runId: string | null = null;
@@ -347,23 +345,27 @@ export async function analyticsAsk(
       modelId: result.modelId ?? resolvedModelId,
       packVersion: result.packVersion ?? packVersion,
     };
-    recordAskLedger({
-      askId,
-      nl: nl.trim().slice(0, 4000),
-      status: out.status,
-      timeEcho: out.timeEcho,
-      sqls: out.sqls,
-      guardIssues,
-      verify: out.verify,
-      rewriteRounds,
-      failureClass: deriveFailureClass(out, guardIssues),
-      packVersion: out.packVersion,
-      modelId: out.modelId,
-      runId: runId || undefined,
-      ms: Date.now() - startedAt,
-      message: out.message?.slice(0, 500),
-      error: out.error?.slice(0, 500),
-    });
+    try {
+      recordAskLedger({
+        askId,
+        nl: nl.slice(0, 500),
+        status: out.status,
+        timeEcho: out.timeEcho,
+        sqls: out.sqls,
+        guardIssues,
+        verify: out.verify,
+        rewriteRounds,
+        failureClass: deriveFailureClass(out, guardIssues),
+        packVersion: out.packVersion,
+        modelId: out.modelId,
+        runId: runId || undefined,
+        ms: Date.now() - startedAt,
+        message: out.message,
+        error: out.error,
+      });
+    } catch {
+      /* ledger best-effort */
+    }
     return out;
   };
 
@@ -399,31 +401,92 @@ export async function analyticsAsk(
     packVersion = pack.version;
     const clock = opts?.clock || new Date();
     const tz = pack.time.businessTimezone || config.metabase.businessTimezone;
-    const resolved = resolveTimeRange(nlForResolve, clock, tz);
-    if (!resolved.ok) {
-      return seal({ status: "clarify", message: resolved.clarify });
+    const clockIso = clock.toISOString().slice(0, 10);
+
+    let conversation: ConversationTurn[] = (opts?.messages || [])
+      .map((m) => ({
+        role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
+        text: String(m.text || "").trim(),
+      }))
+      .filter((m) => m.text);
+    if (!conversation.length && nlForResolve) {
+      conversation = [{ role: "user", text: nlForResolve }];
+    }
+    const last = conversation[conversation.length - 1];
+    if (nl.trim() && (!last || last.role !== "user" || last.text !== nl.trim())) {
+      conversation = [...conversation, { role: "user", text: nl.trim() }];
+    }
+    if (opts?.slotAnswers && Object.keys(opts.slotAnswers).length) {
+      const parts = Object.entries(opts.slotAnswers).map(([k, vs]) => `${k}=${vs.join(",")}`);
+      conversation = [...conversation, { role: "user", text: `澄清选择：${parts.join("；")}` }];
     }
 
-    const { range } = resolved;
-    // Entity / grain / multi-query guards use user NL only (attachments can pollute names).
-    const nlForGuards = nl.trim() || nlForResolve;
+    const userTurns = conversation.filter((m) => m.role === "user").length;
+    if (userTurns <= 1) {
+      const early = resolveTimeRange(nlForResolve, clock, tz);
+      if (!early.ok) {
+        return seal({ status: "clarify", message: early.clarify, clarifySlot: "time_range" });
+      }
+    }
 
-    // Ambiguity Gate：filter_set 未接地 / 指标口径未选 → 反问（禁止执行）
-    let gate = runAmbiguityGate(nlForGuards, pack, { slotAnswers: opts?.slotAnswers });
-    if (!gate.ok) {
-      let options = gate.options?.length ? gate.options : undefined;
-      let probeSummaryForClarify = "";
-      const dimDef = pack.enumDimensions?.find((d) => d.id === gate.slot);
-      const needProbe =
-        !options?.length &&
-        (dimDef?.domain === "probe" ||
-          gate.slot === "contentLang" ||
-          pack.probeDimensions.includes(gate.slot));
-      if (needProbe) {
+    let structured: StructuredAskResult | null = null;
+    if (conversation.length) {
+      try {
+        structured = await runSchemaAgent({
+          pack,
+          messages: conversation,
+          clockIsoDate: clockIso,
+          modelId: opts?.modelId,
+          signal: opts?.signal,
+          traceRunId: runId || undefined,
+        });
+      } catch (e) {
+        if (opts?.signal?.aborted || isAbortError(e)) throw e;
         try {
-          probeSummaryForClarify = await probeDimensions(pack, range, opts?.signal);
-          const field = dimDef?.field || gate.slot;
-          options = parseProbeValuesForDim(probeSummaryForClarify, field);
+          const rawStruct = await llmText(
+            buildStructureSystemPrompt(pack, clockIso),
+            buildStructureUserPrompt(conversation),
+            { ...llmOptsBase, spanName: "analytics.structure.fallback" },
+          );
+          structured = parseStructureResponse(
+            rawStruct,
+            formatConversationTranscript(conversation),
+          );
+        } catch (e2) {
+          if (opts?.signal?.aborted || isAbortError(e2)) throw e2;
+          structured = null;
+        }
+      }
+    }
+
+    const transcript = formatConversationTranscript(conversation);
+
+    if (structured?.status === "clarify") {
+      let rangeEcho: string | undefined;
+      let probeSummaryForClarify = "";
+      let options: Array<{ id: string; label: string }> | undefined;
+      if (structured.time?.start && structured.time?.end) {
+        rangeEcho = `按 ${structured.time.start}～${structured.time.end}`;
+      }
+      const needProbe =
+        structured.clarifySlot === "contentLang" ||
+        structured.clarifySlot === "movieType" ||
+        pack.probeDimensions.includes(structured.clarifySlot);
+      // contentLang ???? schema ?????????????
+      let probeRange = structured.time;
+      if (needProbe && !(probeRange?.start && probeRange?.end)) {
+        const resolved = resolveTimeRange(nlForResolve, clock, tz);
+        if (resolved.ok) probeRange = { start: resolved.range.start, end: resolved.range.end };
+      }
+      if (needProbe && probeRange?.start && probeRange?.end) {
+        try {
+          probeSummaryForClarify = await probeDimensions(
+            pack,
+            { start: probeRange.start, end: probeRange.end },
+            opts?.signal,
+          );
+          options = parseProbeValuesForDim(probeSummaryForClarify, structured.clarifySlot);
+          if (!rangeEcho) rangeEcho = `按 ${probeRange.start}～${probeRange.end}`;
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
         }
@@ -437,259 +500,160 @@ export async function analyticsAsk(
           : "";
       return seal({
         status: "clarify",
-        message: `${gate.clarify}${optionHint}`,
-        timeEcho: range.echo,
-        clarifySlot: gate.slot,
+        message: `${structured.clarify}${optionHint}`,
+        timeEcho: rangeEcho,
+        clarifySlot: structured.clarifySlot,
         clarifyOptions: options,
         probeSummary: probeSummaryForClarify || undefined,
+        packVersion: pack.version,
+        structuredFromConversation: true,
+      });
+    }
+
+    if (!(structured?.status === "ok" && structured.metricId && structured.time)) {
+      // schema-agent ??????N???????????????? LLM ?? SQL
+      if (impliesLangSetWithoutMembers(transcript)) {
+        let options: Array<{ id: string; label: string }> | undefined;
+        let probeSummaryForClarify = "";
+        let rangeEcho: string | undefined;
+        const resolved = resolveTimeRange(nlForResolve, clock, tz);
+        if (resolved.ok) {
+          rangeEcho = resolved.range.echo;
+          try {
+            probeSummaryForClarify = await probeDimensions(pack, resolved.range, opts?.signal);
+            options = parseProbeValuesForDim(probeSummaryForClarify, "contentLang");
+          } catch (e) {
+            if (opts?.signal?.aborted || isAbortError(e)) throw e;
+          }
+        }
+        const optionHint =
+          options && options.length
+            ? `\n候选示例：${options
+                .slice(0, 12)
+                .map((o) => o.label)
+                .join("?")}`
+            : "";
+        return seal({
+          status: "clarify",
+          message: `请确认要统计的具体内容语言列表（可多选）。请直接列出语言码（如 te-IN、ta-IN）。${optionHint}`,
+          timeEcho: rangeEcho,
+          clarifySlot: "contentLang",
+          clarifyOptions: options,
+          probeSummary: probeSummaryForClarify || undefined,
+          packVersion: pack.version,
+        });
+      }
+
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "structure",
+          detail: "未能从对话得到完整结构化 schema（时间/指标/过滤）",
+          structuredJson: structured ? JSON.stringify(structured) : undefined,
+        },
+        llmOptsBase,
+      );
+      return seal({
+        status: "clarify",
+        message: msg,
         packVersion: pack.version,
       });
     }
 
-    const groundedHint = formatGroundedHint(gate);
-    const system = buildStructuralHint(pack, range);
+    const range = {
+      start: structured.time.start,
+      end: structured.time.end,
+      echo: `按 ${structured.time.start}～${structured.time.end}`,
+    };
+    const nlForGuards = structured.mergedNl || nl.trim() || nlForResolve;
     const allowedTables = pack.tables.map((t) => t.name);
     const dimColumns = pack.probeDimensions;
-    const llmOpts: LlmOpts = { ...llmOptsBase, spanName: "analytics.sql" };
 
-    // Task 2：questionBinding 加速 — 未改写则跳过 LLM SQL / LLM 校对
-    const bindingHit = matchQuestionBinding(pack.questionBindings, nlForGuards);
-    if (bindingHit) {
-      opts?.signal?.throwIfAborted();
-      let bindingSql: string | undefined;
-      let bindingResult: DatasetResult;
-      const bindHandle = trace.span(runId, "tool", "metabase.question-binding", {
-        worker: "analytics",
-      });
-      try {
-        if (bindingHit.questionId) {
-          bindingResult = await runMetabaseQuestion(
-            bindingHit.questionId,
-            buildBindingParameters(bindingHit, range),
-            { signal: opts?.signal },
-          );
-        } else {
-          bindingSql = applyBindingSqlTemplate(bindingHit.sqlTemplate || "", range);
-          bindingSql = normalizeDistinctCount(bindingSql, config.metabase.distinctCountFn);
-          assertReadonlySingleSelect(bindingSql);
-          assertTablesWhitelisted(bindingSql, allowedTables);
-          bindingSql = ensureMaxRows(bindingSql, pack.guards.maxRows);
-          bindingResult = await runNativeDataset(bindingSql, pack.datasource.metabaseDatabaseId, {
-            signal: opts?.signal,
-          });
-        }
-        bindHandle.end({
-          status: bindingResult.ok ? "ok" : "error",
-          meta: { bindingId: bindingHit.id, questionId: bindingHit.questionId },
-          error: bindingResult.ok ? undefined : bindingResult.error,
-        });
-      } catch (e) {
-        bindHandle.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
-        throw e;
-      }
-
-      if (!bindingResult.ok) {
-        // Fall through to LLM path when binding exec fails
-      } else {
-        const tables = [
-          {
-            title: "结果",
-            cols: bindingResult.cols,
-            rows: bindingResult.rows,
-            grain: bindingSql && /toDate\s*\(\s*lastWatchTime\s*\)/i.test(bindingSql) ? "day" : undefined,
-          },
-        ];
-        const charts = allEmpty([bindingResult]) ? [] : buildLocalChartsFromTables(tables);
-        return seal({
-          status: "ok",
-          message: range.echo,
-          timeEcho: range.echo,
-          sqls: bindingSql ? [bindingSql] : undefined,
-          tables,
-          charts: charts.length ? charts : undefined,
-          verifySkipped: "question_binding",
-          sqlSource: "question_binding",
-          questionBinding: {
-            id: bindingHit.id,
-            questionId: bindingHit.questionId,
-            rewritten: false,
-          },
-          modelId: opts?.modelId,
-          packVersion: pack.version,
-        });
-      }
-    }
-
-    // Intent → 确定性 SQL（语义层编译优先；失败再 LLM）
-    const intentBuilt = buildAnalyticsIntent({
-      nl: nlForGuards,
-      range: { start: range.start, end: range.end },
-      gate,
+    const intentBuilt = buildAnalyticsIntentFromStructure({
+      structure: {
+        time: structured.time,
+        filters: structured.filters,
+        outputDims: structured.outputDims,
+        layout: structured.layout,
+        pivotDim: structured.pivotDim,
+        metricId: structured.metricId,
+      },
       pack,
+      fallbackNl: nlForGuards,
     });
-    if (intentBuilt.ok) {
-      const compiled = compileAnalyticsIntent(intentBuilt.intent, pack);
-      if (compiled.ok) {
-        let sqls = normalizeSqls([compiled.sql]);
-        let issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-        guardIssues = issues;
-        if (!issues.length) {
-          opts?.signal?.throwIfAborted();
-          const dbId = pack.datasource.metabaseDatabaseId;
-          const maxRows = pack.guards.maxRows;
-          const execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
-          const compileHandle = trace.span(runId, "tool", "analytics.intent-compile", {
-            worker: "analytics",
-          });
-          let results: DatasetResult[];
-          try {
-            results = await mapPool(
-              execSqls,
-              pack.guards.parallelism,
-              (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
-              opts?.signal,
-            );
-            compileHandle.end({
-              status: results.every((r) => r.ok) ? "ok" : "error",
-              meta: { sqlSource: "intent_compile", statements: execSqls.length },
-            });
-          } catch (e) {
-            compileHandle.end({
-              status: "error",
-              error: e instanceof Error ? e.message : String(e),
-            });
-            throw e;
-          }
 
-          const execErrors = results.filter((r) => !r.ok);
-          if (execErrors.length === results.length && results.length > 0) {
-            // 编译 SQL 执行失败 → 回落 LLM
-          } else {
-            const tables = results.map((r, i) => ({
-              title: sqls.length > 1 ? `查询 ${i + 1}` : "结果",
-              cols: r.cols,
-              rows: r.rows,
-              grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
-            }));
-            const dimCheck = reconcileNamedDimensions({
-              nl: nlForGuards,
-              tables,
-              sqls,
-              dimColumns,
-            });
-            if (!dimCheck.ok) {
-              return seal({
-                status: "refuse",
-                message: `维对账未通过：结果中缺少点名维度 ${dimCheck.missing.join("、")}，已停止交付以免假对照。`,
-                timeEcho: range.echo,
-                sqls,
-                tables,
-                sqlSource: "intent_compile",
-                error: dimCheck.detail,
-                modelId: opts?.modelId,
-                packVersion: pack.version,
-              });
-            }
-            const emptyNote = allEmpty(results)
-              ? `（${range.echo} 无数据行；请确认年份或筛选条件）`
-              : "";
-            const charts = allEmpty(results) ? [] : buildLocalChartsFromTables(tables);
-            return seal({
-              status: "ok",
-              message: `${range.echo}${emptyNote}`,
-              timeEcho: range.echo,
-              sqls,
-              tables,
-              charts: charts.length ? charts : undefined,
-              verifySkipped: "intent_compile",
-              sqlSource: "intent_compile",
-              modelId: opts?.modelId,
-              packVersion: pack.version,
-            });
-          }
-        }
-        // lint 失败 → LLM 兜底
-      }
-    }
-
-    let probeSummary = "";
-    try {
-      probeSummary = await probeDimensions(pack, range, opts?.signal);
-    } catch (e) {
-      if (opts?.signal?.aborted || isAbortError(e)) throw e;
-      probeSummary = "PROBE_FAILED";
-    }
-    opts?.signal?.throwIfAborted();
-
-    const intentHint =
-      intentBuilt.ok
-        ? `Structured Intent (prefer honor; compile failed or skipped):\n${intentToJson(intentBuilt.intent)}`
-        : intentBuilt.reason
-          ? `Intent not compiled (${intentBuilt.reason}); use Grounded slots + probe.`
-          : "";
-
-    const genUser = [
-      `User question: ${questionForLlm}`,
-      `Resolved time: ${range.start} .. ${range.end} (${range.echo})`,
-      groundedHint || "",
-      intentHint,
-      probeSummary ? `Probe Top-N DISTINCT:\n${probeSummary}` : "",
-      "Generate SQL now.",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    const raw = await llmText(system, genUser, llmOpts);
-    const parsed = parseSqlsFromLlm(raw);
-    if (parsed === "REFUSE") {
+    if (!intentBuilt.ok) {
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "intent",
+          detail: intentBuilt.reason,
+          structuredJson: JSON.stringify(structured),
+        },
+        llmOptsBase,
+      );
       return seal({
-        status: "refuse",
-        message: "无法安全生成查询。",
+        status: "clarify",
+        message: msg,
         timeEcho: range.echo,
-        probeSummary: probeSummary || undefined,
+        packVersion: pack.version,
+        structuredFromConversation: true,
       });
     }
 
-    let sqls = normalizeSqls(parsed);
-    let issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-    guardIssues = issues;
-    let rounds = 0;
-    while (issues.length && rounds < pack.guards.maxRewriteRounds) {
-      rounds++;
-      rewriteRounds = rounds;
-      const rewritten = await rewriteSqls(system, questionForLlm, sqls, issues.join(", "), {
-        ...llmOpts,
-        spanName: "analytics.sql.rewrite",
-      });
-      if (rewritten === "REFUSE") {
-        return seal({
-          status: "refuse",
-          message: "重写后仍无法安全生成查询。",
-          timeEcho: range.echo,
-          sqls,
-          probeSummary: probeSummary || undefined,
-        });
-      }
-      sqls = normalizeSqls(rewritten);
-      issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-      guardIssues = issues;
-    }
-    if (issues.length) {
+    const compiled = compileAnalyticsIntent(intentBuilt.intent, pack);
+    if (!compiled.ok) {
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "compile",
+          detail: compiled.reason,
+          structuredJson: JSON.stringify(structured),
+          intentJson: intentToJson(intentBuilt.intent),
+        },
+        llmOptsBase,
+      );
       return seal({
-        status: "error",
-        message: `SQL 校验未通过: ${issues.join(", ")}`,
+        status: "clarify",
+        message: msg,
+        timeEcho: range.echo,
+        packVersion: pack.version,
+        structuredFromConversation: true,
+      });
+    }
+
+    let sqls = normalizeSqls([compiled.sql]);
+    const issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
+    guardIssues = issues;
+    if (issues.length) {
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "lint",
+          detail: issues.join("; "),
+          intentJson: intentToJson(intentBuilt.intent),
+          sqlPreview: sqls[0],
+        },
+        llmOptsBase,
+      );
+      return seal({
+        status: "clarify",
+        message: msg,
         timeEcho: range.echo,
         sqls,
-        probeSummary: probeSummary || undefined,
         error: issues.join(", "),
+        packVersion: pack.version,
+        structuredFromConversation: true,
       });
     }
 
     opts?.signal?.throwIfAborted();
     const dbId = pack.datasource.metabaseDatabaseId;
     const maxRows = pack.guards.maxRows;
-    let execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
-    const execHandle = trace.span(runId, "tool", "metabase.dataset", { worker: "analytics" });
+    const execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
+    const compileHandle = trace.span(runId, "tool", "analytics.intent-compile", {
+      worker: "analytics",
+    });
     let results: DatasetResult[];
     try {
       results = await mapPool(
@@ -698,237 +662,83 @@ export async function analyticsAsk(
         (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
         opts?.signal,
       );
-      execHandle.end({
+      compileHandle.end({
         status: results.every((r) => r.ok) ? "ok" : "error",
-        meta: { statements: execSqls.length },
+        meta: { sqlSource: "intent_compile", statements: execSqls.length },
       });
     } catch (e) {
-      execHandle.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
-      throw e;
-    }
-
-    if (allEmpty(results)) {
-      opts?.signal?.throwIfAborted();
-      const yearHint = `All queries returned empty rows for ${range.start}..${range.end}. Consider year mismatch; keep resolved window unless clearly wrong. Rewrite SQL once.`;
-      const rewritten = await rewriteSqls(system, questionForLlm, sqls, `empty_result; ${yearHint}`, {
-        ...llmOpts,
-        spanName: "analytics.sql.empty-rewrite",
+      compileHandle.end({
+        status: "error",
+        error: e instanceof Error ? e.message : String(e),
       });
-      if (rewritten !== "REFUSE" && rewritten.length) {
-        rounds++;
-        rewriteRounds = rounds;
-        sqls = normalizeSqls(rewritten);
-        const emptyIssues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-        guardIssues = emptyIssues;
-        if (!emptyIssues.length) {
-          execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
-          const retryHandle = trace.span(runId, "tool", "metabase.dataset.retry", { worker: "analytics" });
-          try {
-            results = await mapPool(
-              execSqls,
-              pack.guards.parallelism,
-              (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
-              opts?.signal,
-            );
-            retryHandle.end({
-              status: results.every((r) => r.ok) ? "ok" : "error",
-              meta: { statements: execSqls.length },
-            });
-          } catch (e) {
-            retryHandle.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
-            throw e;
-          }
-        }
-      }
+      throw e;
     }
 
     const execErrors = results.filter((r) => !r.ok);
     if (execErrors.length === results.length && results.length > 0) {
+      const detail = execErrors.map((r) => r.error).join("; ");
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "exec",
+          detail,
+          intentJson: intentToJson(intentBuilt.intent),
+          sqlPreview: sqls[0],
+        },
+        llmOptsBase,
+      );
       return seal({
         status: "error",
-        message: `执行失败: ${execErrors.map((r) => r.error).join("; ")}`,
+        message: msg,
         timeEcho: range.echo,
         sqls,
-        probeSummary: probeSummary || undefined,
-        error: execErrors.map((r) => r.error).join("; "),
+        error: detail,
+        sqlSource: "intent_compile",
+        packVersion: pack.version,
+        structuredFromConversation: true,
       });
     }
 
-    let tables = results.map((r, i) => ({
+    const tables = results.map((r, i) => ({
       title: sqls.length > 1 ? `查询 ${i + 1}` : "结果",
       cols: r.cols,
       rows: r.rows,
-      grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]) ? "day" : undefined,
+      grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
     }));
-
-    let dimCheck = reconcileNamedDimensions({
+    const dimCheck = reconcileNamedDimensions({
       nl: nlForGuards,
       tables,
       sqls,
       dimColumns,
     });
-    while (!dimCheck.ok && rounds < pack.guards.maxRewriteRounds) {
-      rounds++;
-      rewriteRounds = rounds;
-      const rewritten = await rewriteSqls(system, questionForLlm, sqls, dimCheck.detail, {
-        ...llmOpts,
-        spanName: "analytics.sql.dim-rewrite",
-      });
-      if (rewritten === "REFUSE" || !rewritten.length) break;
-      sqls = normalizeSqls(rewritten);
-      const dIssues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-      if (dIssues.length) {
-        guardIssues = dIssues;
-        dimCheck = {
-          ok: false,
-          missing: dimCheck.missing,
-          named: dimCheck.named,
-          detail: `dim_mismatch+lint:${dIssues.join(",")}`,
-        };
-        continue;
-      }
-      execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
-      results = await mapPool(
-        execSqls,
-        pack.guards.parallelism,
-        (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
-        opts?.signal,
-      );
-      tables = results.map((r, i) => ({
-        title: sqls.length > 1 ? `查询 ${i + 1}` : "结果",
-        cols: r.cols,
-        rows: r.rows,
-        grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]) ? "day" : undefined,
-      }));
-      dimCheck = reconcileNamedDimensions({
-        nl: nlForGuards,
-        tables,
-        sqls,
-        dimColumns,
-      });
-    }
     if (!dimCheck.ok) {
+      const msg = await diagnoseFailure(
+        {
+          transcript,
+          stage: "dim_reconcile",
+          detail: dimCheck.detail,
+          intentJson: intentToJson(intentBuilt.intent),
+          sqlPreview: sqls[0],
+        },
+        llmOptsBase,
+      );
       return seal({
         status: "refuse",
-        message: `维对账未通过：结果中缺少点名维度 ${dimCheck.missing.join("、")}，已停止交付以免假对照。`,
+        message: msg,
         timeEcho: range.echo,
         sqls,
         tables,
-        probeSummary: probeSummary || undefined,
+        sqlSource: "intent_compile",
         error: dimCheck.detail,
-        modelId: opts?.modelId,
         packVersion: pack.version,
+        structuredFromConversation: true,
       });
-    }
-
-    let verifyMeta: LlmVerifyResult | undefined;
-    const nonempty = !allEmpty(results);
-    if (nonempty && llmVerifyEnabled()) {
-      const verifyInput = () => ({
-        nl: nlForGuards,
-        timeEcho: range.echo,
-        sqls,
-        sampleTables: sampleTablesForVerify(tables),
-      });
-      const runVerify = async (): Promise<LlmVerifyResult> => {
-        const prompt = buildLlmVerifyPrompt(verifyInput());
-        const rawVerify = await llmText(prompt.system, prompt.user, {
-          ...llmOpts,
-          spanName: "analytics.verify",
-        });
-        return parseLlmVerifyResponse(rawVerify);
-      };
-      const runVerifyRetry = async (priorReason: string): Promise<LlmVerifyResult> => {
-        const prompt = buildLlmVerifyRetryPrompt({ ...verifyInput(), priorReason });
-        const rawVerify = await llmText(prompt.system, prompt.user, {
-          ...llmOpts,
-          spanName: "analytics.verify.retry",
-        });
-        return parseLlmVerifyResponse(rawVerify);
-      };
-
-      verifyMeta = await runVerify();
-      while (verifyMeta.verdict === "fail" && rounds < pack.guards.maxRewriteRounds) {
-        rounds++;
-        rewriteRounds = rounds;
-        const feedback = `verify_fail:${verifyMeta.codes.join("|") || "unspecified"}; ${verifyMeta.reason}`;
-        const rewritten = await rewriteSqls(system, questionForLlm, sqls, feedback, {
-          ...llmOpts,
-          spanName: "analytics.sql.verify-rewrite",
-        });
-        if (rewritten === "REFUSE" || !rewritten.length) break;
-        sqls = normalizeSqls(rewritten);
-        const vIssues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
-        if (vIssues.length) {
-          guardIssues = vIssues;
-          verifyMeta = {
-            verdict: "fail",
-            codes: ["rewrite_lint", ...vIssues.slice(0, 3)],
-            reason: vIssues.join(", "),
-          };
-          continue;
-        }
-        execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
-        const vExec = trace.span(runId, "tool", "metabase.dataset.verify-retry", { worker: "analytics" });
-        try {
-          results = await mapPool(
-            execSqls,
-            pack.guards.parallelism,
-            (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
-            opts?.signal,
-          );
-          vExec.end({
-            status: results.every((r) => r.ok) ? "ok" : "error",
-            meta: { statements: execSqls.length },
-          });
-        } catch (e) {
-          vExec.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
-          throw e;
-        }
-        tables = results.map((r, i) => ({
-          title: sqls.length > 1 ? `查询 ${i + 1}` : "结果",
-          cols: r.cols,
-          rows: r.rows,
-          grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]) ? "day" : undefined,
-        }));
-        if (allEmpty(results)) break;
-        verifyMeta = await runVerify();
-      }
-
-      if (verifyMeta.verdict === "unclear") {
-        verifyMeta = await runVerifyRetry(verifyMeta.reason);
-        if (verifyMeta.verdict === "unclear") {
-          verifyMeta = resolveUnclearVerify(verifyMeta);
-        }
-      }
-
-      if (verifyMeta.verdict === "unclear" || verifyMeta.verdict === "fail") {
-        return seal({
-          status: "refuse",
-          message:
-            verifyMeta.verdict === "unclear"
-              ? `校对无法确认结果是否正确（${verifyMeta.reason}），请补充条件或换种问法。`
-              : `校对未通过（${verifyMeta.reason}），已停止交付以免静默错数。`,
-          timeEcho: range.echo,
-          sqls,
-          tables,
-          probeSummary: probeSummary || undefined,
-          verify: {
-            verdict: verifyMeta.verdict,
-            codes: verifyMeta.codes,
-            reason: verifyMeta.reason,
-          },
-          modelId: opts?.modelId,
-          packVersion: pack.version,
-        });
-      }
     }
 
     const emptyNote = allEmpty(results)
       ? `（${range.echo} 无数据行；请确认年份或筛选条件）`
       : "";
     const charts = allEmpty(results) ? [] : buildLocalChartsFromTables(tables);
-
     return seal({
       status: "ok",
       message: `${range.echo}${emptyNote}`,
@@ -936,13 +746,10 @@ export async function analyticsAsk(
       sqls,
       tables,
       charts: charts.length ? charts : undefined,
-      probeSummary: probeSummary || undefined,
-      sqlSource: "llm",
-      verify: verifyMeta
-        ? { verdict: verifyMeta.verdict, codes: verifyMeta.codes, reason: verifyMeta.reason }
-        : undefined,
-      modelId: opts?.modelId,
+      verifySkipped: "intent_compile",
+      sqlSource: "intent_compile",
       packVersion: pack.version,
+      structuredFromConversation: true,
     });
   } catch (e) {
     if (opts?.signal?.aborted || isAbortError(e)) {

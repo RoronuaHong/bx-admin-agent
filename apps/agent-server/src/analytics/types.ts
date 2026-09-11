@@ -1,5 +1,8 @@
 export type DistinctCountFn = "uniq" | "uniqExact";
 
+/** 多值过滤相对输出维的展示形态（完播宽/长表） */
+export type ResultLayout = "wide" | "long";
+
 export interface DatasetResult {
   ok: boolean;
   cols: string[];
@@ -14,15 +17,6 @@ export interface TimeRange {
   echo: string; // e.g. "按 2026-08-19～25"
 }
 
-export interface AnalyticsSlots {
-  time_range?: TimeRange;
-  metrics: string[];
-  dimensions: string[];
-  filters: Record<string, string[]>;
-  need_parallel?: boolean;
-  clarify?: string;
-}
-
 export interface AnalyticsAskResult {
   status: "ok" | "clarify" | "refuse" | "error";
   message: string;
@@ -30,9 +24,9 @@ export interface AnalyticsAskResult {
   sqls?: string[];
   tables?: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
   probeSummary?: string;
-  /** Ambiguity Gate：待填槽位 id（如 contentLang / completion_rate） */
+  /** 待填槽位 id（如 contentLang / completion_rate / time_range） */
   clarifySlot?: string;
-  /** 澄清候选项（Probe / pack 枚举） */
+  /** 澄清候选项（Probe） */
   clarifyOptions?: Array<{ id: string; label: string }>;
   error?: string;
   /** M2 LLM 校对结论（可跳过 empty / 关闭 ANALYTICS_LLM_VERIFY） */
@@ -43,11 +37,12 @@ export interface AnalyticsAskResult {
   askId?: string;
   /** 本问自纠错轮次（lint/empty/dim/verify） */
   rewriteRounds?: number;
-  /** questionBinding 命中且未改写时跳过 LLM 校对 */
-  verifySkipped?: "question_binding" | "empty" | "disabled" | "intent_compile";
-  /** SQL 来源：绑定卡 / Intent 编译 / LLM */
-  sqlSource?: "question_binding" | "intent_compile" | "llm";
-  questionBinding?: { id: string; questionId?: number; rewritten: boolean };
+  /** Intent 编译等路径跳过 LLM 校对 */
+  verifySkipped?: "empty" | "disabled" | "intent_compile";
+  /** SQL 来源：仅 Intent 确定性编译（不再 LLM 写 SQL） */
+  sqlSource?: "intent_compile";
+  /** 是否经对话 schema-agent 结构化 */
+  structuredFromConversation?: boolean;
   /** 本地 ECharts 双轨图（无 Metabase temp card） */
   charts?: Array<{
     title: string;

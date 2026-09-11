@@ -533,6 +533,8 @@ export async function askAnalytics(
     images?: string[];
     files?: string[];
     slotAnswers?: Record<string, string[]>;
+    /** 本轮完整对话（含当前用户句），供后端 LLM 结构化 */
+    messages?: Array<{ role: "user" | "assistant"; text: string }>;
   },
 ): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
@@ -545,6 +547,7 @@ export async function askAnalytics(
       images: opts?.images,
       files: opts?.files,
       slotAnswers: opts?.slotAnswers,
+      messages: opts?.messages,
     }),
     signal: opts?.signal,
   });

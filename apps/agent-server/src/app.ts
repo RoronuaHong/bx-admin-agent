@@ -625,6 +625,7 @@ export function createApp() {
         images?: string[];
         files?: string[];
         slotAnswers?: Record<string, string[]>;
+        messages?: Array<{ role?: string; text?: string; content?: string }>;
       }>()
       .catch(() => ({
         text: "",
@@ -632,6 +633,7 @@ export function createApp() {
         images: undefined as string[] | undefined,
         files: undefined as string[] | undefined,
         slotAnswers: undefined as Record<string, string[]> | undefined,
+        messages: undefined as Array<{ role?: string; text?: string; content?: string }> | undefined,
       }));
     const text = String(body.text || "").trim();
     const images = Array.isArray(body.images) ? body.images.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
@@ -648,12 +650,22 @@ export function createApp() {
               .filter(([, v]) => (v as string[]).length > 0),
           )
         : undefined;
+    const messages = Array.isArray(body.messages)
+      ? body.messages
+          .map((m) => ({
+            role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
+            text: String(m.text || m.content || "").trim(),
+          }))
+          .filter((m) => m.text)
+          .slice(-40)
+      : undefined;
     const result = await analyticsAsk(text, {
       modelId,
       signal: c.req.raw.signal,
       images,
       files,
       slotAnswers: slotAnswers && Object.keys(slotAnswers).length ? slotAnswers : undefined,
+      messages,
     });
     return c.json(result);
   });

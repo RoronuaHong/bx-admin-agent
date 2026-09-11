@@ -131,6 +131,10 @@ function compileUniqOrSum(intent: AnalyticsIntent): CompileResult {
   } else if (intent.metric.kind === "sum") {
     const f = intent.metric.valueField || "watchSecond";
     metricExpr = `sum(${f}) AS ${f}`;
+  } else if (intent.metric.kind === "avg_per_user") {
+    const valueField = intent.metric.valueField || "watchSecond";
+    const distinctField = intent.metric.distinctField || "guid";
+    metricExpr = `round(sum(${valueField}) / nullIf(uniq(${distinctField}), 0), 2) AS avg_watch_second`;
   } else {
     return { ok: false, reason: `unsupported kind ${intent.metric.kind}` };
   }
@@ -161,6 +165,7 @@ export function compileAnalyticsIntent(
       return compileAvgOfMax(intent);
     case "uniq":
     case "sum":
+    case "avg_per_user":
       return compileUniqOrSum(intent);
     default:
       return { ok: false, reason: `unknown metric kind` };

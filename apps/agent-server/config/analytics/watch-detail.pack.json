@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-10.3",
+  "version": "2026-09-11.3",
   "id": "watch-detail",
   "datasource": {
     "engine": "clickhouse",
@@ -20,7 +20,7 @@
       ]
     }
   ],
-  "probeDimensions": ["channel", "contentLang"],
+  "probeDimensions": ["channel", "contentLang", "movieType"],
   "required_filters": ["time_range"],
   "time": {
     "businessTimezone": "Asia/Shanghai",
@@ -40,22 +40,14 @@
       "field": "contentLang",
       "aliases": ["语言", "语种", "小语种", "contentLang"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类", "小语种"],
-      "domain": "probe",
-      "valueAliases": {
-        "泰卢固": "te-IN",
-        "泰米尔": "ta-IN",
-        "马拉雅拉姆": "ml-IN",
-        "印地语": "hi-IN",
-        "印地": "hi-IN"
-      }
+      "domain": "probe"
     },
     {
       "id": "movieType",
       "field": "movieType",
       "aliases": ["影片类型", "内容类型", "影片", "movieType"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类"],
-      "domain": "pack",
-      "allowedValues": ["1", "2", "3", "4", "10", "11"],
+      "domain": "probe",
       "defaultWhenAbsent": true
     }
   ],
@@ -80,21 +72,31 @@
           "groundSignals": ["阈值", "大于等于", "≥"]
         }
       ]
-    }
-  ],
-  "examples": [
+    },
     {
-      "nl": "IndiaA 按天观看人数",
-      "sqlHint": "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' AND toDate(lastWatchTime) BETWEEN {start} AND {end} AND movieType IN (1,2,3,4,10,11) GROUP BY d"
-    }
-  ],
-  "questionBindings": [
-    {
-      "id": "indiaA-day-users",
-      "matchAll": ["印度A", "按天观看人数"],
-      "matchNone": ["和", "与", "同时", "各自", "分别", "FoxA", "GoGo"],
-      "sqlTemplate": "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '{start}' AND '{end}' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
-      "_comment": "No matching Metabase card in inventory (2026-09-10). When BI saves one, set questionId here or ANALYTICS_BINDING_QID_indiaA_day_users=<id>."
+      "id": "watch_duration",
+      "aliases": ["观看时长", "人均时长", "人均观看时长", "watchSecond"],
+      "options": [
+        {
+          "id": "avg_watch_second_per_user",
+          "label": "人均观看时长（秒）",
+          "groundSignals": ["人均", "人均观看", "人均时长"],
+          "compile": {
+            "kind": "avg_per_user",
+            "valueField": "watchSecond",
+            "distinctField": "guid"
+          }
+        },
+        {
+          "id": "sum_watch_second",
+          "label": "观看时长合计（秒）",
+          "groundSignals": ["合计", "总时长", "总观看", "时长合计"],
+          "compile": {
+            "kind": "sum",
+            "valueField": "watchSecond"
+          }
+        }
+      ]
     }
   ]
 }

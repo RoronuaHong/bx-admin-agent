@@ -1,15 +1,15 @@
 /**
- * Analytics Intent — Gate/NL 接地后的结构化查询计划（语义层中间态）。
- * SQL 由 sql-compile 确定性编译，禁止把金句塞进 LLM。
+ * Analytics Intent — schema-agent 结构化后的查询计划（语义层中间态）。
+ * SQL 由 sql-compile 确定性编译；失败时由 pipeline 用 LLM 诊断原因，不写 SQL。
  */
 
 import { extractNamedEntities } from "./named-entities.js";
-import type { AmbiguityGateOk, ResultLayout } from "./ambiguity-gate.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
+import type { ResultLayout } from "./types.js";
 
 export type OutputDimId = "watch_date" | "channel" | string;
 
-export type CompileMetricKind = "avg_of_max" | "uniq" | "sum";
+export type CompileMetricKind = "avg_of_max" | "uniq" | "sum" | "avg_per_user";
 
 export type AnalyticsIntent = {
   table: string;
@@ -28,6 +28,11 @@ export type AnalyticsIntent = {
   };
 };
 
+/**
+ * 渠道中文别名 → 库内码。
+ * 暂时保留：schema-agent / Metabase probe 若未能稳定映射中文渠道名时作兜底。
+ * 优先仍应靠对话原文里的拉丁渠道码，或 probe `channel` 维。
+ */
 const CHANNEL_ALIASES: Record<string, string> = {
   印度A: "IndiaA",
   印度B: "IndiaB",
@@ -38,7 +43,7 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 从 NL 抽渠道名（实体 + 中文别名）。 */
+/** 从 NL 抽渠道名（实体 + 中文别名兜底）。 */
 export function extractChannelsFromNl(nl: string): string[] {
   const found = new Set<string>();
   for (const [alias, code] of Object.entries(CHANNEL_ALIASES)) {
@@ -77,7 +82,6 @@ function resolveMetricCompile(
       if (opt.id !== metricId) continue;
       const c = opt.compile;
       if (!c?.kind) {
-        // 语义层未声明 compile 时，avg_max_progress 用默认配方（语义定义，非 LLM 金句）
         if (metricId === "avg_max_progress") {
           return {
             id: metricId,
@@ -111,78 +115,71 @@ function resolveMetricCompile(
   if (metricId === "sum_watch_second") {
     return { id: metricId, kind: "sum", valueField: "watchSecond" };
   }
+  if (metricId === "avg_watch_second_per_user") {
+    return {
+      id: metricId,
+      kind: "avg_per_user",
+      valueField: "watchSecond",
+      distinctField: "guid",
+    };
+  }
   return null;
 }
 
-function inferMetricId(nl: string, gate: AmbiguityGateOk): string | null {
-  if (gate.groundedMetrics.length) return gate.groundedMetrics[0]!;
-  if (/完播|最大进度/.test(nl)) return null;
-  if (/人数|UV|用户数|观看人数/.test(nl)) return "uniq_users";
-  if (/时长|观看秒|watchSecond|watch_second/.test(nl)) return "sum_watch_second";
-  return null;
-}
-
-/**
- * Gate 通过后组装 Intent；缺渠道等关键过滤时返回 null（交 LLM 或上层 clarify）。
- */
-export function buildAnalyticsIntent(input: {
-  nl: string;
-  range: { start: string; end: string };
-  gate: AmbiguityGateOk;
+/** 由对话结构化结果组装 Intent。 */
+export function buildAnalyticsIntentFromStructure(input: {
+  structure: {
+    time: { start: string; end: string };
+    filters: Record<string, string[]>;
+    outputDims: string[];
+    layout?: ResultLayout;
+    pivotDim?: string;
+    metricId: string;
+  };
   pack: AnalyticsPack;
+  fallbackNl?: string;
 }): { ok: true; intent: AnalyticsIntent } | { ok: false; reason: string } {
-  const { nl, range, gate, pack } = input;
+  const { structure, pack, fallbackNl = "" } = input;
   const table = pack.tables[0]?.name;
   if (!table) return { ok: false, reason: "pack has no table" };
+  const metric = resolveMetricCompile(structure.metricId, pack);
+  if (!metric) return { ok: false, reason: `metric ${structure.metricId} not compilable` };
 
-  const metricId = inferMetricId(nl, gate);
-  if (!metricId) return { ok: false, reason: "metric not inferred" };
-  const metric = resolveMetricCompile(metricId, pack);
-  if (!metric) return { ok: false, reason: `metric ${metricId} not compilable` };
-
-  const filters: Record<string, string[]> = { ...gate.groundedFilters };
-  const channels = extractChannelsFromNl(nl);
-  if (channels.length && !filters.channel?.length) {
-    filters.channel = channels;
+  const filters: Record<string, string[]> = { ...structure.filters };
+  if (!filters.channel?.length) {
+    const channels = extractChannelsFromNl(fallbackNl);
+    if (channels.length) filters.channel = channels;
   }
-  // 语义层默认 movieType（用户未显式覆盖时）
   if (!filters.movieType?.length && pack.guards.defaultMovieTypes?.length) {
     filters.movieType = pack.guards.defaultMovieTypes.map(String);
   }
 
-  // 单渠道题未抽出渠道 → 无法安全编译（避免全渠道扫）
-  const needsChannel =
-    /渠道|India|Fox|GoGo|Tiger|Pak|Peacock|印度/.test(nl) || Boolean(filters.channel?.length);
-  if (needsChannel && !filters.channel?.length) {
-    return { ok: false, reason: "channel filter missing" };
-  }
-
-  let outputDims = [...gate.outputDims];
+  let outputDims = [...structure.outputDims];
   if (!outputDims.length) {
-    // 默认：有「按天/日期」用 watch_date；否则仅聚合
-    if (/按天|按日|按.*日期|每天/.test(nl)) outputDims.push("watch_date");
-    if (/按.*渠道|各渠道/.test(nl)) outputDims.push("channel");
+    if (/按天|按日|按.*日期|每天|观看日期/.test(fallbackNl)) outputDims.push("watch_date");
+    if (/按.*渠道|各渠道|观看日期.*渠道|渠道.*维度/.test(fallbackNl)) outputDims.push("channel");
   }
 
-  // 宽表需要 pivot + layout
+  const pivotDim = structure.pivotDim;
   if (
-    gate.pivotDim &&
-    (filters[gate.pivotDim]?.length || 0) > 1 &&
+    pivotDim &&
+    (filters[pivotDim]?.length || 0) > 1 &&
     outputDims.length &&
-    !outputDims.includes(gate.pivotDim)
+    !outputDims.includes(pivotDim) &&
+    !structure.layout
   ) {
-    if (!gate.layout) return { ok: false, reason: "result_layout missing" };
+    return { ok: false, reason: "result_layout missing" };
   }
 
   return {
     ok: true,
     intent: {
       table,
-      time: { start: range.start, end: range.end },
+      time: { start: structure.time.start, end: structure.time.end },
       filters,
       outputDims,
-      layout: gate.layout,
-      pivotDim: gate.pivotDim,
+      layout: structure.layout,
+      pivotDim,
       metric,
     },
   };

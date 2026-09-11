@@ -1110,6 +1110,20 @@ async function send() {
 
   const priorMessages = [...(activeConversation.value?.messages || [])];
   const askPayload = buildClarifyContinuation(priorMessages, text);
+  const conversationMessages = [
+    ...priorMessages
+      .filter((m) => !m.welcome && !m.pending && !m.cancelled)
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({
+        role: m.role as "user" | "assistant",
+        text: String(m.text || "").trim(),
+      }))
+      .filter((m) => m.text),
+    {
+      role: "user" as const,
+      text: text || (imageIds.length || fileIds.length ? tx("（附件问数）", "(ask with attachments)") : ""),
+    },
+  ].filter((m) => m.text);
 
   const attachedImages = pastingImages.value.map((i) => ({ id: i.id, name: i.name }));
   const attachedFiles = pastingFiles.value.map((f) => ({ id: f.id, name: f.name }));
@@ -1153,12 +1167,13 @@ async function send() {
   };
 
   try {
-    const data = await askAnalytics(askPayload.text, {
+    const data = await askAnalytics(text || askPayload.text, {
       model: selectedModel.value ?? undefined,
       signal: controller.signal,
       images: imageIds.length ? imageIds : undefined,
       files: fileIds.length ? fileIds : undefined,
       slotAnswers: askPayload.slotAnswers,
+      messages: conversationMessages,
     });
     if (data.error === "aborted" || (data.status === "error" && data.message === "已取消")) {
       patchPending({ text: "", pending: false, cancelled: true, status: undefined, error: undefined });
