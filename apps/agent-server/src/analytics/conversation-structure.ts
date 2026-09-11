@@ -5,6 +5,8 @@
 
 import type { AnalyticsPack } from "./semantic-layer.js";
 import type { ResultLayout } from "./types.js";
+import { parseAskPlan, type AskPlan } from "./ask-plan.js";
+import { inferMetricIdFromNl, inferOutputDimsFromNl } from "./metric-infer.js";
 
 export type ConversationTurn = {
   role: "user" | "assistant";
@@ -21,6 +23,12 @@ export type StructuredAskOk = {
   layout?: ResultLayout;
   pivotDim?: string;
   metricId?: string;
+  /** Demand–Capability：本题需要的运算 id（可由模型声明；闸门会与 NL groundSignals 合并） */
+  ops?: string[];
+  /** 一句话复述用户诉求（审计 / 闸门） */
+  askSummary?: string;
+  /** 多步计划（可选）；merge 超纲时整题 refuse */
+  plan?: AskPlan;
   notes?: string[];
 };
 
@@ -49,13 +57,18 @@ function packCatalogHint(pack: AnalyticsPack): string {
     "sum_watch_second (观看时长合计)",
     "avg_watch_second_per_user (人均观看时长)",
   );
+  const caps = pack.capabilities;
+  const supportedOps = (caps?.ops || ["base_aggregate", "pivot_wide", "pivot_long"]).join(", ");
+  const unsupported = Object.keys(caps?.unsupportedOpsHint || {}).join(", ") || "(none listed)";
   return [
     `Table: ${table?.name || "elt_watch_detail"} fields: ${(table?.fields || []).join(", ")}`,
     `Probe dimensions: ${(pack.probeDimensions || []).join(", ")}`,
-    `Enum dims (no value dictionaries — probe Metabase): ${(pack.enumDimensions || [])
+    `Enum dims (lexicon/probe — no invented codes): ${(pack.enumDimensions || [])
       .map((d) => d.field)
       .join(", ")}`,
     `Known metrics: ${metrics.join("; ")}`,
+    `Supported ops: ${supportedOps}`,
+    `Known-but-unsupported ops (declare in ops if user asks; gate will refuse): ${unsupported}`,
     "outputDims soft ids: watch_date, channel, contentLang, movieType",
     "layout: wide|long only for avg_max_progress pivot cases",
   ].join("\n");
@@ -301,6 +314,18 @@ export function impliesLangSetWithoutMembers(text: string): boolean {
   return extractLocalesFromText(userText).length === 0;
 }
 
+/**
+ * User actually asked for language filtering / locale set.
+ * Used to block LLM from inventing contentLang clarify on plain UV/duration asks.
+ */
+export function userDemandsLangFilter(text: string): boolean {
+  const userText = userFacingTranscript(text);
+  if (impliesLangSetWithoutMembers(userText)) return true;
+  if (extractLocalesFromText(userText).length > 0) return true;
+  const compact = userText.replace(/\s+/g, "");
+  return /(小语种|语种|内容语言|contentLang|按语言|各语言|语言筛选|语言过滤|分语言)/.test(compact);
+}
+
 function isCompletionMetric(metricId: string | undefined, mergedNl: string): boolean {
   return (
     metricId === "avg_max_progress" ||
@@ -346,6 +371,11 @@ export function enforceStructurePolicy(
   const needLangMembers =
     (impliesLangSetWithoutMembers(transcript) && chatLocales.length === 0) ||
     (impliesLangSetWithoutMembers(mergedNl) && chatLocales.length === 0);
+  const langWanted =
+    needLangMembers ||
+    userDemandsLangFilter(transcript) ||
+    userDemandsLangFilter(mergedNl) ||
+    chatLocales.length > 0;
 
   const filters =
     result.status === "ok"
@@ -411,10 +441,43 @@ export function enforceStructurePolicy(
     } else {
       filters.contentLang = chatLocales;
     }
+  } else if (!langWanted) {
+    // 用户未要求语言筛选：丢掉模型臆造的 contentLang，避免无故反问
+    delete filters.contentLang;
   }
 
   if (result.status === "clarify") {
     const slot = normalizeClarifySlot(result.clarifySlot);
+    // 无语言诉求时，吞掉模型臆造的 contentLang clarify，改走后续缺槽检查 / ok
+    if (slot === "contentLang" && !langWanted) {
+      delete filters.contentLang;
+      const time = result.time;
+      const metricId =
+        slotAnswers.metric?.[0] ||
+        inferMetricIdFromNl(`${userText}\n${mergedNl}`, { metricDefs: [] } as AnalyticsPack);
+      const outputDims = inferOutputDimsFromNl(`${userText}\n${mergedNl}`);
+      if (time?.start && time?.end && metricId) {
+        return {
+          status: "ok",
+          mergedNl: mergedNl || "（多轮合并问数）",
+          time,
+          filters,
+          outputDims: outputDims.length ? outputDims : ["watch_date"],
+          metricId,
+          notes: ["dropped_spurious_contentLang_clarify"],
+        };
+      }
+      if (time?.start && time?.end && !metricId) {
+        return {
+          status: "clarify",
+          clarify: "请确认指标口径（例如人均观看时长、观看人数、最大进度平均值）。",
+          clarifySlot: "metric",
+          mergedNl: mergedNl || undefined,
+          time,
+          partialFilters: filters,
+        };
+      }
+    }
     return {
       ...result,
       clarifySlot: slot,
@@ -486,7 +549,10 @@ export function enforceStructurePolicy(
     layout,
     pivotDim,
     metricId,
-    notes: [...(result.notes || [])],
+    ops: result.status === "ok" ? result.ops : undefined,
+    askSummary: result.status === "ok" ? result.askSummary : undefined,
+    plan: result.status === "ok" ? result.plan : undefined,
+    notes: [...(result.status === "ok" ? result.notes || [] : [])],
   };
 }
 
@@ -502,10 +568,13 @@ export function buildStructureSystemPrompt(
     "Clarify priority (ask ONE slot at a time): time_range → contentLang → result_layout → metric.",
     "When status=clarify and candidates exist, the pipeline will attach numbered options (1. 2. 3…) for the user; write clarify text that invites 序号 or code replies.",
     "NEVER invent contentLang/movieType codes. If user says N种小语种/几种语言 without listing codes, status=clarify clarifySlot=contentLang (probe first). Do NOT guess te-IN/ta-IN/ml-IN.",
+    "Do NOT clarify contentLang when the user did not ask about languages/locales — omit filters.contentLang and proceed.",
     "Only put a locale into filters.contentLang if it appears in a USER turn, 澄清选择, OR the user replies 全部/全选/all to confirm the candidates you just listed (those candidates are probe-grounded).",
     "When user lists locales like te-IN, put filters.contentLang.",
     "When user names a channel (IndiaA), put filters.channel.",
     "人均观看时长 → metricId avg_watch_second_per_user; 观看人数/UV → uniq_users; 时长合计 → sum_watch_second; 最大进度平均/完播(已点名最大进度) → avg_max_progress.",
+    "IMPORTANT ops rule: put every required capability id into ops (from Catalog supported + known-but-unsupported). Supported growth: yoy / mom / growth_rate (server dual-window + merge_ratio). Still unsupported examples: top_n, percentile — list them in ops; do NOT silently drop to base_aggregate.",
+    "Default ops includes base_aggregate; add pivot_wide/pivot_long when layout is set.",
     "IMPORTANT layout rule: only require layout wide|long when metricId is avg_max_progress. For avg_watch_second_per_user / uniq_users / sum_watch_second, multi contentLang = WHERE IN — do NOT clarify result_layout.",
     "If avg_max_progress and multiple grounded contentLang and outputDims are watch_date+channel (contentLang not in outputDims), clarify result_layout (clarifySlot MUST be result_layout, never layout).",
     `Today (business clock date): ${clockIsoDate}.`,
@@ -519,6 +588,7 @@ export function buildStructureSystemPrompt(
     "{",
     '  "status": "ok" | "clarify",',
     '  "mergedNl": string,',
+    '  "askSummary": string,',
     '  "clarify": string,',
     '  "clarifySlot": "time_range"|"contentLang"|"movieType"|"result_layout"|"metric",',
     '  "time": { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },',
@@ -527,6 +597,7 @@ export function buildStructureSystemPrompt(
     '  "layout": "wide"|"long",',
     '  "pivotDim": string,',
     '  "metricId": string,',
+    '  "ops": string[],',
     '  "notes": string[]',
     "}",
     "Output a single JSON object only (no markdown, no chain-of-thought).",
@@ -590,6 +661,9 @@ export function parseStructureResponse(raw: string, transcript = ""): Structured
     layoutRaw === "wide" || layoutRaw === "long" ? layoutRaw : undefined;
   const pivotDim = obj.pivotDim ? String(obj.pivotDim) : undefined;
   const metricId = obj.metricId ? String(obj.metricId) : undefined;
+  const ops = asStringArray(obj.ops);
+  const askSummary = obj.askSummary ? String(obj.askSummary).trim() : undefined;
+  const plan = parseAskPlan(obj.plan);
 
   return enforceStructurePolicy(
     {
@@ -601,6 +675,9 @@ export function parseStructureResponse(raw: string, transcript = ""): Structured
       layout,
       pivotDim,
       metricId,
+      ops: ops.length ? ops : undefined,
+      askSummary,
+      plan: plan || undefined,
       notes: asStringArray(obj.notes),
     },
     transcript || mergedNl,

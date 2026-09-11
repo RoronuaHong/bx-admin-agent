@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-11.3",
+  "version": "2026-09-11.18",
   "id": "watch-detail",
   "datasource": {
     "engine": "clickhouse",
@@ -42,7 +42,8 @@
       "field": "contentLang",
       "aliases": ["语言", "语种", "小语种", "contentLang", "英语", "英文"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类", "小语种"],
-      "domain": "probe"
+      "domain": "probe",
+      "valueDomain": "literal"
     },
     {
       "id": "movieType",
@@ -50,6 +51,7 @@
       "aliases": ["影片类型", "内容类型", "影片", "movieType"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类"],
       "domain": "probe",
+      "valueDomain": "metabase_lexicon",
       "defaultWhenAbsent": true
     }
   ],
@@ -100,5 +102,57 @@
         }
       ]
     }
-  ]
+  ],
+  "capabilities": {
+    "ops": [
+      "base_aggregate",
+      "pivot_wide",
+      "pivot_long",
+      "side_by_side",
+      "yoy",
+      "mom",
+      "growth_rate",
+      "merge_ratio"
+    ],
+    "metrics": [
+      "uniq_users",
+      "sum_watch_second",
+      "avg_watch_second_per_user",
+      "avg_max_progress"
+    ],
+    "downgradePolicy": "strict",
+    "unsupportedOpsHint": {
+      "yoy": {
+        "hint": "同比（本期 vs 去年同期）",
+        "groundSignals": ["同比", "同比增长", "yoy", "YoY", "year-over-year", "year over year"]
+      },
+      "growth_rate": {
+        "hint": "增长率（相对基期）",
+        "groundSignals": ["增长率", "增速", "growth rate", "growth_rate"]
+      },
+      "merge_ratio": {
+        "hint": "多步比值/增长率合并",
+        "groundSignals": []
+      },
+      "mom": {
+        "hint": "环比（本期 vs 等长上一窗）",
+        "groundSignals": ["环比", "环比增长", "mom", "MoM", "month-over-month"]
+      },
+      "top_n": {
+        "hint": "TopN 排名尚未建模",
+        "groundSignals": ["TopN", "Top N", "top\\s*\\d+", "前\\d+名", "前\\d+"]
+      },
+      "percentile": {
+        "hint": "分位数尚未建模",
+        "groundSignals": ["分位", "percentile", "P50", "P90", "P95", "P99"]
+      },
+      "merge_diff": {
+        "hint": "多步差值合并尚未建模",
+        "groundSignals": []
+      }
+    }
+  },
+  "delivery": {
+    "missingChannel": "zero_fill"
+  }
 }

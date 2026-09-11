@@ -6,7 +6,8 @@
 > **关联**：取代 [`docs/通用数据分析Agent方案.md`](../../通用数据分析Agent方案.md) 中「以 `call_api` 为权威取数」的路径；Multi-Agent Worker 装配见 `docs/agent/MULTI_AGENT_ARCHITECTURE.md`  
 > **产品范围**：对话取数 + 自动巡检预警（交付按 M1→M2→M3 切分，范围不砍）  
 > **质量硬门槛**：发版须同时满足 **正确率 EX ≥ 85%** 与 **拒答召回 ≥ 95%**（CWR ≤ 10%）；详见 §8。禁止以「查询能跑通」替代。  
-> **实现就绪**：对话取数 / 质量门禁 / 巡检主路径已落地。可答 EX 门禁待人工将 provisional→gold；§12.1.1–12.1.4 为定稿当日历史快照。
+> **实现就绪**：对话取数 / 质量门禁 / 巡检主路径已落地。可答 EX 门禁待人工将 provisional→gold；§12.1.1–12.1.4 为定稿当日历史快照。  
+> **可靠性增强（2026-09-11 设计）**：诉求一致性闸门 / 多步规划 / 用户记忆 / 宽表·多指标 → [`2026-09-11-analytics-reliability-roadmap.md`](./2026-09-11-analytics-reliability-roadmap.md)
 
 ---
 

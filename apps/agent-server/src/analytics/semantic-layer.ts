@@ -10,6 +10,13 @@ export interface EnumDimensionDef {
   /** 集合未列成员时的信号（与别名共现才触发该维） */
   setSignals?: string[];
   domain?: "probe" | "pack";
+  /**
+   * How filter tokens are grounded:
+   * - metabase_lexicon: code↔label from Metabase field values/description
+   * - probe: live Top-N values (contentLang)
+   * - literal: tokens used as stored values as-is
+   */
+  valueDomain?: "metabase_lexicon" | "probe" | "literal";
   allowedValues?: string[];
   /** NL 未提及时用 defaultMovieTypes，不反问 */
   defaultWhenAbsent?: boolean;
@@ -63,6 +70,27 @@ export interface AnalyticsPack {
   enumDimensions?: EnumDimensionDef[];
   /** 指标口径与 compile 配方 */
   metricDefs?: MetricDef[];
+  /**
+   * Demand–Capability：已支持能力白名单 + 已知但未建模的 op（供 LLM 声明、代码校验）。
+   * 扩能力 = 实现 compile 后把 op/metric 移入白名单，不改闸门内核。
+   */
+  capabilities?: {
+    ops: string[];
+    metrics: string[];
+    /**
+     * opId → 用户可见说明；可选 groundSignals 供「模型漏填 ops」时从 NL 接地（配置在 pack，不在代码写死业务词）。
+     */
+    unsupportedOpsHint?: Record<
+      string,
+      string | { hint: string; groundSignals?: string[] }
+    >;
+    /** strict = 超纲 refuse；ask_downgrade = clarify 是否降级（默认 strict） */
+    downgradePolicy?: "strict" | "ask_downgrade";
+  };
+  /** Post-exec delivery when requested members missing from result cells */
+  delivery?: {
+    missingChannel?: "zero_fill" | "explain";
+  };
 }
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../config/analytics");

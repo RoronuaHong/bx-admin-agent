@@ -23,6 +23,8 @@ export type AskRuntimeContext = {
   /** 代码侧时间解析结果摘要（注入事实，非改写用户句） */
   timeResolveNote: string;
   timeResolved?: { start: string; end: string; echo: string };
+  /** Soft analytics user prefs facts */
+  prefsFacts?: string;
 };
 
 export type GuardedInput = {
@@ -116,6 +118,7 @@ export function buildAskFactsBlock(ctx: AskRuntimeContext): string {
     ctx.timeResolved
       ? `- resolved_time_range: ${ctx.timeResolved.start} .. ${ctx.timeResolved.end} (${ctx.timeResolved.echo})`
       : `- resolved_time_range: (none — clarify time_range if still missing)`,
+    ctx.prefsFacts ? ctx.prefsFacts : null,
     "If resolved_time_range is set, you MUST use those exact start/end in JSON time.",
   ];
   return lines.filter(Boolean).join("\n");

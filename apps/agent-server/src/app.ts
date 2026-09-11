@@ -12,7 +12,9 @@ import {
   getConversation,
   listConversations,
   ownerKeyOf,
+  pushConversationAskState,
   renameConversation,
+  undoConversationAskState,
   upsertMessages,
   TASK_RESULTS_CONV_ID,
   type StoredMessage,
@@ -626,6 +628,7 @@ export function createApp() {
         files?: string[];
         slotAnswers?: Record<string, string[]>;
         messages?: Array<{ role?: string; text?: string; content?: string }>;
+        prevAskState?: Record<string, unknown>;
       }>()
       .catch(() => ({
         text: "",
@@ -634,6 +637,7 @@ export function createApp() {
         files: undefined as string[] | undefined,
         slotAnswers: undefined as Record<string, string[]> | undefined,
         messages: undefined as Array<{ role?: string; text?: string; content?: string }> | undefined,
+        prevAskState: undefined as Record<string, unknown> | undefined,
       }));
     const text = String(body.text || "").trim();
     const images = Array.isArray(body.images) ? body.images.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
@@ -667,6 +671,7 @@ export function createApp() {
       files,
       slotAnswers: slotAnswers && Object.keys(slotAnswers).length ? slotAnswers : undefined,
       messages,
+      prevAskState: body.prevAskState,
       ownerKey: ownerCtx.ownerKey,
       userId: ownerCtx.loginName || undefined,
       uiLocale: "zh-CN",
@@ -705,7 +710,11 @@ export function createApp() {
 
   app.post("/analytics/conversations/:id/messages", async (c) => {
     const ctx = resolveAnalyticsOwner(c);
-    const body = await readJson<{ messages?: StoredMessage[]; title?: string }>(c);
+    const body = await readJson<{
+      messages?: StoredMessage[];
+      title?: string;
+      askStateStack?: unknown;
+    }>(c);
     if (!Array.isArray(body.messages)) {
       return errorJson(c, 400, "ANALYTICS_CONVERSATION_INVALID_MESSAGES", undefined, "messages 必须为数组");
     }
@@ -717,8 +726,49 @@ export function createApp() {
       messages: body.messages,
       title: body.title,
       store: "analytics",
+      askStateStack: body.askStateStack as import("./analytics/ask-stack.js").AskStateStack | null | undefined,
     });
     return c.json({ ok: true, ownerVia: ctx.via });
+  });
+
+  app.post("/analytics/conversations/:id/ask-state", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const body = await readJson<{ askState?: unknown }>(c);
+    if (!body.askState || typeof body.askState !== "object") {
+      return errorJson(c, 400, "ANALYTICS_ASK_STATE_INVALID", undefined, "askState 无效");
+    }
+    try {
+      const result = await pushConversationAskState({
+        ownerKey: ctx.ownerKey,
+        id: c.req.param("id"),
+        askState: body.askState as Record<string, unknown>,
+        store: "analytics",
+        countryId: ctx.countryId,
+        loginName: ctx.loginName,
+      });
+      return c.json({ ok: true, stack: result.stack, current: result.current, ownerVia: ctx.via });
+    } catch {
+      return errorJson(c, 400, "ANALYTICS_ASK_STATE_INVALID", undefined, "askState 无效");
+    }
+  });
+
+  app.post("/analytics/conversations/:id/ask-state/undo", async (c) => {
+    const ctx = resolveAnalyticsOwner(c);
+    const result = await undoConversationAskState({
+      ownerKey: ctx.ownerKey,
+      id: c.req.param("id"),
+      store: "analytics",
+    });
+    return c.json({
+      ok: true,
+      stack: result.stack,
+      popped: result.popped,
+      current: result.current,
+      message: result.popped
+        ? "已回到上一 Ask"
+        : "没有可撤销的 Ask",
+      ownerVia: ctx.via,
+    });
   });
 
   app.put("/analytics/conversations/:id", async (c) => {

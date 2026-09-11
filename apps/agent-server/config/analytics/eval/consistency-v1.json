@@ -1,0 +1,66 @@
+{
+  "_meta": {
+    "desc": "Demand–Capability / reliability regression seeds (draft). Expectation: no silent downgrade.",
+    "spec": "docs/superpowers/specs/2026-09-11-analytics-reliability-roadmap.md",
+    "version": "consistency-v1",
+    "status": "active"
+  },
+  "cases": [
+    {
+      "id": "C6-yoy-growth",
+      "nl": "2026-08-19到2026-08-25，各渠道观看人数的同比增长率",
+      "expect": {
+        "statusIn": ["ok"],
+        "whenOk": {
+          "sqlMustMatch": ["uniq\\s*\\(\\s*guid\\s*\\)", "2025-08-19", "2026-08-19"],
+          "notes": "Dual-window YoY: current + prior year; merge_ratio growth_rate"
+        }
+      }
+    },
+    {
+      "id": "C2-wide-pivot-avg-max",
+      "nl": "对比 te-IN 和 ta-IN 的平均最大观看进度，按内容语言分列，宽表展示；时间 2026-08-19 到 2026-08-25，渠道 IndiaA",
+      "expect": {
+        "statusIn": ["ok", "clarify"],
+        "forbidErrorSubstring": ["missing_where"],
+        "whenOk": {
+          "sqlMustMatch": ["sumIf|avgIf|countIf", "te-IN|te_IN", "ta-IN|ta_IN"],
+          "sqlMustNotMatch": ["GROUP BY[^;]*contentLang\\s*$"]
+        }
+      }
+    },
+    {
+      "id": "C4-movie-label",
+      "nl": "2026-08-19到2026-08-25，电影的观看人数，按天",
+      "expect": {
+        "statusIn": ["ok", "clarify"],
+        "whenOk": { "filtersMovieTypeIncludes": ["1"] },
+        "whenClarify": { "optionsLabelMustMatch": "电影" }
+      }
+    },
+    {
+      "id": "baseline-uniq-by-day",
+      "nl": "IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "expect": {
+        "statusIn": ["ok"],
+        "whenOk": { "metricId": "uniq_users" }
+      }
+    },
+    {
+      "id": "baseline-avg-watch",
+      "nl": "IndiaA 在 2026-08-19 至 2026-08-25 按天人均观看时长",
+      "expect": {
+        "statusIn": ["ok"],
+        "whenOk": { "metricId": "avg_watch_second_per_user" }
+      }
+    },
+    {
+      "id": "topn-channels-refuse",
+      "nl": "2026-08-19到2026-08-25，观看时长合计 Top 10 渠道",
+      "expect": {
+        "statusIn": ["refuse", "clarify"],
+        "forbidOkSilentDrop": true
+      }
+    }
+  ]
+}

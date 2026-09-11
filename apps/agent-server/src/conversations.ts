@@ -9,6 +9,14 @@
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 import type { SessionUser } from "@bx/shared";
 import type { LocalizedToken } from "./i18n";
+import {
+  emptyAskStateStack,
+  parseAskStateStack,
+  pushAskState,
+  undoAskState,
+  type AskStateStack,
+} from "./analytics/ask-stack.js";
+import { parseAskState, type AskState } from "./analytics/ask-state.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -67,6 +75,8 @@ export interface ConversationDoc {
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
+  /** Analytics P2: linear AskState stack (top = current) */
+  askStateStack?: AskStateStack;
 }
 
 /** 从 session 用户推导归属 key（国家线 + 登录名）。 */
@@ -240,9 +250,18 @@ export async function upsertMessages(input: {
   messages: StoredMessage[];
   title?: string;
   store?: ConversationStore;
+  askStateStack?: AskStateStack | null;
 }): Promise<void> {
   const s = resolveStore(input.store);
   const coll = await getColl(s);
+  const stackPatch =
+    input.askStateStack === undefined
+      ? {}
+      : {
+          askStateStack: input.askStateStack
+            ? parseAskStateStack(input.askStateStack) || emptyAskStateStack()
+            : emptyAskStateStack(),
+        };
   if (!coll) {
     const list = memGet(s, input.ownerKey);
     let doc = list.find((c) => c.id === input.id);
@@ -262,6 +281,9 @@ export async function upsertMessages(input: {
     doc.messages = input.messages;
     doc.updatedAt = Date.now();
     if (input.title) doc.title = input.title;
+    if (input.askStateStack !== undefined) {
+      doc.askStateStack = stackPatch.askStateStack;
+    }
     memSet(s, input.ownerKey, dedupeDocs(list));
     return;
   }
@@ -272,6 +294,7 @@ export async function upsertMessages(input: {
         messages: input.messages,
         updatedAt: Date.now(),
         ...(input.title ? { title: input.title } : {}),
+        ...stackPatch,
       },
       $setOnInsert: {
         countryId: input.countryId,
@@ -281,6 +304,89 @@ export async function upsertMessages(input: {
     },
     { upsert: true },
   );
+}
+
+async function writeAskStateStack(
+  ownerKey: string,
+  id: string,
+  stack: AskStateStack,
+  store: ConversationStore,
+  meta?: { countryId?: string; loginName?: string },
+): Promise<AskStateStack> {
+  const s = resolveStore(store);
+  const normalized = parseAskStateStack(stack) || emptyAskStateStack();
+  const coll = await getColl(s);
+  if (!coll) {
+    const list = memGet(s, ownerKey);
+    let doc = list.find((c) => c.id === id);
+    if (!doc) {
+      doc = {
+        id,
+        ownerKey,
+        countryId: meta?.countryId || "",
+        loginName: meta?.loginName || "",
+        title: "新对话",
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      list.unshift(doc);
+    }
+    doc.askStateStack = normalized;
+    doc.updatedAt = Date.now();
+    memSet(s, ownerKey, dedupeDocs(list));
+    return normalized;
+  }
+  await coll.updateMany(
+    { ownerKey, id },
+    {
+      $set: { askStateStack: normalized, updatedAt: Date.now() },
+      $setOnInsert: {
+        countryId: meta?.countryId || "",
+        loginName: meta?.loginName || "",
+        title: "新对话",
+        messages: [],
+        createdAt: Date.now(),
+      },
+    },
+    { upsert: true },
+  );
+  return normalized;
+}
+
+export async function pushConversationAskState(input: {
+  ownerKey: string;
+  id: string;
+  askState: AskState | Record<string, unknown>;
+  store?: ConversationStore;
+  countryId?: string;
+  loginName?: string;
+}): Promise<{ stack: AskStateStack; current: AskState | null }> {
+  const s = resolveStore(input.store);
+  const state = parseAskState(input.askState);
+  if (!state) throw new Error("invalid_ask_state");
+  const existing = await getConversation(input.ownerKey, input.id, s);
+  const next = pushAskState(existing?.askStateStack, state);
+  const stack = await writeAskStateStack(input.ownerKey, input.id, next, s, {
+    countryId: input.countryId ?? existing?.countryId,
+    loginName: input.loginName ?? existing?.loginName,
+  });
+  return { stack, current: stack.states[stack.states.length - 1] || null };
+}
+
+export async function undoConversationAskState(input: {
+  ownerKey: string;
+  id: string;
+  store?: ConversationStore;
+}): Promise<{ stack: AskStateStack; popped: AskState | null; current: AskState | null }> {
+  const s = resolveStore(input.store);
+  const existing = await getConversation(input.ownerKey, input.id, s);
+  const result = undoAskState(existing?.askStateStack);
+  await writeAskStateStack(input.ownerKey, input.id, result.stack, s, {
+    countryId: existing?.countryId,
+    loginName: existing?.loginName,
+  });
+  return result;
 }
 
 export async function renameConversation(
@@ -335,11 +441,15 @@ export async function clearConversation(
     for (const doc of list) {
       if (doc.id === id) {
         doc.messages = [];
+        doc.askStateStack = emptyAskStateStack();
         doc.updatedAt = Date.now();
       }
     }
     memSet(s, ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateMany({ ownerKey, id }, { $set: { messages: [], updatedAt: Date.now() } });
+  await coll.updateMany(
+    { ownerKey, id },
+    { $set: { messages: [], askStateStack: emptyAskStateStack(), updatedAt: Date.now() } },
+  );
 }

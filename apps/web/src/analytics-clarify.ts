@@ -1,5 +1,8 @@
 /**
  * Analytics 澄清/短答续问：把槽位短答合并回原问，避免丢渠道/时间/口径。
+ *
+ * 注意：ok 后的续问修订（如「IndiaB呢？」）由服务端 AskState TurnIntent 负责；
+ * 本模块仅在 looksLikeSlotOnlyReply 为真时合成澄清续跑，不拦截 revise 短句。
  */
 
 export type ClarifyOption = { id: string; label: string };

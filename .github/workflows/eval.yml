@@ -59,3 +59,24 @@ jobs:
       - name: Analytics unit + refuse GATE_*
         run: pnpm test:analytics && pnpm test:analytics-gate
         working-directory: apps/agent-server
+
+  # Live AskState smoke needs Metabase + LLM — manual / optional only.
+  analytics-askstate-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.RUN_ANALYTICS_ASKSTATE_SMOKE == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: AskState live smoke
+        run: pnpm test:analytics-askstate-smoke
+        working-directory: apps/agent-server
+        env:
+          ASKSTATE_CASE: B

@@ -26,3 +26,9 @@ Gate priority：`filter_set` 成员(20) → 指标口径(30) → `result_layout`
 ## 非目标
 
 - 手维金句、按题硬编码 ClickHouse 方言模板
+
+## 后续
+
+诉求超纲（同比/环比/TopN 等）的 **Demand–Capability 一致性闸门**、多步规划、用户记忆、宽表/多指标路线见：
+
+[`2026-09-11-analytics-reliability-roadmap.md`](./2026-09-11-analytics-reliability-roadmap.md)

@@ -50,6 +50,14 @@ export interface AnalyticsAskResult {
   /** 语义校验是否通过（与 JSON 格式合法分开） */
   semanticOk?: boolean;
   semanticIssues?: string[];
+  /** AskState working memory for follow-up revise */
+  askState?: import("./ask-state.js").AskState;
+  /** Turn intent notes (debug / UI) */
+  turnKind?: string;
+  /** Human-readable ask summary bar */
+  askSummary?: string;
+  /** Soft defaults applied this turn */
+  defaultsNote?: string;
   /** 本地 ECharts 双轨图（无 Metabase temp card） */
   charts?: Array<{
     title: string;

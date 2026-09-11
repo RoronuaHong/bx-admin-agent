@@ -29,6 +29,7 @@ import {
   formatConversationTranscript,
   impliesLangSetWithoutMembers,
   parseStructureResponse,
+  userDemandsLangFilter,
   type ConversationTurn,
   type StructuredAskResult,
 } from "./conversation-structure.js";
@@ -41,6 +42,38 @@ import {
   parseProbeValuesForDim,
   type ClarifyOption,
 } from "./clarify-options.js";
+import { loadFieldLexicon, resolvePackFilters, groundRemappedFieldFromNl } from "./dim-resolve.js";
+import { lexiconClarifyOptions } from "./dim-lexicon.js";
+import { evaluateCapabilityGate } from "./capability-gate.js";
+import { inferMetricIdFromNl, inferOutputDimsFromNl } from "./metric-infer.js";
+import {
+  compileAskPlanSteps,
+  gateAskPlan,
+  inclusiveDaySpan,
+  mergeRatioTables,
+  relativeGrowthKind,
+  synthesizeMomPlan,
+  synthesizeYoyPlan,
+} from "./ask-plan.js";
+import {
+  applyAnalyticsPrefsDefaults,
+  formatAnalyticsPrefsFacts,
+  loadAnalyticsPrefs,
+  rememberAnalyticsSuccess,
+  saveAnalyticsPrefs,
+} from "./analytics-prefs.js";
+import {
+  askStateIsComplete,
+  askStateToStructured,
+  buildAskStateFromStructure,
+  inferTurnIntent,
+  mergeAskState,
+  parseAskState,
+  type AskState,
+  type TurnIntent,
+} from "./ask-state.js";
+import { groundChannelFilters } from "./grounding-gate.js";
+import { applyDeliveryReconcile, type DeliveryMode } from "./delivery.js";
 
 type LlmOpts = { modelId?: string; signal?: AbortSignal; traceRunId?: string; spanName?: string };
 
@@ -215,7 +248,7 @@ function collectIssues(
 
 /** \u8986\u76d6\u7f3a\u53e3 / SQL \u5b89\u5168\u95ee\u9898 \u2192 refuse\uff1b\u5176\u4f59 \u2192 clarify */
 function isCoverageOrSafetyIssue(detail: string): boolean {
-  return /unsupported_metric|not compilable|SQL AST guard|non_readonly|multi_statement|not_select|into_outfile|missing_where|whitelist|unknown metric/i.test(
+  return /unsupported_metric|unsupported_op|not compilable|SQL AST guard|non_readonly|multi_statement|not_select|into_outfile|missing_where|whitelist|unknown metric/i.test(
     detail,
   );
 }
@@ -233,6 +266,23 @@ function ensureMaxRows(sql: string, maxRows: number): string {
   if (!Number.isFinite(maxRows) || maxRows <= 0) return sql;
   if (/\blimit\s+\d+\b/i.test(sql)) return sql;
   return `${sql.trim().replace(/;+\s*$/, "")}\nLIMIT ${Math.floor(maxRows)}`;
+}
+
+function finalizeDeliveredTables(input: {
+  tables: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+  message: string;
+  askState?: AskState;
+  mode?: DeliveryMode;
+}): { tables: typeof input.tables; message: string } {
+  const filled = applyDeliveryReconcile({
+    tables: input.tables,
+    requestedChannels: input.askState?.requested?.channels,
+    mode: input.mode || "zero_fill",
+  });
+  return {
+    tables: filled.tables,
+    message: filled.messageSuffix ? `${input.message}${filled.messageSuffix}` : input.message,
+  };
 }
 
 async function mapPool<T, R>(
@@ -318,11 +368,13 @@ export async function analyticsAsk(
     signal?: AbortSignal;
     images?: string[];
     files?: string[];
-    /** \u6f84\u6e05\u69fd\u4f4d\u77ed\u7b54\uff08\u524d\u7aef\u5408\u6210\uff09\uff0c\u5199\u5165\u5bf9\u8bdd\u4f9b schema \u62bd\u53d6 */
+    /** ?????????????????? schema ?? */
     slotAnswers?: Record<string, string[]>;
-    /** \u591a\u8f6e\u5bf9\u8bdd\uff08\u7528\u6237/\u52a9\u624b\uff09\uff0c\u4f18\u5148\u4e8e\u5355\u6761 NL */
+    /** ???????/????????? NL */
     messages?: ConversationTurn[];
-    /** \u4f1a\u8bdd\u5f52\u5c5e / \u8ffd\u8e2a\uff1b\u4e0d\u6539\u5199\u95ee\u6570 NL */
+    /** ??? AskState??? revise? */
+    prevAskState?: AskState | Record<string, unknown>;
+    /** ???? / ???????? NL */
     ownerKey?: string;
     userId?: string;
     uiLocale?: string;
@@ -342,14 +394,29 @@ export async function analyticsAsk(
   let guardIssues: string[] = [];
   let packVersion: string | undefined;
   const resolvedModelId = opts?.modelId;
+  let currentAskState: AskState | undefined;
+  let turnKind: string | undefined;
+
+  const defaultsNoteFromState = (s?: AskState): string | undefined => {
+    if (!s?.defaultsApplied) return undefined;
+    const bits: string[] = [];
+    if (s.defaultsApplied.channels) bits.push("\u5df2\u7528\u9ed8\u8ba4\u6e20\u9053");
+    if (s.defaultsApplied.layout) bits.push("\u5df2\u7528\u9ed8\u8ba4\u5e03\u5c40");
+    return bits.length ? bits.join("\uff1b") : undefined;
+  };
 
   const seal = (result: AnalyticsAskResult): AnalyticsAskResult => {
+    const state = result.askState ?? currentAskState;
     const out: AnalyticsAskResult = {
       ...result,
       askId,
       rewriteRounds,
       modelId: result.modelId ?? resolvedModelId,
       packVersion: result.packVersion ?? packVersion,
+      askState: state,
+      turnKind: result.turnKind ?? turnKind,
+      askSummary: result.askSummary ?? state?.summary,
+      defaultsNote: result.defaultsNote ?? defaultsNoteFromState(state),
     };
     try {
       recordAskLedger({
@@ -400,6 +467,7 @@ export async function analyticsAsk(
     }
 
     const ownerKey = opts?.ownerKey || "analytics:anonymous";
+    const analyticsPrefs = loadAnalyticsPrefs(ownerKey);
     runId = trace.beginRun({
       userText: nlForResolve.slice(0, 2000),
       model: opts?.modelId,
@@ -436,7 +504,18 @@ export async function analyticsAsk(
       .filter((m) => m.role === "user")
       .map((m) => m.text)
       .join("\n");
-    const timeResolved = resolveTimeRange(userTextJoined, clock, tz);
+    const prevAskStateEarly = parseAskState(opts?.prevAskState);
+    let timeResolved = resolveTimeRange(userTextJoined, clock, tz);
+    if (!timeResolved.ok && prevAskStateEarly?.time?.start && prevAskStateEarly.time?.end) {
+      timeResolved = {
+        ok: true,
+        range: {
+          start: prevAskStateEarly.time.start,
+          end: prevAskStateEarly.time.end,
+          echo: `\u6309 ${prevAskStateEarly.time.start}\uff5e${prevAskStateEarly.time.end}`,
+        },
+      };
+    }
     // \u4ec5\u300c\u6700\u8fd1\u300d\u65e0\u5177\u4f53\u5929\u6570\u65f6\u53cd\u95ee\u65f6\u95f4
     if (
       !timeResolved.ok &&
@@ -460,7 +539,58 @@ export async function analyticsAsk(
         ? `resolved_by_code ${timeResolved.range.start}..${timeResolved.range.end}`
         : `unresolved: ${timeResolved.clarify}`,
       timeResolved: timeResolved.ok ? timeResolved.range : undefined,
+      prefsFacts: formatAnalyticsPrefsFacts(analyticsPrefs) || undefined,
     };
+
+    const prevAskState = prevAskStateEarly;
+    const lastUserText =
+      [...conversation].reverse().find((m) => m.role === "user")?.text || nlSafe || nlForResolve;
+    const turnIntent: TurnIntent = inferTurnIntent({
+      lastUserText,
+      prevAskState,
+      slotAnswers: opts?.slotAnswers,
+    });
+    turnKind = turnIntent.kind;
+
+    if (turnIntent.kind === "meta") {
+      if (turnIntent.action === "clear_defaults") {
+        saveAnalyticsPrefs(ownerKey, { version: 1, updatedAt: Date.now() });
+        return seal({
+          status: "ok",
+          message: "\u5df2\u6e05\u9664\u9ed8\u8ba4\u504f\u597d\u3002",
+          turnKind,
+        });
+      }
+      if (turnIntent.action === "set_defaults") {
+        const channels = Array.isArray(turnIntent.payload?.defaultChannels)
+          ? (turnIntent.payload!.defaultChannels as string[])
+          : [];
+        if (channels.length) {
+          saveAnalyticsPrefs(ownerKey, {
+            version: 1,
+            updatedAt: Date.now(),
+            defaultChannels: channels,
+            preferLayout: analyticsPrefs.preferLayout,
+            recentMetricIds: analyticsPrefs.recentMetricIds,
+          });
+          return seal({
+            status: "ok",
+            message: `\u5df2\u8bb0\u4f4f\u9ed8\u8ba4\u6e20\u9053\uff1a${channels.join(", ")}`,
+            turnKind,
+          });
+        }
+      }
+      if (turnIntent.action === "disable_defaults_this_turn") {
+        return seal({
+          status: "ok",
+          message:
+            "\u672c\u8f6e\u5df2\u5ffd\u7565\u9ed8\u8ba4\u504f\u597d\u3002\u8bf7\u7ee7\u7eed\u63d0\u95ee\uff08\u6216\u5728\u95ee\u53e5\u524d\u52a0\u300c\u672c\u8f6e\u4e0d\u7528\u9ed8\u8ba4\u300d\uff09\u3002",
+          turnKind,
+        });
+      }
+    }
+
+    const disableDefaultsThisTurn = (turnIntent.notes || []).includes("disable_defaults_this_turn");
 
     let structureMeta: {
       mode: "single_forward" | "tool_loop";
@@ -468,8 +598,22 @@ export async function analyticsAsk(
     } | null = null;
     let structured: StructuredAskResult | null = null;
     let preProbeSummary = "";
+    let skipStructureLlm = false;
 
-    if (conversation.length) {
+    if (
+      (turnIntent.kind === "revise" || turnIntent.kind === "clarify_answer") &&
+      prevAskState
+    ) {
+      const merged = mergeAskState({ prev: prevAskState, intent: turnIntent, askId });
+      if (merged.ok && askStateIsComplete(merged.state)) {
+        currentAskState = merged.state;
+        structured = askStateToStructured(merged.state);
+        skipStructureLlm = true;
+        structureMeta = { mode: "single_forward", formatConstraint: "prompt_parse" };
+      }
+    }
+
+    if (!skipStructureLlm && conversation.length) {
       if (timeResolved.ok) {
         try {
           preProbeSummary = await probeDimensions(pack, timeResolved.range, opts?.signal);
@@ -562,6 +706,112 @@ export async function analyticsAsk(
       structureMode: structureMeta?.mode,
     };
 
+    // If model clarified movieType/metric but NL already grounds them, promote to ok
+    if (
+      structured?.status === "clarify" &&
+      (structured.clarifySlot === "movieType" || structured.clarifySlot === "metric") &&
+      timeResolved.ok
+    ) {
+      try {
+        const nlBlob = `${nlSafe || nlForResolve}\n${transcript}`;
+        const metricId = inferMetricIdFromNl(nlBlob, pack);
+        const grounded = await groundRemappedFieldFromNl({
+          pack,
+          field: "movieType",
+          nl: nlBlob,
+          opts: { signal: opts?.signal },
+        });
+        const movieCodes =
+          grounded.ok && grounded.codes.length
+            ? grounded.codes
+            : structured.partialFilters?.movieType;
+        const canPromoteMetric = structured.clarifySlot === "metric" && Boolean(metricId);
+        const canPromoteMovie =
+          structured.clarifySlot === "movieType" &&
+          Boolean(metricId) &&
+          Boolean(movieCodes?.length);
+        if ((canPromoteMetric || canPromoteMovie) && metricId) {
+          const dims = inferOutputDimsFromNl(nlBlob);
+          const filters = { ...(structured.partialFilters || {}) };
+          if (movieCodes?.length) filters.movieType = movieCodes;
+          structured = {
+            status: "ok",
+            mergedNl: structured.mergedNl || nlSafe || nlForResolve,
+            time: structured.time || {
+              start: timeResolved.range.start,
+              end: timeResolved.range.end,
+            },
+            filters,
+            outputDims: dims.length ? dims : ["watch_date"],
+            metricId,
+            notes: [
+              canPromoteMovie
+                ? "nl_grounded_movieType_skip_clarify"
+                : "nl_grounded_metric_skip_clarify",
+            ],
+          };
+        }
+      } catch (e) {
+        if (opts?.signal?.aborted || isAbortError(e)) throw e;
+      }
+    }
+
+    // Belt: drop spurious contentLang clarify when user never asked for languages
+    const langScope =
+      turnIntent.kind === "revise" || turnIntent.kind === "clarify_answer"
+        ? lastUserText
+        : `${transcript}\n${nlSafe || nlForResolve}`;
+    if (
+      structured?.status === "clarify" &&
+      structured.clarifySlot === "contentLang" &&
+      !userDemandsLangFilter(langScope) &&
+      !impliesLangSetWithoutMembers(langScope) &&
+      timeResolved.ok
+    ) {
+      const nlBlob = `${nlSafe || nlForResolve}\n${transcript}`;
+      const mid = inferMetricIdFromNl(nlBlob, pack);
+      if (mid) {
+        const dims = inferOutputDimsFromNl(nlBlob);
+        const filters = { ...(structured.partialFilters || {}) };
+        delete filters.contentLang;
+        structured = {
+          status: "ok",
+          mergedNl: structured.mergedNl || nlSafe || nlForResolve,
+          time: structured.time || {
+            start: timeResolved.range.start,
+            end: timeResolved.range.end,
+          },
+          filters,
+          outputDims: dims.length ? dims : ["watch_date"],
+          metricId: mid,
+          notes: ["pipeline_dropped_spurious_contentLang_clarify"],
+        };
+      }
+    }
+
+    if (structured?.status === "ok" && structured.metricId) {
+      const prefsForApply = disableDefaultsThisTurn
+        ? { version: 1 as const, updatedAt: 0 }
+        : analyticsPrefs;
+      const applied = applyAnalyticsPrefsDefaults({
+        filters: structured.filters || {},
+        layout: structured.layout,
+        prefs: prefsForApply,
+        nl: structured.mergedNl || nlSafe || nlForResolve,
+        outputDims: structured.outputDims,
+      });
+      structured = {
+        ...structured,
+        filters: applied.filters,
+        layout: applied.layout,
+        notes: [
+          ...(structured.notes || []),
+          ...applied.notes,
+          ...(disableDefaultsThisTurn ? ["disable_defaults_this_turn"] : []),
+        ],
+      };
+    }
+
     if (structured?.status === "clarify") {
       let rangeEcho: string | undefined;
       let probeSummaryForClarify = preProbeSummary;
@@ -597,6 +847,17 @@ export async function analyticsAsk(
       }
       if (needProbe && probeSummaryForClarify) {
         options = parseProbeValuesForDim(probeSummaryForClarify, structured.clarifySlot);
+      }
+      // Prefer Metabase lexicon labels for remapped dims (movieType 1=?? ?)
+      if (structured.clarifySlot === "movieType") {
+        try {
+          const lex = await loadFieldLexicon(pack, "movieType", { signal: opts?.signal });
+          if (lex.ok && lex.lexicon.remapped) {
+            options = lexiconClarifyOptions(lex.lexicon);
+          }
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        }
       }
       if (
         structured.clarifySlot === "metric" &&
@@ -682,10 +943,402 @@ export async function analyticsAsk(
     const allowedTables = pack.tables.map((t) => t.name);
     const dimColumns = pack.probeDimensions;
 
+    // Demand-Capability: refuse unsupported ops (no silent downgrade)
+    const capGate = evaluateCapabilityGate({
+      structure: structured,
+      pack,
+      nl: `${nlForGuards}\n${transcript}`,
+    });
+    if (capGate.status === "refuse") {
+      return seal({
+        status: "refuse",
+        message: capGate.message,
+        timeEcho: range.echo,
+        error: capGate.reason,
+        packVersion: pack.version,
+        structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: [capGate.reason, ...capGate.notes],
+        ...metaFields,
+      });
+    }
+    if (capGate.status === "clarify") {
+      return seal({
+        status: "clarify",
+        message: capGate.message,
+        clarifySlot: "metric",
+        timeEcho: range.echo,
+        packVersion: pack.version,
+        structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: [capGate.reason, ...capGate.notes],
+        ...metaFields,
+      });
+    }
+    structured = {
+      ...structured,
+      ops: capGate.ops,
+      notes: [...(structured.notes || []), ...capGate.notes],
+    };
+
+    // Metabase field lexicon: map labels to codes before Intent/SQL compile
+    let filtersForIntent = structured.filters;
+    try {
+      const grounded = await resolvePackFilters({
+        pack,
+        filters: structured.filters,
+        nl: nlForGuards,
+        opts: { signal: opts?.signal },
+      });
+      if (grounded.status === "clarify") {
+        const clarified = attachClarifyOptions(grounded.message, grounded.options, {
+          multiSelect: true,
+          slot: grounded.clarifySlot,
+        });
+        return seal({
+          status: "clarify",
+          message: clarified.message,
+          clarifySlot: grounded.clarifySlot,
+          clarifyOptions: clarified.clarifyOptions,
+          timeEcho: range.echo,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          ...metaFields,
+        });
+      }
+      filtersForIntent = grounded.filters;
+      if (grounded.notes.length) {
+        structured = {
+          ...structured,
+          notes: [...(structured.notes || []), ...grounded.notes],
+        };
+      }
+    } catch (e) {
+      if (opts?.signal?.aborted || isAbortError(e)) throw e;
+    }
+
+    // Channel grounding hard gate: ghost codes ? clarify
+    try {
+      const chGround = await groundChannelFilters({
+        pack,
+        filters: filtersForIntent,
+        opts: { signal: opts?.signal },
+      });
+      if (chGround.status === "clarify") {
+        const clarified = attachClarifyOptions(chGround.message, chGround.options, {
+          multiSelect: true,
+          slot: "channel",
+        });
+        return seal({
+          status: "clarify",
+          message: clarified.message,
+          clarifySlot: "channel",
+          clarifyOptions: clarified.clarifyOptions,
+          timeEcho: range.echo,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          ...metaFields,
+        });
+      }
+      filtersForIntent = chGround.filters;
+      if (chGround.notes.length) {
+        structured = {
+          ...structured,
+          filters: filtersForIntent,
+          notes: [...(structured.notes || []), ...chGround.notes],
+        };
+      }
+    } catch (e) {
+      if (opts?.signal?.aborted || isAbortError(e)) throw e;
+    }
+
+    currentAskState = buildAskStateFromStructure({
+      structure: { ...structured, filters: filtersForIntent },
+      askId,
+      packId: pack.id,
+      packVersion: pack.version,
+      defaultsApplied: {
+        channels: (structured.notes || []).some((n) => n.startsWith("prefs_default_channel")),
+        layout: (structured.notes || []).some((n) => n.startsWith("prefs_default_layout")),
+      },
+    });
+
+    // Multi-intent plan: synthesize YoY/MoM when ops demand it; never step-1-only on growth
+    const growthKind = !structured.plan ? relativeGrowthKind(structured.ops) : null;
+    if (growthKind) {
+      const syn =
+        growthKind === "mom"
+          ? synthesizeMomPlan({ ...structured, filters: filtersForIntent })
+          : synthesizeYoyPlan({ ...structured, filters: filtersForIntent });
+      if (syn) {
+        structured = {
+          ...structured,
+          plan: syn,
+          notes: [
+            ...(structured.notes || []),
+            growthKind === "mom" ? "synthesized_mom_plan" : "synthesized_yoy_plan",
+          ],
+        };
+      } else {
+        return seal({
+          status: "refuse",
+          message:
+            "\u76f8\u5bf9\u589e\u957f\uff08\u540c\u6bd4/\u73af\u6bd4\uff09\u5df2\u8bc6\u522b\uff0c\u4f46\u65e0\u6cd5\u7ec4\u88c5\u53cc\u7a97\u53e3\u8ba1\u5212\uff08\u7f3a\u5c11\u6307\u6807\u6216\u65f6\u95f4\uff09\uff0c\u5df2\u62d2\u7edd\u4ee5\u514d\u7b54\u975e\u6240\u95ee\u3002",
+          timeEcho: range.echo,
+          error: "relative_growth_plan_synthesize_failed",
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          semanticOk: false,
+          semanticIssues: ["relative_growth_plan_synthesize_failed"],
+          ...metaFields,
+        });
+      }
+    }
+    if (structured.plan) {
+      const planBase = {
+        ...structured,
+        filters: filtersForIntent,
+      };
+      const planGate = gateAskPlan(structured.plan, pack, planBase);
+      if (planGate.status === "refuse") {
+        return seal({
+          status: "refuse",
+          message: planGate.message,
+          timeEcho: range.echo,
+          error: planGate.reason,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          semanticOk: false,
+          semanticIssues: [planGate.reason, ...planGate.notes],
+          ...metaFields,
+        });
+      }
+      const mergeKind = structured.plan.merge.kind;
+      if (mergeKind === "side_by_side" || mergeKind === "ratio") {
+        const planCompiled = compileAskPlanSteps({
+          plan: structured.plan,
+          base: planBase,
+          pack,
+          fallbackNl: nlForGuards,
+        });
+        if (!planCompiled.ok) {
+          return seal({
+            status: "refuse",
+            message: coverageRefuseMessage("plan_compile", planCompiled.reason),
+            timeEcho: range.echo,
+            error: planCompiled.reason,
+            packVersion: pack.version,
+            structuredFromConversation: true,
+            semanticOk: false,
+            semanticIssues: [planCompiled.reason],
+            ...metaFields,
+          });
+        }
+        let sqls = normalizeSqls(planCompiled.steps.map((s) => s.sql));
+        const issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
+        guardIssues = issues;
+        if (issues.length) {
+          const detail = issues.join("; ");
+          if (isCoverageOrSafetyIssue(detail)) {
+            return seal({
+              status: "refuse",
+              message: coverageRefuseMessage("lint", detail),
+              timeEcho: range.echo,
+              sqls,
+              error: detail,
+              packVersion: pack.version,
+              structuredFromConversation: true,
+              semanticOk: false,
+              semanticIssues: issues,
+              ...metaFields,
+            });
+          }
+          return seal({
+            status: "clarify",
+            message: detail,
+            timeEcho: range.echo,
+            sqls,
+            error: detail,
+            packVersion: pack.version,
+            structuredFromConversation: true,
+            semanticOk: false,
+            semanticIssues: issues,
+            ...metaFields,
+          });
+        }
+        opts?.signal?.throwIfAborted();
+        const dbId = pack.datasource.metabaseDatabaseId;
+        const maxRows = pack.guards.maxRows;
+        const execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
+        const results = await mapPool(
+          execSqls,
+          pack.guards.parallelism,
+          (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal, timeoutMs: pack.guards.queryTimeoutMs }),
+          opts?.signal,
+        );
+        const stepById = new Map(planCompiled.steps.map((s, i) => [s.id, { step: s, result: results[i]! }]));
+        const leftId = structured.plan.merge.left;
+        const rightId = structured.plan.merge.right;
+        if (results.every((r) => !r.ok)) {
+          return seal({
+            status: "error",
+            message: results.map((r) => r.error).join("; "),
+            timeEcho: range.echo,
+            sqls: execSqls,
+            error: results.map((r) => r.error).join("; "),
+            packVersion: pack.version,
+            structuredFromConversation: true,
+            sqlSource: "intent_compile",
+            semanticOk: false,
+            ...metaFields,
+          });
+        }
+
+        let tables: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+        let message = range.echo;
+        if (mergeKind === "ratio") {
+          const left = stepById.get(leftId);
+          const right = stepById.get(rightId);
+          if (!left?.result.ok || !right?.result.ok) {
+            return seal({
+              status: "error",
+              message:
+                [left?.result.error, right?.result.error].filter(Boolean).join("; ") ||
+                "relative growth step failed",
+              timeEcho: range.echo,
+              sqls: execSqls,
+              error: "relative_growth_step_failed",
+              packVersion: pack.version,
+              structuredFromConversation: true,
+              sqlSource: "intent_compile",
+              semanticOk: false,
+              ...metaFields,
+            });
+          }
+          const priorOffset = String(right.step.timeOffset || left.step.timeOffset || "");
+          const isMom =
+            /mom/i.test(priorOffset) ||
+            priorOffset.includes("\u73af\u6bd4") ||
+            relativeGrowthKind(structured.ops) === "mom";
+          const isYoy =
+            /yoy/i.test(priorOffset) ||
+            priorOffset.includes("\u540c\u6bd4") ||
+            relativeGrowthKind(structured.ops) === "yoy";
+          const spanDays =
+            right.step.time.spanDays ||
+            (structured.time
+              ? inclusiveDaySpan(structured.time.start, structured.time.end)
+              : undefined);
+          const align = isMom
+            ? spanDays
+              ? { days: spanDays }
+              : undefined
+            : isYoy
+              ? { years: 1 }
+              : undefined;
+          const priorLabel = isMom ? "prior_mom" : "prior_yoy";
+          const merged = mergeRatioTables({
+            left: { cols: left.result.cols, rows: left.result.rows },
+            right: { cols: right.result.cols, rows: right.result.rows },
+            align,
+            leftLabel: "current",
+            rightLabel: priorLabel,
+          });
+          const growthTitle = isMom
+            ? "\u73af\u6bd4\u589e\u957f\u7387"
+            : "\u540c\u6bd4\u589e\u957f\u7387";
+          const currentTitle = `\u672c\u671f ${left.step.time.echo}`;
+          const priorTitle = isMom
+            ? `\u4e0a\u4e00\u7b49\u957f\u7a97 ${right.step.time.echo}`
+            : `\u53bb\u5e74\u540c\u671f ${right.step.time.echo}`;
+          message = `${range.echo}\uff1b${isMom ? "\u73af\u6bd4" : "\u540c\u6bd4"}\u57fa\u671f ${right.step.time.echo}\uff1bgrowth_rate=(\u672c\u671f-\u57fa\u671f)/\u57fa\u671f`;
+          tables = [
+            {
+              title: growthTitle,
+              cols: merged.cols,
+              rows: merged.rows,
+              grain: /watchDate|watch_date/i.test(merged.cols[0] || "") ? "day" : undefined,
+            },
+            {
+              title: currentTitle,
+              cols: left.result.cols,
+              rows: left.result.rows,
+            },
+            {
+              title: priorTitle,
+              cols: right.result.cols,
+              rows: right.result.rows,
+            },
+          ];
+        } else {
+          tables = results.map((r, i) => ({
+            title: `\u7ed3\u679c ${i + 1}`,
+            cols: r.cols,
+            rows: r.rows,
+            grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
+          }));
+        }
+
+        try {
+          rememberAnalyticsSuccess({
+            ownerKey,
+            channels: structured.filters?.channel,
+            metricId: structured.metricId,
+            layout: structured.layout,
+          });
+        } catch {
+          /* prefs write is best-effort */
+        }
+        const delivered = finalizeDeliveredTables({
+          tables,
+          message,
+          askState: currentAskState,
+          mode: pack.delivery?.missingChannel,
+        });
+        const dimCheck = reconcileNamedDimensions({
+          nl: nlForGuards,
+          tables: delivered.tables,
+          sqls: execSqls,
+          dimColumns,
+          requiredInResults: currentAskState?.requested?.channels,
+          requiredDim: "channel",
+        });
+        if (!dimCheck.ok) {
+          return seal({
+            status: "refuse",
+            message: dimCheck.detail,
+            timeEcho: range.echo,
+            sqls: execSqls,
+            tables: delivered.tables,
+            packVersion: pack.version,
+            structuredFromConversation: true,
+            sqlSource: "intent_compile",
+            error: dimCheck.detail,
+            semanticOk: false,
+            semanticIssues: [dimCheck.detail],
+            ...metaFields,
+          });
+        }
+        return seal({
+          status: "ok",
+          message: delivered.message,
+          timeEcho: range.echo,
+          sqls: execSqls,
+          tables: delivered.tables,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          sqlSource: "intent_compile",
+          semanticOk: true,
+          semanticIssues: [],
+          ...metaFields,
+        });
+      }
+    }
+
     const intentBuilt = buildAnalyticsIntentFromStructure({
       structure: {
         time: structured.time,
-        filters: structured.filters,
+        filters: filtersForIntent,
         outputDims: structured.outputDims,
         layout: structured.layout,
         pivotDim: structured.pivotDim,
@@ -866,11 +1519,23 @@ export async function analyticsAsk(
       rows: r.rows,
       grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
     }));
+    const emptyNote = allEmpty(results)
+      ? `\uff08${range.echo} \u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff0c\u8bf7\u6838\u5bf9\u7b5b\u9009\u6761\u4ef6\uff09`
+      : "";
+    // Delivery zero-fill before dim reconcile so requested members can appear in cells
+    const delivered = finalizeDeliveredTables({
+      tables,
+      message: `${range.echo}${emptyNote}`,
+      askState: currentAskState,
+      mode: pack.delivery?.missingChannel,
+    });
     const dimCheck = reconcileNamedDimensions({
       nl: nlForGuards,
-      tables,
+      tables: delivered.tables,
       sqls,
       dimColumns,
+      requiredInResults: currentAskState?.requested?.channels,
+      requiredDim: "channel",
     });
     if (!dimCheck.ok) {
       const msg = await diagnoseFailure(
@@ -888,7 +1553,7 @@ export async function analyticsAsk(
         message: msg,
         timeEcho: range.echo,
         sqls,
-        tables,
+        tables: delivered.tables,
         sqlSource: "intent_compile",
         error: dimCheck.detail,
         packVersion: pack.version,
@@ -899,16 +1564,23 @@ export async function analyticsAsk(
       });
     }
 
-    const emptyNote = allEmpty(results)
-      ? `\uff08${range.echo} \u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff0c\u8bf7\u6838\u5bf9\u7b5b\u9009\u6761\u4ef6\uff09`
-      : "";
-    const charts = allEmpty(results) ? [] : buildLocalChartsFromTables(tables);
+    const charts = allEmpty(results) ? [] : buildLocalChartsFromTables(delivered.tables);
+    try {
+      rememberAnalyticsSuccess({
+        ownerKey,
+        channels: structured.filters?.channel,
+        metricId: structured.metricId,
+        layout: structured.layout,
+      });
+    } catch {
+      /* prefs write is best-effort */
+    }
     return seal({
       status: "ok",
-      message: `${range.echo}${emptyNote}`,
+      message: delivered.message,
       timeEcho: range.echo,
       sqls,
-      tables,
+      tables: delivered.tables,
       charts: charts.length ? charts : undefined,
       sqlSource: "intent_compile",
       packVersion: pack.version,

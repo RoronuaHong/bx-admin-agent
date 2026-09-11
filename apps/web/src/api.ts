@@ -318,6 +318,10 @@ export interface ConversationDto {
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
+  askStateStack?: {
+    states: Record<string, unknown>[];
+    updatedAt: number;
+  };
 }
 
 async function jsonFetch(path: string, options?: RequestInit) {
@@ -476,6 +480,10 @@ export interface AnalyticsAskResult {
   packVersion?: string;
   askId?: string;
   rewriteRounds?: number;
+  askState?: Record<string, unknown>;
+  turnKind?: string;
+  askSummary?: string;
+  defaultsNote?: string;
   charts?: Array<{
     title: string;
     categories: string[];
@@ -536,6 +544,8 @@ export async function askAnalytics(
     slotAnswers?: Record<string, string[]>;
     /** 本轮完整对话（含当前用户句），供后端 LLM 结构化 */
     messages?: Array<{ role: "user" | "assistant"; text: string }>;
+    /** 上一轮 AskState，供续问 revise */
+    prevAskState?: Record<string, unknown>;
   },
 ): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
@@ -549,6 +559,7 @@ export async function askAnalytics(
       files: opts?.files,
       slotAnswers: opts?.slotAnswers,
       messages: opts?.messages,
+      prevAskState: opts?.prevAskState,
     }),
     signal: opts?.signal,
   });
@@ -583,11 +594,36 @@ export async function saveAnalyticsConversationMessages(
   id: string,
   messages: StoredMessage[],
   title?: string,
+  askStateStack?: ConversationDto["askStateStack"] | null,
 ) {
   return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}/messages`, {
     method: "POST",
-    body: JSON.stringify({ messages, title }),
+    body: JSON.stringify({ messages, title, askStateStack }),
   });
+}
+
+export async function pushAnalyticsAskState(id: string, askState: Record<string, unknown>) {
+  return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}/ask-state`, {
+    method: "POST",
+    body: JSON.stringify({ askState }),
+  }) as Promise<{
+    ok: boolean;
+    stack: ConversationDto["askStateStack"];
+    current: Record<string, unknown> | null;
+  }>;
+}
+
+export async function undoAnalyticsAskState(id: string) {
+  return jsonFetch(`/agent/analytics/conversations/${encodeURIComponent(id)}/ask-state/undo`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }) as Promise<{
+    ok: boolean;
+    stack: ConversationDto["askStateStack"];
+    popped: Record<string, unknown> | null;
+    current: Record<string, unknown> | null;
+    message?: string;
+  }>;
 }
 
 export async function deleteAnalyticsConversation(id: string) {

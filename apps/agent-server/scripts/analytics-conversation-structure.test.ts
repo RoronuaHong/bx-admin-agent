@@ -5,6 +5,7 @@ import {
   impliesLangSetWithoutMembers,
   normalizeClarifySlot,
   parseStructureResponse,
+  userDemandsLangFilter,
 } from "../src/analytics/conversation-structure.js";
 
 {
@@ -185,6 +186,36 @@ import {
   assert.equal(r.status, "ok");
   if (r.status === "ok") {
     assert.deepEqual(r.filters.contentLang?.slice().sort(), ["(empty)", "ml-IN", "ta-IN", "te-IN"]);
+  }
+}
+
+{
+  assert.equal(userDemandsLangFilter("IndiaA 按天观看人数"), false);
+  assert.equal(userDemandsLangFilter("按语言看人均时长"), true);
+  assert.equal(userDemandsLangFilter("三种小语种完播率"), true);
+}
+
+{
+  // baseline: model invents contentLang clarify → drop and promote when metric+time clear
+  const transcript = formatConversationTranscript([
+    { role: "user", text: "IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数" },
+  ]);
+  const r = enforceStructurePolicy(
+    {
+      status: "clarify",
+      clarify: "请选择内容语言",
+      clarifySlot: "contentLang",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      partialFilters: { channel: ["IndiaA"], contentLang: ["te-IN"] },
+      mergedNl: "IndiaA 按天观看人数",
+    },
+    transcript,
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.equal(r.metricId, "uniq_users");
+    assert.equal(r.filters.contentLang, undefined);
+    assert.ok(r.notes?.includes("dropped_spurious_contentLang_clarify"));
   }
 }
 

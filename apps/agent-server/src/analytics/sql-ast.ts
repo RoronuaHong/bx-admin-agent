@@ -189,7 +189,9 @@ export function analyzeSqlAst(sql: string): SqlAstSummary {
   }
 
   const tables = extractTablesFromClause(primary);
-  const hasWhere = topLevelHasKeyword(primary, /\bwhere\b/i);
+  // WHERE may live only in a subquery (wide/pivot compile); accept nested WHERE.
+  const hasWhere =
+    topLevelHasKeyword(primary, /\bwhere\b/i) || /\bwhere\b/i.test(primary);
   const hasLimit = topLevelHasKeyword(primary, /\blimit\b/i);
   const hasUnion = topLevelHasKeyword(primary, /\bunion\b/i);
 

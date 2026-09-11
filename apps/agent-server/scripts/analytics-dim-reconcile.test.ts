@@ -45,4 +45,46 @@ import { extractNamedEntities, reconcileNamedDimensions } from "../src/analytics
   assert.equal(r.ok, true);
 }
 
+{
+  // requested + channel col: SQL-only no longer enough
+  const r = reconcileNamedDimensions({
+    nl: "IndiaA 和 IndiaB 对比",
+    tables: [{ cols: ["channel", "users"], rows: [["IndiaA", 10]] }],
+    sqls: ["SELECT channel, uniq(guid) WHERE channel IN ('IndiaA','IndiaB') GROUP BY channel"],
+    requiredInResults: ["IndiaA", "IndiaB"],
+  });
+  assert.equal(r.ok, false);
+  assert.ok(r.missing.includes("IndiaB"));
+}
+
+{
+  // after zero_fill, requested covered in cells → ok
+  const r = reconcileNamedDimensions({
+    nl: "IndiaA 和 IndiaB 对比",
+    tables: [
+      {
+        cols: ["channel", "users"],
+        rows: [
+          ["IndiaA", 10],
+          ["IndiaB", 0],
+        ],
+      },
+    ],
+    sqls: ["SELECT channel WHERE channel IN ('IndiaA','IndiaB')"],
+    requiredInResults: ["IndiaA", "IndiaB"],
+  });
+  assert.equal(r.ok, true);
+}
+
+{
+  // filter-only (no channel col): SQL still ok even with requiredInResults
+  const r = reconcileNamedDimensions({
+    nl: "IndiaA 按天",
+    tables: [{ cols: ["d", "users"], rows: [["2026-08-20", 10]] }],
+    sqls: ["SELECT toDate(lastWatchTime) d, uniq(guid) WHERE channel='IndiaA' GROUP BY d"],
+    requiredInResults: ["IndiaA"],
+  });
+  assert.equal(r.ok, true);
+}
+
 console.log("analytics-dim-reconcile.test.ts OK");

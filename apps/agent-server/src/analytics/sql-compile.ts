@@ -44,7 +44,19 @@ function normalizeFilterToken(v: string): string {
   return t;
 }
 
-function buildWhere(intent: AnalyticsIntent, forcedFilters?: Record<string, string[]>): string {
+function assertNumericFilterValues(field: string, values: string[]): CompileFail | null {
+  const bad = values.filter((v) => v !== "" && !/^-?\d+(\.\d+)?$/.test(v));
+  if (!bad.length) return null;
+  return {
+    ok: false,
+    reason: `filter_${field}_not_numeric:${bad.slice(0, 5).join(",")}`,
+  };
+}
+
+function buildWhere(
+  intent: AnalyticsIntent,
+  forcedFilters?: Record<string, string[]>,
+): { ok: true; where: string } | CompileFail {
   const parts: string[] = [
     `toDate(lastWatchTime) BETWEEN ${sqlStringLiteral(intent.time.start)} AND ${sqlStringLiteral(intent.time.end)}`,
   ];
@@ -65,8 +77,13 @@ function buildWhere(intent: AnalyticsIntent, forcedFilters?: Record<string, stri
   for (const [field, values] of Object.entries(merged)) {
     if (!values?.length) continue;
     const normalized = values.map(normalizeFilterToken);
+    const forceNumeric = field === "movieType";
+    if (forceNumeric) {
+      const bad = assertNumericFilterValues(field, normalized);
+      if (bad) return bad;
+    }
     const numeric =
-      field === "movieType" || normalized.every((v) => v !== "" && /^-?\d+(\.\d+)?$/.test(v));
+      forceNumeric || normalized.every((v) => v !== "" && /^-?\d+(\.\d+)?$/.test(v));
     const lit = (v: string) => (numeric ? v : sqlStringLiteral(v));
     if (normalized.length === 1) {
       parts.push(`${field} = ${lit(normalized[0]!)}`);
@@ -74,7 +91,7 @@ function buildWhere(intent: AnalyticsIntent, forcedFilters?: Record<string, stri
       parts.push(`${field} IN (${normalized.map(lit).join(", ")})`);
     }
   }
-  return parts.join("\n  AND ");
+  return { ok: true, where: parts.join("\n  AND ") };
 }
 
 function safeAlias(code: string): string {
@@ -86,20 +103,46 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
   const dims = intent.outputDims.length ? intent.outputDims : ["watch_date"];
   const dimMeta = dims.map(dimSelectExpr);
-  const where = buildWhere(intent, pack?.guards.forcedFilters);
+  const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
+  if (!whereBuilt.ok) return whereBuilt;
+  const where = whereBuilt.where;
 
   const pivot = intent.pivotDim;
   const pivotValues = pivot ? (intent.filters[pivot] || []).map(normalizeFilterToken) : [];
   const useWide = intent.layout === "wide" && pivot && pivotValues.length > 1;
 
   if (useWide) {
-    const innerSelect = [
-      ...dimMeta.map((d) => d.select),
+    // Pivot dim is expanded as columns — do not also select/group it as a row dim.
+    const wideDims = dims.filter((d) => d !== pivot);
+    const wideMeta = (wideDims.length ? wideDims : dims.filter((d) => d !== pivot)).map(dimSelectExpr);
+    // If all dims were pivot-only, keep empty outer grain (single row of pivot columns)
+    const innerDimMeta = wideMeta.length ? wideMeta : [];
+    const innerSelectParts = [
+      ...innerDimMeta.map((d) => d.select),
       ...entityKeys,
-      pivot,
+      pivot!,
       `max(${valueField}) AS a`,
-    ].join(",\n    ");
-    const innerGroup = [...dimMeta.map((d) => d.group), ...entityKeys, pivot!].join(", ");
+    ];
+    // De-dupe identical select expressions (e.g. contentLang listed twice)
+    const seenSel = new Set<string>();
+    const innerSelect = innerSelectParts
+      .filter((s) => {
+        const key = s.replace(/\s+/g, " ").trim().toLowerCase();
+        if (seenSel.has(key)) return false;
+        seenSel.add(key);
+        return true;
+      })
+      .join(",\n    ");
+    const innerGroupParts = [...innerDimMeta.map((d) => d.group), ...entityKeys, pivot!];
+    const seenGrp = new Set<string>();
+    const innerGroup = innerGroupParts
+      .filter((g) => {
+        const key = g.toLowerCase();
+        if (seenGrp.has(key)) return false;
+        seenGrp.add(key);
+        return true;
+      })
+      .join(", ");
     const outerMetrics = pivotValues
       .map((v) => {
         const lit = sqlStringLiteral(v);
@@ -107,9 +150,9 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
         return `round(sumIf(a, ${pivot} = ${lit}) / nullIf(countIf(${pivot} = ${lit}), 0), 0) AS ${alias}`;
       })
       .join(",\n  ");
-    const outerGroup = dimMeta.map((d) => d.group).join(", ");
-    const outerSelect = [...dimMeta.map((d) => d.group), outerMetrics].join(",\n  ");
-    const order = dimMeta.map((d) => d.group).join(", ");
+    const outerGroup = innerDimMeta.map((d) => d.group).join(", ");
+    const outerSelect = [...innerDimMeta.map((d) => d.group), outerMetrics].filter(Boolean).join(",\n  ");
+    const order = outerGroup || outerMetrics.split(" AS ").pop()?.trim() || "1";
     const sql = [
       `SELECT`,
       `  ${outerSelect}`,
@@ -120,8 +163,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
       `  WHERE ${where}`,
       `  GROUP BY ${innerGroup}`,
       `)`,
-      `GROUP BY ${outerGroup}`,
-      `ORDER BY ${order}`,
+      ...(outerGroup ? [`GROUP BY ${outerGroup}`, `ORDER BY ${outerGroup}`] : []),
     ].join("\n");
     return { ok: true, sql };
   }
@@ -157,7 +199,9 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
 function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const dims = intent.outputDims.length ? intent.outputDims : [];
   const dimMeta = dims.map(dimSelectExpr);
-  const where = buildWhere(intent, pack?.guards.forcedFilters);
+  const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
+  if (!whereBuilt.ok) return whereBuilt;
+  const where = whereBuilt.where;
   let metricExpr: string;
   if (intent.metric.kind === "uniq") {
     const f = intent.metric.distinctField || "guid";

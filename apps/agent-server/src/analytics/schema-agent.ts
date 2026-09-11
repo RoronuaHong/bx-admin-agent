@@ -10,6 +10,8 @@ import { listModels } from "../config.js";
 import * as trace from "../trace.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
+import { resolveDimensionValues } from "./dim-resolve.js";
+import { catalogCapabilitiesPayload } from "./capability-gate.js";
 import {
   buildStructureSystemPrompt,
   buildStructureUserPrompt,
@@ -94,9 +96,12 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
     metrics,
     defaultMovieTypesWhenAbsent: pack.guards.defaultMovieTypes,
     sqlStyleIds: listSqlStyleIds(),
+    capabilities: catalogCapabilitiesPayload(pack),
     notes: [
-      "Do NOT invent locale/movieType dictionaries. Call metabase_probe_dimension.",
-      "Map Chinese names to codes ONLY using probe results + user text.",
+      "Do NOT invent locale/movieType dictionaries in your head.",
+      "For movieType Chinese names (电影/电视剧/…): call metabase_resolve_dimension_values — codes come from Metabase field values/description.",
+      "For contentLang membership: call metabase_probe_dimension.",
+      "Declare required ops ids from capabilities.supportedOps / knownButUnsupportedOps. Never status=ok after silently dropping unsupported ops.",
       "If unsure which values, status=clarify.",
     ],
   };
@@ -116,7 +121,7 @@ const TOOLS = [
     function: {
       name: "metabase_probe_dimension",
       description:
-        "Probe distinct values for a dimension via Metabase/ClickHouse (Top-N by count). Use for contentLang, movieType, channel, etc.",
+        "Probe distinct values for a dimension via Metabase/ClickHouse (Top-N by count). Use for contentLang, channel. For movieType labels→codes prefer metabase_resolve_dimension_values.",
       parameters: {
         type: "object",
         properties: {
@@ -126,6 +131,27 @@ const TOOLS = [
           limit: { type: "number", description: "Max distinct values, default 30" },
         },
         required: ["field", "start", "end"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "metabase_resolve_dimension_values",
+      description:
+        "Resolve dimension tokens (Chinese labels or codes) to stored DB values using Metabase field values/description lexicon. Use for movieType (电影→1). Returns resolved codes + unresolved + options.",
+      parameters: {
+        type: "object",
+        properties: {
+          field: { type: "string", description: "Physical field, e.g. movieType" },
+          tokens: {
+            type: "array",
+            items: { type: "string" },
+            description: "User-facing labels and/or codes to resolve",
+          },
+        },
+        required: ["field", "tokens"],
         additionalProperties: false,
       },
     },
@@ -209,12 +235,14 @@ function buildSystem(
 ): string {
   return [
     "You are an analytics SCHEMA agent. Read the FULL conversation.",
-    "Use tools to probe Metabase for real dimension values. Do NOT rely on hardcoded Chinese→code dictionaries.",
+    "Use tools to probe Metabase for real dimension values. Do NOT invent Chinese→code dictionaries.",
     "Goal: emit ONE JSON schema for deterministic SQL compile, OR clarify.",
     "Clarify priority (ONE slot): time_range → contentLang → result_layout → metric. clarifySlot must use these ids (never 'layout').",
     "NEVER invent contentLang codes. If user says 三种小语种/几种语言 without listing codes → probe contentLang then clarify contentLang. Do NOT guess te-IN/ta-IN/ml-IN.",
+    "Do NOT clarify contentLang when the user did not ask about languages/locales — omit filters.contentLang and proceed.",
     "Only put locale into filters.contentLang if a USER turn (or 澄清选择) literally contains that code, OR user replies 全部/全选/all to confirm the candidates you just listed from probe.",
-    "When user says 电影/电视剧 etc., call metabase_probe_dimension(movieType) and map; if still ambiguous, clarify movieType.",
+    "When user says 电影/电视剧/真人秀 etc.: call metabase_resolve_dimension_values(movieType, tokens) and put RESOLVED numeric codes into filters.movieType. If unresolved → clarify movieType.",
+    "Declare ops from catalog capabilities (supported + known-but-unsupported). If user needs yoy/mom/growth_rate, include those op ids — server will run dual-window + merge_ratio. For top_n/percentile still unsupported: include the op id (do NOT silently drop to base_aggregate).",
     "If time range missing → clarify time_range.",
     "metricId: avg_watch_second_per_user | sum_watch_second | uniq_users | avg_max_progress | …",
     "For avg_watch_second_per_user / uniq / sum: multi contentLang = WHERE IN; do NOT require result_layout.",
@@ -228,7 +256,7 @@ function buildSystem(
     '  "time":{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"},',
     '  "filters":{"channel":[],"contentLang":[],"movieType":[]},',
     '  "outputDims":["watch_date","channel"], "layout":"wide"|"long", "pivotDim":"contentLang",',
-    '  "metricId":"...", "notes":[] }',
+    '  "metricId":"...", "ops":["base_aggregate"], "askSummary":"...", "notes":[] }',
   ]
     .filter(Boolean)
     .join("\n");
@@ -458,6 +486,20 @@ export async function runSchemaAgent(input: {
               Number(args.limit || 30),
               input.signal,
             );
+          } else if (name === "metabase_resolve_dimension_values") {
+            const tokens = Array.isArray(args.tokens)
+              ? args.tokens.map((t) => String(t))
+              : String(args.tokens || "")
+                  .split(/[,，、\s]+/)
+                  .map((t) => t.trim())
+                  .filter(Boolean);
+            const resolved = await resolveDimensionValues({
+              pack: input.pack,
+              field: String(args.field || ""),
+              tokens,
+              opts: { signal: input.signal },
+            });
+            result = JSON.stringify(resolved);
           } else {
             result = JSON.stringify({ ok: false, error: `unknown tool ${name}` });
           }

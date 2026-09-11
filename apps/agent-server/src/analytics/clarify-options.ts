@@ -107,10 +107,13 @@ export function attachClarifyOptions(
 ): { message: string; clarifyOptions?: ClarifyOption[] } {
   if (!options?.length) return { message };
   const numbered = withOptionNumbers(options);
-  const base =
-    (opts?.slot ? slotClarifyMessage(opts.slot) : undefined) ||
-    stripEmbeddedCandidateJunk(message) ||
-    message;
+  const stripped = stripEmbeddedCandidateJunk(message) || message;
+  const slotMsg = opts?.slot ? slotClarifyMessage(opts.slot) : undefined;
+  // Prefer caller message when it already names unresolved tokens (Grounding Gate).
+  const specific =
+    /无法识别|不存在|未校验|无法将|映射到|幽灵/u.test(stripped) ||
+    /unresolved|ungrounded|cannot map/i.test(stripped);
+  const base = specific ? stripped : slotMsg || stripped || message;
   return {
     message: `${base}${formatOptionHint(numbered, opts)}`,
     clarifyOptions: numbered,
@@ -148,16 +151,34 @@ export function metricClarifyOptions(
   }));
 }
 
-/** Flatten pack.metricDefs.options into numbered clarify options. */
+/** Flatten pack.metricDefs.options + common compiled metrics into clarify options. */
 export function metricClarifyOptionsFromPack(pack: {
-  metricDefs?: Array<{ options?: Array<{ id: string; label?: string }> }>;
+  metricDefs?: Array<{ options?: Array<{ id: string; label?: string; compile?: unknown }> }>;
+  capabilities?: { metrics?: string[] };
 }): ClarifyOption[] {
   const flat: ClarifyOption[] = [];
+  const seen = new Set<string>();
+  const push = (id: string, label: string) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    flat.push({ id, label });
+  };
+  // Prefer metrics that have compile recipes
   for (const def of pack.metricDefs || []) {
     for (const o of def.options || []) {
-      if (!o?.id) continue;
-      flat.push({ id: o.id, label: o.label || o.id });
+      if (!o?.id || !o.compile) continue;
+      push(o.id, o.label || o.id);
     }
+  }
+  const builtins: Array<{ id: string; label: string }> = [
+    { id: "uniq_users", label: "观看人数/UV" },
+    { id: "avg_watch_second_per_user", label: "人均观看时长（秒）" },
+    { id: "sum_watch_second", label: "观看时长合计（秒）" },
+    { id: "avg_max_progress", label: "最大观看进度平均值" },
+  ];
+  for (const b of builtins) {
+    if (pack.capabilities?.metrics?.length && !pack.capabilities.metrics.includes(b.id)) continue;
+    push(b.id, b.label);
   }
   return metricClarifyOptions(flat);
 }

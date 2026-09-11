@@ -236,7 +236,115 @@ export async function runMetabaseQuestion(
   }
 }
 
+async function metabaseGetJson<T>(
+  path: string,
+  opts?: MetabaseRunOpts,
+): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
+  const signal = opts?.signal;
+  try {
+    signal?.throwIfAborted();
+    let session = await login(false, signal);
+    let resp = await fetch(`${config.metabase.url}${path}`, {
+      headers: { "X-Metabase-Session": session },
+      signal,
+    });
+    if (resp.status === 401) {
+      clearMetabaseSessionCache();
+      session = await login(true, signal);
+      resp = await fetch(`${config.metabase.url}${path}`, {
+        headers: { "X-Metabase-Session": session },
+        signal,
+      });
+    }
+    const data = (await resp.json()) as T;
+    if (!resp.ok) {
+      return { ok: false, error: `metabase_get ${path} → ${resp.status}` };
+    }
+    return { ok: true, data };
+  } catch (e) {
+    rethrowIfAborted(e, signal);
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export type MetabaseFieldMeta = {
+  id: number;
+  name: string;
+  display_name?: string;
+  description?: string | null;
+  table_id?: number;
+  has_field_values?: string;
+};
+
+type DbMetadata = {
+  tables?: Array<{
+    id?: number;
+    name?: string;
+    schema?: string;
+    fields?: Array<{
+      id?: number;
+      name?: string;
+      display_name?: string;
+      description?: string | null;
+      has_field_values?: string;
+    }>;
+  }>;
+};
+
+const fieldMetaCache = new Map<string, { at: number; field: MetabaseFieldMeta }>();
+const FIELD_META_TTL_MS = 30 * 60 * 1000;
+
+/** Locate a table.field in Metabase DB metadata (cached). */
+export async function findMetabaseField(
+  databaseId: number,
+  tableName: string,
+  fieldName: string,
+  opts?: MetabaseRunOpts,
+): Promise<{ ok: true; field: MetabaseFieldMeta } | { ok: false; error: string }> {
+  const cacheKey = `${databaseId}:${tableName}.${fieldName}`;
+  const hit = fieldMetaCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < FIELD_META_TTL_MS) {
+    return { ok: true, field: hit.field };
+  }
+  const meta = await metabaseGetJson<DbMetadata>(
+    `/api/database/${databaseId}/metadata?include_hidden=true`,
+    opts,
+  );
+  if (!meta.ok) return meta;
+  const table = (meta.data.tables || []).find((t) => t.name === tableName);
+  if (!table) return { ok: false, error: `table_not_found:${tableName}` };
+  const f = (table.fields || []).find((x) => x.name === fieldName);
+  if (!f?.id) return { ok: false, error: `field_not_found:${tableName}.${fieldName}` };
+  const field: MetabaseFieldMeta = {
+    id: f.id,
+    name: f.name || fieldName,
+    display_name: f.display_name,
+    description: f.description,
+    table_id: table.id,
+    has_field_values: f.has_field_values,
+  };
+  fieldMetaCache.set(cacheKey, { at: Date.now(), field });
+  return { ok: true, field };
+}
+
+export type MetabaseFieldValuesPayload = {
+  values?: unknown[];
+  field_id?: number;
+  has_more_values?: boolean;
+};
+
+/** Field values (often [[code, label], …] when remapped in Metabase Admin). */
+export async function fetchMetabaseFieldValues(
+  fieldId: number,
+  opts?: MetabaseRunOpts,
+): Promise<{ ok: true; values: unknown[] } | { ok: false; error: string }> {
+  const res = await metabaseGetJson<MetabaseFieldValuesPayload>(`/api/field/${fieldId}/values`, opts);
+  if (!res.ok) return res;
+  return { ok: true, values: Array.isArray(res.data.values) ? res.data.values : [] };
+}
+
 /** Clear cached session (tests / credential rotation). */
 export function clearMetabaseSessionCache(): void {
   cachedSession = null;
+  fieldMetaCache.clear();
 }

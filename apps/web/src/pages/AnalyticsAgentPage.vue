@@ -13,6 +13,8 @@ import {
   listAnalyticsScanJobs,
   runAnalyticsScan,
   saveAnalyticsConversationMessages,
+  pushAnalyticsAskState,
+  undoAnalyticsAskState,
   submitAnalyticsFeedback,
   uploadAnalyticsFiles,
   type AnalyticsAskResult,
@@ -56,6 +58,8 @@ type AnalyticsBubble = {
   text: string;
   status?: AnalyticsAskResult["status"];
   timeEcho?: string;
+  askSummary?: string;
+  defaultsNote?: string;
   tables?: AnalyticsAskTable[];
   sqls?: string[];
   probeSummary?: string;
@@ -81,6 +85,9 @@ type AnalyticsConversation = {
   messages: AnalyticsBubble[];
   createdAt: number;
   updatedAt: number;
+  /** Last AskState for revise follow-ups (persisted with conversation) */
+  askState?: Record<string, unknown> | null;
+  askStateStack?: { states: Record<string, unknown>[]; updatedAt: number } | null;
 };
 
 const STORAGE_KEY = "bx-analytics-conversations-v1";
@@ -183,6 +190,8 @@ function blankConversation(): AnalyticsConversation {
     messages: [],
     createdAt: now,
     updatedAt: now,
+    askState: null,
+    askStateStack: { states: [], updatedAt: Date.now() },
   };
 }
 
@@ -306,6 +315,8 @@ function loadConversationsFromStorage(): { list: AnalyticsConversation[]; active
 
 const conversations = ref<AnalyticsConversation[]>([]);
 const activeId = ref("");
+/** Working memory for follow-up revise (IndiaB呢？); also stored on conversation */
+const lastAskState = ref<Record<string, unknown> | null>(null);
 let suppressConversationSave = false;
 const deletedConversationIds = new Set<string>();
 
@@ -321,7 +332,9 @@ function cacheLocally() {
 function persistConversationRemote(id: string, messages: AnalyticsBubble[], title?: string) {
   if (deletedConversationIds.has(id)) return;
   const stored = messages.map(bubbleToStored).filter((m): m is StoredMessage => Boolean(m));
-  saveAnalyticsConversationMessages(id, stored, title)
+  const conv = conversations.value.find((c) => c.id === id);
+  const stack = conv?.askStateStack || undefined;
+  saveAnalyticsConversationMessages(id, stored, title, stack)
     .then(() => {
       if (deletedConversationIds.has(id)) {
         deleteAnalyticsConversation(id).catch(() => {});
@@ -330,6 +343,65 @@ function persistConversationRemote(id: string, messages: AnalyticsBubble[], titl
     .catch(() => {
       /* network fail: local cache remains */
     });
+}
+
+function applyAskStateStackToConv(
+  convId: string,
+  stack: { states: Record<string, unknown>[]; updatedAt: number } | null | undefined,
+) {
+  const states = stack?.states || [];
+  const top = states.length ? states[states.length - 1]! : null;
+  touchConversation(convId, (conv) => {
+    conv.askStateStack = stack
+      ? { states: [...states], updatedAt: stack.updatedAt || Date.now() }
+      : { states: [], updatedAt: Date.now() };
+    conv.askState = top;
+  });
+  if (convId === activeId.value) {
+    lastAskState.value = top;
+  }
+}
+
+const canUndoAsk = computed(() => {
+  const conv = conversations.value.find((c) => c.id === activeId.value);
+  return (conv?.askStateStack?.states?.length || 0) >= 2;
+});
+
+async function undoLastAsk() {
+  if (!canUndoAsk.value || sending.value) return;
+  const id = activeId.value;
+  try {
+    const data = await undoAnalyticsAskState(id);
+    applyAskStateStackToConv(id, data.stack || null);
+    cacheLocally();
+    const summary =
+      data.current && typeof data.current === "object" && "summary" in data.current
+        ? String((data.current as { summary?: string }).summary || "")
+        : "";
+    const note = data.popped
+      ? tx(
+          summary ? `已撤销上一 Ask，当前：${summary}` : "已撤销上一 Ask",
+          summary ? `Undid last Ask. Current: ${summary}` : "Undid last Ask",
+        )
+      : tx("没有可撤销的 Ask", "Nothing to undo");
+    touchConversation(id, (conv) => {
+      conv.messages = [
+        ...conv.messages,
+        {
+          id: uid(),
+          role: "assistant",
+          text: note,
+          status: "ok",
+          askSummary: summary || undefined,
+        },
+      ];
+    });
+    saveConversations();
+    await nextTick();
+    scrollBottom();
+  } catch (err) {
+    alert(formatRequestError(err));
+  }
 }
 
 function saveConversations() {
@@ -357,21 +429,41 @@ async function restoreConversations() {
     const remote = await fetchAnalyticsConversations();
     if (!remote.length) {
       if (!conversations.value.length) ensureBlankConversation(true);
+      restoreLastAskStateFromActive();
       return;
     }
+    const localAskById = new Map(
+      local.list
+        .map((c) => [c.id, { askState: c.askState, askStateStack: c.askStateStack }] as const)
+        .filter(([, s]) => Boolean(s.askState) || Boolean(s.askStateStack?.states?.length)),
+    );
     const convs: AnalyticsConversation[] = remote
       .filter((c) => c && c.id && !deletedConversationIds.has(c.id))
       .slice(0, MAX_REMOTE_CONVERSATIONS)
-      .map((c) => ({
-        id: c.id,
-        title: displayConversationTitleOf(c),
-        messages: (c.messages || [])
-          .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-          .slice(-MAX_REMOTE_MESSAGES)
-          .map((m, i) => storedToBubble(m, `${c.id}_${i}`)),
-        createdAt: c.createdAt || 0,
-        updatedAt: c.updatedAt || 0,
-      }));
+      .map((c) => {
+        const localBits = localAskById.get(c.id);
+        const remoteStack = c.askStateStack;
+        const stack =
+          remoteStack?.states?.length
+            ? remoteStack
+            : localBits?.askStateStack ||
+              (localBits?.askState
+                ? { states: [localBits.askState], updatedAt: Date.now() }
+                : null);
+        const top = stack?.states?.length ? stack.states[stack.states.length - 1]! : null;
+        return {
+          id: c.id,
+          title: displayConversationTitleOf(c),
+          messages: (c.messages || [])
+            .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+            .slice(-MAX_REMOTE_MESSAGES)
+            .map((m, i) => storedToBubble(m, `${c.id}_${i}`)),
+          createdAt: c.createdAt || 0,
+          updatedAt: c.updatedAt || 0,
+          askState: top,
+          askStateStack: stack,
+        };
+      });
     if (convs.length) {
       conversations.value = convs;
       activeId.value = convs.some((c) => c.id === local.activeId) ? local.activeId : convs[0]!.id;
@@ -382,6 +474,12 @@ async function restoreConversations() {
   } catch {
     if (!conversations.value.length) ensureBlankConversation(true);
   }
+  restoreLastAskStateFromActive();
+}
+
+function restoreLastAskStateFromActive() {
+  const conv = conversations.value.find((c) => c.id === activeId.value);
+  lastAskState.value = (conv?.askState as Record<string, unknown> | null) || null;
 }
 
 const shellRef = ref<{ threadEl: HTMLElement | null } | null>(null);
@@ -665,6 +763,7 @@ function newConversation() {
   const conv = blankConversation();
   conversations.value = [...conversations.value, conv];
   activeId.value = conv.id;
+  lastAskState.value = null;
   saveConversations();
   createAnalyticsConversation({ id: conv.id, title: conv.title }).catch(() => {});
   input.value = "";
@@ -682,6 +781,11 @@ function switchConversation(id: string) {
   hideTabMenu();
   if (sending.value) cancelSend();
   activeId.value = id;
+  const conv = conversations.value.find((c) => c.id === id);
+  const stackTop = conv?.askStateStack?.states?.length
+    ? conv.askStateStack.states[conv.askStateStack.states.length - 1]!
+    : null;
+  lastAskState.value = (conv?.askState as Record<string, unknown> | null) || stackTop || null;
   cacheLocally();
   nextTick(() => {
     resizeComposer();
@@ -1102,7 +1206,10 @@ function cancelSend() {
   controller.abort();
 }
 
-async function send() {
+async function send(presetText?: string) {
+  if (typeof presetText === "string" && presetText.trim()) {
+    input.value = presetText.trim();
+  }
   const text = input.value.trim();
   const imageIds = pastingImages.value.map((i) => i.id);
   const fileIds = pastingFiles.value.map((f) => f.id);
@@ -1180,6 +1287,7 @@ async function send() {
       files: fileIds.length ? fileIds : undefined,
       slotAnswers: askPayload.slotAnswers,
       messages: conversationMessages,
+      prevAskState: lastAskState.value || undefined,
     });
     if (data.error === "aborted" || (data.status === "error" && data.message === "已取消")) {
       if (userInitiatedCancel) {
@@ -1194,10 +1302,28 @@ async function send() {
         });
       }
     } else {
+      if (data.askState && (data.status === "ok" || data.status === "clarify")) {
+        lastAskState.value = data.askState as Record<string, unknown>;
+        touchConversation(requestConvId, (conv) => {
+          conv.askState = data.askState as Record<string, unknown>;
+          const prev = conv.askStateStack?.states || [];
+          const without = prev.filter(
+            (s) => String((s as { askId?: string }).askId || "") !== String((data.askState as { askId?: string })?.askId || ""),
+          );
+          without.push(data.askState as Record<string, unknown>);
+          conv.askStateStack = {
+            states: without.slice(-20),
+            updatedAt: Date.now(),
+          };
+        });
+        pushAnalyticsAskState(requestConvId, data.askState as Record<string, unknown>).catch(() => {});
+      }
       patchPending({
         text: data.message || data.error || (data.status === "ok" ? tx("查询完成", "Done") : ""),
         status: data.status,
         timeEcho: data.timeEcho,
+        askSummary: data.askSummary,
+        defaultsNote: data.defaultsNote,
         tables: data.tables,
         sqls: data.sqls,
         probeSummary: data.probeSummary,
@@ -1409,6 +1535,15 @@ onUnmounted(() => {
         >
           ＋
         </button>
+        <button
+          class="tab-undo"
+          type="button"
+          :disabled="!canUndoAsk || sending"
+          :title="tx('撤销上一 Ask', 'Undo last Ask')"
+          @click="undoLastAsk"
+        >
+          {{ tx("撤销Ask", "Undo Ask") }}
+        </button>
       </nav>
     </template>
 
@@ -1424,7 +1559,7 @@ onUnmounted(() => {
         </div>
 
         <div
-          v-if="item.text || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
+          v-if="item.text || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
           class="body-wrap"
         >
           <p v-if="item.status && item.role === 'assistant' && !item.pending" class="status-line" :data-status="item.status">
@@ -1434,6 +1569,29 @@ onUnmounted(() => {
               <template v-if="item.packVersion">pack {{ item.packVersion }}</template>
               <template v-if="item.packVersion && item.modelId"> · </template>
               <template v-if="item.modelId">{{ item.modelId }}</template>
+            </span>
+          </p>
+          <p
+            v-if="(item.askSummary || item.defaultsNote) && item.role === 'assistant' && !item.pending"
+            class="ask-summary"
+          >
+            <span v-if="item.askSummary">{{ item.askSummary }}</span>
+            <span v-if="item.defaultsNote" class="defaults-chip">
+              {{ item.defaultsNote }}
+              <button
+                type="button"
+                class="defaults-dismiss"
+                :disabled="sending"
+                :title="tx('本轮不用默认', 'Disable defaults this turn')"
+                @click="
+                  send(
+                    tx('本轮不用默认渠道。', 'Disable defaults. ') +
+                      (item.userNl || tx('请按原条件重跑', 'Please re-run the last ask')),
+                  )
+                "
+              >
+                ×
+              </button>
             </span>
           </p>
 
@@ -2202,6 +2360,33 @@ onUnmounted(() => {
   color: var(--ink);
 }
 
+.tab-undo {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  padding: 0 10px;
+  align-self: center;
+  margin: 0 0 1px 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tab-undo:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  color: var(--ink);
+}
+
+.tab-undo:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .tab-ctx-backdrop {
   position: fixed;
   inset: 0;
@@ -2530,6 +2715,48 @@ onUnmounted(() => {
 .time-echo {
   color: var(--muted);
   font-size: 12px;
+}
+
+.ask-summary {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--ink);
+  line-height: 1.45;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.defaults-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.defaults-dismiss {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.defaults-dismiss:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.defaults-dismiss:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
 .meta-echo {

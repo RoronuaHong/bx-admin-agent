@@ -70,4 +70,21 @@ assert.doesNotThrow(() =>
 
 assert.throws(() => assertReadonlySingleSelect("SELECT 1 INTO OUTFILE '/tmp/x'"), /into_outfile|SQL AST/);
 
+{
+  const nested = `
+SELECT channel,
+  round(sumIf(a, contentLang = 'te-IN') / nullIf(countIf(contentLang = 'te-IN'), 0), 0) AS te_IN
+FROM (
+  SELECT channel, guid, eid, contentLang, max(maxWatchProgress) AS a
+  FROM elt_watch_detail
+  WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25'
+  GROUP BY channel, guid, eid, contentLang
+)
+GROUP BY channel`;
+  assert.equal(analyzeSqlAst(nested).hasWhere, true);
+  assert.doesNotThrow(() =>
+    assertSqlAstSafe(nested, { requireWhere: true, allowedTables: ["elt_watch_detail"] }),
+  );
+}
+
 console.log("analytics-sql-ast.test.ts OK");
