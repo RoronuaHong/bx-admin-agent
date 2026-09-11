@@ -215,6 +215,7 @@ function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
     sqls: m.sqls,
     probeSummary: m.probeSummary,
     clarifySlot: m.clarifySlot,
+    clarifyOptions: m.clarifyOptions,
     error: m.error,
     cancelled: m.cancelled,
     images: m.images,
@@ -239,6 +240,7 @@ function storedToBubble(m: StoredMessage, fallbackId: string): AnalyticsBubble {
     sqls: m.sqls,
     probeSummary: m.probeSummary,
     clarifySlot: m.clarifySlot,
+    clarifyOptions: m.clarifyOptions,
     error: m.error,
     cancelled: m.cancelled,
     images: m.images,
@@ -394,6 +396,8 @@ const copiedId = ref<string | null>(null);
 const copiedSqlKey = ref<string | null>(null);
 const helpOpen = ref(false);
 const activeController = ref<AbortController | null>(null);
+/** 仅用户主动点停止时为 true；网络中断/HMR/组件卸载不展示「已取消」 */
+let userInitiatedCancel = false;
 let threadScrollbarCleanup: (() => void) | null = null;
 
 const activeConversation = computed(
@@ -1094,6 +1098,7 @@ watch(modelMenuOpen, async (open) => {
 function cancelSend() {
   const controller = activeController.value;
   if (!controller || controller.signal.aborted) return;
+  userInitiatedCancel = true;
   controller.abort();
 }
 
@@ -1104,6 +1109,7 @@ async function send() {
   if ((!text && !imageIds.length && !fileIds.length) || sending.value) return;
   stopVoice();
   sending.value = true;
+  userInitiatedCancel = false;
   const controller = new AbortController();
   activeController.value = controller;
   const requestConvId = activeId.value;
@@ -1176,7 +1182,17 @@ async function send() {
       messages: conversationMessages,
     });
     if (data.error === "aborted" || (data.status === "error" && data.message === "已取消")) {
-      patchPending({ text: "", pending: false, cancelled: true, status: undefined, error: undefined });
+      if (userInitiatedCancel) {
+        patchPending({ text: "", pending: false, cancelled: true, status: undefined, error: undefined });
+      } else {
+        patchPending({
+          text: "",
+          status: "error",
+          error: tx("请求中断，请重试", "Request interrupted, please retry"),
+          pending: false,
+          cancelled: false,
+        });
+      }
     } else {
       patchPending({
         text: data.message || data.error || (data.status === "ok" ? tx("查询完成", "Done") : ""),
@@ -1199,7 +1215,17 @@ async function send() {
     }
   } catch (err) {
     if (isAbortError(err)) {
-      patchPending({ text: "", pending: false, cancelled: true, status: undefined, error: undefined });
+      if (userInitiatedCancel) {
+        patchPending({ text: "", pending: false, cancelled: true, status: undefined, error: undefined });
+      } else {
+        patchPending({
+          text: "",
+          status: "error",
+          error: tx("请求中断，请重试", "Request interrupted, please retry"),
+          pending: false,
+          cancelled: false,
+        });
+      }
     } else {
       const msg = formatRequestError(err);
       patchPending({

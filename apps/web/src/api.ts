@@ -309,6 +309,7 @@ export interface StoredMessage {
   welcome?: boolean;
   pending?: boolean;
   clarifySlot?: string;
+  clarifyOptions?: Array<{ id: string; label: string }>;
 }
 
 export interface ConversationDto {

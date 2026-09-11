@@ -131,4 +131,61 @@ import {
   if (r.status === "ok") assert.equal(r.layout, "wide");
 }
 
+{
+  // 澄清选择确定性落槽：模型漏填 filters 时仍能从 transcript 回填
+  const r = enforceStructurePolicy(
+    {
+      status: "ok",
+      mergedNl: "完播率",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"] },
+      outputDims: ["watch_date", "channel"],
+      metricId: "avg_max_progress",
+    },
+    formatConversationTranscript([
+      {
+        role: "user",
+        text: "三种小语种完播率 IndiaA 2026-08-19 至 2026-08-25 按天+渠道",
+      },
+      { role: "user", text: "澄清选择：contentLang=(empty),ta-IN,te-IN；result_layout=wide" },
+    ]),
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.deepEqual(r.filters.contentLang?.slice().sort(), ["(empty)", "ta-IN", "te-IN"]);
+    assert.equal(r.layout, "wide");
+    assert.equal(r.pivotDim, "contentLang");
+  }
+}
+
+{
+  // 用户回「全部」：从上一轮助手候选落地，不再因原问「四种语言」被政策拦下
+  const transcript = formatConversationTranscript([
+    {
+      role: "user",
+      text: "IndiaA 2026-08-19到25 四种内容语言人均观看时长 按天渠道",
+    },
+    {
+      role: "assistant",
+      text: "请确认语言\n候选：\n1. 英语（contentLang 为空）\n2. ta-IN\n3. te-IN\n4. ml-IN\ncontentLang: (empty), ta-IN, te-IN, ml-IN",
+    },
+    { role: "user", text: "全部" },
+  ]);
+  const r = enforceStructurePolicy(
+    {
+      status: "ok",
+      mergedNl: "IndiaA 四种内容语言人均观看时长",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["(empty)", "ta-IN", "te-IN", "ml-IN"] },
+      outputDims: ["watch_date", "channel"],
+      metricId: "avg_watch_second_per_user",
+    },
+    transcript,
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.deepEqual(r.filters.contentLang?.slice().sort(), ["(empty)", "ml-IN", "ta-IN", "te-IN"]);
+  }
+}
+
 console.log("analytics-conversation-structure.test.ts OK");

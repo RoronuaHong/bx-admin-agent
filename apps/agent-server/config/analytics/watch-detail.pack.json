@@ -32,13 +32,15 @@
     "maxProbeRounds": 3,
     "maxRewriteRounds": 2,
     "parallelism": 4,
-    "defaultMovieTypes": [1, 2, 3, 4, 10, 11]
+    "defaultMovieTypes": [1, 2, 3, 4, 10, 11],
+    "queryTimeoutMs": 120000,
+    "forcedFilters": {}
   },
   "enumDimensions": [
     {
       "id": "contentLang",
       "field": "contentLang",
-      "aliases": ["语言", "语种", "小语种", "contentLang"],
+      "aliases": ["语言", "语种", "小语种", "contentLang", "英语", "英文"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类", "小语种"],
       "domain": "probe"
     },

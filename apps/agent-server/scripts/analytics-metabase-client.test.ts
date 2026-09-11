@@ -123,7 +123,7 @@ try {
     const originalFetch = globalThis.fetch;
     let sawSignal = false;
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-      sawSignal = init?.signal === ctrl.signal;
+      sawSignal = Boolean(init?.signal);
       const err = new Error("aborted");
       err.name = "AbortError";
       throw err;

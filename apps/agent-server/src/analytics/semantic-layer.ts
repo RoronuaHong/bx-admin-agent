@@ -51,6 +51,13 @@ export interface AnalyticsPack {
     maxRewriteRounds: number;
     parallelism: number;
     defaultMovieTypes: number[];
+    /** Metabase/CH 单次查询超时（毫秒）；缺省读 ANALYTICS_QUERY_TIMEOUT_MS 或 120000 */
+    queryTimeoutMs?: number;
+    /**
+     * 行级强制过滤（RLS 钩子）：编译时 AND 进 WHERE，调用方/租户不可去掉。
+     * 例：{ "channel": ["IndiaA"] }
+     */
+    forcedFilters?: Record<string, string[]>;
   };
   /** Ambiguity Gate / schema：可枚举维 */
   enumDimensions?: EnumDimensionDef[];

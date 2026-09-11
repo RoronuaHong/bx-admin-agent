@@ -37,12 +37,19 @@ export interface AnalyticsAskResult {
   askId?: string;
   /** 本问自纠错轮次（lint/empty/dim/verify） */
   rewriteRounds?: number;
-  /** Intent 编译等路径跳过 LLM 校对 */
+  /** @deprecated 保留兼容；语义结果见 semanticOk */
   verifySkipped?: "empty" | "disabled" | "intent_compile";
   /** SQL 来源：仅 Intent 确定性编译（不再 LLM 写 SQL） */
   sqlSource?: "intent_compile";
   /** 是否经对话 schema-agent 结构化 */
   structuredFromConversation?: boolean;
+  /** 结构抽取模式：预探库单次 / tool-loop */
+  structureMode?: "single_forward" | "tool_loop";
+  /** 输出格式约束：json_object 或 prompt 解析兜底 */
+  formatConstraint?: "json_object" | "prompt_parse";
+  /** 语义校验是否通过（与 JSON 格式合法分开） */
+  semanticOk?: boolean;
+  semanticIssues?: string[];
   /** 本地 ECharts 双轨图（无 Metabase temp card） */
   charts?: Array<{
     title: string;

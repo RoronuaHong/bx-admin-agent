@@ -1,7 +1,7 @@
 /**
  * Analytics ask pipeline:
- * conversation ? schema-agent (probe tools) ? Intent compile ? exec.
- * Intent/compile/lint/exec ??? LLM ????????????? SQL?
+ * \u62a4\u680f + \u4e8b\u5b9e\u6ce8\u5165 \u2192\uff08\u9884\u63a2\u5e93\uff09\u5355\u6b21\u7ed3\u6784\u5316 / \u5fc5\u8981\u65f6 tool-loop \u2192 Intent compile \u2192 lint/exec/\u8bed\u4e49\u6821\u9a8c\u3002
+ * Intent/compile/lint/exec \u4e0d\u8d70 LLM \u5199 SQL\uff1b\u4e0d\u6539\u5199\u7528\u6237\u95ee\u53e5\uff1b\u65f6\u95f4\u7531\u4ee3\u7801\u89e3\u6790\u5e76\u8986\u76d6\u6a21\u578b time\u3002
  */
 
 import { config, listModels } from "../config.js";
@@ -11,12 +11,11 @@ import { transcribeImage } from "../vision.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import { loadAnalyticsPack, type AnalyticsPack } from "./semantic-layer.js";
 import {
-  assertReadonlySingleSelect,
-  assertTablesWhitelisted,
+  assertAnalyticsSqlSafe,
   lintSql,
   normalizeDistinctCount,
 } from "./sql-guard.js";
-import { resolveTimeRange } from "./time-resolve.js";
+import { applyResolvedTime, hasTimeSignal, resolveTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
 import { reconcileNamedDimensions } from "./dim-reconcile.js";
@@ -33,7 +32,15 @@ import {
   type ConversationTurn,
   type StructuredAskResult,
 } from "./conversation-structure.js";
-import { runSchemaAgent } from "./schema-agent.js";
+import { runSchemaAgent, runStructureOnce } from "./schema-agent.js";
+import { guardAnalyticsInput, type AskRuntimeContext } from "./input-guard.js";
+import {
+  attachClarifyOptions,
+  layoutClarifyOptions,
+  metricClarifyOptionsFromPack,
+  parseProbeValuesForDim,
+  type ClarifyOption,
+} from "./clarify-options.js";
 
 type LlmOpts = { modelId?: string; signal?: AbortSignal; traceRunId?: string; spanName?: string };
 
@@ -49,33 +56,33 @@ async function collectAttachmentContext(
     const item = getUpload(id);
     if (item?.kind === "text") {
       if (item.text.trim()) {
-        parts.push(`[附件文本]\n${item.text.trim()}`);
+        parts.push(`[\u9644\u4ef6\u6587\u672c]\n${item.text.trim()}`);
         usableCount += 1;
       } else {
-        parts.push(`[附件文本为空] id=${id}`);
+        parts.push(`[\u9644\u4ef6\u6587\u672c\u4e3a\u7a7a] id=${id}`);
       }
     } else {
-      parts.push(`[附件缺失] id=${id}（不存在或已过期）`);
+      parts.push(`[\u9644\u4ef6\u7f3a\u5931] id=${id}\uff08\u4e0d\u5b58\u5728\u6216\u5df2\u8fc7\u671f\uff09`);
     }
   }
   for (const id of (images || []).slice(0, MAX_AT_ONCE)) {
     signal?.throwIfAborted();
     const item = getUpload(id);
     if (!item || item.kind !== "image") {
-      parts.push(`[图片缺失] id=${id}（不存在或已过期）`);
+      parts.push(`[\u56fe\u7247\u7f3a\u5931] id=${id}\uff08\u4e0d\u5b58\u5728\u6216\u5df2\u8fc7\u671f\uff09`);
       continue;
     }
     try {
       const desc = await transcribeImage(item.base64, item.mediaType, signal);
       if (desc.trim()) {
-        parts.push(`[图片内容]\n${desc.trim()}`);
+        parts.push(`[\u56fe\u7247\u5185\u5bb9]\n${desc.trim()}`);
         usableCount += 1;
       } else {
-        parts.push(`[附件文本为空] id=${id}`);
+        parts.push(`[\u56fe\u7247\u5185\u5bb9\u4e3a\u7a7a] id=${id}`);
       }
     } catch (e) {
       if (signal?.aborted || isAbortError(e)) throw e;
-      parts.push(`[图片转录失败] ${e instanceof Error ? e.message : String(e)}`);
+      parts.push(`[\u56fe\u7247\u8f6c\u5f55\u5931\u8d25] ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return { context: parts.join("\n\n"), usableCount };
@@ -172,10 +179,10 @@ async function probeDimensions(
         lines.push(`${dim}: PROBE_FAILED (${res.error || "error"})`);
         continue;
       }
-      const vals = res.rows
-        .slice(0, 15)
-        .map((r) => String(r[0] ?? ""))
-        .filter(Boolean);
+      const vals = res.rows.slice(0, 15).map((r) => {
+        const v = r[0] == null ? "" : String(r[0]);
+        return v === "" ? "(empty)" : v;
+      });
       lines.push(`${dim}: ${vals.join(", ") || "(empty)"}`);
     } catch (e) {
       if (signal?.aborted || isAbortError(e)) throw e;
@@ -183,25 +190,6 @@ async function probeDimensions(
     }
   }
   return lines.join("\n");
-}
-
-function parseProbeValuesForDim(
-  probeSummary: string,
-  dimField: string,
-): Array<{ id: string; label: string }> {
-  const line = probeSummary
-    .split("\n")
-    .map((l) => l.trim())
-    .find((l) => l.toLowerCase().startsWith(dimField.toLowerCase() + ":"));
-  if (!line || /PROBE_FAILED/i.test(line)) return [];
-  const raw = line.slice(line.indexOf(":") + 1).trim();
-  if (!raw || raw === "(empty)") return [];
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 15)
-    .map((v) => ({ id: v, label: v }));
 }
 
 function collectIssues(
@@ -213,12 +201,7 @@ function collectIssues(
   const issues: string[] = [];
   for (const sql of sqls) {
     try {
-      assertReadonlySingleSelect(sql);
-    } catch (e) {
-      issues.push(e instanceof Error ? e.message : String(e));
-    }
-    try {
-      assertTablesWhitelisted(sql, allowedTables);
+      assertAnalyticsSqlSafe(sql, allowedTables);
     } catch (e) {
       issues.push(e instanceof Error ? e.message : String(e));
     }
@@ -228,6 +211,17 @@ function collectIssues(
   issues.push(...verifyNamedChannel(nl, sqls, dimColumns));
   issues.push(...verifyMultiQueryIntent(nl, sqls));
   return [...new Set(issues)];
+}
+
+/** \u8986\u76d6\u7f3a\u53e3 / SQL \u5b89\u5168\u95ee\u9898 \u2192 refuse\uff1b\u5176\u4f59 \u2192 clarify */
+function isCoverageOrSafetyIssue(detail: string): boolean {
+  return /unsupported_metric|not compilable|SQL AST guard|non_readonly|multi_statement|not_select|into_outfile|missing_where|whitelist|unknown metric/i.test(
+    detail,
+  );
+}
+
+function coverageRefuseMessage(stage: string, detail: string): string {
+  return `\u5f53\u524d\u95ee\u6570\u8d85\u51fa\u8bed\u4e49\u5c42\u5df2\u5efa\u6a21\u8303\u56f4\u6216\u672a\u901a\u8fc7 SQL \u5b89\u5168\u6821\u9a8c\uff08${stage}\uff09\uff1a${detail}\u3002\u8bf7\u6539\u7528\u5df2\u652f\u6301\u7684\u6307\u6807/\u7ef4\u5ea6\uff0c\u6216\u8054\u7cfb\u8865\u5145\u5efa\u6a21\uff1b\u7cfb\u7edf\u4e0d\u4f1a\u8fd4\u56de\u672a\u6821\u9a8c\u7684\u67e5\u8be2\u7ed3\u679c\u3002`;
 }
 
 function normalizeSqls(sqls: string[]): string[] {
@@ -247,25 +241,25 @@ async function mapPool<T, R>(
   fn: (item: T, index: number) => Promise<R>,
   signal?: AbortSignal,
 ): Promise<R[]> {
-  const limit = Math.max(1, concurrency);
-  const results: R[] = new Array(items.length);
+  const out: R[] = new Array(items.length);
   let next = 0;
-  async function worker() {
-    while (next < items.length) {
+  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (true) {
       signal?.throwIfAborted();
       const i = next++;
-      results[i] = await fn(items[i], i);
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]!, i);
     }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 function allEmpty(results: DatasetResult[]): boolean {
   return results.length > 0 && results.every((r) => r.ok && r.rows.length === 0);
 }
 
-/** Intent/compile/lint/exec ???LLM ????????? SQL? */
+/** Intent/compile \u5931\u8d25\u65f6\u7528 LLM \u89e3\u91ca\u539f\u56e0\uff1b\u4e25\u7981 LLM \u5199 SQL */
 async function diagnoseFailure(
   input: {
     transcript: string;
@@ -277,35 +271,43 @@ async function diagnoseFailure(
   },
   opts?: LlmOpts,
 ): Promise<string> {
-  const system = [
-    "You are an analytics diagnose assistant for a Metabase analytics agent.",
-    "Explain in concise Chinese: why the ask cannot complete, and what the user should clarify next.",
-    "ABSOLUTELY FORBIDDEN: do not write SQL, do not invent tables/schemas, do not propose CREATE/SELECT code blocks.",
-    "If languages are missing, ask for contentLang codes. If wide/long is missing, ask result_layout.",
-    "Plain text only; no markdown headings.",
-  ].join(" ");
-  const user = [
-    `Failure stage: ${input.stage}`,
-    `Technical detail: ${input.detail}`,
-    input.structuredJson ? `Structured JSON:\n${input.structuredJson}` : "",
-    input.intentJson ? `Intent:\n${input.intentJson}` : "",
-    input.sqlPreview ? `SQL preview:\n${input.sqlPreview.slice(0, 2000)}` : "",
-    "Conversation:\n" + input.transcript,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
   try {
-    const text = (await llmText(system, user, { ...opts, spanName: "analytics.diagnose" })).trim();
-    if (text && !/```sql|SELECT\s+\w+/i.test(text)) return text;
+    const text = await llmText(
+      [
+        "Explain in concise Chinese: why the ask cannot complete, and what the user should clarify next.",
+        "ABSOLUTELY FORBIDDEN: do not write SQL, do not invent table/column names.",
+      ].join("\n"),
+      [
+        `Stage: ${input.stage}`,
+        `Detail: ${input.detail}`,
+        `Transcript:\n${input.transcript.slice(0, 2500)}`,
+        input.structuredJson ? `Structured JSON:\n${input.structuredJson}` : "",
+        input.intentJson ? `Intent:\n${input.intentJson}` : "",
+        input.sqlPreview ? `SQL preview:\n${input.sqlPreview.slice(0, 800)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      { ...opts, spanName: "analytics.diagnose" },
+    );
+    const cleaned = text.trim();
+    if (cleaned) return cleaned.slice(0, 800);
   } catch {
     /* fall through */
   }
-  return `当前无法完成问数（${input.stage}）：${input.detail}。请补充更明确的时间、渠道、指标或筛选条件后再试。`;
+  return `\u95ee\u6570\u5728 ${input.stage} \u9636\u6bb5\u672a\u80fd\u5b8c\u6210\uff1a${input.detail}\u3002\u8bf7\u8865\u5145\u65f6\u95f4/\u7ef4\u5ea6/\u6307\u6807\u53e3\u5f84\u540e\u91cd\u8bd5\u3002`;
+}
+
+function businessClockDate(clock: Date, tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(clock);
 }
 
 /**
- * NL ?????? schema-agent?? Intent compile ? lint ? exec?
- * Trace agentId=analytics; ownerKey analytics:anonymous.
+ * NL \u2192 \u62a4\u680f+\u4e8b\u5b9e\u6ce8\u5165 \u2192\uff08\u9884\u63a2\u5e93\uff09\u5355\u6b21\u7ed3\u6784\u5316 / \u5fc5\u8981\u65f6 tool-loop \u2192 Intent compile \u2192 lint/exec\u3002
  */
 export async function analyticsAsk(
   nl: string,
@@ -316,10 +318,14 @@ export async function analyticsAsk(
     signal?: AbortSignal;
     images?: string[];
     files?: string[];
-    /** ??????????????? schema-agent? */
+    /** \u6f84\u6e05\u69fd\u4f4d\u77ed\u7b54\uff08\u524d\u7aef\u5408\u6210\uff09\uff0c\u5199\u5165\u5bf9\u8bdd\u4f9b schema \u62bd\u53d6 */
     slotAnswers?: Record<string, string[]>;
-    /** ?????????????? */
+    /** \u591a\u8f6e\u5bf9\u8bdd\uff08\u7528\u6237/\u52a9\u624b\uff09\uff0c\u4f18\u5148\u4e8e\u5355\u6761 NL */
     messages?: ConversationTurn[];
+    /** \u4f1a\u8bdd\u5f52\u5c5e / \u8ffd\u8e2a\uff1b\u4e0d\u6539\u5199\u95ee\u6570 NL */
+    ownerKey?: string;
+    userId?: string;
+    uiLocale?: string;
   },
 ): Promise<AnalyticsAskResult> {
   let runId: string | null = null;
@@ -377,23 +383,28 @@ export async function analyticsAsk(
       opts?.files,
       opts?.signal,
     );
-    if (!nl.trim() && attachmentReq > 0 && usableCount === 0) {
+    const guardedNl = guardAnalyticsInput(nl);
+    if (guardedNl.refused && attachmentReq === 0) {
+      return seal({ status: "clarify", message: guardedNl.refused });
+    }
+    if (!guardedNl.text && attachmentReq > 0 && usableCount === 0) {
       return seal({
         status: "clarify",
-        message: "附件已过期或无法识别，请重新上传，或直接输入问数内容。",
+        message: "\u9644\u4ef6\u5df2\u8fc7\u671f\u6216\u65e0\u6cd5\u8bc6\u522b\uff0c\u8bf7\u91cd\u65b0\u4e0a\u4f20\uff0c\u6216\u76f4\u63a5\u8f93\u5165\u95ee\u6570\u5185\u5bb9\u3002",
       });
     }
-    const questionForLlm = [nl.trim(), attachmentCtx].filter(Boolean).join("\n\n");
-    const nlForResolve = nl.trim() || (usableCount > 0 ? attachmentCtx : "");
+    const nlSafe = guardedNl.text;
+    const nlForResolve = nlSafe || (usableCount > 0 ? guardAnalyticsInput(attachmentCtx).text : "");
     if (!nlForResolve) {
-      return seal({ status: "clarify", message: "请输入问数内容，或附带可识别的文本/图片。" });
+      return seal({ status: "clarify", message: "\u8bf7\u8f93\u5165\u95ee\u6570\u5185\u5bb9\uff0c\u6216\u4e0a\u4f20\u53ef\u7528\u7684\u6587\u672c/\u56fe\u7247\u9644\u4ef6\u3002" });
     }
 
+    const ownerKey = opts?.ownerKey || "analytics:anonymous";
     runId = trace.beginRun({
       userText: nlForResolve.slice(0, 2000),
       model: opts?.modelId,
       agentId: "analytics",
-      ownerKey: "analytics:anonymous",
+      ownerKey,
     });
     const llmOptsBase: LlmOpts = { modelId: opts?.modelId, signal: opts?.signal, traceRunId: runId };
 
@@ -401,146 +412,247 @@ export async function analyticsAsk(
     packVersion = pack.version;
     const clock = opts?.clock || new Date();
     const tz = pack.time.businessTimezone || config.metabase.businessTimezone;
-    const clockIso = clock.toISOString().slice(0, 10);
+    const clockIso = businessClockDate(clock, tz);
 
     let conversation: ConversationTurn[] = (opts?.messages || [])
       .map((m) => ({
         role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
-        text: String(m.text || "").trim(),
+        text: guardAnalyticsInput(String(m.text || "")).text,
       }))
       .filter((m) => m.text);
     if (!conversation.length && nlForResolve) {
       conversation = [{ role: "user", text: nlForResolve }];
     }
     const last = conversation[conversation.length - 1];
-    if (nl.trim() && (!last || last.role !== "user" || last.text !== nl.trim())) {
-      conversation = [...conversation, { role: "user", text: nl.trim() }];
+    if (nlSafe && (!last || last.role !== "user" || last.text !== nlSafe)) {
+      conversation = [...conversation, { role: "user", text: nlSafe }];
     }
     if (opts?.slotAnswers && Object.keys(opts.slotAnswers).length) {
       const parts = Object.entries(opts.slotAnswers).map(([k, vs]) => `${k}=${vs.join(",")}`);
-      conversation = [...conversation, { role: "user", text: `澄清选择：${parts.join("；")}` }];
+      conversation = [...conversation, { role: "user", text: `\u6f84\u6e05\u9009\u62e9\uff1a${parts.join("\uff1b")}` }];
     }
 
-    const userTurns = conversation.filter((m) => m.role === "user").length;
-    if (userTurns <= 1) {
-      const early = resolveTimeRange(nlForResolve, clock, tz);
-      if (!early.ok) {
-        return seal({ status: "clarify", message: early.clarify, clarifySlot: "time_range" });
-      }
+    const userTextJoined = conversation
+      .filter((m) => m.role === "user")
+      .map((m) => m.text)
+      .join("\n");
+    const timeResolved = resolveTimeRange(userTextJoined, clock, tz);
+    // \u4ec5\u300c\u6700\u8fd1\u300d\u65e0\u5177\u4f53\u5929\u6570\u65f6\u53cd\u95ee\u65f6\u95f4
+    if (
+      !timeResolved.ok &&
+      /\u6700\u8fd1/.test(userTextJoined) &&
+      !hasTimeSignal(userTextJoined.replace(/\u6700\u8fd1/g, ""))
+    ) {
+      return seal({
+        status: "clarify",
+        message: timeResolved.clarify,
+        clarifySlot: "time_range",
+      });
     }
 
+    const askContext: AskRuntimeContext = {
+      clockIsoDate: clockIso,
+      timezone: tz,
+      ownerKey,
+      userId: opts?.userId,
+      uiLocale: opts?.uiLocale || "zh-CN",
+      timeResolveNote: timeResolved.ok
+        ? `resolved_by_code ${timeResolved.range.start}..${timeResolved.range.end}`
+        : `unresolved: ${timeResolved.clarify}`,
+      timeResolved: timeResolved.ok ? timeResolved.range : undefined,
+    };
+
+    let structureMeta: {
+      mode: "single_forward" | "tool_loop";
+      formatConstraint: "json_object" | "prompt_parse";
+    } | null = null;
     let structured: StructuredAskResult | null = null;
+    let preProbeSummary = "";
+
     if (conversation.length) {
-      try {
-        structured = await runSchemaAgent({
-          pack,
-          messages: conversation,
-          clockIsoDate: clockIso,
-          modelId: opts?.modelId,
-          signal: opts?.signal,
-          traceRunId: runId || undefined,
-        });
-      } catch (e) {
-        if (opts?.signal?.aborted || isAbortError(e)) throw e;
+      if (timeResolved.ok) {
         try {
-          const rawStruct = await llmText(
-            buildStructureSystemPrompt(pack, clockIso),
-            buildStructureUserPrompt(conversation),
-            { ...llmOptsBase, spanName: "analytics.structure.fallback" },
-          );
-          structured = parseStructureResponse(
-            rawStruct,
-            formatConversationTranscript(conversation),
-          );
-        } catch (e2) {
-          if (opts?.signal?.aborted || isAbortError(e2)) throw e2;
+          preProbeSummary = await probeDimensions(pack, timeResolved.range, opts?.signal);
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        }
+        try {
+          const once = await runStructureOnce({
+            pack,
+            messages: conversation,
+            clockIsoDate: clockIso,
+            askContext,
+            probeSummary: preProbeSummary,
+            modelId: opts?.modelId,
+            signal: opts?.signal,
+            traceRunId: runId || undefined,
+          });
+          structured = once.result;
+          structureMeta = { mode: once.meta.mode, formatConstraint: once.meta.formatConstraint };
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+          structured = null;
+        }
+      }
+
+      const needsFuzzyDims =
+        impliesLangSetWithoutMembers(formatConversationTranscript(conversation)) ||
+        /\u7535\u5f71|\u7535\u89c6\u5267|\u77ed\u5267|\u52a8\u6f2b|\u771f\u4eba\u79c0|\u80a5\u7682\u5267/.test(userTextJoined);
+      const needsToolLoop = !structured || (!timeResolved.ok && needsFuzzyDims);
+
+      if (needsToolLoop) {
+        try {
+          structured = await runSchemaAgent({
+            pack,
+            messages: conversation,
+            clockIsoDate: clockIso,
+            askContext,
+            modelId: opts?.modelId,
+            signal: opts?.signal,
+            traceRunId: runId || undefined,
+          });
+          structureMeta = { mode: "tool_loop", formatConstraint: "prompt_parse" };
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+          try {
+            const rawStruct = await llmText(
+              buildStructureSystemPrompt(pack, clockIso, {
+                factsBlock: askContext.timeResolveNote,
+              }),
+              buildStructureUserPrompt(conversation, { probeSummary: preProbeSummary }),
+              { ...llmOptsBase, spanName: "analytics.structure.fallback" },
+            );
+            structured = parseStructureResponse(
+              rawStruct,
+              formatConversationTranscript(conversation),
+            );
+            structureMeta = { mode: "single_forward", formatConstraint: "prompt_parse" };
+          } catch (e2) {
+            if (opts?.signal?.aborted || isAbortError(e2)) throw e2;
+            structured = null;
+          }
+        }
+      } else if (!structured && !timeResolved.ok) {
+        try {
+          const once = await runStructureOnce({
+            pack,
+            messages: conversation,
+            clockIsoDate: clockIso,
+            askContext,
+            modelId: opts?.modelId,
+            signal: opts?.signal,
+            traceRunId: runId || undefined,
+          });
+          structured = once.result;
+          structureMeta = { mode: once.meta.mode, formatConstraint: once.meta.formatConstraint };
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
           structured = null;
         }
       }
     }
 
+    if (structured && timeResolved.ok) {
+      structured = applyResolvedTime(structured, timeResolved);
+    }
+
     const transcript = formatConversationTranscript(conversation);
+    const metaFields = {
+      formatConstraint: structureMeta?.formatConstraint,
+      structureMode: structureMeta?.mode,
+    };
 
     if (structured?.status === "clarify") {
       let rangeEcho: string | undefined;
-      let probeSummaryForClarify = "";
-      let options: Array<{ id: string; label: string }> | undefined;
+      let probeSummaryForClarify = preProbeSummary;
+      let options: ClarifyOption[] | undefined;
       if (structured.time?.start && structured.time?.end) {
-        rangeEcho = `按 ${structured.time.start}～${structured.time.end}`;
+        rangeEcho = `\u6309 ${structured.time.start}\uff5e${structured.time.end}`;
       }
-      const needProbe =
-        structured.clarifySlot === "contentLang" ||
-        structured.clarifySlot === "movieType" ||
-        pack.probeDimensions.includes(structured.clarifySlot);
-      // contentLang ???? schema ?????????????
+      if (structured.clarifySlot === "result_layout") {
+        options = layoutClarifyOptions();
+      }
+      const needProbe = Boolean(
+        structured.clarifySlot &&
+          (structured.clarifySlot === "contentLang" ||
+            structured.clarifySlot === "movieType" ||
+            pack.probeDimensions.includes(structured.clarifySlot)),
+      );
+      // contentLang / movieType \u7b49\u53ef\u63a2\u7ef4\uff1a\u5148 probe \u518d\u9644\u5e26\u5e8f\u53f7\u5019\u9009
       let probeRange = structured.time;
-      if (needProbe && !(probeRange?.start && probeRange?.end)) {
-        const resolved = resolveTimeRange(nlForResolve, clock, tz);
-        if (resolved.ok) probeRange = { start: resolved.range.start, end: resolved.range.end };
+      if (needProbe && !(probeRange?.start && probeRange?.end) && timeResolved.ok) {
+        probeRange = { start: timeResolved.range.start, end: timeResolved.range.end };
       }
-      if (needProbe && probeRange?.start && probeRange?.end) {
+      if (needProbe && probeRange?.start && probeRange?.end && !probeSummaryForClarify) {
         try {
           probeSummaryForClarify = await probeDimensions(
             pack,
             { start: probeRange.start, end: probeRange.end },
             opts?.signal,
           );
-          options = parseProbeValuesForDim(probeSummaryForClarify, structured.clarifySlot);
-          if (!rangeEcho) rangeEcho = `按 ${probeRange.start}～${probeRange.end}`;
+          if (!rangeEcho) rangeEcho = `\u6309 ${probeRange.start}\uff5e${probeRange.end}`;
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
         }
       }
-      const optionHint =
-        options && options.length
-          ? `\n候选示例：${options
-              .slice(0, 12)
-              .map((o) => o.label)
-              .join("、")}`
-          : "";
+      if (needProbe && probeSummaryForClarify) {
+        options = parseProbeValuesForDim(probeSummaryForClarify, structured.clarifySlot);
+      }
+      if (
+        structured.clarifySlot === "metric" &&
+        !(options && options.length) &&
+        pack.metricDefs?.length
+      ) {
+        options = metricClarifyOptionsFromPack(pack);
+      }
+      const clarified = attachClarifyOptions(structured.clarify, options, {
+        multiSelect: structured.clarifySlot !== "result_layout" && structured.clarifySlot !== "metric",
+        slot: structured.clarifySlot,
+      });
       return seal({
         status: "clarify",
-        message: `${structured.clarify}${optionHint}`,
+        message: clarified.message,
         timeEcho: rangeEcho,
         clarifySlot: structured.clarifySlot,
-        clarifyOptions: options,
+        clarifyOptions: clarified.clarifyOptions,
         probeSummary: probeSummaryForClarify || undefined,
         packVersion: pack.version,
         structuredFromConversation: true,
+        ...metaFields,
       });
     }
 
     if (!(structured?.status === "ok" && structured.metricId && structured.time)) {
-      // schema-agent ??????N???????????????? LLM ?? SQL
+      // schema \u672a\u843d\u5730\u4e14\u542b\u300cN\u79cd\u5c0f\u8bed\u79cd\u300d\uff1a\u5f3a\u5236 contentLang \u53cd\u95ee\uff08\u7981\u6b62 LLM \u731c\u7801\uff09
       if (impliesLangSetWithoutMembers(transcript)) {
-        let options: Array<{ id: string; label: string }> | undefined;
-        let probeSummaryForClarify = "";
+        let options: ClarifyOption[] | undefined;
+        let probeSummaryForClarify = preProbeSummary;
         let rangeEcho: string | undefined;
-        const resolved = resolveTimeRange(nlForResolve, clock, tz);
-        if (resolved.ok) {
-          rangeEcho = resolved.range.echo;
-          try {
-            probeSummaryForClarify = await probeDimensions(pack, resolved.range, opts?.signal);
-            options = parseProbeValuesForDim(probeSummaryForClarify, "contentLang");
-          } catch (e) {
-            if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        if (timeResolved.ok) {
+          rangeEcho = timeResolved.range.echo;
+          if (!probeSummaryForClarify) {
+            try {
+              probeSummaryForClarify = await probeDimensions(pack, timeResolved.range, opts?.signal);
+            } catch (e) {
+              if (opts?.signal?.aborted || isAbortError(e)) throw e;
+            }
           }
+          options = parseProbeValuesForDim(probeSummaryForClarify, "contentLang");
         }
-        const optionHint =
-          options && options.length
-            ? `\n候选示例：${options
-                .slice(0, 12)
-                .map((o) => o.label)
-                .join("?")}`
-            : "";
+        const clarified = attachClarifyOptions(
+          "\u8bf7\u786e\u8ba4\u8981\u7edf\u8ba1\u7684\u5177\u4f53\u5185\u5bb9\u8bed\u8a00\uff08\u53ef\u591a\u9009\uff09\u3002\u53ef\u56de\u590d\u5e8f\u53f7\u6216\u8bed\u8a00\u7801\u3002",
+          options,
+          { multiSelect: true, slot: "contentLang" },
+        );
         return seal({
           status: "clarify",
-          message: `请确认要统计的具体内容语言列表（可多选）。请直接列出语言码（如 te-IN、ta-IN）。${optionHint}`,
+          message: clarified.message,
           timeEcho: rangeEcho,
           clarifySlot: "contentLang",
-          clarifyOptions: options,
+          clarifyOptions: clarified.clarifyOptions,
           probeSummary: probeSummaryForClarify || undefined,
           packVersion: pack.version,
+          ...metaFields,
         });
       }
 
@@ -548,7 +660,7 @@ export async function analyticsAsk(
         {
           transcript,
           stage: "structure",
-          detail: "未能从对话得到完整结构化 schema（时间/指标/过滤）",
+          detail: "\u672a\u80fd\u4ece\u5bf9\u8bdd\u5f97\u5230\u5b8c\u6574\u7ed3\u6784\u5316 schema\uff08\u65f6\u95f4/\u6307\u6807/\u8fc7\u6ee4\uff09",
           structuredJson: structured ? JSON.stringify(structured) : undefined,
         },
         llmOptsBase,
@@ -557,15 +669,16 @@ export async function analyticsAsk(
         status: "clarify",
         message: msg,
         packVersion: pack.version,
+        ...metaFields,
       });
     }
 
     const range = {
       start: structured.time.start,
       end: structured.time.end,
-      echo: `按 ${structured.time.start}～${structured.time.end}`,
+      echo: `\u6309 ${structured.time.start}\uff5e${structured.time.end}`,
     };
-    const nlForGuards = structured.mergedNl || nl.trim() || nlForResolve;
+    const nlForGuards = structured.mergedNl || nlSafe || nlForResolve;
     const allowedTables = pack.tables.map((t) => t.name);
     const dimColumns = pack.probeDimensions;
 
@@ -583,11 +696,42 @@ export async function analyticsAsk(
     });
 
     if (!intentBuilt.ok) {
+      const detail = intentBuilt.reason;
+      if (isCoverageOrSafetyIssue(detail) || /not compilable/i.test(detail)) {
+        return seal({
+          status: "refuse",
+          message: coverageRefuseMessage("intent", detail),
+          timeEcho: range.echo,
+          error: detail,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          semanticOk: false,
+          semanticIssues: [detail],
+          ...metaFields,
+        });
+      }
+      if (/result_layout/i.test(detail)) {
+        const clarified = attachClarifyOptions(
+          "\u8bf7\u9009\u62e9\u5bbd\u8868\u6216\u957f\u8868\uff08wide/long\uff09\u3002",
+          layoutClarifyOptions(),
+          { multiSelect: false, slot: "result_layout" },
+        );
+        return seal({
+          status: "clarify",
+          message: clarified.message,
+          clarifySlot: "result_layout",
+          clarifyOptions: clarified.clarifyOptions,
+          timeEcho: range.echo,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          ...metaFields,
+        });
+      }
       const msg = await diagnoseFailure(
         {
           transcript,
           stage: "intent",
-          detail: intentBuilt.reason,
+          detail,
           structuredJson: JSON.stringify(structured),
         },
         llmOptsBase,
@@ -598,27 +742,23 @@ export async function analyticsAsk(
         timeEcho: range.echo,
         packVersion: pack.version,
         structuredFromConversation: true,
+        ...metaFields,
       });
     }
 
     const compiled = compileAnalyticsIntent(intentBuilt.intent, pack);
     if (!compiled.ok) {
-      const msg = await diagnoseFailure(
-        {
-          transcript,
-          stage: "compile",
-          detail: compiled.reason,
-          structuredJson: JSON.stringify(structured),
-          intentJson: intentToJson(intentBuilt.intent),
-        },
-        llmOptsBase,
-      );
+      const detail = compiled.reason;
       return seal({
-        status: "clarify",
-        message: msg,
+        status: "refuse",
+        message: coverageRefuseMessage("compile", detail),
         timeEcho: range.echo,
+        error: detail,
         packVersion: pack.version,
         structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: [detail],
+        ...metaFields,
       });
     }
 
@@ -626,11 +766,26 @@ export async function analyticsAsk(
     const issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
     guardIssues = issues;
     if (issues.length) {
+      const detail = issues.join("; ");
+      if (isCoverageOrSafetyIssue(detail)) {
+        return seal({
+          status: "refuse",
+          message: coverageRefuseMessage("lint", detail),
+          timeEcho: range.echo,
+          sqls,
+          error: detail,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          semanticOk: false,
+          semanticIssues: issues,
+          ...metaFields,
+        });
+      }
       const msg = await diagnoseFailure(
         {
           transcript,
           stage: "lint",
-          detail: issues.join("; "),
+          detail,
           intentJson: intentToJson(intentBuilt.intent),
           sqlPreview: sqls[0],
         },
@@ -641,9 +796,12 @@ export async function analyticsAsk(
         message: msg,
         timeEcho: range.echo,
         sqls,
-        error: issues.join(", "),
+        error: detail,
         packVersion: pack.version,
         structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: issues,
+        ...metaFields,
       });
     }
 
@@ -659,7 +817,7 @@ export async function analyticsAsk(
       results = await mapPool(
         execSqls,
         pack.guards.parallelism,
-        (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal }),
+        (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal, timeoutMs: pack.guards.queryTimeoutMs }),
         opts?.signal,
       );
       compileHandle.end({
@@ -696,11 +854,14 @@ export async function analyticsAsk(
         sqlSource: "intent_compile",
         packVersion: pack.version,
         structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: [detail],
+        ...metaFields,
       });
     }
 
     const tables = results.map((r, i) => ({
-      title: sqls.length > 1 ? `查询 ${i + 1}` : "结果",
+      title: sqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
       cols: r.cols,
       rows: r.rows,
       grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
@@ -732,11 +893,14 @@ export async function analyticsAsk(
         error: dimCheck.detail,
         packVersion: pack.version,
         structuredFromConversation: true,
+        semanticOk: false,
+        semanticIssues: [dimCheck.detail],
+        ...metaFields,
       });
     }
 
     const emptyNote = allEmpty(results)
-      ? `（${range.echo} 无数据行；请确认年份或筛选条件）`
+      ? `\uff08${range.echo} \u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff0c\u8bf7\u6838\u5bf9\u7b5b\u9009\u6761\u4ef6\uff09`
       : "";
     const charts = allEmpty(results) ? [] : buildLocalChartsFromTables(tables);
     return seal({
@@ -746,14 +910,16 @@ export async function analyticsAsk(
       sqls,
       tables,
       charts: charts.length ? charts : undefined,
-      verifySkipped: "intent_compile",
       sqlSource: "intent_compile",
       packVersion: pack.version,
       structuredFromConversation: true,
+      semanticOk: true,
+      semanticIssues: [],
+      ...metaFields,
     });
   } catch (e) {
     if (opts?.signal?.aborted || isAbortError(e)) {
-      return seal({ status: "error", message: "已取消", error: "aborted" });
+      return seal({ status: "error", message: "\u5df2\u53d6\u6d88", error: "aborted" });
     }
     return seal({
       status: "error",

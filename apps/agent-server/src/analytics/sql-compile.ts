@@ -26,18 +26,52 @@ function dimSelectExpr(dim: OutputDimId): { select: string; group: string; alias
   return { select: dim, group: dim, alias: dim };
 }
 
-function buildWhere(intent: AnalyticsIntent): string {
+/** Probe/clarify may use "(empty)" for blank dimension values → SQL empty string. */
+function normalizeFilterToken(v: string): string {
+  const t = String(v).trim();
+  if (
+    !t ||
+    t === "(empty)" ||
+    t === "\u7a7a" ||
+    t.startsWith("\u7a7a\uff08") ||
+    t === "\u82f1\u8bed" ||
+    t.startsWith("\u82f1\u8bed\uff08") ||
+    /^english$/i.test(t) ||
+    /^en(-US)?$/i.test(t)
+  ) {
+    return "";
+  }
+  return t;
+}
+
+function buildWhere(intent: AnalyticsIntent, forcedFilters?: Record<string, string[]>): string {
   const parts: string[] = [
     `toDate(lastWatchTime) BETWEEN ${sqlStringLiteral(intent.time.start)} AND ${sqlStringLiteral(intent.time.end)}`,
   ];
-  for (const [field, values] of Object.entries(intent.filters)) {
+  const merged: Record<string, string[]> = { ...intent.filters };
+  if (forcedFilters) {
+    for (const [field, values] of Object.entries(forcedFilters)) {
+      if (!values?.length) continue;
+      const prev = merged[field] || [];
+      // 强制维：与用户过滤求交；用户未指定则全用强制集
+      if (!prev.length) merged[field] = [...values];
+      else {
+        const allow = new Set(values.map(String));
+        const kept = prev.filter((v) => allow.has(String(v)));
+        merged[field] = kept.length ? kept : [...values];
+      }
+    }
+  }
+  for (const [field, values] of Object.entries(merged)) {
     if (!values?.length) continue;
-    const numeric = field === "movieType" || values.every((v) => /^-?\d+(\.\d+)?$/.test(v));
+    const normalized = values.map(normalizeFilterToken);
+    const numeric =
+      field === "movieType" || normalized.every((v) => v !== "" && /^-?\d+(\.\d+)?$/.test(v));
     const lit = (v: string) => (numeric ? v : sqlStringLiteral(v));
-    if (values.length === 1) {
-      parts.push(`${field} = ${lit(values[0]!)}`);
+    if (normalized.length === 1) {
+      parts.push(`${field} = ${lit(normalized[0]!)}`);
     } else {
-      parts.push(`${field} IN (${values.map(lit).join(", ")})`);
+      parts.push(`${field} IN (${normalized.map(lit).join(", ")})`);
     }
   }
   return parts.join("\n  AND ");
@@ -47,15 +81,15 @@ function safeAlias(code: string): string {
   return String(code).replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "") || "v";
 }
 
-function compileAvgOfMax(intent: AnalyticsIntent): CompileResult {
+function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const valueField = intent.metric.valueField || "maxWatchProgress";
   const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
   const dims = intent.outputDims.length ? intent.outputDims : ["watch_date"];
   const dimMeta = dims.map(dimSelectExpr);
-  const where = buildWhere(intent);
+  const where = buildWhere(intent, pack?.guards.forcedFilters);
 
   const pivot = intent.pivotDim;
-  const pivotValues = pivot ? intent.filters[pivot] || [] : [];
+  const pivotValues = pivot ? (intent.filters[pivot] || []).map(normalizeFilterToken) : [];
   const useWide = intent.layout === "wide" && pivot && pivotValues.length > 1;
 
   if (useWide) {
@@ -69,7 +103,7 @@ function compileAvgOfMax(intent: AnalyticsIntent): CompileResult {
     const outerMetrics = pivotValues
       .map((v) => {
         const lit = sqlStringLiteral(v);
-        const alias = safeAlias(v);
+        const alias = safeAlias(v === "" ? "en" : v);
         return `round(sumIf(a, ${pivot} = ${lit}) / nullIf(countIf(${pivot} = ${lit}), 0), 0) AS ${alias}`;
       })
       .join(",\n  ");
@@ -120,10 +154,10 @@ function compileAvgOfMax(intent: AnalyticsIntent): CompileResult {
   return { ok: true, sql };
 }
 
-function compileUniqOrSum(intent: AnalyticsIntent): CompileResult {
+function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const dims = intent.outputDims.length ? intent.outputDims : [];
   const dimMeta = dims.map(dimSelectExpr);
-  const where = buildWhere(intent);
+  const where = buildWhere(intent, pack?.guards.forcedFilters);
   let metricExpr: string;
   if (intent.metric.kind === "uniq") {
     const f = intent.metric.distinctField || "guid";
@@ -158,16 +192,16 @@ function compileUniqOrSum(intent: AnalyticsIntent): CompileResult {
 
 export function compileAnalyticsIntent(
   intent: AnalyticsIntent,
-  _pack?: AnalyticsPack,
+  pack?: AnalyticsPack,
 ): CompileResult {
   switch (intent.metric.kind) {
     case "avg_of_max":
-      return compileAvgOfMax(intent);
+      return compileAvgOfMax(intent, pack);
     case "uniq":
     case "sum":
     case "avg_per_user":
-      return compileUniqOrSum(intent);
+      return compileUniqOrSum(intent, pack);
     default:
-      return { ok: false, reason: `unknown metric kind` };
+      return { ok: false, reason: `unsupported_metric_kind:${String((intent.metric as { kind?: string }).kind || "")}` };
   }
 }

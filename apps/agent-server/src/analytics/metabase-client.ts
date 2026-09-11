@@ -4,7 +4,38 @@ import type { DatasetResult } from "./types.js";
 let cachedSession: { id: string; at: number } | null = null;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
-export type MetabaseRunOpts = { signal?: AbortSignal };
+export type MetabaseRunOpts = { signal?: AbortSignal; timeoutMs?: number };
+
+function mergeTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number | undefined): {
+  signal?: AbortSignal;
+  cleanup: () => void;
+  didTimeout: () => boolean;
+} {
+  const ms = timeoutMs && Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : 0;
+  if (!ms) return { signal, cleanup: () => {}, didTimeout: () => false };
+
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, ms);
+
+  const onParentAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onParentAbort, { once: true });
+  }
+
+  return {
+    signal: ctrl.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onParentAbort);
+    },
+    didTimeout: () => timedOut,
+  };
+}
 
 /** Strip trailing slash so path join `${url}/api/...` is safe. */
 export function normalizeMetabaseUrl(url: string): string {
@@ -76,7 +107,10 @@ export async function runNativeDataset(
   databaseId = config.metabase.databaseId,
   opts?: MetabaseRunOpts,
 ): Promise<DatasetResult> {
-  const signal = opts?.signal;
+  const timeoutMs =
+    opts?.timeoutMs ??
+    Number(process.env.ANALYTICS_QUERY_TIMEOUT_MS || process.env.METABASE_TIMEOUT_MS || 120000);
+  const { signal, cleanup, didTimeout } = mergeTimeoutSignal(opts?.signal, timeoutMs);
   const t0 = Date.now();
   try {
     signal?.throwIfAborted();
@@ -99,7 +133,17 @@ export async function runNativeDataset(
     const cols = (data?.data?.cols ?? []).map((c) => c.name || c.display_name || "");
     return { ok: true, cols, rows: data?.data?.rows ?? [], ms };
   } catch (e) {
-    rethrowIfAborted(e, signal);
+    if (opts?.signal?.aborted) rethrowIfAborted(e, opts.signal);
+    if (isAbortError(e) && didTimeout()) {
+      return {
+        ok: false,
+        cols: [],
+        rows: [],
+        error: `query_timeout:${timeoutMs}ms`,
+        ms: Date.now() - t0,
+      };
+    }
+    if (isAbortError(e)) rethrowIfAborted(e, signal);
     return {
       ok: false,
       cols: [],
@@ -107,6 +151,8 @@ export async function runNativeDataset(
       error: e instanceof Error ? e.message : String(e),
       ms: Date.now() - t0,
     };
+  } finally {
+    cleanup();
   }
 }
 

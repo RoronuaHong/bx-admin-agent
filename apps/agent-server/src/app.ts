@@ -659,6 +659,7 @@ export function createApp() {
           .filter((m) => m.text)
           .slice(-40)
       : undefined;
+    const ownerCtx = resolveAnalyticsOwner(c);
     const result = await analyticsAsk(text, {
       modelId,
       signal: c.req.raw.signal,
@@ -666,6 +667,9 @@ export function createApp() {
       files,
       slotAnswers: slotAnswers && Object.keys(slotAnswers).length ? slotAnswers : undefined,
       messages,
+      ownerKey: ownerCtx.ownerKey,
+      userId: ownerCtx.loginName || undefined,
+      uiLocale: "zh-CN",
     });
     return c.json(result);
   });

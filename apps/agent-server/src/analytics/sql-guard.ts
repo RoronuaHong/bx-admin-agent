@@ -1,4 +1,7 @@
 import type { DistinctCountFn } from "./types.js";
+import { analyzeSqlAst, assertSqlAstSafe } from "./sql-ast.js";
+
+export { analyzeSqlAst, assertSqlAstSafe } from "./sql-ast.js";
 
 /** Rewrite distinct-count calls to match the configured global default (§7.2). */
 export function normalizeDistinctCount(sql: string, fn: DistinctCountFn): string {
@@ -10,13 +13,12 @@ export function normalizeDistinctCount(sql: string, fn: DistinctCountFn): string
     .replace(/\buniqExactExact\s*\(/gi, "uniqExact(");
 }
 
-/** Deterministic SQL lint checks aligned with spec §7.1. */
+/** Deterministic SQL lint checks aligned with spec §7.1（业务规则；结构项交给 AST）。 */
 export function lintSql(sql: string, nl: string): string[] {
   const issues: string[] = [];
-  if (/;/.test(sql.trim().replace(/;+\s*$/, ""))) issues.push("multi_statement");
-  if (/\b(insert|update|delete|drop|alter|truncate|create)\b/i.test(sql)) {
-    issues.push("non_readonly");
-  }
+  const ast = analyzeSqlAst(sql);
+  issues.push(...ast.issues.filter((x) => x === "multi_statement" || x === "non_readonly" || x === "into_outfile" || x === "not_select"));
+
   if (/lastWatchTime\s*=\s*'?\d{4}-\d{2}-\d{2}'?/i.test(sql)) {
     issues.push("datetime_eq_date_string");
   }
@@ -27,53 +29,27 @@ export function lintSql(sql: string, nl: string): string[] {
   if (/limit\s+1\b/i.test(sql) && !/只要第|第一名|top\s*1/i.test(nl)) {
     issues.push("avoid_limit_1_unless_asked");
   }
-  return issues;
+  return [...new Set(issues)];
 }
 
-function readonlyIssues(sql: string): string[] {
-  const issues: string[] = [];
-  if (/;/.test(sql.trim().replace(/;+\s*$/, ""))) issues.push("multi_statement");
-  if (/\b(insert|update|delete|drop|alter|truncate|create)\b/i.test(sql)) {
-    issues.push("non_readonly");
-  }
-  return issues;
-}
-
-/** Fail-closed guard: single read-only SELECT / WITH … SELECT only (§7). */
+/** Fail-closed guard: single read-only SELECT / WITH … SELECT；走 AST。 */
 export function assertReadonlySingleSelect(sql: string): void {
-  const issues = readonlyIssues(sql);
-  if (issues.length > 0) {
-    throw new Error(`SQL guard: ${issues.join(", ")}`);
-  }
-  if (!/^\s*(with\b|select\b)/i.test(sql.trim())) {
-    throw new Error("SQL guard: not_select");
-  }
+  assertSqlAstSafe(sql);
 }
 
 /**
- * Extract bare table names from FROM / JOIN clauses (simple regex).
- * Does not resolve subquery aliases; only identifier tokens after FROM|JOIN.
+ * Extract bare table names from FROM / JOIN clauses (AST strip + scan).
  */
 export function extractFromTables(sql: string): string[] {
-  const tables: string[] = [];
-  const seen = new Set<string>();
-  const re = /\b(?:from|join)\s+([a-zA-Z_][\w]*)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(sql)) !== null) {
-    const name = m[1];
-    if (seen.has(name)) continue;
-    seen.add(name);
-    tables.push(name);
-  }
-  return tables;
+  return analyzeSqlAst(sql).tables;
 }
 
 /** Ensure every extracted FROM table is in the allowed whitelist. */
 export function assertTablesWhitelisted(sql: string, allowedTables: string[]): void {
-  const allowed = new Set(allowedTables);
-  for (const table of extractFromTables(sql)) {
-    if (!allowed.has(table)) {
-      throw new Error(`table not in whitelist: ${table}`);
-    }
-  }
+  assertSqlAstSafe(sql, { allowedTables });
+}
+
+/** 问数编译结果：必须有 WHERE + 表白名单。 */
+export function assertAnalyticsSqlSafe(sql: string, allowedTables: string[]): void {
+  assertSqlAstSafe(sql, { requireWhere: true, allowedTables });
 }
