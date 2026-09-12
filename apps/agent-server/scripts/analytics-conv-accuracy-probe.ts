@@ -257,6 +257,21 @@ for (const d of dialogs) {
         issues.push("movie ok without movieType=1");
       }
     }
+    if (d.id === "D5-lang-then-channel-revise" && i === 1 && r.status === "ok") {
+      const sql = (r.sqls || []).join("\n");
+      if (!/GROUP BY[\s\S]*channel/i.test(sql) && !/,\s*channel/i.test(sql)) {
+        issues.push("multi-channel revise should group/select by channel");
+      }
+      if (!/FoxA/i.test(sql) || !/IndiaA/i.test(sql)) {
+        issues.push("multi-channel revise sql missing IndiaA/FoxA");
+      }
+    }
+    if (d.id === "D8-short-followup-no-lang" && i === 1) {
+      if (r.turnKind && r.turnKind !== "revise" && r.turnKind !== "new_ask") {
+        issues.push(`unexpected turnKind ${r.turnKind}`);
+      }
+      // Prefer revise; soft warn only logged in issues if sql wrong (already sqlMust)
+    }
 
     if (issues.length) dialogOk = false;
     const row = {

@@ -341,7 +341,10 @@ async function main() {
     console.log(`  baseline EX=${pct(baselineEx)} regressionMaxPp=${thresholds.exRegressionMaxPp}`);
   }
 
-  if (process.env.ANALYTICS_EVAL_WRITE_BASELINE === "1" && gate.ex != null && gate.pass) {
+  // Write baseline whenever EX is computable (not gated on full gate.pass): the baseline
+  // captures the CURRENT measured state so future runs can detect EX regressions, even when
+  // other gates (refuse recall / cwr) still have known agent gaps.
+  if (process.env.ANALYTICS_EVAL_WRITE_BASELINE === "1" && gate.ex != null) {
     writeFileSync(
       BASELINE_PATH,
       JSON.stringify(

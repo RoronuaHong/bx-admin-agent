@@ -52,8 +52,10 @@ export interface AnalyticsAskResult {
   semanticIssues?: string[];
   /** AskState working memory for follow-up revise */
   askState?: import("./ask-state.js").AskState;
-  /** Turn intent notes (debug / UI) */
+  /** Turn intent kind (debug / UI) */
   turnKind?: string;
+  /** How TurnIntent was resolved: fallback | llm | llm_invalid | llm_error */
+  turnIntentSource?: string;
   /** Human-readable ask summary bar */
   askSummary?: string;
   /** Soft defaults applied this turn */

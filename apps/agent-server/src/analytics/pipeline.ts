@@ -4,7 +4,7 @@
  * Intent/compile/lint/exec \u4e0d\u8d70 LLM \u5199 SQL\uff1b\u4e0d\u6539\u5199\u7528\u6237\u95ee\u53e5\uff1b\u65f6\u95f4\u7531\u4ee3\u7801\u89e3\u6790\u5e76\u8986\u76d6\u6a21\u578b time\u3002
  */
 
-import { config, listModels } from "../config.js";
+import { config } from "../config.js";
 import * as trace from "../trace.js";
 import { getUpload, MAX_AT_ONCE } from "../uploads.js";
 import { transcribeImage } from "../vision.js";
@@ -46,6 +46,7 @@ import { loadFieldLexicon, resolvePackFilters, groundRemappedFieldFromNl } from 
 import { lexiconClarifyOptions } from "./dim-lexicon.js";
 import { evaluateCapabilityGate } from "./capability-gate.js";
 import { inferMetricIdFromNl, inferOutputDimsFromNl } from "./metric-infer.js";
+import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import {
   compileAskPlanSteps,
   gateAskPlan,
@@ -66,12 +67,12 @@ import {
   askStateIsComplete,
   askStateToStructured,
   buildAskStateFromStructure,
-  inferTurnIntent,
   mergeAskState,
   parseAskState,
   type AskState,
   type TurnIntent,
 } from "./ask-state.js";
+import { resolveTurnIntent } from "./turn-intent-llm.js";
 import { groundChannelFilters } from "./grounding-gate.js";
 import { applyDeliveryReconcile, type DeliveryMode } from "./delivery.js";
 
@@ -122,18 +123,7 @@ async function collectAttachmentContext(
 }
 
 async function llmText(system: string, user: string, opts?: LlmOpts): Promise<string> {
-  const models = listModels();
-  const eol = /nvstepflash|step-3\.7-flash|stepflash/i;
-  const envDefault = (process.env.ANALYTICS_DEFAULT_MODEL || "").trim();
-  const preferred =
-    (opts?.modelId ? models.find((m) => m.id === opts.modelId) : undefined) ||
-    (envDefault ? models.find((m) => m.id === envDefault) : undefined) ||
-    models.find((m) => /glm5turbo/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => /dsflash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => /flash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => !eol.test(m.id) && !eol.test(m.name)) ||
-    models[0];
-  const model = preferred;
+  const model = pickAnalyticsModel(opts?.modelId);
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
   const handle = opts?.traceRunId
@@ -372,9 +362,12 @@ export async function analyticsAsk(
     slotAnswers?: Record<string, string[]>;
     /** ???????/????????? NL */
     messages?: ConversationTurn[];
-    /** ??? AskState??? revise? */
+    /** ??? AskState???? revise */
     prevAskState?: AskState | Record<string, unknown>;
-    /** ???? / ???????? NL */
+    /** ???? clarify ???????????? TurnIntent? */
+    lastClarifySlot?: string;
+    clarifyOptionIds?: string[];
+    /** ?? / ??? owner */
     ownerKey?: string;
     userId?: string;
     uiLocale?: string;
@@ -396,6 +389,7 @@ export async function analyticsAsk(
   const resolvedModelId = opts?.modelId;
   let currentAskState: AskState | undefined;
   let turnKind: string | undefined;
+  let turnIntentSource: string | undefined;
 
   const defaultsNoteFromState = (s?: AskState): string | undefined => {
     if (!s?.defaultsApplied) return undefined;
@@ -415,6 +409,7 @@ export async function analyticsAsk(
       packVersion: result.packVersion ?? packVersion,
       askState: state,
       turnKind: result.turnKind ?? turnKind,
+      turnIntentSource: result.turnIntentSource ?? turnIntentSource,
       askSummary: result.askSummary ?? state?.summary,
       defaultsNote: result.defaultsNote ?? defaultsNoteFromState(state),
     };
@@ -545,12 +540,19 @@ export async function analyticsAsk(
     const prevAskState = prevAskStateEarly;
     const lastUserText =
       [...conversation].reverse().find((m) => m.role === "user")?.text || nlSafe || nlForResolve;
-    const turnIntent: TurnIntent = inferTurnIntent({
+    const turnResolved = await resolveTurnIntent({
       lastUserText,
       prevAskState,
       slotAnswers: opts?.slotAnswers,
+      lastClarifySlot: opts?.lastClarifySlot,
+      clarifyOptionIds: opts?.clarifyOptionIds,
+      modelId: opts?.modelId,
+      signal: opts?.signal,
+      traceRunId: runId || undefined,
     });
+    const turnIntent: TurnIntent = turnResolved.intent;
     turnKind = turnIntent.kind;
+    turnIntentSource = turnResolved.source;
 
     if (turnIntent.kind === "meta") {
       if (turnIntent.action === "clear_defaults") {
@@ -579,6 +581,12 @@ export async function analyticsAsk(
             turnKind,
           });
         }
+        return seal({
+          status: "clarify",
+          message:
+            "\u8bf7\u8bf4\u660e\u8981\u8bb0\u4f4f\u7684\u9ed8\u8ba4\u6e20\u9053\uff08\u4f8b\u5982\uff1a\u4ee5\u540e\u9ed8\u8ba4 IndiaA\uff09\u3002",
+          turnKind,
+        });
       }
       if (turnIntent.action === "disable_defaults_this_turn") {
         return seal({
@@ -870,6 +878,39 @@ export async function analyticsAsk(
         multiSelect: structured.clarifySlot !== "result_layout" && structured.clarifySlot !== "metric",
         slot: structured.clarifySlot,
       });
+      // Recoverable clarify: seal partial Ask when time+metric known so free-text follow-up can revise
+      {
+        const t =
+          structured.time?.start && structured.time?.end
+            ? structured.time
+            : timeResolved.ok
+              ? { start: timeResolved.range.start, end: timeResolved.range.end }
+              : prevAskState?.time;
+        const metricId =
+          prevAskState?.metricId ||
+          inferMetricIdFromNl(`${nlSafe || nlForResolve}\n${transcript}`, pack);
+        if (t?.start && t?.end && metricId) {
+          const dims =
+            prevAskState?.outputDims?.length
+              ? prevAskState.outputDims
+              : inferOutputDimsFromNl(`${nlSafe || nlForResolve}\n${transcript}`);
+          currentAskState = buildAskStateFromStructure({
+            structure: {
+              status: "ok",
+              mergedNl: structured.mergedNl || nlSafe || nlForResolve,
+              time: { start: t.start, end: t.end },
+              filters: { ...(structured.partialFilters || {}) },
+              outputDims: dims.length ? dims : ["watch_date"],
+              metricId,
+              ops: prevAskState?.ops || ["base_aggregate"],
+              notes: ["ask_state_sealed_on_structure_clarify"],
+            },
+            askId,
+            packId: pack.id,
+            packVersion: pack.version,
+          });
+        }
+      }
       return seal({
         status: "clarify",
         message: clarified.message,
@@ -905,6 +946,32 @@ export async function analyticsAsk(
           options,
           { multiSelect: true, slot: "contentLang" },
         );
+        {
+          const metricId =
+            prevAskState?.metricId ||
+            inferMetricIdFromNl(`${nlSafe || nlForResolve}\n${transcript}`, pack);
+          if (timeResolved.ok && metricId) {
+            const dims = inferOutputDimsFromNl(nlSafe || nlForResolve);
+            currentAskState = buildAskStateFromStructure({
+              structure: {
+                status: "ok",
+                mergedNl: nlSafe || nlForResolve,
+                time: {
+                  start: timeResolved.range.start,
+                  end: timeResolved.range.end,
+                },
+                filters: {},
+                outputDims: dims.length ? dims : ["watch_date"],
+                metricId,
+                ops: ["base_aggregate"],
+                notes: ["ask_state_sealed_on_contentLang_clarify"],
+              },
+              askId,
+              packId: pack.id,
+              packVersion: pack.version,
+            });
+          }
+        }
         return seal({
           status: "clarify",
           message: clarified.message,
@@ -963,6 +1030,15 @@ export async function analyticsAsk(
       });
     }
     if (capGate.status === "clarify") {
+      currentAskState = buildAskStateFromStructure({
+        structure: {
+          ...structured,
+          notes: [...(structured.notes || []), "ask_state_sealed_on_capability_clarify"],
+        },
+        askId,
+        packId: pack.id,
+        packVersion: pack.version,
+      });
       return seal({
         status: "clarify",
         message: capGate.message,
@@ -983,6 +1059,22 @@ export async function analyticsAsk(
 
     // Metabase field lexicon: map labels to codes before Intent/SQL compile
     let filtersForIntent = structured.filters;
+    const materializeAskState = (filters: typeof filtersForIntent) => {
+      currentAskState = buildAskStateFromStructure({
+        structure: { ...structured!, filters },
+        askId,
+        packId: pack.id,
+        packVersion: pack.version,
+        defaultsApplied: {
+          channels: (structured!.notes || []).some((n) => n.startsWith("prefs_default_channel")),
+          layout: (structured!.notes || []).some((n) => n.startsWith("prefs_default_layout")),
+        },
+      });
+      return currentAskState;
+    };
+    // Seal incomplete Ask early so channel/dim clarify can still revise next turn
+    materializeAskState(filtersForIntent);
+
     try {
       const grounded = await resolvePackFilters({
         pack,
@@ -991,6 +1083,7 @@ export async function analyticsAsk(
         opts: { signal: opts?.signal },
       });
       if (grounded.status === "clarify") {
+        materializeAskState(filtersForIntent);
         const clarified = attachClarifyOptions(grounded.message, grounded.options, {
           multiSelect: true,
           slot: grounded.clarifySlot,
@@ -1017,7 +1110,7 @@ export async function analyticsAsk(
       if (opts?.signal?.aborted || isAbortError(e)) throw e;
     }
 
-    // Channel grounding hard gate: ghost codes ? clarify
+    // Channel grounding hard gate: ghost codes ? clarify (AskState already sealed)
     try {
       const chGround = await groundChannelFilters({
         pack,
@@ -1025,6 +1118,7 @@ export async function analyticsAsk(
         opts: { signal: opts?.signal },
       });
       if (chGround.status === "clarify") {
+        materializeAskState(filtersForIntent);
         const clarified = attachClarifyOptions(chGround.message, chGround.options, {
           multiSelect: true,
           slot: "channel",
@@ -1052,16 +1146,7 @@ export async function analyticsAsk(
       if (opts?.signal?.aborted || isAbortError(e)) throw e;
     }
 
-    currentAskState = buildAskStateFromStructure({
-      structure: { ...structured, filters: filtersForIntent },
-      askId,
-      packId: pack.id,
-      packVersion: pack.version,
-      defaultsApplied: {
-        channels: (structured.notes || []).some((n) => n.startsWith("prefs_default_channel")),
-        layout: (structured.notes || []).some((n) => n.startsWith("prefs_default_layout")),
-      },
-    });
+    materializeAskState(filtersForIntent);
 
     // Multi-intent plan: synthesize YoY/MoM when ops demand it; never step-1-only on growth
     const growthKind = !structured.plan ? relativeGrowthKind(structured.ops) : null;
@@ -1296,7 +1381,7 @@ export async function analyticsAsk(
           mode: pack.delivery?.missingChannel,
         });
         const dimCheck = reconcileNamedDimensions({
-          nl: nlForGuards,
+          nl: lastUserText || nlForGuards,
           tables: delivered.tables,
           sqls: execSqls,
           dimColumns,
@@ -1530,7 +1615,8 @@ export async function analyticsAsk(
       mode: pack.delivery?.missingChannel,
     });
     const dimCheck = reconcileNamedDimensions({
-      nl: nlForGuards,
+      // Only the current user turn ? history may contain unresolved ghost names from prior clarify
+      nl: lastUserText || nlForGuards,
       tables: delivered.tables,
       sqls,
       dimColumns,

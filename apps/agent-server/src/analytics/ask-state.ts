@@ -3,7 +3,6 @@
  * TurnIntent revise/new/clarify/meta → merge → candidate Ask for gates/compile.
  */
 
-import { extractNamedEntities } from "./named-entities.js";
 import { extractChannelsFromNl } from "./intent.js";
 import type { StructuredAskOk } from "./conversation-structure.js";
 import type { ResultLayout } from "./types.js";
@@ -65,21 +64,43 @@ export function extractChannelTokensFromText(text: string): string[] {
   return extractChannelsFromNl(text);
 }
 
+/** Strip 「本轮/这次不用默认…」prefix; shared by fallback + TurnIntent-LLM. */
+export function stripDisableDefaultsPrefix(text: string): string {
+  return String(text || "")
+    .replace(/本轮不用默认渠道/g, " ")
+    .replace(/这次不用默认渠道/g, " ")
+    .replace(/本轮不用默认/g, " ")
+    .replace(/这次不用默认/g, " ")
+    .replace(/不要用默认渠道/g, " ")
+    .replace(/不用默认渠道/g, " ")
+    .replace(/不要用默认/g, " ")
+    .replace(/不用默认/g, " ")
+    .replace(/[。.!！,，;；]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
- * Heuristic TurnIntent (P0). LLM classifier can replace later; codes validate enums.
+ * Thin TurnIntent fallback (slotAnswers + meta only).
+ * Short-follow-up revise heuristics removed — LLM path is resolveTurnIntent().
  */
-export function inferTurnIntent(input: {
+export function inferTurnIntentFallback(input: {
   lastUserText: string;
   prevAskState?: AskState | null;
   slotAnswers?: Record<string, string[]>;
 }): TurnIntent {
-  const notes: string[] = [];
   if (input.slotAnswers && Object.keys(input.slotAnswers).length) {
     const entries = Object.entries(input.slotAnswers);
-    if (entries.length === 1) {
-      const [slot, values] = entries[0]!;
-      return { kind: "clarify_answer", slot, values: [...values], notes: ["slotAnswers"] };
-    }
+    const [slot, values] = entries[0]!;
+    return {
+      kind: "clarify_answer",
+      slot,
+      values: [...values],
+      notes:
+        entries.length === 1
+          ? ["slotAnswers"]
+          : ["slotAnswers", `slotAnswers_first_of_${entries.length}`],
+    };
   }
 
   const text = String(input.lastUserText || "").trim();
@@ -103,19 +124,7 @@ export function inferTurnIntent(input: {
         notes: ["meta_clear_defaults"],
       };
     }
-    // 「本轮不用默认」可单独发，也可与重跑问句合并在同一条
-    const rest = text
-      .replace(/本轮不用默认渠道/g, " ")
-      .replace(/这次不用默认渠道/g, " ")
-      .replace(/本轮不用默认/g, " ")
-      .replace(/这次不用默认/g, " ")
-      .replace(/不要用默认渠道/g, " ")
-      .replace(/不用默认渠道/g, " ")
-      .replace(/不要用默认/g, " ")
-      .replace(/不用默认/g, " ")
-      .replace(/[。.!！,，;；]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const rest = stripDisableDefaultsPrefix(text);
     if (rest.length < 6) {
       return {
         kind: "meta",
@@ -123,61 +132,131 @@ export function inferTurnIntent(input: {
         notes: ["meta_disable_defaults"],
       };
     }
-    const inner = inferTurnIntent({ ...input, lastUserText: rest });
+    // Rest is a real ask → LLM will classify; keep disable note on new_ask shell
+    return { kind: "new_ask", notes: ["disable_defaults_this_turn", "meta_prefix_stripped"] };
+  }
+
+  return { kind: "new_ask", notes: ["fallback_new_ask"] };
+}
+
+const ALLOWED_SET_PATHS = new Set([
+  "metricId",
+  "layout",
+  "pivotDim",
+  "outputDims",
+  "ops",
+  "time",
+]);
+
+function isAllowedSetPath(path: string): boolean {
+  if (ALLOWED_SET_PATHS.has(path)) return true;
+  if (path.startsWith("filters.") && path.length > "filters.".length) return true;
+  if (path.startsWith("requested.") && path.length > "requested.".length) return true;
+  return false;
+}
+
+function isAllowedClearPath(path: string): boolean {
+  return (
+    path === "layout" ||
+    path === "pivotDim" ||
+    path.startsWith("filters.") ||
+    path.startsWith("requested.")
+  );
+}
+
+/**
+ * Validate LLM / raw TurnIntent. Illegal → degrade to new_ask (no hard-guess slots).
+ */
+export function validateTurnIntent(raw: unknown, prevAskState?: AskState | null): TurnIntent {
+  if (!raw || typeof raw !== "object") {
+    return { kind: "new_ask", notes: ["turn_intent_invalid:not_object"] };
+  }
+  const o = raw as Record<string, unknown>;
+  const kind = String(o.kind || "").trim();
+  const notes = Array.isArray(o.notes) ? o.notes.map(String) : [];
+
+  if (kind === "new_ask") {
+    return { kind: "new_ask", notes: [...notes, "validated_new_ask"] };
+  }
+
+  if (kind === "meta") {
+    const action = String(o.action || "").trim();
+    if (
+      action !== "set_defaults" &&
+      action !== "clear_defaults" &&
+      action !== "disable_defaults_this_turn"
+    ) {
+      return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:meta_action"] };
+    }
     return {
-      ...inner,
-      notes: [...(inner.notes || []), "disable_defaults_this_turn"],
+      kind: "meta",
+      action,
+      payload:
+        o.payload && typeof o.payload === "object"
+          ? (o.payload as Record<string, unknown>)
+          : undefined,
+      notes: [...notes, "validated_meta"],
     };
   }
 
-  const prev = input.prevAskState;
-  if (prev?.metricId && prev.time?.start && prev.time?.end) {
-    let channels = extractChannelTokensFromText(text);
-    // Unknown CamelCase tokens on short follow-ups still count as channel revise candidates
-    // (Grounding gate will clarify if not in DB — never silent SQL).
-    if (!channels.length && text.length <= 40 && (/呢[？?！!。.]*$/.test(text) || /^(那|那么|换成)/.test(text))) {
-      channels = extractNamedEntities(text).filter((e) => /^[A-Za-z][A-Za-z0-9]{1,31}$/.test(e));
+  if (kind === "clarify_answer") {
+    const slot = String(o.slot || "").trim();
+    const values = asStringArray(o.values);
+    if (!slot || !values.length) {
+      return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:clarify"] };
     }
-    const shortFollowUp =
-      text.length <= 40 &&
-      (/呢[？?！!。.]*$/.test(text) ||
-        /^(那|那么|换成|改成|换成渠道|渠道改)/.test(text) ||
-        (channels.length > 0 && !/按天|按日|观看人数|人均|完播|同比|环比|语种|语言/.test(text)));
-
-    if (shortFollowUp && channels.length) {
-      notes.push("heuristic_revise_channel");
-      return {
-        kind: "revise",
-        set: { "filters.channel": channels },
-        requestedPatch: { channels: { mode: "union", values: channels } },
-        notes,
-      };
-    }
-
-    if (text.length <= 30 && /换成人均|改成人均|人均观看|人均时长/.test(text)) {
-      return {
-        kind: "revise",
-        set: { metricId: "avg_watch_second_per_user" },
-        notes: ["heuristic_revise_metric"],
-      };
-    }
-    if (text.length <= 30 && /换成人数|改成人数|观看人数/.test(text) && !/人均/.test(text)) {
-      return {
-        kind: "revise",
-        set: { metricId: "uniq_users" },
-        notes: ["heuristic_revise_metric"],
-      };
-    }
-    if (text.length <= 40 && /(不要|去掉|取消).{0,6}(语言|语种|contentLang)/.test(text)) {
-      return {
-        kind: "revise",
-        clear: ["filters.contentLang", "requested.contentLangs"],
-        notes: ["heuristic_clear_lang"],
-      };
-    }
+    return { kind: "clarify_answer", slot, values, notes: [...notes, "validated_clarify"] };
   }
 
-  return { kind: "new_ask", notes: ["default_new_ask"] };
+  if (kind === "revise") {
+    if (!prevAskState || !askStateIsComplete(prevAskState)) {
+      return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:revise_without_prev"] };
+    }
+    const setRaw =
+      o.set && typeof o.set === "object" ? (o.set as Record<string, unknown>) : {};
+    const set: Record<string, unknown> = {};
+    for (const [path, value] of Object.entries(setRaw)) {
+      if (!isAllowedSetPath(path)) {
+        return { kind: "new_ask", notes: [...notes, `turn_intent_invalid:set_path:${path}`] };
+      }
+      set[path] = value;
+    }
+    const clear = asStringArray(o.clear);
+    for (const path of clear) {
+      if (!isAllowedClearPath(path)) {
+        return { kind: "new_ask", notes: [...notes, `turn_intent_invalid:clear_path:${path}`] };
+      }
+    }
+    let requestedPatch:
+      | {
+          channels?: { mode: "replace" | "union"; values: string[] };
+        }
+      | undefined;
+    if (o.requestedPatch && typeof o.requestedPatch === "object") {
+      const rp = o.requestedPatch as Record<string, unknown>;
+      const ch =
+        rp.channels && typeof rp.channels === "object"
+          ? (rp.channels as Record<string, unknown>)
+          : null;
+      if (ch) {
+        const mode = String(ch.mode || "").trim();
+        const values = asStringArray(ch.values);
+        if ((mode !== "union" && mode !== "replace") || !values.length) {
+          return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:requestedPatch"] };
+        }
+        requestedPatch = { channels: { mode: mode as "union" | "replace", values } };
+      }
+    }
+    return {
+      kind: "revise",
+      set: Object.keys(set).length ? set : undefined,
+      clear: clear.length ? clear : undefined,
+      requestedPatch,
+      notes: [...notes, "validated_revise"],
+    };
+  }
+
+  return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:kind"] };
 }
 
 function setPath(state: AskState, path: string, value: unknown): void {
@@ -239,11 +318,13 @@ function clearPath(state: AskState, path: string): void {
     const next = { ...state.requested };
     delete next.contentLangs;
     state.requested = next;
+    return;
   }
   if (path === "requested.channels") {
     const next = { ...state.requested };
     delete next.channels;
     state.requested = next;
+    return;
   }
   if (path === "requested.movieTypes") {
     const next = { ...state.requested };
@@ -316,6 +397,11 @@ export function mergeAskState(input: {
     state.requested = { ...state.requested, channels: next };
     state.filters = { ...state.filters, channel: next };
     notes.push(`requested_channels_${patch.mode}:${next.join(",")}`);
+    // Multi-channel compare must expose channel in the result grain
+    if (next.length > 1 && !state.outputDims.includes("channel")) {
+      state.outputDims = uniq([...state.outputDims, "channel"]);
+      notes.push("auto_output_dim_channel_for_compare");
+    }
   } else if (state.filters.channel?.length) {
     state.requested = { ...state.requested, channels: [...state.filters.channel] };
   }

@@ -2,7 +2,7 @@
 
 > **状态**：P0 已落地；P1 YoY + MoM（等长前窗）+ merge_ratio 已落地；P2 prefs MVP 已落地；**AskState P0/P1 + P2 线性栈/Undo** 见 [`2026-09-11-analytics-askstate-design.md`](./2026-09-11-analytics-askstate-design.md) / [`2026-09-11-analytics-askstate-p2-design.md`](./2026-09-11-analytics-askstate-p2-design.md)  
 > **日期**：2026-09-11  
-> **实现**：`capability-gate.ts`；`ask-plan.ts`（yoy_window / mom_window / merge_ratio）；`analytics-prefs.ts`；pack `2026-09-11.10`；`scripts/analytics-consistency-live.ts`  
+> **实现**：`capability-gate.ts`；`ask-plan.ts`（yoy_window / mom_window / merge_ratio）；`analytics-prefs.ts`；AskState/TurnIntent 见专文；pack 以 `config/analytics/watch-detail.pack.json` 当前 version 为准（曾用 `2026-09-11.10`）  
 > **宿主**：`apps/agent-server` Analytics 语义层路径（Structure → Intent → sql-compile → AST/lint → Metabase）  
 > **关联**：  
 > - [`2026-09-09-metabase-analytics-agent-design.md`](./2026-09-09-metabase-analytics-agent-design.md)（总定稿；质量门禁 EX / RefuseRecall / CWR）  

@@ -482,6 +482,7 @@ export interface AnalyticsAskResult {
   rewriteRounds?: number;
   askState?: Record<string, unknown>;
   turnKind?: string;
+  turnIntentSource?: string;
   askSummary?: string;
   defaultsNote?: string;
   charts?: Array<{
@@ -546,6 +547,9 @@ export async function askAnalytics(
     messages?: Array<{ role: "user" | "assistant"; text: string }>;
     /** 上一轮 AskState，供续问 revise */
     prevAskState?: Record<string, unknown>;
+    /** 上一助手澄清槽位 */
+    lastClarifySlot?: string;
+    clarifyOptionIds?: string[];
   },
 ): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
@@ -560,6 +564,8 @@ export async function askAnalytics(
       slotAnswers: opts?.slotAnswers,
       messages: opts?.messages,
       prevAskState: opts?.prevAskState,
+      lastClarifySlot: opts?.lastClarifySlot,
+      clarifyOptionIds: opts?.clarifyOptionIds,
     }),
     signal: opts?.signal,
   });

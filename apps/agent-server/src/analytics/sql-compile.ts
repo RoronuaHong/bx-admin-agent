@@ -98,10 +98,28 @@ function safeAlias(code: string): string {
   return String(code).replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "") || "v";
 }
 
+/**
+ * Canonicalize output dimensions for deterministic SQL grain.
+ * - Constant single-value filter fields (e.g. channel='IndiaA') are redundant in GROUP BY
+ *   (already fixed by WHERE), so they are dropped from the breakout dims.
+ * - No explicit breakout → default to daily grain (watch_date) so range aggregations always
+ *   yield a consistent by-day series instead of a nondeterministic grand-total flip.
+ */
+function canonicalDims(intent: AnalyticsIntent): OutputDimId[] {
+  const constantFilterFields = new Set(
+    Object.entries(intent.filters || {})
+      .filter(([, vs]) => Array.isArray(vs) && vs.length === 1)
+      .map(([field]) => field),
+  );
+  const dims = (intent.outputDims || []).filter((d) => !constantFilterFields.has(d));
+  if (!dims.length) return ["watch_date"];
+  return dims;
+}
+
 function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const valueField = intent.metric.valueField || "maxWatchProgress";
   const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
-  const dims = intent.outputDims.length ? intent.outputDims : ["watch_date"];
+  const dims = canonicalDims(intent);
   const dimMeta = dims.map(dimSelectExpr);
   const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
   if (!whereBuilt.ok) return whereBuilt;
@@ -197,7 +215,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
 }
 
 function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
-  const dims = intent.outputDims.length ? intent.outputDims : [];
+  const dims = canonicalDims(intent);
   const dimMeta = dims.map(dimSelectExpr);
   const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
   if (!whereBuilt.ok) return whereBuilt;

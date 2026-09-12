@@ -1,5 +1,5 @@
 /**
- * AskState / TurnIntent unit tests.
+ * AskState / TurnIntent validate + merge unit tests (LLM path mocked via validate).
  * Run: tsx scripts/analytics-ask-state.test.ts
  */
 import assert from "node:assert/strict";
@@ -8,15 +8,16 @@ import {
   askStateToStructured,
   buildAskStateFromStructure,
   extractChannelTokensFromText,
-  inferTurnIntent,
+  inferTurnIntentFallback,
   mergeAskState,
   parseAskState,
+  validateTurnIntent,
   type AskState,
+  type TurnIntent,
 } from "../src/analytics/ask-state.js";
 
 {
   assert.deepEqual(extractChannelTokensFromText("IndiaB呢？"), ["IndiaB"]);
-  assert.ok(extractChannelTokensFromText("印度B怎么样").includes("IndiaB"));
 }
 
 const base: AskState = {
@@ -26,7 +27,7 @@ const base: AskState = {
   metricId: "uniq_users",
   time: { start: "2026-08-19", end: "2026-08-25" },
   filters: { channel: ["IndiaA"], contentLang: ["te-IN"] },
-  outputDims: ["watch_date", "channel"],
+  outputDims: ["watch_date"],
   ops: ["base_aggregate"],
   requested: { channels: ["IndiaA"], contentLangs: ["te-IN"] },
   summary: "IndiaA te-IN UV",
@@ -34,44 +35,124 @@ const base: AskState = {
 };
 
 {
-  const intent = inferTurnIntent({
+  // Fallback no longer invents revise from 「呢？」
+  const fb = inferTurnIntentFallback({
     lastUserText: "IndiaB呢？",
     prevAskState: base,
   });
+  assert.equal(fb.kind, "new_ask");
+}
+
+{
+  const llmJson = {
+    kind: "revise",
+    requestedPatch: { channels: { mode: "union", values: ["FoxA"] } },
+    set: { outputDims: ["watch_date", "channel"] },
+    notes: ["from_llm"],
+  };
+  const intent = validateTurnIntent(llmJson, base);
   assert.equal(intent.kind, "revise");
-  if (intent.kind !== "revise") throw new Error("expected revise");
-  const merged = mergeAskState({ prev: base, intent, askId: "a2" });
-  assert.equal(merged.ok, true);
+  const merged = mergeAskState({ prev: base, intent: intent as Extract<TurnIntent, { kind: "revise" }> });
+  assert.ok(merged.ok);
   if (!merged.ok) throw new Error("merge failed");
-  assert.deepEqual(merged.state.filters.channel?.slice().sort(), ["IndiaA", "IndiaB"]);
-  assert.deepEqual(merged.state.requested.channels?.slice().sort(), ["IndiaA", "IndiaB"]);
-  // language filter inherited — revise does not invent contentLang clarify
+  assert.deepEqual(merged.state.requested.channels?.slice().sort(), ["FoxA", "IndiaA"]);
+  assert.ok(merged.state.outputDims.includes("channel"));
   assert.deepEqual(merged.state.filters.contentLang, ["te-IN"]);
-  assert.ok(askStateIsComplete(merged.state));
-  const structured = askStateToStructured(merged.state);
-  assert.equal(structured.status, "ok");
-  assert.equal(structured.metricId, "uniq_users");
 }
 
 {
-  const intent = inferTurnIntent({
-    lastUserText: "不要语言筛选",
-    prevAskState: base,
-  });
+  // Soft-complete: multi channel without channel dim → merge adds it
+  const intent = validateTurnIntent(
+    {
+      kind: "revise",
+      requestedPatch: { channels: { mode: "union", values: ["FoxA"] } },
+    },
+    base,
+  );
   assert.equal(intent.kind, "revise");
-  if (intent.kind === "revise") {
-    const merged = mergeAskState({ prev: base, intent });
-    assert.ok(merged.ok);
-    if (merged.ok) assert.equal(merged.state.filters.contentLang, undefined);
-  }
+  const merged = mergeAskState({ prev: base, intent: intent as Extract<TurnIntent, { kind: "revise" }> });
+  assert.ok(merged.ok);
+  if (!merged.ok) throw new Error("merge failed");
+  assert.ok(merged.state.outputDims.includes("channel"));
+  assert.ok((merged.notes || []).some((n) => n.includes("auto_output_dim_channel")));
 }
 
 {
-  const intent = inferTurnIntent({
-    lastUserText: "NotARealChannelXYZ呢？",
-    prevAskState: base,
+  const intent = validateTurnIntent(
+    {
+      kind: "revise",
+      requestedPatch: { channels: { mode: "replace", values: ["FoxA"] } },
+    },
+    base,
+  );
+  const merged = mergeAskState({ prev: base, intent: intent as Extract<TurnIntent, { kind: "revise" }> });
+  assert.ok(merged.ok);
+  if (!merged.ok) throw new Error("merge failed");
+  assert.deepEqual(merged.state.filters.channel, ["FoxA"]);
+}
+
+{
+  // Illegal path → new_ask
+  const bad = validateTurnIntent({ kind: "revise", set: { "filters.evil": ["x"] }, hack: 1 }, base);
+  // filters.evil is allowed path prefix filters.* — use unknown root
+  const bad2 = validateTurnIntent({ kind: "revise", set: { sql: "DROP" } }, base);
+  assert.equal(bad2.kind, "new_ask");
+  assert.ok((bad2.notes || []).some((n) => n.includes("turn_intent_invalid")));
+  void bad;
+}
+
+{
+  const noPrev = validateTurnIntent({ kind: "revise", set: { metricId: "uniq_users" } }, null);
+  assert.equal(noPrev.kind, "new_ask");
+}
+
+{
+  const clearLang = validateTurnIntent(
+    {
+      kind: "revise",
+      clear: ["filters.contentLang", "requested.contentLangs"],
+    },
+    base,
+  );
+  assert.equal(clearLang.kind, "revise");
+  const merged = mergeAskState({
+    prev: base,
+    intent: clearLang as Extract<TurnIntent, { kind: "revise" }>,
   });
-  assert.equal(intent.kind, "revise");
+  assert.ok(merged.ok);
+  if (!merged.ok) throw new Error("merge failed");
+  assert.equal(merged.state.filters.contentLang, undefined);
+}
+
+{
+  const meta = inferTurnIntentFallback({ lastUserText: "清除默认渠道" });
+  assert.equal(meta.kind, "meta");
+  if (meta.kind === "meta") assert.equal(meta.action, "clear_defaults");
+
+  const disable = inferTurnIntentFallback({ lastUserText: "本轮不用默认渠道" });
+  assert.equal(disable.kind, "meta");
+  if (disable.kind === "meta") assert.equal(disable.action, "disable_defaults_this_turn");
+
+  const combined = inferTurnIntentFallback({
+    lastUserText: "本轮不用默认渠道。2026-08-19到2026-08-25按天观看人数",
+  });
+  assert.equal(combined.kind, "new_ask");
+  assert.ok((combined.notes || []).includes("disable_defaults_this_turn"));
+}
+
+{
+  const v = validateTurnIntent({ kind: "not_a_kind" }, base);
+  assert.equal(v.kind, "new_ask");
+}
+
+{
+  const multi = inferTurnIntentFallback({
+    lastUserText: "x",
+    slotAnswers: { channel: ["IndiaA"], contentLang: ["te-IN"] },
+  });
+  assert.equal(multi.kind, "clarify_answer");
+  if (multi.kind === "clarify_answer") assert.equal(multi.slot, "channel");
+  assert.ok((multi.notes || []).some((n) => n.startsWith("slotAnswers_first_of_")));
 }
 
 {
@@ -93,22 +174,9 @@ const base: AskState = {
   const round = parseAskState(JSON.parse(JSON.stringify(built)));
   assert.ok(round);
   assert.equal(round!.metricId, "uniq_users");
-}
-
-{
-  const disable = inferTurnIntent({ lastUserText: "本轮不用默认渠道" });
-  assert.equal(disable.kind, "meta");
-  if (disable.kind === "meta") assert.equal(disable.action, "disable_defaults_this_turn");
-
-  const clear = inferTurnIntent({ lastUserText: "清除默认渠道" });
-  assert.equal(clear.kind, "meta");
-  if (clear.kind === "meta") assert.equal(clear.action, "clear_defaults");
-
-  const combined = inferTurnIntent({
-    lastUserText: "本轮不用默认渠道。2026-08-19到2026-08-25按天观看人数",
-  });
-  assert.equal(combined.kind, "new_ask");
-  assert.ok((combined.notes || []).includes("disable_defaults_this_turn"));
+  assert.ok(askStateIsComplete(built));
+  const structured = askStateToStructured(built);
+  assert.equal(structured.status, "ok");
 }
 
 console.log("analytics-ask-state.test.ts OK");

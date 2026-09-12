@@ -1223,6 +1223,9 @@ async function send(presetText?: string) {
 
   const priorMessages = [...(activeConversation.value?.messages || [])];
   const askPayload = buildClarifyContinuation(priorMessages, text);
+  const lastClarifyBubble = [...priorMessages]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.status === "clarify" && m.clarifySlot);
   const conversationMessages = [
     ...priorMessages
       .filter((m) => !m.welcome && !m.pending && !m.cancelled)
@@ -1288,6 +1291,8 @@ async function send(presetText?: string) {
       slotAnswers: askPayload.slotAnswers,
       messages: conversationMessages,
       prevAskState: lastAskState.value || undefined,
+      lastClarifySlot: lastClarifyBubble?.clarifySlot,
+      clarifyOptionIds: lastClarifyBubble?.clarifyOptions?.map((o) => o.id),
     });
     if (data.error === "aborted" || (data.status === "error" && data.message === "已取消")) {
       if (userInitiatedCancel) {

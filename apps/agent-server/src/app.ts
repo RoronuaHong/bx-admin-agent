@@ -629,6 +629,8 @@ export function createApp() {
         slotAnswers?: Record<string, string[]>;
         messages?: Array<{ role?: string; text?: string; content?: string }>;
         prevAskState?: Record<string, unknown>;
+        lastClarifySlot?: string;
+        clarifyOptionIds?: string[];
       }>()
       .catch(() => ({
         text: "",
@@ -638,6 +640,8 @@ export function createApp() {
         slotAnswers: undefined as Record<string, string[]> | undefined,
         messages: undefined as Array<{ role?: string; text?: string; content?: string }> | undefined,
         prevAskState: undefined as Record<string, unknown> | undefined,
+        lastClarifySlot: undefined as string | undefined,
+        clarifyOptionIds: undefined as string[] | undefined,
       }));
     const text = String(body.text || "").trim();
     const images = Array.isArray(body.images) ? body.images.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
@@ -663,6 +667,13 @@ export function createApp() {
           .filter((m) => m.text)
           .slice(-40)
       : undefined;
+    const lastClarifySlot =
+      typeof body.lastClarifySlot === "string" && body.lastClarifySlot.trim()
+        ? body.lastClarifySlot.trim()
+        : undefined;
+    const clarifyOptionIds = Array.isArray(body.clarifyOptionIds)
+      ? body.clarifyOptionIds.map(String).filter(Boolean).slice(0, 80)
+      : undefined;
     const ownerCtx = resolveAnalyticsOwner(c);
     const result = await analyticsAsk(text, {
       modelId,
@@ -672,6 +683,8 @@ export function createApp() {
       slotAnswers: slotAnswers && Object.keys(slotAnswers).length ? slotAnswers : undefined,
       messages,
       prevAskState: body.prevAskState,
+      lastClarifySlot,
+      clarifyOptionIds,
       ownerKey: ownerCtx.ownerKey,
       userId: ownerCtx.loginName || undefined,
       uiLocale: "zh-CN",

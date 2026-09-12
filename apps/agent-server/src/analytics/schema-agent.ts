@@ -6,7 +6,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { listModels } from "../config.js";
+import type { ModelEntry } from "../config.js";
+import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import * as trace from "../trace.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
@@ -176,21 +177,6 @@ const TOOLS = [
   },
 ];
 
-function pickModel(modelId?: string) {
-  const models = listModels();
-  const eol = /nvstepflash|step-3\.7-flash|stepflash/i;
-  const envDefault = (process.env.ANALYTICS_DEFAULT_MODEL || "").trim();
-  return (
-    (modelId ? models.find((m) => m.id === modelId) : undefined) ||
-    (envDefault ? models.find((m) => m.id === envDefault) : undefined) ||
-    models.find((m) => /glm5turbo/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => /dsflash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => /flash/i.test(m.id) && !eol.test(m.id) && !eol.test(m.name)) ||
-    models.find((m) => !eol.test(m.id) && !eol.test(m.name)) ||
-    models[0]
-  );
-}
-
 async function probeField(
   pack: AnalyticsPack,
   field: string,
@@ -263,7 +249,7 @@ function buildSystem(
 }
 
 async function chatCompletions(input: {
-  model: NonNullable<ReturnType<typeof pickModel>>;
+  model: ModelEntry;
   key: string;
   body: Record<string, unknown>;
   signal?: AbortSignal;
@@ -315,7 +301,7 @@ export async function runStructureOnce(input: {
   signal?: AbortSignal;
   traceRunId?: string;
 }): Promise<{ result: StructuredAskResult; meta: StructureExtractMeta }> {
-  const model = pickModel(input.modelId);
+  const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
   const system = buildStructureSystemPrompt(input.pack, input.clockIsoDate, {
@@ -392,7 +378,7 @@ export async function runSchemaAgent(input: {
   maxToolRounds?: number;
   askContext?: AskRuntimeContext;
 }): Promise<StructuredAskResult> {
-  const model = pickModel(input.modelId);
+  const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
   const maxRounds = input.maxToolRounds ?? 6;

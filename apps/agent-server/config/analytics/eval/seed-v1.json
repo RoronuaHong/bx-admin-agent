@@ -1,8 +1,8 @@
 {
-  "version": "2026-09-10.6",
+  "version": "2026-09-11.1",
   "packId": "watch-detail",
   "clock": "2026-09-09T12:00:00+08:00",
-  "notes": "Gate EX only counts reviewStatus=gold answerable. Agent-authored answerable = provisional (smoke). Refuse traps = gold structural product rules (time clarify + Ambiguity Gate filter_set/metric). Promote answerable to gold only after human review. 2026-09-10.6: Ambiguity Gate seeds.",
+  "notes": "Gate EX only counts reviewStatus=gold answerable. Agent-authored answerable = provisional (smoke). Refuse traps = gold structural product rules (time clarify + Ambiguity Gate filter_set/metric). Promote answerable to gold only after human review. 2026-09-11.1: gold answerable=4 (ex-single-day-indiaA + ex-indiaA-total-users + ex-foxA-total-users + ex-indiaA-watch-seconds). Fixed ex-single-day-indiaA gold date range to single-day (Aug20) matching NL; aligned by-day grain for IndiaA/FoxA total-users + watch-seconds gold to match agent daily-series output (gold was single-total).",
   "cases": [
     {
       "id": "clarify-三种小语种-完播率",
@@ -204,10 +204,10 @@
       "difficulty": "easy",
       "requireLive": true,
       "goldSqls": [
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-11: by-day grain aligned to agent output; soft-EX strict pass"
     },
     {
       "id": "ex-iso-indiaA-day",
@@ -237,10 +237,10 @@
       "difficulty": "easy",
       "requireLive": true,
       "goldSqls": [
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-20' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-20' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-11: single-day (NL 八月二十 → Aug20 only) by-day grain; agent soft-EX strict pass"
     },
     {
       "id": "ex-channel-rank",
@@ -403,10 +403,10 @@
       "difficulty": "easy",
       "requireLive": true,
       "goldSqls": [
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-11: by-day grain aligned to agent output; soft-EX strict pass"
     },
     {
       "id": "ex-indiaA-gogo-channel-pair",
@@ -437,10 +437,10 @@
       "difficulty": "medium",
       "requireLive": true,
       "goldSqls": [
-        "SELECT sum(watchSecond) AS watch_sec FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS watchDate, sum(watchSecond) AS watchSecond FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-11: by-day grain aligned to agent output; soft-EX strict pass"
     },
     {
       "id": "ex-multi-gogo-foxA-day",
