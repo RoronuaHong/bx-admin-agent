@@ -1,6 +1,6 @@
 import { config } from "../../config.js";
 import { runNativeDataset } from "../metabase-client.js";
-import { loadAnalyticsPack } from "../semantic-layer.js";
+import { loadAnalyticsPack, packTimeField } from "../semantic-layer.js";
 import {
   assertReadonlySingleSelect,
   assertTablesWhitelisted,
@@ -23,6 +23,8 @@ export interface ChannelUsersSqlOpts {
   movieTypes?: number[];
   /** Distinct-count fn; default uniq. */
   distinctCountFn?: "uniq" | "uniqExact";
+  /** Business time column; default lastWatchTime. */
+  timeField?: string;
 }
 
 export type ChannelDailyUserRow = ScanMetricRow & { sample: number | null };
@@ -40,6 +42,10 @@ export function buildChannelUsersSql(opts: ChannelUsersSqlOpts): string {
   const dodDate = assertYmd(opts.dodDate, "dodDate");
   const wowDate = assertYmd(opts.wowDate, "wowDate");
   const fn = opts.distinctCountFn ?? "uniq";
+  const timeField = opts.timeField || "lastWatchTime";
+  if (!IDENT_RE.test(timeField)) {
+    throw new Error(`invalid timeField identifier: ${timeField}`);
+  }
 
   let movieFilter = "";
   if (opts.movieTypes?.length) {
@@ -50,9 +56,9 @@ export function buildChannelUsersSql(opts: ChannelUsersSqlOpts): string {
   }
 
   return [
-    `SELECT channel AS entity_key, toDate(lastWatchTime) AS d, ${fn}(guid) AS users`,
+    `SELECT channel AS entity_key, toDate(${timeField}) AS d, ${fn}(guid) AS users`,
     `FROM ${table}`,
-    `WHERE toDate(lastWatchTime) IN ('${scanDate}', '${dodDate}', '${wowDate}')${movieFilter}`,
+    `WHERE toDate(${timeField}) IN ('${scanDate}', '${dodDate}', '${wowDate}')${movieFilter}`,
     `GROUP BY channel, d`,
   ].join(" ");
 }
@@ -153,6 +159,7 @@ export async function fetchChannelDailyUsers(
     table,
     movieTypes: pack.guards.defaultMovieTypes,
     distinctCountFn: config.metabase.distinctCountFn,
+    timeField: packTimeField(pack),
   });
   sql = normalizeDistinctCount(sql, config.metabase.distinctCountFn);
   assertReadonlySingleSelect(sql);

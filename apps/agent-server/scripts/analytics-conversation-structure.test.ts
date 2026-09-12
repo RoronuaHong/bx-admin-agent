@@ -3,6 +3,9 @@ import {
   enforceStructurePolicy,
   formatConversationTranscript,
   impliesLangSetWithoutMembers,
+  impliesMovieTypeSetWithoutMembers,
+  neededProbeFields,
+  needsDimensionProbe,
   normalizeClarifySlot,
   parseStructureResponse,
   userDemandsLangFilter,
@@ -58,6 +61,11 @@ import {
   assert.equal(normalizeClarifySlot("layout"), "result_layout");
   assert.equal(impliesLangSetWithoutMembers("三种小语种用户完播率"), true);
   assert.equal(impliesLangSetWithoutMembers("te-IN、ta-IN、ml-IN 完播率"), false);
+  assert.equal(needsDimensionProbe("三种小语种用户完播率"), true);
+  assert.equal(needsDimensionProbe("电影观看人数"), true);
+  assert.equal(needsDimensionProbe("IndiaA 上周观看人数"), false);
+  assert.deepEqual(neededProbeFields("三种小语种用户完播率"), ["contentLang"]);
+  assert.deepEqual(neededProbeFields("电影观看人数"), ["movieType"]);
 }
 
 {
@@ -193,6 +201,46 @@ import {
   assert.equal(userDemandsLangFilter("IndiaA 按天观看人数"), false);
   assert.equal(userDemandsLangFilter("按语言看人均时长"), true);
   assert.equal(userDemandsLangFilter("三种小语种完播率"), true);
+}
+
+{
+  assert.equal(impliesMovieTypeSetWithoutMembers("多种影片类型观看人数"), true);
+  assert.equal(impliesMovieTypeSetWithoutMembers("电影的观看人数按天"), false);
+  const r = parseStructureResponse(
+    JSON.stringify({
+      status: "ok",
+      mergedNl: "多种影片类型观看人数",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], movieType: ["1", "2"] },
+      outputDims: ["watch_date"],
+      metricId: "uniq_users",
+    }),
+    "多种影片类型观看人数",
+  );
+  assert.equal(r.status, "clarify");
+  if (r.status === "clarify") assert.equal(r.clarifySlot, "movieType");
+}
+
+{
+  // 同会话新问：历史「三种小语种」不得再逼 contentLang
+  const transcript = formatConversationTranscript([
+    { role: "user", text: "IndiaA 2026-08-19到25 三种小语种完播率按天" },
+    { role: "assistant", text: "请确认指标口径" },
+    { role: "user", text: "电影的观看人数按天" },
+  ]);
+  const r = parseStructureResponse(
+    JSON.stringify({
+      status: "ok",
+      mergedNl: "三种小语种完播率 电影的观看人数按天",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"] },
+      outputDims: ["watch_date"],
+      metricId: "uniq_users",
+    }),
+    transcript,
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") assert.equal(r.filters.contentLang, undefined);
 }
 
 {

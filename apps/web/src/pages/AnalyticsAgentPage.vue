@@ -1007,6 +1007,9 @@ let modelScrollbarCleanup: (() => void) | null = null;
 
 const textModels = computed(() => availableModels.value.filter((m) => m.vision === "none"));
 const visionModels = computed(() => availableModels.value.filter((m) => m.vision !== "none"));
+const glm5Model = computed(() =>
+  availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label)),
+);
 
 function selectModel(id: string | null) {
   selectedModel.value = id;
@@ -1386,7 +1389,7 @@ function onComposerKeydown(ev: KeyboardEvent) {
 
 function onWindowClickAway(e: MouseEvent) {
   const t = e.target as HTMLElement | null;
-  if (!t || !t.closest(".model-switch")) modelMenuOpen.value = false;
+  if (!t || !t.closest(".model-switch-row")) modelMenuOpen.value = false;
 }
 
 function onWindowKeydown(e: KeyboardEvent) {
@@ -1449,6 +1452,8 @@ onMounted(async () => {
     } else if (selectedModel.value) {
       const hit = availableModels.value.find((m) => m.id === selectedModel.value);
       if (hit) selectedModelLabel.value = hit.label;
+    } else if (glm5Model.value) {
+      selectModel(glm5Model.value.id);
     }
   } catch {
     availableModels.value = [];
@@ -1848,6 +1853,18 @@ onUnmounted(() => {
             @paste="onComposerPaste"
           />
           <div class="composer-toolbar">
+            <div class="model-switch-row">
+            <button
+              v-if="glm5Model"
+              type="button"
+              class="model-chip"
+              :class="{ selected: selectedModel === glm5Model.id }"
+              :title="`${glm5Model.label} · TokenHub glm-5`"
+              :disabled="sending"
+              @click="selectModel(glm5Model.id)"
+            >
+              GLM-5
+            </button>
             <div class="model-switch">
               <button
                 type="button"
@@ -1948,6 +1965,7 @@ onUnmounted(() => {
                   </div>
                 </div>
               </Transition>
+            </div>
             </div>
             <div class="toolbar-right">
               <button
@@ -3240,6 +3258,43 @@ onUnmounted(() => {
   50% {
     opacity: 0.45;
   }
+}
+
+.model-switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-chip {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.model-chip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+
+.model-chip:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.model-chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.model-chip.selected {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
 }
 
 .model-switch {

@@ -423,6 +423,9 @@ onMounted(async () => {
       selectedModel.value = null;
       selectedModelLabel.value = "Auto";
       writeModelCache(MODEL_CACHE_KEY, null, "Auto");
+    } else if (!selectedModel.value) {
+      const glm5 = availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label));
+      if (glm5) selectModel(glm5.id);
     }
     writeIdentityCache(IDENTITY_CACHE_KEY, { countryId: fetched.country.id, loginName: fetched.user.loginName });
     // 服务端记录按登录用户归属：登录态就绪后始终从服务端拉权威数据（覆盖本地缓存）。
@@ -471,7 +474,7 @@ onMounted(async () => {
   };
   const onClickAway = (e: MouseEvent) => {
     const t = e.target as HTMLElement | null;
-    if (!t || !t.closest(".model-switch")) modelMenuOpen.value = false;
+    if (!t || !t.closest(".model-switch-row")) modelMenuOpen.value = false;
   };
   window.addEventListener("keydown", onEsc);
   window.addEventListener("click", onClickAway);
@@ -769,6 +772,9 @@ const modelMenuOpen = ref(false);
 // 按能力用途分组：纯文本对话模型 vs 视觉/多模态模型（vision 非 none）。
 const textModels = computed(() => availableModels.value.filter((m) => m.vision === "none"));
 const visionModels = computed(() => availableModels.value.filter((m) => m.vision !== "none"));
+const glm5Model = computed(() =>
+  availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label)),
+);
 
 function detectCapabilities(): Capabilities {
   const SR = (window as unknown as Record<string, unknown>).SpeechRecognition ||
@@ -1370,6 +1376,18 @@ async function onClearContext() {
         />
 
         <div class="composer-toolbar">
+          <div class="model-switch-row">
+          <button
+            v-if="glm5Model"
+            type="button"
+            class="model-chip"
+            :class="{ selected: selectedModel === glm5Model.id }"
+            :title="`${glm5Model.label} · TokenHub glm-5`"
+            :disabled="sending"
+            @click="selectModel(glm5Model.id)"
+          >
+            GLM-5
+          </button>
           <div class="model-switch">
             <button
               type="button"
@@ -1470,6 +1488,7 @@ async function onClearContext() {
                 </div>
               </div>
             </Transition>
+          </div>
           </div>
           <div class="toolbar-right">
             <button
@@ -2408,6 +2427,43 @@ async function onClearContext() {
 }
 
 /* 模型切换：按钮 + 下拉菜单 */
+.model-switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-chip {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.model-chip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+
+.model-chip:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.model-chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.model-chip.selected {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
+}
+
 .model-switch {
   position: relative;
 }

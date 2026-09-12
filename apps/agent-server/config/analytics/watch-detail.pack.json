@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-12.01",
+  "version": "2026-09-12.08",
   "id": "watch-detail",
   "datasource": {
     "engine": "clickhouse",
@@ -24,7 +24,8 @@
   "required_filters": ["time_range"],
   "time": {
     "businessTimezone": "Asia/Shanghai",
-    "missingYearDefault": "clock_year"
+    "missingYearDefault": "clock_year",
+    "field": "lastWatchTime"
   },
   "guards": {
     "distinctCountFn": "uniq",
@@ -37,6 +38,18 @@
     "forcedFilters": {}
   },
   "enumDimensions": [
+    {
+      "id": "channel",
+      "field": "channel",
+      "aliases": ["渠道", "频道", "channel"],
+      "domain": "probe",
+      "valueDomain": "literal",
+      "valueAliases": {
+        "印度A": "IndiaA",
+        "印度B": "IndiaB",
+        "印度a": "IndiaA"
+      }
+    },
     {
       "id": "contentLang",
       "field": "contentLang",
@@ -94,7 +107,7 @@
         {
           "id": "sum_watch_second",
           "label": "观看时长合计（秒）",
-          "groundSignals": ["合计", "总时长", "总观看", "时长合计"],
+          "groundSignals": ["时长合计", "总时长", "总观看", "观看时长合计"],
           "compile": {
             "kind": "sum",
             "valueField": "watchSecond"
@@ -140,7 +153,7 @@
       },
       "top_n": {
         "hint": "TopN 排名尚未建模",
-        "groundSignals": ["TopN", "Top N", "top\\s*\\d+", "前\\d+名", "前\\d+"]
+        "groundSignals": ["TopN", "Top N", "top\\s*\\d+", "前\\d+名", "前\\d+", "排行", "排名"]
       },
       "percentile": {
         "hint": "分位数尚未建模",

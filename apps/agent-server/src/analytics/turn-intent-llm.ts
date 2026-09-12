@@ -5,6 +5,7 @@
 import * as trace from "../trace.js";
 import {
   askStateIsComplete,
+  completeTurnIntentSlots,
   inferTurnIntentFallback,
   stripDisableDefaultsPrefix,
   validateTurnIntent,
@@ -12,20 +13,10 @@ import {
   type TurnIntent,
 } from "./ask-state.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
+import type { AnalyticsPack } from "./semantic-layer.js";
+import { packAnalyticsLlmContext } from "./context-pack.js";
+import { wrapPackedAnalyticsUserText } from "./input-guard.js";
 
-function prevAskSummary(prev: AskState): Record<string, unknown> {
-  return {
-    askId: prev.askId,
-    metricId: prev.metricId,
-    time: prev.time,
-    filters: prev.filters,
-    outputDims: prev.outputDims,
-    layout: prev.layout,
-    ops: prev.ops,
-    requested: prev.requested,
-    summary: prev.summary,
-  };
-}
 
 function buildSystemPrompt(): string {
   return [
@@ -38,7 +29,8 @@ function buildSystemPrompt(): string {
     '- "meta": preference actions only.',
     "Rules:",
     "- Follow-ups like 「X呢？」that add a channel for comparison → revise + requestedPatch.channels.mode=union.",
-    "- 「换成/改成 X」channel → revise + mode=replace.",
+    "- 「换成/改成 X」channel → revise + requestedPatch.channels.mode=replace with X only (drop previous channels).",
+    "- If lastClarifySlot is channel and the user names a code, use clarify_answer or replace; never keep ungrounded prev codes.",
     "- Multi-channel compare → set.outputDims must include \"channel\" (and keep watch_date if day grain).",
     "- 「按天/按日」grain → revise set.outputDims to include watch_date; do NOT invent contentLang.",
     "- Without prevAskState you must use new_ask (never revise).",
@@ -61,12 +53,14 @@ function buildUserPrompt(input: {
   prevAskState?: AskState | null;
   lastClarifySlot?: string;
   clarifyOptionIds?: string[];
-}): string {
+}): { text: string; usage: ReturnType<typeof packAnalyticsLlmContext>["usage"] } {
+  const packed = packAnalyticsLlmContext({
+    messages: [{ role: "user", text: input.lastUserText }],
+    prevAskState: input.prevAskState && askStateIsComplete(input.prevAskState) ? input.prevAskState : null,
+    phase: "turn_intent",
+  });
   const parts = [
-    `Last user text:\n${input.lastUserText}`,
-    input.prevAskState && askStateIsComplete(input.prevAskState)
-      ? `prevAskState:\n${JSON.stringify(prevAskSummary(input.prevAskState), null, 2)}`
-      : "prevAskState: null",
+    wrapPackedAnalyticsUserText(packed),
   ];
   if (input.lastClarifySlot) {
     parts.push(`lastClarifySlot: ${input.lastClarifySlot}`);
@@ -75,7 +69,7 @@ function buildUserPrompt(input: {
     }
   }
   parts.push("Emit TurnIntent JSON now.");
-  return parts.join("\n\n");
+  return { text: parts.join("\n\n"), usage: packed.usage };
 }
 
 function extractJsonObject(raw: string): unknown {
@@ -100,6 +94,7 @@ async function chatJson(input: {
   user: string;
   signal?: AbortSignal;
   traceRunId?: string;
+  context?: ReturnType<typeof packAnalyticsLlmContext>["usage"];
 }): Promise<string> {
   const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no_model");
@@ -155,7 +150,7 @@ async function chatJson(input: {
       if (!resp.ok) throw new Error(JSON.stringify(data).slice(0, 300));
       content = String(data.choices?.[0]?.message?.content || "").trim();
     }
-    handle?.end({ status: "ok", meta: { bytes: content.length } });
+    handle?.end({ status: "ok", meta: { bytes: content.length, context: input.context } });
     return content;
   } catch (e) {
     handle?.end({
@@ -183,15 +178,21 @@ export async function resolveTurnIntent(input: {
   modelId?: string;
   signal?: AbortSignal;
   traceRunId?: string;
+  pack?: AnalyticsPack | null;
 }): Promise<ResolveTurnIntentResult> {
   const fb = inferTurnIntentFallback({
     lastUserText: input.lastUserText,
     prevAskState: input.prevAskState,
     slotAnswers: input.slotAnswers,
+    lastClarifySlot: input.lastClarifySlot,
+    pack: input.pack,
   });
 
-  // Pure meta / slotAnswers / empty → no LLM
+  // Pure meta / slotAnswers / grounded channel replace → no LLM
   if (fb.kind === "clarify_answer" || fb.kind === "meta") {
+    return { intent: fb, source: "fallback" };
+  }
+  if ((fb.notes || []).includes("fallback_channel_replace")) {
     return { intent: fb, source: "fallback" };
   }
   if ((fb.notes || []).includes("empty")) {
@@ -219,35 +220,44 @@ export async function resolveTurnIntent(input: {
   }
 
   try {
+    const prompt = buildUserPrompt({
+      lastUserText: textForLlm || input.lastUserText,
+      prevAskState: input.prevAskState,
+      lastClarifySlot: input.lastClarifySlot,
+      clarifyOptionIds: input.clarifyOptionIds,
+    });
     const raw = await chatJson({
       modelId: input.modelId,
       system: buildSystemPrompt(),
-      user: buildUserPrompt({
-        lastUserText: textForLlm || input.lastUserText,
-        prevAskState: input.prevAskState,
-        lastClarifySlot: input.lastClarifySlot,
-        clarifyOptionIds: input.clarifyOptionIds,
-      }),
+      user: prompt.text,
       signal: input.signal,
       traceRunId: input.traceRunId,
+      context: prompt.usage,
     });
     const parsed = extractJsonObject(raw);
     const validated = validateTurnIntent(parsed, input.prevAskState);
+    const completed = completeTurnIntentSlots({
+      intent: validated,
+      lastUserText: textForLlm || input.lastUserText,
+      prevAskState: input.prevAskState,
+      pack: input.pack,
+      lastClarifySlot: input.lastClarifySlot,
+    });
     const notes = [
-      ...(validated.notes || []),
+      ...(completed.notes || []),
       "turn_intent_source:llm",
       ...(disableNote ? ["disable_defaults_this_turn"] : []),
     ];
     if ((validated.notes || []).some((n) => n.startsWith("turn_intent_invalid"))) {
       return {
-        intent: { ...validated, notes },
+        intent: { ...completed, notes },
         source: "llm_invalid",
       };
     }
-    return { intent: { ...validated, notes }, source: "llm" };
+    return { intent: { ...completed, notes }, source: "llm" };
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e);
-    return {
+    const completed = completeTurnIntentSlots({
       intent: {
         kind: "new_ask",
         notes: [
@@ -256,7 +266,11 @@ export async function resolveTurnIntent(input: {
           ...(disableNote ? ["disable_defaults_this_turn"] : []),
         ],
       },
-      source: "llm_error",
-    };
+      lastUserText: textForLlm || input.lastUserText,
+      prevAskState: input.prevAskState,
+      pack: input.pack,
+      lastClarifySlot: input.lastClarifySlot,
+    });
+    return { intent: completed, source: "llm_error" };
   }
 }

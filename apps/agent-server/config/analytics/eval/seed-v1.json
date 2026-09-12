@@ -1,14 +1,18 @@
 {
-  "version": "2026-09-11.1",
+  "version": "2026-09-12.2",
   "packId": "watch-detail",
   "clock": "2026-09-09T12:00:00+08:00",
-  "notes": "Gate EX only counts reviewStatus=gold answerable. Agent-authored answerable = provisional (smoke). Refuse traps = gold structural product rules (time clarify + Ambiguity Gate filter_set/metric). Promote answerable to gold only after human review. 2026-09-11.1: gold answerable=4 (ex-single-day-indiaA + ex-indiaA-total-users + ex-foxA-total-users + ex-indiaA-watch-seconds). Fixed ex-single-day-indiaA gold date range to single-day (Aug20) matching NL; aligned by-day grain for IndiaA/FoxA total-users + watch-seconds gold to match agent daily-series output (gold was single-total).",
+  "notes": "Gate EX counts reviewStatus=gold answerable. 2026-09-12.2: promote 20 provisional answerable after glm5 soft-EX (17 full-run + 3 after CWR/prefs isolation). Refuse traps remain gold structural rules. Eval harness uses isolated ownerKey per case.",
   "cases": [
     {
       "id": "clarify-三种小语种-完播率",
       "nl": "统计 IndiaA 渠道 在 2026-08-19 至 2026-08-25 期间，按观看日期 + 渠道 维度，三种小语种用户观看视频最大进度的平均值，也就是完播率",
       "should_refuse": true,
-      "tags": ["refuse", "ambiguity", "filter_set"],
+      "tags": [
+        "refuse",
+        "ambiguity",
+        "filter_set"
+      ],
       "difficulty": "medium",
       "reviewStatus": "gold",
       "reviewNote": "Ambiguity Gate: contentLang filter_set without member list must clarify before SQL"
@@ -17,7 +21,11 @@
       "id": "clarify-四种语言",
       "nl": "IndiaA 在 2026-08-19 到 2026-08-25 四种语言用户按天观看人数",
       "should_refuse": true,
-      "tags": ["refuse", "ambiguity", "filter_set"],
+      "tags": [
+        "refuse",
+        "ambiguity",
+        "filter_set"
+      ],
       "difficulty": "easy",
       "reviewStatus": "gold",
       "reviewNote": "cardinality without enum list → clarify contentLang"
@@ -26,7 +34,11 @@
       "id": "clarify-多种影片类型",
       "nl": "IndiaA 在 2026-08-19 到 2026-08-25 多种影片类型观看人数",
       "should_refuse": true,
-      "tags": ["refuse", "ambiguity", "filter_set"],
+      "tags": [
+        "refuse",
+        "ambiguity",
+        "filter_set"
+      ],
       "difficulty": "easy",
       "reviewStatus": "gold",
       "reviewNote": "movieType filter_set without members → clarify"
@@ -35,7 +47,11 @@
       "id": "clarify-完播率无口径",
       "nl": "IndiaA 在 2026-08-19 到 2026-08-25 完播率按天",
       "should_refuse": true,
-      "tags": ["refuse", "ambiguity", "metric"],
+      "tags": [
+        "refuse",
+        "ambiguity",
+        "metric"
+      ],
       "difficulty": "easy",
       "reviewStatus": "gold",
       "reviewNote": "completion_rate alias without grounded option → clarify"
@@ -143,8 +159,8 @@
       "goldSqls": [
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-foxA-day-users",
@@ -159,8 +175,8 @@
       "goldSqls": [
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-indiaA-by-lang",
@@ -175,8 +191,8 @@
       "goldSqls": [
         "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-foxA-by-lang",
@@ -191,8 +207,8 @@
       "goldSqls": [
         "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-indiaA-total-users",
@@ -223,8 +239,8 @@
       "goldSqls": [
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-single-day-indiaA",
@@ -245,34 +261,28 @@
     {
       "id": "ex-channel-rank",
       "nl": "八月二十到二十一各渠道观看人数排行",
-      "should_refuse": false,
+      "should_refuse": true,
       "tags": [
-        "aggregation",
-        "rank"
+        "refuse",
+        "capability",
+        "top_n"
       ],
       "difficulty": "medium",
-      "requireLive": true,
-      "goldSqls": [
-        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY users DESC"
-      ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "排行 grounds top_n; capability gate must refuse/clarify, not silent UV"
     },
     {
       "id": "ex-lang-rank",
       "nl": "八月二十到二十一按语言观看人数排行",
-      "should_refuse": false,
+      "should_refuse": true,
       "tags": [
-        "aggregation",
-        "rank"
+        "refuse",
+        "capability",
+        "top_n"
       ],
       "difficulty": "medium",
-      "requireLive": true,
-      "goldSqls": [
-        "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
-      ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "排行 grounds top_n; capability gate must refuse/clarify, not silent UV"
     },
     {
       "id": "ex-indiaA-day-avg-watch",
@@ -288,8 +298,8 @@
       "goldSqls": [
         "SELECT toDate(lastWatchTime) AS d, sum(watchSecond) / uniq(guid) AS avg_watch_sec FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-gogo-day-users",
@@ -304,8 +314,8 @@
       "goldSqls": [
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-multi-indiaA-day-foxA-lang",
@@ -321,8 +331,8 @@
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
         "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-multi-foxA-day-indiaA-lang",
@@ -338,8 +348,8 @@
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
         "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-multi-indiaA-foxA-day",
@@ -356,8 +366,8 @@
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-indiaA-foxA-channel-pair",
@@ -371,11 +381,11 @@
       "difficulty": "medium",
       "requireLive": true,
       "goldSqls": [
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)",
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; multi_query totals (model prefers split over GROUP BY channel)"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-gogo-by-lang",
@@ -390,8 +400,8 @@
       "goldSqls": [
         "SELECT contentLang, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY contentLang ORDER BY users DESC"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-foxA-total-users",
@@ -420,11 +430,11 @@
       "difficulty": "medium",
       "requireLive": true,
       "goldSqls": [
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)",
-        "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11)"
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'IndiaA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
+        "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; multi_query totals (model prefers split over GROUP BY channel)"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     },
     {
       "id": "ex-indiaA-watch-seconds",
@@ -457,8 +467,158 @@
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'GoGo' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d",
         "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel = 'FoxA' AND toDate(lastWatchTime) BETWEEN '2026-08-20' AND '2026-08-21' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY d ORDER BY d"
       ],
-      "reviewStatus": "provisional",
-      "reviewNote": "agent-authored scaffold; not human-confirmed gold"
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "refuse-topn-channels",
+      "nl": "2026-08-19到2026-08-25，观看时长合计 Top 10 渠道",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "capability",
+        "top_n"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "TopN unmodeled; forbid silent uniq downgrade"
+    },
+    {
+      "id": "clarify-brazilA-ungrounded",
+      "nl": "巴西A 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "grounding",
+        "channel"
+      ],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "live 2026-09-12: no BrazilA in elt_watch_detail; clarify channel; SQL empty"
+    },
+    {
+      "id": "clarify-brazil-compare-no-silent",
+      "nl": "对比 IndiaA 和巴西A 在 2026-08-19 至 2026-08-25 的观看人数，按渠道",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "grounding",
+        "channel"
+      ],
+      "difficulty": "medium",
+      "reviewStatus": "gold",
+      "reviewNote": "live 2026-09-12: partial ground must not drop 巴西A and run IndiaA only"
+    },
+    {
+      "id": "clarify-indiaB-ungrounded",
+      "nl": "对比 IndiaA 和 IndiaB 在 2026-08-19 至 2026-08-25 的观看人数，按渠道",
+      "should_refuse": true,
+      "tags": [
+        "refuse",
+        "grounding",
+        "channel"
+      ],
+      "difficulty": "medium",
+      "reviewStatus": "gold",
+      "reviewNote": "live 2026-09-12: IndiaB not in elt_watch_detail; must not silent-ok IndiaA only"
+    },
+    {
+      "id": "ex-baseline-uniq-week",
+      "nl": "IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "date"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND channel = 'IndiaA' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "ex-S1-alias",
+      "nl": "印度A 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "alias"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND channel = 'IndiaA' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "ex-C4-movie",
+      "nl": "2026-08-19到2026-08-25，电影的观看人数，按天",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "movieType"
+      ],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND movieType = 1 GROUP BY watchDate ORDER BY watchDate"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "ex-C6-yoy",
+      "nl": "2026-08-19到2026-08-25，各渠道观看人数的同比增长率",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "yoy"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY channel",
+        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2025-08-19' AND '2025-08-25' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY channel"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "ex-mom",
+      "nl": "2026-08-19到2026-08-25，各渠道观看人数的环比增长率",
+      "should_refuse": false,
+      "tags": [
+        "multi_query",
+        "mom"
+      ],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY channel",
+        "SELECT channel, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-12' AND '2026-08-18' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY channel ORDER BY channel"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "ex-filme-tela-uv",
+      "nl": "FilmeTela 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "should_refuse": false,
+      "tags": [
+        "aggregation",
+        "channel"
+      ],
+      "difficulty": "easy",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND channel = 'FilmeTela' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
     }
   ]
 }

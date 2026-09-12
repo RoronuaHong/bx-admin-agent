@@ -14,6 +14,8 @@ type Case = {
   forbidOkSql?: RegExp[];
   whenClarifyLabel?: RegExp;
   forbidClarifySlot?: string;
+  requireSlot?: string;
+  minSqls?: number;
 };
 
 const cases: Case[] = [
@@ -47,26 +49,82 @@ const cases: Case[] = [
   {
     id: "C4-movie",
     nl: "2026-08-19到2026-08-25，电影的观看人数，按天",
-    expectStatus: ["ok", "clarify"],
+    expectStatus: ["ok"],
     whenOkSqlMust: [/movieType\s*=\s*1|movieType\s+IN\s*\([^)]*\b1\b/i],
-    whenClarifyLabel: /电影/,
+    forbidOkSql: [/channel\s*=/i],
   },
   {
     id: "C2-wide",
     nl: "对比 te-IN 和 ta-IN 的平均最大观看进度，按内容语言分列，宽表展示；时间 2026-08-19 到 2026-08-25，渠道 IndiaA",
-    expectStatus: ["ok", "clarify", "refuse"],
-    whenOkSqlMust: [/sumIf|countIf/i, /te-IN/, /ta-IN/],
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/sumIf|countIf|avgIf/i, /te-IN/, /ta-IN/, /IndiaA/],
+  },
+  {
+    id: "S1-alias",
+    nl: "印度A 在 2026-08-19 至 2026-08-25 按天观看人数",
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/uniq\s*\(\s*guid\s*\)/i, /IndiaA/],
+  },
+  {
+    id: "S6-mixed-grain",
+    nl: "八月二十到二十一印度A按天观看人数，同时FoxA按语言观看人数",
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/IndiaA/, /FoxA/],
+    minSqls: 2,
+  },
+  {
+    id: "S7-split",
+    nl: "八月二十到二十一印度A和FoxA各自按天观看人数",
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/IndiaA/, /FoxA/],
+    minSqls: 2,
+  },
+  {
+    id: "S8-yoy-channel",
+    nl: "IndiaA 2026-08 同比观看人数",
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/IndiaA/, /2025-08/, /2026-08/],
+  },
+  {
+    id: "clarify-completion",
+    nl: "2026-08-19到2026-08-25，IndiaA 完播率按天",
+    expectStatus: ["clarify"],
+    whenClarifyLabel: /指标口径|最大观看进度|完播|阈值/,
+  },
+  {
+    id: "brazilA-clarify",
+    nl: "巴西A 在 2026-08-19 至 2026-08-25 按天观看人数",
+    expectStatus: ["clarify"],
+    requireSlot: "channel",
+    forbidClarifySlot: "contentLang",
+    whenClarifyLabel: /渠道|channel|巴西/,
+  },
+  {
+    id: "brazil-compare-no-silent",
+    nl: "对比 IndiaA 和巴西A 在 2026-08-19 至 2026-08-25 的观看人数，按渠道",
+    expectStatus: ["clarify"],
+    requireSlot: "channel",
+    forbidClarifySlot: "contentLang",
+  },
+  {
+    id: "filme-tela-uv",
+    nl: "FilmeTela 在 2026-08-19 至 2026-08-25 按天观看人数",
+    expectStatus: ["ok"],
+    whenOkSqlMust: [/uniq\s*\(\s*guid\s*\)/i, /FilmeTela/],
+    forbidClarifySlot: "contentLang",
   },
 ];
 
 const clock = new Date("2026-09-11T12:00:00+08:00");
+const modelId = "glm5";
+const ownerKey = `analytics:consistency-live:${Date.now()}`;
 let failed = 0;
 
 for (const c of cases) {
   const t0 = Date.now();
   let r;
   try {
-    r = await analyticsAsk(c.nl, { clock });
+    r = await analyticsAsk(c.nl, { clock, modelId, ownerKey: `${ownerKey}:${c.id}` });
   } catch (e) {
     console.log(
       JSON.stringify({
@@ -97,6 +155,9 @@ for (const c of cases) {
     }
     if (/missing_where/i.test(r.error || "")) issues.push("missing_where_error");
   }
+  if (r.status === "ok" && c.minSqls && (r.sqls || []).length < c.minSqls) {
+    issues.push(`sql_count=${(r.sqls || []).length}<${c.minSqls}`);
+  }
   if (r.status === "ok" && c.forbidOkSql) {
     const sql = (r.sqls || []).join("\n");
     for (const re of c.forbidOkSql) {
@@ -110,11 +171,21 @@ for (const c of cases) {
   if (r.status === "clarify" && c.forbidClarifySlot && r.clarifySlot === c.forbidClarifySlot) {
     issues.push(`spurious_clarify:${c.forbidClarifySlot}`);
   }
-  if (r.status === "ok" && c.id === "C4-movie") {
-    const sql = (r.sqls || []).join("\n");
-    if (!/movieType/.test(sql) || !/\b1\b/.test(sql)) {
-      // lexicon may put IN (1) — already checked by whenOkSqlMust
-    }
+  if (c.requireSlot && r.clarifySlot !== c.requireSlot) {
+    issues.push(`slot=${r.clarifySlot} want ${c.requireSlot}`);
+  }
+  if (/missing_where/i.test(r.error || "")) issues.push("missing_where_error");
+  if (r.status === "ok" && /巴西/.test(c.nl)) {
+    issues.push("brazil_silent_ok");
+  }
+  if ((r.sqls || []).some((s) => /巴西A|BrazilA/i.test(s))) {
+    issues.push("ghost_brazil_sql");
+  }
+  if (c.id === "brazil-compare-no-silent" && r.status === "ok") {
+    issues.push("compare_dropped_brazil_ran_india_only");
+  }
+  if (c.id === "C2-wide" && r.status === "ok" && r.askState?.metricId && r.askState.metricId !== "avg_max_progress") {
+    issues.push(`metricId=${r.askState.metricId}`);
   }
 
   const pass = issues.length === 0;
@@ -132,6 +203,7 @@ for (const c of cases) {
         clarifyOptions: (r.clarifyOptions || []).slice(0, 5),
         issues,
         packVersion: r.packVersion,
+        modelId: r.modelId,
       },
       null,
       0,

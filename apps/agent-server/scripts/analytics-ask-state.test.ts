@@ -3,13 +3,18 @@
  * Run: tsx scripts/analytics-ask-state.test.ts
  */
 import assert from "node:assert/strict";
+import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 import {
+  applySlotAnswersToAskState,
   askStateIsComplete,
   askStateToStructured,
   buildAskStateFromStructure,
+  completeTurnIntentSlots,
   extractChannelTokensFromText,
   inferTurnIntentFallback,
+  isChannelSlotAnswer,
   mergeAskState,
+  normalizeResultLayout,
   parseAskState,
   validateTurnIntent,
   type AskState,
@@ -17,7 +22,10 @@ import {
 } from "../src/analytics/ask-state.js";
 
 {
+  const pack = loadAnalyticsPack("watch-detail");
   assert.deepEqual(extractChannelTokensFromText("IndiaB呢？"), ["IndiaB"]);
+  assert.deepEqual(extractChannelTokensFromText("以后默认印度A", pack), ["IndiaA"]);
+  assert.deepEqual(extractChannelTokensFromText("以后默认印度A"), []);
 }
 
 const base: AskState = {
@@ -41,6 +49,28 @@ const base: AskState = {
     prevAskState: base,
   });
   assert.equal(fb.kind, "new_ask");
+}
+
+{
+  const completed = completeTurnIntentSlots({
+    intent: { kind: "revise", notes: ["validated_revise"] },
+    lastUserText: "那换成 IndiaA 吧",
+    prevAskState: {
+      ...base,
+      filters: { channel: ["GhostZZZ"] },
+      requested: { channels: ["GhostZZZ"] },
+    },
+  });
+  assert.equal(completed.kind, "revise");
+  if (completed.kind === "revise") {
+    assert.deepEqual(completed.requestedPatch?.channels, { mode: "replace", values: ["IndiaA"] });
+  }
+  const stillFollowup = completeTurnIntentSlots({
+    intent: { kind: "new_ask", notes: ["fallback_new_ask"] },
+    lastUserText: "IndiaB呢？",
+    prevAskState: base,
+  });
+  assert.equal(stillFollowup.kind, "new_ask");
 }
 
 {
@@ -177,6 +207,97 @@ const base: AskState = {
   assert.ok(askStateIsComplete(built));
   const structured = askStateToStructured(built);
   assert.equal(structured.status, "ok");
+}
+
+{
+  const extra = applySlotAnswersToAskState({
+    prev: base,
+    slotAnswers: {
+      contentLang: ["ta-IN", "te-IN"],
+      result_layout: ["wide"],
+    },
+  });
+  assert.ok(extra.ok);
+  if (extra.ok) {
+    assert.deepEqual(extra.state.filters.contentLang, ["ta-IN", "te-IN"]);
+    assert.equal(extra.state.layout, "wide");
+  }
+}
+
+{
+  const pack = loadAnalyticsPack("watch-detail");
+  assert.equal(isChannelSlotAnswer("那换成 IndiaA 吧", ["IndiaA"]), true);
+  assert.equal(isChannelSlotAnswer("IndiaA 的人均观看时长", ["IndiaA"]), false);
+  const clarify = inferTurnIntentFallback({
+    lastUserText: "那换成 IndiaA 吧",
+    prevAskState: {
+      ...base,
+      filters: { channel: ["GhostZZZ"] },
+      requested: { channels: ["GhostZZZ"] },
+    },
+    lastClarifySlot: "channel",
+    pack,
+  });
+  assert.equal(clarify.kind, "clarify_answer");
+  if (clarify.kind === "clarify_answer") {
+    assert.equal(clarify.slot, "channel");
+    assert.deepEqual(clarify.values, ["IndiaA"]);
+  }
+  const replace = inferTurnIntentFallback({
+    lastUserText: "那换成 IndiaA 吧",
+    prevAskState: {
+      ...base,
+      filters: { channel: ["GhostZZZ"] },
+      requested: { channels: ["GhostZZZ"] },
+    },
+    pack,
+  });
+  assert.equal(replace.kind, "revise");
+  if (replace.kind === "revise") {
+    assert.deepEqual(replace.requestedPatch?.channels, { mode: "replace", values: ["IndiaA"] });
+  }
+  const leftover = inferTurnIntentFallback({
+    lastUserText: "IndiaA 的人均观看时长",
+    prevAskState: base,
+    lastClarifySlot: "channel",
+    pack,
+  });
+  assert.equal(leftover.kind, "new_ask");
+}
+
+{
+  assert.equal(normalizeResultLayout("宽表"), "wide");
+  assert.equal(normalizeResultLayout("1"), "wide");
+  assert.equal(normalizeResultLayout("长表"), "long");
+  assert.equal(normalizeResultLayout("ghost"), undefined);
+  const fromNl = inferTurnIntentFallback({
+    lastUserText: "宽表",
+    prevAskState: base,
+    lastClarifySlot: "result_layout",
+  });
+  assert.equal(fromNl.kind, "clarify_answer");
+  if (fromNl.kind === "clarify_answer") {
+    assert.equal(fromNl.slot, "result_layout");
+    assert.deepEqual(fromNl.values, ["wide"]);
+  }
+  const merged = mergeAskState({
+    prev: base,
+    intent: { kind: "clarify_answer", slot: "result_layout", values: ["宽表"] },
+  });
+  assert.ok(merged.ok);
+  if (merged.ok) assert.equal(merged.state.layout, "wide");
+}
+
+{
+  const merged = mergeAskState({
+    prev: base,
+    intent: { kind: "clarify_answer", slot: "table", values: ["elt_film_order"] },
+  });
+  assert.ok(merged.ok);
+  if (merged.ok) {
+    assert.equal(merged.state.table, "elt_film_order");
+    assert.ok(!merged.state.filters.table);
+  }
 }
 
 console.log("analytics-ask-state.test.ts OK");

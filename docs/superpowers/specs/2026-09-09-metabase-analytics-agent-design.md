@@ -1,7 +1,7 @@
 # Metabase 数据分析 Agent 设计（定稿）
 
 > **状态**：设计定稿；**M1 / M2 / M3 已验收**（2026-09-10，见 §12 / 各验收清单）  
-> **日期**：2026-09-09（实现收口 2026-09-10）  
+> **日期**：2026-09-09（实现收口 2026-09-10；**2026-09-12 架构权威收口为 A：语义层编译**）  
 > **宿主**：bx-admin-agent（`apps/web` + `apps/agent-server`）  
 > **关联**：取代 [`docs/通用数据分析Agent方案.md`](../../通用数据分析Agent方案.md) 中「以 `call_api` 为权威取数」的路径；Multi-Agent Worker 装配见 `docs/agent/MULTI_AGENT_ARCHITECTURE.md`  
 > **产品范围**：对话取数 + 自动巡检预警（交付按 M1→M2→M3 切分，范围不砍）  
@@ -13,8 +13,8 @@
 
 ## 1. 一句话定位
 
-用户用自然语言提问 → 时间确定性 resolve →（按需）Probe → LLM 生成 SQL → **全局去重规范化** → 护栏/**日·维·列 Verify** → Metabase 执行 → 失败/空结果则回喂重写（不定则反问）→ 表/图交付。  
-**允许**全局引擎默认（如 `distinctCountFn=uniq`、缺年=today 年）；**禁止**业务同义词表与手维逐指标公式表；**禁止**模型自猜「今天/缺年/去重口径」作唯一手段。对齐业界：**Agentic Text-to-SQL（B）+ 确定性闸**；不走完整语义层指标编译（A）作权威。
+用户用自然语言提问 → 时间确定性 resolve → Structure / TurnIntent（LLM **填槽，不写 SQL**）→ 能力/覆盖/歧义/接地闸 → Intent → **确定性 sql-compile** → lint / Verify → Metabase 执行 → 表/图交付。  
+**允许**全局引擎默认（如 `distinctCountFn=uniq`、缺年=today 年）；渠道/维值别名以 **pack + Metabase lexicon/probe** 为源，禁止代码里维护产品白名单当主路径；**禁止**模型自猜「今天/缺年/去重口径」或私自写 SQL。对齐业界：**语义层编译（A）为权威**；B（LLM 写 SQL + 执行回写）为非目标。
 
 入口为独立应用页 `/analytics`，会话与后台管理 Agent（`/chat`）隔离。权威数据源仅为 Metabase（[bi.vmovs.com](https://bi.vmovs.com)），不经后台业务 `call_api` 取数。
 
@@ -25,7 +25,7 @@
 ### 2.1 目标
 
 - 通用分析能力：换场景 = 加语义层场景包（pack）+ 评测用例，不改执行内核。
-- 主链路：NL → **时间 resolve** →（按需）Probe → SQL(s) → 护栏 → 并行执行 → 汇总展示（优先 Metabase 表/图能力）。
+- 主链路：NL → **时间 resolve** → Structure/TurnIntent 填槽 → 闸门 → **Intent 编译 SQL** → 护栏 → 并行执行 → 汇总展示（优先 Metabase 表/图能力）。
 - V1 含对话分析与可配置的自动巡检预警（钉钉 + 应用内）。
 - **质量双保证（必须）**：
   - **正确率（EX）**：可答题结果与 gold 对齐，发版默认 **≥ 85%**（M2 争取 ≥ 90%）；
@@ -47,7 +47,7 @@
 | 旧草案（2026-09-08） | 本定稿 |
 |---------------------|--------|
 | `call_api` 取投放数据 | **废止为本 Agent 权威路径** |
-| 语义层偏「模板填槽」易被误解 | **LLM 主生成**；examples/question 仅加速 |
+| 语义层偏「模板填槽」易被误解 | **LLM 填槽 + 代码编译 SQL**；examples/question 仅加速 |
 | 前端 ECharts 为主 | **dataset 默认**；按需 Metabase 临时 card；否则本地 ECharts |
 
 旧文保留作历史参考，文首应指向本文。
@@ -189,9 +189,9 @@ M1：本仓内核 + facade A 和/或 B（建议含 analytics_ask）
 - 表白名单、`required_filters`、LIMIT/超时/估计阈值、临时 card 目录。
 - 维度列可声明「取值靠库内 Probe」，**禁止**把「泰卢固→te-IN」类中文同义词表当作主路径。
 
-**对齐主流 Agent**：**工具 + 闭环**（Probe → Generate → Guard/Verify → Rewrite），不是「业务词写死路由」。
+**对齐主流 Agent**：LLM 声明槽位/修订，**代码编译与校验**；Probe / lexicon 接地维值，不是「业务词写死路由」。
 
-**不是**「填槽拼死模板替代 LLM」的引擎。主路径始终是 LLM 生成 SQL（可多条）。`examples` 与 `questionBindings` 仅作加速与口径锚定。
+主路径是 **语义层编译（A）**：LLM 不写 SQL。`examples` 与 `questionBindings` 仅作加速与口径锚定。Agentic Text-to-SQL（B：生成→执行→改写 SQL）为历史方案，**不是**本仓权威。
 
 ### 5.2 配置（可热更新）
 
@@ -552,14 +552,14 @@ UI：有用 / 有误 + 错因标签。
 | **B. Agentic Text-to-SQL** | PV-SQL、DIVER、CHESS、LangChain SQL Agent | LLM 写 SQL + **Probe / 规则 Verify / 执行回馈** | 探索/口语/覆盖面优先 |
 
 共识（dbt 2026 等）：**准确率优先用 A；临时探索用 B**；生产常混用。  
-**本仓拍板**：走 **B 骨架**（工具+闭环），只吸收 A 的「确定性」思想（全局默认、护栏、Verify checklist）；**CUT** 手维大指标库与业务同义词主路径（§5.6）。
+**本仓拍板（2026-09-12 收口）**：走 **A 权威**（pack metric/dim → Intent → `sql-compile`）；LLM 只填 Structure / TurnIntent。B 的「执行后改写 SQL」**CUT**。维值别名放 pack / Metabase lexicon，不在代码写产品 allow-list。
 
 #### 8.7.2 生产共性层（与模型品牌无关）
 
 ```
-NL → 槽位 → 受控上下文（裁剪 schema / Probe 真值）
-  → 生成 → 校验闸（只读、必填槽、lint、grain/维/列 Verify）
-  → 执行 → 空/错回馈重写或反问 → 带来源交付
+NL → 槽位（LLM JSON）→ 受控上下文（pack / Probe / lexicon）
+  → 确定性编译 SQL → 校验闸（只读、必填槽、lint、grain/维/列 Verify）
+  → 执行 → 空/错则反问或拒答（不改写 SQL）→ 带来源交付
   → 离线 EX + 拒答召回 + CWR 门禁
 ```
 

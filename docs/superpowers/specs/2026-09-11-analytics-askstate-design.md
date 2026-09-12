@@ -7,6 +7,7 @@
 > - [`2026-09-09-metabase-analytics-agent-design.md`](./2026-09-09-metabase-analytics-agent-design.md)  
 > - [`2026-09-10-analytics-ambiguity-gate-design.md`](./2026-09-10-analytics-ambiguity-gate-design.md)  
 > - [`2026-09-11-analytics-reliability-roadmap.md`](./2026-09-11-analytics-reliability-roadmap.md)  
+> - [`2026-09-12-analytics-context-budget-design.md`](./2026-09-12-analytics-context-budget-design.md)（每次推理喂什么：分桶投影，禁止全文当权威）  
 > **决策**：采用方案 B（AskState）；channel 未接地默认 **`clarify`**（非 refuse）
 
 ---

@@ -9,13 +9,21 @@ import * as trace from "../trace.js";
 import { getUpload, MAX_AT_ONCE } from "../uploads.js";
 import { transcribeImage } from "../vision.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
-import { loadAnalyticsPack, type AnalyticsPack } from "./semantic-layer.js";
+import {
+  allowedTableNames,
+  loadAnalyticsPack,
+  packTimeField,
+  canApplyTextChannelFilter,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
+import { answerableTableNamedInNl, formatCatalogFacts, refreshPackFromCatalog } from "./catalog.js";
+import { resolveAskTable } from "./table-resolve.js";
 import {
   assertAnalyticsSqlSafe,
   lintSql,
   normalizeDistinctCount,
 } from "./sql-guard.js";
-import { applyResolvedTime, hasTimeSignal, resolveTimeRange } from "./time-resolve.js";
+import { applyResolvedTime, resolveAskTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
 import { reconcileNamedDimensions } from "./dim-reconcile.js";
@@ -26,15 +34,23 @@ import { compileAnalyticsIntent } from "./sql-compile.js";
 import {
   buildStructureSystemPrompt,
   buildStructureUserPrompt,
-  formatConversationTranscript,
   impliesLangSetWithoutMembers,
+  neededProbeFields,
+  needsDimensionProbe,
   parseStructureResponse,
   userDemandsLangFilter,
   type ConversationTurn,
   type StructuredAskResult,
 } from "./conversation-structure.js";
 import { runSchemaAgent, runStructureOnce } from "./schema-agent.js";
-import { guardAnalyticsInput, type AskRuntimeContext } from "./input-guard.js";
+import {
+  UNTRUSTED_USER_CONTENT_RULE,
+  buildAskFactsBlock,
+  guardAnalyticsInput,
+  wrapPackedAnalyticsUserText,
+  type AskRuntimeContext,
+} from "./input-guard.js";
+import { packAnalyticsLlmContext, type AnalyticsLlmPack } from "./context-pack.js";
 import {
   attachClarifyOptions,
   layoutClarifyOptions,
@@ -43,16 +59,27 @@ import {
   type ClarifyOption,
 } from "./clarify-options.js";
 import { loadFieldLexicon, resolvePackFilters, groundRemappedFieldFromNl } from "./dim-resolve.js";
-import { lexiconClarifyOptions } from "./dim-lexicon.js";
+import { lexiconClarifyOptions, type DimLexicon } from "./dim-lexicon.js";
 import { evaluateCapabilityGate } from "./capability-gate.js";
-import { inferMetricIdFromNl, inferOutputDimsFromNl } from "./metric-infer.js";
+import { applyCoverageGate, coverageFields } from "./coverage-gate.js";
+import {
+  ambiguousMetricFamilyClarify,
+  alignMetricIdToNl,
+  coerceUnknownMetricId,
+  inferMetricIdFromNl,
+  inferOutputDimsFromNl,
+  nlForMetricFamilyGate,
+} from "./metric-infer.js";
+import { checkMetricIntentAlignment } from "./llm-verify.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import {
   compileAskPlanSteps,
   gateAskPlan,
   inclusiveDaySpan,
   mergeRatioTables,
+  growthKindToSynthesize,
   relativeGrowthKind,
+  resolvePlanCardinality,
   synthesizeMomPlan,
   synthesizeYoyPlan,
 } from "./ask-plan.js";
@@ -67,6 +94,7 @@ import {
   askStateIsComplete,
   askStateToStructured,
   buildAskStateFromStructure,
+  applySlotAnswersToAskState,
   mergeAskState,
   parseAskState,
   type AskState,
@@ -76,7 +104,13 @@ import { resolveTurnIntent } from "./turn-intent-llm.js";
 import { groundChannelFilters } from "./grounding-gate.js";
 import { applyDeliveryReconcile, type DeliveryMode } from "./delivery.js";
 
-type LlmOpts = { modelId?: string; signal?: AbortSignal; traceRunId?: string; spanName?: string };
+type LlmOpts = {
+  modelId?: string;
+  signal?: AbortSignal;
+  traceRunId?: string;
+  spanName?: string;
+  spanMeta?: Record<string, unknown>;
+};
 
 async function collectAttachmentContext(
   images?: string[],
@@ -169,7 +203,7 @@ async function llmText(system: string, user: string, opts?: LlmOpts): Promise<st
           totalTokens: data.usage.total_tokens,
         }
       : undefined;
-    endOnce({ usage });
+    endOnce({ usage, meta: opts?.spanMeta });
     if (opts?.traceRunId) trace.setRunModel(opts.traceRunId, model.id);
     return data.choices?.[0]?.message?.content || "";
   } catch (e) {
@@ -182,16 +216,26 @@ async function probeDimensions(
   pack: AnalyticsPack,
   range: { start: string; end: string },
   signal?: AbortSignal,
+  fields?: string[],
 ): Promise<string> {
-  const dims = pack.probeDimensions.slice(0, pack.guards.maxProbeRounds);
+  const wanted = fields?.length
+    ? pack.probeDimensions.filter((d) => fields.includes(d))
+    : pack.probeDimensions;
+  const dims = wanted.slice(0, pack.guards.maxProbeRounds);
   const lines: string[] = [];
   for (const dim of dims) {
     signal?.throwIfAborted();
     const table = pack.tables[0]?.name ?? "elt_watch_detail";
+    const timeField = packTimeField(pack);
+    const liveFields = new Set(pack.tables[0]?.fields || []);
+    if (liveFields.size && !liveFields.has(dim)) {
+      lines.push(`${dim}: SKIP_NOT_IN_CATALOG`);
+      continue;
+    }
     const sql = [
       `SELECT ${dim}, count() AS c`,
       `FROM ${table}`,
-      `WHERE toDate(lastWatchTime) BETWEEN '${range.start}' AND '${range.end}'`,
+      `WHERE toDate(${timeField}) BETWEEN '${range.start}' AND '${range.end}'`,
       `GROUP BY ${dim}`,
       `ORDER BY c DESC`,
       `LIMIT 20`,
@@ -220,20 +264,30 @@ function collectIssues(
   sqls: string[],
   allowedTables: string[],
   dimColumns?: string[],
+  timeField?: string,
+  skipNamedChannel?: boolean,
 ): string[] {
   const issues: string[] = [];
+  const tf = timeField || "lastWatchTime";
   for (const sql of sqls) {
     try {
       assertAnalyticsSqlSafe(sql, allowedTables);
     } catch (e) {
       issues.push(e instanceof Error ? e.message : String(e));
     }
-    issues.push(...lintSql(sql, nl));
-    issues.push(...verifyGrainDay(nl, sql));
+    issues.push(...lintSql(sql, nl, { timeField: tf }));
+    issues.push(...verifyGrainDay(nl, sql, tf));
   }
-  issues.push(...verifyNamedChannel(nl, sqls, dimColumns));
+  if (!skipNamedChannel) {
+    issues.push(...verifyNamedChannel(nl, sqls, dimColumns));
+  }
   issues.push(...verifyMultiQueryIntent(nl, sqls));
   return [...new Set(issues)];
+}
+
+function sqlHasDayGrain(sql: string, pack: AnalyticsPack): boolean {
+  const f = packTimeField(pack).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`toDate\\s*\\(\\s*${f}\\s*\\)`, "i").test(sql);
 }
 
 /** \u8986\u76d6\u7f3a\u53e3 / SQL \u5b89\u5168\u95ee\u9898 \u2192 refuse\uff1b\u5176\u4f59 \u2192 clarify */
@@ -302,7 +356,7 @@ function allEmpty(results: DatasetResult[]): boolean {
 /** Intent/compile \u5931\u8d25\u65f6\u7528 LLM \u89e3\u91ca\u539f\u56e0\uff1b\u4e25\u7981 LLM \u5199 SQL */
 async function diagnoseFailure(
   input: {
-    transcript: string;
+    packed: AnalyticsLlmPack;
     stage: string;
     detail: string;
     structuredJson?: string;
@@ -320,14 +374,18 @@ async function diagnoseFailure(
       [
         `Stage: ${input.stage}`,
         `Detail: ${input.detail}`,
-        `Transcript:\n${input.transcript.slice(0, 2500)}`,
-        input.structuredJson ? `Structured JSON:\n${input.structuredJson}` : "",
-        input.intentJson ? `Intent:\n${input.intentJson}` : "",
+        wrapPackedAnalyticsUserText(input.packed),
+        input.structuredJson
+          ? `Structured JSON:\n${input.structuredJson.length > 1200 ? `${input.structuredJson.slice(0, 1200)}\n?(truncated)` : input.structuredJson}`
+          : "",
+        input.intentJson
+          ? `Intent:\n${input.intentJson.length > 800 ? `${input.intentJson.slice(0, 800)}\n?(truncated)` : input.intentJson}`
+          : "",
         input.sqlPreview ? `SQL preview:\n${input.sqlPreview.slice(0, 800)}` : "",
       ]
         .filter(Boolean)
         .join("\n\n"),
-      { ...opts, spanName: "analytics.diagnose" },
+      { ...opts, spanName: "analytics.diagnose", spanMeta: { context: input.packed.usage } },
     );
     const cleaned = text.trim();
     if (cleaned) return cleaned.slice(0, 800);
@@ -471,7 +529,7 @@ export async function analyticsAsk(
     });
     const llmOptsBase: LlmOpts = { modelId: opts?.modelId, signal: opts?.signal, traceRunId: runId };
 
-    const pack = loadAnalyticsPack(opts?.packId || "watch-detail");
+    let pack = loadAnalyticsPack(opts?.packId || "watch-detail");
     packVersion = pack.version;
     const clock = opts?.clock || new Date();
     const tz = pack.time.businessTimezone || config.metabase.businessTimezone;
@@ -495,34 +553,86 @@ export async function analyticsAsk(
       conversation = [...conversation, { role: "user", text: `\u6f84\u6e05\u9009\u62e9\uff1a${parts.join("\uff1b")}` }];
     }
 
-    const userTextJoined = conversation
-      .filter((m) => m.role === "user")
-      .map((m) => m.text)
-      .join("\n");
+    const userTexts = conversation.filter((m) => m.role === "user").map((m) => m.text);
+    const lastUserText = userTexts[userTexts.length - 1] || nlSafe || nlForResolve;
+    const priorUserTexts = userTexts.slice(0, -1).reverse();
     const prevAskStateEarly = parseAskState(opts?.prevAskState);
-    let timeResolved = resolveTimeRange(userTextJoined, clock, tz);
-    if (!timeResolved.ok && prevAskStateEarly?.time?.start && prevAskStateEarly.time?.end) {
-      timeResolved = {
-        ok: true,
-        range: {
-          start: prevAskStateEarly.time.start,
-          end: prevAskStateEarly.time.end,
-          echo: `\u6309 ${prevAskStateEarly.time.start}\uff5e${prevAskStateEarly.time.end}`,
-        },
-      };
+
+    const catalogApplied = await refreshPackFromCatalog(pack, {
+      signal: opts?.signal,
+      nl: lastUserText,
+    });
+    pack = catalogApplied.pack;
+    const catalogFacts = formatCatalogFacts(pack, catalogApplied.notes);
+    const blocked = catalogApplied.unmodeledTablesInNl;
+    if (blocked.length) {
+      return seal({
+        status: "refuse",
+        message: `\u8868 ${blocked.join("\u3001")} \u5df2\u9690\u85cf\u6216\u4e0d\u53ef\u67e5\u8be2\uff08\u4e34\u65f6\u8868/\u5b57\u5178/\u4e0a\u4f20\u8868\uff09\uff0c\u4e0d\u4f1a\u751f\u6210 SQL\u3002`,
+        error: `blocked_table:${blocked.join(",")}`,
+        packVersion: pack.version,
+        semanticOk: false,
+        semanticIssues: catalogApplied.notes,
+      });
     }
-    // \u4ec5\u300c\u6700\u8fd1\u300d\u65e0\u5177\u4f53\u5929\u6570\u65f6\u53cd\u95ee\u65f6\u95f4
-    if (
-      !timeResolved.ok &&
-      /\u6700\u8fd1/.test(userTextJoined) &&
-      !hasTimeSignal(userTextJoined.replace(/\u6700\u8fd1/g, ""))
-    ) {
+
+    const timeResolved = resolveAskTimeRange({
+      lastUserText,
+      prevTime: prevAskStateEarly?.time,
+      priorUserTexts,
+      clock,
+      tz,
+    });
+    // Code could not pin start/end: clarify immediately. Do not let the LLM guess time.
+    if (!timeResolved.ok) {
       return seal({
         status: "clarify",
         message: timeResolved.clarify,
         clarifySlot: "time_range",
       });
     }
+    const timeCol = packTimeField(pack);
+    const overlayFields = pack.tables[0]?.fields || [];
+    if (
+      pack.catalog?.source !== "skipped" &&
+      overlayFields.length &&
+      !overlayFields.includes(timeCol)
+    ) {
+      return seal({
+        status: "refuse",
+        message: `???? ${timeCol} ???? overlay ? schema???????`,
+        error: `catalog_time_field_missing:${timeCol}`,
+        packVersion: pack.version,
+        semanticOk: false,
+        semanticIssues: catalogApplied.notes,
+      });
+    }
+
+    const tableResolved = resolveAskTable({
+      nl: lastUserText,
+      pack,
+      hinted: opts?.slotAnswers?.table?.[0],
+      fallback: prevAskStateEarly
+        ? prevAskStateEarly.table || pack.tables[0]?.name
+        : undefined,
+    });
+    if (tableResolved.status === "clarify") {
+      const clarified = attachClarifyOptions(tableResolved.message, tableResolved.options, {
+        multiSelect: false,
+        slot: "table",
+      });
+      return seal({
+        status: "clarify",
+        message: clarified.message,
+        clarifySlot: "table",
+        clarifyOptions: clarified.clarifyOptions,
+        timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+        packVersion: pack.version,
+        semanticOk: false,
+        semanticIssues: [`table_resolve:${tableResolved.reason}`],
+      });
+    }
+    const lockedTable = tableResolved.table;
 
     const askContext: AskRuntimeContext = {
       clockIsoDate: clockIso,
@@ -535,11 +645,12 @@ export async function analyticsAsk(
         : `unresolved: ${timeResolved.clarify}`,
       timeResolved: timeResolved.ok ? timeResolved.range : undefined,
       prefsFacts: formatAnalyticsPrefsFacts(analyticsPrefs) || undefined,
+      catalogFacts: [catalogFacts, `- resolved_table: ${lockedTable} (${tableResolved.reason})`]
+        .filter(Boolean)
+        .join("\n"),
     };
 
     const prevAskState = prevAskStateEarly;
-    const lastUserText =
-      [...conversation].reverse().find((m) => m.role === "user")?.text || nlSafe || nlForResolve;
     const turnResolved = await resolveTurnIntent({
       lastUserText,
       prevAskState,
@@ -549,10 +660,28 @@ export async function analyticsAsk(
       modelId: opts?.modelId,
       signal: opts?.signal,
       traceRunId: runId || undefined,
+      pack,
     });
     const turnIntent: TurnIntent = turnResolved.intent;
     turnKind = turnIntent.kind;
     turnIntentSource = turnResolved.source;
+    /** Gates read current turn + structure summary; never the full transcript. */
+    const askScopeNl = (merged = "") =>
+      [...new Set([lastUserText, merged].filter((s) => String(s || "").trim()))].join("\n");
+
+    const loadAskLexicons = async (): Promise<Record<string, DimLexicon>> => {
+      const out: Record<string, DimLexicon> = {};
+      for (const field of coverageFields(pack)) {
+        try {
+          const loaded = await loadFieldLexicon(pack, field, { signal: opts?.signal });
+          if (loaded.ok) out[field] = loaded.lexicon;
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        }
+      }
+      return out;
+    };
+    let askLexicons: Record<string, DimLexicon> | undefined;
 
     if (turnIntent.kind === "meta") {
       if (turnIntent.action === "clear_defaults") {
@@ -612,7 +741,15 @@ export async function analyticsAsk(
       (turnIntent.kind === "revise" || turnIntent.kind === "clarify_answer") &&
       prevAskState
     ) {
-      const merged = mergeAskState({ prev: prevAskState, intent: turnIntent, askId });
+      let merged = mergeAskState({ prev: prevAskState, intent: turnIntent, askId });
+      if (opts?.slotAnswers && Object.keys(opts.slotAnswers).length) {
+        const extra = applySlotAnswersToAskState({
+          prev: merged.ok ? merged.state : prevAskState,
+          slotAnswers: opts.slotAnswers,
+          askId,
+        });
+        if (extra.ok) merged = extra;
+      }
       if (merged.ok && askStateIsComplete(merged.state)) {
         currentAskState = merged.state;
         structured = askStateToStructured(merged.state);
@@ -622,43 +759,45 @@ export async function analyticsAsk(
     }
 
     if (!skipStructureLlm && conversation.length) {
-      if (timeResolved.ok) {
+      // JIT probe: only when this turn needs dim members. Structure itself always runs.
+      if (needsDimensionProbe(lastUserText)) {
         try {
-          preProbeSummary = await probeDimensions(pack, timeResolved.range, opts?.signal);
-        } catch (e) {
-          if (opts?.signal?.aborted || isAbortError(e)) throw e;
-        }
-        try {
-          const once = await runStructureOnce({
+          preProbeSummary = await probeDimensions(
             pack,
-            messages: conversation,
-            clockIsoDate: clockIso,
-            askContext,
-            probeSummary: preProbeSummary,
-            modelId: opts?.modelId,
-            signal: opts?.signal,
-            traceRunId: runId || undefined,
-          });
-          structured = once.result;
-          structureMeta = { mode: once.meta.mode, formatConstraint: once.meta.formatConstraint };
+            timeResolved.range,
+            opts?.signal,
+            neededProbeFields(lastUserText),
+          );
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
-          structured = null;
         }
       }
+      try {
+        const once = await runStructureOnce({
+          pack,
+          messages: conversation,
+          askContext,
+          probeSummary: preProbeSummary,
+          prevAskState,
+          modelId: opts?.modelId,
+          signal: opts?.signal,
+          traceRunId: runId || undefined,
+        });
+        structured = once.result;
+        structureMeta = { mode: once.meta.mode, formatConstraint: once.meta.formatConstraint };
+      } catch (e) {
+        if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        structured = null;
+      }
 
-      const needsFuzzyDims =
-        impliesLangSetWithoutMembers(formatConversationTranscript(conversation)) ||
-        /\u7535\u5f71|\u7535\u89c6\u5267|\u77ed\u5267|\u52a8\u6f2b|\u771f\u4eba\u79c0|\u80a5\u7682\u5267/.test(userTextJoined);
-      const needsToolLoop = !structured || (!timeResolved.ok && needsFuzzyDims);
-
-      if (needsToolLoop) {
+      if (!structured) {
         try {
           structured = await runSchemaAgent({
             pack,
             messages: conversation,
-            clockIsoDate: clockIso,
             askContext,
+            probeSummary: preProbeSummary,
+            prevAskState,
             modelId: opts?.modelId,
             signal: opts?.signal,
             traceRunId: runId || undefined,
@@ -667,39 +806,26 @@ export async function analyticsAsk(
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
           try {
+            const packed = packAnalyticsLlmContext({
+              messages: conversation,
+              prevAskState,
+              probeSummary: preProbeSummary,
+              facts: buildAskFactsBlock(askContext),
+              phase: "structure",
+            });
             const rawStruct = await llmText(
-              buildStructureSystemPrompt(pack, clockIso, {
-                factsBlock: askContext.timeResolveNote,
+              buildStructureSystemPrompt(pack, {
+                untrustedRule: UNTRUSTED_USER_CONTENT_RULE,
               }),
-              buildStructureUserPrompt(conversation, { probeSummary: preProbeSummary }),
-              { ...llmOptsBase, spanName: "analytics.structure.fallback" },
+              buildStructureUserPrompt(wrapPackedAnalyticsUserText(packed)),
+              { ...llmOptsBase, spanName: "analytics.structure.fallback", spanMeta: { context: packed.usage } },
             );
-            structured = parseStructureResponse(
-              rawStruct,
-              formatConversationTranscript(conversation),
-            );
+            structured = parseStructureResponse(rawStruct, packed.transcript);
             structureMeta = { mode: "single_forward", formatConstraint: "prompt_parse" };
           } catch (e2) {
             if (opts?.signal?.aborted || isAbortError(e2)) throw e2;
             structured = null;
           }
-        }
-      } else if (!structured && !timeResolved.ok) {
-        try {
-          const once = await runStructureOnce({
-            pack,
-            messages: conversation,
-            clockIsoDate: clockIso,
-            askContext,
-            modelId: opts?.modelId,
-            signal: opts?.signal,
-            traceRunId: runId || undefined,
-          });
-          structured = once.result;
-          structureMeta = { mode: once.meta.mode, formatConstraint: once.meta.formatConstraint };
-        } catch (e) {
-          if (opts?.signal?.aborted || isAbortError(e)) throw e;
-          structured = null;
         }
       }
     }
@@ -708,7 +834,12 @@ export async function analyticsAsk(
       structured = applyResolvedTime(structured, timeResolved);
     }
 
-    const transcript = formatConversationTranscript(conversation);
+    const diagnosePack = packAnalyticsLlmContext({
+      messages: conversation,
+      prevAskState: currentAskState || prevAskState,
+      facts: buildAskFactsBlock(askContext, { slim: true }),
+      phase: "diagnose",
+    });
     const metaFields = {
       formatConstraint: structureMeta?.formatConstraint,
       structureMode: structureMeta?.mode,
@@ -721,7 +852,7 @@ export async function analyticsAsk(
       timeResolved.ok
     ) {
       try {
-        const nlBlob = `${nlSafe || nlForResolve}\n${transcript}`;
+        const nlBlob = lastUserText || nlSafe || nlForResolve;
         const metricId = inferMetricIdFromNl(nlBlob, pack);
         const grounded = await groundRemappedFieldFromNl({
           pack,
@@ -765,10 +896,7 @@ export async function analyticsAsk(
     }
 
     // Belt: drop spurious contentLang clarify when user never asked for languages
-    const langScope =
-      turnIntent.kind === "revise" || turnIntent.kind === "clarify_answer"
-        ? lastUserText
-        : `${transcript}\n${nlSafe || nlForResolve}`;
+    const langScope = askScopeNl();
     if (
       structured?.status === "clarify" &&
       structured.clarifySlot === "contentLang" &&
@@ -776,10 +904,14 @@ export async function analyticsAsk(
       !impliesLangSetWithoutMembers(langScope) &&
       timeResolved.ok
     ) {
-      const nlBlob = `${nlSafe || nlForResolve}\n${transcript}`;
-      const mid = inferMetricIdFromNl(nlBlob, pack);
+      const mid =
+        prevAskState?.metricId ||
+        inferMetricIdFromNl(lastUserText, pack) ||
+        inferMetricIdFromNl(structured.mergedNl || "", pack);
       if (mid) {
-        const dims = inferOutputDimsFromNl(nlBlob);
+        const dims = prevAskState?.outputDims?.length
+          ? prevAskState.outputDims
+          : inferOutputDimsFromNl(lastUserText);
         const filters = { ...(structured.partialFilters || {}) };
         delete filters.contentLang;
         structured = {
@@ -797,6 +929,65 @@ export async function analyticsAsk(
       }
     }
 
+    const metricNlBlob = nlForMetricFamilyGate({
+      lastUserText,
+      fallbackNl: nlSafe || nlForResolve,
+    });
+    if (
+      structured?.status === "ok" &&
+      !opts?.slotAnswers?.metric &&
+      !opts?.slotAnswers?.metricId
+    ) {
+      const familyClarify = ambiguousMetricFamilyClarify(metricNlBlob, pack);
+      if (familyClarify) {
+        if (structured.time?.start && structured.time?.end && structured.metricId) {
+          currentAskState = buildAskStateFromStructure({
+            structure: {
+              ...structured,
+              notes: [...(structured.notes || []), "ask_state_sealed_on_metric_family_clarify"],
+            },
+            askId,
+            packId: pack.id,
+            packVersion: pack.version,
+          });
+        }
+        structured = {
+          status: "clarify",
+          clarify: familyClarify.message,
+          clarifySlot: "metric",
+          mergedNl: structured.mergedNl || nlSafe || nlForResolve,
+          time: structured.time,
+          partialFilters: structured.filters,
+        };
+      }
+    }
+
+    if (structured?.status === "ok") {
+      if (lockedTable && structured.table !== lockedTable) {
+        structured = {
+          ...structured,
+          table: lockedTable,
+          notes: [...(structured.notes || []), `locked_table:${tableResolved.reason}:${lockedTable}`],
+        };
+      }
+      askLexicons = await loadAskLexicons();
+      const coverageNl = askScopeNl(structured.mergedNl || "");
+      const covered = applyCoverageGate({
+        filters: structured.filters || {},
+        nl: coverageNl,
+        pack,
+        lexicons: askLexicons,
+        table: structured.table || lockedTable || answerableTableNamedInNl(lastUserText, pack),
+      });
+      if (covered.notes.length) {
+        structured = {
+          ...structured,
+          filters: covered.filters,
+          notes: [...(structured.notes || []), ...covered.notes],
+        };
+      }
+    }
+
     if (structured?.status === "ok" && structured.metricId) {
       const prefsForApply = disableDefaultsThisTurn
         ? { version: 1 as const, updatedAt: 0 }
@@ -805,8 +996,10 @@ export async function analyticsAsk(
         filters: structured.filters || {},
         layout: structured.layout,
         prefs: prefsForApply,
-        nl: structured.mergedNl || nlSafe || nlForResolve,
+        nl: askScopeNl(structured.mergedNl || ""),
         outputDims: structured.outputDims,
+        pack,
+        table: structured.table || answerableTableNamedInNl(lastUserText, pack),
       });
       structured = {
         ...structured,
@@ -847,6 +1040,7 @@ export async function analyticsAsk(
             pack,
             { start: probeRange.start, end: probeRange.end },
             opts?.signal,
+            [structured.clarifySlot],
           );
           if (!rangeEcho) rangeEcho = `\u6309 ${probeRange.start}\uff5e${probeRange.end}`;
         } catch (e) {
@@ -888,20 +1082,27 @@ export async function analyticsAsk(
               : prevAskState?.time;
         const metricId =
           prevAskState?.metricId ||
-          inferMetricIdFromNl(`${nlSafe || nlForResolve}\n${transcript}`, pack);
+          inferMetricIdFromNl(lastUserText, pack) ||
+          inferMetricIdFromNl(structured.mergedNl || "", pack);
         if (t?.start && t?.end && metricId) {
           const dims =
             prevAskState?.outputDims?.length
               ? prevAskState.outputDims
-              : inferOutputDimsFromNl(`${nlSafe || nlForResolve}\n${transcript}`);
+              : inferOutputDimsFromNl(lastUserText);
+          const filters = { ...(structured.partialFilters || {}) };
+          const langs = filters.contentLang || [];
           currentAskState = buildAskStateFromStructure({
             structure: {
               status: "ok",
               mergedNl: structured.mergedNl || nlSafe || nlForResolve,
               time: { start: t.start, end: t.end },
-              filters: { ...(structured.partialFilters || {}) },
+              filters,
               outputDims: dims.length ? dims : ["watch_date"],
               metricId,
+              pivotDim:
+                structured.clarifySlot === "result_layout" && langs.length > 1
+                  ? "contentLang"
+                  : prevAskState?.pivotDim,
               ops: prevAskState?.ops || ["base_aggregate"],
               notes: ["ask_state_sealed_on_structure_clarify"],
             },
@@ -926,7 +1127,7 @@ export async function analyticsAsk(
 
     if (!(structured?.status === "ok" && structured.metricId && structured.time)) {
       // schema \u672a\u843d\u5730\u4e14\u542b\u300cN\u79cd\u5c0f\u8bed\u79cd\u300d\uff1a\u5f3a\u5236 contentLang \u53cd\u95ee\uff08\u7981\u6b62 LLM \u731c\u7801\uff09
-      if (impliesLangSetWithoutMembers(transcript)) {
+      if (impliesLangSetWithoutMembers(lastUserText)) {
         let options: ClarifyOption[] | undefined;
         let probeSummaryForClarify = preProbeSummary;
         let rangeEcho: string | undefined;
@@ -934,7 +1135,12 @@ export async function analyticsAsk(
           rangeEcho = timeResolved.range.echo;
           if (!probeSummaryForClarify) {
             try {
-              probeSummaryForClarify = await probeDimensions(pack, timeResolved.range, opts?.signal);
+              probeSummaryForClarify = await probeDimensions(
+                pack,
+                timeResolved.range,
+                opts?.signal,
+                ["contentLang"],
+              );
             } catch (e) {
               if (opts?.signal?.aborted || isAbortError(e)) throw e;
             }
@@ -949,9 +1155,12 @@ export async function analyticsAsk(
         {
           const metricId =
             prevAskState?.metricId ||
-            inferMetricIdFromNl(`${nlSafe || nlForResolve}\n${transcript}`, pack);
+            inferMetricIdFromNl(lastUserText, pack) ||
+            inferMetricIdFromNl(structured?.mergedNl || "", pack);
           if (timeResolved.ok && metricId) {
-            const dims = inferOutputDimsFromNl(nlSafe || nlForResolve);
+            const dims = prevAskState?.outputDims?.length
+              ? prevAskState.outputDims
+              : inferOutputDimsFromNl(lastUserText);
             currentAskState = buildAskStateFromStructure({
               structure: {
                 status: "ok",
@@ -986,7 +1195,7 @@ export async function analyticsAsk(
 
       const msg = await diagnoseFailure(
         {
-          transcript,
+          packed: diagnosePack,
           stage: "structure",
           detail: "\u672a\u80fd\u4ece\u5bf9\u8bdd\u5f97\u5230\u5b8c\u6574\u7ed3\u6784\u5316 schema\uff08\u65f6\u95f4/\u6307\u6807/\u8fc7\u6ee4\uff09",
           structuredJson: structured ? JSON.stringify(structured) : undefined,
@@ -1007,14 +1216,51 @@ export async function analyticsAsk(
       echo: `\u6309 ${structured.time.start}\uff5e${structured.time.end}`,
     };
     const nlForGuards = structured.mergedNl || nlSafe || nlForResolve;
-    const allowedTables = pack.tables.map((t) => t.name);
+    const allowedTables = allowedTableNames(pack).length
+      ? allowedTableNames(pack)
+      : pack.tables.map((t) => t.name);
     const dimColumns = pack.probeDimensions;
+
+    const coercedMetric = coerceUnknownMetricId(structured.metricId, lastUserText, pack);
+    const alignedMetric = alignMetricIdToNl(coercedMetric, lastUserText, pack);
+    if (alignedMetric !== structured.metricId) {
+      structured = {
+        ...structured,
+        metricId: alignedMetric,
+        notes: [
+          ...(structured.notes || []),
+          alignedMetric !== coercedMetric
+            ? `aligned_metric:${structured.metricId}->${alignedMetric}`
+            : `coerced_metric:${structured.metricId}->${alignedMetric}`,
+        ],
+      };
+    }
+    const metricVerifyForOk = (): Pick<
+      AnalyticsAskResult,
+      "semanticOk" | "semanticIssues" | "verify"
+    > => {
+      const metricAlign = checkMetricIntentAlignment({
+        nl: lastUserText,
+        metricId: structured.metricId,
+        pack,
+      });
+      const alignedNote = (structured.notes || []).find((n) => n.startsWith("aligned_metric:"));
+      return {
+        semanticOk: !metricAlign,
+        semanticIssues: metricAlign ? [metricAlign.reason] : [],
+        verify: metricAlign
+          ? metricAlign
+          : alignedNote
+            ? { verdict: "pass", codes: ["metric_aligned"], reason: alignedNote }
+            : undefined,
+      };
+    };
 
     // Demand-Capability: refuse unsupported ops (no silent downgrade)
     const capGate = evaluateCapabilityGate({
       structure: structured,
       pack,
-      nl: `${nlForGuards}\n${transcript}`,
+      nl: askScopeNl(nlForGuards),
     });
     if (capGate.status === "refuse") {
       return seal({
@@ -1110,46 +1356,87 @@ export async function analyticsAsk(
       if (opts?.signal?.aborted || isAbortError(e)) throw e;
     }
 
-    // Channel grounding hard gate: ghost codes ? clarify (AskState already sealed)
-    try {
-      const chGround = await groundChannelFilters({
-        pack,
-        filters: filtersForIntent,
-        opts: { signal: opts?.signal },
-      });
-      if (chGround.status === "clarify") {
-        materializeAskState(filtersForIntent);
-        const clarified = attachClarifyOptions(chGround.message, chGround.options, {
-          multiSelect: true,
-          slot: "channel",
-        });
-        return seal({
-          status: "clarify",
-          message: clarified.message,
-          clarifySlot: "channel",
-          clarifyOptions: clarified.clarifyOptions,
-          timeEcho: range.echo,
-          packVersion: pack.version,
-          structuredFromConversation: true,
-          ...metaFields,
-        });
-      }
-      filtersForIntent = chGround.filters;
-      if (chGround.notes.length) {
-        structured = {
-          ...structured,
+    // Channel grounding hard gate: ghost codes -> clarify (AskState already sealed)
+    const askTable = structured.table || answerableTableNamedInNl(nlForGuards, pack);
+    if (!askTable || canApplyTextChannelFilter(pack, askTable)) {
+      try {
+        const chGround = await groundChannelFilters({
+          pack,
           filters: filtersForIntent,
-          notes: [...(structured.notes || []), ...chGround.notes],
-        };
+          opts: { signal: opts?.signal },
+        });
+        if (chGround.status === "clarify") {
+          materializeAskState(filtersForIntent);
+          const clarified = attachClarifyOptions(chGround.message, chGround.options, {
+            multiSelect: true,
+            slot: "channel",
+          });
+          return seal({
+            status: "clarify",
+            message: clarified.message,
+            clarifySlot: "channel",
+            clarifyOptions: clarified.clarifyOptions,
+            timeEcho: range.echo,
+            packVersion: pack.version,
+            structuredFromConversation: true,
+            ...metaFields,
+          });
+        }
+        filtersForIntent = chGround.filters;
+        if (chGround.notes.length) {
+          structured = {
+            ...structured,
+            filters: filtersForIntent,
+            notes: [...(structured.notes || []), ...chGround.notes],
+          };
+        }
+      } catch (e) {
+        if (opts?.signal?.aborted || isAbortError(e)) throw e;
       }
-    } catch (e) {
-      if (opts?.signal?.aborted || isAbortError(e)) throw e;
     }
 
     materializeAskState(filtersForIntent);
 
+    if (structured.status === "ok" && !structured.plan) {
+      if (!askLexicons) askLexicons = await loadAskLexicons();
+      const card = resolvePlanCardinality({
+        structure: { ...structured, filters: filtersForIntent },
+        nl: askScopeNl(structured.mergedNl || ""),
+        lexicons: askLexicons,
+        pack,
+      });
+      if (card.kind === "clarify") {
+        return seal({
+          status: "clarify",
+          message: card.message,
+          timeEcho: range.echo,
+          packVersion: pack.version,
+          structuredFromConversation: true,
+          semanticOk: false,
+          semanticIssues: card.notes,
+          ...metaFields,
+        });
+      }
+      if (card.kind === "plan") {
+        const planChannels = [
+          ...new Set(card.plan.steps.flatMap((s) => s.filters?.channel || [])),
+        ];
+        structured = {
+          ...structured,
+          plan: card.plan,
+          filters: {
+            ...filtersForIntent,
+            ...(planChannels.length ? { channel: planChannels } : {}),
+          },
+          notes: [...(structured.notes || []), ...card.notes],
+        };
+        filtersForIntent = structured.filters;
+        materializeAskState(filtersForIntent);
+      }
+    }
+
     // Multi-intent plan: synthesize YoY/MoM when ops demand it; never step-1-only on growth
-    const growthKind = !structured.plan ? relativeGrowthKind(structured.ops) : null;
+    const growthKind = growthKindToSynthesize(structured.ops, structured.plan);
     if (growthKind) {
       const syn =
         growthKind === "mom"
@@ -1220,7 +1507,15 @@ export async function analyticsAsk(
           });
         }
         let sqls = normalizeSqls(planCompiled.steps.map((s) => s.sql));
-        const issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
+        const lintTable = structured.table || lockedTable;
+        const issues = collectIssues(
+          nlForGuards,
+          sqls,
+          allowedTables,
+          dimColumns,
+          packTimeField(pack, lintTable),
+          !canApplyTextChannelFilter(pack, lintTable),
+        );
         guardIssues = issues;
         if (issues.length) {
           const detail = issues.join("; ");
@@ -1360,14 +1655,13 @@ export async function analyticsAsk(
             title: `\u7ed3\u679c ${i + 1}`,
             cols: r.cols,
             rows: r.rows,
-            grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
+            grain: sqlHasDayGrain(sqls[i]!, pack) ? "day" : undefined,
           }));
         }
 
         try {
           rememberAnalyticsSuccess({
             ownerKey,
-            channels: structured.filters?.channel,
             metricId: structured.metricId,
             layout: structured.layout,
           });
@@ -1380,7 +1674,13 @@ export async function analyticsAsk(
           askState: currentAskState,
           mode: pack.delivery?.missingChannel,
         });
-        const dimCheck = reconcileNamedDimensions({
+        const skipChannelDim = !canApplyTextChannelFilter(
+          pack,
+          structured.table || lockedTable,
+        );
+        const dimCheck = skipChannelDim
+          ? { ok: true as const, missing: [] as string[], named: [] as string[], detail: "skip_non_text_channel" }
+          : reconcileNamedDimensions({
           nl: lastUserText || nlForGuards,
           tables: delivered.tables,
           sqls: execSqls,
@@ -1413,8 +1713,7 @@ export async function analyticsAsk(
           packVersion: pack.version,
           structuredFromConversation: true,
           sqlSource: "intent_compile",
-          semanticOk: true,
-          semanticIssues: [],
+          ...metricVerifyForOk(),
           ...metaFields,
         });
       }
@@ -1428,6 +1727,7 @@ export async function analyticsAsk(
         layout: structured.layout,
         pivotDim: structured.pivotDim,
         metricId: structured.metricId,
+        table: structured.table,
       },
       pack,
       fallbackNl: nlForGuards,
@@ -1467,7 +1767,7 @@ export async function analyticsAsk(
       }
       const msg = await diagnoseFailure(
         {
-          transcript,
+          packed: diagnosePack,
           stage: "intent",
           detail,
           structuredJson: JSON.stringify(structured),
@@ -1501,7 +1801,15 @@ export async function analyticsAsk(
     }
 
     let sqls = normalizeSqls([compiled.sql]);
-    const issues = collectIssues(nlForGuards, sqls, allowedTables, dimColumns);
+    const lintTable = intentBuilt.intent.table || structured.table || lockedTable;
+    const issues = collectIssues(
+      nlForGuards,
+      sqls,
+      allowedTables,
+      dimColumns,
+      packTimeField(pack, lintTable),
+      !canApplyTextChannelFilter(pack, lintTable),
+    );
     guardIssues = issues;
     if (issues.length) {
       const detail = issues.join("; ");
@@ -1521,7 +1829,7 @@ export async function analyticsAsk(
       }
       const msg = await diagnoseFailure(
         {
-          transcript,
+          packed: diagnosePack,
           stage: "lint",
           detail,
           intentJson: intentToJson(intentBuilt.intent),
@@ -1575,7 +1883,7 @@ export async function analyticsAsk(
       const detail = execErrors.map((r) => r.error).join("; ");
       const msg = await diagnoseFailure(
         {
-          transcript,
+          packed: diagnosePack,
           stage: "exec",
           detail,
           intentJson: intentToJson(intentBuilt.intent),
@@ -1602,7 +1910,7 @@ export async function analyticsAsk(
       title: sqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
       cols: r.cols,
       rows: r.rows,
-      grain: /toDate\s*\(\s*lastWatchTime\s*\)/i.test(sqls[i]!) ? "day" : undefined,
+      grain: sqlHasDayGrain(sqls[i]!, pack) ? "day" : undefined,
     }));
     const emptyNote = allEmpty(results)
       ? `\uff08${range.echo} \u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff0c\u8bf7\u6838\u5bf9\u7b5b\u9009\u6761\u4ef6\uff09`
@@ -1614,7 +1922,13 @@ export async function analyticsAsk(
       askState: currentAskState,
       mode: pack.delivery?.missingChannel,
     });
-    const dimCheck = reconcileNamedDimensions({
+    const skipChannelDim = !canApplyTextChannelFilter(
+      pack,
+      intentBuilt.intent.table || structured.table || lockedTable,
+    );
+    const dimCheck = skipChannelDim
+      ? { ok: true as const, missing: [] as string[], named: [] as string[], detail: "skip_non_text_channel" }
+      : reconcileNamedDimensions({
       // Only the current user turn ? history may contain unresolved ghost names from prior clarify
       nl: lastUserText || nlForGuards,
       tables: delivered.tables,
@@ -1626,7 +1940,7 @@ export async function analyticsAsk(
     if (!dimCheck.ok) {
       const msg = await diagnoseFailure(
         {
-          transcript,
+          packed: diagnosePack,
           stage: "dim_reconcile",
           detail: dimCheck.detail,
           intentJson: intentToJson(intentBuilt.intent),
@@ -1654,7 +1968,6 @@ export async function analyticsAsk(
     try {
       rememberAnalyticsSuccess({
         ownerKey,
-        channels: structured.filters?.channel,
         metricId: structured.metricId,
         layout: structured.layout,
       });
@@ -1671,8 +1984,7 @@ export async function analyticsAsk(
       sqlSource: "intent_compile",
       packVersion: pack.version,
       structuredFromConversation: true,
-      semanticOk: true,
-      semanticIssues: [],
+      ...metricVerifyForOk(),
       ...metaFields,
     });
   } catch (e) {

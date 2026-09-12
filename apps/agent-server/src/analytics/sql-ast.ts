@@ -104,7 +104,7 @@ function splitTopLevelStatements(cleaned: string): string[] {
 function extractTablesFromClause(cleaned: string): string[] {
   const tables: string[] = [];
   const seen = new Set<string>();
-  const re = /\b(?:from|join)\s+([a-zA-Z_][\w]*)/gi;
+  const re = /\b(?:from|join)\s+([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)?)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(cleaned)) !== null) {
     const name = m[1]!;
@@ -222,7 +222,9 @@ export function assertSqlAstSafe(sql: string, opts?: AstGuardOpts): void {
   if (opts?.allowedTables?.length) {
     const allowed = new Set(opts.allowedTables.map((t) => t.toLowerCase()));
     for (const t of ast.tables) {
-      if (!allowed.has(t.toLowerCase())) issues.push(`table not in whitelist: ${t}`);
+      const full = t.toLowerCase();
+      const bare = full.includes(".") ? full.slice(full.lastIndexOf(".") + 1) : full;
+      if (!allowed.has(full) && !allowed.has(bare)) issues.push(`table not in whitelist: ${t}`);
     }
   }
   if (ast.kind === "invalid" || issues.length) {

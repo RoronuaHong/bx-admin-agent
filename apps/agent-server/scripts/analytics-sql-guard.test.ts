@@ -48,6 +48,13 @@ assert.ok(
     "8月20日人数",
   ).includes("datetime_eq_date_string"),
 );
+assert.ok(
+  lintSql(
+    "SELECT count(*) FROM ads_other WHERE eventAt = '2026-08-20'",
+    "8月20日人数",
+    { timeField: "eventAt" },
+  ).includes("datetime_eq_date_string"),
+);
 
 // ---- lintSql: forbid_exclude_empty_lang ----
 assert.ok(

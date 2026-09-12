@@ -11,6 +11,7 @@ import {
   groundOpsFromNl,
   resolvePackCapabilities,
 } from "../src/analytics/capability-gate.js";
+import { alignMetricIdToNl, coerceUnknownMetricId } from "../src/analytics/metric-infer.js";
 import type { AnalyticsPack } from "../src/analytics/semantic-layer.js";
 import { assertSqlAstSafe, analyzeSqlAst } from "../src/analytics/sql-ast.js";
 
@@ -44,6 +45,14 @@ const pack = JSON.parse(
 {
   const grounded = groundOpsFromNl(
     "观看时长合计 Top 10 渠道",
+    resolvePackCapabilities(pack).unsupportedHints,
+  );
+  assert.ok(grounded.includes("top_n"), `got ${grounded.join(",")}`);
+}
+
+{
+  const grounded = groundOpsFromNl(
+    "按语言观看人数排行",
     resolvePackCapabilities(pack).unsupportedHints,
   );
   assert.ok(grounded.includes("top_n"), `got ${grounded.join(",")}`);
@@ -141,6 +150,27 @@ const pack = JSON.parse(
   assert.equal(gate.status, "refuse");
 }
 
+// Follow-up UV must not inherit TopN from history NL
+{
+  const uv = {
+    status: "ok" as const,
+    mergedNl: "IndiaA 按天观看人数",
+    time: { start: "2026-08-19", end: "2026-08-25" },
+    filters: { channel: ["IndiaA"] },
+    outputDims: ["watch_date"],
+    metricId: "uniq_users",
+    ops: ["base_aggregate"],
+  };
+  const current = evaluateCapabilityGate({ structure: uv, pack, nl: "FoxA呢？" });
+  assert.equal(current.status, "ok");
+  const polluted = evaluateCapabilityGate({
+    structure: uv,
+    pack,
+    nl: "观看时长合计 Top 10 渠道\nFoxA呢？",
+  });
+  assert.equal(polluted.status, "refuse");
+}
+
 // Nested WHERE must pass requireWhere (C2 false missing_where)
 {
   const sql = `
@@ -168,6 +198,14 @@ ORDER BY channel`;
     () => assertSqlAstSafe("SELECT uniq(guid) FROM elt_watch_detail", { requireWhere: true }),
     /missing_where/,
   );
+}
+
+{
+  assert.equal(coerceUnknownMetricId("watch_user_count", "改成观看人数", pack), "uniq_users");
+  assert.equal(coerceUnknownMetricId("uniq_users", "改成观看人数", pack), "uniq_users");
+  assert.equal(coerceUnknownMetricId("not_a_metric", "同比呢？", pack), "not_a_metric");
+  assert.equal(coerceUnknownMetricId("count:*", "观看人数", pack), "count:*");
+  assert.equal(alignMetricIdToNl("count:*", "elt_film_order 用户数", pack), "count:*");
 }
 
 console.log("analytics-capability-gate.test.ts OK");

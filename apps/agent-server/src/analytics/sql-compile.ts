@@ -1,23 +1,38 @@
 /**
  * Intent → SQL 确定性编译（语义层引擎）。
- * 仅支持已建模 metric kind；不支持则返回 ok:false，由上层 LLM 兜底或拒答。
+ * 仅支持已建模 metric kind；不支持则返回 ok:false，由上层拒答/反问，不写 SQL。
  */
 
 import type { AnalyticsIntent, OutputDimId } from "./intent.js";
 import { sqlStringLiteral } from "./intent.js";
-import type { AnalyticsPack } from "./semantic-layer.js";
+import {
+  compileTableRef,
+  isNumericWarehouseType,
+  isOverlayTable,
+  packFieldType,
+  packFieldsForTable,
+  packTimeField,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
+
+export function dayGrainSelect(timeField: string): { select: string; group: string; alias: string } {
+  return {
+    select: `toDate(${timeField}) AS watchDate`,
+    group: "watchDate",
+    alias: "watchDate",
+  };
+}
 
 export type CompileOk = { ok: true; sql: string };
 export type CompileFail = { ok: false; reason: string };
 export type CompileResult = CompileOk | CompileFail;
 
-function dimSelectExpr(dim: OutputDimId): { select: string; group: string; alias: string } {
+function dimSelectExpr(
+  dim: OutputDimId,
+  timeField: string,
+): { select: string; group: string; alias: string } {
   if (dim === "watch_date") {
-    return {
-      select: "toDate(lastWatchTime) AS watchDate",
-      group: "watchDate",
-      alias: "watchDate",
-    };
+    return dayGrainSelect(timeField);
   }
   if (dim === "channel") {
     return { select: "channel", group: "channel", alias: "channel" };
@@ -55,17 +70,22 @@ function assertNumericFilterValues(field: string, values: string[]): CompileFail
 
 function buildWhere(
   intent: AnalyticsIntent,
-  forcedFilters?: Record<string, string[]>,
+  pack?: AnalyticsPack,
 ): { ok: true; where: string } | CompileFail {
-  const parts: string[] = [
-    `toDate(lastWatchTime) BETWEEN ${sqlStringLiteral(intent.time.start)} AND ${sqlStringLiteral(intent.time.end)}`,
-  ];
+  const timeField = packTimeField(pack, intent.table);
+  const knownFields = new Set(packFieldsForTable(pack, intent.table));
+  const parts: string[] = [];
+  if (timeField) {
+    parts.push(
+      `toDate(${timeField}) BETWEEN ${sqlStringLiteral(intent.time.start)} AND ${sqlStringLiteral(intent.time.end)}`,
+    );
+  }
   const merged: Record<string, string[]> = { ...intent.filters };
+  const forcedFilters = pack?.guards.forcedFilters;
   if (forcedFilters) {
     for (const [field, values] of Object.entries(forcedFilters)) {
       if (!values?.length) continue;
       const prev = merged[field] || [];
-      // 强制维：与用户过滤求交；用户未指定则全用强制集
       if (!prev.length) merged[field] = [...values];
       else {
         const allow = new Set(values.map(String));
@@ -76,8 +96,12 @@ function buildWhere(
   }
   for (const [field, values] of Object.entries(merged)) {
     if (!values?.length) continue;
+    if (knownFields.size && !knownFields.has(field)) {
+      return { ok: false, reason: `filter_field_not_in_catalog:${field}` };
+    }
     const normalized = values.map(normalizeFilterToken);
-    const forceNumeric = field === "movieType";
+    const typedNumeric = isNumericWarehouseType(packFieldType(pack, field, intent.table));
+    const forceNumeric = typedNumeric || field === "movieType";
     if (forceNumeric) {
       const bad = assertNumericFilterValues(field, normalized);
       if (bad) return bad;
@@ -91,7 +115,7 @@ function buildWhere(
       parts.push(`${field} IN (${normalized.map(lit).join(", ")})`);
     }
   }
-  return { ok: true, where: parts.join("\n  AND ") };
+  return { ok: true, where: parts.join("\n  AND ") || "1" };
 }
 
 function safeAlias(code: string): string {
@@ -102,26 +126,27 @@ function safeAlias(code: string): string {
  * Canonicalize output dimensions for deterministic SQL grain.
  * - Constant single-value filter fields (e.g. channel='IndiaA') are redundant in GROUP BY
  *   (already fixed by WHERE), so they are dropped from the breakout dims.
- * - No explicit breakout → default to daily grain (watch_date) so range aggregations always
- *   yield a consistent by-day series instead of a nondeterministic grand-total flip.
+ * - Overlay table with no explicit breakout → daily grain (watch_date).
+ * - Other warehouse tables with no breakout → grand total (no invented day grain).
  */
-function canonicalDims(intent: AnalyticsIntent): OutputDimId[] {
+function canonicalDims(intent: AnalyticsIntent, pack?: AnalyticsPack): OutputDimId[] {
   const constantFilterFields = new Set(
     Object.entries(intent.filters || {})
       .filter(([, vs]) => Array.isArray(vs) && vs.length === 1)
       .map(([field]) => field),
   );
   const dims = (intent.outputDims || []).filter((d) => !constantFilterFields.has(d));
-  if (!dims.length) return ["watch_date"];
+  if (!dims.length) return isOverlayTable(pack, intent.table) ? ["watch_date"] : [];
   return dims;
 }
 
 function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const valueField = intent.metric.valueField || "maxWatchProgress";
   const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
-  const dims = canonicalDims(intent);
-  const dimMeta = dims.map(dimSelectExpr);
-  const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
+  const timeField = packTimeField(pack, intent.table);
+  const dims = canonicalDims(intent, pack);
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const whereBuilt = buildWhere(intent, pack);
   if (!whereBuilt.ok) return whereBuilt;
   const where = whereBuilt.where;
 
@@ -132,7 +157,9 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   if (useWide) {
     // Pivot dim is expanded as columns — do not also select/group it as a row dim.
     const wideDims = dims.filter((d) => d !== pivot);
-    const wideMeta = (wideDims.length ? wideDims : dims.filter((d) => d !== pivot)).map(dimSelectExpr);
+    const wideMeta = (wideDims.length ? wideDims : dims.filter((d) => d !== pivot)).map((d) =>
+      dimSelectExpr(d, timeField),
+    );
     // If all dims were pivot-only, keep empty outer grain (single row of pivot columns)
     const innerDimMeta = wideMeta.length ? wideMeta : [];
     const innerSelectParts = [
@@ -177,7 +204,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
       `FROM (`,
       `  SELECT`,
       `    ${innerSelect}`,
-      `  FROM ${intent.table}`,
+      `  FROM ${compileTableRef(pack, intent.table)}`,
       `  WHERE ${where}`,
       `  GROUP BY ${innerGroup}`,
       `)`,
@@ -189,7 +216,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   // LONG / 单值：输出维（+ 可选 pivot）上对 max 再 avg
   const longDims = [...dims];
   if (intent.layout === "long" && pivot && !longDims.includes(pivot)) longDims.push(pivot);
-  const longMeta = longDims.map(dimSelectExpr);
+  const longMeta = longDims.map((d) => dimSelectExpr(d, timeField));
   const innerSelect = [
     ...longMeta.map((d) => d.select),
     ...entityKeys,
@@ -204,7 +231,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
     `FROM (`,
     `  SELECT`,
     `    ${innerSelect}`,
-    `  FROM ${intent.table}`,
+    `  FROM ${compileTableRef(pack, intent.table)}`,
     `  WHERE ${where}`,
     `  GROUP BY ${innerGroup}`,
     `)`,
@@ -215,9 +242,10 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
 }
 
 function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
-  const dims = canonicalDims(intent);
-  const dimMeta = dims.map(dimSelectExpr);
-  const whereBuilt = buildWhere(intent, pack?.guards.forcedFilters);
+  const timeField = packTimeField(pack, intent.table);
+  const dims = canonicalDims(intent, pack);
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const whereBuilt = buildWhere(intent, pack);
   if (!whereBuilt.ok) return whereBuilt;
   const where = whereBuilt.where;
   let metricExpr: string;
@@ -227,16 +255,22 @@ function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
   } else if (intent.metric.kind === "sum") {
     const f = intent.metric.valueField || "watchSecond";
     metricExpr = `sum(${f}) AS ${f}`;
+  } else if (intent.metric.kind === "avg") {
+    const f = intent.metric.valueField || "watchSecond";
+    metricExpr = `round(avg(${f}), 2) AS ${f}`;
   } else if (intent.metric.kind === "avg_per_user") {
     const valueField = intent.metric.valueField || "watchSecond";
     const distinctField = intent.metric.distinctField || "guid";
     metricExpr = `round(sum(${valueField}) / nullIf(uniq(${distinctField}), 0), 2) AS avg_watch_second`;
+  } else if (intent.metric.kind === "count") {
+    const f = intent.metric.valueField;
+    metricExpr = f ? `count(${f}) AS ${f}` : "count() AS rows";
   } else {
     return { ok: false, reason: `unsupported kind ${intent.metric.kind}` };
   }
 
   if (!dimMeta.length) {
-    const sql = [`SELECT ${metricExpr}`, `FROM ${intent.table}`, `WHERE ${where}`].join("\n");
+    const sql = [`SELECT ${metricExpr}`, `FROM ${compileTableRef(pack, intent.table)}`, `WHERE ${where}`].join("\n");
     return { ok: true, sql };
   }
 
@@ -244,7 +278,7 @@ function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
     `SELECT`,
     `  ${dimMeta.map((d) => d.select).join(",\n  ")},`,
     `  ${metricExpr}`,
-    `FROM ${intent.table}`,
+    `FROM ${compileTableRef(pack, intent.table)}`,
     `WHERE ${where}`,
     `GROUP BY ${dimMeta.map((d) => d.group).join(", ")}`,
     `ORDER BY ${dimMeta.map((d) => d.group).join(", ")}`,
@@ -261,7 +295,9 @@ export function compileAnalyticsIntent(
       return compileAvgOfMax(intent, pack);
     case "uniq":
     case "sum":
+    case "avg":
     case "avg_per_user":
+    case "count":
       return compileUniqOrSum(intent, pack);
     default:
       return { ok: false, reason: `unsupported_metric_kind:${String((intent.metric as { kind?: string }).kind || "")}` };

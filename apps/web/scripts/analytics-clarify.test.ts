@@ -178,4 +178,24 @@ const ORIG_TWO =
   assert.deepEqual(r.slotAnswers?.contentLang, ["(empty)", "ta-IN", "te-IN", "ml-IN"]);
 }
 
+{
+  const prior = [
+    { role: "user" as const, text: "2026-08-19 到 2026-08-25 成交了多少" },
+    {
+      role: "assistant" as const,
+      status: "clarify",
+      clarifySlot: "table",
+      text: "请选择表",
+      clarifyOptions: [
+        { id: "elt_watch_detail", label: "1. elt_watch_detail" },
+        { id: "elt_film_order", label: "2. elt_film_order" },
+      ],
+    },
+  ];
+  const typed = buildClarifyContinuation(prior, "elt_film_order");
+  assert.deepEqual(typed.slotAnswers?.table, ["elt_film_order"]);
+  const picked = buildClarifyContinuation(prior, "2");
+  assert.deepEqual(picked.slotAnswers?.table, ["elt_film_order"]);
+}
+
 console.log("analytics-clarify.test.ts OK");

@@ -8,11 +8,12 @@ import {
   wantsMultiQuerySplit,
 } from "./named-entities.js";
 
-/** NL contains 按天 → SQL must group by toDate(lastWatchTime). */
-export function verifyGrainDay(nl: string, sql: string): string[] {
+/** NL contains 按天 → SQL must group by toDate(timeField). */
+export function verifyGrainDay(nl: string, sql: string, timeField = "lastWatchTime"): string[] {
   const issues: string[] = [];
   if (!/按天|每天|按日/.test(nl)) return issues;
-  if (!/toDate\s*\(\s*lastWatchTime\s*\)/i.test(sql)) {
+  const field = String(timeField || "lastWatchTime").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!new RegExp(`toDate\\s*\\(\\s*${field}\\s*\\)`, "i").test(sql)) {
     issues.push("missing_day_grain_toDate");
   }
   if (!/\bGROUP\s+BY\b/i.test(sql)) {

@@ -9,6 +9,11 @@ import { buildAnalyticsIntentFromStructure } from "./intent.js";
 import { compileAnalyticsIntent } from "./sql-compile.js";
 import { evaluateCapabilityGate } from "./capability-gate.js";
 import type { StructuredAskOk } from "./conversation-structure.js";
+import { extractLocalesFromText } from "./conversation-structure.js";
+import { extractCodesFromText, type DimLexicon } from "./dim-lexicon.js";
+import { extractChannelsFromNl } from "./intent.js";
+import { inferOutputDimsFromNl } from "./metric-infer.js";
+import { wantsMultiQuerySplit } from "./named-entities.js";
 
 export type PlanStep = {
   id: string;
@@ -76,6 +81,144 @@ export function parseAskPlan(raw: unknown): AskPlan | null {
       right: String(merge.right || steps[1]!.id),
     },
   };
+}
+
+export type PlanTuple = {
+  channels: string[];
+  contentLangs: string[];
+  outputDims: string[];
+};
+
+/** Clause split on punctuation / discourse connectors — not a business synonym list. */
+export function splitAskClauses(nl: string): string[] {
+  return String(nl || "")
+    .split(/[，,。；;]|同时|以及|还有|并且|另外/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+}
+
+export function inferPlanTuples(
+  nl: string,
+  lexicons?: Record<string, DimLexicon>,
+  pack?: AnalyticsPack,
+): PlanTuple[] {
+  const channelLex = lexicons?.channel;
+  const out: PlanTuple[] = [];
+  for (const clause of splitAskClauses(nl)) {
+    const fromLex = channelLex ? extractCodesFromText(clause, channelLex) : [];
+    const channels = [...new Set([...fromLex, ...extractChannelsFromNl(clause, pack)])];
+    const contentLangs = extractLocalesFromText(clause);
+    const outputDims = inferOutputDimsFromNl(clause);
+    if (!channels.length && !contentLangs.length && !outputDims.length) continue;
+    out.push({ channels, contentLangs, outputDims });
+  }
+  return out;
+}
+
+function dimSig(dims: string[]): string {
+  return [...new Set(dims.filter((d) => d !== "channel"))].sort().join("+");
+}
+
+function expandTuplesToSteps(input: {
+  base: StructuredAskOk;
+  tuples: PlanTuple[];
+}): PlanStep[] {
+  const steps: PlanStep[] = [];
+  let i = 1;
+  const metricId = String(input.base.metricId || "").trim();
+  if (!metricId) return [];
+  for (const t of input.tuples) {
+    const dims = (t.outputDims.length ? t.outputDims : input.base.outputDims || []).filter(
+      (d) => d !== "channel",
+    );
+    const channels = t.channels.length ? t.channels : [];
+    const langs = t.contentLangs;
+    const targets = channels.length ? channels : [""];
+    for (const ch of targets) {
+      const filters: Record<string, string[]> = { ...(input.base.filters || {}) };
+      if (ch) filters.channel = [ch];
+      else delete filters.channel;
+      if (langs.length) filters.contentLang = langs;
+      else if (!t.contentLangs.length && dimSig(dims) === "watch_date") {
+        delete filters.contentLang;
+      }
+      steps.push({
+        id: `s${i++}`,
+        metricId,
+        ops: ["base_aggregate"],
+        filters,
+        outputDims: dims.length ? dims : ["watch_date"],
+      });
+    }
+  }
+  return steps.slice(0, 4);
+}
+
+export function synthesizeEntityComparePlan(input: {
+  base: StructuredAskOk;
+  tuples: PlanTuple[];
+}): AskPlan | null {
+  const steps = expandTuplesToSteps(input);
+  if (steps.length < 2) return null;
+  return {
+    steps,
+    merge: { kind: "side_by_side", left: steps[0]!.id, right: steps[1]!.id },
+  };
+}
+
+export type PlanCardinality =
+  | { kind: "keep"; notes: string[] }
+  | { kind: "plan"; plan: AskPlan; notes: string[] }
+  | { kind: "clarify"; message: string; notes: string[] };
+
+/**
+ * One step = one (metric, filters, grain). 2+ incompatible tuples → plan or clarify.
+ * Never fold mixed grains into a single IN + stacked outputDims.
+ */
+export function resolvePlanCardinality(input: {
+  structure: StructuredAskOk;
+  nl: string;
+  lexicons?: Record<string, DimLexicon>;
+  pack?: AnalyticsPack;
+}): PlanCardinality {
+  const notes: string[] = [];
+  if ((input.structure.plan?.steps?.length || 0) >= 2) {
+    return { kind: "keep", notes: ["plan_cardinality:llm_plan"] };
+  }
+  const tuples = inferPlanTuples(input.nl, input.lexicons, input.pack);
+  const syn = synthesizeEntityComparePlan({ base: input.structure, tuples });
+  const sigs = new Set(
+    (syn?.steps || []).map((s) => dimSig(s.outputDims || [])),
+  );
+  const channels = input.structure.filters?.channel || [];
+  const dims = input.structure.outputDims || [];
+  const mixedCollapsed =
+    channels.length >= 2 &&
+    dims.includes("watch_date") &&
+    dims.includes("contentLang");
+  const wantSplit = wantsMultiQuerySplit(input.nl);
+
+  if (syn && (sigs.size >= 2 || wantSplit || mixedCollapsed)) {
+    notes.push(
+      sigs.size >= 2
+        ? "plan_cardinality:synthesized_mixed_grain"
+        : wantSplit
+          ? "plan_cardinality:synthesized_split"
+          : "plan_cardinality:unfolder_mixed_dims",
+    );
+    return { kind: "plan", plan: syn, notes };
+  }
+
+  if (mixedCollapsed) {
+    return {
+      kind: "clarify",
+      message:
+        "问句里包含多组不同的筛选×粒度，无法安全折成一张表。请拆成两次查询，或确认统一用同一套分组维度。",
+      notes: [...notes, "plan_cardinality:mixed_grain_clarify"],
+    };
+  }
+
+  return { kind: "keep", notes };
 }
 
 function pad2(n: number) {
@@ -227,6 +370,28 @@ export function planNeedsYoy(ops: string[] | undefined): boolean {
 
 export function planNeedsMom(ops: string[] | undefined): boolean {
   return relativeGrowthKind(ops) === "mom";
+}
+
+/** True when a plan step already carries the prior window for this growth kind. */
+export function planHasRelativeWindow(plan: AskPlan | undefined, kind: "yoy" | "mom"): boolean {
+  if (!plan?.steps?.length) return false;
+  return plan.steps.some((s) => {
+    const off = String(s.timeOffset || "");
+    if (!off) return false;
+    if (kind === "mom") return /mom/i.test(off) || off.includes("\u73af\u6bd4");
+    return /yoy/i.test(off) || off.includes("\u540c\u6bd4");
+  });
+}
+
+/** Synthesize unless the existing plan already has the matching prior window. */
+export function growthKindToSynthesize(
+  ops: string[] | undefined,
+  plan?: AskPlan,
+): "yoy" | "mom" | null {
+  const kind = relativeGrowthKind(ops);
+  if (!kind) return null;
+  if (planHasRelativeWindow(plan, kind)) return null;
+  return kind;
 }
 
 export type PlanGateOk = { status: "ok"; plan: AskPlan; notes: string[] };

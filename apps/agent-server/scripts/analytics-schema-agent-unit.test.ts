@@ -11,6 +11,7 @@ const pack = loadAnalyticsPack("watch-detail");
   const dims = cat.enumDimensions as Array<{ field: string }>;
   assert.ok(dims.some((d) => d.field === "movieType"));
   assert.ok(dims.some((d) => d.field === "contentLang"));
+  assert.ok(dims.some((d) => d.field === "channel"));
   const styles = listSqlStyleIds();
   assert.ok(styles.includes("avg_per_user_by_day"));
   assert.ok(styles.includes("avg_of_max_wide"));

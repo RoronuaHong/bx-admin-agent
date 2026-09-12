@@ -276,20 +276,38 @@ export type MetabaseFieldMeta = {
   has_field_values?: string;
 };
 
-type DbMetadata = {
+export type MetabaseDatabaseMetadata = {
   tables?: Array<{
     id?: number;
     name?: string;
     schema?: string;
+    active?: boolean;
     fields?: Array<{
       id?: number;
       name?: string;
       display_name?: string;
       description?: string | null;
       has_field_values?: string;
+      base_type?: string;
+      semantic_type?: string | null;
+      visibility_type?: string;
+      active?: boolean;
     }>;
   }>;
 };
+
+type DbMetadata = MetabaseDatabaseMetadata;
+
+/** Full database metadata (tables + fields). Used as live catalog truth. */
+export async function fetchDatabaseMetadata(
+  databaseId: number,
+  opts?: MetabaseRunOpts,
+): Promise<{ ok: true; data: MetabaseDatabaseMetadata } | { ok: false; error: string }> {
+  return metabaseGetJson<MetabaseDatabaseMetadata>(
+    `/api/database/${databaseId}/metadata?include_hidden=true`,
+    opts,
+  );
+}
 
 const fieldMetaCache = new Map<string, { at: number; field: MetabaseFieldMeta }>();
 const FIELD_META_TTL_MS = 30 * 60 * 1000;

@@ -4,6 +4,7 @@
  */
 
 import { extractChannelsFromNl } from "./intent.js";
+import type { AnalyticsPack } from "./semantic-layer.js";
 import type { StructuredAskOk } from "./conversation-structure.js";
 import type { ResultLayout } from "./types.js";
 
@@ -18,6 +19,8 @@ export type AskState = {
   packId: string;
   packVersion: string;
   metricId: string;
+  /** Warehouse table for this Ask; omit = overlay pack table. */
+  table?: string;
   time: { start: string; end: string };
   filters: Record<string, string[]>;
   outputDims: string[];
@@ -59,9 +62,91 @@ function asStringArray(v: unknown): string[] {
   return uniq(v.map(String));
 }
 
-/** Channel tokens from NL — reuses intent extractor (no duplicate allow-list). */
-export function extractChannelTokensFromText(text: string): string[] {
-  return extractChannelsFromNl(text);
+/** Channel tokens from NL — pack aliases + shape; no product allow-list. */
+export function extractChannelTokensFromText(text: string, pack?: AnalyticsPack): string[] {
+  return extractChannelsFromNl(text, pack);
+}
+
+const CHANNEL_REPLACE_CUE = /换成|改成|改为|替换成/;
+
+/** True when leftover text after named codes is only a channel-slot answer (换成/吧/呢). */
+export function isChannelSlotAnswer(text: string, channels: string[]): boolean {
+  if (!channels.length) return false;
+  let rest = String(text || "");
+  for (const ch of channels) rest = rest.split(ch).join(" ");
+  rest = rest
+    .replace(/那|换成|改成|改为|替换成|吧|呢|啊|呀|用|看|渠道/g, " ")
+    .replace(/[。.!！,，;；?\s]+/g, " ")
+    .trim();
+  return rest.length === 0;
+}
+
+/** Map NL / option id / index to wide|long. Unknown → undefined (do not default to long). */
+export function normalizeResultLayout(v: unknown): "wide" | "long" | undefined {
+  const raw = String(v ?? "").trim();
+  if (!raw) return undefined;
+  const t = raw.toLowerCase();
+  if (t === "wide" || t === "1" || raw === "宽表" || /^wide\b/.test(t)) return "wide";
+  if (t === "long" || t === "2" || raw === "长表" || /^long\b/.test(t)) return "long";
+  if (/宽表/.test(raw)) return "wide";
+  if (/长表/.test(raw)) return "long";
+  return undefined;
+}
+
+/**
+ * Complete incomplete TurnIntent from the latest turn only.
+ * Does not invent revise from bare 「呢？」; only fills missing channel slots
+ * when the user named codes and either replaced or answered a channel clarify.
+ */
+export function completeTurnIntentSlots(input: {
+  intent: TurnIntent;
+  lastUserText: string;
+  prevAskState?: AskState | null;
+  pack?: AnalyticsPack | null;
+  lastClarifySlot?: string;
+}): TurnIntent {
+  if (input.lastClarifySlot === "result_layout") {
+    const layout = normalizeResultLayout(input.lastUserText);
+    if (layout) {
+      return {
+        kind: "clarify_answer",
+        slot: "result_layout",
+        values: [layout],
+        notes: [...(input.intent.notes || []), "complete_layout_from_nl"],
+      };
+    }
+  }
+  const channels = extractChannelTokensFromText(input.lastUserText, input.pack || undefined);
+  if (!channels.length) return input.intent;
+  const replaceCue = CHANNEL_REPLACE_CUE.test(input.lastUserText);
+  const channelClarify = input.lastClarifySlot === "channel";
+  if (!replaceCue && !channelClarify) return input.intent;
+
+  const notes = [...(input.intent.notes || [])];
+  if (input.intent.kind === "clarify_answer" && input.intent.slot === "channel") {
+    if (input.intent.values.length) return input.intent;
+    return { ...input.intent, values: channels, notes: [...notes, "complete_clarify_channel_nl"] };
+  }
+
+  if (channelClarify && input.prevAskState && input.intent.kind !== "revise") {
+    return {
+      kind: "clarify_answer",
+      slot: "channel",
+      values: channels,
+      notes: [...notes, "complete_channel_clarify_from_nl"],
+    };
+  }
+
+  if (input.prevAskState && askStateIsComplete(input.prevAskState)) {
+    return {
+      kind: "revise",
+      set: input.intent.kind === "revise" ? input.intent.set : undefined,
+      clear: input.intent.kind === "revise" ? input.intent.clear : undefined,
+      requestedPatch: { channels: { mode: "replace", values: channels } },
+      notes: [...notes, "complete_channel_replace_from_nl"],
+    };
+  }
+  return input.intent;
 }
 
 /** Strip 「本轮/这次不用默认…」prefix; shared by fallback + TurnIntent-LLM. */
@@ -81,13 +166,15 @@ export function stripDisableDefaultsPrefix(text: string): string {
 }
 
 /**
- * Thin TurnIntent fallback (slotAnswers + meta only).
- * Short-follow-up revise heuristics removed — LLM path is resolveTurnIntent().
+ * Thin TurnIntent fallback (slotAnswers + meta + grounded channel clarify/replace).
+ * Bare 「呢？」 follow-ups still go to LLM — do not invent revise.
  */
 export function inferTurnIntentFallback(input: {
   lastUserText: string;
   prevAskState?: AskState | null;
   slotAnswers?: Record<string, string[]>;
+  lastClarifySlot?: string;
+  pack?: AnalyticsPack | null;
 }): TurnIntent {
   if (input.slotAnswers && Object.keys(input.slotAnswers).length) {
     const entries = Object.entries(input.slotAnswers);
@@ -106,8 +193,46 @@ export function inferTurnIntentFallback(input: {
   const text = String(input.lastUserText || "").trim();
   if (!text) return { kind: "new_ask", notes: ["empty"] };
 
+  if (input.lastClarifySlot === "result_layout") {
+    const layout = normalizeResultLayout(text);
+    if (layout) {
+      return {
+        kind: "clarify_answer",
+        slot: "result_layout",
+        values: [layout],
+        notes: ["fallback_layout_clarify"],
+      };
+    }
+  }
+
+  const namedChannels = extractChannelTokensFromText(text, input.pack || undefined);
+  if (
+    input.lastClarifySlot === "channel" &&
+    namedChannels.length &&
+    isChannelSlotAnswer(text, namedChannels)
+  ) {
+    return {
+      kind: "clarify_answer",
+      slot: "channel",
+      values: namedChannels,
+      notes: ["fallback_channel_clarify"],
+    };
+  }
+  if (
+    CHANNEL_REPLACE_CUE.test(text) &&
+    namedChannels.length &&
+    input.prevAskState &&
+    askStateIsComplete(input.prevAskState)
+  ) {
+    return {
+      kind: "revise",
+      requestedPatch: { channels: { mode: "replace", values: namedChannels } },
+      notes: ["fallback_channel_replace"],
+    };
+  }
+
   if (/^(以后|今后|下次).{0,8}默认/.test(text) || /记住默认|设为默认/.test(text)) {
-    const channels = extractChannelTokensFromText(text);
+    const channels = extractChannelTokensFromText(text, input.pack || undefined);
     return {
       kind: "meta",
       action: "set_defaults",
@@ -264,8 +389,9 @@ function setPath(state: AskState, path: string, value: unknown): void {
     state.metricId = value;
     return;
   }
-  if (path === "layout" && (value === "wide" || value === "long")) {
-    state.layout = value;
+  if (path === "layout") {
+    const layout = normalizeResultLayout(value);
+    if (layout) state.layout = layout;
     return;
   }
   if (path === "pivotDim" && typeof value === "string") {
@@ -369,8 +495,17 @@ export function mergeAskState(input: {
   if (input.intent.kind === "clarify_answer") {
     const slot = input.intent.slot;
     const values = uniq(input.intent.values);
-    if (slot === "metric" || slot === "metricId") state.metricId = values[0] || state.metricId;
-    else if (slot === "result_layout") state.layout = values[0] === "wide" ? "wide" : "long";
+    if (slot === "table") {
+      const next = String(values[0] || "").trim();
+      if (next) state.table = next;
+      delete state.filters.table;
+    } else if (slot === "metric" || slot === "metricId") state.metricId = values[0] || state.metricId;
+    else if (slot === "result_layout") {
+      const layout = normalizeResultLayout(values[0]);
+      if (layout) state.layout = layout;
+      const langs = state.filters.contentLang || [];
+      if (langs.length > 1 && !state.pivotDim) state.pivotDim = "contentLang";
+    }
     else if (slot === "time_range" && values.length >= 2) {
       state.time = { start: values[0]!, end: values[1]! };
     } else {
@@ -410,12 +545,36 @@ export function mergeAskState(input: {
   return { ok: true, state, notes };
 }
 
+/** Apply every slotAnswers entry (UI may send contentLang + result_layout together). */
+export function applySlotAnswersToAskState(input: {
+  prev: AskState;
+  slotAnswers?: Record<string, string[]>;
+  askId?: string;
+}): { ok: true; state: AskState; notes: string[] } | { ok: false; reason: string } {
+  const entries = Object.entries(input.slotAnswers || {}).filter(([, vs]) => Array.isArray(vs) && vs.length);
+  if (!entries.length) return { ok: false, reason: "no_slot_answers" };
+  let state = cloneAskState(input.prev);
+  if (input.askId) state.askId = input.askId;
+  const notes: string[] = [];
+  for (const [slot, values] of entries) {
+    const merged = mergeAskState({
+      prev: state,
+      intent: { kind: "clarify_answer", slot, values: [...values] },
+    });
+    if (!merged.ok) return merged;
+    state = merged.state;
+    notes.push(...merged.notes);
+  }
+  return { ok: true, state, notes };
+}
+
 export function summarizeAskState(state: AskState): string {
   const parts = [
     state.time?.start && state.time?.end ? `${state.time.start}～${state.time.end}` : null,
     state.filters.channel?.length ? `渠道 ${state.filters.channel.join(",")}` : null,
     state.filters.contentLang?.length ? `语言 ${state.filters.contentLang.join(",")}` : null,
     state.filters.movieType?.length ? `类型 ${state.filters.movieType.join(",")}` : null,
+    state.table && state.table !== "elt_watch_detail" ? `表 ${state.table}` : null,
     state.metricId || null,
     state.ops?.filter((o) => o !== "base_aggregate").join(",") || null,
   ];
@@ -424,6 +583,21 @@ export function summarizeAskState(state: AskState): string {
 
 export function askStateIsComplete(state: AskState): boolean {
   return Boolean(state.metricId && state.time?.start && state.time?.end);
+}
+
+/** Compact AskState for LLM injection (no askId / timestamps). */
+export function compactAskStateForLlm(state: AskState): Record<string, unknown> {
+  return {
+    metricId: state.metricId,
+    table: state.table,
+    time: state.time,
+    filters: state.filters,
+    outputDims: state.outputDims,
+    layout: state.layout,
+    ops: state.ops,
+    requested: state.requested,
+    summary: state.summary,
+  };
 }
 
 export function askStateToStructured(state: AskState): StructuredAskOk {
@@ -436,6 +610,7 @@ export function askStateToStructured(state: AskState): StructuredAskOk {
     layout: state.layout,
     pivotDim: state.pivotDim,
     metricId: state.metricId,
+    table: state.table,
     ops: [...(state.ops || [])],
     askSummary: state.summary,
     notes: ["from_ask_state"],
@@ -461,6 +636,7 @@ export function buildAskStateFromStructure(input: {
     packId: input.packId,
     packVersion: input.packVersion,
     metricId: String(s.metricId || ""),
+    table: s.table,
     time: { start: s.time!.start, end: s.time!.end },
     filters,
     outputDims: [...(s.outputDims || [])],
@@ -512,6 +688,7 @@ export function parseAskState(raw: unknown): AskState | null {
     packId: String(o.packId || "watch-detail"),
     packVersion: String(o.packVersion || ""),
     metricId,
+    table: o.table ? String(o.table).trim() || undefined : undefined,
     time: { start: time.start, end: time.end },
     filters,
     outputDims: asStringArray(o.outputDims),

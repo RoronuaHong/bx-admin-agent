@@ -165,6 +165,44 @@ export function extractLabelsFromText(text: string, lexicon: DimLexicon): string
   return hit;
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Ground lexicon codes from NL for remapped AND literal dims (channel codes, locale codes).
+ * Skips short/numeric codes to avoid matching dates (10 in 2026-08-10).
+ */
+export function extractCodesFromText(text: string, lexicon: DimLexicon): string[] {
+  if (!text || !lexicon.entries.length) return [];
+  const hit: string[] = [];
+  const seen = new Set<string>();
+  const add = (code: string | undefined) => {
+    if (code == null || seen.has(code)) return;
+    seen.add(code);
+    hit.push(code);
+  };
+
+  for (const c of extractLabelsFromText(text, lexicon)) add(c);
+
+  const needles = lexicon.entries
+    .flatMap((e) => [e.label, e.code])
+    .filter((n) => n && n.trim() && n.length >= 2 && !/^\d+$/.test(n))
+    .sort((a, b) => b.length - a.length);
+
+  let rest = text;
+  for (const needle of needles) {
+    const latin = /^[A-Za-z][A-Za-z0-9_-]*$/.test(needle);
+    const found = latin
+      ? new RegExp(`(?:^|[^A-Za-z0-9])${escapeRegExp(needle)}(?:[^A-Za-z0-9]|$)`, "i").test(rest)
+      : rest.includes(needle);
+    if (!found) continue;
+    add(lexicon.labelToCode.get(normalizeDimLabel(needle)) ?? (lexicon.codes.has(needle) ? needle : undefined));
+    rest = rest.split(needle).join(" ");
+  }
+  return hit;
+}
+
 export function lexiconClarifyOptions(lexicon: DimLexicon): Array<{ id: string; label: string }> {
   return lexicon.entries
     .filter((e) => !(e.code === "" && e.label === ""))

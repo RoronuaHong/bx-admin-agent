@@ -5,6 +5,7 @@
 
 import type { AnalyticsPack } from "./semantic-layer.js";
 import type { StructuredAskOk, StructuredAskResult } from "./conversation-structure.js";
+import { parseGenericMetricId } from "./intent.js";
 
 export type CapabilityGateOk = {
   status: "ok";
@@ -135,7 +136,7 @@ export function refuseMessageForOps(
 export function evaluateCapabilityGate(input: {
   structure: StructuredAskOk;
   pack: AnalyticsPack;
-  /** Full transcript or mergedNl for groundSignals */
+  /** Current-turn NL + merged summary for groundSignals — not the full transcript */
   nl?: string;
 }): CapabilityGateResult {
   const caps = resolvePackCapabilities(input.pack);
@@ -150,7 +151,7 @@ export function evaluateCapabilityGate(input: {
       notes: ["capability_gate:missing_metric"],
     };
   }
-  if (!caps.metrics.has(metricId)) {
+  if (!caps.metrics.has(metricId) && !parseGenericMetricId(metricId)) {
     return {
       status: "refuse",
       reason: `unsupported_metric:${metricId}`,

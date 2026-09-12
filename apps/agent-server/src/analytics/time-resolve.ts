@@ -113,9 +113,99 @@ function okRange(start: string, end: string): ResolveOk {
   return { ok: true, range: { start, end, echo: start === end ? `按 ${start}` : `按 ${start}～${end}` } };
 }
 
+function validMd(month: number, day: number): boolean {
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+function monthBounds(year: number, month: number, tz: string): ResolveOk | null {
+  if (!validMd(month, 1)) return null;
+  const start = `${year}-${pad(month)}-01`;
+  const next = month === 12 ? `${year + 1}-01-01` : `${year}-${pad(month + 1)}-01`;
+  return okRange(start, addDaysYmd(next, tz, -1));
+}
+
+function normalizeIsoSeps(nl: string): string {
+  return nl.replace(/(\d{4})\/(\d{1,2})\/(\d{1,2})/g, (_, y, m, d) => `${y}-${pad(Number(m))}-${pad(Number(d))}`);
+}
+
+const REL_DAY: Record<string, number> = {
+  今天: 0,
+  今日: 0,
+  昨天: -1,
+  昨日: -1,
+  前天: -2,
+  明天: 1,
+  明日: 1,
+  后天: 2,
+};
+
+/** ISO 区间；支持「2026-08-19到25 / 到08-25 / 到8月25日」。单段 NL 内取最先两个完整 ISO。 */
+function resolveIsoFamily(nl: string): ResolveOk | null {
+  const all = [...normalizeIsoSeps(nl).matchAll(/(\d{4})-(\d{2})-(\d{2})/g)];
+  if (all.length >= 2) return okRange(all[0]![0]!, all[1]![0]!);
+  if (all.length !== 1) return null;
+  const start = all[0]![0]!;
+  const after = nl.slice((all[0]!.index || 0) + start.length);
+  const md = after.match(/^\s*(?:到|至|-)\s*(\d{1,2})-(\d{1,2})(?:\s*(?:日|号))?/);
+  if (md) {
+    const m2 = Number(md[1]);
+    const d2 = Number(md[2]);
+    if (validMd(m2, d2)) return okRange(start, `${start.slice(0, 5)}${pad(m2)}-${pad(d2)}`);
+  }
+  const cn = after.match(new RegExp(`^\\s*(?:到|至|-)\\s*(${NUM})\\s*月\\s*(${NUM})\\s*(?:日|号)?`));
+  if (cn) {
+    const m2 = parseNumberToken(cn[1]!);
+    const d2 = parseNumberToken(cn[2]!);
+    if (m2 != null && d2 != null && validMd(m2, d2)) {
+      return okRange(start, `${start.slice(0, 5)}${pad(m2)}-${pad(d2)}`);
+    }
+  }
+  const dayOnly = after.match(/^\s*(?:到|至|-)\s*(\d{1,2})(?:\s*(?:日|号))?(?![\d-])/);
+  if (dayOnly) {
+    const d2 = Number(dayOnly[1]);
+    const m1 = Number(start.slice(5, 7));
+    if (validMd(m1, d2)) return okRange(start, `${start.slice(0, 8)}${pad(d2)}`);
+  }
+  return okRange(start, start);
+}
+
+/** 本轮是否在谈时间（不是词表穷举；有日历字就视为试图改时间）。 */
+export function turnMentionsTime(nl: string): boolean {
+  const t = String(nl || "");
+  if (hasTimeSignal(t)) return true;
+  return /[年月]|最近|旬|期间|区间/.test(t);
+}
+
+/**
+ * Ask 时间：本轮解析出具体起止日才用。
+ * 本轮在谈时间但解析失败 → 反问，不沿用上一问。
+ * 本轮完全没谈时间（如「FoxA呢？」）→ 沿用 AskState。
+ */
+export function resolveAskTimeRange(input: {
+  lastUserText: string;
+  prevTime?: { start: string; end: string } | null;
+  priorUserTexts?: string[];
+  clock: Date;
+  tz: string;
+}): ResolveResult {
+  const fromTurn = resolveTimeRange(input.lastUserText, input.clock, input.tz);
+  if (fromTurn.ok) return fromTurn;
+  if (turnMentionsTime(input.lastUserText)) return fromTurn;
+  if (input.prevTime?.start && input.prevTime.end) {
+    return okRange(input.prevTime.start, input.prevTime.end);
+  }
+  for (const prior of input.priorUserTexts || []) {
+    const fromPrior = resolveTimeRange(prior, input.clock, input.tz);
+    if (fromPrior.ok) return fromPrior;
+  }
+  return fromTurn;
+}
+
 /** 是否含可解析的显式日历/相对时间信号（不含裸「最近」） */
 export function hasTimeSignal(nl: string): boolean {
-  if (/\d{4}-\d{2}-\d{2}/.test(nl)) return true;
+  if (/\d{4}[/-]\d{1,2}[/-]\d{1,2}/.test(nl) || /\d{4}-\d{2}(?!-\d)/.test(nl)) return true;
+  if (/\d{4}\s*年/.test(nl)) return true;
+  if (/\d{1,2}\.\d{1,2}\s*(?:到|至|-)\s*\d{1,2}\.\d{1,2}/.test(nl)) return true;
   if (new RegExp(`${NUM}\\s*月\\s*${NUM}`).test(nl)) return true;
   if (/(今天|今日|昨天|昨日|前天|明天|明日|后天)/.test(nl)) return true;
   if (/(本周|这周|上周|下周|本月|上月|这个月|上个月)/.test(nl)) return true;
@@ -131,13 +221,42 @@ export function resolveTimeRange(nl: string, clock: Date, tz: string): ResolveRe
   const year = clockYear(clock, tz);
 
   // 裸「最近」无法定界（有「最近N天」则走下面）
-  if (/最近/.test(nl) && !new RegExp(`最近\\s*(${NUM})\\s*天`).test(nl) && !/\d{1,2}\s*月/.test(nl) && !/\d{4}-\d{2}-\d{2}/.test(nl)) {
+  if (
+    /最近/.test(nl) &&
+    !new RegExp(`最近\\s*(${NUM})\\s*天`).test(nl) &&
+    !/\d{1,2}\s*月/.test(nl) &&
+    !/\d{4}-\d{2}-\d{2}/.test(nl) &&
+    !/\d{4}-\d{2}(?!-\d)/.test(nl)
+  ) {
     return { ok: false, clarify: "「最近」无法定界，请给出具体起止日期（例如 8月19日到25日）或「最近7天」。" };
   }
 
-  const iso = [...nl.matchAll(/(\d{4})-(\d{2})-(\d{2})/g)].map((m) => m[0]!);
-  if (iso.length >= 2) return okRange(iso[0]!, iso[1]!);
-  if (iso.length === 1) return okRange(iso[0]!, iso[0]!);
+  // 整周/整月后再接「初/中/底/旬」：不能取整段
+  if (/(?:本月|这个月|上月|上个月|本周|这周|上周|下周)(?:初|中|底|旬)/.test(nl)) {
+    return {
+      ok: false,
+      clarify: "这种时间无法定界，请给出具体起止日期（例如 8月19日到25日）。",
+    };
+  }
+
+  // 两个整周/整月用「到/至」拼接：无法定界，禁止取其中一端
+  if (/(上|本|这|下)[周月].{0,8}(?:到|至).{0,8}(上|本|这|下)[周月]/.test(nl)) {
+    return {
+      ok: false,
+      clarify: "跨周/跨月的「到」无法定界，请给出具体起止日期（例如 8月19日到25日）。",
+    };
+  }
+
+  const isoFamily = resolveIsoFamily(nl);
+  if (isoFamily) return isoFamily;
+
+  const monthOnly = nl.match(/(?:^|[^\d-])(\d{4})-(\d{2})(?!-\d)/);
+  if (monthOnly) {
+    const y = Number(monthOnly[1]);
+    const m = Number(monthOnly[2]);
+    const bounds = monthBounds(y, m, tz);
+    if (bounds) return bounds;
+  }
 
   // 最近N天 / 过去N天（含今天往前 N 天，共 N 天）
   const recent = nl.match(new RegExp(`(?:最近|过去)\\s*(${NUM})\\s*天`));
@@ -173,6 +292,33 @@ export function resolveTimeRange(nl: string, clock: Date, tz: string): ResolveRe
     const n = parseNumberToken(within[1]!);
     if (n != null && n >= 1) {
       return okRange(addDaysYmd(today, tz, -(n - 1)), today);
+    }
+  }
+
+  const relRange = nl.match(
+    /(今天|今日|昨天|昨日|前天|明天|明日|后天)\s*(?:到|至|-)\s*(今天|今日|昨天|昨日|前天|明天|明日|后天)/,
+  );
+  if (relRange) {
+    const a = REL_DAY[relRange[1]!]!;
+    const b = REL_DAY[relRange[2]!]!;
+    let start = addDaysYmd(today, tz, a);
+    let end = addDaysYmd(today, tz, b);
+    if (start > end) {
+      const tmp = start;
+      start = end;
+      end = tmp;
+    }
+    return okRange(start, end);
+  }
+
+  const dotted = nl.match(/(\d{1,2})\.(\d{1,2})\s*(?:到|至|-)\s*(\d{1,2})\.(\d{1,2})/);
+  if (dotted) {
+    const m1 = Number(dotted[1]);
+    const d1 = Number(dotted[2]);
+    const m2 = Number(dotted[3]);
+    const d2 = Number(dotted[4]);
+    if (validMd(m1, d1) && validMd(m2, d2)) {
+      return okRange(`${year}-${pad(m1)}-${pad(d1)}`, `${year}-${pad(m2)}-${pad(d2)}`);
     }
   }
 
@@ -279,6 +425,18 @@ export function resolveTimeRange(nl: string, clock: Date, tz: string): ResolveRe
     }
     const start = `${year}-${pad(m1)}-${pad(d1)}`;
     return okRange(start, start);
+  }
+
+  const yearMonth = nl.match(
+    new RegExp(`(\\d{4})\\s*年\\s*(${NUM})\\s*月(?!\\s*(?:${NUM}))`),
+  );
+  if (yearMonth) {
+    const y = Number(yearMonth[1]);
+    const m = parseNumberToken(yearMonth[2]!);
+    if (m != null) {
+      const bounds = monthBounds(y, m, tz);
+      if (bounds) return bounds;
+    }
   }
 
   return { ok: false, clarify: "请提供分析的日期范围（例如 2026-08-19 到 2026-08-25）。" };

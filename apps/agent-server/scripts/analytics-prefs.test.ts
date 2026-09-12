@@ -74,14 +74,21 @@ try {
   });
   assert.equal(multi.filters.channel, undefined);
 
+  // NL already names a channel — do not inject prefs IndiaA
+  const named = applyAnalyticsPrefsDefaults({
+    filters: {},
+    prefs: loaded,
+    nl: "FoxA 按天观看人数",
+  });
+  assert.equal(named.filters.channel, undefined);
+
   rememberAnalyticsSuccess({
     ownerKey: "owner:b",
-    channels: ["IndiaC"],
     metricId: "avg_watch_second_per_user",
     layout: "long",
   });
   const remembered = loadAnalyticsPrefs("owner:b");
-  assert.deepEqual(remembered.defaultChannels, ["IndiaC"]);
+  assert.equal(remembered.defaultChannels, undefined);
   assert.equal(remembered.preferLayout, "long");
   assert.equal(remembered.recentMetricIds?.[0], "avg_watch_second_per_user");
 

@@ -1,7 +1,7 @@
 {
-  "seedVersion": "2026-09-11.1",
+  "seedVersion": "2026-09-12.2",
   "ex": 1,
   "refuseRecall": null,
-  "recordedAt": "2026-09-12T01:14:38.667Z",
+  "recordedAt": "2026-09-12T18:53:56.676Z",
   "notes": "Gold-only EX baseline (reviewStatus=gold). Written by analytics-eval-harness with ANALYTICS_EVAL_WRITE_BASELINE=1"
 }

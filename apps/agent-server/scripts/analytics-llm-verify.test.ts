@@ -3,6 +3,8 @@
  * Run: tsx scripts/analytics-llm-verify.test.ts
  */
 import assert from "node:assert/strict";
+import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
+import { alignMetricIdToNl } from "../src/analytics/metric-infer.js";
 import {
   parseLlmVerifyResponse,
   llmVerifyEnabled,
@@ -10,6 +12,7 @@ import {
   resolveUnclearVerify,
   buildLlmVerifyPrompt,
   buildLlmVerifyRetryPrompt,
+  checkMetricIntentAlignment,
 } from "../src/analytics/llm-verify.js";
 
 {
@@ -80,6 +83,44 @@ import {
   });
   assert.ok(retry.system.includes("unclear forbidden"));
   assert.ok(retry.user.includes("Prior unclear reason"));
+  const withMetric = buildLlmVerifyPrompt({
+    nl: "人均观看时长",
+    timeEcho: "昨天",
+    sqls: ["SELECT 1"],
+    sampleTables: [{ title: "t", cols: ["a"], rows: [[1]] }],
+    metricId: "avg_watch_second_per_user",
+  });
+  assert.ok(withMetric.user.includes("Compiled metricId"));
+  assert.ok(withMetric.system.includes("metric_nl_mismatch"));
+}
+
+{
+  const pack = loadAnalyticsPack("watch-detail");
+  assert.equal(
+    alignMetricIdToNl("sum_watch_second", "八月二十到二十一印度A观看人数合计", pack),
+    "uniq_users",
+  );
+  assert.equal(
+    alignMetricIdToNl("avg_max_progress", "八月二十印度A按天人均观看时长秒", pack),
+    "avg_watch_second_per_user",
+  );
+  assert.equal(alignMetricIdToNl("uniq_users", "FoxA呢", pack), "uniq_users");
+  const mismatch = checkMetricIntentAlignment({
+    nl: "八月二十印度A按天人均观看时长秒",
+    metricId: "avg_max_progress",
+    pack,
+  });
+  assert.ok(mismatch);
+  assert.equal(mismatch!.verdict, "fail");
+  assert.ok(mismatch!.codes.includes("metric_nl_mismatch"));
+  assert.equal(
+    checkMetricIntentAlignment({
+      nl: "FoxA呢",
+      metricId: "uniq_users",
+      pack,
+    }),
+    null,
+  );
 }
 
 console.log("analytics-llm-verify.test.ts OK");

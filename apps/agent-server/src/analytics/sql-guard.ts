@@ -14,12 +14,13 @@ export function normalizeDistinctCount(sql: string, fn: DistinctCountFn): string
 }
 
 /** Deterministic SQL lint checks aligned with spec §7.1（业务规则；结构项交给 AST）。 */
-export function lintSql(sql: string, nl: string): string[] {
+export function lintSql(sql: string, nl: string, opts?: { timeField?: string }): string[] {
   const issues: string[] = [];
   const ast = analyzeSqlAst(sql);
   issues.push(...ast.issues.filter((x) => x === "multi_statement" || x === "non_readonly" || x === "into_outfile" || x === "not_select"));
 
-  if (/lastWatchTime\s*=\s*'?\d{4}-\d{2}-\d{2}'?/i.test(sql)) {
+  const timeField = String(opts?.timeField || "lastWatchTime").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`${timeField}\\s*=\\s*'?\\d{4}-\\d{2}-\\d{2}'?`, "i").test(sql)) {
     issues.push("datetime_eq_date_string");
   }
   const allowDropEmpty = /不要没标|排除空|不要空语言/.test(nl);

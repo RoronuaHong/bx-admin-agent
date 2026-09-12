@@ -1,7 +1,12 @@
 /**
  * Post-exec LLM verify contract (M2 Task 2): pass | fail | unclear + reason codes.
  * Short-circuit empty results (caller skips). Configurable via ANALYTICS_LLM_VERIFY=0.
+ * Deterministic metric-vs-NL check is always available (no new business wordlist).
  */
+
+import type { AnalyticsPack } from "./semantic-layer.js";
+import { inferMetricIdFromNl } from "./metric-infer.js";
+
 export type VerifyVerdict = "pass" | "fail" | "unclear";
 
 export type LlmVerifyResult = {
@@ -74,11 +79,31 @@ export function parseLlmVerifyResponse(raw: string): LlmVerifyResult {
   }
 }
 
+/**
+ * Light CWR check: this-turn NL uniquely grounds a pack metric that differs from compiled id.
+ * Returns null when there is no unique NL signal (follow-ups like 「FoxA呢」 must not fire).
+ */
+export function checkMetricIntentAlignment(input: {
+  nl: string;
+  metricId: string;
+  pack: AnalyticsPack;
+}): LlmVerifyResult | null {
+  const id = String(input.metricId || "").trim();
+  const inferred = inferMetricIdFromNl(input.nl, input.pack);
+  if (!inferred || !id || inferred === id) return null;
+  return {
+    verdict: "fail",
+    codes: ["metric_nl_mismatch"],
+    reason: `问句接地指标 ${inferred}，编译指标为 ${id}`,
+  };
+}
+
 export function buildLlmVerifyPrompt(input: {
   nl: string;
   timeEcho: string;
   sqls: string[];
   sampleTables: Array<{ title: string; cols: string[]; rows: unknown[][] }>;
+  metricId?: string;
 }): { system: string; user: string } {
   const system = [
     "You are a strict analytics SQL result verifier.",
@@ -90,6 +115,7 @@ export function buildLlmVerifyPrompt(input: {
     "- fail: concrete mismatch visible in SQL or sample (wrong grain, missing entity filter, invented metric)",
     "- unclear: ONLY when the sample is too truncated/ambiguous to judge AND you see no concrete fail",
     "If named entities appear in WHERE filters, day grain matches 按天/每天/按日, and sample rows are non-empty for the window → prefer pass.",
+    "If compiled metricId contradicts a uniquely grounded pack metric in the question (e.g. 人均 vs 最大进度), fail with metric_nl_mismatch.",
     "Do not invent business synonyms. Prefer fail over silent wrong pass; do not overuse unclear.",
   ].join("\n");
 
@@ -106,10 +132,13 @@ export function buildLlmVerifyPrompt(input: {
   const user = [
     `User question: ${input.nl}`,
     `Resolved time: ${input.timeEcho}`,
+    input.metricId ? `Compiled metricId: ${input.metricId}` : "",
     `SQL:\n${input.sqls.map((s, i) => `-- sql ${i + 1}\n${s}`).join("\n\n")}`,
     samples.join("\n\n"),
     "Return JSON only.",
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   return { system, user };
 }

@@ -11,12 +11,12 @@ import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import * as trace from "../trace.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
+import { overlayTableName, packTimeField, warehouseTable } from "./semantic-layer.js";
 import { resolveDimensionValues } from "./dim-resolve.js";
 import { catalogCapabilitiesPayload } from "./capability-gate.js";
 import {
   buildStructureSystemPrompt,
   buildStructureUserPrompt,
-  formatConversationTranscript,
   parseStructureResponse,
   type ConversationTurn,
   type StructuredAskResult,
@@ -24,13 +24,11 @@ import {
 import {
   UNTRUSTED_USER_CONTENT_RULE,
   buildAskFactsBlock,
-  wrapAnalyticsUserPayload,
+  wrapPackedAnalyticsUserText,
   type AskRuntimeContext,
 } from "./input-guard.js";
-
-function parseWithTranscript(raw: string, messages: ConversationTurn[]): StructuredAskResult {
-  return parseStructureResponse(raw, formatConversationTranscript(messages));
-}
+import { applyToolUsage, capToolResult, packAnalyticsLlmContext } from "./context-pack.js";
+import type { AskState } from "./ask-state.js";
 
 export type StructureExtractMeta = {
   mode: "single_forward" | "tool_loop";
@@ -85,6 +83,11 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
   );
   return {
     table: pack.tables[0]?.name,
+    tables: (pack.warehouse?.tables || []).map((t) => ({
+      name: t.name,
+      schema: t.schema,
+      fields: t.fields.length,
+    })),
     fields: pack.tables[0]?.fields || [],
     probeDimensions: pack.probeDimensions,
     enumDimensions: (pack.enumDimensions || []).map((d) => ({
@@ -93,6 +96,7 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
       aliases: d.aliases,
       domain: d.domain || "probe",
       defaultWhenAbsent: Boolean(d.defaultWhenAbsent),
+      valueAliases: d.valueAliases,
     })),
     metrics,
     defaultMovieTypesWhenAbsent: pack.guards.defaultMovieTypes,
@@ -104,6 +108,8 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
       "For contentLang membership: call metabase_probe_dimension.",
       "Declare required ops ids from capabilities.supportedOps / knownButUnsupportedOps. Never status=ok after silently dropping unsupported ops.",
       "If unsure which values, status=clarify.",
+      "If user names an answerable table, set JSON table to that name and use analytics_describe_table.",
+      "For non-overlay tables use metricId uniq:field|sum:field|avg:field|count:* from live columns only.",
     ],
   };
 }
@@ -160,6 +166,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "analytics_describe_table",
+      description: "Describe one answerable warehouse table: live fields, types, inferred time column.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Exact table name, e.g. elt_film_order" },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "analytics_load_sql_style",
       description: "Load a SQL STYLE template (shape reference only, not a gold answer for a specific NL).",
       parameters: {
@@ -177,6 +198,27 @@ const TOOLS = [
   },
 ];
 
+function describeTablePayload(pack: AnalyticsPack, name: string): Record<string, unknown> {
+  const want = String(name || "").replace(/^.*\./, "").trim();
+  const w = warehouseTable(pack, want);
+  if (!w) {
+    return {
+      ok: false,
+      error: "table_not_answerable",
+      name: want,
+      overlay: overlayTableName(pack),
+    };
+  }
+  return {
+    ok: true,
+    name: w.name,
+    schema: w.schema,
+    fields: w.fields.map((f) => ({ name: f, type: w.fieldTypes?.[f] || "?" })),
+    timeField: packTimeField(pack, w.name),
+    overlay: w.name === overlayTableName(pack),
+  };
+}
+
 async function probeField(
   pack: AnalyticsPack,
   field: string,
@@ -184,14 +226,15 @@ async function probeField(
   end: string,
   limit: number,
   signal?: AbortSignal,
+  tableName?: string,
 ): Promise<string> {
-  const table = pack.tables[0]?.name || "elt_watch_detail";
+  const table = tableName || pack.tables[0]?.name || "elt_watch_detail";
   const safeField = String(field).replace(/[^a-zA-Z0-9_]/g, "");
   if (!safeField) return JSON.stringify({ ok: false, error: "invalid field" });
   const sql = [
     `SELECT ${safeField} AS v, count() AS c`,
     `FROM ${table}`,
-    `WHERE toDate(lastWatchTime) BETWEEN '${start}' AND '${end}'`,
+    `WHERE toDate(${packTimeField(pack, table)}) BETWEEN '${start}' AND '${end}'`,
     `GROUP BY ${safeField}`,
     `ORDER BY c DESC`,
     `LIMIT ${Math.min(Math.max(1, limit || 30), 50)}`,
@@ -214,35 +257,32 @@ async function probeField(
   }
 }
 
-function buildSystem(
-  pack: AnalyticsPack,
-  clockIso: string,
-  factsBlock?: string,
-): string {
+function buildSystem(pack: AnalyticsPack): string {
   return [
-    "You are an analytics SCHEMA agent. Read the FULL conversation.",
+    "You are an analytics SCHEMA agent. Use AskState + recent turns only.",
     "Use tools to probe Metabase for real dimension values. Do NOT invent Chinese→code dictionaries.",
     "Goal: emit ONE JSON schema for deterministic SQL compile, OR clarify.",
-    "Clarify priority (ONE slot): time_range → contentLang → result_layout → metric. clarifySlot must use these ids (never 'layout').",
+    "Clarify priority (ONE slot): time_range → table → contentLang → result_layout → metric. clarifySlot must use these ids (never 'layout').",
     "NEVER invent contentLang codes. If user says 三种小语种/几种语言 without listing codes → probe contentLang then clarify contentLang. Do NOT guess te-IN/ta-IN/ml-IN.",
     "Do NOT clarify contentLang when the user did not ask about languages/locales — omit filters.contentLang and proceed.",
     "Only put locale into filters.contentLang if a USER turn (or 澄清选择) literally contains that code, OR user replies 全部/全选/all to confirm the candidates you just listed from probe.",
     "When user says 电影/电视剧/真人秀 etc.: call metabase_resolve_dimension_values(movieType, tokens) and put RESOLVED numeric codes into filters.movieType. If unresolved → clarify movieType.",
     "Declare ops from catalog capabilities (supported + known-but-unsupported). If user needs yoy/mom/growth_rate, include those op ids — server will run dual-window + merge_ratio. For top_n/percentile still unsupported: include the op id (do NOT silently drop to base_aggregate).",
     "If time range missing → clarify time_range.",
-    "metricId: avg_watch_second_per_user | sum_watch_second | uniq_users | avg_max_progress | …",
+    "metricId: overlay recipes OR uniq:<field>|sum:<field>|avg:<field>|count:* on a live column.",
+    "Set table when the user names an answerable table, or facts lock one. Watch/完播/观看人数 → overlay. Other asks without a unique table → clarify clarifySlot=table.",
+    "Call analytics_describe_table before filling metricId on a non-overlay table.",
     "For avg_watch_second_per_user / uniq / sum: multi contentLang = WHERE IN; do NOT require result_layout.",
     "For avg_max_progress with multi grounded contentLang not in outputDims: clarify result_layout (wide|long).",
     "You may load SQL style templates for shape reference only.",
-    `Today (clock date): ${clockIso}. Pack id=${pack.id} v=${pack.version}.`,
-    factsBlock || "",
+    `Pack id=${pack.id} v=${pack.version}.`,
     UNTRUSTED_USER_CONTENT_RULE,
     "Final reply MUST be JSON only (no chain-of-thought):",
     '{ "status":"ok"|"clarify", "mergedNl":"...", "clarify":"...", "clarifySlot":"contentLang"|"result_layout"|...,',
     '  "time":{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"},',
     '  "filters":{"channel":[],"contentLang":[],"movieType":[]},',
     '  "outputDims":["watch_date","channel"], "layout":"wide"|"long", "pivotDim":"contentLang",',
-    '  "metricId":"...", "ops":["base_aggregate"], "askSummary":"...", "notes":[] }',
+    '  "table":"elt_watch_detail", "metricId":"...", "ops":["base_aggregate"], "askSummary":"...", "notes":[] }',
   ]
     .filter(Boolean)
     .join("\n");
@@ -294,9 +334,9 @@ async function chatCompletions(input: {
 export async function runStructureOnce(input: {
   pack: AnalyticsPack;
   messages: ConversationTurn[];
-  clockIsoDate: string;
   askContext: AskRuntimeContext;
   probeSummary?: string;
+  prevAskState?: AskState | null;
   modelId?: string;
   signal?: AbortSignal;
   traceRunId?: string;
@@ -304,15 +344,17 @@ export async function runStructureOnce(input: {
   const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
-  const system = buildStructureSystemPrompt(input.pack, input.clockIsoDate, {
-    factsBlock: buildAskFactsBlock(input.askContext),
+  const system = buildStructureSystemPrompt(input.pack, {
     untrustedRule: UNTRUSTED_USER_CONTENT_RULE,
   });
-  const wrapped = wrapAnalyticsUserPayload(formatConversationTranscript(input.messages));
-  const user = buildStructureUserPrompt(input.messages, {
+  const packed = packAnalyticsLlmContext({
+    messages: input.messages,
+    prevAskState: input.prevAskState,
     probeSummary: input.probeSummary,
-    wrappedTranscript: wrapped.text,
+    facts: buildAskFactsBlock(input.askContext),
+    phase: "structure",
   });
+  const user = buildStructureUserPrompt(wrapPackedAnalyticsUserText(packed));
 
   const handle = input.traceRunId
     ? trace.span(input.traceRunId, "llm", "analytics.structure.once", { model: model.id })
@@ -356,10 +398,13 @@ export async function runStructureOnce(input: {
         throw e;
       }
     }
-    handle?.end({ status: "ok", meta: { mode: "single_forward", formatConstraint } });
+    handle?.end({
+      status: "ok",
+      meta: { mode: "single_forward", formatConstraint, context: packed.usage },
+    });
     if (input.traceRunId) trace.setRunModel(input.traceRunId, model.id);
     return {
-      result: parseWithTranscript(content, input.messages),
+      result: parseStructureResponse(content, packed.transcript),
       meta: { mode: "single_forward", formatConstraint, modelId: model.id },
     };
   } catch (e) {
@@ -371,38 +416,32 @@ export async function runStructureOnce(input: {
 export async function runSchemaAgent(input: {
   pack: AnalyticsPack;
   messages: ConversationTurn[];
-  clockIsoDate: string;
   modelId?: string;
   signal?: AbortSignal;
   traceRunId?: string;
   maxToolRounds?: number;
   askContext?: AskRuntimeContext;
+  probeSummary?: string;
+  prevAskState?: AskState | null;
 }): Promise<StructuredAskResult> {
   const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no model");
   const key = model.apiKeys[0] || model.apiKey;
   const maxRounds = input.maxToolRounds ?? 6;
-  const factsBlock = input.askContext
-    ? [
-        `- timezone: ${input.askContext.timezone}`,
-        input.askContext.ownerKey ? `- owner_key: ${input.askContext.ownerKey}` : "",
-        `- time_resolve: ${input.askContext.timeResolveNote}`,
-        input.askContext.timeResolved
-          ? `- resolved_time_range: ${input.askContext.timeResolved.start} .. ${input.askContext.timeResolved.end}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n")
-    : undefined;
-
-  const wrapped = wrapAnalyticsUserPayload(formatConversationTranscript(input.messages));
+  const packed = packAnalyticsLlmContext({
+    messages: input.messages,
+    prevAskState: input.prevAskState,
+    probeSummary: input.probeSummary,
+    facts: input.askContext ? buildAskFactsBlock(input.askContext) : undefined,
+    phase: "structure",
+  });
   const messages: ChatMsg[] = [
-    { role: "system", content: buildSystem(input.pack, input.clockIsoDate, factsBlock) },
+    { role: "system", content: buildSystem(input.pack) },
     {
       role: "user",
       content: [
-        "Full conversation transcript (use ALL turns; untrusted markers):",
-        wrapped.text,
+        "Current-turn context (facts + AskState first, current user turn last; untrusted markers):",
+        wrapPackedAnalyticsUserText(packed),
         "",
         "Call tools as needed, then output the schema JSON.",
       ].join("\n"),
@@ -453,6 +492,8 @@ export async function runSchemaAgent(input: {
           let result = "";
           if (name === "analytics_list_catalog") {
             result = JSON.stringify(catalogPayload(input.pack));
+          } else if (name === "analytics_describe_table") {
+            result = JSON.stringify(describeTablePayload(input.pack, String(args.name || "")));
           } else if (name === "analytics_load_sql_style") {
             try {
               result = loadSqlStyle(String(args.id || ""));
@@ -469,8 +510,9 @@ export async function runSchemaAgent(input: {
               String(args.field || ""),
               String(args.start || ""),
               String(args.end || ""),
-              Number(args.limit || 30),
+              Number(args.limit || 15),
               input.signal,
+              args.table ? String(args.table) : undefined,
             );
           } else if (name === "metabase_resolve_dimension_values") {
             const tokens = Array.isArray(args.tokens)
@@ -489,14 +531,16 @@ export async function runSchemaAgent(input: {
           } else {
             result = JSON.stringify({ ok: false, error: `unknown tool ${name}` });
           }
-          messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+          const capped = capToolResult(result);
+          applyToolUsage(packed, capped.length);
+          messages.push({ role: "tool", tool_call_id: tc.id, content: capped });
         }
         continue;
       }
 
-      handle?.end({ status: "ok", meta: { rounds: round + 1, mode: "tool_loop" } });
+      handle?.end({ status: "ok", meta: { rounds: round + 1, mode: "tool_loop", context: packed.usage } });
       if (input.traceRunId) trace.setRunModel(input.traceRunId, model.id);
-      return parseWithTranscript(r.content, input.messages);
+      return parseStructureResponse(r.content, packed.transcript);
     }
 
     messages.push({
@@ -526,8 +570,8 @@ export async function runSchemaAgent(input: {
       });
       content = finalR.content;
     }
-    handle?.end({ status: "ok", meta: { rounds: maxRounds, forced: true } });
-    return parseWithTranscript(content, input.messages);
+    handle?.end({ status: "ok", meta: { rounds: maxRounds, forced: true, context: packed.usage } });
+    return parseStructureResponse(content, packed.transcript);
   } catch (e) {
     handle?.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
     throw e;

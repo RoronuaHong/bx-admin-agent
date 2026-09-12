@@ -1,11 +1,14 @@
 /**
  * Analytics user preferences (per ownerKey): default channel / layout / recent metrics.
  * Soft defaults only — never override explicit NL / 澄清选择.
+ * defaultChannels is written only by explicit「设为默认」; success memory does not overwrite it.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractChannelsFromNl } from "./intent.js";
+import { canApplyTextChannelFilter, type AnalyticsPack } from "./semantic-layer.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let PREFS_DIR = resolve(__dirname, "../../.data", "analytics-prefs");
@@ -108,6 +111,8 @@ export function applyAnalyticsPrefsDefaults(input: {
   prefs: AnalyticsUserPrefs;
   nl?: string;
   outputDims?: string[];
+  pack?: AnalyticsPack;
+  table?: string;
 }): { filters: Record<string, string[]>; layout?: "wide" | "long"; notes: string[] } {
   const filters = { ...input.filters };
   const notes: string[] = [];
@@ -115,12 +120,14 @@ export function applyAnalyticsPrefsDefaults(input: {
   const nl = String(input.nl || "");
   const multiChannelAsk = /各渠道|所有渠道|全部渠道|每个渠道|分渠道/.test(nl);
   const prefsChannels = input.prefs.defaultChannels || [];
+  const channelOnTable = !input.table || canApplyTextChannelFilter(input.pack, input.table);
+  const mentioned = channelOnTable ? extractChannelsFromNl(nl, input.pack) : [];
   const nlMentionsAnyPreferred =
-    prefsChannels.some((c) => new RegExp(`\\b${c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(nl)) ||
-    /India[A-Za-z0-9]*|Fox[A-Za-z0-9]*|GoGo|Tiger|Pak[A-Za-z0-9]*/i.test(nl);
+    mentioned.length > 0 ||
+    prefsChannels.some((c) => new RegExp(`\\b${c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(nl));
 
-  if (prefsChannels.length && !multiChannelAsk) {
-    if (!filters.channel?.length) {
+  if (channelOnTable && prefsChannels.length && !multiChannelAsk) {
+    if (!filters.channel?.length && !mentioned.length) {
       filters.channel = [...prefsChannels];
       notes.push(`prefs_default_channel:${filters.channel.join(",")}`);
     } else if (
@@ -144,18 +151,14 @@ function sameStringSet(a: string[], b: string[]): boolean {
   return b.every((x) => sa.has(x.toLowerCase()));
 }
 
-/** After successful ask: remember channel + metric (soft). */
+/** After successful ask: remember recent metric / layout. Channels stay explicit-default only. */
 export function rememberAnalyticsSuccess(input: {
   ownerKey: string;
-  channels?: string[];
   metricId?: string;
   layout?: "wide" | "long";
 }): void {
   if (!input.ownerKey?.trim()) return;
   const cur = loadAnalyticsPrefs(input.ownerKey);
-  if (input.channels?.length) {
-    cur.defaultChannels = [...new Set(input.channels.map(String).filter(Boolean))].slice(0, 8);
-  }
   if (input.metricId) {
     const recent = [input.metricId, ...(cur.recentMetricIds || [])].filter(Boolean);
     cur.recentMetricIds = [...new Set(recent)].slice(0, 8);

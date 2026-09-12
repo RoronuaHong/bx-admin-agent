@@ -87,4 +87,17 @@ GROUP BY channel`;
   );
 }
 
+{
+  const ast = analyzeSqlAst(
+    "SELECT count() AS rows FROM gather.gather_stat WHERE toDate(createTime) BETWEEN '2026-08-19' AND '2026-08-25'",
+  );
+  assert.deepEqual(ast.tables, ["gather.gather_stat"]);
+  assert.doesNotThrow(() =>
+    assertSqlAstSafe(
+      "SELECT count() AS rows FROM gather.gather_stat WHERE toDate(createTime) BETWEEN '2026-08-19' AND '2026-08-25'",
+      { requireWhere: true, allowedTables: ["gather_stat"] },
+    ),
+  );
+}
+
 console.log("analytics-sql-ast.test.ts OK");

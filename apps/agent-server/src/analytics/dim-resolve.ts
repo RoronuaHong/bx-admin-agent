@@ -15,7 +15,7 @@ import {
   findMetabaseField,
   type MetabaseRunOpts,
 } from "./metabase-client.js";
-import type { AnalyticsPack, EnumDimensionDef } from "./semantic-layer.js";
+import { remapEnumTokens, type AnalyticsPack, type EnumDimensionDef } from "./semantic-layer.js";
 
 const lexiconCache = new Map<string, { at: number; lexicon: DimLexicon }>();
 const LEXICON_TTL_MS = 30 * 60 * 1000;
@@ -105,7 +105,11 @@ export async function resolvePackFilters(input: {
 
   for (const field of fields) {
     const dim = enumByField.get(field);
-    let tokens = [...(filters[field] || [])];
+    let tokens = remapEnumTokens([...(filters[field] || [])], input.pack, field);
+    if (tokens.length && filters[field]?.some((t, i) => t !== tokens[i])) {
+      filters[field] = tokens;
+      notes.push(`pack_alias:${field}:${tokens.join(",")}`);
+    }
     if (!wantsLexiconResolve(dim, field, tokens, input.nl)) continue;
 
     const loaded = await loadFieldLexicon(input.pack, field, input.opts);

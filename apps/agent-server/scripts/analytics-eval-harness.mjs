@@ -37,20 +37,20 @@ const SEED_PATH = join(ROOT, "config/analytics/eval/seed-v1.json");
 const BASELINE_PATH = join(ROOT, "config/analytics/eval/baseline.json");
 
 function preferAnalyticsLlm() {
-  const forced = (process.env.ANALYTICS_EVAL_MODEL || "").trim();
-  if (forced) {
-    const ids = (process.env.MODEL_PROVIDERS || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    process.env.MODEL_PROVIDERS = [forced, ...ids.filter((id) => id !== forced)].join(",");
-    return;
-  }
+  const forced = (
+    process.env.ANALYTICS_EVAL_MODEL ||
+    process.env.ANALYTICS_DEFAULT_MODEL ||
+    ""
+  ).trim();
   const ids = (process.env.MODEL_PROVIDERS || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const preferred = ids.find((id) => id.toLowerCase() === "dsflash");
+  const preferred =
+    (forced && ids.find((id) => id.toLowerCase() === forced.toLowerCase())) ||
+    ids.find((id) => id.toLowerCase() === "glm5") ||
+    ids.find((id) => id.toLowerCase() === "glm5turbo") ||
+    ids.find((id) => id.toLowerCase() === "dsflash");
   if (!preferred) return;
   process.env.MODEL_PROVIDERS = [preferred, ...ids.filter((id) => id !== preferred)].join(",");
 }
@@ -60,7 +60,10 @@ function resolveModelId() {
   if (fromArg) return fromArg.slice("--model=".length).trim();
   const idx = process.argv.indexOf("--model");
   if (idx >= 0 && process.argv[idx + 1]) return process.argv[idx + 1].trim();
-  return (process.env.ANALYTICS_EVAL_MODEL || "").trim() || undefined;
+  return (
+    (process.env.ANALYTICS_EVAL_MODEL || process.env.ANALYTICS_DEFAULT_MODEL || "").trim() ||
+    undefined
+  );
 }
 
 preferAnalyticsLlm();
@@ -113,6 +116,7 @@ async function runCase(c, ctx) {
       clock: ctx.clock,
       packId: ctx.packId,
       modelId: ctx.modelId,
+      ownerKey: ctx.ownerKey ? `${ctx.ownerKey}:${c.id}` : undefined,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -276,7 +280,14 @@ async function main() {
     );
   }
 
-  const ctx = { mode, clock, packId, databaseId, modelId: EVAL_MODEL_ID };
+  const ctx = {
+    mode,
+    clock,
+    packId,
+    databaseId,
+    modelId: EVAL_MODEL_ID,
+    ownerKey: `analytics:eval:${Date.now()}`,
+  };
   const gateMetrics = emptyMetrics();
   const smokeMetrics = emptyMetrics();
   const lines = [];

@@ -52,6 +52,10 @@ import { reconcileNamedDimensions } from "../src/analytics/dim-reconcile.js";
       "missing_day_grain_toDate",
     ),
   );
+  assert.deepEqual(
+    verifyGrainDay(nl, "SELECT toDate(eventAt) AS d, uniq(guid) FROM t GROUP BY d", "eventAt"),
+    [],
+  );
 }
 
 // ---- verifyNamedChannel (generic single entity) ----

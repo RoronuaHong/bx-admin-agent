@@ -21,7 +21,7 @@
       "id": "C2-wide-pivot-avg-max",
       "nl": "对比 te-IN 和 ta-IN 的平均最大观看进度，按内容语言分列，宽表展示；时间 2026-08-19 到 2026-08-25，渠道 IndiaA",
       "expect": {
-        "statusIn": ["ok", "clarify"],
+        "statusIn": ["ok"],
         "forbidErrorSubstring": ["missing_where"],
         "whenOk": {
           "sqlMustMatch": ["sumIf|avgIf|countIf", "te-IN|te_IN", "ta-IN|ta_IN"],
@@ -33,9 +33,8 @@
       "id": "C4-movie-label",
       "nl": "2026-08-19到2026-08-25，电影的观看人数，按天",
       "expect": {
-        "statusIn": ["ok", "clarify"],
-        "whenOk": { "filtersMovieTypeIncludes": ["1"] },
-        "whenClarify": { "optionsLabelMustMatch": "电影" }
+        "statusIn": ["ok"],
+        "whenOk": { "filtersMovieTypeIncludes": ["1"] }
       }
     },
     {
@@ -60,6 +59,32 @@
       "expect": {
         "statusIn": ["refuse", "clarify"],
         "forbidOkSilentDrop": true
+      }
+    },
+    {
+      "id": "brazilA-ungrounded-clarify",
+      "nl": "巴西A 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "expect": {
+        "statusIn": ["clarify"],
+        "whenClarify": { "slot": "channel" },
+        "notes": "elt_watch_detail has no BrazilA; must not invent a code or silent-ok"
+      }
+    },
+    {
+      "id": "brazil-compare-no-silent",
+      "nl": "对比 IndiaA 和巴西A 在 2026-08-19 至 2026-08-25 的观看人数，按渠道",
+      "expect": {
+        "statusIn": ["clarify"],
+        "whenClarify": { "slot": "channel" },
+        "notes": "Partial ground (IndiaA) must not drop 巴西A and run"
+      }
+    },
+    {
+      "id": "filme-tela-uv",
+      "nl": "FilmeTela 在 2026-08-19 至 2026-08-25 按天观看人数",
+      "expect": {
+        "statusIn": ["ok"],
+        "whenOk": { "sqlMustMatch": ["FilmeTela", "uniq\\s*\\(\\s*guid\\s*\\)"] }
       }
     }
   ]

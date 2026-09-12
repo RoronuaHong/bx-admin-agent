@@ -10,9 +10,9 @@ import {
   UNTRUSTED_USER_CONTENT_RULE,
   type WrapUserResult,
 } from "../prompt-guard.js";
+import { renderAnalyticsLlmUserTextWrapped, type AnalyticsLlmPack } from "./context-pack.js";
 
 export const ANALYTICS_MAX_NL_CHARS = 4000;
-export const ANALYTICS_MAX_TRANSCRIPT_CHARS = 12000;
 
 export type AskRuntimeContext = {
   clockIsoDate: string;
@@ -25,6 +25,8 @@ export type AskRuntimeContext = {
   timeResolved?: { start: string; end: string; echo: string };
   /** Soft analytics user prefs facts */
   prefsFacts?: string;
+  /** Live Metabase catalog vs pack overlay */
+  catalogFacts?: string;
 };
 
 export type GuardedInput = {
@@ -84,49 +86,40 @@ export function guardAnalyticsInput(raw: string, maxLen = ANALYTICS_MAX_NL_CHARS
   };
 }
 
-export function guardTranscriptLines(
-  lines: string[],
-  maxTotal = ANALYTICS_MAX_TRANSCRIPT_CHARS,
-): { lines: string[]; truncated: boolean } {
-  const out: string[] = [];
-  let used = 0;
-  let truncated = false;
-  for (const line of lines) {
-    const g = guardAnalyticsInput(line, Math.min(ANALYTICS_MAX_NL_CHARS, maxTotal - used));
-    if (g.refused) continue;
-    if (used + g.text.length > maxTotal) {
-      truncated = true;
-      break;
-    }
-    out.push(g.text);
-    used += g.text.length + 1;
-    if (g.truncated) truncated = true;
+/** User-side facts only — pack prepends the "Deterministic facts:" label. */
+export function buildAskFactsBlock(ctx: AskRuntimeContext, opts?: { slim?: boolean }): string {
+  const timeLines = [
+    `- time_resolve: ${ctx.timeResolveNote}`,
+    ctx.timeResolved
+      ? `- resolved_time_range: ${ctx.timeResolved.start} .. ${ctx.timeResolved.end} (${ctx.timeResolved.echo})`
+      : `- resolved_time_range: (none — clarify time_range if still missing)`,
+  ];
+  if (opts?.slim) {
+    return [`- today_date: ${ctx.clockIsoDate}`, `- timezone: ${ctx.timezone}`, ...timeLines].join("\n");
   }
-  return { lines: out, truncated };
-}
-
-/** 拼进 system 的确定性事实块（补全上下文，不清洗用户句） */
-export function buildAskFactsBlock(ctx: AskRuntimeContext): string {
-  const lines = [
-    "Deterministic runtime facts (trust these; do not guess):",
+  return [
     `- today_date: ${ctx.clockIsoDate}`,
     `- timezone: ${ctx.timezone}`,
     ctx.ownerKey ? `- owner_key: ${ctx.ownerKey}` : null,
     ctx.userId ? `- user_id: ${ctx.userId}` : null,
     ctx.uiLocale ? `- ui_locale: ${ctx.uiLocale}` : null,
-    `- time_resolve: ${ctx.timeResolveNote}`,
-    ctx.timeResolved
-      ? `- resolved_time_range: ${ctx.timeResolved.start} .. ${ctx.timeResolved.end} (${ctx.timeResolved.echo})`
-      : `- resolved_time_range: (none — clarify time_range if still missing)`,
+    ...timeLines,
     ctx.prefsFacts ? ctx.prefsFacts : null,
+    ctx.catalogFacts ? ctx.catalogFacts : null,
     "If resolved_time_range is set, you MUST use those exact start/end in JSON time.",
-  ];
-  return lines.filter(Boolean).join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function wrapAnalyticsUserPayload(raw: string): WrapUserResult {
   const stripped = stripDangerousControls(raw || "");
   return wrapUntrustedUserContent(stripped.text);
+}
+
+/** Wrap only history + current; facts / AskState stay trusted. */
+export function wrapPackedAnalyticsUserText(pack: AnalyticsLlmPack): string {
+  return renderAnalyticsLlmUserTextWrapped(pack, (t) => wrapAnalyticsUserPayload(t).text);
 }
 
 export { UNTRUSTED_USER_CONTENT_RULE };

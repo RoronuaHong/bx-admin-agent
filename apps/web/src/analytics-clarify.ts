@@ -196,6 +196,11 @@ function composeFromOrigin(
   const indexed = resolveOptionIndexes(currentText, lastClarify?.clarifyOptions);
   if (indexed && lastClarify?.clarifySlot) {
     slotAnswers[lastClarify.clarifySlot] = indexed;
+  } else if (
+    lastClarify?.clarifySlot === "table" &&
+    /^[A-Za-z][A-Za-z0-9_]{2,64}$/.test(currentText.trim())
+  ) {
+    slotAnswers.table = [currentText.trim()];
   } else if (opts.replaceLocalesFromCurrent && extractLocaleCodes(currentText).length) {
     slotAnswers.contentLang = extractLocaleCodes(currentText);
   } else {
