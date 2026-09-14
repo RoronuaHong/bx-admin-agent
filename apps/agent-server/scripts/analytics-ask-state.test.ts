@@ -300,4 +300,34 @@ const base: AskState = {
   }
 }
 
+{
+  // 槽位短答闭环（「全部」「1,2,3,4」）：澄清链 seal 的 AskState + slotAnswers
+  // → clarify_answer（无 LLM）→ 合并完整 → Path A 编译输入，时间/口径沿用上一问
+  const sealed: AskState = {
+    ...base,
+    filters: {},
+    requested: {},
+    summary: "按天完播率",
+  };
+  const slotAnswers = { contentLang: ["(empty)", "ta-IN", "te-IN", "ml-IN"] };
+  const fb = inferTurnIntentFallback({
+    lastUserText: "全部",
+    prevAskState: sealed,
+    slotAnswers,
+  });
+  assert.equal(fb.kind, "clarify_answer");
+
+  const merged = applySlotAnswersToAskState({ prev: sealed, slotAnswers });
+  assert.ok(merged.ok);
+  if (merged.ok) {
+    assert.ok(askStateIsComplete(merged.state), "合并后必须可编译");
+    assert.deepEqual(merged.state.filters.contentLang, slotAnswers.contentLang);
+    const s = askStateToStructured(merged.state);
+    assert.equal(s.status, "ok");
+    assert.ok((s.notes || []).includes("from_ask_state"));
+    assert.deepEqual(s.time, sealed.time);
+    assert.equal(s.metricId, sealed.metricId);
+  }
+}
+
 console.log("analytics-ask-state.test.ts OK");

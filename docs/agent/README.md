@@ -21,6 +21,7 @@ PC 后台仓库 `bx-film-admin-in2` 不再维护 `docs/agent` 正文（仅保留
 | [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md) | **高优** 观影助手 Agent 方案（**Web 先行、不做 App**；Worker `consumer-viewing`；Mock/API 占位；对标瑞幸/BOSS 交互，2026-09-05） |
 | [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) | A2A 接入方案（Agent2Agent 标准：对外 A2A Server 暴露 + 挂 M3 的 A2A Client 编排；Agent Card/JSON-RPC/Task→chatStream 映射/只读安全，2026-09-03） |
 | [ANALYTICS_ARCHITECTURE_REVIEW.md](./ANALYTICS_ARCHITECTURE_REVIEW.md) | **Analytics 子系统架构评审**（2026-09-13 快照；2026-09-14 更正：coverage 已是 GATE，今日 72/67/5 不是 1/71）。**实现计划以** [`../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md) **为准** |
+| [ANALYTICS_INPUT_TO_LLM.md](./ANALYTICS_INPUT_TO_LLM.md) | **问数：用户输入 → LLM 接收前**（清洗/记忆/检索/组包；相对时间 LLM 读懂、日期由代码算出） |
 | [ANALYTICS_NL_TO_TABLE.md](./ANALYTICS_NL_TO_TABLE.md) | **自然语言 → 正确结果表**（10 步对照 + 代码锚点）。只比问句到结果行，不比身份/卡片 API/评测 |
 | [ANALYTICS_CATALOG_DIGEST.md](./ANALYTICS_CATALOG_DIGEST.md) | **问数 Metabase 表结构说明（自动生成）**：全库可答/隐藏表、推断时间列、字段类型与已有 description。刷新：`pnpm --filter @bx/agent-server catalog-digest` |
 | [ANALYTICS_CATALOG_INFERRED.md](./ANALYTICS_CATALOG_INFERRED.md) | **无官方说明表的暂存推断**（由 `catalog-inferred.json` 生成，不要手改）。源文件：`apps/agent-server/config/analytics/catalog-inferred.json` |

@@ -25,7 +25,17 @@ export type SqlAgentClarify = {
   clarify: string;
   notes: string[];
 };
-export type SqlAgentResult = SqlAgentOk | SqlAgentClarify;
+export type SqlAgentError = {
+  status: "error";
+  message: string;
+  notes: string[];
+};
+/**
+ * NOTE: infra/config/LLM failures must be `error` — never `clarify`. A clarify tells the user the
+ * question itself needs refining; misreporting a dead model/quota as a clarify shows a bogus slot
+ * prompt the user cannot act on (and pollutes the clarify metrics).
+ */
+export type SqlAgentResult = SqlAgentOk | SqlAgentClarify | SqlAgentError;
 
 export type SqlAgentTurn =
   | SqlAgentOk
@@ -108,7 +118,7 @@ export async function runSqlAgent(input: {
 }): Promise<SqlAgentResult> {
   const model = pickAnalyticsModel(input.modelId);
   if (!model) {
-    return { status: "clarify", clarifySlot: "metric", clarify: "未配置问数模型，无法生成 SQL。", notes: ["no_model"] };
+    return { status: "error", message: "未配置问数模型，无法生成 SQL。", notes: ["no_model"] };
   }
   const key = model.apiKeys[0] || model.apiKey;
   const prefetched = getTableSchemas(input.pack, input.tables);
@@ -218,9 +228,8 @@ export async function runSqlAgent(input: {
   } catch (e) {
     handle?.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
     return {
-      status: "clarify",
-      clarifySlot: "metric",
-      clarify: sanitizeAnalyticsLlmError(e),
+      status: "error",
+      message: sanitizeAnalyticsLlmError(e),
       notes: ["sql_agent_http"],
     };
   }

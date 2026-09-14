@@ -12,15 +12,20 @@ const prior = [
   { role: "assistant" as const, status: "ok", text: "done" },
 ];
 
-const payload = buildClarifyContinuation(prior, "te-IN、ml-IN");
+const typed = "te-IN、ml-IN";
+const payload = buildClarifyContinuation(prior, typed);
 console.log("payload", JSON.stringify(payload, null, 2));
 
-const r = await analyticsAsk(payload.text, {
+const r = await analyticsAsk(typed, {
   clock: new Date("2026-09-10T12:00:00+08:00"),
   slotAnswers: {
     ...(payload.slotAnswers || {}),
     result_layout: ["wide"],
   },
+  messages: [
+    ...prior.map((m) => ({ role: m.role, text: m.text })),
+    { role: "user" as const, text: typed },
+  ],
 });
 
 console.log(

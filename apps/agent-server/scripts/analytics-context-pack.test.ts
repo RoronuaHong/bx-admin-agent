@@ -8,7 +8,6 @@ import {
   capToolResult,
   packAnalyticsLlmContext,
   renderAnalyticsLlmUserText,
-  renderAnalyticsLlmUserTextWrapped,
 } from "../src/analytics/context-pack.js";
 import {
   buildStructureSystemPrompt,
@@ -116,28 +115,6 @@ const prev: AskState = {
   assert.equal(ANALYTICS_MODEL_TRANSCRIPT_CHARS, 8000);
 }
 
-{
-  const packed = packAnalyticsLlmContext({
-    messages: [
-      { role: "user", text: "旧问 三种小语种" },
-      { role: "assistant", text: "请确认语言" },
-      { role: "user", text: "FoxA呢？" },
-    ],
-    prevAskState: prev,
-    facts: "today_date: 2026-09-12\nresolved_time_range: 2026-08-19 .. 2026-08-25",
-    phase: "structure",
-  });
-  const wrapped = renderAnalyticsLlmUserTextWrapped(packed, (t) => `⟦UNTRUSTED⟧${t}⟦/UNTRUSTED⟧`);
-  assert.match(wrapped, /Deterministic facts/);
-  assert.match(wrapped, /AskState/);
-  assert.match(wrapped, /⟦UNTRUSTED⟧/);
-  assert.match(wrapped, /FoxA呢/);
-  assert.doesNotMatch(wrapped, /⟦UNTRUSTED⟧[\s\S]*today_date/);
-  assert.doesNotMatch(wrapped, /⟦UNTRUSTED⟧AskState/);
-  const factsIdx = wrapped.indexOf("Deterministic facts");
-  const wrapIdx = wrapped.indexOf("⟦UNTRUSTED⟧");
-  assert.ok(factsIdx >= 0 && wrapIdx > factsIdx);
-}
 
 {
   const longHist = Array.from({ length: 8 }, (_, i) => ({

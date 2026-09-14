@@ -4,11 +4,9 @@
  */
 import assert from "node:assert/strict";
 import { applyCatalogToPack, parseMetabaseDatabaseMetadata } from "../src/analytics/catalog.js";
-import { buildDocumentedTableStructure, coerceMetricForWarehouseTable } from "../src/analytics/documented-ask.js";
-import { buildAnalyticsIntentFromStructure } from "../src/analytics/intent.js";
+import { coerceMetricForWarehouseTable } from "../src/analytics/documented-ask.js";
 import { inferMetricIdFromNl, missingRequiredMetricSlots } from "../src/analytics/metric-infer.js";
 import { resolveAskTable } from "../src/analytics/table-resolve.js";
-import { compileAnalyticsIntent } from "../src/analytics/sql-compile.js";
 import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 
 const catalog = parseMetabaseDatabaseMetadata(
@@ -78,70 +76,8 @@ const pack = applyCatalogToPack(loadAnalyticsPack("watch-detail"), catalog, "met
 }
 
 {
-  const built = buildDocumentedTableStructure({
-    nl: "2026-08-19 到 2026-08-25 的订单数",
-    pack,
-    table: "elt_film_order",
-    time: { start: "2026-08-19", end: "2026-08-25" },
-    reason: "unique_score:8",
-  });
-  assert.ok(built);
-  assert.equal(built?.table, "elt_film_order");
-  assert.equal(built?.metricId, "count:*");
-  const intent = buildAnalyticsIntentFromStructure({
-    structure: {
-      time: built!.time!,
-      filters: built!.filters,
-      outputDims: built!.outputDims,
-      metricId: built!.metricId!,
-      table: built!.table,
-    },
-    pack,
-    fallbackNl: "2026-08-19 到 2026-08-25 的订单数",
-  });
-  assert.equal(intent.ok, true);
-  if (!intent.ok) throw new Error(intent.reason);
-  const compiled = compileAnalyticsIntent(intent.intent, pack);
-  assert.equal(compiled.ok, true);
-  if (!compiled.ok) throw new Error(compiled.reason);
-  assert.match(compiled.sql, /FROM film_report\.elt_film_order/);
-  assert.match(compiled.sql, /count\(\)/);
-  assert.match(compiled.sql, /toDate\(payTime\)/);
-  assert.doesNotMatch(compiled.sql, /lastWatchTime/);
-}
-
-{
   assert.equal(inferMetricIdFromNl("订单金额合计", pack, "elt_film_order"), "sum:amount");
   assert.equal(coerceMetricForWarehouseTable("uniq_users", "订单数", pack, "elt_film_order"), "count:*");
-}
-
-{
-  const built = buildDocumentedTableStructure({
-    nl: "2026-08-19 到 2026-08-25 账号资料有多少",
-    pack,
-    table: "elt_film_user",
-    time: { start: "2026-08-19", end: "2026-08-25" },
-    reason: "unique_score:6",
-  });
-  assert.ok(built);
-  const intent = buildAnalyticsIntentFromStructure({
-    structure: {
-      time: built!.time!,
-      filters: built!.filters,
-      outputDims: built!.outputDims,
-      metricId: built!.metricId!,
-      table: built!.table,
-    },
-    pack,
-    fallbackNl: "账号资料有多少",
-  });
-  assert.equal(intent.ok, true);
-  if (!intent.ok) throw new Error(intent.reason);
-  const compiled = compileAnalyticsIntent(intent.intent, pack);
-  assert.equal(compiled.ok, true);
-  if (!compiled.ok) throw new Error(compiled.reason);
-  assert.match(compiled.sql, /toDate\(createdTime\)/);
-  assert.doesNotMatch(compiled.sql, /birthday/);
 }
 
 {
@@ -151,51 +87,6 @@ const pack = applyCatalogToPack(loadAnalyticsPack("watch-detail"), catalog, "met
   assert.equal(inferMetricIdFromNl("找下巴西环境的昨天到今天的日活", pack), "dau");
   assert.deepEqual(missingRequiredMetricSlots("dau", "找下印度环境的昨天到今天的日活", pack), ["channel"]);
   assert.deepEqual(missingRequiredMetricSlots("dau", "找下巴西环境的昨天到今天的日活", pack), ["channel"]);
-  const built = buildDocumentedTableStructure({
-    nl: "IndiaA 昨天到今天的日活",
-    pack,
-    table: "elt_active_guid",
-    time: { start: "2026-09-13", end: "2026-09-14" },
-    reason: "metric_tables:dau",
-  });
-  assert.ok(built);
-  assert.equal(built?.table, "elt_active_guid");
-  assert.equal(built?.metricId, "dau");
-  assert.deepEqual(built?.filters.channel, ["IndiaA"]);
-  assert.ok(built?.outputDims.includes("watch_date"));
-  const intent = buildAnalyticsIntentFromStructure({
-    structure: {
-      time: built!.time!,
-      filters: built!.filters,
-      outputDims: built!.outputDims,
-      metricId: built!.metricId!,
-      table: built!.table,
-    },
-    pack,
-    fallbackNl: "IndiaA 昨天到今天的日活",
-  });
-  assert.equal(intent.ok, true);
-  if (!intent.ok) throw new Error(intent.reason);
-  const compiled = compileAnalyticsIntent(intent.intent, pack);
-  assert.equal(compiled.ok, true);
-  if (!compiled.ok) throw new Error(compiled.reason);
-  assert.match(compiled.sql, /elt_active_guid/);
-  assert.match(compiled.sql, /uniq\(guid\)/);
-  assert.match(compiled.sql, /toDate\(activeDate\)/);
-  assert.match(compiled.sql, /IndiaA/);
-}
-
-{
-  assert.equal(
-    buildDocumentedTableStructure({
-      nl: "观看人数",
-      pack,
-      table: "elt_watch_detail",
-      time: { start: "2026-08-19", end: "2026-08-25" },
-      reason: "overlay_grounded",
-    }),
-    null,
-  );
 }
 
 console.log("analytics-documented-ask.test.ts OK");

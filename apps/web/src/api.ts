@@ -317,7 +317,6 @@ export interface StoredMessage {
   insight?: string;
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
   turnKind?: string;
-  helpCard?: AnalyticsAskResult["helpCard"];
 }
 
 export interface ConversationDto {
@@ -505,13 +504,6 @@ export interface AnalyticsAskResult {
     series: Array<{ name: string; data: number[]; selected?: boolean; type?: "line" | "bar" }>;
     height?: number;
   }>;
-  helpCard?: {
-    title: string;
-    intro: string;
-    how: string[];
-    examples: string[];
-    note: string;
-  };
 }
 
 export type AnalyticsFeedbackVerdict = "useful" | "wrong";

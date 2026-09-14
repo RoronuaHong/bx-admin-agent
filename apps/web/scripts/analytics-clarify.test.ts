@@ -24,7 +24,6 @@ const ORIG_TWO =
   ];
   assert.equal(looksLikeSlotOnlyReply("te-IN、ml-IN"), true);
   const r = buildClarifyContinuation(prior, "te-IN、ml-IN");
-  assert.equal(r.text, ORIG_TWO);
   assert.deepEqual(r.slotAnswers?.contentLang?.slice().sort(), ["ml-IN", "te-IN"]);
   // 不应残留仅 ml-IN 的旧答案主导（覆盖后仍是这两种）
   assert.equal(r.slotAnswers?.contentLang?.length, 2);
@@ -42,7 +41,6 @@ const ORIG_TWO =
     },
   ];
   const r = buildClarifyContinuation(prior, "te-IN、ml-IN");
-  assert.equal(r.text, ORIG_TWO);
   assert.deepEqual(r.slotAnswers?.contentLang?.slice().sort(), ["ml-IN", "te-IN"]);
 }
 
@@ -54,7 +52,6 @@ const ORIG_TWO =
   ];
   const neu = "IndiaA 昨天观看人数";
   const r = buildClarifyContinuation(prior, neu);
-  assert.equal(r.text, neu);
   assert.equal(r.slotAnswers, undefined);
 }
 
@@ -70,7 +67,6 @@ const ORIG_TWO =
   ];
   // 再改语言
   const r = buildClarifyContinuation(prior, "ta-IN、te-IN");
-  assert.equal(r.text, ORIG_TWO);
   assert.deepEqual(r.slotAnswers?.contentLang?.slice().sort(), ["ta-IN", "te-IN"]);
 }
 
@@ -92,7 +88,6 @@ const ORIG_TWO =
     },
   ];
   const r = buildClarifyContinuation(prior, "2,3,4");
-  assert.equal(r.text, ORIG_TWO);
   assert.deepEqual(r.slotAnswers?.contentLang, ["ta-IN", "te-IN", "ml-IN"]);
 }
 
@@ -144,7 +139,6 @@ const ORIG_TWO =
     },
   ];
   const r = buildClarifyContinuation(prior, "1");
-  assert.equal(r.text, ORIG_TWO);
   assert.deepEqual(r.slotAnswers?.result_layout, ["wide"]);
   assert.deepEqual(r.slotAnswers?.contentLang?.slice().sort(), ["ml-IN", "ta-IN", "te-IN"]);
 }
@@ -217,8 +211,24 @@ const ORIG_TWO =
   assert.equal(looksLikeAcceptSuggestionReply("按你说的来"), true);
   assert.equal(looksLikeSlotOnlyReply("按你说的来"), true);
   const r = buildClarifyContinuation(prior, "按你说的来");
-  assert.equal(r.text, "昨天到今天的每日变现漏斗数据");
   assert.deepEqual(r.slotAnswers?.table, ["elt_film_app_channel"]);
+}
+
+// 契约：只产出 slotAnswers，不再有 text 字段。
+// 前端因此拿不到「拼好的原问」，body.text 只能是用户刚打的字 —— 编译期即拦住拼接。
+{
+  const prior = [
+    { role: "user" as const, text: ORIG_TWO },
+    {
+      role: "assistant" as const,
+      status: "clarify",
+      clarifySlot: "contentLang",
+      text: "请确认语言",
+    },
+  ];
+  const r = buildClarifyContinuation(prior, "te-IN、ml-IN");
+  assert.deepEqual(Object.keys(r), ["slotAnswers"]);
+  assert.ok(!("text" in r));
 }
 
 console.log("analytics-clarify.test.ts OK");

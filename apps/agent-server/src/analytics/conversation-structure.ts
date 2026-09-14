@@ -146,7 +146,6 @@ export function lastUserUtterance(transcript: string): string {
 function isShortClarifyReply(text: string): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
-  if (/澄清选择/.test(t)) return true;
   if (/^(全部|全选|all|宽表|长表|wide|long)$/i.test(t)) return true;
   if (/^\d+([、,，]\d+)*$/.test(t)) return true;
   if (
@@ -585,7 +584,8 @@ export function enforceStructurePolicy(
       const time = result.time;
       const metricId =
         slotAnswers.metric?.[0] ||
-        inferMetricIdFromNl(`${lastUserText}\n${modelMerged}`, { metricDefs: [] } as AnalyticsPack);
+        // 空 pack：这里只要内置口径兜底，不走语义层指标定义
+        inferMetricIdFromNl(`${lastUserText}\n${modelMerged}`, { metricDefs: [] } as unknown as AnalyticsPack);
       const outputDims = inferOutputDimsFromNl(`${lastUserText}\n${modelMerged}`);
       if (time?.start && time?.end && metricId) {
         return {

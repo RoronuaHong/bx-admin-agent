@@ -670,7 +670,11 @@ export function parseAskState(raw: unknown): AskState | null {
   const o = raw as Record<string, unknown>;
   const time = o.time as Record<string, unknown> | undefined;
   const metricId = String(o.metricId || "").trim();
-  if (!metricId || !time || typeof time.start !== "string" || typeof time.end !== "string") {
+  // NOTE: an empty metricId is valid here — a clarify continuation's prevAskState may legitimately
+  // have a resolved time but a still-pending metric (the user answers it via slotAnswers on the
+  // next turn). Requiring a non-empty metricId would reject such partial states and drop the
+  // carried table/context, forcing the turn through the free-text LLM path and losing context.
+  if (!time || typeof time.start !== "string" || typeof time.end !== "string") {
     return null;
   }
   const filters =

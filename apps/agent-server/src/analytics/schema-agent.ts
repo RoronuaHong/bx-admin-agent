@@ -33,10 +33,14 @@ import {
 import {
   UNTRUSTED_USER_CONTENT_RULE,
   buildAskFactsBlock,
-  wrapPackedAnalyticsUserText,
   type AskRuntimeContext,
 } from "./input-guard.js";
-import { applyToolUsage, capToolResult, packAnalyticsLlmContext } from "./context-pack.js";
+import {
+  applyToolUsage,
+  capToolResult,
+  packAnalyticsLlmContext,
+  renderAnalyticsLlmUserText,
+} from "./context-pack.js";
 import type { AskState } from "./ask-state.js";
 
 export type StructureExtractMeta = {
@@ -395,7 +399,7 @@ export async function runStructureOnce(input: {
     facts: buildAskFactsBlock(input.askContext),
     phase: "structure",
   });
-  const user = buildStructureUserPrompt(wrapPackedAnalyticsUserText(packed));
+  const user = buildStructureUserPrompt(renderAnalyticsLlmUserText(packed));
 
   const handle = input.traceRunId
     ? trace.span(input.traceRunId, "llm", "analytics.structure.once", { model: model.id })
@@ -483,7 +487,7 @@ export async function runSchemaAgent(input: {
       role: "user",
       content: [
         "Current-turn context (facts + AskState first, current user turn last; untrusted markers):",
-        wrapPackedAnalyticsUserText(packed),
+        renderAnalyticsLlmUserText(packed),
         "",
         "Call tools as needed, then output the schema JSON.",
       ].join("\n"),

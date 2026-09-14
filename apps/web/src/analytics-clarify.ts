@@ -1,8 +1,9 @@
 /**
- * Analytics 澄清/短答续问：把槽位短答合并回原问，避免丢渠道/时间/口径。
+ * Analytics 澄清/短答续问：只解析 slotAnswers（序号 / 全部 / 按你说的来 → 选项）。
+ * 请求 body.text 始终是用户原文，不把原问拼回去。
  *
  * 注意：ok 后的续问修订（如「IndiaB呢？」）由服务端 AskState TurnIntent 负责；
- * 本模块仅在 looksLikeSlotOnlyReply 为真时合成澄清续跑，不拦截 revise 短句。
+ * 本模块仅在 looksLikeSlotOnlyReply 为真时填槽，不拦截 revise 短句。
  */
 
 export type ClarifyOption = { id: string; label: string };
@@ -166,9 +167,9 @@ function composeFromOrigin(
     replaceLocalesFromCurrent?: boolean;
     lastClarify?: ClarifyBubble;
   },
-): { text: string; slotAnswers?: Record<string, string[]> } {
+): { slotAnswers?: Record<string, string[]> } {
   const originalNl = String(msgs[originIdx]!.text || "").trim();
-  if (!originalNl) return { text: currentText };
+  if (!originalNl) return {};
 
   const slotAnswers: Record<string, string[]> = {};
 
@@ -236,37 +237,16 @@ function composeFromOrigin(
     if (layout) slotAnswers.result_layout = [layout];
   }
 
-  const priorUserTexts = msgs
-    .slice(originIdx + 1)
-    .filter((m) => m.role === "user")
-    .map((m) => m.text || "");
-  const supplements = [...priorUserTexts, currentText];
-
-  const hasIsoInOrigin = /\d{4}-\d{2}-\d{2}/.test(originalNl) || /\d{1,2}\s*月/.test(originalNl);
-  const dateBits = supplements.filter((s) => looksLikeDateOnlyReply(s) || /\d{4}-\d{2}-\d{2}/.test(s));
-  let text = originalNl;
-  if (!hasIsoInOrigin && dateBits.length) {
-    text = `${originalNl}\n日期范围：${dateBits[dateBits.length - 1]}`;
-  }
-
-  const metricBit = supplements.find((s) => /最大进度|阈值/.test(s));
-  if (metricBit && !/最大进度|阈值/.test(originalNl)) {
-    text = `${text}\n口径：${metricBit}`;
-  }
-
-  return {
-    text,
-    slotAnswers: Object.keys(slotAnswers).length ? slotAnswers : undefined,
-  };
+  return { slotAnswers: Object.keys(slotAnswers).length ? slotAnswers : undefined };
 }
 
 /**
- * 澄清多轮 + ok 后槽位短答修正：合成 text + slotAnswers。
+ * 澄清多轮 + ok 后槽位短答修正：只填 slotAnswers，text 保持用户原文。
  */
 export function buildClarifyContinuation(
   priorMessages: ClarifyBubble[],
   currentText: string,
-): { text: string; slotAnswers?: Record<string, string[]> } {
+): { slotAnswers?: Record<string, string[]> } {
   const msgs = priorMessages.filter((m) => !m.welcome && !m.pending && !m.cancelled);
 
   // 1) 活跃澄清链（遇到 ok/refuse/error 即停）
@@ -283,14 +263,14 @@ export function buildClarifyContinuation(
   }
   if (lastClarifyIdx >= 0) {
     const originIdx = findOriginUserIdx(msgs, lastClarifyIdx);
-    if (originIdx < 0) return { text: currentText };
+    if (originIdx < 0) return {};
     return composeFromOrigin(msgs, originIdx, currentText, {
       lastClarify: msgs[lastClarifyIdx],
     });
   }
 
   // 2) 上一条已是 ok/refuse/error，但当前是槽位短答 → 当作对上一原问的修正重跑
-  if (!looksLikeSlotOnlyReply(currentText)) return { text: currentText };
+  if (!looksLikeSlotOnlyReply(currentText)) return {};
 
   let lastResultIdx = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -300,10 +280,10 @@ export function buildClarifyContinuation(
       break;
     }
   }
-  if (lastResultIdx < 0) return { text: currentText };
+  if (lastResultIdx < 0) return {};
 
   const originIdx = findOriginUserIdx(msgs, lastResultIdx);
-  if (originIdx < 0) return { text: currentText };
+  if (originIdx < 0) return {};
 
   return composeFromOrigin(msgs, originIdx, currentText, {
     replaceLocalesFromCurrent: true,

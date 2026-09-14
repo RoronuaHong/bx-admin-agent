@@ -5,7 +5,7 @@ export interface ScanMetricRow {
   scanValue: number | null;
   dodValue: number | null;
   wowValue: number | null;
-  sample?: number;
+  sample?: number | null;
 }
 
 export interface ThresholdChildAlert {
@@ -35,7 +35,7 @@ function baselineValue(row: ScanMetricRow, kind: BaselineKind): number | null {
   return kind === "dod" ? row.dodValue : row.wowValue;
 }
 
-function isMissingNumber(value: number | null | undefined): boolean {
+function isMissingNumber(value: number | null | undefined): value is null | undefined {
   return value === null || value === undefined || Number.isNaN(value);
 }
 

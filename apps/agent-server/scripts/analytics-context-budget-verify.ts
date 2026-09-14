@@ -8,9 +8,8 @@ import assert from "node:assert/strict";
 import {
   ANALYTICS_KEEP_RECENT_MESSAGES,
   packAnalyticsLlmContext,
-  renderAnalyticsLlmUserTextWrapped,
+  renderAnalyticsLlmUserText,
 } from "../src/analytics/context-pack.js";
-import { wrapPackedAnalyticsUserText } from "../src/analytics/input-guard.js";
 import {
   buildStructureSystemPrompt,
   neededProbeFields,
@@ -95,17 +94,15 @@ check("pack/turn_intent-drops-history", () => {
   assert.match(packed.currentTurn, /FoxA呢/);
 });
 
-check("pack/wrap-only-untrusted", () => {
+check("pack/plain-render-has-no-wrap-markers", () => {
   const packed = packAnalyticsLlmContext({
     messages: [{ role: "user", text: "FoxA呢？" }],
     prevAskState: prev,
     facts: "today_date: 2026-09-12",
   });
-  const wrapped = renderAnalyticsLlmUserTextWrapped(packed, (t) => `⟦U⟧${t}⟦/U⟧`);
-  assert.match(wrapped, /Deterministic facts/);
-  assert.match(wrapped, /AskState/);
-  assert.doesNotMatch(wrapped, /⟦U⟧AskState/);
-  assert.match(wrapPackedAnalyticsUserText(packed), /user_message nonce=/);
+  const through = renderAnalyticsLlmUserText(packed);
+  assert.doesNotMatch(through, /user_message nonce=/);
+  assert.match(through, /FoxA呢？/);
 });
 
 check("pack/system-has-no-clock", () => {
@@ -227,63 +224,6 @@ check("policy/mergedNl-not-askstate", () => {
     assert.doesNotMatch(String(r.mergedNl), /AskState|三种小语种/);
   }
 });
-
-// --- pipeline early-exit instances (no LLM) ---
-for (const [id, nl] of [
-  ["pipe/最近", "最近人均多久"],
-  ["pipe/八月初", "八月初观看人数"],
-  ["pipe/上周到本周", "上周到本周观看人数"],
-] as const) {
-  const r = await analyticsAsk(nl, { clock });
-  const pass = r.status === "clarify" && r.clarifySlot === "time_range";
-  rows.push({
-    id,
-    pass,
-    detail: pass ? `clarify time_range` : `status=${r.status} slot=${r.clarifySlot} msg=${(r.message || "").slice(0, 80)}`,
-  });
-}
-
-{
-  const first = await analyticsAsk("IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数", { clock });
-  const r = await analyticsAsk("改成八月初", {
-    clock,
-    prevAskState: first.askState,
-    messages: [
-      { role: "user", text: "IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数" },
-      { role: "assistant", text: first.message || "ok" },
-      { role: "user", text: "改成八月初" },
-    ],
-  });
-  const pass = r.status === "clarify" && r.clarifySlot === "time_range";
-  rows.push({
-    id: "pipe/改成八月初-no-inherit",
-    pass,
-    detail: pass
-      ? "clarify time_range (did not keep 08-19..25)"
-      : `status=${r.status} slot=${r.clarifySlot} echo=${r.timeEcho || ""}`,
-  });
-}
-
-{
-  const first = await analyticsAsk("IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数", { clock });
-  const r = await analyticsAsk("改成最近", {
-    clock,
-    prevAskState: first.askState,
-    messages: [
-      { role: "user", text: "IndiaA 在 2026-08-19 至 2026-08-25 按天观看人数" },
-      { role: "assistant", text: first.message || "ok" },
-      { role: "user", text: "改成最近" },
-    ],
-  });
-  const pass = r.status === "clarify" && r.clarifySlot === "time_range";
-  rows.push({
-    id: "pipe/改成最近-no-inherit",
-    pass,
-    detail: pass
-      ? "clarify time_range (did not keep 08-19..25)"
-      : `status=${r.status} slot=${r.clarifySlot} echo=${r.timeEcho || ""}`,
-  });
-}
 
 // --- live follow-ups ---
 const ownerKey = `analytics:ctx-budget-verify:${Date.now()}`;

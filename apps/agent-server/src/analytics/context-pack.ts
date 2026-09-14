@@ -140,21 +140,6 @@ export function renderAnalyticsLlmUserText(pack: Pick<
     .join("\n\n");
 }
 
-/** Wrap only history + current (untrusted). Facts / AskState stay trusted. */
-export function renderAnalyticsLlmUserTextWrapped(
-  pack: AnalyticsLlmPack,
-  wrapUntrusted: (text: string) => string,
-): string {
-  return renderAnalyticsLlmUserText({
-    facts: pack.facts,
-    askStateLine: pack.askStateLine,
-    history: pack.history ? wrapUntrusted(pack.history) : "",
-    currentTurn: pack.currentTurn ? wrapUntrusted(pack.currentTurn) : "",
-    probeSummary: pack.probeSummary,
-    omittedMessages: pack.omittedMessages,
-  });
-}
-
 export function applyToolUsage(pack: AnalyticsLlmPack, toolChars: number): AnalyticsLlmPack {
   pack.usage.buckets.tool = (pack.usage.buckets.tool || 0) + Math.max(0, toolChars);
   return pack;

@@ -471,6 +471,8 @@ export type CompiledPlanStep = {
   intent: AnalyticsIntent;
   sql: string;
   time: { start: string; end: string; echo: string; spanDays?: number };
+  /** 源 step 的相对窗口（yoy/mom），供结果层判定同比/环比 */
+  timeOffset?: string;
 };
 
 export function compileAskPlanSteps(input: {
@@ -506,7 +508,13 @@ export function compileAskPlanSteps(input: {
     if (!built.ok) return { ok: false, reason: built.reason };
     const compiled = compileAnalyticsIntent(built.intent, input.pack);
     if (!compiled.ok) return { ok: false, reason: compiled.reason };
-    out.push({ id: step.id, intent: built.intent, sql: compiled.sql, time: stepTime });
+    out.push({
+      id: step.id,
+      intent: built.intent,
+      sql: compiled.sql,
+      time: stepTime,
+      timeOffset: step.timeOffset,
+    });
   }
   return { ok: true, steps: out };
 }

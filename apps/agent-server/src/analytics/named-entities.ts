@@ -53,7 +53,14 @@ export function extractNamedEntities(nl: string): string[] {
   const out = new Set<string>();
 
   for (const m of nl.matchAll(/\b([A-Za-z][A-Za-z0-9]{1,31})\b/g)) {
-    if (looksLikeCodeToken(m[1])) out.add(m[1]);
+    if (!looksLikeCodeToken(m[1])) continue;
+    // A parenthesized token is an annotation / sentinel (e.g. the blank-member marker), not an
+    // entity the user named. The AskState summary renders such markers verbatim, and treating
+    // them as named entities made verifyNamedChannel flag SQL that legitimately mapped the
+    // marker onto its value form (false "missing_named_channel").
+    const at = m.index ?? 0;
+    if (nl[at - 1] === "(" && nl[at + m[1].length] === ")") continue;
+    out.add(m[1]);
   }
 
   // 逐位置扫描，避免较长噪声匹配吞掉短实体

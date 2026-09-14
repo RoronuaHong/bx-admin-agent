@@ -14,8 +14,7 @@ import {
 } from "./ask-state.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
-import { packAnalyticsLlmContext } from "./context-pack.js";
-import { wrapPackedAnalyticsUserText } from "./input-guard.js";
+import { packAnalyticsLlmContext, renderAnalyticsLlmUserText } from "./context-pack.js";
 import { beginAnalyticsLlmSignal } from "./llm-error.js";
 
 
@@ -61,7 +60,7 @@ function buildUserPrompt(input: {
     phase: "turn_intent",
   });
   const parts = [
-    wrapPackedAnalyticsUserText(packed),
+    renderAnalyticsLlmUserText(packed),
   ];
   if (input.lastClarifySlot) {
     parts.push(`lastClarifySlot: ${input.lastClarifySlot}`);

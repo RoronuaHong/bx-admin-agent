@@ -9,7 +9,6 @@ import { compileAnalyticsIntent } from "../src/analytics/sql-compile.js";
 import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 import { assertAnalyticsSqlSafe, analyzeSqlAst } from "../src/analytics/sql-guard.js";
 import { resolveTimeRange } from "../src/analytics/time-resolve.js";
-import { analyticsAsk } from "../src/analytics/pipeline.js";
 
 const pack = loadAnalyticsPack("watch-detail");
 const clock = new Date("2026-09-09T12:00:00+08:00");
@@ -105,14 +104,10 @@ function check(name: string, ok: boolean, detail = "") {
   check("time_recent_7d", r.ok && r.ok && r.range.start === "2026-09-03" && r.range.end === "2026-09-09");
 }
 
-// 5) 裸「最近」→ 代码澄清（不烧 LLM）
+// 5) 裸「最近」：代码解析无法钉死日期（facts 记 unresolved，不再提前退出）
 {
-  const ask = await analyticsAsk("最近人均多久", { clock });
-  check(
-    "bare_recent_clarify",
-    ask.status === "clarify" && ask.clarifySlot === "time_range",
-    ask.message.slice(0, 80),
-  );
+  const r = resolveTimeRange("最近人均多久", clock, "Asia/Shanghai");
+  check("bare_recent_unresolved", !r.ok, r.ok ? "" : r.clarify.slice(0, 80));
 }
 
 // 6) queryTimeout 配置存在

@@ -3,13 +3,15 @@
 > **范围**：只比「一句话进 → 一张列和行都对的结果表出」。不比登录身份、Metabase 卡片 API、评测看板、多轮偏好。  
 > **对照**：Cortex Analyst / Looker Conversational Analytics / Cube / dbt Semantic Layer + 本仓 `analyticsAsk`（`pipeline.ts`）。  
 > **规格**：[`../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md)  
-> **核对日期**：2026-09-14（覆盖率 GATE 与扩表名单已对齐代码；NL→表步骤仍以实现为准）
+> **核对日期**：2026-09-14（进 LLM 前组包与时间分工见 `ANALYTICS_INPUT_TO_LLM.md`；覆盖率 GATE 与扩表名单已对齐代码；NL→表步骤仍以实现为准）
 
 **正确表**：对的表、对的日期、对的指标公式、点过的过滤还在。能跑但换了分母、丢了渠道、少了最后一天，都不算。
 
 ```
-NL → 护栏 → 目录 → 时间 → 检索表 → 锁口径 → 路由 A/B/C → 出 SQL → 守卫 → 取值 → 对表 → 行
+NL → 护栏 → 目录 → 组包(时钟+已算日期进 facts) → LLM 抽槽 → 代码覆盖日期 → 检索表 → 锁口径 → 路由 A/B/C → 出 SQL → 守卫 → 取值 → 对表 → 行
 ```
+
+进 LLM 之前（清洗 / 记忆 / 检索 / 组包 / **时间语义 vs 日期算术**）见 [`ANALYTICS_INPUT_TO_LLM.md`](./ANALYTICS_INPUT_TO_LLM.md)。
 
 ---
 
@@ -19,10 +21,10 @@ NL → 护栏 → 目录 → 时间 → 检索表 → 锁口径 → 路由 A/B/C
 |---|---|---|---|
 | 1 | 原文进管线，禁止改写 | 对齐 | `pipeline.ts` → `guardAnalyticsInput` |
 | 2 | 先定能查哪些表 | 对齐 | `refreshPackFromCatalog`；隐藏表 `blocked_table` refuse |
-| 3 | 时间由代码钉死 | 对齐 | `resolveAskTimeRange`；失败 `clarify time_range` |
+| 3 | 时间：LLM 读懂相对说法，代码算 YYYY-MM-DD | 对齐 | facts 注入 `today_date`；`resolveAskTimeRange` 能钉则写入 `resolved_time_range`（模型必须用）；钉不死不提前退出；`applyResolvedTime` 覆盖模型心算 |
 | 4 | 检索表（不要求用户锁表） | 对齐 | `resolveAskTable` 卡片检索；Path C `get_table_schema` 按需拉列 |
-| 5 | 锁对口径（指标 + 形状） | 对齐 | metric family 闸；观看宽表 / 付费 / 留存已编译；缺渠道或版本 clarify |
-| 6 | 谁写 SQL（互斥） | 对齐 | `matchVerifiedQuery` → `routeAnalyticsAsk` |
+| 5 | 锁对口径（指标 + 形状） | 对齐 | metric family 闸；观看宽表 / 付费 / 留存已编译；缺渠道或版本在 structure 后 grounding clarify |
+| 6 | 谁写 SQL（互斥） | 对齐 | 金样进 facts；`routeAnalyticsAsk` 组包前算出路径；Path C 执行在 structure 之后 |
 | 7 | 出 SQL | 对齐 | A `sql-compile` / B `bindVerifiedQuery` / C `runSqlAgent` |
 | 8 | 跑之前挡住错 SQL | 部分 | AST + `requireWhere` + 三对 relationship；图外多表不出表（V1 有意） |
 | 9 | 取值；失败按路径处理 | 对齐 | A/B 失败不换口径；C 最多 3 次 |
@@ -52,11 +54,18 @@ NL → 护栏 → 目录 → 时间 → 检索表 → 锁口径 → 路由 A/B/C
 
 本仓：活目录 **72 / 67 / 5**（总 / 可答 / 隐藏）。`catalogApplied.unmodeledTablesInNl` 非空立刻 `refuse`（`blocked_table`），不编 SQL。覆盖率 GATE 见 `warehouse-coverage.ts`：与 EX 分母分开；扩表优先名单在 `config/analytics/warehouse-coverage.json`（batch 0 `elt_watch_detail` overlay；batch 1 付费/留存 VQR 五表；batch 2 首张 `gather_stat` 已升金样，其余影片/会员/邀请等 catalog_only）。
 
-### 3. 时间由代码钉死
+### 3. 时间：读懂归 LLM，落地归代码
 
-业界：相对时间用应用时钟和业务时区；解不开就反问。
+业界：相对时间（2周内 / 下周三之前）由模型结合「今天」理解意图；具体日历日用时钟工具算，禁止模型心算（跨月、闰年、周序会错）。
 
-本仓：`resolveAskTimeRange` 失败 → `clarifySlot=time_range`。Path C 再经 `overlayResolvedDates` + `includeResolvedEndDay`，禁止 `< 结束日 00:00:00` 丢掉最后一天。
+本仓：
+
+- 组包时注入 `today_date` + `timezone`（业务时区，默认 Asia/Shanghai）。
+- `resolveAskTimeRange` 用同一时钟做确定性算术（昨天 / 最近7天 / ISO 区间等）→ facts `resolved_time_range`。模型 JSON 的 time **必须**用这两个日期；`applyResolvedTime` 再覆盖一遍。
+- 钉不死（裸「最近」等）→ facts 写 none，**不**再 `clarify time_range` 提前退出；模型可澄清，不得编造起止日。
+- Path C 再经 `overlayResolvedDates` + `includeResolvedEndDay`，禁止 `< 结束日 00:00:00` 丢掉最后一天。
+
+细表见 [`ANALYTICS_INPUT_TO_LLM.md`](./ANALYTICS_INPUT_TO_LLM.md) §0。
 
 ### 4. 检索表（不要求用户锁表）
 
@@ -78,17 +87,17 @@ NL → 护栏 → 目录 → 时间 → 检索表 → 锁口径 → 路由 A/B/C
 - `ambiguousMetricFamilyClarify`：光说「完播率按天」反问（人数 vs 最大进度）。
 - 「完播 + 宽表」跳过 family 闸，走 `avg_max_progress`。
 - 付费 / 留存已有 `ratio` / `retention_dn`；缺渠道或版本会 clarify。
-- 「日活 / 活跃用户」编到 `elt_active_guid`（`uniq(guid)` 按天）；缺渠道立刻 clarify，不进 Path C。模型调用 15s 超时，额度/网关错误不把 JSON 甩到对话里。
+- 「日活 / 活跃用户」编到 `elt_active_guid`（`uniq(guid)` 按天）；缺渠道在 structure 后 grounding clarify，不进 Path C。模型调用 15s 超时，额度/网关错误不把 JSON 甩到对话里。
 
 ### 6. 决定谁写 SQL（互斥）
 
 业界：已建模 KPI 编译；高频金句 Verified Query；其余受控 Text2SQL。一问一条，禁止失败后偷换指标。
 
-本仓顺序（`pipeline.ts` 前半段）：
+本仓顺序（`pipeline.ts`）：
 
-1. 时间已钉死后先 `matchVerifiedQuery`（内部若 `compileCanCoverVerified` 则 **不** 进 B）。
-2. `resolveAskTable` 检索表（唯一才锁编译；否则 retrieved / catalog）。
-3. `routeAnalyticsAsk`：B → A（overlay / 已建模 / 显式单表四则，且非 retrieved）→ C。
+1. 金样命中只进 facts（不在进 LLM 前直接跑 SQL；多命中也不提前反问）。
+2. `resolveAskTable` 检索表（唯一才锁编译；否则 retrieved / catalog；**不**因多候选提前选表）。
+3. `routeAnalyticsAsk` 组包前算出 A / C / refuse。澄清短答不按当前句进 Path C：AskState 合并完整则直接 Path A。新探索问才在 structure 后 `runSqlAgent`。
 4. 文档表默认 `count:*` **不**抢 C（除非 NL 有人数/订单数等显式线索）。
 
 ### 7. 出 SQL
