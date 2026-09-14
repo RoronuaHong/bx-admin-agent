@@ -11,6 +11,7 @@ import {
   catalogRefreshEnabled,
   diffTableFields,
   formatCatalogFacts,
+  summarizeCatalogCoverage,
   parseMetabaseDatabaseMetadata,
   unmodeledTablesNamedInNl,
   _setCatalogDirForTest,
@@ -18,6 +19,7 @@ import {
 import { loadAnalyticsPack, packTimeField } from "../src/analytics/semantic-layer.js";
 
 _setCatalogDirForTest(mkdtempSync(join(tmpdir(), "analytics-catalog-")));
+assert.equal(summarizeCatalogCoverage(2), null);
 
 assert.equal(catalogRefreshEnabled({ ANALYTICS_CATALOG_REFRESH: "0" }), false);
 assert.equal(catalogRefreshEnabled({ ANALYTICS_CATALOG_REFRESH: "1" }), true);
@@ -28,6 +30,8 @@ const parsed = parseMetabaseDatabaseMetadata(
       {
         name: "elt_watch_detail",
         schema: "film_report",
+        display_name: "每天观影明细（新）",
+        description: "本表为用户设备观影的每天汇总明细表",
         fields: [
           { name: "lastWatchTime", active: true, visibility_type: "normal", base_type: "type/DateTime" },
           { name: "channel", active: true, visibility_type: "normal", base_type: "type/Text" },
@@ -73,6 +77,9 @@ assert.deepEqual(applied.pack.catalog?.schemas, ["film_report", "gather"]);
 assert.equal(applied.pack.catalog?.answerableCount, 2);
 assert.ok(applied.pack.warehouse?.tables.some((t) => t.name === "ads_other"));
 assert.ok(!applied.pack.warehouse?.tables.some((t) => t.name === "elt_user_full_tmp"));
+const watchWh = applied.pack.warehouse?.tables.find((t) => t.name === "elt_watch_detail");
+assert.equal(watchWh?.description, "本表为用户设备观影的每天汇总明细表");
+assert.equal(watchWh?.displayName, "每天观影明细（新）");
 
 const facts = formatCatalogFacts(applied.pack, applied.notes);
 assert.match(String(facts), /3 tables/);

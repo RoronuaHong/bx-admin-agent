@@ -6,7 +6,7 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 export type MetabaseRunOpts = { signal?: AbortSignal; timeoutMs?: number };
 
-function mergeTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number | undefined): {
+export function mergeTimeoutSignal(signal: AbortSignal | undefined, timeoutMs: number | undefined): {
   signal?: AbortSignal;
   cleanup: () => void;
   didTimeout: () => boolean;
@@ -281,6 +281,8 @@ export type MetabaseDatabaseMetadata = {
     id?: number;
     name?: string;
     schema?: string;
+    display_name?: string;
+    description?: string | null;
     active?: boolean;
     fields?: Array<{
       id?: number;

@@ -1,5 +1,11 @@
 import type { DistinctCountFn } from "./types.js";
 import { analyzeSqlAst, assertSqlAstSafe } from "./sql-ast.js";
+import {
+  bareTableName,
+  relationshipAllowsJoin,
+  tableHasTimeField,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
 
 export { analyzeSqlAst, assertSqlAstSafe } from "./sql-ast.js";
 
@@ -50,7 +56,59 @@ export function assertTablesWhitelisted(sql: string, allowedTables: string[]): v
   assertSqlAstSafe(sql, { allowedTables });
 }
 
+/** Require WHERE only when at least one table in the SQL has a time column. */
+export function sqlRequiresWhere(sql: string, pack?: AnalyticsPack): boolean {
+  if (!pack) return true;
+  const tables = extractFromTables(sql);
+  if (!tables.length) return true;
+  return tables.some((t) => tableHasTimeField(pack, bareTableName(t)));
+}
+
+/** Fail unless every joined table is connected via declared relationships. */
+export function assertJoinsOnDeclaredRelationships(sql: string, pack: AnalyticsPack): void {
+  const tables = [...new Set(extractFromTables(sql).map((t) => bareTableName(t).toLowerCase()))].filter(
+    Boolean,
+  );
+  if (tables.length <= 1) return;
+  const adj = new Map<string, Set<string>>();
+  const add = (a: string, b: string) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    adj.get(a)!.add(b);
+  };
+  for (const a of tables) {
+    for (const b of tables) {
+      if (a !== b && relationshipAllowsJoin(pack, a, b)) {
+        add(a, b);
+        add(b, a);
+      }
+    }
+  }
+  const start = tables[0]!;
+  const seen = new Set<string>([start]);
+  const queue = [start];
+  while (queue.length) {
+    const cur = queue.shift()!;
+    for (const n of adj.get(cur) || []) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        queue.push(n);
+      }
+    }
+  }
+  const orphan = tables.filter((t) => !seen.has(t));
+  if (orphan.length) {
+    throw new Error(`undeclared_join:${orphan.join("+")}`);
+  }
+}
+
 /** 问数编译结果：必须有 WHERE + 表白名单。 */
-export function assertAnalyticsSqlSafe(sql: string, allowedTables: string[]): void {
-  assertSqlAstSafe(sql, { requireWhere: true, allowedTables });
+export function assertAnalyticsSqlSafe(
+  sql: string,
+  allowedTables: string[],
+  opts?: { requireWhere?: boolean },
+): void {
+  assertSqlAstSafe(sql, {
+    requireWhere: opts?.requireWhere !== false,
+    allowedTables,
+  });
 }

@@ -39,12 +39,18 @@ const pack = JSON.parse(
 
 assert.equal(inferMetricIdFromNl("电影的观看人数按天", pack), "uniq_users");
 assert.equal(inferMetricIdFromNl("IndiaA 完播率按天", pack), undefined);
+assert.equal(inferMetricIdFromNl("IndiaA 完播率宽表", pack), "avg_max_progress");
 assert.equal(
   inferMetricIdFromNl("最大进度的平均值，也就是完播率", pack),
   "avg_max_progress",
 );
 assert.equal(inferMetricIdFromNl("八月二十到二十一印度A观看总时长秒", pack), "sum_watch_second");
+assert.equal(inferMetricIdFromNl("IndiaA 2.4.1 付费率", pack), "pay_rate_lang_wide");
+assert.equal(inferMetricIdFromNl("IndiaA 2.4.1 次日留存", pack), "retention_d1_total");
+assert.equal(inferMetricIdFromNl("IndiaA 2.4.1 留存1", pack), "retention_d1_lang");
+assert.equal(ambiguousMetricFamilyClarify("IndiaA 次日留存", pack), null);
 assert.ok(ambiguousMetricFamilyClarify("IndiaA 完播率按天", pack));
+assert.equal(ambiguousMetricFamilyClarify("IndiaA 完播率宽表", pack), null);
 assert.equal(ambiguousMetricFamilyClarify("最大进度的平均值，也就是完播率", pack), null);
 {
   const historyBlob = [

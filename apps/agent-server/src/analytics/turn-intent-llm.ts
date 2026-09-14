@@ -16,6 +16,7 @@ import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
 import { packAnalyticsLlmContext } from "./context-pack.js";
 import { wrapPackedAnalyticsUserText } from "./input-guard.js";
+import { beginAnalyticsLlmSignal } from "./llm-error.js";
 
 
 function buildSystemPrompt(): string {
@@ -117,33 +118,52 @@ async function chatJson(input: {
   try {
     let content = "";
     try {
-      const resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          ...bodyBase,
-          response_format: { type: "json_object" },
-        }),
-        signal: input.signal,
-      });
+      const llmSig = beginAnalyticsLlmSignal(input.signal);
+      let resp: Response;
+      try {
+        resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            ...bodyBase,
+            response_format: { type: "json_object" },
+          }),
+          signal: llmSig.signal,
+        });
+      } catch (e) {
+        if (llmSig.didTimeout()) throw new Error("llm_timeout");
+        throw e;
+      } finally {
+        llmSig.cleanup();
+      }
       const data = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string | null } }>;
       };
       if (!resp.ok) throw new Error("json_object_unsupported");
       content = String(data.choices?.[0]?.message?.content || "").trim();
-    } catch {
-      const resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(bodyBase),
-        signal: input.signal,
-      });
+    } catch (first) {
+      if (first instanceof Error && first.message === "llm_timeout") throw first;
+      const llmSig = beginAnalyticsLlmSignal(input.signal);
+      let resp: Response;
+      try {
+        resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(bodyBase),
+          signal: llmSig.signal,
+        });
+      } catch (e) {
+        if (llmSig.didTimeout()) throw new Error("llm_timeout");
+        throw e;
+      } finally {
+        llmSig.cleanup();
+      }
       const data = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string | null } }>;
       };

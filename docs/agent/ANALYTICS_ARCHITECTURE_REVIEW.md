@@ -1,5 +1,7 @@
 # Analytics 子系统架构评审（含覆盖率真相与主流对比）
 
+> **2026-09-13 后续更正**：warehouse 已灌可答表（71 / 67 / 4），「1/71、生成 71 pack、Phase 0–4」不再作为实现计划。混合问数（编译 + 金样 + LLM 写 SQL）以 [`docs/superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md) 为准。**自然语言 → 正确结果表**的逐步对照见 [`ANALYTICS_NL_TO_TABLE.md`](./ANALYTICS_NL_TO_TABLE.md)。下文保留当日评审快照。
+>
 > 日期：2026-09-13
 > 范围：`apps/agent-server/src/analytics/**` + `apps/agent-server/config/analytics/**`
 > 触发：对「EX=100%」评测结果的质疑 → 追查 gold 的能力边界 → 发现 1/71 表覆盖率问题

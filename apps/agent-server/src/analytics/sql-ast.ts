@@ -101,16 +101,31 @@ function splitTopLevelStatements(cleaned: string): string[] {
   return parts;
 }
 
-function extractTablesFromClause(cleaned: string): string[] {
+/** CTE / derived-table names declared as `name AS (` — not physical warehouse tables. */
+export function extractCteNames(cleaned: string): Set<string> {
+  const names = new Set<string>();
+  if (!/^\s*with\b/i.test(cleaned)) return names;
+  const re = /\b([a-zA-Z_][\w]*)\s+as\s*\(/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(cleaned)) !== null) {
+    names.add(m[1]!.toLowerCase());
+  }
+  return names;
+}
+
+function extractTablesFromClause(cleaned: string, cteNames?: Set<string>): string[] {
   const tables: string[] = [];
   const seen = new Set<string>();
+  const ctes = cteNames || extractCteNames(cleaned);
   const re = /\b(?:from|join)\s+([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)?)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(cleaned)) !== null) {
     const name = m[1]!;
-    // skip subquery alias after ) AS x — FROM (select...) t already skipped by pattern needing ident after FROM
-    if (seen.has(name.toLowerCase())) continue;
-    seen.add(name.toLowerCase());
+    const full = name.toLowerCase();
+    const bare = full.includes(".") ? full.slice(full.lastIndexOf(".") + 1) : full;
+    if (ctes.has(full) || ctes.has(bare)) continue;
+    if (seen.has(full)) continue;
+    seen.add(full);
     tables.push(name);
   }
   return tables;
@@ -188,7 +203,7 @@ export function analyzeSqlAst(sql: string): SqlAstSummary {
     kind = "invalid";
   }
 
-  const tables = extractTablesFromClause(primary);
+  const tables = extractTablesFromClause(primary, extractCteNames(primary));
   // WHERE may live only in a subquery (wide/pivot compile); accept nested WHERE.
   const hasWhere =
     topLevelHasKeyword(primary, /\bwhere\b/i) || /\bwhere\b/i.test(primary);

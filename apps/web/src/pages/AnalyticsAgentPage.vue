@@ -62,6 +62,10 @@ type AnalyticsBubble = {
   defaultsNote?: string;
   tables?: AnalyticsAskTable[];
   sqls?: string[];
+  sqlSource?: AnalyticsAskResult["sqlSource"];
+  trust?: AnalyticsAskResult["trust"];
+  linkedTables?: string[];
+  verifiedQueryId?: string;
   probeSummary?: string;
   clarifySlot?: string;
   clarifyOptions?: Array<{ id: string; label: string }>;
@@ -77,6 +81,8 @@ type AnalyticsBubble = {
   userNl?: string;
   feedback?: "useful" | "wrong";
   charts?: ChartView[];
+  insight?: string;
+  verify?: AnalyticsAskResult["verify"];
 };
 
 type AnalyticsConversation = {
@@ -92,7 +98,7 @@ type AnalyticsConversation = {
 
 const STORAGE_KEY = "bx-analytics-conversations-v1";
 /** 与后台 Agent 共用模型偏好，切换 Agent 后模型选择一致 */
-const MODEL_CACHE_KEY = "bx-admin-agent-model-v1";
+const MODEL_CACHE_KEY = "bx-admin-agent-model-v2";
 const ACTIVE_KEY = "bx-analytics-active-conv-v1";
 
 const route = useRoute();
@@ -222,6 +228,10 @@ function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
       rows: Array.isArray(t.rows) ? t.rows.slice(0, STORE_TABLE_ROWS) : t.rows,
     })),
     sqls: m.sqls,
+    sqlSource: m.sqlSource,
+    trust: m.trust,
+    linkedTables: m.linkedTables,
+    verifiedQueryId: m.verifiedQueryId,
     probeSummary: m.probeSummary,
     clarifySlot: m.clarifySlot,
     clarifyOptions: m.clarifyOptions,
@@ -235,6 +245,8 @@ function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
     userNl: m.userNl,
     feedback: m.feedback,
     charts: m.charts,
+    insight: m.insight,
+    verify: m.verify,
   };
 }
 
@@ -247,6 +259,10 @@ function storedToBubble(m: StoredMessage, fallbackId: string): AnalyticsBubble {
     timeEcho: m.timeEcho,
     tables: m.tables as AnalyticsAskTable[] | undefined,
     sqls: m.sqls,
+    sqlSource: m.sqlSource,
+    trust: m.trust,
+    linkedTables: m.linkedTables,
+    verifiedQueryId: m.verifiedQueryId,
     probeSummary: m.probeSummary,
     clarifySlot: m.clarifySlot,
     clarifyOptions: m.clarifyOptions,
@@ -260,6 +276,8 @@ function storedToBubble(m: StoredMessage, fallbackId: string): AnalyticsBubble {
     userNl: m.userNl,
     feedback: m.feedback === "useful" || m.feedback === "wrong" ? m.feedback : undefined,
     charts: m.charts as ChartView[] | undefined,
+    insight: m.insight,
+    verify: m.verify,
     welcome: m.welcome,
     pending: false,
   };
@@ -496,6 +514,7 @@ const helpOpen = ref(false);
 const activeController = ref<AbortController | null>(null);
 /** 仅用户主动点停止时为 true；网络中断/HMR/组件卸载不展示「已取消」 */
 let userInitiatedCancel = false;
+const ASK_TIMEOUT_MS = 45_000;
 let threadScrollbarCleanup: (() => void) | null = null;
 
 const activeConversation = computed(
@@ -925,6 +944,24 @@ async function copyBody(item: AnalyticsBubble) {
   }
 }
 
+function verifyLabel(item: AnalyticsBubble): string {
+  const v = item.verify?.verdict;
+  if (v === "pass") return tx("校对通过", "Verify pass");
+  if (v === "fail") return tx("校对未通过", "Verify fail");
+  if (v === "unclear") return tx("校对未决", "Verify unclear");
+  return "";
+}
+
+function sqlTrustLabel(item: AnalyticsBubble): string {
+  if (item.trust === "verified" || item.sqlSource === "verified_query") {
+    return tx("金样口径", "Verified query");
+  }
+  if (item.trust === "unverified" || item.sqlSource === "llm_sql") {
+    return tx("未核验口径", "Unverified");
+  }
+  return "";
+}
+
 async function copySqls(item: AnalyticsBubble) {
   const sql = (item.sqls || []).filter(Boolean).join("\n\n---\n\n");
   if (!sql) return;
@@ -1007,8 +1044,8 @@ let modelScrollbarCleanup: (() => void) | null = null;
 
 const textModels = computed(() => availableModels.value.filter((m) => m.vision === "none"));
 const visionModels = computed(() => availableModels.value.filter((m) => m.vision !== "none"));
-const glm5Model = computed(() =>
-  availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label)),
+const dsflashModel = computed(() =>
+  availableModels.value.find((m) => m.id === "dsflash" || /deepseek-v4-flash/i.test(m.label)),
 );
 
 function selectModel(id: string | null) {
@@ -1222,6 +1259,11 @@ async function send(presetText?: string) {
   userInitiatedCancel = false;
   const controller = new AbortController();
   activeController.value = controller;
+  let askTimedOut = false;
+  const askTimer = window.setTimeout(() => {
+    askTimedOut = true;
+    controller.abort();
+  }, ASK_TIMEOUT_MS);
   const requestConvId = activeId.value;
 
   const priorMessages = [...(activeConversation.value?.messages || [])];
@@ -1304,7 +1346,9 @@ async function send(presetText?: string) {
         patchPending({
           text: "",
           status: "error",
-          error: tx("请求中断，请重试", "Request interrupted, please retry"),
+          error: askTimedOut
+            ? tx("查询超时，请换一个模型或把渠道写成具体代码后重试", "Ask timed out. Switch model or name a channel code.")
+            : tx("请求中断，请重试", "Request interrupted, please retry"),
           pending: false,
           cancelled: false,
         });
@@ -1334,6 +1378,10 @@ async function send(presetText?: string) {
         defaultsNote: data.defaultsNote,
         tables: data.tables,
         sqls: data.sqls,
+        sqlSource: data.sqlSource,
+        trust: data.trust,
+        linkedTables: data.linkedTables,
+        verifiedQueryId: data.verifiedQueryId,
         probeSummary: data.probeSummary,
         clarifySlot: data.clarifySlot,
         clarifyOptions: data.clarifyOptions,
@@ -1345,6 +1393,8 @@ async function send(presetText?: string) {
         packVersion: data.packVersion,
         userNl: askPayload.text,
         charts: data.charts,
+        insight: data.insight,
+        verify: data.verify,
       });
     }
   } catch (err) {
@@ -1355,7 +1405,9 @@ async function send(presetText?: string) {
         patchPending({
           text: "",
           status: "error",
-          error: tx("请求中断，请重试", "Request interrupted, please retry"),
+          error: askTimedOut
+            ? tx("查询超时，请换一个模型或把渠道写成具体代码后重试", "Ask timed out. Switch model or name a channel code.")
+            : tx("请求中断，请重试", "Request interrupted, please retry"),
           pending: false,
           cancelled: false,
         });
@@ -1371,6 +1423,7 @@ async function send(presetText?: string) {
       });
     }
   } finally {
+    window.clearTimeout(askTimer);
     if (activeController.value === controller) activeController.value = null;
     sending.value = false;
     if (activeId.value === requestConvId) {
@@ -1389,7 +1442,7 @@ function onComposerKeydown(ev: KeyboardEvent) {
 
 function onWindowClickAway(e: MouseEvent) {
   const t = e.target as HTMLElement | null;
-  if (!t || !t.closest(".model-switch-row")) modelMenuOpen.value = false;
+  if (!t || !t.closest(".model-switch")) modelMenuOpen.value = false;
 }
 
 function onWindowKeydown(e: KeyboardEvent) {
@@ -1452,8 +1505,8 @@ onMounted(async () => {
     } else if (selectedModel.value) {
       const hit = availableModels.value.find((m) => m.id === selectedModel.value);
       if (hit) selectedModelLabel.value = hit.label;
-    } else if (glm5Model.value) {
-      selectModel(glm5Model.value.id);
+    } else if (dsflashModel.value) {
+      selectModel(dsflashModel.value.id);
     }
   } catch {
     availableModels.value = [];
@@ -1569,7 +1622,7 @@ onUnmounted(() => {
         </div>
 
         <div
-          v-if="item.text || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
+          v-if="item.text || item.insight || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
           class="body-wrap"
         >
           <p v-if="item.status && item.role === 'assistant' && !item.pending" class="status-line" :data-status="item.status">
@@ -1580,6 +1633,12 @@ onUnmounted(() => {
               <template v-if="item.packVersion && item.modelId"> · </template>
               <template v-if="item.modelId">{{ item.modelId }}</template>
             </span>
+            <span
+              v-if="verifyLabel(item)"
+              class="verify-chip"
+              :data-verdict="item.verify?.verdict"
+              :title="item.verify?.reason || ''"
+            >{{ verifyLabel(item) }}</span>
           </p>
           <p
             v-if="(item.askSummary || item.defaultsNote) && item.role === 'assistant' && !item.pending"
@@ -1628,9 +1687,16 @@ onUnmounted(() => {
             v-html="renderMarkdown(item.text)"
           />
 
+          <div
+            v-if="item.insight && !item.pending"
+            class="ask-insight"
+            v-html="renderMarkdown(item.insight)"
+          />
+
           <details v-if="item.sqls?.length" class="sql">
             <summary class="sql-summary">
               <span>{{ tx("SQL", "SQL", "SQL", "SQL") }} ({{ item.sqls.length }})</span>
+              <span v-if="sqlTrustLabel(item)" class="sql-trust" :class="`sql-trust-${item.trust || item.sqlSource || ''}`">{{ sqlTrustLabel(item) }}</span>
               <button
                 type="button"
                 class="sql-copy"
@@ -1853,18 +1919,6 @@ onUnmounted(() => {
             @paste="onComposerPaste"
           />
           <div class="composer-toolbar">
-            <div class="model-switch-row">
-            <button
-              v-if="glm5Model"
-              type="button"
-              class="model-chip"
-              :class="{ selected: selectedModel === glm5Model.id }"
-              :title="`${glm5Model.label} · TokenHub glm-5`"
-              :disabled="sending"
-              @click="selectModel(glm5Model.id)"
-            >
-              GLM-5
-            </button>
             <div class="model-switch">
               <button
                 type="button"
@@ -1965,7 +2019,6 @@ onUnmounted(() => {
                   </div>
                 </div>
               </Transition>
-            </div>
             </div>
             <div class="toolbar-right">
               <button
@@ -2751,6 +2804,43 @@ onUnmounted(() => {
   gap: 6px;
 }
 
+.ask-insight {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.ask-insight p {
+  margin: 0 0 8px;
+}
+
+.ask-insight p:last-child {
+  margin-bottom: 0;
+}
+
+.verify-chip {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid var(--line, #d8d8d8);
+  color: var(--muted);
+}
+
+.verify-chip[data-verdict="pass"] {
+  color: #0a7a3e;
+  border-color: #8fd4ad;
+}
+
+.verify-chip[data-verdict="fail"] {
+  color: #b42318;
+  border-color: #f0b0aa;
+}
+
 .defaults-chip {
   display: inline-flex;
   align-items: center;
@@ -2864,6 +2954,28 @@ onUnmounted(() => {
 
 .sql-summary::-webkit-details-marker {
   display: none;
+}
+
+.sql-trust {
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted, var(--ink));
+  white-space: nowrap;
+}
+
+.sql-trust-unverified,
+.sql-trust-llm_sql {
+  border-color: color-mix(in srgb, #c47d1a 45%, var(--line));
+  color: #9a5b00;
+}
+
+.sql-trust-verified,
+.sql-trust-verified_query {
+  border-color: color-mix(in srgb, #2f7d4a 45%, var(--line));
+  color: #1f6b3a;
 }
 
 .sql-copy {
@@ -3258,43 +3370,6 @@ onUnmounted(() => {
   50% {
     opacity: 0.45;
   }
-}
-
-.model-switch-row {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.model-chip {
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: transparent;
-  color: var(--ink);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
-}
-
-.model-chip:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--ink) 7%, transparent);
-}
-
-.model-chip:active:not(:disabled) {
-  transform: scale(0.97);
-}
-
-.model-chip:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.model-chip.selected {
-  background: color-mix(in srgb, var(--ink) 10%, transparent);
-  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
 }
 
 .model-switch {

@@ -17,6 +17,8 @@ const ORIG =
   assert.deepEqual(extractChannelsFromNl("印度A 按天人数", pack), ["IndiaA"]);
   assert.deepEqual(extractChannelsFromNl("印度A 按天人数"), []);
   assert.deepEqual(extractChannelsFromNl("巴西A 按天人数", pack), []);
+  assert.deepEqual(extractChannelsFromNl("巴西环境的日活", pack), []);
+  assert.deepEqual(extractChannelsFromNl("印度环境的日活", pack), []);
   assert.deepEqual(extractChannelsFromNl("FilmeTela 按天人数", pack), ["FilmeTela"]);
   assert.deepEqual(extractChannelsFromNl("FoxA 和 GoGo 观看人数", pack).slice().sort(), ["FoxA", "GoGo"]);
   assert.ok(!extractChannelsFromNl("同比 YoY 增长率 SQL", pack).includes("YoY"));
@@ -295,6 +297,125 @@ const ORIG =
   assert.match(compiled.sql, /count\(\)/);
   assert.doesNotMatch(compiled.sql, /lastWatchTime/);
   assert.doesNotMatch(compiled.sql, /toDate\(/);
+}
+
+// conditional_wide: 人均 / 起播 未点语种 → pack defaultWideLangs
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["", "te-IN", "ta-IN", "ml-IN"] },
+      outputDims: ["watch_date", "channel"],
+      layout: "wide",
+      pivotDim: "contentLang",
+      metricId: "avg_watch_second_per_user",
+    },
+    pack,
+    fallbackNl: "IndiaA 人均时长宽表 2026-08-19 至 2026-08-25",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.match(compiled.sql, /sumIf\(watchSecond,\s*contentLang = ''\)/);
+  assert.match(compiled.sql, /uniqIf\(guid,\s*contentLang = 'te-IN'\)/);
+  assert.match(compiled.sql, /AS te_IN/);
+}
+
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"] },
+      outputDims: ["watch_date", "channel"],
+      layout: "wide",
+      pivotDim: "contentLang",
+      metricId: "uniq_users",
+    },
+    pack,
+    fallbackNl: "IndiaA 起播人数宽表 2026-08-19 至 2026-08-25",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.match(compiled.sql, /uniqIf\(guid,\s*contentLang = ''\)/);
+  assert.match(compiled.sql, /uniqIf\(guid,\s*contentLang = 'ml-IN'\)/);
+}
+
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], appVersion: ["2.4.1"] },
+      outputDims: [],
+      metricId: "pay_rate_lang_wide",
+      table: "elt_film_user",
+    },
+    pack,
+    fallbackNl: "IndiaA 版本 2.4.1 付费率 2026-08-19 至 2026-08-25",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  assert.equal(built.intent.metric.kind, "ratio");
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.match(compiled.sql, /elt_film_user/);
+  assert.match(compiled.sql, /elt_film_order/);
+  assert.match(compiled.sql, /aa\._id = bb\.uid/);
+  assert.match(compiled.sql, /orderStatus = 6/);
+  assert.match(compiled.sql, /uniqIf\(uid,\s*contentLang = ''\)/);
+  assert.match(compiled.sql, /AS a2/);
+}
+
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], appVersion: ["2.4.1"] },
+      outputDims: [],
+      metricId: "retention_d1_total",
+      table: "elt_new_guid",
+    },
+    pack,
+    fallbackNl: "IndiaA 版本 2.4.1 次日留存 2026-08-19",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  assert.equal(built.intent.metric.kind, "retention_dn");
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.match(compiled.sql, /gather\.gather/);
+  assert.match(compiled.sql, /elt_new_guid/);
+  assert.match(compiled.sql, /elt_active_guid/);
+  assert.match(compiled.sql, /addDays\(targetDate, 1\)/);
+  assert.match(compiled.sql, /content_language_save_success/);
+  assert.match(compiled.sql, /uniq\(guid\) AS a/);
+}
+
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], appVersion: ["2.4.1"] },
+      outputDims: [],
+      metricId: "retention_d1_lang",
+      table: "elt_new_guid",
+    },
+    pack,
+    fallbackNl: "IndiaA 版本 2.4.1 留存1 2026-08-19",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.match(compiled.sql, /countIf\(contentLang = ''\) AS a/);
+  assert.match(compiled.sql, /countIf\(contentLang = ''\) AS aa/);
 }
 
 console.log("analytics-intent-compile.test.ts OK");

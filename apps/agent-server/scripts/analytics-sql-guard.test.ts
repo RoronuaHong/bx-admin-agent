@@ -4,12 +4,16 @@
  */
 import assert from "node:assert/strict";
 import {
+  assertAnalyticsSqlSafe,
+  assertJoinsOnDeclaredRelationships,
   assertReadonlySingleSelect,
   assertTablesWhitelisted,
   extractFromTables,
   lintSql,
   normalizeDistinctCount,
+  sqlRequiresWhere,
 } from "../src/analytics/sql-guard.ts";
+import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 
 const okSelect =
   "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' LIMIT 100";
@@ -140,5 +144,53 @@ assert.throws(
     ),
   /whitelist/,
 );
+
+assert.doesNotThrow(() =>
+  assertAnalyticsSqlSafe("SELECT 1 FROM dim_x", ["dim_x"], { requireWhere: false }),
+);
+assert.throws(
+  () => assertAnalyticsSqlSafe("SELECT 1 FROM dim_x", ["dim_x"], { requireWhere: true }),
+  /missing_where/,
+);
+
+{
+  const pack = loadAnalyticsPack("watch-detail");
+  const live = {
+    ...pack,
+    warehouse: {
+      tables: [
+        { schema: "film_report", name: "dim_country", fields: ["id", "name"] },
+        {
+          schema: "film_report",
+          name: "elt_film_order",
+          fields: ["createdTime", "uid"],
+          fieldTypes: { createdTime: "type/DateTime" },
+        },
+      ],
+    },
+  };
+  assert.equal(sqlRequiresWhere("SELECT 1 FROM dim_country", live), false);
+  assert.equal(sqlRequiresWhere("SELECT 1 FROM elt_watch_detail", live), true);
+  assert.doesNotThrow(() =>
+    assertJoinsOnDeclaredRelationships(
+      "SELECT 1 FROM elt_film_user a INNER JOIN elt_film_order b ON a._id = b.uid",
+      live,
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertJoinsOnDeclaredRelationships(
+      "SELECT 1 FROM gather g INNER JOIN elt_new_guid n ON g.guid = n.guid INNER JOIN elt_active_guid a ON n.guid = a.guid",
+      live,
+    ),
+  );
+  assert.throws(
+    () =>
+      assertJoinsOnDeclaredRelationships(
+        "SELECT 1 FROM elt_watch_detail w INNER JOIN elt_film_order o ON 1=1",
+        live,
+      ),
+    /undeclared_join/,
+  );
+}
 
 console.log("analytics-sql-guard.test.ts OK");

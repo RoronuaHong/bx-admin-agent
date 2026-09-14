@@ -3,7 +3,13 @@
  */
 
 import { isAbortError, runNativeDataset, type MetabaseRunOpts } from "./metabase-client.js";
-import type { AnalyticsPack } from "./semantic-layer.js";
+import {
+  canApplyTextChannelFilter,
+  compileTableRef,
+  overlayTableName,
+  packFieldsForTable,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
 
 export type GroundingOk = {
   status: "ok";
@@ -34,17 +40,21 @@ function canonMap(values: string[]): Map<string, string> {
 async function existingChannelMembers(input: {
   pack: AnalyticsPack;
   channels: string[];
+  table?: string;
   opts?: MetabaseRunOpts;
 }): Promise<{ ok: true; foundCanon: Map<string, string>; sample: string[] } | { ok: false; error: string }> {
-  const table = input.pack.tables[0]?.name;
+  const table = input.table || overlayTableName(input.pack);
   if (!table) return { ok: false, error: "no_table" };
+  const live = new Set(packFieldsForTable(input.pack, table));
+  if (live.size && !live.has("channel")) return { ok: false, error: "no_channel_field" };
+  const from = compileTableRef(input.pack, table);
   const channels = [...new Set(input.channels.map(String).filter((c) => c !== "(empty)" && c !== ""))];
   if (!channels.length) return { ok: true, foundCanon: new Map(), sample: [] };
 
   // Case-insensitive match; return DB-canonical spelling
   const sql = [
     `SELECT channel, count() AS c`,
-    `FROM ${table}`,
+    `FROM ${from}`,
     `WHERE lower(channel) IN (${channels.map((c) => `'${c.replace(/'/g, "''").toLowerCase()}'`).join(", ")})`,
     `GROUP BY channel`,
     `ORDER BY c DESC`,
@@ -60,7 +70,7 @@ async function existingChannelMembers(input: {
     }
     const sampleSql = [
       `SELECT channel, count() AS c`,
-      `FROM ${table}`,
+      `FROM ${from}`,
       `GROUP BY channel`,
       `ORDER BY c DESC`,
       `LIMIT 15`,
@@ -87,14 +97,19 @@ async function existingChannelMembers(input: {
 export async function groundChannelFilters(input: {
   pack: AnalyticsPack;
   filters: Record<string, string[]>;
+  table?: string;
   opts?: MetabaseRunOpts;
 }): Promise<GroundingResult> {
   const filters = { ...input.filters };
   const channels = [...(filters.channel || [])];
   if (!channels.length) return { status: "ok", filters, notes: [] };
+  if (input.table && !canApplyTextChannelFilter(input.pack, input.table)) {
+    return { status: "ok", filters, notes: ["channel_grounding_skipped:no_text_channel"] };
+  }
 
   const checked = await existingChannelMembers({
     pack: input.pack,
+    table: input.table,
     channels,
     opts: input.opts,
   });

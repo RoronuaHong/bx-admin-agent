@@ -13,6 +13,14 @@ import {
   buildLlmVerifyPrompt,
   buildLlmVerifyRetryPrompt,
   checkMetricIntentAlignment,
+  llmInsightEnabled,
+  collectGroundedNumbers,
+  sanitizeInsightText,
+  parseInsightResponse,
+  composeInsightMarkdown,
+  buildInsightPrompt,
+  buildLocalInsight,
+  runPostExecLlm,
 } from "../src/analytics/llm-verify.js";
 
 {
@@ -121,6 +129,95 @@ import {
     }),
     null,
   );
+}
+
+{
+  assert.equal(llmInsightEnabled({ ANALYTICS_LLM_INSIGHT: "1" } as NodeJS.ProcessEnv), true);
+  assert.equal(llmInsightEnabled({ ANALYTICS_LLM_INSIGHT: "0" } as NodeJS.ProcessEnv), false);
+}
+
+{
+  const grounded = collectGroundedNumbers(
+    [{ cols: ["channel", "n"], rows: [["GoGo", 96901], ["FoxA", 69335]] }],
+    ["按 2026-08-19～2026-08-25"],
+  );
+  assert.ok(grounded.has("96901"));
+  assert.ok(grounded.has("2026"));
+  const ok = sanitizeInsightText("GoGo 为 96901，高于 FoxA 的 69335。", grounded);
+  assert.match(ok, /96901/);
+  const bad = sanitizeInsightText("预计下周将到 200000。GoGo 为 96901。", grounded);
+  assert.doesNotMatch(bad, /200000/);
+  assert.match(bad, /96901/);
+}
+
+{
+  const parsed = parseInsightResponse('{"summary":"GoGo 96901 居首。","trend":"头部集中在 2.1.2。"}');
+  assert.match(parsed.summary, /96901/);
+  const grounded = collectGroundedNumbers(
+    [{ cols: ["c", "v", "n"], rows: [["GoGo", "2.1.2", 96901]] }],
+    [],
+  );
+  const md = composeInsightMarkdown(parsed, grounded);
+  assert.match(md, /96901/);
+  assert.match(md, /2\.1\.2/);
+}
+
+{
+  const prompt = buildInsightPrompt({
+    nl: "渠道交叉",
+    timeEcho: "按 2026-08-19～2026-08-25",
+    sqls: ["SELECT 1"],
+    sampleTables: [{ title: "t", cols: ["a"], rows: [[1]] }],
+  });
+  assert.match(prompt.system, /Do not invent/);
+}
+
+{
+  const local = buildLocalInsight({
+    timeEcho: "按 2026-08-19～2026-08-25",
+    tables: [{ cols: ["rows"], rows: [[141567]] }],
+  });
+  assert.match(local, /141567/);
+}
+
+{
+  const prevV = process.env.ANALYTICS_LLM_VERIFY;
+  const prevI = process.env.ANALYTICS_LLM_INSIGHT;
+  process.env.ANALYTICS_LLM_VERIFY = "1";
+  process.env.ANALYTICS_LLM_INSIGHT = "1";
+  let calls = 0;
+  const compiled = await runPostExecLlm({
+    nl: "订单数",
+    timeEcho: "按 2026-08-19～2026-08-25",
+    sqls: ["SELECT count() AS rows FROM elt_film_order"],
+    tables: [{ title: "结果", cols: ["rows"], rows: [[141567]] }],
+    trust: "trusted",
+    llmText: async () => {
+      calls += 1;
+      return "";
+    },
+  });
+  assert.equal(calls, 0);
+  assert.equal(compiled.verify?.verdict, "pass");
+  assert.match(compiled.insight || "", /141567/);
+
+  const post = await runPostExecLlm({
+    nl: "渠道交叉",
+    timeEcho: "按 2026-08-19～2026-08-25",
+    sqls: ["SELECT 1"],
+    tables: [{ title: "结果", cols: ["channel", "n"], rows: [["GoGo", 96901]] }],
+    trust: "unverified",
+    llmText: async () => {
+      calls += 1;
+      return '{"verdict":"pass","codes":[],"reason":"ok","summary":"GoGo 为 96901。","trend":"预计下周 200000。"}';
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(post.verify?.verdict, "pass");
+  assert.match(post.insight || "", /96901/);
+  assert.doesNotMatch(post.insight || "", /200000/);
+  process.env.ANALYTICS_LLM_VERIFY = prevV;
+  process.env.ANALYTICS_LLM_INSIGHT = prevI;
 }
 
 console.log("analytics-llm-verify.test.ts OK");

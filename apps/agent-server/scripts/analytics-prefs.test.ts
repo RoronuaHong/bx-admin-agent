@@ -10,6 +10,7 @@ import {
   rememberAnalyticsSuccess,
   saveAnalyticsPrefs,
 } from "../src/analytics/analytics-prefs.js";
+import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 
 const dir = mkdtempSync(join(tmpdir(), "analytics-prefs-"));
 _setAnalyticsPrefsDirForTest(dir);
@@ -81,6 +82,28 @@ try {
     nl: "FoxA 按天观看人数",
   });
   assert.equal(named.filters.channel, undefined);
+
+  const warehousePack = {
+    ...loadAnalyticsPack("watch-detail"),
+    warehouse: {
+      tables: [
+        {
+          schema: "film_report",
+          name: "elt_active_guid",
+          fields: ["guid", "channel"],
+          fieldTypes: { channel: "type/Text" },
+        },
+      ],
+    },
+  };
+  const noLeak = applyAnalyticsPrefsDefaults({
+    filters: {},
+    prefs: loaded,
+    nl: "活跃用户有多少",
+    pack: warehousePack,
+    table: "elt_active_guid",
+  });
+  assert.equal(noLeak.filters.channel, undefined);
 
   rememberAnalyticsSuccess({
     ownerKey: "owner:b",

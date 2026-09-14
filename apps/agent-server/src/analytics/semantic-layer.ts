@@ -24,16 +24,54 @@ export interface EnumDimensionDef {
   defaultWhenAbsent?: boolean;
 }
 
+export type RatioCompileSpec = {
+  relationshipId: string;
+  denominatorTable: string;
+  numeratorTable: string;
+  numeratorDistinctField: string;
+  numeratorTimeField: string;
+  numeratorFilters?: Record<string, string[]>;
+  pivotField: string;
+  filterFields: Record<string, Record<string, string>>;
+};
+
+export type RetentionLangSpec = {
+  table: string;
+  schema?: string;
+  eventName: string;
+  timeField: string;
+  langField: string;
+  versionField: string;
+  channelField: string;
+};
+
+export type RetentionCompileSpec = {
+  n: number;
+  layout: "wide" | "total";
+  cohortTable: string;
+  cohortDateField: string;
+  cohortChannelField: string;
+  activeTable: string;
+  activeDateField: string;
+  activeChannelField: string;
+  keyField: string;
+  lang: RetentionLangSpec;
+};
+
 export interface MetricDefOption {
   id: string;
   label: string;
   groundSignals?: string[];
+  /** Family alias with no option grounded → pick this option. */
+  defaultWhenAbsent?: boolean;
   /** 语义层编译配方（Intent→SQL）；有则走确定性编译 */
   compile?: {
-    kind: "avg_of_max" | "uniq" | "sum" | "avg_per_user";
+    kind: "avg_of_max" | "uniq" | "sum" | "avg_per_user" | "ratio" | "retention_dn";
     valueField?: string;
     entityKeys?: string[];
     distinctField?: string;
+    ratio?: RatioCompileSpec;
+    retention?: RetentionCompileSpec;
   };
 }
 
@@ -42,6 +80,9 @@ export interface MetricDefOption {
 export interface MetricDef {
   id: string;
   aliases: string[];
+  /** Non-overlay metrics: lock tables[0]; overlayAsk must ignore these. */
+  tables?: string[];
+  requiredSlots?: Array<"channel" | "appVersion">;
   options: MetricDefOption[];
 }
 
@@ -56,13 +97,47 @@ export type PackCatalogMeta = {
   hiddenCount?: number;
 };
 
+export type WarehouseFieldMeta = {
+  displayName?: string;
+  description?: string | null;
+};
+
 /** Runtime snapshot of one warehouse table (live catalog, not pack JSON). */
 export type WarehouseTable = {
   schema: string;
   name: string;
   fields: string[];
   fieldTypes?: Record<string, string>;
+  displayName?: string;
+  description?: string | null;
+  /** Retrieval identity (对照/他表提及已剥掉). */
+  identity?: string;
+  /** NL synonyms for schema linking; not compile recipes. */
+  synonyms?: string[];
+  /** metabase = official description; inferred = catalog-inferred.json fallback. */
+  docSource?: "metabase" | "inferred";
+  fieldMeta?: Record<string, WarehouseFieldMeta>;
 };
+
+/** Higher = better default query window. ≤0 means do not use as the ask time column. */
+export function timeFieldRank(name: string): number {
+  const n = String(name || "");
+  if (!n) return -100;
+  if (/birthday/i.test(n)) return -100;
+  if (/forbiddenEnd|logoutTime|lastNickNameModify/i.test(n)) return -90;
+  if (/expire/i.test(n)) return -80;
+  if (/^(endTime|endDate)$/i.test(n)) return -70;
+  if (/^(lastWatchTime|watchTime|actionTime|payTime)$/i.test(n)) return 100;
+  if (/^(reportDate|recordDate|activeDate|onlineTime|publishTime|day)$/i.test(n)) return 90;
+  if (/^(date)$/i.test(n)) return 88;
+  if (/^(createdTime|createTime|createDate|createdDate)$/i.test(n)) return 80;
+  if (/^(serverTime|eventTime|eventDate)$/i.test(n)) return 70;
+  if (/^(lastLoginTime|latestActiveDate)$/i.test(n)) return 60;
+  if (/^(date|time|ct)$/i.test(n)) return 50;
+  if (/updateTime|updateDate/i.test(n)) return 15;
+  if (/(?:time|date|at)$/i.test(n)) return 10;
+  return 0;
+}
 
 export function inferTimeFieldFromTypes(
   fieldTypes?: Record<string, string>,
@@ -72,9 +147,18 @@ export function inferTimeFieldFromTypes(
   if (!names.length) return undefined;
   const typeOf = (n: string) => String(fieldTypes?.[n] || "");
   const isTemporalType = (n: string) => /date|time/i.test(typeOf(n));
-  const isTemporalName = (n: string) => /(?:^|_)(?:create|update|record|watch|event|pay|order)?(?:ed)?(?:time|date|at)$/i.test(n);
   const typed = names.filter(isTemporalType);
-  return typed.find(isTemporalName) || typed[0] || names.find(isTemporalName);
+  const candidates = typed.length ? typed : names.filter((n) => timeFieldRank(n) > 0);
+  let best: string | undefined;
+  let bestRank = 0;
+  for (const n of candidates) {
+    const rank = timeFieldRank(n);
+    if (rank > bestRank) {
+      bestRank = rank;
+      best = n;
+    }
+  }
+  return best;
 }
 
 export function warehouseTable(pack: AnalyticsPack | undefined, table?: string): WarehouseTable | undefined {
@@ -163,6 +247,82 @@ export function packTimeField(pack: AnalyticsPack | undefined, table?: string): 
   return inferTimeFieldFromTypes(w?.fieldTypes, w?.fields) || "";
 }
 
+/** True when this table has a usable analytics time column. */
+export function tableHasTimeField(pack: AnalyticsPack | undefined, table?: string): boolean {
+  return Boolean(packTimeField(pack, table));
+}
+
+export type PackRelationship = {
+  id: string;
+  left: { table: string; key: string; schema?: string };
+  right: { table: string; key: string; schema?: string };
+  join?: "inner" | "left";
+};
+
+export type PackEntity = {
+  id: string;
+  keys: string[];
+};
+
+/** Bare table name from schema.table or table. */
+export function bareTableName(name: string): string {
+  const t = String(name || "").trim();
+  const dot = t.lastIndexOf(".");
+  return dot >= 0 ? t.slice(dot + 1) : t;
+}
+
+export function packRelationships(pack: AnalyticsPack | undefined): PackRelationship[] {
+  return pack?.relationships || [];
+}
+
+/** Seed tables plus neighbors declared in pack relationships (max two hops, cap 6). */
+export function expandLinkedTables(
+  pack: AnalyticsPack | undefined,
+  seeds: string[],
+  cap = 6,
+): string[] {
+  const allowed = allowedTableNames(pack);
+  const nameByLower = new Map(allowed.map((t) => [t.toLowerCase(), t]));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string) => {
+    const b = bareTableName(raw).toLowerCase();
+    if (!b || seen.has(b) || !nameByLower.has(b)) return;
+    seen.add(b);
+    out.push(nameByLower.get(b)!);
+  };
+  for (const s of seeds) add(s);
+  for (let hop = 0; hop < 2; hop++) {
+    const cur = [...out];
+    for (const name of cur) {
+      const b = bareTableName(name).toLowerCase();
+      for (const r of packRelationships(pack)) {
+        const l = bareTableName(r.left.table).toLowerCase();
+        const rr = bareTableName(r.right.table).toLowerCase();
+        if (l === b) add(r.right.table);
+        if (rr === b) add(r.left.table);
+      }
+    }
+  }
+  return out.slice(0, cap);
+}
+
+/** True when this pair of tables is an allowed join (order-insensitive). */
+export function relationshipAllowsJoin(
+  pack: AnalyticsPack | undefined,
+  leftTable: string,
+  rightTable: string,
+): boolean {
+  const a = bareTableName(leftTable).toLowerCase();
+  const b = bareTableName(rightTable).toLowerCase();
+  if (!a || !b || a === b) return true;
+  return packRelationships(pack).some((r) => {
+    const l = bareTableName(r.left.table).toLowerCase();
+    const rr = bareTableName(r.right.table).toLowerCase();
+    return (l === a && rr === b) || (l === b && rr === a);
+  });
+}
+
 export function packFieldType(
   pack: AnalyticsPack | undefined,
   field: string,
@@ -196,6 +356,8 @@ export interface AnalyticsPack {
    * Hidden tmp/dict/upload tables are excluded.
    */
   warehouse?: { tables: WarehouseTable[] };
+  entities?: PackEntity[];
+  relationships?: PackRelationship[];
   probeDimensions: string[];
   required_filters: string[];
   time: {
@@ -216,6 +378,8 @@ export interface AnalyticsPack {
     maxRewriteRounds: number;
     parallelism: number;
     defaultMovieTypes: number[];
+    /** Language-wide columns when NL says 宽表 but does not name ≥2 locales. */
+    defaultWideLangs?: string[];
     /** Metabase/CH 单次查询超时（毫秒）；缺省读 ANALYTICS_QUERY_TIMEOUT_MS 或 120000 */
     queryTimeoutMs?: number;
     /**
@@ -288,6 +452,26 @@ export function remapEnumTokens(
     const hit = Object.entries(aliases).find(([k]) => k.toLowerCase() === raw.toLowerCase());
     return hit ? String(hit[1]) : raw;
   });
+}
+
+/** Locale codes for language-wide columns when the user did not name ≥2 langs. */
+export function findMetricOption(
+  pack: AnalyticsPack | undefined,
+  metricId: string,
+): { def: MetricDef; opt: MetricDefOption } | undefined {
+  const id = String(metricId || "").trim();
+  if (!id || !pack) return undefined;
+  for (const def of pack.metricDefs || []) {
+    const opt = (def.options || []).find((o) => o.id === id);
+    if (opt) return { def, opt };
+  }
+  return undefined;
+}
+
+export function packDefaultWideLangs(pack?: AnalyticsPack): string[] {
+  const raw = pack?.guards?.defaultWideLangs;
+  if (!Array.isArray(raw) || raw.length < 2) return [];
+  return raw.map((v) => (v == null ? "" : String(v)));
 }
 
 export function loadAnalyticsPack(id = "watch-detail"): AnalyticsPack {

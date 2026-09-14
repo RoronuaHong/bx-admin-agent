@@ -15,11 +15,20 @@ import {
   type AnalyticsPack,
 } from "./semantic-layer.js";
 import { answerableTableNamedInNl } from "./catalog.js";
+import { extractAppVersionFromNl } from "./verified-query.js";
 import type { ResultLayout } from "./types.js";
 
 export type OutputDimId = "watch_date" | "channel" | string;
 
-export type CompileMetricKind = "avg_of_max" | "uniq" | "sum" | "avg" | "avg_per_user" | "count";
+export type CompileMetricKind =
+  | "avg_of_max"
+  | "uniq"
+  | "sum"
+  | "avg"
+  | "avg_per_user"
+  | "count"
+  | "ratio"
+  | "retention_dn";
 
 const GENERIC_METRIC_RE = /^(uniq|sum|avg|count):([A-Za-z_][A-Za-z0-9_]*|\*)$/;
 
@@ -108,7 +117,7 @@ function resolveMetricCompile(
       }
       return {
         id: metricId,
-        kind: c.kind,
+        kind: c.kind as AnalyticsIntent["metric"]["kind"],
         valueField: c.valueField,
         entityKeys: c.entityKeys,
         distinctField: c.distinctField,
@@ -161,14 +170,17 @@ export function buildAnalyticsIntentFromStructure(input: {
   const knownFields = new Set(packFieldsForTable(pack, table));
   const metric = resolveMetricCompile(structure.metricId, pack);
   if (!metric) return { ok: false, reason: `metric ${structure.metricId} not compilable` };
-  if (metric.distinctField && knownFields.size && !knownFields.has(metric.distinctField)) {
+  const joinKind = metric.kind === "ratio" || metric.kind === "retention_dn";
+  if (!joinKind && metric.distinctField && knownFields.size && !knownFields.has(metric.distinctField)) {
     return { ok: false, reason: `metric_field_not_in_catalog:${metric.distinctField}` };
   }
-  if (metric.valueField && knownFields.size && !knownFields.has(metric.valueField)) {
+  if (!joinKind && metric.valueField && knownFields.size && !knownFields.has(metric.valueField)) {
     return { ok: false, reason: `metric_field_not_in_catalog:${metric.valueField}` };
   }
 
-  const filters: Record<string, string[]> = pruneFiltersToTable(pack, table, structure.filters);
+  const filters: Record<string, string[]> = joinKind
+    ? { ...structure.filters }
+    : pruneFiltersToTable(pack, table, structure.filters);
   if (canApplyTextChannelFilter(pack, table)) {
     if (filters.channel?.length) {
       filters.channel = remapEnumTokens(filters.channel, pack, "channel");
@@ -177,8 +189,12 @@ export function buildAnalyticsIntentFromStructure(input: {
       const channels = extractChannelsFromNl(fallbackNl, pack);
       if (channels.length) filters.channel = channels;
     }
-  } else {
+  } else if (!joinKind) {
     delete filters.channel;
+  }
+  if (joinKind && !filters.appVersion?.length) {
+    const ver = extractAppVersionFromNl(fallbackNl);
+    if (ver) filters.appVersion = [ver];
   }
   const overlayFields = pack.tables[0]?.fields || [];
   if (

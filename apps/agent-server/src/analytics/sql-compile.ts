@@ -7,12 +7,17 @@ import type { AnalyticsIntent, OutputDimId } from "./intent.js";
 import { sqlStringLiteral } from "./intent.js";
 import {
   compileTableRef,
+  findMetricOption,
   isNumericWarehouseType,
   isOverlayTable,
+  packDefaultWideLangs,
   packFieldType,
   packFieldsForTable,
+  packRelationships,
   packTimeField,
   type AnalyticsPack,
+  type RatioCompileSpec,
+  type RetentionCompileSpec,
 } from "./semantic-layer.js";
 
 export function dayGrainSelect(timeField: string): { select: string; group: string; alias: string } {
@@ -140,6 +145,14 @@ function canonicalDims(intent: AnalyticsIntent, pack?: AnalyticsPack): OutputDim
   return dims;
 }
 
+function resolveWidePivotValues(intent: AnalyticsIntent, pack?: AnalyticsPack): string[] {
+  const pivot = intent.pivotDim;
+  if (intent.layout !== "wide" || !pivot) return [];
+  const fromFilters = (intent.filters[pivot] || []).map(normalizeFilterToken);
+  if (fromFilters.length >= 2) return fromFilters;
+  return packDefaultWideLangs(pack);
+}
+
 function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
   const valueField = intent.metric.valueField || "maxWatchProgress";
   const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
@@ -151,7 +164,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   const where = whereBuilt.where;
 
   const pivot = intent.pivotDim;
-  const pivotValues = pivot ? (intent.filters[pivot] || []).map(normalizeFilterToken) : [];
+  const pivotValues = resolveWidePivotValues(intent, pack);
   const useWide = intent.layout === "wide" && pivot && pivotValues.length > 1;
 
   if (useWide) {
@@ -241,7 +254,62 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   return { ok: true, sql };
 }
 
+function compileWideAggregates(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult | null {
+  const pivot = intent.pivotDim;
+  const pivotValues = resolveWidePivotValues(intent, pack);
+  if (intent.layout !== "wide" || !pivot || pivotValues.length < 2) return null;
+  if (intent.metric.kind === "avg_of_max") return null;
+
+  const timeField = packTimeField(pack, intent.table);
+  const dims = canonicalDims(intent, pack).filter((d) => d !== pivot);
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const whereBuilt = buildWhere(intent, pack);
+  if (!whereBuilt.ok) return whereBuilt;
+  const where = whereBuilt.where;
+
+  const cols = pivotValues.map((v) => {
+    const lit = sqlStringLiteral(v);
+    const alias = safeAlias(v === "" ? "en" : v);
+    const pred = `${pivot} = ${lit}`;
+    if (intent.metric.kind === "uniq") {
+      const f = intent.metric.distinctField || "guid";
+      return `uniqIf(${f}, ${pred}) AS ${alias}`;
+    }
+    if (intent.metric.kind === "avg_per_user") {
+      const valueField = intent.metric.valueField || "watchSecond";
+      const distinctField = intent.metric.distinctField || "guid";
+      return `round(sumIf(${valueField}, ${pred}) / nullIf(uniqIf(${distinctField}, ${pred}), 0), 0) AS ${alias}`;
+    }
+    if (intent.metric.kind === "sum") {
+      const f = intent.metric.valueField || "watchSecond";
+      return `sumIf(${f}, ${pred}) AS ${alias}`;
+    }
+    if (intent.metric.kind === "avg") {
+      const f = intent.metric.valueField || "watchSecond";
+      return `round(avgIf(${f}, ${pred}), 2) AS ${alias}`;
+    }
+    if (intent.metric.kind === "count") {
+      return `countIf(${pred}) AS ${alias}`;
+    }
+    return "";
+  });
+  if (cols.some((c) => !c)) return null;
+
+  const selectHead = dimMeta.map((d) => d.select);
+  const group = dimMeta.map((d) => d.group).join(", ");
+  const sql = [
+    `SELECT`,
+    `  ${[...selectHead, ...cols].filter(Boolean).join(",\n  ")}`,
+    `FROM ${compileTableRef(pack, intent.table)}`,
+    `WHERE ${where}`,
+    ...(group ? [`GROUP BY ${group}`, `ORDER BY ${group}`] : []),
+  ].join("\n");
+  return { ok: true, sql };
+}
+
 function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
+  const wide = compileWideAggregates(intent, pack);
+  if (wide) return wide;
   const timeField = packTimeField(pack, intent.table);
   const dims = canonicalDims(intent, pack);
   const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
@@ -286,6 +354,160 @@ function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
   return { ok: true, sql };
 }
 
+function defaultLangAliases(values: string[], pack?: AnalyticsPack): string[] | null {
+  const defaults = packDefaultWideLangs(pack);
+  if (defaults.length && values.length === defaults.length && values.every((v, i) => v === defaults[i])) {
+    return defaults.map((_, i) => String.fromCharCode(97 + i));
+  }
+  return null;
+}
+
+function compileRatio(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
+  const spec = findMetricOption(pack, intent.metric.id)?.opt.compile?.ratio as RatioCompileSpec | undefined;
+  if (!spec) return { ok: false, reason: "ratio_spec_missing" };
+  const channel = (intent.filters.channel || [])[0];
+  const appVersion = (intent.filters.appVersion || [])[0];
+  if (!channel) return { ok: false, reason: "missing_filter:channel" };
+  if (!appVersion) return { ok: false, reason: "missing_filter:appVersion" };
+  const rel = packRelationships(pack).find((r) => r.id === spec.relationshipId);
+  if (!rel) return { ok: false, reason: `relationship_missing:${spec.relationshipId}` };
+
+  const langs = resolveWidePivotValues({ ...intent, layout: intent.layout || "wide", pivotDim: spec.pivotField }, pack);
+  const pivotValues = langs.length >= 2 ? langs : packDefaultWideLangs(pack);
+  if (pivotValues.length < 2) return { ok: false, reason: "ratio_need_wide_langs" };
+  const aliases = defaultLangAliases(pivotValues, pack);
+
+  const denTbl = compileTableRef(pack, spec.denominatorTable);
+  const leftTbl = compileTableRef(pack, rel.left.table);
+  const rightTbl = compileTableRef(pack, spec.numeratorTable);
+  const denCh = spec.filterFields.channel?.[spec.denominatorTable] || "channel";
+  const denVer = spec.filterFields.appVersion?.[spec.denominatorTable] || "appVersion";
+  const numCh = spec.filterFields.channel?.[spec.numeratorTable] || "channel";
+  const numVerLeft = spec.filterFields.appVersion?.[spec.denominatorTable] || "appVersion";
+  const numVerRight = spec.filterFields.appVersion?.[spec.numeratorTable] || "appVersion";
+  const extra = Object.entries(spec.numeratorFilters || {})
+    .flatMap(([field, values]) => {
+      if (!values?.length) return [];
+      const numeric = values.every((v) => /^-?\d+(\.\d+)?$/.test(v));
+      const lit = values.map((v) => (numeric ? v : sqlStringLiteral(v)));
+      return values.length === 1
+        ? [`bb.${field} = ${lit[0]}`]
+        : [`bb.${field} IN (${lit.join(", ")})`];
+    })
+    .join("\n    AND ");
+
+  const uniqCols = pivotValues.map((v, i) => {
+    const alias = aliases?.[i] || safeAlias(v === "" ? "en" : v);
+    return `uniqIf(${spec.numeratorDistinctField}, ${spec.pivotField} = ${sqlStringLiteral(v)}) AS ${alias}`;
+  });
+  const rateCols = pivotValues.map((v, i) => {
+    const src = aliases?.[i] || safeAlias(v === "" ? "en" : v);
+    const alias = aliases ? `${src}2` : `${src}_rate`;
+    return `round(${src} / total, 6) AS ${alias}`;
+  });
+
+  const sql = [
+    `SELECT`,
+    `  ${rateCols.join(",\n  ")}`,
+    `FROM (`,
+    `  SELECT 1 AS i1, count() AS total`,
+    `  FROM ${denTbl}`,
+    `  WHERE ${denCh} = ${sqlStringLiteral(channel)} AND ${denVer} = ${sqlStringLiteral(appVersion)}`,
+    `) t1`,
+    `INNER JOIN (`,
+    `  SELECT 1 AS i,`,
+    `    ${uniqCols.join(",\n    ")}`,
+    `  FROM ${leftTbl} AS aa`,
+    `  INNER JOIN ${rightTbl} AS bb ON aa.${rel.left.key} = bb.${rel.right.key}`,
+    `  WHERE toDate(bb.${spec.numeratorTimeField}) BETWEEN ${sqlStringLiteral(intent.time.start)} AND ${sqlStringLiteral(intent.time.end)}`,
+    extra ? `    AND ${extra}` : "",
+    `    AND bb.${numCh} = ${sqlStringLiteral(channel)}`,
+    `    AND aa.${numVerLeft} = ${sqlStringLiteral(appVersion)}`,
+    `    AND bb.${numVerRight} = ${sqlStringLiteral(appVersion)}`,
+    `) t2 ON t1.i1 = t2.i`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return { ok: true, sql };
+}
+
+function langTableRef(spec: RetentionCompileSpec["lang"], pack?: AnalyticsPack): string {
+  if (spec.schema) return `${spec.schema}.${spec.table}`;
+  return compileTableRef(pack, spec.table);
+}
+
+function compileRetention(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
+  const spec = findMetricOption(pack, intent.metric.id)?.opt.compile?.retention as RetentionCompileSpec | undefined;
+  if (!spec) return { ok: false, reason: "retention_spec_missing" };
+  const channel = (intent.filters.channel || [])[0];
+  const appVersion = (intent.filters.appVersion || [])[0];
+  if (!channel) return { ok: false, reason: "missing_filter:channel" };
+  if (!appVersion) return { ok: false, reason: "missing_filter:appVersion" };
+  const n = Number(spec.n || 1);
+  const cohortRef = compileTableRef(pack, spec.cohortTable);
+  const activeRef = compileTableRef(pack, spec.activeTable);
+  const langRef = langTableRef(spec.lang, pack);
+  const key = spec.keyField || "guid";
+  const header = [
+    `WITH`,
+    `${sqlStringLiteral(channel)} AS targetChannel,`,
+    `toDate(${sqlStringLiteral(intent.time.start)}) AS targetDate,`,
+    `todayGuid AS (`,
+    `  SELECT ${key}, argMax(${spec.lang.langField}, ${spec.lang.timeField}) AS ${spec.lang.langField}`,
+    `  FROM ${langRef}`,
+    `  WHERE eventName = ${sqlStringLiteral(spec.lang.eventName)}`,
+    `    AND toDate(${spec.lang.timeField}) = targetDate`,
+    `    AND ${spec.lang.channelField} = targetChannel`,
+    `    AND ${spec.lang.versionField} = ${sqlStringLiteral(appVersion)}`,
+    `    AND ${key} IN (SELECT DISTINCT ${key} FROM ${cohortRef} WHERE ${spec.cohortDateField} = targetDate AND ${spec.cohortChannelField} = targetChannel)`,
+    `  GROUP BY ${key}`,
+    `),`,
+    `retentionGuid AS (`,
+    `  SELECT b.${key}, b.${spec.lang.langField}`,
+    `  FROM ${activeRef} AS a`,
+    `  INNER JOIN todayGuid AS b ON a.${key} = b.${key}`,
+    `  WHERE a.${spec.activeDateField} = addDays(targetDate, ${n}) AND a.${spec.activeChannelField} = targetChannel`,
+    `)`,
+  ];
+
+  if (spec.layout === "total") {
+    const sql = [
+      ...header,
+      `,`,
+      `todayCount AS (SELECT uniq(${key}) AS a FROM todayGuid),`,
+      `retentionCount AS (SELECT uniq(${key}) AS b FROM retentionGuid)`,
+      `SELECT t1.a, t2.b, round(t2.b / t1.a, 2)`,
+      `FROM todayCount AS t1, retentionCount AS t2`,
+    ].join("\n");
+    return { ok: true, sql };
+  }
+
+  const langs = resolveWidePivotValues({ ...intent, layout: "wide", pivotDim: spec.lang.langField }, pack);
+  const pivotValues = langs.length >= 2 ? langs : packDefaultWideLangs(pack);
+  if (pivotValues.length < 2) return { ok: false, reason: "retention_need_wide_langs" };
+  const aliases = defaultLangAliases(pivotValues, pack) || pivotValues.map((v) => safeAlias(v === "" ? "en" : v));
+  const todayCols = pivotValues.map((v, i) => `countIf(${spec.lang.langField} = ${sqlStringLiteral(v)}) AS ${aliases[i]}`);
+  const retAliases = aliases.map((a) => (a.length === 1 ? `${a}${a}` : `${a}_r`));
+  const retCols = pivotValues.map((v, i) => `countIf(${spec.lang.langField} = ${sqlStringLiteral(v)}) AS ${retAliases[i]}`);
+  const rateCols = aliases.map((a, i) => `round(t2.${retAliases[i]} / t1.${a}, 2)`);
+  const sql = [
+    ...header,
+    `,`,
+    `todayCount AS (`,
+    `  SELECT ${todayCols.join(", ")}`,
+    `  FROM todayGuid`,
+    `),`,
+    `retentionCount AS (`,
+    `  SELECT ${retCols.join(", ")}`,
+    `  FROM retentionGuid`,
+    `)`,
+    `SELECT t1.${aliases.join(", t1.")}, t2.${retAliases.join(", t2.")},`,
+    `  ${rateCols.join(", ")}`,
+    `FROM todayCount AS t1, retentionCount AS t2`,
+  ].join("\n");
+  return { ok: true, sql };
+}
+
 export function compileAnalyticsIntent(
   intent: AnalyticsIntent,
   pack?: AnalyticsPack,
@@ -299,6 +521,10 @@ export function compileAnalyticsIntent(
     case "avg_per_user":
     case "count":
       return compileUniqOrSum(intent, pack);
+    case "ratio":
+      return compileRatio(intent, pack);
+    case "retention_dn":
+      return compileRetention(intent, pack);
     default:
       return { ok: false, reason: `unsupported_metric_kind:${String((intent.metric as { kind?: string }).kind || "")}` };
   }

@@ -1,5 +1,7 @@
 # Metabase 数据分析 Agent 设计（定稿）
 
+> **2026-09-13**：§1「B（LLM 写 SQL）为非目标」已被 [`2026-09-13-analytics-hybrid-sql-agent-design.md`](./2026-09-13-analytics-hybrid-sql-agent-design.md) 修订——B/C 升为受控路径，A 仍是 KPI 权威。质量门禁与 AskState 条款仍有效。
+>
 > **状态**：设计定稿；**M1 / M2 / M3 已验收**（2026-09-10，见 §12 / 各验收清单）  
 > **日期**：2026-09-09（实现收口 2026-09-10；**2026-09-12 架构权威收口为 A：语义层编译**）  
 > **宿主**：bx-admin-agent（`apps/web` + `apps/agent-server`）  

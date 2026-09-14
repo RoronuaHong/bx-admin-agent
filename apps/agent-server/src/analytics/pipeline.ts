@@ -1,7 +1,8 @@
 /**
- * Analytics ask pipeline:
- * \u62a4\u680f + \u4e8b\u5b9e\u6ce8\u5165 \u2192\uff08\u9884\u63a2\u5e93\uff09\u5355\u6b21\u7ed3\u6784\u5316 / \u5fc5\u8981\u65f6 tool-loop \u2192 Intent compile \u2192 lint/exec/\u8bed\u4e49\u6821\u9a8c\u3002
- * Intent/compile/lint/exec \u4e0d\u8d70 LLM \u5199 SQL\uff1b\u4e0d\u6539\u5199\u7528\u6237\u95ee\u53e5\uff1b\u65f6\u95f4\u7531\u4ee3\u7801\u89e3\u6790\u5e76\u8986\u76d6\u6a21\u578b time\u3002
+ * Analytics ask pipeline (hybrid):
+ * Time resolve \u2192 Path B verified query \u2192 table resolve \u2192
+ * Path A intent compile (structure + sql-compile) or Path C LLM SQL (2 repairs).
+ * Dates always come from code. Path C results carry an unverified watermark.
  */
 
 import { config } from "../config.js";
@@ -9,27 +10,47 @@ import * as trace from "../trace.js";
 import { getUpload, MAX_AT_ONCE } from "../uploads.js";
 import { transcribeImage } from "../vision.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
+import { beginAnalyticsLlmSignal, sanitizeAnalyticsLlmError } from "./llm-error.js";
 import {
   allowedTableNames,
+  bareTableName,
+  compileTableRef,
+  expandLinkedTables,
+  isOverlayTable,
   loadAnalyticsPack,
+  packDefaultWideLangs,
+  packFieldsForTable,
   packTimeField,
   canApplyTextChannelFilter,
   type AnalyticsPack,
 } from "./semantic-layer.js";
+import { llmSqlEnabled, routeAnalyticsAsk } from "./ask-route.js";
+import {
+  bindVerifiedQuery,
+  extractAppVersionFromNl,
+  matchVerifiedQuery,
+  nlWantsWideShape,
+} from "./verified-query.js";
+import { missingNlAnchorsInSql, overlayResolvedDates, runSqlAgent } from "./sql-agent.js";
+import { buildDocumentedTableStructure, coerceMetricForWarehouseTable } from "./documented-ask.js";
 import { answerableTableNamedInNl, formatCatalogFacts, refreshPackFromCatalog } from "./catalog.js";
 import { resolveAskTable } from "./table-resolve.js";
 import {
   assertAnalyticsSqlSafe,
+  assertJoinsOnDeclaredRelationships,
+  extractFromTables,
   lintSql,
   normalizeDistinctCount,
+  sqlRequiresWhere,
 } from "./sql-guard.js";
+import { getTableSchemas } from "./catalog-schema.js";
 import { applyResolvedTime, resolveAskTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
 import { reconcileNamedDimensions } from "./dim-reconcile.js";
 import { deriveFailureClass, newAskId, recordAskLedger } from "./audit-ledger.js";
 import { buildLocalChartsFromTables } from "./local-chart.js";
-import { buildAnalyticsIntentFromStructure, intentToJson } from "./intent.js";
+import { buildAnalyticsIntentFromStructure, extractChannelsFromNl, intentToJson } from "./intent.js";
 import { compileAnalyticsIntent } from "./sql-compile.js";
 import {
   buildStructureSystemPrompt,
@@ -37,6 +58,7 @@ import {
   impliesLangSetWithoutMembers,
   neededProbeFields,
   needsDimensionProbe,
+  extractLocalesFromText,
   parseStructureResponse,
   userDemandsLangFilter,
   type ConversationTurn,
@@ -60,7 +82,7 @@ import {
 } from "./clarify-options.js";
 import { loadFieldLexicon, resolvePackFilters, groundRemappedFieldFromNl } from "./dim-resolve.js";
 import { lexiconClarifyOptions, type DimLexicon } from "./dim-lexicon.js";
-import { evaluateCapabilityGate } from "./capability-gate.js";
+import { evaluateCapabilityGate, refuseUnsupportedOpsFromNl } from "./capability-gate.js";
 import { applyCoverageGate, coverageFields } from "./coverage-gate.js";
 import {
   ambiguousMetricFamilyClarify,
@@ -68,9 +90,10 @@ import {
   coerceUnknownMetricId,
   inferMetricIdFromNl,
   inferOutputDimsFromNl,
+  missingRequiredMetricSlots,
   nlForMetricFamilyGate,
 } from "./metric-infer.js";
-import { checkMetricIntentAlignment } from "./llm-verify.js";
+import { checkMetricIntentAlignment, runPostExecLlm, verifyCaution } from "./llm-verify.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import {
   compileAskPlanSteps,
@@ -169,6 +192,7 @@ async function llmText(system: string, user: string, opts?: LlmOpts): Promise<st
     ended = true;
     handle.end(endOpts);
   };
+  const llmSig = beginAnalyticsLlmSignal(opts?.signal);
   try {
     const resp = await fetch(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
@@ -184,7 +208,7 @@ async function llmText(system: string, user: string, opts?: LlmOpts): Promise<st
           { role: "user", content: user },
         ],
       }),
-      signal: opts?.signal,
+      signal: llmSig.signal,
     });
     const data = (await resp.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
@@ -207,8 +231,11 @@ async function llmText(system: string, user: string, opts?: LlmOpts): Promise<st
     if (opts?.traceRunId) trace.setRunModel(opts.traceRunId, model.id);
     return data.choices?.[0]?.message?.content || "";
   } catch (e) {
-    endOnce({ status: "error", error: e instanceof Error ? e.message : String(e) });
-    throw e;
+    const err = llmSig.didTimeout() ? new Error("llm_timeout") : e;
+    endOnce({ status: "error", error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  } finally {
+    llmSig.cleanup();
   }
 }
 
@@ -217,29 +244,36 @@ async function probeDimensions(
   range: { start: string; end: string },
   signal?: AbortSignal,
   fields?: string[],
+  tableName?: string,
 ): Promise<string> {
   const wanted = fields?.length
     ? pack.probeDimensions.filter((d) => fields.includes(d))
     : pack.probeDimensions;
   const dims = wanted.slice(0, pack.guards.maxProbeRounds);
   const lines: string[] = [];
+  const table = tableName || pack.tables[0]?.name || "elt_watch_detail";
+  const timeField = packTimeField(pack, table);
+  const liveFields = new Set(packFieldsForTable(pack, table));
+  const from = compileTableRef(pack, table);
   for (const dim of dims) {
     signal?.throwIfAborted();
-    const table = pack.tables[0]?.name ?? "elt_watch_detail";
-    const timeField = packTimeField(pack);
-    const liveFields = new Set(pack.tables[0]?.fields || []);
     if (liveFields.size && !liveFields.has(dim)) {
       lines.push(`${dim}: SKIP_NOT_IN_CATALOG`);
       continue;
     }
+    const where = timeField
+      ? `WHERE toDate(${timeField}) BETWEEN '${range.start}' AND '${range.end}'`
+      : "";
     const sql = [
       `SELECT ${dim}, count() AS c`,
-      `FROM ${table}`,
-      `WHERE toDate(${timeField}) BETWEEN '${range.start}' AND '${range.end}'`,
+      `FROM ${from}`,
+      where,
       `GROUP BY ${dim}`,
       `ORDER BY c DESC`,
       `LIMIT 20`,
-    ].join(" ");
+    ]
+      .filter(Boolean)
+      .join(" ");
     try {
       const res = await runNativeDataset(sql, pack.datasource.metabaseDatabaseId, { signal });
       if (!res.ok) {
@@ -266,12 +300,15 @@ function collectIssues(
   dimColumns?: string[],
   timeField?: string,
   skipNamedChannel?: boolean,
+  pack?: AnalyticsPack,
 ): string[] {
   const issues: string[] = [];
   const tf = timeField || "lastWatchTime";
   for (const sql of sqls) {
     try {
-      assertAnalyticsSqlSafe(sql, allowedTables);
+      assertAnalyticsSqlSafe(sql, allowedTables, {
+        requireWhere: pack ? sqlRequiresWhere(sql, pack) : true,
+      });
     } catch (e) {
       issues.push(e instanceof Error ? e.message : String(e));
     }
@@ -292,9 +329,76 @@ function sqlHasDayGrain(sql: string, pack: AnalyticsPack): boolean {
 
 /** \u8986\u76d6\u7f3a\u53e3 / SQL \u5b89\u5168\u95ee\u9898 \u2192 refuse\uff1b\u5176\u4f59 \u2192 clarify */
 function isCoverageOrSafetyIssue(detail: string): boolean {
-  return /unsupported_metric|unsupported_op|not compilable|SQL AST guard|non_readonly|multi_statement|not_select|into_outfile|missing_where|whitelist|unknown metric/i.test(
+  return /unsupported_metric|unsupported_op|not compilable|SQL AST guard|non_readonly|multi_statement|not_select|into_outfile|missing_where|whitelist|unknown metric|undeclared_join/i.test(
     detail,
   );
+}
+
+function trustCaption(trust: "trusted" | "verified" | "unverified"): string {
+  if (trust === "verified") return "\u300c\u91d1\u6837\u53e3\u5f84\u300d";
+  if (trust === "unverified") return "\u300c\u672a\u6838\u9a8c\u53e3\u5f84\u300d";
+  return "";
+}
+
+async function runHybridSqls(input: {
+  pack: AnalyticsPack;
+  sqls: string[];
+  nl: string;
+  time: { start: string; end: string };
+  table?: string;
+  allowedTables?: string[];
+  signal?: AbortSignal;
+}): Promise<
+  | {
+      ok: true;
+      sqls: string[];
+      tables: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+      empty: boolean;
+    }
+  | { ok: false; sqls: string[]; issues: string[] }
+> {
+  const allowed = input.allowedTables?.length ? input.allowedTables : allowedTableNames(input.pack);
+  const sqls = normalizeSqls(input.sqls);
+  const issues: string[] = [];
+  for (const sql of sqls) {
+    try {
+      assertAnalyticsSqlSafe(sql, allowed, { requireWhere: sqlRequiresWhere(sql, input.pack) });
+      assertJoinsOnDeclaredRelationships(sql, input.pack);
+    } catch (e) {
+      issues.push(e instanceof Error ? e.message : String(e));
+    }
+    const tf = packTimeField(input.pack, input.table) || packTimeField(input.pack);
+    issues.push(...lintSql(sql, input.nl, { timeField: tf || undefined }));
+    if (tf) issues.push(...verifyGrainDay(input.nl, sql, tf));
+  }
+  issues.push(...verifyNamedChannel(input.nl, sqls, input.pack.probeDimensions));
+  const uniq = [...new Set(issues.filter(Boolean))];
+  if (uniq.length) return { ok: false, sqls, issues: uniq };
+  const execSqls = sqls.map((s) => ensureMaxRows(s, input.pack.guards.maxRows));
+  const results = await mapPool(
+    execSqls,
+    input.pack.guards.parallelism,
+    (sql) =>
+      runNativeDataset(sql, input.pack.datasource.metabaseDatabaseId, {
+        signal: input.signal,
+        timeoutMs: input.pack.guards.queryTimeoutMs,
+      }),
+    input.signal,
+  );
+  if (results.every((r) => !r.ok)) {
+    return { ok: false, sqls: execSqls, issues: results.map((r) => r.error || "exec_failed") };
+  }
+  return {
+    ok: true,
+    sqls: execSqls,
+    tables: results.map((r, i) => ({
+      title: execSqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
+      cols: r.cols,
+      rows: r.rows,
+      grain: sqlHasDayGrain(execSqls[i]!, input.pack) ? "day" : undefined,
+    })),
+    empty: allEmpty(results),
+  };
 }
 
 function coverageRefuseMessage(stage: string, detail: string): string {
@@ -416,16 +520,16 @@ export async function analyticsAsk(
     signal?: AbortSignal;
     images?: string[];
     files?: string[];
-    /** ?????????????????? schema ?? */
+    /** Clarify slot answers used to fill schema */
     slotAnswers?: Record<string, string[]>;
-    /** ???????/????????? NL */
+    /** Conversation turns / current-turn NL */
     messages?: ConversationTurn[];
-    /** ??? AskState???? revise */
+    /** Previous AskState for revise */
     prevAskState?: AskState | Record<string, unknown>;
-    /** ???? clarify ???????????? TurnIntent? */
+    /** Last clarify slot, used to resolve TurnIntent */
     lastClarifySlot?: string;
     clarifyOptionIds?: string[];
-    /** ?? / ??? owner */
+    /** Conversation / prefs owner */
     ownerKey?: string;
     userId?: string;
     uiLocale?: string;
@@ -470,6 +574,15 @@ export async function analyticsAsk(
       turnIntentSource: result.turnIntentSource ?? turnIntentSource,
       askSummary: result.askSummary ?? state?.summary,
       defaultsNote: result.defaultsNote ?? defaultsNoteFromState(state),
+      trust:
+        result.trust ??
+        (result.sqlSource === "intent_compile"
+          ? "trusted"
+          : result.sqlSource === "verified_query"
+            ? "verified"
+            : result.sqlSource === "llm_sql"
+              ? "unverified"
+              : undefined),
     };
     try {
       recordAskLedger({
@@ -557,6 +670,43 @@ export async function analyticsAsk(
     const lastUserText = userTexts[userTexts.length - 1] || nlSafe || nlForResolve;
     const priorUserTexts = userTexts.slice(0, -1).reverse();
     const prevAskStateEarly = parseAskState(opts?.prevAskState);
+    const mergeVerify = (
+      a?: AnalyticsAskResult["verify"],
+      b?: AnalyticsAskResult["verify"],
+    ) => (a?.verdict === "fail" ? a : b?.verdict === "fail" ? b : b || a);
+    const attachPostExec = async (input: {
+      message: string;
+      timeEcho: string;
+      sqls: string[];
+      tables: NonNullable<AnalyticsAskResult["tables"]>;
+      metricId?: string;
+      empty?: boolean;
+      trust?: AnalyticsAskResult["trust"];
+      priorVerify?: AnalyticsAskResult["verify"];
+    }) => {
+      const post = await runPostExecLlm({
+        nl: lastUserText,
+        timeEcho: input.timeEcho,
+        sqls: input.sqls,
+        tables: input.tables,
+        metricId: input.metricId,
+        empty: input.empty,
+        trust: input.trust,
+        llmText: async (system, user, spanName) => {
+          try {
+            return await llmText(system, user, { ...llmOptsBase, spanName });
+          } catch {
+            return "";
+          }
+        },
+      });
+      const verify = mergeVerify(input.priorVerify, post.verify);
+      return {
+        verify,
+        insight: post.insight,
+        message: `${input.message}${verifyCaution(verify)}`,
+      };
+    };
 
     const catalogApplied = await refreshPackFromCatalog(pack, {
       signal: opts?.signal,
@@ -600,11 +750,103 @@ export async function analyticsAsk(
     ) {
       return seal({
         status: "refuse",
-        message: `???? ${timeCol} ???? overlay ? schema???????`,
+        message: `\u65f6\u95f4\u5b57\u6bb5 ${timeCol} \u4e0d\u5728 overlay \u8868 schema \u4e2d\uff0c\u5df2\u62d2\u7edd\u3002`,
         error: `catalog_time_field_missing:${timeCol}`,
         packVersion: pack.version,
         semanticOk: false,
         semanticIssues: catalogApplied.notes,
+      });
+    }
+
+    const vqrHit = matchVerifiedQuery(lastUserText, pack);
+    if (vqrHit && "clarify" in vqrHit) {
+      const clarified = attachClarifyOptions(
+        "\u591a\u6761\u91d1\u6837\u540c\u65f6\u547d\u4e2d\uff0c\u8bf7\u9009\u62e9\u8981\u67e5\u7684\u53e3\u5f84\u3002",
+        vqrHit.clarify,
+        { multiSelect: false, slot: "verified_query" },
+      );
+      return seal({
+        status: "clarify",
+        message: clarified.message,
+        clarifySlot: "verified_query",
+        clarifyOptions: clarified.clarifyOptions,
+        timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+        packVersion: pack.version,
+      });
+    }
+    if (vqrHit && "query" in vqrHit) {
+      const q = vqrHit.query;
+      const channels = extractChannelsFromNl(lastUserText, pack);
+      const channel = opts?.slotAnswers?.channel?.[0] || channels[0];
+      const appVersion = extractAppVersionFromNl(lastUserText);
+      const bound = bindVerifiedQuery(q, {
+        start: timeResolved.range.start,
+        end: timeResolved.range.end,
+        channel,
+        appVersion,
+      });
+      if (!bound.ok) {
+        const slot = bound.missing[0] === "appVersion" ? "appVersion" : "channel";
+        return seal({
+          status: "clarify",
+          message: `\u91d1\u6837\u300c${q.title}\u300d\u8fd8\u9700\u8981\uff1a${bound.missing.join("\u3001")}`,
+          clarifySlot: slot,
+          timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+          packVersion: pack.version,
+          verifiedQueryId: q.id,
+          linkedTables: q.tables,
+          sqlSource: "verified_query",
+          trust: "verified",
+        });
+      }
+      const ran = await runHybridSqls({
+        pack,
+        sqls: [bound.sql],
+        nl: lastUserText,
+        time: timeResolved.range,
+        table: q.tables[0],
+        signal: opts?.signal,
+      });
+      const echo = `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`;
+      if (!ran.ok) {
+        return seal({
+          status: "refuse",
+          message: ran.issues.join("; "),
+          sqls: ran.sqls,
+          error: ran.issues.join("; "),
+          timeEcho: echo,
+          packVersion: pack.version,
+          sqlSource: "verified_query",
+          trust: "verified",
+          verifiedQueryId: q.id,
+          linkedTables: q.tables,
+          semanticOk: false,
+          semanticIssues: ran.issues,
+        });
+      }
+      const extra = await attachPostExec({
+        message: `${trustCaption("verified")}${echo}${ran.empty ? "\uff08\u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff09" : ""}`,
+        timeEcho: echo,
+        sqls: ran.sqls,
+        tables: ran.tables,
+        empty: ran.empty,
+        trust: "verified",
+      });
+      return seal({
+        status: "ok",
+        message: extra.message,
+        timeEcho: echo,
+        sqls: ran.sqls,
+        tables: ran.tables,
+        charts: ran.empty ? undefined : buildLocalChartsFromTables(ran.tables),
+        packVersion: pack.version,
+        sqlSource: "verified_query",
+        trust: "verified",
+        verifiedQueryId: q.id,
+        linkedTables: q.tables,
+        semanticOk: true,
+        verify: extra.verify,
+        insight: extra.insight,
       });
     }
 
@@ -633,6 +875,255 @@ export async function analyticsAsk(
       });
     }
     const lockedTable = tableResolved.table;
+    const linkedSeed = tableResolved.linked.length
+      ? tableResolved.linked
+      : lockedTable
+        ? expandLinkedTables(pack, [lockedTable])
+        : [];
+
+    const hybridRoute = routeAnalyticsAsk({
+      nl: lastUserText,
+      pack,
+      lockedTable,
+      linkedTables: linkedSeed,
+      tableConfidence: tableResolved.confidence,
+      llmSqlEnabled: llmSqlEnabled(),
+    });
+    if (hybridRoute.path === "clarify") {
+      const clarified = attachClarifyOptions(hybridRoute.message, hybridRoute.options || [], {
+        multiSelect: false,
+        slot: hybridRoute.slot,
+      });
+      return seal({
+        status: "clarify",
+        message: clarified.message,
+        clarifySlot: hybridRoute.slot,
+        clarifyOptions: clarified.clarifyOptions,
+        timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+        packVersion: pack.version,
+      });
+    }
+    if (hybridRoute.path === "refuse") {
+      return seal({
+        status: "refuse",
+        message: hybridRoute.message,
+        error: hybridRoute.reason,
+        timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+        packVersion: pack.version,
+        semanticOk: false,
+        semanticIssues: [hybridRoute.reason],
+      });
+    }
+    if (hybridRoute.path === "intent_compile") {
+      const routedMetric =
+        inferMetricIdFromNl(lastUserText, pack, lockedTable) ||
+        inferMetricIdFromNl(lastUserText, pack);
+      const missingSlots = missingRequiredMetricSlots(
+        routedMetric,
+        lastUserText,
+        pack,
+        opts?.slotAnswers,
+      );
+      if (missingSlots.length) {
+        const slot = missingSlots[0]!;
+        let message =
+          slot === "appVersion"
+            ? "\u8bf7\u8865\u5145 App \u7248\u672c\u53f7\u3002"
+            : "\u8bf7\u8865\u5145\u8981\u7b5b\u9009\u7684\u6e20\u9053\u3002";
+        let clarifyOptions: AnalyticsAskResult["clarifyOptions"];
+        if (slot === "channel") {
+          try {
+            const probe = await probeDimensions(
+              pack,
+              timeResolved.range,
+              opts?.signal,
+              ["channel"],
+              lockedTable,
+            );
+            const options = parseProbeValuesForDim(probe, "channel");
+            if (options.length) {
+              const clarified = attachClarifyOptions(message, options, {
+                multiSelect: true,
+                slot: "channel",
+              });
+              message = clarified.message;
+              clarifyOptions = clarified.clarifyOptions;
+            }
+          } catch (e) {
+            if (opts?.signal?.aborted || isAbortError(e)) throw e;
+          }
+        }
+        return seal({
+          status: "clarify",
+          message,
+          clarifySlot: slot,
+          clarifyOptions,
+          timeEcho: `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`,
+          packVersion: pack.version,
+          sqlSource: "intent_compile",
+          trust: "trusted",
+          linkedTables: expandLinkedTables(pack, [lockedTable]),
+        });
+      }
+    }
+    if (hybridRoute.path === "llm_sql") {
+      const echo = `\u6309 ${timeResolved.range.start}\uff5e${timeResolved.range.end}`;
+      const capRefuse = refuseUnsupportedOpsFromNl(lastUserText, pack);
+      if (capRefuse) {
+        return seal({
+          status: "refuse",
+          message: capRefuse.message,
+          error: capRefuse.reason,
+          timeEcho: echo,
+          packVersion: pack.version,
+          sqlSource: "llm_sql",
+          trust: "unverified",
+          linkedTables: hybridRoute.tables,
+          semanticOk: false,
+          semanticIssues: capRefuse.notes,
+        });
+      }
+      const preChannels = extractChannelsFromNl(lastUserText, pack);
+      const channelTable = lockedTable || hybridRoute.tables[0] || "";
+      if (preChannels.length && channelTable && canApplyTextChannelFilter(pack, channelTable)) {
+        try {
+          const chGround = await groundChannelFilters({
+            pack,
+            filters: { channel: preChannels },
+            table: channelTable,
+            opts: { signal: opts?.signal },
+          });
+          if (chGround.status === "clarify") {
+            const clarified = attachClarifyOptions(chGround.message, chGround.options, {
+              multiSelect: true,
+              slot: "channel",
+            });
+            return seal({
+              status: "clarify",
+              message: clarified.message,
+              clarifySlot: "channel",
+              clarifyOptions: clarified.clarifyOptions,
+              timeEcho: echo,
+              packVersion: pack.version,
+              sqlSource: "llm_sql",
+              trust: "unverified",
+              linkedTables: hybridRoute.tables,
+            });
+          }
+        } catch (e) {
+          if (opts?.signal?.aborted || isAbortError(e)) throw e;
+        }
+      }
+      let lastErr = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const gen = await runSqlAgent({
+          nl: lastUserText,
+          pack,
+          tables: hybridRoute.tables,
+          time: { start: timeResolved.range.start, end: timeResolved.range.end },
+          repair: lastErr || undefined,
+          modelId: opts?.modelId,
+          signal: opts?.signal,
+          traceRunId: runId || undefined,
+        });
+        if (gen.status === "clarify") {
+          return seal({
+            status: "clarify",
+            message: gen.clarify,
+            clarifySlot: gen.clarifySlot,
+            timeEcho: echo,
+            packVersion: pack.version,
+            sqlSource: "llm_sql",
+            trust: "unverified",
+            linkedTables: hybridRoute.tables,
+          });
+        }
+        const sql = overlayResolvedDates(
+          gen.sql,
+          timeResolved.range.start,
+          timeResolved.range.end,
+        );
+        const anchors = missingNlAnchorsInSql(lastUserText, sql, pack);
+        if (anchors.length) {
+          lastErr = `SQL omitted user-mentioned filters: ${anchors.join("; ")}`;
+          continue;
+        }
+        const claimed = [
+          ...new Set(
+            [
+              ...(hybridRoute.tables || []),
+              ...(gen.schemaedTables || []),
+              ...(gen.tables || []),
+              ...extractFromTables(sql),
+            ]
+              .map((t) => bareTableName(t))
+              .filter(Boolean),
+          ),
+        ];
+        const got = getTableSchemas(pack, claimed, Math.max(claimed.length, 1));
+        if (got.refused.length) {
+          lastErr = `get_table_schema refused: ${got.refused.map((r) => `${r.name}:${r.reason}`).join("; ")}`;
+          continue;
+        }
+        if (!got.ok.length) {
+          lastErr = "get_table_schema required before FROM; no answerable table was schemed.";
+          continue;
+        }
+        const ran = await runHybridSqls({
+          pack,
+          sqls: [sql],
+          nl: lastUserText,
+          time: timeResolved.range,
+          table: lockedTable || gen.tables[0] || hybridRoute.tables[0],
+          allowedTables: got.ok,
+          signal: opts?.signal,
+        });
+        if (ran.ok) {
+          const extra = await attachPostExec({
+            message: `${trustCaption("unverified")}${echo}${ran.empty ? "\uff08\u65f6\u6bb5\u5185\u65e0\u5339\u914d\u884c\uff09" : ""}`,
+            timeEcho: echo,
+            sqls: ran.sqls,
+            tables: ran.tables,
+            empty: ran.empty,
+            trust: "unverified",
+          });
+          if (!ran.empty && extra.verify?.verdict === "fail" && attempt < 2) {
+            lastErr = `LLM verify fail: ${extra.verify.reason}`;
+            rewriteRounds += 1;
+            continue;
+          }
+          return seal({
+            status: "ok",
+            message: extra.message,
+            timeEcho: echo,
+            sqls: ran.sqls,
+            tables: ran.tables,
+            charts: ran.empty ? undefined : buildLocalChartsFromTables(ran.tables),
+            packVersion: pack.version,
+            sqlSource: "llm_sql",
+            trust: "unverified",
+            linkedTables: hybridRoute.tables,
+            semanticOk: extra.verify?.verdict !== "fail",
+            semanticIssues: extra.verify?.verdict === "fail" ? [extra.verify.reason] : undefined,
+            verify: extra.verify,
+            insight: extra.insight,
+          });
+        }
+        lastErr = ran.issues.join("; ");
+      }
+      return seal({
+        status: "refuse",
+        message: lastErr || "\u6a21\u578b\u5199 SQL \u4e09\u6b21\u4ecd\u5931\u8d25",
+        error: lastErr,
+        timeEcho: echo,
+        packVersion: pack.version,
+        sqlSource: "llm_sql",
+        trust: "unverified",
+        linkedTables: hybridRoute.tables,
+        semanticOk: false,
+        semanticIssues: [lastErr || "llm_sql_exhausted"],
+      });
+    }
 
     const askContext: AskRuntimeContext = {
       clockIsoDate: clockIso,
@@ -673,7 +1164,10 @@ export async function analyticsAsk(
       const out: Record<string, DimLexicon> = {};
       for (const field of coverageFields(pack)) {
         try {
-          const loaded = await loadFieldLexicon(pack, field, { signal: opts?.signal });
+          const loaded = await loadFieldLexicon(pack, field, {
+            signal: opts?.signal,
+            table: lockedTable,
+          });
           if (loaded.ok) out[field] = loaded.lexicon;
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
@@ -758,6 +1252,63 @@ export async function analyticsAsk(
       }
     }
 
+    if (
+      !skipStructureLlm &&
+      timeResolved.ok &&
+      lockedTable &&
+      !isOverlayTable(pack, lockedTable)
+    ) {
+      const built = buildDocumentedTableStructure({
+        nl: lastUserText,
+        pack,
+        table: lockedTable,
+        time: timeResolved.range,
+        reason: tableResolved.reason,
+      });
+      if (built) {
+        structured = built;
+        skipStructureLlm = true;
+        structureMeta = { mode: "single_forward", formatConstraint: "prompt_parse" };
+      }
+    }
+
+    if (
+      !skipStructureLlm &&
+      timeResolved.ok &&
+      lockedTable &&
+      isOverlayTable(pack, lockedTable) &&
+      nlWantsWideShape(lastUserText)
+    ) {
+      const metricId =
+        inferMetricIdFromNl(lastUserText, pack, lockedTable) ||
+        (/\u5b8c\u64ad/.test(lastUserText) ? "avg_max_progress" : undefined);
+      const wideMetrics = new Set(["avg_max_progress", "avg_watch_second_per_user", "uniq_users"]);
+      if (metricId && wideMetrics.has(metricId)) {
+        const channels = extractChannelsFromNl(lastUserText, pack);
+        const langs = extractLocalesFromText(lastUserText).map((l) => (l === "(empty)" ? "" : l));
+        const pivotLangs = langs.length >= 2 ? langs : packDefaultWideLangs(pack);
+        if (pivotLangs.length >= 2) {
+          const filters: Record<string, string[]> = {};
+          if (channels.length) filters.channel = channels;
+          filters.contentLang = pivotLangs;
+          structured = {
+            status: "ok",
+            mergedNl: lastUserText,
+            time: { start: timeResolved.range.start, end: timeResolved.range.end },
+            filters,
+            outputDims: ["watch_date", "channel"],
+            metricId,
+            layout: "wide",
+            pivotDim: "contentLang",
+            table: lockedTable,
+            notes: ["wide_overlay_from_nl"],
+          };
+          skipStructureLlm = true;
+          structureMeta = { mode: "single_forward", formatConstraint: "prompt_parse" };
+        }
+      }
+    }
+
     if (!skipStructureLlm && conversation.length) {
       // JIT probe: only when this turn needs dim members. Structure itself always runs.
       if (needsDimensionProbe(lastUserText)) {
@@ -767,6 +1318,7 @@ export async function analyticsAsk(
             timeResolved.range,
             opts?.signal,
             neededProbeFields(lastUserText),
+            lockedTable,
           );
         } catch (e) {
           if (opts?.signal?.aborted || isAbortError(e)) throw e;
@@ -779,6 +1331,7 @@ export async function analyticsAsk(
           askContext,
           probeSummary: preProbeSummary,
           prevAskState,
+          resolvedTable: lockedTable,
           modelId: opts?.modelId,
           signal: opts?.signal,
           traceRunId: runId || undefined,
@@ -798,6 +1351,7 @@ export async function analyticsAsk(
             askContext,
             probeSummary: preProbeSummary,
             prevAskState,
+            resolvedTable: lockedTable,
             modelId: opts?.modelId,
             signal: opts?.signal,
             traceRunId: runId || undefined,
@@ -858,6 +1412,7 @@ export async function analyticsAsk(
           pack,
           field: "movieType",
           nl: nlBlob,
+          table: lockedTable,
           opts: { signal: opts?.signal },
         });
         const movieCodes =
@@ -970,6 +1525,23 @@ export async function analyticsAsk(
           notes: [...(structured.notes || []), `locked_table:${tableResolved.reason}:${lockedTable}`],
         };
       }
+      if (lockedTable && !isOverlayTable(pack, lockedTable)) {
+        const nextMetric = coerceMetricForWarehouseTable(
+          structured.metricId,
+          lastUserText,
+          pack,
+          lockedTable,
+        );
+        if (nextMetric && nextMetric !== structured.metricId) {
+          structured = {
+            ...structured,
+            metricId: nextMetric,
+            notes: [...(structured.notes || []), `coerced_metric_for_warehouse_table:${nextMetric}`],
+          };
+        } else if (!structured.metricId && nextMetric) {
+          structured = { ...structured, metricId: nextMetric };
+        }
+      }
       askLexicons = await loadAskLexicons();
       const coverageNl = askScopeNl(structured.mergedNl || "");
       const covered = applyCoverageGate({
@@ -1041,6 +1613,7 @@ export async function analyticsAsk(
             { start: probeRange.start, end: probeRange.end },
             opts?.signal,
             [structured.clarifySlot],
+            lockedTable,
           );
           if (!rangeEcho) rangeEcho = `\u6309 ${probeRange.start}\uff5e${probeRange.end}`;
         } catch (e) {
@@ -1053,7 +1626,10 @@ export async function analyticsAsk(
       // Prefer Metabase lexicon labels for remapped dims (movieType 1=?? ?)
       if (structured.clarifySlot === "movieType") {
         try {
-          const lex = await loadFieldLexicon(pack, "movieType", { signal: opts?.signal });
+          const lex = await loadFieldLexicon(pack, "movieType", {
+            signal: opts?.signal,
+            table: lockedTable,
+          });
           if (lex.ok && lex.lexicon.remapped) {
             options = lexiconClarifyOptions(lex.lexicon);
           }
@@ -1140,6 +1716,7 @@ export async function analyticsAsk(
                 timeResolved.range,
                 opts?.signal,
                 ["contentLang"],
+                lockedTable,
               );
             } catch (e) {
               if (opts?.signal?.aborted || isAbortError(e)) throw e;
@@ -1326,6 +1903,7 @@ export async function analyticsAsk(
         pack,
         filters: structured.filters,
         nl: nlForGuards,
+        table: structured.table || lockedTable,
         opts: { signal: opts?.signal },
       });
       if (grounded.status === "clarify") {
@@ -1363,6 +1941,7 @@ export async function analyticsAsk(
         const chGround = await groundChannelFilters({
           pack,
           filters: filtersForIntent,
+          table: askTable || lockedTable,
           opts: { signal: opts?.signal },
         });
         if (chGround.status === "clarify") {
@@ -1515,6 +2094,7 @@ export async function analyticsAsk(
           dimColumns,
           packTimeField(pack, lintTable),
           !canApplyTextChannelFilter(pack, lintTable),
+          pack,
         );
         guardIssues = issues;
         if (issues.length) {
@@ -1704,16 +2284,29 @@ export async function analyticsAsk(
             ...metaFields,
           });
         }
+        const metricV = metricVerifyForOk();
+        const extra = await attachPostExec({
+          message: delivered.message,
+          timeEcho: range.echo,
+          sqls: execSqls,
+          tables: delivered.tables,
+          metricId: structured.metricId,
+          empty: delivered.tables.every((t) => !t.rows.length),
+          trust: "trusted",
+          priorVerify: metricV.verify,
+        });
         return seal({
           status: "ok",
-          message: delivered.message,
+          message: extra.message,
           timeEcho: range.echo,
           sqls: execSqls,
           tables: delivered.tables,
           packVersion: pack.version,
           structuredFromConversation: true,
           sqlSource: "intent_compile",
-          ...metricVerifyForOk(),
+          ...metricV,
+          verify: extra.verify,
+          insight: extra.insight,
           ...metaFields,
         });
       }
@@ -1809,6 +2402,7 @@ export async function analyticsAsk(
       dimColumns,
       packTimeField(pack, lintTable),
       !canApplyTextChannelFilter(pack, lintTable),
+      pack,
     );
     guardIssues = issues;
     if (issues.length) {
@@ -1974,9 +2568,20 @@ export async function analyticsAsk(
     } catch {
       /* prefs write is best-effort */
     }
+    const metricV = metricVerifyForOk();
+    const extra = await attachPostExec({
+      message: delivered.message,
+      timeEcho: range.echo,
+      sqls,
+      tables: delivered.tables,
+      metricId: structured.metricId,
+      empty: allEmpty(results),
+      trust: "trusted",
+      priorVerify: metricV.verify,
+    });
     return seal({
       status: "ok",
-      message: delivered.message,
+      message: extra.message,
       timeEcho: range.echo,
       sqls,
       tables: delivered.tables,
@@ -1984,17 +2589,21 @@ export async function analyticsAsk(
       sqlSource: "intent_compile",
       packVersion: pack.version,
       structuredFromConversation: true,
-      ...metricVerifyForOk(),
+      ...metricV,
+      verify: extra.verify,
+      insight: extra.insight,
       ...metaFields,
     });
   } catch (e) {
     if (opts?.signal?.aborted || isAbortError(e)) {
       return seal({ status: "error", message: "\u5df2\u53d6\u6d88", error: "aborted" });
     }
+    const raw = e instanceof Error ? e.message : String(e);
+    const llmish = /llm_timeout|401008|gateway_error|quota|exhausted|"error"/.test(raw) || raw.trim().startsWith("{");
     return seal({
       status: "error",
-      message: e instanceof Error ? e.message : String(e),
-      error: e instanceof Error ? e.message : String(e),
+      message: llmish ? sanitizeAnalyticsLlmError(e) : raw,
+      error: raw,
     });
   } finally {
     closeRun();

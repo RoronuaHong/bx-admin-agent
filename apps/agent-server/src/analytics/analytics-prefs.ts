@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractChannelsFromNl } from "./intent.js";
-import { canApplyTextChannelFilter, type AnalyticsPack } from "./semantic-layer.js";
+import { canApplyTextChannelFilter, isOverlayTable, type AnalyticsPack } from "./semantic-layer.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let PREFS_DIR = resolve(__dirname, "../../.data", "analytics-prefs");
@@ -120,7 +120,9 @@ export function applyAnalyticsPrefsDefaults(input: {
   const nl = String(input.nl || "");
   const multiChannelAsk = /各渠道|所有渠道|全部渠道|每个渠道|分渠道/.test(nl);
   const prefsChannels = input.prefs.defaultChannels || [];
-  const channelOnTable = !input.table || canApplyTextChannelFilter(input.pack, input.table);
+  const applyChannelPrefs = !input.table || isOverlayTable(input.pack, input.table);
+  const channelOnTable =
+    applyChannelPrefs && (!input.table || canApplyTextChannelFilter(input.pack, input.table));
   const mentioned = channelOnTable ? extractChannelsFromNl(nl, input.pack) : [];
   const nlMentionsAnyPreferred =
     mentioned.length > 0 ||

@@ -31,6 +31,8 @@ export interface AnalyticsAskResult {
   error?: string;
   /** M2 LLM 校对结论（可跳过 empty / 关闭 ANALYTICS_LLM_VERIFY） */
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
+  /** Post-exec reading; numbers must come from the result sample */
+  insight?: string;
   modelId?: string;
   packVersion?: string;
   /** M2 审计账本 id；UI 反馈挂靠 */
@@ -39,8 +41,14 @@ export interface AnalyticsAskResult {
   rewriteRounds?: number;
   /** @deprecated 保留兼容；语义结果见 semanticOk */
   verifySkipped?: "empty" | "disabled" | "intent_compile";
-  /** SQL 来源：仅 Intent 确定性编译（不再 LLM 写 SQL） */
-  sqlSource?: "intent_compile";
+  /** SQL 来源：语义编译 / 金样绑槽 / 模型写 SQL */
+  sqlSource?: "intent_compile" | "verified_query" | "llm_sql";
+  /** 交付信任：A 可信 / B 金样 / C 未核验 */
+  trust?: "trusted" | "verified" | "unverified";
+  /** 本轮链接或金样声明的表 */
+  linkedTables?: string[];
+  /** Path B 命中的金样 id */
+  verifiedQueryId?: string;
   /** 是否经对话 schema-agent 结构化 */
   structuredFromConversation?: boolean;
   /** 结构抽取模式：预探库单次 / tool-loop */

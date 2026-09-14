@@ -23,13 +23,18 @@ import { analyticsAsk } from "../src/analytics/pipeline.js";
 import { runNativeDataset } from "../src/analytics/metabase-client.js";
 import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 import {
+  accumulateLlmSql,
   accumulateOutcome,
+  emptyLlmSqlReport,
   emptyMetrics,
   evaluateGates,
   isGateCase,
+  isTaggedLlmSqlCase,
+  llmSqlRates,
   loadGateThresholds,
   softExMatchTables,
 } from "../src/analytics/eval-score.js";
+import { summarizeCatalogCoverage } from "../src/analytics/catalog.js";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dir, "..");
@@ -48,9 +53,9 @@ function preferAnalyticsLlm() {
     .filter(Boolean);
   const preferred =
     (forced && ids.find((id) => id.toLowerCase() === forced.toLowerCase())) ||
+    ids.find((id) => id.toLowerCase() === "dsflash") ||
     ids.find((id) => id.toLowerCase() === "glm5") ||
-    ids.find((id) => id.toLowerCase() === "glm5turbo") ||
-    ids.find((id) => id.toLowerCase() === "dsflash");
+    ids.find((id) => id.toLowerCase() === "glm5turbo");
   if (!preferred) return;
   process.env.MODEL_PROVIDERS = [preferred, ...ids.filter((id) => id !== preferred)].join(",");
 }
@@ -153,6 +158,15 @@ async function runCase(c, ctx) {
     return {
       outcome: "error",
       detail: `status=${result.status} ${result.error || result.message || ""}`,
+      ms: Date.now() - started,
+      result,
+    };
+  }
+
+  if (c.expectSqlSource && result.sqlSource && result.sqlSource !== c.expectSqlSource) {
+    return {
+      outcome: "ex_fail",
+      detail: `sqlSource=${result.sqlSource} want ${c.expectSqlSource}`,
       ms: Date.now() - started,
       result,
     };
@@ -290,13 +304,28 @@ async function main() {
   };
   const gateMetrics = emptyMetrics();
   const smokeMetrics = emptyMetrics();
+  const llmSqlMetrics = emptyLlmSqlReport();
   const lines = [];
+  const coverage = summarizeCatalogCoverage(databaseId);
+  if (coverage) {
+    console.log(
+      `[analytics-eval] coverage total=${coverage.total} answerable=${coverage.answerable} hidden=${coverage.hidden} (not in EX denominator)`,
+    );
+  } else {
+    console.log("[analytics-eval] coverage n/a (no disk catalog yet)");
+  }
 
   for (const c of cases) {
     const gate = isGateCase(c);
-    process.stdout.write(`[analytics-eval] RUN ${c.id}${gate ? "" : " [smoke]"} … `);
+    const taggedC = isTaggedLlmSqlCase(c) && c.should_refuse !== true;
+    process.stdout.write(`[analytics-eval] RUN ${c.id}${gate ? "" : " [smoke]"}${taggedC ? " [llm_sql]" : ""} … `);
     const out = await runCase(c, ctx);
-    accumulateOutcome(gate ? gateMetrics : smokeMetrics, out.outcome, c.should_refuse === true);
+    if (taggedC) {
+      if (out.outcome === "skipped") accumulateOutcome(smokeMetrics, "skipped", false);
+      else accumulateLlmSql(llmSqlMetrics, out.outcome, out.result?.status === "ok");
+    } else {
+      accumulateOutcome(gate ? gateMetrics : smokeMetrics, out.outcome, c.should_refuse === true);
+    }
     const mark = ["ex_pass", "ex_soft", "refuse_ok", "skipped"].includes(out.outcome) ? "PASS" : "FAIL";
     console.log(`${mark} (${out.ms}ms) ${out.outcome} ${out.detail}`);
     lines.push({
@@ -305,6 +334,7 @@ async function main() {
       outcome: out.outcome,
       detail: out.detail,
       ms: out.ms,
+      sqlSource: out.result?.sqlSource || "",
     });
   }
 
@@ -343,6 +373,12 @@ async function main() {
       `  answerable=${smokeMetrics.answerable} exPass=${smokeMetrics.exPass} cwr=${smokeMetrics.cwr} overRefuse=${smokeMetrics.overRefuse} errors=${smokeMetrics.errors}`,
     );
   }
+  const llmRates = llmSqlRates(llmSqlMetrics);
+  console.log("\n[analytics-eval] path C (not in GATE EX)");
+  console.log(
+    `  llm_sql_cases=${llmSqlMetrics.cases} llm_sql_exec_ok=${pct(llmRates.execOk)} llm_sql_ex=${pct(llmRates.ex)}`,
+  );
+
   console.log("\n[analytics-eval] gates");
   console.log(`  EX=${pct(gate.ex)} (min ${pct(thresholds.exMin)})`);
   console.log(`  RefuseRecall=${pct(gate.refuseRecall)} (min ${pct(thresholds.refuseRecallMin)})`);

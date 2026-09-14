@@ -236,6 +236,34 @@ export function isGateCase(c: { reviewStatus?: string }): boolean {
   return String(c.reviewStatus || "").trim().toLowerCase() === "gold";
 }
 
+/** Tagged Path C exploration — EX stays out of GATE denominator. Refuse tags still gate. */
+export function isTaggedLlmSqlCase(c: { expectSqlSource?: string; tags?: string[] }): boolean {
+  return c.expectSqlSource === "llm_sql" || (c.tags || []).includes("llm_sql");
+}
+
+export type LlmSqlReport = {
+  cases: number;
+  execOk: number;
+  exPass: number;
+};
+
+export function emptyLlmSqlReport(): LlmSqlReport {
+  return { cases: 0, execOk: 0, exPass: 0 };
+}
+
+export function accumulateLlmSql(m: LlmSqlReport, outcome: CaseOutcome, execOk: boolean): void {
+  m.cases += 1;
+  if (execOk) m.execOk += 1;
+  if (outcome === "ex_pass" || outcome === "ex_soft") m.exPass += 1;
+}
+
+export function llmSqlRates(m: LlmSqlReport): { execOk: number | null; ex: number | null } {
+  return {
+    execOk: m.cases > 0 ? m.execOk / m.cases : null,
+    ex: m.execOk > 0 ? m.exPass / m.execOk : null,
+  };
+}
+
 export type GateMetrics = {
   answerable: number;
   exPass: number; // strict + soft

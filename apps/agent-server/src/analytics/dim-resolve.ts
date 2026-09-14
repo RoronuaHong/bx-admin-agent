@@ -27,9 +27,9 @@ export function clearDimLexiconCache(): void {
 export async function loadFieldLexicon(
   pack: AnalyticsPack,
   field: string,
-  opts?: MetabaseRunOpts,
+  opts?: MetabaseRunOpts & { table?: string },
 ): Promise<{ ok: true; lexicon: DimLexicon } | { ok: false; error: string }> {
-  const table = pack.tables[0]?.name;
+  const table = opts?.table || pack.tables[0]?.name;
   if (!table) return { ok: false, error: "pack has no table" };
   const dbId = pack.datasource.metabaseDatabaseId;
   const cacheKey = `${dbId}:${table}.${field}`;
@@ -92,6 +92,7 @@ export async function resolvePackFilters(input: {
   pack: AnalyticsPack;
   filters: Record<string, string[]>;
   nl?: string;
+  table?: string;
   opts?: MetabaseRunOpts;
 }): Promise<FilterResolveResult> {
   const filters: Record<string, string[]> = { ...input.filters };
@@ -112,7 +113,10 @@ export async function resolvePackFilters(input: {
     }
     if (!wantsLexiconResolve(dim, field, tokens, input.nl)) continue;
 
-    const loaded = await loadFieldLexicon(input.pack, field, input.opts);
+    const loaded = await loadFieldLexicon(input.pack, field, {
+      ...input.opts,
+      table: input.table,
+    });
     if (!loaded.ok) {
       notes.push(`lexicon_skip:${field}:${loaded.error}`);
       // Soft-fail: leave tokens; compile gate will refuse bare Chinese for numeric dims
@@ -156,9 +160,13 @@ export async function groundRemappedFieldFromNl(input: {
   pack: AnalyticsPack;
   field: string;
   nl: string;
+  table?: string;
   opts?: MetabaseRunOpts;
 }): Promise<{ ok: true; codes: string[]; lexicon: DimLexicon } | { ok: false; error: string }> {
-  const loaded = await loadFieldLexicon(input.pack, input.field, input.opts);
+  const loaded = await loadFieldLexicon(input.pack, input.field, {
+    ...input.opts,
+    table: input.table,
+  });
   if (!loaded.ok) return loaded;
   if (!loaded.lexicon.remapped) {
     return { ok: false, error: "not_remapped" };
@@ -172,6 +180,7 @@ export async function resolveDimensionValues(input: {
   pack: AnalyticsPack;
   field: string;
   tokens: string[];
+  table?: string;
   opts?: MetabaseRunOpts;
 }): Promise<{
   ok: boolean;
@@ -182,7 +191,10 @@ export async function resolveDimensionValues(input: {
   options?: Array<{ id: string; label: string }>;
   error?: string;
 }> {
-  const loaded = await loadFieldLexicon(input.pack, input.field, input.opts);
+  const loaded = await loadFieldLexicon(input.pack, input.field, {
+    ...input.opts,
+    table: input.table,
+  });
   if (!loaded.ok) {
     return {
       ok: false,

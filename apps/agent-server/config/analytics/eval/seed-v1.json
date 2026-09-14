@@ -619,6 +619,33 @@
       ],
       "reviewStatus": "gold",
       "reviewNote": "gold verified 2026-09-13: this-run soft-EX pass (glm5); GATE_EX now counts this row"
+    },
+    {
+      "id": "refuse-hidden-tmp",
+      "nl": "2026-08-19到2026-08-25，查 elt_user_full_tmp 有多少行",
+      "should_refuse": true,
+      "tags": ["refuse", "hidden", "catalog"],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "Hidden _tmp table must refuse; no SQL"
+    },
+    {
+      "id": "refuse-hidden-dict",
+      "nl": "2026-08-19到2026-08-25，查 elt_watch_detail_lang_dict 有多少行",
+      "should_refuse": true,
+      "tags": ["refuse", "hidden", "catalog"],
+      "difficulty": "easy",
+      "reviewStatus": "gold",
+      "reviewNote": "Hidden _dict table must refuse; no SQL"
+    },
+    {
+      "id": "refuse-undeclared-join",
+      "nl": "2026-08-19到2026-08-25，把 elt_film_order 和 elt_watch_detail 关联统计付费用户观看人数",
+      "should_refuse": true,
+      "tags": ["refuse", "join"],
+      "difficulty": "medium",
+      "reviewStatus": "provisional",
+      "reviewNote": "JOIN pair not in V1 relationships; smoke until Path C consistently refuses instead of single-table fallback"
     }
   ]
 }

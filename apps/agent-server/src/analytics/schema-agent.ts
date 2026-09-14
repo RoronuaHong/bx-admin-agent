@@ -10,8 +10,17 @@ import type { ModelEntry } from "../config.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
 import * as trace from "../trace.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
+import { beginAnalyticsLlmSignal } from "./llm-error.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
-import { overlayTableName, packTimeField, warehouseTable } from "./semantic-layer.js";
+import {
+  compileTableRef,
+  overlayTableName,
+  packFieldsForTable,
+  packTimeField,
+  tableHasTimeField,
+  warehouseTable,
+} from "./semantic-layer.js";
+import { oneLineDoc, warehouseTableHasDocs } from "./catalog-digest.js";
 import { resolveDimensionValues } from "./dim-resolve.js";
 import { catalogCapabilitiesPayload } from "./capability-gate.js";
 import {
@@ -65,7 +74,7 @@ function loadSqlStyle(id: string): string {
   return readFileSync(path, "utf8");
 }
 
-function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
+function catalogPayload(pack: AnalyticsPack, resolvedTable?: string): Record<string, unknown> {
   const metrics: Array<{ id: string; label: string; kind?: string }> = [];
   for (const def of pack.metricDefs || []) {
     for (const opt of def.options || []) {
@@ -81,14 +90,18 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
     { id: "sum_watch_second", label: "观看时长合计", kind: "sum" },
     { id: "avg_watch_second_per_user", label: "人均观看时长", kind: "avg_per_user" },
   );
+  const resolved = String(resolvedTable || "").trim() || pack.tables[0]?.name;
   return {
-    table: pack.tables[0]?.name,
+    table: resolved,
     tables: (pack.warehouse?.tables || []).map((t) => ({
       name: t.name,
       schema: t.schema,
       fields: t.fields.length,
+      documented: warehouseTableHasDocs(t),
+      timeField: packTimeField(pack, t.name) || null,
+      blurb: warehouseTableHasDocs(t) ? oneLineDoc(t.description || "", 90) : undefined,
     })),
-    fields: pack.tables[0]?.fields || [],
+    fields: packFieldsForTable(pack, resolved),
     probeDimensions: pack.probeDimensions,
     enumDimensions: (pack.enumDimensions || []).map((d) => ({
       id: d.id,
@@ -109,6 +122,7 @@ function catalogPayload(pack: AnalyticsPack): Record<string, unknown> {
       "Declare required ops ids from capabilities.supportedOps / knownButUnsupportedOps. Never status=ok after silently dropping unsupported ops.",
       "If unsure which values, status=clarify.",
       "If user names an answerable table, set JSON table to that name and use analytics_describe_table.",
+      "If facts lock resolved_table, copy that table. Documented tables may be chosen from NL meaning + blurb.",
       "For non-overlay tables use metricId uniq:field|sum:field|avg:field|count:* from live columns only.",
     ],
   };
@@ -213,7 +227,14 @@ function describeTablePayload(pack: AnalyticsPack, name: string): Record<string,
     ok: true,
     name: w.name,
     schema: w.schema,
-    fields: w.fields.map((f) => ({ name: f, type: w.fieldTypes?.[f] || "?" })),
+    displayName: w.displayName,
+    description: w.description || null,
+    fields: w.fields.map((f) => ({
+      name: f,
+      type: w.fieldTypes?.[f] || "?",
+      displayName: w.fieldMeta?.[f]?.displayName,
+      description: w.fieldMeta?.[f]?.description || null,
+    })),
     timeField: packTimeField(pack, w.name),
     overlay: w.name === overlayTableName(pack),
   };
@@ -231,14 +252,24 @@ async function probeField(
   const table = tableName || pack.tables[0]?.name || "elt_watch_detail";
   const safeField = String(field).replace(/[^a-zA-Z0-9_]/g, "");
   if (!safeField) return JSON.stringify({ ok: false, error: "invalid field" });
+  const from = compileTableRef(pack, table);
+  const timeField = packTimeField(pack, table);
+  const where =
+    timeField && start && end
+      ? `WHERE toDate(${timeField}) BETWEEN '${start}' AND '${end}'`
+      : tableHasTimeField(pack, table)
+        ? ""
+        : "";
   const sql = [
     `SELECT ${safeField} AS v, count() AS c`,
-    `FROM ${table}`,
-    `WHERE toDate(${packTimeField(pack, table)}) BETWEEN '${start}' AND '${end}'`,
+    `FROM ${from}`,
+    where,
     `GROUP BY ${safeField}`,
     `ORDER BY c DESC`,
     `LIMIT ${Math.min(Math.max(1, limit || 30), 50)}`,
-  ].join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
   try {
     const res = await runNativeDataset(sql, pack.datasource.metabaseDatabaseId, { signal });
     if (!res.ok) return JSON.stringify({ ok: false, error: res.error || "probe failed", field: safeField });
@@ -298,15 +329,24 @@ async function chatCompletions(input: {
   tool_calls: Array<{ id: string; function?: { name?: string; arguments?: string } }>;
   raw: unknown;
 }> {
-  const resp = await fetch(`${input.model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${input.key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(input.body),
-    signal: input.signal,
-  });
+  const llmSig = beginAnalyticsLlmSignal(input.signal);
+  let resp: Response;
+  try {
+    resp = await fetch(`${input.model.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${input.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input.body),
+      signal: llmSig.signal,
+    });
+  } catch (e) {
+    if (llmSig.didTimeout()) throw new Error("llm_timeout");
+    throw e;
+  } finally {
+    llmSig.cleanup();
+  }
   const data = (await resp.json()) as {
     choices?: Array<{
       message?: {
@@ -337,6 +377,7 @@ export async function runStructureOnce(input: {
   askContext: AskRuntimeContext;
   probeSummary?: string;
   prevAskState?: AskState | null;
+  resolvedTable?: string;
   modelId?: string;
   signal?: AbortSignal;
   traceRunId?: string;
@@ -423,6 +464,7 @@ export async function runSchemaAgent(input: {
   askContext?: AskRuntimeContext;
   probeSummary?: string;
   prevAskState?: AskState | null;
+  resolvedTable?: string;
 }): Promise<StructuredAskResult> {
   const model = pickAnalyticsModel(input.modelId);
   if (!model) throw new Error("no model");
@@ -491,7 +533,7 @@ export async function runSchemaAgent(input: {
           }
           let result = "";
           if (name === "analytics_list_catalog") {
-            result = JSON.stringify(catalogPayload(input.pack));
+            result = JSON.stringify(catalogPayload(input.pack, input.resolvedTable));
           } else if (name === "analytics_describe_table") {
             result = JSON.stringify(describeTablePayload(input.pack, String(args.name || "")));
           } else if (name === "analytics_load_sql_style") {
@@ -525,6 +567,7 @@ export async function runSchemaAgent(input: {
               pack: input.pack,
               field: String(args.field || ""),
               tokens,
+              table: args.table ? String(args.table) : input.resolvedTable,
               opts: { signal: input.signal },
             });
             result = JSON.stringify(resolved);
@@ -578,4 +621,4 @@ export async function runSchemaAgent(input: {
   }
 }
 
-export { listSqlStyleIds, loadSqlStyle, catalogPayload };
+export { listSqlStyleIds, loadSqlStyle, catalogPayload, describeTablePayload };

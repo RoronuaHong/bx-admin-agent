@@ -100,4 +100,52 @@ GROUP BY channel`;
   );
 }
 
+{
+  const withCte =
+    "WITH todayGuid AS (SELECT guid FROM elt_new_guid WHERE createDate = '2026-08-19') " +
+    "SELECT uniq(guid) FROM todayGuid";
+  const ast = analyzeSqlAst(withCte);
+  assert.deepEqual(ast.tables, ["elt_new_guid"]);
+  assert.doesNotThrow(() =>
+    assertSqlAstSafe(withCte, { requireWhere: true, allowedTables: ["elt_new_guid"] }),
+  );
+}
+
+{
+  const retention = `WITH
+'IndiaA' AS targetChannel,
+toDate('2026-08-19') AS targetDate,
+todayGuid AS (
+  SELECT guid, argMax(contentLang, createTime) AS contentLang
+  FROM gather.gather
+  WHERE eventName = 'content_language_save_success'
+    AND toDate(createTime) = targetDate
+    AND channel = targetChannel
+    AND guid IN (SELECT DISTINCT guid FROM elt_new_guid WHERE createDate = targetDate)
+  GROUP BY guid
+),
+retentionGuid AS (
+  SELECT b.guid
+  FROM elt_active_guid AS a
+  INNER JOIN todayGuid AS b ON a.guid = b.guid
+  WHERE a.activeDate = addDays(targetDate, 1)
+),
+todayCount AS (SELECT uniq(guid) AS a FROM todayGuid),
+retentionCount AS (SELECT uniq(guid) AS b FROM retentionGuid)
+SELECT t1.a, t2.b
+FROM todayCount AS t1, retentionCount AS t2`;
+  const ast = analyzeSqlAst(retention);
+  assert.equal(ast.kind, "with_select");
+  assert.ok(!ast.tables.some((t) => /todayGuid|retentionGuid|todayCount|retentionCount/i.test(t)));
+  assert.ok(ast.tables.includes("gather.gather") || ast.tables.includes("gather"));
+  assert.ok(ast.tables.includes("elt_new_guid"));
+  assert.ok(ast.tables.includes("elt_active_guid"));
+  assert.doesNotThrow(() =>
+    assertSqlAstSafe(retention, {
+      requireWhere: true,
+      allowedTables: ["gather", "gather.gather", "elt_new_guid", "elt_active_guid"],
+    }),
+  );
+}
+
 console.log("analytics-sql-ast.test.ts OK");

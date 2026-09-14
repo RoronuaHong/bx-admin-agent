@@ -197,6 +197,24 @@ export function evaluateCapabilityGate(input: {
   };
 }
 
+/** Path C: refuse TopN / percentile etc. from NL without inventing a compilable metric. */
+export function refuseUnsupportedOpsFromNl(
+  nl: string,
+  pack: AnalyticsPack,
+): CapabilityGateRefuse | null {
+  const caps = resolvePackCapabilities(pack);
+  const grounded = groundOpsFromNl(nl, caps.unsupportedHints);
+  const unsupported = grounded.filter((op) => !caps.ops.has(op));
+  if (!unsupported.length) return null;
+  return {
+    status: "refuse",
+    reason: `unsupported_op:${unsupported.join(",")}`,
+    message: refuseMessageForOps(unsupported, caps.unsupportedHints),
+    unsupportedOps: unsupported,
+    notes: [`capability_gate:path_c_nl:${unsupported.join(",")}`],
+  };
+}
+
 /** Convenience: only run gate when structure is ok. */
 export function gateStructuredAsk(
   structure: StructuredAskResult,

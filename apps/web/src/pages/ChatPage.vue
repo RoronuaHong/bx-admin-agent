@@ -74,7 +74,7 @@ const CLOSED_KEY = "bx-admin-agent-closed-v1";
 // 身份缓存：持久化最近一次成功的登录身份，用于刷新时、fetchMe 未返回/失败时
 // 也能拼出正确的 storageKey 来恢复本地会话，避免落到 ":x:anon" 导致记录"消失"。
 const IDENTITY_CACHE_KEY = "bx-admin-agent-identity-v1";
-const MODEL_CACHE_KEY = "bx-admin-agent-model-v1";
+const MODEL_CACHE_KEY = "bx-admin-agent-model-v2";
 
 // 当前生效的登录身份：优先实时登录态，回退到身份缓存，避免回落到匿名校验不到数据。
 function currentIdentity(): Identity {
@@ -424,8 +424,8 @@ onMounted(async () => {
       selectedModelLabel.value = "Auto";
       writeModelCache(MODEL_CACHE_KEY, null, "Auto");
     } else if (!selectedModel.value) {
-      const glm5 = availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label));
-      if (glm5) selectModel(glm5.id);
+      const dsflash = availableModels.value.find((m) => m.id === "dsflash" || /deepseek-v4-flash/i.test(m.label));
+      if (dsflash) selectModel(dsflash.id);
     }
     writeIdentityCache(IDENTITY_CACHE_KEY, { countryId: fetched.country.id, loginName: fetched.user.loginName });
     // 服务端记录按登录用户归属：登录态就绪后始终从服务端拉权威数据（覆盖本地缓存）。
@@ -772,8 +772,8 @@ const modelMenuOpen = ref(false);
 // 按能力用途分组：纯文本对话模型 vs 视觉/多模态模型（vision 非 none）。
 const textModels = computed(() => availableModels.value.filter((m) => m.vision === "none"));
 const visionModels = computed(() => availableModels.value.filter((m) => m.vision !== "none"));
-const glm5Model = computed(() =>
-  availableModels.value.find((m) => m.id === "glm5" || /^glm-5$/i.test(m.label)),
+const dsflashModel = computed(() =>
+  availableModels.value.find((m) => m.id === "dsflash" || /deepseek-v4-flash/i.test(m.label)),
 );
 
 function detectCapabilities(): Capabilities {
@@ -1378,15 +1378,15 @@ async function onClearContext() {
         <div class="composer-toolbar">
           <div class="model-switch-row">
           <button
-            v-if="glm5Model"
+            v-if="dsflashModel"
             type="button"
             class="model-chip"
-            :class="{ selected: selectedModel === glm5Model.id }"
-            :title="`${glm5Model.label} · TokenHub glm-5`"
+            :class="{ selected: selectedModel === dsflashModel.id }"
+            :title="`${dsflashModel.label} · TokenHub deepseek-v4-flash-202605`"
             :disabled="sending"
-            @click="selectModel(glm5Model.id)"
+            @click="selectModel(dsflashModel.id)"
           >
-            GLM-5
+            DeepSeek-V4-Flash
           </button>
           <div class="model-switch">
             <button

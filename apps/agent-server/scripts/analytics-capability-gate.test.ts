@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   evaluateCapabilityGate,
   groundOpsFromNl,
+  refuseUnsupportedOpsFromNl,
   resolvePackCapabilities,
 } from "../src/analytics/capability-gate.js";
 import { alignMetricIdToNl, coerceUnknownMetricId } from "../src/analytics/metric-infer.js";
@@ -130,6 +131,14 @@ const pack = JSON.parse(
     nl: "各渠道观看人数环比",
   });
   assert.equal(gate.status, "ok");
+}
+
+{
+  const cRefuse = refuseUnsupportedOpsFromNl("各渠道订单数 Top 10", pack);
+  assert.ok(cRefuse);
+  assert.equal(cRefuse.status, "refuse");
+  assert.ok(cRefuse.unsupportedOps.includes("top_n"));
+  assert.equal(refuseUnsupportedOpsFromNl("elt_film_user 渠道交叉", pack), null);
 }
 
 // top_n still refused

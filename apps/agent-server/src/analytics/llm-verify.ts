@@ -193,3 +193,257 @@ export function sampleTablesForVerify(
     rows: t.rows.slice(0, maxRows),
   }));
 }
+
+export function llmInsightEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.ANALYTICS_LLM_INSIGHT || "1").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "off" || v === "no");
+}
+
+const NUM_TOKEN = /\d[\d,]*(?:\.\d+)?/g;
+const VERSION_TOKEN = /\b\d+(?:\.\d+){1,3}\b/g;
+
+/** Normalize a numeric/version token so 96,901 and 96901 match. */
+export function normalizeGroundedToken(raw: string): string {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/\d+\.\d+\.\d/.test(s)) return s;
+  const n = s.replace(/,/g, "");
+  if (!n) return "";
+  const num = Number(n);
+  if (Number.isFinite(num) && !/\d+\.\d+\.\d/.test(n)) {
+    if (Number.isInteger(num)) return String(num);
+    return String(num);
+  }
+  return n;
+}
+
+/** Numbers / versions the insight is allowed to mention (sample + time + row count). */
+export function collectGroundedNumbers(
+  tables: Array<{ cols: string[]; rows: unknown[][] }>,
+  extraTexts: string[] = [],
+): Set<string> {
+  const out = new Set<string>();
+  const add = (raw: string) => {
+    const n = normalizeGroundedToken(raw);
+    if (n) out.add(n);
+  };
+  for (let i = 0; i <= 10; i++) add(String(i));
+  for (const t of tables) {
+    add(String(t.rows.length));
+    for (const row of t.rows) {
+      for (const cell of row) {
+        const s = String(cell ?? "");
+        for (const m of s.match(VERSION_TOKEN) || []) add(m);
+        for (const m of s.match(NUM_TOKEN) || []) add(m);
+      }
+    }
+  }
+  for (const text of extraTexts) {
+    const s = String(text || "");
+    for (const m of s.match(VERSION_TOKEN) || []) add(m);
+    for (const m of s.match(NUM_TOKEN) || []) add(m);
+  }
+  return out;
+}
+
+export function extractNumberTokens(text: string): string[] {
+  const s = String(text || "");
+  const found = [...(s.match(VERSION_TOKEN) || []), ...(s.match(NUM_TOKEN) || [])];
+  return [...new Set(found)];
+}
+
+/** Drop sentences that invent numbers not present in the sample / time echo. */
+export function sanitizeInsightText(text: string, grounded: Set<string>): string {
+  const body = String(text || "").trim();
+  if (!body) return "";
+  const parts = body.split(/(?<=[。！？\n])/).map((p) => p.trim()).filter(Boolean);
+  const kept = parts.filter((p) => {
+    const tokens = extractNumberTokens(p);
+    return tokens.every((t) => grounded.has(normalizeGroundedToken(t)));
+  });
+  return kept.join("").trim();
+}
+
+export function buildInsightPrompt(input: {
+  nl: string;
+  timeEcho: string;
+  sqls: string[];
+  sampleTables: Array<{ title: string; cols: string[]; rows: unknown[][] }>;
+  locale?: string;
+}): { system: string; user: string } {
+  const system = [
+    "You write a short analytics reading of ALREADY EXECUTED SQL results.",
+    "Output ONLY JSON: {\"summary\":\"...\",\"trend\":\"...\"}",
+    "summary: 2-4 sentences in the user's language (default Chinese).",
+    "trend: one sentence on the pattern visible in the shown rows (rank, concentration, day-to-day direction).",
+    "HARD RULES:",
+    "- Use ONLY numbers/versions that appear in the sample rows or the resolved time window.",
+    "- Do not invent totals, rates, or forecasts. No next-week / next-month numeric prediction.",
+    "- Do not rewrite or round sample numbers into a different value.",
+    "- If the sample is truncated, say you are describing the shown rows only.",
+    "- Do not mention SQL dialect or internal table names unless the user named them.",
+  ].join("\n");
+  const samples = input.sampleTables.map((t, i) => {
+    const head = t.rows.slice(0, 8).map((r) => r.map((c) => (c == null ? "" : String(c))).join(" | "));
+    return [
+      `### Table ${i + 1}: ${t.title}`,
+      `cols: ${t.cols.join(", ")}`,
+      `rows(${t.rows.length} total, showing ≤8):`,
+      ...head,
+    ].join("\n");
+  });
+  const user = [
+    `User question: ${input.nl}`,
+    `Resolved time: ${input.timeEcho}`,
+    `SQL:\n${input.sqls.map((s, i) => `-- sql ${i + 1}\n${s}`).join("\n\n")}`,
+    samples.join("\n\n"),
+    "Return JSON only.",
+  ].join("\n\n");
+  return { system, user };
+}
+
+export function parseInsightResponse(raw: string): { summary: string; trend: string } {
+  const text = String(raw || "").trim();
+  if (!text) return { summary: "", trend: "" };
+  let jsonText = text;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) jsonText = fence[1].trim();
+  const brace = jsonText.match(/\{[\s\S]*\}/);
+  if (brace) jsonText = brace[0];
+  try {
+    const obj = JSON.parse(jsonText) as { summary?: unknown; trend?: unknown; insight?: unknown };
+    return {
+      summary: String(obj.summary || obj.insight || "").trim(),
+      trend: String(obj.trend || "").trim(),
+    };
+  } catch {
+    return { summary: text.slice(0, 600).trim(), trend: "" };
+  }
+}
+
+export function composeInsightMarkdown(parsed: { summary: string; trend: string }, grounded: Set<string>): string {
+  const summary = sanitizeInsightText(parsed.summary, grounded);
+  const trend = sanitizeInsightText(parsed.trend, grounded);
+  return [summary, trend].filter(Boolean).join("\n\n").trim();
+}
+
+export type PostExecLlm = {
+  verify?: LlmVerifyResult;
+  insight?: string;
+};
+
+/** Instant reading from the result table — no extra LLM. Used for Path A/B. */
+export function buildLocalInsight(input: {
+  timeEcho: string;
+  tables: Array<{ title?: string; cols: string[]; rows: unknown[][] }>;
+}): string {
+  const tables = input.tables || [];
+  const first = tables[0];
+  if (!first?.rows?.length) return "";
+  const echo = String(input.timeEcho || "").trim();
+  if (tables.length === 1 && first.rows.length === 1) {
+    const row = first.rows[0] || [];
+    const nums = first.cols.map((c, i) => {
+      const v = row[i];
+      if (v == null || v === "") return "";
+      return first.cols.length === 1 ? String(v) : `${c} ${v}`;
+    }).filter(Boolean);
+    if (!nums.length) return "";
+    return echo ? `${echo}，结果为 ${nums.join("，")}。` : `结果为 ${nums.join("，")}。`;
+  }
+  const n = tables.reduce((s, t) => s + (t.rows?.length || 0), 0);
+  const row = first.rows[0] || [];
+  const head = first.cols
+    .map((c, i) => (row[i] == null || row[i] === "" ? "" : `${c} ${row[i]}`))
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(" / ");
+  const bits = [echo, `共 ${n} 行`, head ? `首位 ${head}` : ""].filter(Boolean);
+  return bits.length ? `${bits.join("，")}。` : "";
+}
+
+export function buildPostExecCombinedPrompt(input: {
+  nl: string;
+  timeEcho: string;
+  sqls: string[];
+  sampleTables: Array<{ title: string; cols: string[]; rows: unknown[][] }>;
+  metricId?: string;
+}): { system: string; user: string } {
+  const system = [
+    "You are an analytics SQL result verifier AND reader.",
+    "The SQL already ran. Do not rewrite numbers.",
+    "Output ONLY JSON:",
+    '{"verdict":"pass"|"fail"|"unclear","codes":["..."],"reason":"...","summary":"...","trend":"..."}',
+    "verdict: pass if SQL/filters/grain match the question; fail if a concrete mismatch is visible; unclear only if the sample is too short AND you see no concrete fail.",
+    "summary: 2-4 sentences in the user's language (default Chinese).",
+    "trend: one observed pattern from shown rows. No future numeric forecast.",
+    "Use ONLY numbers/versions that appear in the sample or resolved time window.",
+  ].join("\n");
+  const verify = buildLlmVerifyPrompt(input);
+  const insight = buildInsightPrompt(input);
+  return { system, user: verify.user + "\n\n" + insight.user.split("Return JSON only.")[0] + "Return one JSON object only." };
+}
+
+/** Path A/B already compiled or gold — skip extra LLM. Path C = one combined call, no retry. */
+export async function runPostExecLlm(input: {
+  nl: string;
+  timeEcho: string;
+  sqls: string[];
+  tables: Array<{ title: string; cols: string[]; rows: unknown[][] }>;
+  metricId?: string;
+  empty?: boolean;
+  trust?: "trusted" | "verified" | "unverified";
+  llmText: (system: string, user: string, spanName: string) => Promise<string>;
+}): Promise<PostExecLlm> {
+  if (input.empty) {
+    return { verify: { verdict: "pass", codes: ["empty_skip"], reason: "empty result skip verify" } };
+  }
+  const sampleTables = sampleTablesForVerify(input.tables, 8);
+  const local = llmInsightEnabled() ? buildLocalInsight({ timeEcho: input.timeEcho, tables: input.tables }) : "";
+  const compiled = input.trust === "trusted" || input.trust === "verified";
+  if (compiled || (!llmVerifyEnabled() && !llmInsightEnabled())) {
+    return {
+      verify: {
+        verdict: "pass",
+        codes: [compiled ? "verify_skipped_compiled" : "verify_disabled"],
+        reason: compiled ? "compiled/gold SQL; skipped extra LLM verify" : "ANALYTICS_LLM_VERIFY=0",
+      },
+      insight: local || undefined,
+    };
+  }
+
+  const out: PostExecLlm = { insight: local || undefined };
+  if (!llmVerifyEnabled() && !llmInsightEnabled()) return out;
+  try {
+    const prompt = buildPostExecCombinedPrompt({
+      nl: input.nl,
+      timeEcho: input.timeEcho,
+      sqls: input.sqls,
+      sampleTables,
+      metricId: input.metricId,
+    });
+    const raw = await input.llmText(prompt.system, prompt.user, "analytics.llm_post_exec");
+    if (llmVerifyEnabled()) {
+      out.verify = resolveUnclearVerify(parseLlmVerifyResponse(raw));
+    }
+    if (llmInsightEnabled()) {
+      const parsed = parseInsightResponse(raw);
+      const grounded = collectGroundedNumbers(sampleTables, [input.timeEcho, input.nl, ...input.sqls]);
+      const insight = composeInsightMarkdown(parsed, grounded) || local;
+      if (insight) out.insight = insight;
+    }
+  } catch {
+    if (llmVerifyEnabled()) {
+      out.verify = { verdict: "unclear", codes: ["verify_http"], reason: "校对调用失败" };
+    }
+  }
+  if (!out.verify && llmVerifyEnabled()) {
+    out.verify = { verdict: "pass", codes: ["verify_disabled"], reason: "ANALYTICS_LLM_VERIFY=0" };
+  }
+  return out;
+}
+
+export function verifyCaution(verify?: LlmVerifyResult): string {
+  if (verify?.verdict === "fail" && verify.reason) return `\n\n校对未通过：${verify.reason}`;
+  return "";
+}

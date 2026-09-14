@@ -6,6 +6,7 @@
 import type { AnalyticsPack } from "./semantic-layer.js";
 import type { ResultLayout } from "./types.js";
 import { parseAskPlan, type AskPlan } from "./ask-plan.js";
+import { formatDocumentedCatalogHint } from "./catalog-digest.js";
 import { inferMetricIdFromNl, inferOutputDimsFromNl } from "./metric-infer.js";
 
 export type ConversationTurn = {
@@ -63,10 +64,7 @@ function packCatalogHint(pack: AnalyticsPack): string {
   );
   const answerable = pack.warehouse?.tables || [];
   const tableLines = answerable.length
-    ? answerable
-        .slice(0, 80)
-        .map((t) => `${t.name} (${t.fields.length} fields)`)
-        .join(", ") + (answerable.length > 80 ? ` …+${answerable.length - 80}` : "")
+    ? formatDocumentedCatalogHint(pack)
     : `${table?.name || "elt_watch_detail"} (overlay only; live catalog unavailable)`;
   const caps = pack.capabilities;
   const supportedOps = (caps?.ops || ["base_aggregate", "pivot_wide", "pivot_long"]).join(", ");
@@ -78,7 +76,7 @@ function packCatalogHint(pack: AnalyticsPack): string {
     : null;
   return [
     catalogLine,
-    `Answerable tables: ${tableLines}`,
+    tableLines,
     `Default overlay table: ${table?.name || "elt_watch_detail"} fields: ${(table?.fields || []).join(", ")}`,
     `Probe dimensions: ${(pack.probeDimensions || []).join(", ")}`,
     `Enum dims (lexicon/probe — no invented codes): ${(pack.enumDimensions || [])
@@ -686,6 +684,7 @@ export function buildStructureSystemPrompt(
     "When user lists locales like te-IN, put filters.contentLang.",
     "When user names a channel (IndiaA), put filters.channel.",
     "If the user names an answerable catalog table, or facts lock a table, set table to that exact name.",
+    "If Catalog lists a documented table whose description uniquely matches the ask, set table to that name.",
     "Watch/完播/观看人数 asks default to the overlay table. Other business asks without a unique table → status=clarify clarifySlot=table (do not silently stay on overlay).",
     "For a non-overlay table, metricId MUST be uniq:<field>|sum:<field>|avg:<field>|count:* using a live column on that table. Do not invent columns.",
     "人均观看时长 → metricId avg_watch_second_per_user; 观看人数/UV → uniq_users; 时长合计 → sum_watch_second; 最大进度平均（须点名最大进度） → avg_max_progress.",

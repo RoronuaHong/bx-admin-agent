@@ -300,6 +300,10 @@ export interface StoredMessage {
   currentTool?: string;
   timeEcho?: string;
   sqls?: string[];
+  sqlSource?: "intent_compile" | "verified_query" | "llm_sql";
+  trust?: "trusted" | "verified" | "unverified";
+  linkedTables?: string[];
+  verifiedQueryId?: string;
   probeSummary?: string;
   askId?: string;
   modelId?: string;
@@ -310,6 +314,8 @@ export interface StoredMessage {
   pending?: boolean;
   clarifySlot?: string;
   clarifyOptions?: Array<{ id: string; label: string }>;
+  insight?: string;
+  verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
 }
 
 export interface ConversationDto {
@@ -476,8 +482,13 @@ export interface AnalyticsAskResult {
   clarifyOptions?: Array<{ id: string; label: string }>;
   error?: string;
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
+  insight?: string;
   modelId?: string;
   packVersion?: string;
+  sqlSource?: "intent_compile" | "verified_query" | "llm_sql";
+  trust?: "trusted" | "verified" | "unverified";
+  linkedTables?: string[];
+  verifiedQueryId?: string;
   askId?: string;
   rewriteRounds?: number;
   askState?: Record<string, unknown>;

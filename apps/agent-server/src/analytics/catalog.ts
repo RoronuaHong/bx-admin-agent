@@ -13,6 +13,8 @@ import {
   type PackCatalogMeta,
   type WarehouseTable,
 } from "./semantic-layer.js";
+import { attachCatalogCard } from "./catalog-card.js";
+import { inferredDescriptionFor } from "./catalog-inferred.js";
 
 export type CatalogField = {
   name: string;
@@ -25,6 +27,8 @@ export type CatalogField = {
 export type CatalogTable = {
   schema: string;
   name: string;
+  displayName?: string;
+  description?: string | null;
   fields: CatalogField[];
 };
 
@@ -80,15 +84,28 @@ export function answerableCatalogTables(catalog: AnalyticsCatalog): CatalogTable
 export function warehouseFromCatalog(catalog: AnalyticsCatalog): WarehouseTable[] {
   return answerableCatalogTables(catalog).map((t) => {
     const fieldTypes: Record<string, string> = {};
+    const fieldMeta: NonNullable<WarehouseTable["fieldMeta"]> = {};
+    const liveDesc = String(t.description || "").trim();
+    const inferred = inferredDescriptionFor(t.name);
     for (const f of t.fields) {
       if (f.baseType) fieldTypes[f.name] = f.baseType;
+      if (f.displayName || f.description) {
+        fieldMeta[f.name] = {
+          displayName: f.displayName,
+          description: f.description ?? null,
+        };
+      }
     }
-    return {
+    return attachCatalogCard({
       schema: t.schema,
       name: t.name,
       fields: t.fields.map((f) => f.name),
       fieldTypes: Object.keys(fieldTypes).length ? fieldTypes : undefined,
-    };
+      displayName: t.displayName,
+      description: liveDesc || inferred || null,
+      docSource: liveDesc ? "metabase" : inferred ? "inferred" : undefined,
+      fieldMeta: Object.keys(fieldMeta).length ? fieldMeta : undefined,
+    });
   });
 }
 
@@ -127,6 +144,8 @@ export function parseMetabaseDatabaseMetadata(
     tables.push({
       schema: String(t.schema || "").trim() || "(default)",
       name,
+      displayName: t.display_name || undefined,
+      description: t.description ?? null,
       fields,
     });
   }
@@ -375,6 +394,22 @@ export async function refreshPackFromCatalog(
   const applied = applyCatalogToPack(pack, loaded.catalog, loaded.source);
   applied.unmodeledTablesInNl = blockedTablesNamedInNl(opts?.nl || "", loaded.catalog);
   return applied;
+}
+
+/** Disk snapshot for eval/GATE: 71 / 67 / 4 — not part of EX. */
+export function summarizeCatalogCoverage(databaseId = 2): {
+  total: number;
+  answerable: number;
+  hidden: number;
+} | null {
+  const disk = readDiskCatalog(databaseId);
+  if (!disk?.tables?.length) return null;
+  const answerable = answerableCatalogTables(disk).length;
+  return {
+    total: disk.tables.length,
+    answerable,
+    hidden: Math.max(0, disk.tables.length - answerable),
+  };
 }
 
 export function formatCatalogFacts(pack: AnalyticsPack, notes: string[]): string | undefined {

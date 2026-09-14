@@ -8,9 +8,13 @@ import {
   softExMatchTables,
   cellsClose,
   accumulateOutcome,
+  accumulateLlmSql,
+  emptyLlmSqlReport,
   emptyMetrics,
   evaluateGates,
   isGateCase,
+  isTaggedLlmSqlCase,
+  llmSqlRates,
   loadGateThresholds,
 } from "../src/analytics/eval-score.js";
 
@@ -102,6 +106,19 @@ import {
   assert.equal(isGateCase({ reviewStatus: "provisional" }), false);
   assert.equal(isGateCase({}), false);
   assert.equal(isGateCase({ reviewStatus: "GOLD" }), true);
+}
+
+{
+  assert.equal(isTaggedLlmSqlCase({ expectSqlSource: "llm_sql" }), true);
+  assert.equal(isTaggedLlmSqlCase({ tags: ["llm_sql"] }), true);
+  assert.equal(isTaggedLlmSqlCase({ tags: ["aggregation"] }), false);
+  const m = emptyLlmSqlReport();
+  accumulateLlmSql(m, "ex_soft", true);
+  accumulateLlmSql(m, "error", false);
+  const r = llmSqlRates(m);
+  assert.equal(m.cases, 2);
+  assert.equal(r.execOk, 0.5);
+  assert.equal(r.ex, 1);
 }
 
 console.log("analytics-eval-score.test.ts OK");
