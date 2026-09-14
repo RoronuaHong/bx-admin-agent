@@ -60,7 +60,17 @@ for (const [schema, ts] of Object.entries(bySchema)) {
   }
 }
 
-// 是否存在 elt_watch_detail
+function isHiddenCatalogTable(t) {
+  const name = String(t.name || "").toLowerCase();
+  const schema = String(t.schema || "").toLowerCase();
+  if (!name) return true;
+  if (schema === "metabase_upload") return true;
+  if (name.startsWith("upload_")) return true;
+  return /_tmp$|_dict$/.test(name);
+}
+
+const hidden = tables.filter(isHiddenCatalogTable);
+const answerable = tables.filter((t) => !isHiddenCatalogTable(t));
 const modeled = tables.find((t) => t.name === "elt_watch_detail");
 console.log(`\nmodeled in pack: elt_watch_detail = ${modeled ? "PRESENT (" + (modeled.fields?.length||0) + " fields)" : "ABSENT"}`);
-console.log(`coverage: 1 / ${tables.length} tables modeled`);
+console.log(`warehouse: ${tables.length} total / ${answerable.length} answerable / ${hidden.length} hidden`);

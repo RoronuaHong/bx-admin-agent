@@ -110,6 +110,8 @@ export interface ScanJob {
   status: ScanJobStatus;
   dryRun: boolean;
   forceRerun: boolean;
+  /** Cron / env asked for a daily digest even when no warn. */
+  digest?: boolean;
   rerunSeq: number;
   createdAt: string;
   updatedAt: string;

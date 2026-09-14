@@ -7,7 +7,11 @@ import { listModels, type ModelEntry } from "../config.js";
 const EOL = /nvstepflash|step-3\.7-flash|stepflash/i;
 
 function isDsFlash(m: ModelEntry): boolean {
-  return m.id === "dsflash" || /deepseek-v4-flash/i.test(m.name) || /deepseek-v4-flash/i.test(m.label);
+  return (
+    m.id === "dsflash" ||
+    /deepseek[-/]flash/i.test(m.name) ||
+    /deepseek[-/]?flash/i.test(m.label)
+  );
 }
 
 function isGlm5Base(m: ModelEntry): boolean {

@@ -223,7 +223,11 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   analytics_ask:
     "自然语言问数：走 Metabase 分析流水线（时间 resolve → Probe → SQL → lint/verify → 并行执行），返回表格与来源条。" +
     "用户问观看人数、渠道分布、按天指标等 BI 问题时优先使用；不要用 call_api 代替。" +
-    "参数：text（自然语言问题，必填）、packId（可选语义包 id，默认 watch-detail）。",
+    "一次调用即可完整处理：多维度 GROUP BY、多筛选条件（IN 列表）、派生指标（人均 = 总量/去重人数，单条 SQL 内计算）。" +
+    "注意区分两种句式：『<维度> 为 <值列表>』是 WHERE 筛选；『按 <枚举维度取值> 的 <指标>』是按取值分别成列计算（条件聚合展开为多列），不是筛选。" +
+    "把用户的完整问题原样放进 text，一轮只调一次；禁止把一个问题拆成多次调用（拆开会生成多条 SQL、返回多个表格）。" +
+    "仅当用户明确要求多个互相独立的问题时才分别调用。" +
+    "参数：text（自然语言问题，必填，完整原话）、packId（可选语义包 id，默认 watch-detail）。",
   metabase_run_dataset:
     "在 Metabase 上执行一条原生 SQL（ClickHouse），返回 cols/rows。" +
     "Probe DISTINCT / 已校验 SQL 取数时使用；禁止 DDL/DML；异 grain 请多次调用而非多语句。" +

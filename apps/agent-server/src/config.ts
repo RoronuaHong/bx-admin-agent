@@ -210,5 +210,13 @@ export const config = {
     get workerEnabled() {
       return process.env.ANALYTICS_SCAN_WORKER === "1";
     },
+    /** In-process daily enqueue (T-1). Requires workerEnabled. */
+    get cronEnabled() {
+      return process.env.ANALYTICS_SCAN_CRON === "1";
+    },
+    /** HH:mm in businessTimezone. */
+    get cronHhmm() {
+      return (process.env.ANALYTICS_SCAN_CRON_HHMM || "10:00").trim();
+    },
   },
 };

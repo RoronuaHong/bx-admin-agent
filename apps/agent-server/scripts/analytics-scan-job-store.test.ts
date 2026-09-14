@@ -26,6 +26,7 @@ resetJobStoreForTests();
   assert.equal(job.status, "queued");
   assert.equal(job.dryRun, true);
   assert.equal(job.forceRerun, false);
+  assert.equal(job.digest, false);
   assert.equal(job.rerunSeq, 0);
   const got = getJob(job.jobId);
   assert.ok(got);

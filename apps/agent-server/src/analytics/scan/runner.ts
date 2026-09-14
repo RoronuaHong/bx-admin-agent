@@ -18,7 +18,7 @@ import {
 import { notifyAlerts } from "../../alert-notify.js";
 import { checkFreshness } from "./freshness.js";
 import { fetchChannelDailyUsers } from "./metrics.js";
-import { notifyScanAlerts } from "./notify.js";
+import { notifyScanAlerts, notifyScanDigest } from "./notify.js";
 import { loadRuleset } from "./ruleset.js";
 import { evaluateThreshold } from "./threshold.js";
 import { resolveScanWindow } from "./window.js";
@@ -28,6 +28,7 @@ export type ScanDeps = {
   checkFreshness?: typeof checkFreshness;
   fetchChannelDailyUsers?: typeof fetchChannelDailyUsers;
   notifyScanAlerts?: typeof notifyScanAlerts;
+  notifyScanDigest?: typeof notifyScanDigest;
 };
 
 export type EnqueueScanInput = {
@@ -35,6 +36,7 @@ export type EnqueueScanInput = {
   scanDate?: string;
   forceRerun?: boolean;
   dryRun?: boolean;
+  digest?: boolean;
   /** Injected clock for window resolution / tests. */
   clock?: Date;
   deps?: EnqueueDeps;
@@ -84,6 +86,7 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
   const checkFr = deps?.checkFreshness ?? checkFreshness;
   const fetchUsers = deps?.fetchChannelDailyUsers ?? fetchChannelDailyUsers;
   const notify = deps?.notifyScanAlerts ?? notifyScanAlerts;
+  const notifyDigest = deps?.notifyScanDigest ?? notifyScanDigest;
 
   let ruleSet: RuleSet | undefined;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -169,6 +172,19 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
         dryRun: false,
         threshold,
       });
+      if (job.digest) {
+        await notifyDigest({
+          ruleSetId: ruleSet.id,
+          scanDate: window.scanDate,
+          dodDate: window.dodDate,
+          wowDate: window.wowDate,
+          metric,
+          rerunSeq: job.rerunSeq,
+          dryRun: false,
+          threshold,
+          rows,
+        });
+      }
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -206,6 +222,7 @@ export async function enqueueScan(
       scanDate: window.scanDate,
       dryRun: input.dryRun === true,
       forceRerun: input.forceRerun === true,
+      digest: input.digest === true,
       now: input.clock,
     });
 

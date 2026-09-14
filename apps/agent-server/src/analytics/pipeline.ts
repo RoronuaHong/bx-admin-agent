@@ -2085,7 +2085,11 @@ export async function analyticsAsk(
             ...metaFields,
           });
         }
+        // 同文本 SQL 去重（协议护栏）：模型 plan 可能产出多个完全相同的 step SQL，
+        // 重复执行只会浪费查询并上屏 N 张相同表格（2026-09-14 实测 3 条相同 SQL/3 张重复表）。
+        const normByStep = planCompiled.steps.map((s) => normalizeSqls([s.sql])[0]!);
         let sqls = normalizeSqls(planCompiled.steps.map((s) => s.sql));
+        const uniqSqls = [...new Set(normByStep)];
         const lintTable = structured.table || lockedTable;
         const issues = collectIssues(
           nlForGuards,
@@ -2129,14 +2133,19 @@ export async function analyticsAsk(
         opts?.signal?.throwIfAborted();
         const dbId = pack.datasource.metabaseDatabaseId;
         const maxRows = pack.guards.maxRows;
-        const execSqls = sqls.map((s) => ensureMaxRows(s, maxRows));
+        const execSqls = uniqSqls.map((s) => ensureMaxRows(s, maxRows));
         const results = await mapPool(
           execSqls,
           pack.guards.parallelism,
           (sql) => runNativeDataset(sql, dbId, { signal: opts?.signal, timeoutMs: pack.guards.queryTimeoutMs }),
           opts?.signal,
         );
-        const stepById = new Map(planCompiled.steps.map((s, i) => [s.id, { step: s, result: results[i]! }]));
+        // 相同 SQL 的多个 step 共享同一份查询结果
+        const resultBySql = new Map<string, DatasetResult>();
+        uniqSqls.forEach((s, i) => resultBySql.set(s, results[i]!));
+        const stepById = new Map(
+          planCompiled.steps.map((s, i) => [s.id, { step: s, result: resultBySql.get(normByStep[i]!) ?? results[0]! }]),
+        );
         const leftId = structured.plan.merge.left;
         const rightId = structured.plan.merge.right;
         if (results.every((r) => !r.ok)) {
@@ -2231,11 +2240,11 @@ export async function analyticsAsk(
             },
           ];
         } else {
-          tables = results.map((r, i) => ({
-            title: `\u7ed3\u679c ${i + 1}`,
-            cols: r.cols,
-            rows: r.rows,
-            grain: sqlHasDayGrain(sqls[i]!, pack) ? "day" : undefined,
+          tables = execSqls.map((s, i) => ({
+            title: execSqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
+            cols: results[i]!.cols,
+            rows: results[i]!.rows,
+            grain: sqlHasDayGrain(s, pack) ? "day" : undefined,
           }));
         }
 

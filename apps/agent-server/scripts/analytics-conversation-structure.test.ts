@@ -194,6 +194,51 @@ import {
   assert.equal(r.status, "ok");
   if (r.status === "ok") {
     assert.deepEqual(r.filters.contentLang?.slice().sort(), ["(empty)", "ml-IN", "ta-IN", "te-IN"]);
+    // 非 pivot 指标 + 多语言成员确认 + 不按语言分组 → 自动宽表（per-value 条件聚合展开）
+    assert.equal(r.layout, "wide");
+    assert.equal(r.pivotDim, "contentLang");
+  }
+}
+
+{
+  // 单语言成员：普通筛选，不得触发宽表展开
+  const r = enforceStructurePolicy(
+    {
+      status: "ok",
+      mergedNl: "IndiaA 英语人均观看时长",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["(empty)"] },
+      outputDims: ["watch_date", "channel"],
+      metricId: "avg_watch_second_per_user",
+    },
+    formatConversationTranscript([{ role: "user", text: "IndiaA 英语人均观看时长 2026-08-19至25" }]),
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.equal(r.layout, undefined);
+    assert.equal(r.pivotDim, undefined);
+  }
+}
+
+{
+  // 按语言分组（outputDims 含 contentLang）：走长表 GROUP BY，不得触发宽表展开
+  const r = enforceStructurePolicy(
+    {
+      status: "ok",
+      mergedNl: "IndiaA 按语言分组人均观看时长",
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["(empty)", "te-IN", "ta-IN", "ml-IN"] },
+      outputDims: ["watch_date", "channel", "contentLang"],
+      metricId: "avg_watch_second_per_user",
+    },
+    formatConversationTranscript([
+      { role: "user", text: "IndiaA 按语言分组统计人均观看时长 2026-08-19至25" },
+    ]),
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.equal(r.layout, undefined);
+    assert.equal(r.pivotDim, undefined);
   }
 }
 

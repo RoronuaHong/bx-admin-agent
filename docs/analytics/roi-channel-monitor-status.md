@@ -37,7 +37,7 @@
 
 | 点 | 结果 | 现状 |
 |---|---|---|
-| 每日自动算各渠道 ROI | **未完成** | 有异步巡检 API、页面可手工点「运行巡检」、钉钉可推。`ANALYTICS_SCAN_WORKER=1` 已开。仓库里没有每日 cron，不会无人值守跑。算的也不是 ROI。 |
+| 每日自动算各渠道 ROI | **未完成（日活日报已接）** | `ANALYTICS_SCAN_WORKER=1` + `ANALYTICS_SCAN_CRON=1` 时，进程内每日入队 `watch-users`（`digest: true`，默认 10:00 业务时区，T-1）。会推「问数巡检日报」渠道日活（无 webhook 则静默）。**算的不是 ROI**，也没有投放渠道维。 |
 | 对比昨日 + 上周同期 | **框架完成，指标不对** | `dod`（T-2）+ `wow`（T-8）已实现，任一破线可告警（`baselineLogic=any`）。对比的是观看人数，不是 ROI。需求里的「同比」按上下文应理解为上周同期（wow），不是自然年同比。 |
 | 某渠道下降超过 10% 就预警 | **框架完成，指标不对** | `thresholdRatio=0.9`（降幅 >10%）已实现，可钉钉 + 深链。预警文案是渠道日活，不是 ROI。 |
 | 预警后自动按语言 / 包体下钻，定位细分群体 | **未完成** | 告警 runbook 只写了一句「请按语言/包体下钻」。runner 不会自动再查语言或包体。`maxChildAlerts` 配了，没有子查询。 |
@@ -54,7 +54,7 @@
 2. 书面口径：ROI = ?（支付金额 / 消耗？），CVR 分母是点击还是曝光
 3. 新 ruleset + 取数，替换现在的 `channel_daily_users`
 4. 预警后的自动下钻
-5. 外部每日调度
+5. 投放 ROI 口径与自动下钻（进程内日活 cron 已接，不能代替本条）
 
 这些和「数据获取难度大可以约时间讨论」是对上的：数据层还没对齐，Agent 侧无法假装 ROI 已经能监控。
 
@@ -68,5 +68,6 @@
 | 日活取数（非 ROI） | `apps/agent-server/src/analytics/scan/metrics.ts` → `fetchChannelDailyUsers` |
 | 阈值（ratio &lt; 0.9） | `apps/agent-server/src/analytics/scan/threshold.ts` |
 | 巡检编排 | `apps/agent-server/src/analytics/scan/runner.ts` |
-| 告警文案 / 深链 / runbook | `apps/agent-server/src/analytics/scan/notify.ts` |
+| 告警文案 / 深链 / runbook / 日报 | `apps/agent-server/src/analytics/scan/notify.ts` |
+| 进程内每日入队 | `apps/agent-server/src/analytics/scan/scheduler.ts`（`ANALYTICS_SCAN_CRON=1`） |
 | M3 验收（明确排除真 ROI） | `docs/analytics/m3-acceptance.md` |

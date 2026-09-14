@@ -83,14 +83,38 @@ function looksLikeChannelCode(t: string): boolean {
   return (/[a-z][A-Z]/.test(t) && t.length >= 4) || /\d/.test(t);
 }
 
+/**
+ * Lower-camelCase identifiers owned by the pack schema (fields / compile params like
+ * "watchSecond"/"appVersion") — these are parameter names, never channel codes.
+ * Collected from the pack object itself (zero hardcoded business words).
+ */
+function packLowerCamelTokens(pack?: AnalyticsPack): Set<string> {
+  const out = new Set<string>();
+  if (!pack) return out;
+  const walk = (v: unknown): void => {
+    if (typeof v === "string") {
+      if (/^[a-z][a-zA-Z0-9]*$/.test(v) && /[A-Z]/.test(v)) out.add(v.toLowerCase());
+    } else if (Array.isArray(v)) {
+      v.forEach(walk);
+    } else if (v && typeof v === "object") {
+      Object.values(v as Record<string, unknown>).forEach(walk);
+    }
+  };
+  walk(pack);
+  return out;
+}
+
 /** 从 NL 抽渠道码：pack.valueAliases + CamelCase/含数字实体（无产品白名单）。 */
 export function extractChannelsFromNl(nl: string, pack?: AnalyticsPack): string[] {
   const found = new Set<string>(extractAliasedEnumValues(nl, pack, "channel"));
+  const schemaTokens = packLowerCamelTokens(pack);
   for (const ent of extractNamedEntities(nl)) {
+    if (schemaTokens.has(ent.toLowerCase())) continue;
     if (looksLikeChannelCode(ent)) found.add(ent);
   }
   for (const m of nl.matchAll(/\b([A-Za-z][A-Za-z0-9]{1,31})\b/g)) {
     const t = m[1]!;
+    if (schemaTokens.has(t.toLowerCase())) continue;
     if (looksLikeChannelCode(t)) found.add(t);
   }
   return remapEnumTokens([...found], pack, "channel");
@@ -207,14 +231,18 @@ export function buildAnalyticsIntentFromStructure(input: {
   }
 
   let outputDims = [...structure.outputDims];
-  if (!outputDims.length) {
-    if (/按天|按日|按.*日期|每天|观看日期/.test(fallbackNl)) outputDims.push("watch_date");
-    if (
-      tableHasField(pack, table, "channel") &&
-      /按.*渠道|各渠道|观看日期.*渠道|渠道.*维度/.test(fallbackNl)
-    ) {
-      outputDims.push("channel");
-    }
+  // 用户显式提及的分组维兜底补齐（复用既有推断正则）：模型 structure 偶发漏填 outputDims
+  //（如点名「按观看日期和渠道分组」却只输出 watch_date），导致 SELECT/GROUP BY 缺列。
+  // 用户点名了分组维就必须出现在结果列中（2026-09-14 ground truth 对齐）。
+  if (/按天|按日|按.*日期|每天|观看日期/.test(fallbackNl) && !outputDims.includes("watch_date")) {
+    outputDims.unshift("watch_date");
+  }
+  if (
+    tableHasField(pack, table, "channel") &&
+    /按.*渠道|各渠道|观看日期.*渠道|渠道.*维度/.test(fallbackNl) &&
+    !outputDims.includes("channel")
+  ) {
+    outputDims.push("channel");
   }
   if (knownFields.size) {
     outputDims = outputDims.filter((d) => d === "watch_date" || knownFields.has(d));

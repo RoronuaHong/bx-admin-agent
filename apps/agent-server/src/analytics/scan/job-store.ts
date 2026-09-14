@@ -50,6 +50,7 @@ export interface CreateScanJobInput {
   scanDate: string;
   dryRun?: boolean;
   forceRerun?: boolean;
+  digest?: boolean;
   /** Injected clock for tests. */
   now?: Date;
 }
@@ -98,6 +99,7 @@ export function createJob(input: CreateScanJobInput): ScanJob {
     status: "queued",
     dryRun,
     forceRerun,
+    digest: input.digest === true,
     rerunSeq,
     createdAt: ts,
     updatedAt: ts,

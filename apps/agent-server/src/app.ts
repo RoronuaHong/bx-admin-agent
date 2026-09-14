@@ -893,12 +893,14 @@ export function createApp() {
         scanDate?: string;
         forceRerun?: boolean;
         dryRun?: boolean;
+        digest?: boolean;
       }>()
       .catch(() => ({} as {
         ruleSetId?: string;
         scanDate?: string;
         forceRerun?: boolean;
         dryRun?: boolean;
+        digest?: boolean;
       }));
     const ruleSetId = String(body.ruleSetId || "watch-users").trim() || "watch-users";
     const result = await enqueueScan({
@@ -906,6 +908,7 @@ export function createApp() {
       scanDate: body.scanDate,
       forceRerun: body.forceRerun === true,
       dryRun: body.dryRun === true,
+      digest: body.digest === true,
     });
     if ("error" in result) {
       if (result.error === "scan_job_running") {
@@ -955,12 +958,14 @@ export function createApp() {
         scanDate?: string;
         forceRerun?: boolean;
         dryRun?: boolean;
+        digest?: boolean;
       }>()
       .catch(() => ({} as {
         ruleSetId?: string;
         scanDate?: string;
         forceRerun?: boolean;
         dryRun?: boolean;
+        digest?: boolean;
       }));
     const ruleSetId = String(body.ruleSetId || "").trim();
     if (!ruleSetId) {
@@ -971,6 +976,7 @@ export function createApp() {
       scanDate: body.scanDate,
       forceRerun: body.forceRerun === true,
       dryRun: body.dryRun === true,
+      digest: body.digest === true,
     });
     if ("error" in result) {
       if (result.error === "scan_job_running") {

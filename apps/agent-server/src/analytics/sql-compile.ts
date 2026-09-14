@@ -129,18 +129,13 @@ function safeAlias(code: string): string {
 
 /**
  * Canonicalize output dimensions for deterministic SQL grain.
- * - Constant single-value filter fields (e.g. channel='IndiaA') are redundant in GROUP BY
- *   (already fixed by WHERE), so they are dropped from the breakout dims.
+ * - 用户/模型显式声明的 outputDims 全部保留（即使某维被单值 filter 固定，如 channel='X'）：
+ *   用户点名「按 X 分组」即要求 X 出现在结果列中，服务端不得静默剔除（2026-09-14 修正）。
  * - Overlay table with no explicit breakout → daily grain (watch_date).
  * - Other warehouse tables with no breakout → grand total (no invented day grain).
  */
 function canonicalDims(intent: AnalyticsIntent, pack?: AnalyticsPack): OutputDimId[] {
-  const constantFilterFields = new Set(
-    Object.entries(intent.filters || {})
-      .filter(([, vs]) => Array.isArray(vs) && vs.length === 1)
-      .map(([field]) => field),
-  );
-  const dims = (intent.outputDims || []).filter((d) => !constantFilterFields.has(d));
+  const dims = [...(intent.outputDims || [])];
   if (!dims.length) return isOverlayTable(pack, intent.table) ? ["watch_date"] : [];
   return dims;
 }

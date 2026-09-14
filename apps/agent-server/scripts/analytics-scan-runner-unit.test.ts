@@ -167,6 +167,43 @@ resetJobStoreForTests();
 }
 
 {
+  // digest job calls notifyScanDigest after alerts
+  resetJobStoreForTests();
+  const job = createJob({
+    ruleSetId: "watch-users",
+    scanDate: "2026-09-08",
+    digest: true,
+  });
+  let alertCalled = 0;
+  let digestCalled = 0;
+  await processJob(job.jobId, {
+    checkFreshness: async () => ({ ok: true, maxDate: "2026-09-08" }),
+    fetchChannelDailyUsers: async () => [
+      {
+        entityKey: "IndiaA",
+        scanValue: 200,
+        dodValue: 200,
+        wowValue: 200,
+        sample: 200,
+      },
+    ],
+    notifyScanAlerts: async () => {
+      alertCalled += 1;
+      return { sent: 0, skipped: true };
+    },
+    notifyScanDigest: async (opts) => {
+      digestCalled += 1;
+      assert.equal(opts.rows.length, 1);
+      assert.equal(opts.scanDate, "2026-09-08");
+      return { sent: 1 };
+    },
+  });
+  assert.equal(getJob(job.jobId)?.status, "succeeded");
+  assert.equal(alertCalled, 1);
+  assert.equal(digestCalled, 1);
+}
+
+{
   // list/get wrappers
   resetJobStoreForTests();
   const a = createJob({ ruleSetId: "watch-users", scanDate: "2026-09-08" });

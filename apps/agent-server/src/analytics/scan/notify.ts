@@ -11,6 +11,7 @@ import {
   type AlertNotifyResult,
   type AlertSender,
 } from "../../alert-notify.js";
+import type { ChannelDailyUserRow } from "./metrics.js";
 import type { ThresholdResult } from "./threshold.js";
 import type { BaselineKind, ScanAlertSeverity } from "./types.js";
 
@@ -147,6 +148,113 @@ function buildScanAlertMessage(opts: NotifyScanAlertsOpts): string | null {
  * Push scan threshold alerts via DingTalk analytics channel.
  * dryRun → no notifyAlerts; warn/critical only; one combined message per job.
  */
+function pctChange(cur: number | null, base: number | null): string {
+  if (cur == null || base == null || base === 0) return "—";
+  const r = ((cur - base) / base) * 100;
+  const sign = r > 0 ? "+" : "";
+  return `${sign}${r.toFixed(1)}%`;
+}
+
+export function buildScanDigestMessage(input: {
+  ruleSetId: string;
+  scanDate: string;
+  dodDate?: string;
+  wowDate?: string;
+  metric: string;
+  rerunSeq: number;
+  rows: ChannelDailyUserRow[];
+  threshold: ThresholdResult;
+  queryText?: string;
+}): string {
+  const fingerprint = buildFingerprint({
+    ruleSetId: input.ruleSetId,
+    scanDate: input.scanDate,
+    metric: input.metric,
+    entityKey: "",
+    baseline: "",
+    severity: "info",
+    rerunSeq: input.rerunSeq,
+  });
+  const top = [...input.rows]
+    .sort((a, b) => (b.scanValue || 0) - (a.scanValue || 0))
+    .slice(0, 12);
+  const lines: string[] = [
+    `[fingerprint: ${fingerprint}|digest]`,
+    `【问数巡检日报】${input.metric}（非 ROI）`,
+    `巡检日 ${input.scanDate}` +
+      (input.dodDate && input.wowDate ? `；对比昨日 ${input.dodDate} / 上周同期 ${input.wowDate}` : ""),
+  ];
+  if (!top.length) {
+    lines.push("当日无渠道行。");
+  } else {
+    lines.push("渠道日活（scan / DoD / WoW）：");
+    for (const row of top) {
+      const scan = row.scanValue == null ? "—" : String(row.scanValue);
+      lines.push(
+        `• ${row.entityKey}  ${scan}  DoD ${pctChange(row.scanValue, row.dodValue)}  WoW ${pctChange(row.scanValue, row.wowValue)}`,
+      );
+    }
+    if (input.rows.length > top.length) {
+      lines.push(`… 另有 ${input.rows.length - top.length} 个渠道未列出`);
+    }
+  }
+  const warnN = input.threshold.children.length;
+  lines.push(
+    input.threshold.severity === "warn" || input.threshold.severity === "critical"
+      ? `异常：${warnN} 条（降幅>10%）`
+      : "异常：无",
+  );
+  lines.push(
+    `深链：${buildDeepLink({
+      from: input.scanDate,
+      to: input.scanDate,
+      q: input.queryText ?? defaultQueryText(input.metric, input.scanDate),
+    })}`,
+  );
+  return lines.join("\n");
+}
+
+export async function notifyScanDigest(
+  opts: NotifyScanAlertsOpts & { rows: ChannelDailyUserRow[]; dodDate?: string; wowDate?: string },
+): Promise<NotifyScanAlertsResult> {
+  if (opts.dryRun) {
+    return { sent: 0, dryRun: true };
+  }
+  const message = buildScanDigestMessage({
+    ruleSetId: opts.ruleSetId,
+    scanDate: opts.scanDate,
+    dodDate: opts.dodDate,
+    wowDate: opts.wowDate,
+    metric: opts.metric,
+    rerunSeq: opts.rerunSeq,
+    rows: opts.rows,
+    threshold: opts.threshold,
+    queryText: opts.queryText,
+  });
+  const notify = opts.notifyFn ?? notifyAlerts;
+  const notifyResult = await notify({
+    kind: "analytics",
+    title: opts.title || "问数巡检日报",
+    messages: [message],
+    webhook: opts.webhook,
+    sender: opts.sender,
+  });
+  return {
+    sent: notifyResult.sent,
+    fingerprint: `${buildFingerprint({
+      ruleSetId: opts.ruleSetId,
+      scanDate: opts.scanDate,
+      metric: opts.metric,
+      entityKey: "",
+      baseline: "",
+      severity: "info",
+      rerunSeq: opts.rerunSeq,
+    })}|digest`,
+    message,
+    notifyResult,
+  };
+}
+
 export async function notifyScanAlerts(
   opts: NotifyScanAlertsOpts,
 ): Promise<NotifyScanAlertsResult> {

@@ -30,6 +30,7 @@
 - [x] 默认单 scan worker；应用内 `/analytics/scan/*` 与 internal Bearer **鉴权分流**（应用内暂不强制运营 session，见计划）
 - [x] 告警深链 `/analytics?q=...&from=&to=` + 一句话 runbook
 - [x] `/analytics` 页可触发巡检并看到 job / 告警摘要（`AnalyticsAgentPage` 巡检对话框）
+- [x] 进程内每日 cron（`ANALYTICS_SCAN_CRON=1`）入队 `digest` 任务，推渠道日活日报（非 ROI；无 webhook 静默）
 
 ## 自动化
 
@@ -41,6 +42,8 @@
 
 - `SCAN_INTERNAL_TOKEN` — internal scan API Bearer
 - `ANALYTICS_SCAN_WORKER=1` — 本实例接受入队并执行
+- `ANALYTICS_SCAN_CRON=1` — 进程内每日入队（须同时 worker=1）
+- `ANALYTICS_SCAN_CRON_HHMM=10:00` — 业务时区下的触发时刻
 
 ## 不在范围（勿当验收缺口）
 

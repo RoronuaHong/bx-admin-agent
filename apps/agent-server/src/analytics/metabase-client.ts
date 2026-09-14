@@ -102,6 +102,25 @@ async function postDataset(sql: string, databaseId: number, session: string, sig
   });
 }
 
+/**
+ * Non-numeric cells from ClickHouse (0/0 → NaN, overflow → ±Infinity) arrive as the
+ * strings "NaN"/"Infinity"/"-Infinity". Blank them to null — never fabricate a number.
+ * (2026-09-14: ratio metrics over empty windows rendered "NaN" into UI tables.)
+ */
+function sanitizeRows(rows: unknown[][]): unknown[][] {
+  return rows.map((row) =>
+    Array.isArray(row)
+      ? row.map((v) =>
+          typeof v === "number" && !Number.isFinite(v)
+            ? null
+            : v === "NaN" || v === "Infinity" || v === "-Infinity"
+              ? null
+              : v,
+        )
+      : row,
+  );
+}
+
 export async function runNativeDataset(
   sql: string,
   databaseId = config.metabase.databaseId,
@@ -131,7 +150,7 @@ export async function runNativeDataset(
       return { ok: false, cols: [], rows: [], error: String(data?.error || resp.status), ms };
     }
     const cols = (data?.data?.cols ?? []).map((c) => c.name || c.display_name || "");
-    return { ok: true, cols, rows: data?.data?.rows ?? [], ms };
+    return { ok: true, cols, rows: sanitizeRows(data?.data?.rows ?? []), ms };
   } catch (e) {
     if (opts?.signal?.aborted) rethrowIfAborted(e, opts.signal);
     if (isAbortError(e) && didTimeout()) {
@@ -223,7 +242,7 @@ export async function runMetabaseQuestion(
       return { ok: false, cols: [], rows: [], error: String(data?.error || resp.status), ms };
     }
     const cols = (data?.data?.cols ?? []).map((c) => c.name || c.display_name || "");
-    return { ok: true, cols, rows: data?.data?.rows ?? [], ms };
+    return { ok: true, cols, rows: sanitizeRows(data?.data?.rows ?? []), ms };
   } catch (e) {
     rethrowIfAborted(e, signal);
     return {

@@ -22,6 +22,12 @@ const ORIG =
   assert.deepEqual(extractChannelsFromNl("FilmeTela 按天人数", pack), ["FilmeTela"]);
   assert.deepEqual(extractChannelsFromNl("FoxA 和 GoGo 观看人数", pack).slice().sort(), ["FoxA", "GoGo"]);
   assert.ok(!extractChannelsFromNl("同比 YoY 增长率 SQL", pack).includes("YoY"));
+  // pack schema 驼峰词（字段/参数名）不得被当成渠道候选（2026-09-14 修复）
+  assert.ok(!extractChannelsFromNl("按 appVersion 3.4.1 统计 watchSecond", pack).includes("appVersion"));
+  assert.ok(!extractChannelsFromNl("watchSecond 合计按 contentLang", pack).includes("watchSecond"));
+  assert.ok(!extractChannelsFromNl("watchSecond 合计按 contentLang", pack).includes("contentLang"));
+  // 真实渠道码不受影响
+  assert.deepEqual(extractChannelsFromNl("统计 IndiaA 渠道版本 3.4.1 的付费转化率", pack), ["IndiaA"]);
 }
 
 // structure → Intent → 宽表 avg_of_max
@@ -61,10 +67,49 @@ const ORIG =
   assert.match(sql, /AS\s+ml_IN/i);
   assert.match(sql, /channel\s*=\s*'IndiaA'/);
   assert.match(sql, /movieType\s+IN\s*\(\s*1\s*,/);
-  assert.match(sql, /GROUP BY\s+watchDate\s*$/m);
-  assert.doesNotMatch(sql, /GROUP BY\s+watchDate\s*,\s*channel/i);
+  assert.match(sql, /GROUP BY\s+watchDate\s*,\s*channel\s*$/m);
   assert.doesNotMatch(sql, /GROUP BY\s+watchDate\s*,\s*channel\s*,\s*contentLang/i);
   assert.doesNotMatch(sql, /uniq\s*\(\s*guid\s*\)/i);
+}
+
+// structure → Intent → 宽表 avg_per_user（人均按语言 per-value 条件聚合展开，2026-09-14 根治）
+{
+  const built = buildAnalyticsIntentFromStructure({
+    structure: {
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: {
+        channel: ["IndiaA"],
+        contentLang: ["(empty)", "te-IN", "ta-IN", "ml-IN"],
+        movieType: ["1", "2", "3", "4", "10", "11"],
+      },
+      outputDims: ["watch_date", "channel"],
+      layout: "wide",
+      pivotDim: "contentLang",
+      metricId: "avg_watch_second_per_user",
+    },
+    pack,
+    fallbackNl: "按观看日期和渠道分组，统计 IndiaA 渠道四种内容语言的人均观看时长",
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) throw new Error(built.reason);
+  assert.equal(built.intent.metric.kind, "avg_per_user");
+  assert.equal(built.intent.layout, "wide");
+  assert.equal(built.intent.pivotDim, "contentLang");
+
+  const compiled = compileAnalyticsIntent(built.intent, pack);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  const sql = compiled.sql;
+  // 每种语言独立一列：分子 sumIf / 分母 uniqIf（同语言内各自去重），禁止混算
+  assert.match(sql, /sumIf\s*\(\s*watchSecond\s*,\s*contentLang\s*=\s*'te-IN'\s*\)/i);
+  assert.match(sql, /uniqIf\s*\(\s*guid\s*,\s*contentLang\s*=\s*'te-IN'\s*\)/i);
+  assert.match(sql, /contentLang\s*=\s*''/); // 英语 = 空字符串成员
+  assert.match(sql, /AS\s+ml_IN/i);
+  assert.match(sql, /channel\s*=\s*'IndiaA'/);
+  assert.match(sql, /movieType\s+IN\s*\(\s*1\s*,/);
+  // 分组仅 watchDate+channel；语言是列展开不是行维
+  assert.match(sql, /GROUP BY\s+watchDate\s*,\s*channel\s*$/m);
+  assert.doesNotMatch(sql, /sum\(watchSecond\)\s*\/\s*nullIf\(uniq\(guid\)\)/i);
 }
 
 // long 布局

@@ -25,6 +25,7 @@ import {
   type UploadResult,
 } from "../api";
 import AgentChromeNav from "../components/AgentChromeNav.vue";
+import { ANALYTICS_ASK_EXAMPLES } from "../analytics-ask-examples";
 import AnalyticsCapabilitiesHelp from "../components/AnalyticsCapabilitiesHelp.vue";
 import ChatShell from "../components/ChatShell.vue";
 import ResultTable from "../components/ResultTable.vue";
@@ -108,32 +109,7 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 
 const renderMarkdown = renderChatMarkdown;
 
-const WELCOME_EXAMPLES = [
-  {
-    zh: "八月二十到二十一印度A按天观看人数",
-    en: "viewers by day for India A from Aug 20–21",
-    pt: "visualizadores por dia India A de 20–21 ago",
-    hi: "भारत A 20–21 अगस्त दैनिक व्यूअर्स",
-  },
-  {
-    zh: "最近7天各渠道观看人数",
-    en: "viewers by channel for the last 7 days",
-    pt: "visualizadores por canal nos ultimos 7 dias",
-    hi: "पिछले 7 दिनों में चैनल अनुसार व्यूअर्स",
-  },
-  {
-    zh: "昨天印度A和印度B对比观看人数",
-    en: "compare India A vs India B viewers yesterday",
-    pt: "compare visualizadores India A vs India B ontem",
-    hi: "कल भारत A बनाम भारत B व्यूअर्स की तुलना",
-  },
-  {
-    zh: "本周FoxA按语言观看人数",
-    en: "viewers by language for Fox A this week",
-    pt: "visualizadores por idioma Fox A nesta semana",
-    hi: "इस सप्ताह Fox A भाषा अनुसार व्यूअर्स",
-  },
-] as const;
+const WELCOME_EXAMPLES = ANALYTICS_ASK_EXAMPLES;
 
 function pickWelcomeText(): string {
   const example = WELCOME_EXAMPLES[Math.floor(Math.random() * WELCOME_EXAMPLES.length)]!;
@@ -1045,7 +1021,7 @@ let modelScrollbarCleanup: (() => void) | null = null;
 const textModels = computed(() => availableModels.value.filter((m) => m.vision === "none"));
 const visionModels = computed(() => availableModels.value.filter((m) => m.vision !== "none"));
 const dsflashModel = computed(() =>
-  availableModels.value.find((m) => m.id === "dsflash" || /deepseek-v4-flash/i.test(m.label)),
+  availableModels.value.find((m) => m.id === "dsflash" || /deepseek-flash/i.test(m.label)),
 );
 
 function selectModel(id: string | null) {

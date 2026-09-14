@@ -2408,11 +2408,47 @@ export async function* chatStream(
         // 白名单外的工具调用一律拒绝执行（返回说明回喂模型），模型须先 route_to_agent 切回对应 Worker。
         const curWorker = activeWorkerId ? resolveWorkerById(activeWorkerId) : null;
         const curWhitelist = workerToolNames(curWorker);
+        // 同轮 analytics_ask 合并（协议护栏，非语义判定，对齐 call_api 同轮去重模式）：
+        // 通用模型常把一次复杂问数并行拆成多个 analytics_ask（每个各生成 1 条 SQL → 多 SQL/多表格），
+        // 而该工具一次即可完成多分组 + 多筛选 + 指标计算（人均 = 总量/去重人数，单条 SQL）。
+        // 同轮 ≥2 次 analytics_ask 且 packId 一致时：合并全部 text 只执行第一个，其余调用回喂合并说明。
+        let askMergeSkip: Set<unknown> | null = null;
+        {
+          const askIdx: number[] = [];
+          for (let i = 0; i < toolCalls.length; i++) {
+            if (toolCalls[i].name === "analytics_ask") askIdx.push(i);
+          }
+          if (askIdx.length >= 2) {
+            const packIds = new Set(askIdx.map((i) => String(toolCalls[i].input?.packId ?? "")));
+            const texts = askIdx.map((i) => String(toolCalls[i].input?.text ?? "").trim()).filter(Boolean);
+            if (packIds.size === 1 && texts.length >= 2) {
+              const first = toolCalls[askIdx[0]]!;
+              toolCalls[askIdx[0]] = { ...first, input: { ...first.input, text: texts.join("；\n") } };
+              askMergeSkip = new Set(askIdx.slice(1).map((i) => toolCalls[i]));
+              console.log(
+                `[chat:ask-merge] 同轮 ${askIdx.length} 次 analytics_ask 已合并为 1 次执行（packId=${[...packIds][0] || "default"}，保留原始完整问题）`,
+              );
+            }
+          }
+        }
         for (const call of toolCalls) {
           const s = trace.span(state.traceRunId, "tool", call.name, { worker: activeWorkerId ?? undefined });
           let toolStatus: trace.SpanStatus = "ok";
           let toolNote: string | undefined;
           try {
+          // 同轮 analytics_ask 合并：非首个调用不执行，回喂合并说明（toolResult 必须齐套，防上游 400001）
+          if (askMergeSkip?.has(call)) {
+            const mergedNote = JSON.stringify({
+              status: "merged",
+              message:
+                "本轮你并行提交了多个 analytics_ask，服务端已把全部问题合并进第一个调用统一执行（该工具一次即可完成多分组+多筛选+指标计算）。请基于第一个调用的返回数据总结收束。",
+            });
+            emitEvent({ type: "tool_result", name: call.name, result: truncateToolResultForUi(mergedNote) });
+            nextSteps.push({ kind: "toolResult", toolCallId: call.id, content: mergedNote });
+            toolStatus = "skip";
+            toolNote = "merged into first analytics_ask";
+            continue;
+          }
           // M1 执行层防护：越权工具调用拒绝执行（META_TOOLS 始终放行；route_to_agent 已走短路分支）
           if (curWhitelist && !META_TOOLS.has(call.name) && !curWhitelist.has(call.name)) {
             const reject =

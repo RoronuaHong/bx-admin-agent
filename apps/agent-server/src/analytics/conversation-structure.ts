@@ -90,7 +90,8 @@ function packCatalogHint(pack: AnalyticsPack): string {
     `Supported ops: ${supportedOps}`,
     `Known-but-unsupported ops (declare in ops if user asks; gate will refuse): ${unsupported}`,
     "outputDims soft ids: watch_date, channel, contentLang, movieType",
-    "layout: wide|long only for avg_max_progress pivot cases",
+    "layout/pivotDim: when the question is '<N values> of <enum dim>' for a per-user/total/uniq metric and the dim is NOT in outputDims, it means per-value columns — output layout=wide + pivotDim=<dim field>, keeping confirmed members in filters.<dim>. For avg_max_progress the wide/long choice still needs the user to pick.",
+    "Pre-defined semantics — do NOT clarify as gaps (the semantic layer owns these definitions): per-user average = sum(value)/uniq(entity) with the unit of the value field; watch/behavior date = the pack time field; a ratio metric split 'per enum value' = one column per value (conditional aggregation); a blank/empty member is written as \"(empty)\". Clarify ONLY when a required slot is truly missing (time range / metric / a filter the user clearly wants but gave no member for).",
   ]
     .filter(Boolean)
     .join("\n");
@@ -645,6 +646,20 @@ export function enforceStructurePolicy(
         partialFilters: filters,
       };
     }
+  }
+
+  // 非 pivot 指标（人均/合计/去重人数类）+ 多语言成员已确认 + 不按语言分组：
+  // 「N种语言的<人均/合计指标>」的语义即每种语言各一列（条件聚合展开），直接宽表，不反问。
+  // 语言成员未列出（只说 N 种没给代码）时走上游 contentLang clarify，确认后进本分支；
+  // pivot 成员来自 filters（用户确认），缺失时编译层回落 pack defaultWideLangs（probe/pack 提供）。
+  if (
+    isNonPivotMetric(metricId, mergedNl) &&
+    !layout &&
+    finalLangs.length > 1 &&
+    !outputDims.includes("contentLang")
+  ) {
+    layout = "wide";
+    pivotDim = "contentLang";
   }
 
   if (!layout && /宽表|wide/i.test(userText)) layout = "wide";

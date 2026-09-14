@@ -121,6 +121,7 @@ export async function runSqlAgent(input: {
     "Do not invent tables or columns. JOIN only on Allowed joins.",
     "Must use the provided start/end dates inclusively (both calendar days). Prefer toDate(timeField) BETWEEN 'start' AND 'end'. Do not write col < 'end 00:00:00'.",
     "If the user named a channel code, app version, or locale (xx-YY), those exact literals MUST appear in SQL filters. Do not drop them.",
+    "Per-value ratio breakdown: when the question asks a ratio/average metric broken down by an enum dimension's values, expand each value into its own column via conditional aggregation (sumIf(metric, dim='v') / uniqIf(id, dim='v') per value, matching the user's value list). Do NOT put those values into WHERE, and do NOT mix them into one combined average. Enum members come from probe/catalog/schema only — never invent values.",
     "Prefer uniq() for distinct counts. LIMIT at most 5000.",
     UNTRUSTED_USER_CONTENT_RULE,
     'Final JSON: {"sql":"...","tables":["..."]} or {"action":"get_table_schema","tables":["..."]} or {"status":"clarify","clarifySlot":"table","clarify":"..."}',

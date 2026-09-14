@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onUnmounted, ref, watch } from "vue";
+import { ANALYTICS_HELP_EXAMPLES, type AnalyticsAskExample } from "../analytics-ask-examples";
 import { getUiLocale } from "../ui-locale";
 
 const open = defineModel<boolean>("open", { default: false });
@@ -44,26 +45,15 @@ onUnmounted(() => {
   window.removeEventListener("keydown", onKey, true);
 });
 
-const examples = [
-  {
-    zh: "八月二十到二十一印度A按天观看人数",
-    en: "viewers by day for India A from Aug 20–21",
-    pt: "visualizadores por dia India A de 20–21 ago",
-    hi: "भारत A 20–21 अगस्त दैनिक व्यूअर्स",
-  },
-  {
-    zh: "最近7天各渠道观看人数",
-    en: "viewers by channel for the last 7 days",
-    pt: "visualizadores por canal nos ultimos 7 dias",
-    hi: "पिछले 7 दिनों में चैनल अनुसार व्यूअर्स",
-  },
-  {
-    zh: "昨天印度A和印度B对比观看人数",
-    en: "compare India A vs India B viewers yesterday",
-    pt: "compare visualizadores India A vs India B ontem",
-    hi: "कल भारत A बनाम भारत B व्यूअर्स की तुलना",
-  },
-];
+const examples = ANALYTICS_HELP_EXAMPLES;
+
+function exampleText(ex: AnalyticsAskExample) {
+  const loc = uiLocale.value;
+  if (loc === "en") return ex.en;
+  if (loc === "pt-BR") return ex.pt;
+  if (loc === "hi") return ex.hi;
+  return ex.zh;
+}
 </script>
 
 <template>
@@ -83,23 +73,39 @@ const examples = [
 
         <div class="cap-body">
           <p class="cap-intro">
-            {{ tx("我是数据分析 Agent：用自然语言问观看人数等指标，结果来自 Metabase。尽量写明", "I am the Analytics Agent: ask metrics like viewers in natural language; results come from Metabase. Prefer an explicit ", "Sou o Agent de Analise: pergunte metricas como visualizadores em linguagem natural; resultados do Metabase. Prefira ", "मैं एनालिटिक्स एजेंट हूँ: प्राकृतिक भाषा में व्यूअर्स जैसे मेट्रिक पूछें — परिणाम Metabase से। स्पष्ट ") }}<strong>{{ tx("日期或时间范围", "date or range", "data ou intervalo", "तिथि या अवधि") }}</strong>{{ tx("；缺日期会反问，不编造口径。", "; missing dates trigger clarification — no invented metrics.", "; datas ausentes pedem esclarecimento — sem metricas inventadas.", "; तिथि न हो तो स्पष्टीकरण मांगा जाएगा — काल्पनिक मेट्रिक नहीं।") }}
+            {{ tx("我是数据分析 Agent：用自然语言问观看人数等指标，结果来自 Metabase。尽量写明", "I am the Analytics Agent. Ask metrics like viewers in natural language; results come from Metabase. Prefer an explicit ", "Sou o Agent de Analise. Pergunte metricas como visualizadores em linguagem natural; resultados do Metabase. Prefira ", "मैं एनालिटिक्स एजेंट हूँ। प्राकृतिक भाषा में व्यूअर्स जैसे मेट्रिक पूछें — परिणाम Metabase से। स्पष्ट ") }}<strong>{{ tx("日期或时间范围", "date or range", "data ou intervalo", "तिथि या अवधि") }}</strong>{{ tx("；缺日期会反问，不编造口径。", "; if it is missing I will ask — I will not invent definitions.", "; se faltar, eu pergunto — sem inventar definicoes.", "; तिथि न हो तो मैं पूछूंगा — काल्पनिक परिभाषा नहीं।") }}
           </p>
 
           <section>
             <h3>{{ tx("怎么问", "How to ask", "Como perguntar", "कैसे पूछें") }}</h3>
             <ul>
-              <li>{{ tx("写清渠道 / 维度 + 指标 + 日期，如「八月二十到二十一印度A按天观看人数」", "Include channel/dimension + metric + dates, e.g. “viewers by day for India A from Aug 20–21”", "Inclua canal/dimensao + metrica + datas, ex.: visualizadores por dia India A de 20–21 ago", "चैनल/आयाम + मेट्रिक + तिथि बताएं, जैसे भारत A 20–21 अगस्त दैनिक व्यूअर्स") }}</li>
-              <li>{{ tx("对比或多 grain 会拆成多张表返回", "Comparisons or mixed grains return multiple tables", "Comparacoes ou grains mistos retornam varias tabelas", "तुलना या मिश्रित grain पर कई तालिकाएं मिलेंगी") }}</li>
-              <li>{{ tx("可展开「查看 SQL」核对生成语句", "Expand “View SQL” to inspect generated statements", "Expanda “Ver SQL” para inspecionar as queries", "जनरेटेड SQL देखने के लिए “SQL देखें” खोलें") }}</li>
-              <li>{{ tx("支持粘贴/上传图片与 txt/md/json/csv；图片会先转录再问数。可用语音填入输入框", "Paste/upload images or txt/md/json/csv; images are transcribed before asking. Voice can fill the composer", "Cole/envie imagens ou txt/md/json/csv; imagens sao transcritas antes. Voz preenche o campo", "चित्र या txt/md/json/csv पेस्ट/अपलोड करें; चित्र पहले ट्रांसक्राइब होते हैं। वॉइस से इनपुट भर सकते हैं") }}</li>
+              <li>{{ tx("一次说清：渠道 / 维度 + 指标 + 日期（「昨天」「最近 7 天」也可以）", "Spell out channel/dimension + metric + dates (“yesterday” or “last 7 days” also works)", "Diga canal/dimensao + metrica + datas (“ontem” ou “ultimos 7 dias” tambem vale)", "एक साथ बताएं: चैनल/आयाम + मेट्रिक + तिथि (“कल” या “पिछले 7 दिन” भी चलता है)") }}</li>
+              <li>{{ tx("对比、或「按天」和「按渠道」混在一句里时，会拆成多张表", "Comparisons, or mixing daily and by-channel in one ask, return multiple tables", "Comparacoes, ou misturar por dia e por canal na mesma pergunta, retornam varias tabelas", "तुलना, या एक ही सवाल में दैनिक और चैनल अनुसार मिलाने पर कई तालिकाएं मिलेंगी") }}</li>
+            </ul>
+          </section>
+
+          <section>
+            <h3>{{ tx("看结果", "Results", "Resultados", "परिणाम") }}</h3>
+            <ul>
+              <li>{{ tx("表格可下载 CSV", "Download tables as CSV", "Baixe as tabelas em CSV", "तालिकाएं CSV में डाउनलोड करें") }}</li>
+              <li>{{ tx("展开 SQL 可核对生成语句", "Expand SQL to check the generated query", "Expanda SQL para conferir a query gerada", "जनरेटेड क्वेरी देखने के लिए SQL खोलें") }}</li>
+            </ul>
+          </section>
+
+          <section>
+            <h3>{{ tx("附件与语音", "Files and voice", "Arquivos e voz", "फ़ाइलें और वॉइस") }}</h3>
+            <ul>
+              <li>{{ tx("可粘贴或上传图片、txt / md / json / csv；图片会先转成文字再问数", "Paste or upload images and txt / md / json / csv; images are turned into text first", "Cole ou envie imagens e txt / md / json / csv; imagens viram texto antes", "चित्र और txt / md / json / csv पेस्ट या अपलोड करें; चित्र पहले टेक्स्ट बनते हैं") }}</li>
+              <li>{{ tx("可用语音填入输入框", "Voice can fill the input box", "A voz pode preencher o campo", "वॉइस से इनपुट बॉक्स भर सकते हैं") }}</li>
             </ul>
           </section>
 
           <section>
             <h3>{{ tx("巡检", "Scan", "Varredura", "स्कैन") }}</h3>
             <ul>
-              <li>{{ tx("顶栏「巡检」可手动跑 watch-users 规则集；dryRun 不发钉钉", "Header “Scan” enqueues the watch-users rule set; dryRun skips DingTalk", "O “Varredura” no topo enfileira watch-users; dryRun nao envia DingTalk", "हेडर “स्कैन” watch-users नियम चलाता है; dryRun में DingTalk नहीं जाता") }}</li>
+              <li>{{ tx("顶栏「巡检」可手动跑渠道日活", "Header “Scan” runs channel daily-active checks", "O “Varredura” no topo roda a checagem de ativos diarios por canal", "हेडर “स्कैन” चैनल दैनिक एक्टिव जांच चलाता है") }}</li>
+              <li>{{ tx("勾选 dryRun 只试跑、不发钉钉", "Check dryRun to trial the job without sending DingTalk", "Marque dryRun para testar sem enviar DingTalk", "dryRun चुनें तो सिर्फ ट्रायल होगा, DingTalk नहीं जाएगा") }}</li>
+              <li>{{ tx("自动巡检开启后，每天汇总昨日日活（不是投放 ROI）", "When auto-scan is on, yesterday’s daily actives are summarized each day (not ad ROI)", "Com a varredura automatica, os ativos de ontem sao resumidos todo dia (nao e ROI de ads)", "ऑटो-स्कैन चालू हो तो हर दिन कल के दैनिक एक्टिव का सार आता है (विज्ञापन ROI नहीं)") }}</li>
             </ul>
           </section>
 
@@ -111,15 +117,15 @@ const examples = [
                 :key="ex.zh"
                 type="button"
                 class="cap-chip"
-                @click="pickExample(uiLocale === 'en' ? ex.en : uiLocale === 'pt-BR' ? ex.pt : uiLocale === 'hi' ? ex.hi : ex.zh)"
+                @click="pickExample(exampleText(ex))"
               >
-                {{ uiLocale === "en" ? ex.en : uiLocale === "pt-BR" ? ex.pt : uiLocale === "hi" ? ex.hi : ex.zh }}
+                {{ exampleText(ex) }}
               </button>
             </div>
           </section>
 
           <p class="cap-note">
-            {{ tx("问数会话与后台管理 Agent 隔离；不支持后台写操作。会话 Tab 先保存在本机。", "Analytics sessions are isolated from the Admin Agent and do not perform backend writes. Conversation tabs are stored locally for now.", "Sessoes de analise ficam isoladas do Agent de Backoffice e nao fazem escritas. Abas ficam no navegador por enquanto.", "एनालिटिक्स सत्र एडमिन एजेंट से अलग हैं और बैकएंड लिखते नहीं। टैब अभी लोकल सेव होते हैं।") }}
+            {{ tx("问数会话与后台管理 Agent 隔离，不能改后台数据。会话 Tab 先保存在本机。", "Analytics chats are separate from the Admin Agent and cannot change backend data. Conversation tabs stay on this device for now.", "As conversas de analise ficam isoladas do Agent de Backoffice e nao alteram dados. As abas ficam neste dispositivo por enquanto.", "एनालिटिक्स चैट एडमिन एजेंट से अलग हैं और बैकएंड डेटा नहीं बदलतीं। टैब अभी इसी डिवाइस पर रहते हैं।") }}
           </p>
         </div>
 
@@ -145,7 +151,7 @@ const examples = [
 }
 
 .cap-dialog {
-  width: min(520px, 100%);
+  width: min(560px, 100%);
   max-height: min(84vh, 720px);
   display: flex;
   flex-direction: column;
