@@ -36,4 +36,22 @@ const clock = new Date("2026-09-09T12:00:00+08:00");
   assert.equal(r.clarifySlot, "time_range");
 }
 
+{
+  const r = await analyticsAsk("你好，你能干嘛", { clock });
+  assert.equal(r.status, "ok");
+  assert.equal(r.turnKind, "help");
+  assert.equal(r.clarifySlot, undefined);
+  assert.match(r.message, /数据分析|问数/);
+  assert.doesNotMatch(r.message, /请提供分析的日期范围/);
+  assert.ok(r.helpCard);
+  assert.ok(r.helpCard.examples.length >= 2);
+  assert.ok(r.helpCard.examples.every((ex) => !/印度B/.test(ex)));
+}
+
+{
+  const r = await analyticsAsk("有多少台设备", { clock });
+  assert.equal(r.status, "clarify");
+  assert.equal(r.clarifySlot, "time_range");
+}
+
 console.log("analytics-pipeline-unit.test.ts OK");

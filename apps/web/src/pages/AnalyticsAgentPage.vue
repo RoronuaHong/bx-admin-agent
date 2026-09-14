@@ -27,6 +27,7 @@ import {
 import AgentChromeNav from "../components/AgentChromeNav.vue";
 import { ANALYTICS_ASK_EXAMPLES } from "../analytics-ask-examples";
 import AnalyticsCapabilitiesHelp from "../components/AnalyticsCapabilitiesHelp.vue";
+import AnalyticsHelpCard from "../components/AnalyticsHelpCard.vue";
 import ChatShell from "../components/ChatShell.vue";
 import ResultTable from "../components/ResultTable.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
@@ -84,6 +85,8 @@ type AnalyticsBubble = {
   charts?: ChartView[];
   insight?: string;
   verify?: AnalyticsAskResult["verify"];
+  turnKind?: string;
+  helpCard?: AnalyticsAskResult["helpCard"];
 };
 
 type AnalyticsConversation = {
@@ -223,6 +226,8 @@ function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
     charts: m.charts,
     insight: m.insight,
     verify: m.verify,
+    turnKind: m.turnKind,
+    helpCard: m.helpCard,
   };
 }
 
@@ -256,6 +261,8 @@ function storedToBubble(m: StoredMessage, fallbackId: string): AnalyticsBubble {
     verify: m.verify,
     welcome: m.welcome,
     pending: false,
+    turnKind: m.turnKind,
+    helpCard: m.helpCard,
   };
 }
 
@@ -1314,6 +1321,7 @@ async function send(presetText?: string) {
       prevAskState: lastAskState.value || undefined,
       lastClarifySlot: lastClarifyBubble?.clarifySlot,
       clarifyOptionIds: lastClarifyBubble?.clarifyOptions?.map((o) => o.id),
+      uiLocale: uiLocale.value,
     });
     if (data.error === "aborted" || (data.status === "error" && data.message === "已取消")) {
       if (userInitiatedCancel) {
@@ -1371,6 +1379,8 @@ async function send(presetText?: string) {
         charts: data.charts,
         insight: data.insight,
         verify: data.verify,
+        turnKind: data.turnKind,
+        helpCard: data.helpCard,
       });
     }
   } catch (err) {
@@ -1590,7 +1600,7 @@ onUnmounted(() => {
       <article
         v-for="item in messages"
         :key="item.id"
-        :class="['msg', item.role === 'user' ? 'user' : '']"
+        :class="['msg', item.role === 'user' ? 'user' : '', item.turnKind === 'help' ? 'msg-help' : '']"
       >
         <div class="who" :class="{ me: item.role === 'user' }">
           <span class="dot" />
@@ -1601,7 +1611,7 @@ onUnmounted(() => {
           v-if="item.text || item.insight || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
           class="body-wrap"
         >
-          <p v-if="item.status && item.role === 'assistant' && !item.pending" class="status-line" :data-status="item.status">
+          <p v-if="item.status && item.role === 'assistant' && !item.pending && item.turnKind !== 'help'" class="status-line" :data-status="item.status">
             <span class="status-pill">{{ item.status }}</span>
             <span v-if="item.timeEcho" class="time-echo">{{ item.timeEcho }}</span>
             <span v-if="item.packVersion || item.modelId" class="meta-echo">
@@ -1656,8 +1666,18 @@ onUnmounted(() => {
             <span v-for="f in item.files" :key="f.id" class="msg-file-chip">{{ f.name }}</span>
           </div>
 
+          <AnalyticsHelpCard
+            v-if="item.turnKind === 'help' && item.helpCard && !item.pending"
+            :title="item.helpCard.title"
+            :intro="item.helpCard.intro"
+            :how="item.helpCard.how"
+            :examples="item.helpCard.examples"
+            :note="item.helpCard.note"
+            @use-example="useHelpExample"
+            @open-docs="helpOpen = true"
+          />
           <div
-            v-if="item.text && !item.pending"
+            v-else-if="item.text && !item.pending"
             class="body"
             :class="{ error: item.status === 'error' || item.status === 'refuse' }"
             v-html="renderMarkdown(item.text)"
@@ -1708,7 +1728,7 @@ onUnmounted(() => {
           </p>
 
           <div
-            v-if="item.role === 'assistant' && item.askId && !item.pending && !item.welcome && !item.cancelled"
+            v-if="item.role === 'assistant' && item.askId && !item.pending && !item.welcome && !item.cancelled && item.turnKind !== 'help'"
             class="feedback-row"
           >
             <span class="feedback-label">{{ tx("这题结果", "This answer", "Esta resposta", "यह उत्तर") }}</span>
@@ -2727,6 +2747,14 @@ onUnmounted(() => {
   width: fit-content;
   max-width: 100%;
   min-width: 0;
+}
+
+.msg-help {
+  width: min(540px, 100%);
+}
+
+.msg-help .body-wrap {
+  width: 100%;
 }
 
 .status-line {

@@ -44,6 +44,12 @@ import {
   sqlRequiresWhere,
 } from "./sql-guard.js";
 import { getTableSchemas } from "./catalog-schema.js";
+import {
+  analyticsNonAskReply,
+  buildAnalyticsHelpCard,
+  isThanksTurn,
+  shouldAnswerCapabilities,
+} from "./ask-kind.js";
 import { applyResolvedTime, resolveAskTimeRange } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
@@ -670,6 +676,34 @@ export async function analyticsAsk(
     const lastUserText = userTexts[userTexts.length - 1] || nlSafe || nlForResolve;
     const priorUserTexts = userTexts.slice(0, -1).reverse();
     const prevAskStateEarly = parseAskState(opts?.prevAskState);
+    if (
+      !opts?.slotAnswers ||
+      !Object.keys(opts.slotAnswers).length
+    ) {
+      if (shouldAnswerCapabilities(lastUserText, pack)) {
+        turnKind = "help";
+        if (isThanksTurn(lastUserText) && prevAskStateEarly) {
+          return seal({
+            status: "ok",
+            message: analyticsNonAskReply({
+              locale: opts?.uiLocale,
+              hasPrevAsk: true,
+              thanks: true,
+            }),
+            turnKind: "help",
+            packVersion: pack.version,
+          });
+        }
+        const help = buildAnalyticsHelpCard({ locale: opts?.uiLocale });
+        return seal({
+          status: "ok",
+          message: help.message,
+          helpCard: help.helpCard,
+          turnKind: "help",
+          packVersion: pack.version,
+        });
+      }
+    }
     const mergeVerify = (
       a?: AnalyticsAskResult["verify"],
       b?: AnalyticsAskResult["verify"],

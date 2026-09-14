@@ -75,4 +75,12 @@ export interface AnalyticsAskResult {
     series: Array<{ name: string; data: number[]; selected?: boolean; type?: "line" | "bar" }>;
     height?: number;
   }>;
+  /** Capability / how-to card (turnKind=help) */
+  helpCard?: {
+    title: string;
+    intro: string;
+    how: string[];
+    examples: string[];
+    note: string;
+  };
 }

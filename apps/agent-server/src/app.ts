@@ -631,6 +631,7 @@ export function createApp() {
         prevAskState?: Record<string, unknown>;
         lastClarifySlot?: string;
         clarifyOptionIds?: string[];
+        uiLocale?: string;
       }>()
       .catch(() => ({
         text: "",
@@ -642,6 +643,7 @@ export function createApp() {
         prevAskState: undefined as Record<string, unknown> | undefined,
         lastClarifySlot: undefined as string | undefined,
         clarifyOptionIds: undefined as string[] | undefined,
+        uiLocale: undefined as string | undefined,
       }));
     const text = String(body.text || "").trim();
     const images = Array.isArray(body.images) ? body.images.map(String).filter(Boolean).slice(0, MAX_AT_ONCE) : [];
@@ -687,7 +689,7 @@ export function createApp() {
       clarifyOptionIds,
       ownerKey: ownerCtx.ownerKey,
       userId: ownerCtx.loginName || undefined,
-      uiLocale: "zh-CN",
+      uiLocale: typeof body.uiLocale === "string" && body.uiLocale.trim() ? body.uiLocale.trim() : "zh-CN",
     });
     return c.json(result);
   });

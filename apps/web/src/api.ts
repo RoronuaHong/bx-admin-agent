@@ -316,6 +316,8 @@ export interface StoredMessage {
   clarifyOptions?: Array<{ id: string; label: string }>;
   insight?: string;
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
+  turnKind?: string;
+  helpCard?: AnalyticsAskResult["helpCard"];
 }
 
 export interface ConversationDto {
@@ -502,6 +504,13 @@ export interface AnalyticsAskResult {
     series: Array<{ name: string; data: number[]; selected?: boolean; type?: "line" | "bar" }>;
     height?: number;
   }>;
+  helpCard?: {
+    title: string;
+    intro: string;
+    how: string[];
+    examples: string[];
+    note: string;
+  };
 }
 
 export type AnalyticsFeedbackVerdict = "useful" | "wrong";
@@ -561,6 +570,7 @@ export async function askAnalytics(
     /** 上一助手澄清槽位 */
     lastClarifySlot?: string;
     clarifyOptionIds?: string[];
+    uiLocale?: string;
   },
 ): Promise<AnalyticsAskResult> {
   const resp = await fetch("/agent/analytics/ask", {
@@ -577,6 +587,7 @@ export async function askAnalytics(
       prevAskState: opts?.prevAskState,
       lastClarifySlot: opts?.lastClarifySlot,
       clarifyOptionIds: opts?.clarifyOptionIds,
+      uiLocale: opts?.uiLocale,
     }),
     signal: opts?.signal,
   });
