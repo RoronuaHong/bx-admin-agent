@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   enforceStructurePolicy,
+  extractLocalesFromText,
   formatConversationTranscript,
   impliesLangSetWithoutMembers,
   impliesMovieTypeSetWithoutMembers,
@@ -10,6 +11,22 @@ import {
   parseStructureResponse,
   userDemandsLangFilter,
 } from "../src/analytics/conversation-structure.js";
+
+{
+  const four = extractLocalesFromText(
+    [
+      "从观看明细表 elt_watch_detail 中，筛选出观看日期在 2026-08-19 到 2026-08-25 之间、渠道为 IndiaA、影片类型属于 1/2/3/4/10/11 的记录。",
+      "对每一组，分别按内容语言做条件聚合，计算人均观看时长：",
+      "英语（contentLang=''）的人均时长；",
+      "泰卢固语（te-IN）的人均时长；",
+      "泰米尔语（ta-IN）的人均时长；",
+      "马拉雅拉姆语（ml-IN）的人均时长。",
+    ].join("\n"),
+  );
+  assert.deepEqual(four, ["(empty)", "te-IN", "ta-IN", "ml-IN"]);
+  assert.deepEqual(extractLocalesFromText("IndiaA 英语人均观看时长"), ["(empty)"]);
+  assert.deepEqual(extractLocalesFromText("te-IN、ta-IN、ml-IN 完播率"), ["te-IN", "ta-IN", "ml-IN"]);
+}
 
 {
   const t = formatConversationTranscript([
@@ -195,6 +212,31 @@ import {
   if (r.status === "ok") {
     assert.deepEqual(r.filters.contentLang?.slice().sort(), ["(empty)", "ml-IN", "ta-IN", "te-IN"]);
     // 非 pivot 指标 + 多语言成员确认 + 不按语言分组 → 自动宽表（per-value 条件聚合展开）
+    assert.equal(r.layout, "wide");
+    assert.equal(r.pivotDim, "contentLang");
+  }
+}
+
+{
+  // 模型漏填英语空串时，按用户原文回填四种语言并走宽表
+  const origin = [
+    "从观看明细表 elt_watch_detail 中，筛选出观看日期在 2026-08-19 到 2026-08-25 之间、渠道为 IndiaA 的记录。",
+    "英语（contentLang=''）的人均时长；泰卢固语（te-IN）；泰米尔语（ta-IN）；马拉雅拉姆语（ml-IN）。",
+  ].join("\n");
+  const r = enforceStructurePolicy(
+    {
+      status: "ok",
+      mergedNl: origin,
+      time: { start: "2026-08-19", end: "2026-08-25" },
+      filters: { channel: ["IndiaA"], contentLang: ["te-IN", "ta-IN", "ml-IN"] },
+      outputDims: ["watch_date", "channel"],
+      metricId: "avg_watch_second_per_user",
+    },
+    formatConversationTranscript([{ role: "user", text: origin }]),
+  );
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.deepEqual(r.filters.contentLang, ["(empty)", "te-IN", "ta-IN", "ml-IN"]);
     assert.equal(r.layout, "wide");
     assert.equal(r.pivotDim, "contentLang");
   }

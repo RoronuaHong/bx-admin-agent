@@ -81,4 +81,19 @@ import {
   assert.equal(charts.length, 2);
 }
 
+{
+  const chart = buildLocalChartFromTable({
+    title: "结果",
+    cols: ["watchDate", "te_IN"],
+    colTitles: ["观看日期", "泰卢固语"],
+    rows: [
+      ["2026-08-20", 10],
+      ["2026-08-21", 12],
+    ],
+    grain: "day",
+  });
+  assert.ok(chart);
+  assert.equal(chart!.series[0].name, "泰卢固语");
+}
+
 console.log("analytics-local-chart.test.ts OK");

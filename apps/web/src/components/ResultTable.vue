@@ -367,7 +367,7 @@ function cellStyle(cell: {
     <ul class="result-empty__tips">
       <li>{{ tx("核对时间范围（缺年时默认业务年）", "Check the time range (default business year when year is omitted)") }}</li>
       <li>{{ tx("放宽渠道 / 语言 / 包体等筛选", "Broaden channel / language / package filters") }}</li>
-      <li>{{ tx("换一种 grain（按天 / 汇总）再问", "Try another grain (daily / aggregate)") }}</li>
+      <li>{{ tx("换一种问法（按天 / 合计）再问", "Try asking by day or as a total", "Tente perguntar por dia ou no total", "दिन अनुसार या कुल मिलाकर फिर पूछें") }}</li>
     </ul>
   </div>
 

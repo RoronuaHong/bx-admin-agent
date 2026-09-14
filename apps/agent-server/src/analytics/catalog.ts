@@ -173,7 +173,7 @@ export function findCatalogTable(
   return catalog.tables.find((t) => t.name === want);
 }
 
-function requiredCompileFields(pack: AnalyticsPack): string[] {
+export function requiredCompileFields(pack: AnalyticsPack): string[] {
   const ids = new Set<string>([packTimeField(pack)]);
   for (const d of pack.enumDimensions || []) {
     if (d.field) ids.add(d.field);
@@ -315,6 +315,11 @@ function readDiskCatalog(databaseId: number): AnalyticsCatalog | null {
   }
 }
 
+/** Disk Metabase snapshot for coverage GATE (null when CI has no catalog cache). */
+export function loadDiskCatalog(databaseId = 2): AnalyticsCatalog | null {
+  return readDiskCatalog(databaseId);
+}
+
 function writeDiskCatalog(catalog: AnalyticsCatalog): void {
   mkdirSync(CATALOG_DIR, { recursive: true });
   writeFileSync(catalogPath(catalog.databaseId), JSON.stringify(catalog, null, 2) + "\n");
@@ -396,7 +401,7 @@ export async function refreshPackFromCatalog(
   return applied;
 }
 
-/** Disk snapshot for eval/GATE: 71 / 67 / 4 — not part of EX. */
+/** Disk snapshot for eval/GATE: 72 / 67 / 5 — not part of EX. */
 export function summarizeCatalogCoverage(databaseId = 2): {
   total: number;
   answerable: number;

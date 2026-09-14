@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-12.2",
+  "version": "2026-09-14.1",
   "packId": "watch-detail",
   "clock": "2026-09-09T12:00:00+08:00",
   "notes": "Gate EX counts reviewStatus=gold answerable. 2026-09-12.2: promote 20 provisional answerable after glm5 soft-EX (17 full-run + 3 after CWR/prefs isolation). Refuse traps remain gold structural rules. Eval harness uses isolated ownerKey per case.",
@@ -646,6 +646,84 @@
       "difficulty": "medium",
       "reviewStatus": "provisional",
       "reviewNote": "JOIN pair not in V1 relationships; smoke until Path C consistently refuses instead of single-table fallback"
+    },
+    {
+      "id": "ex-wide-avg-per-user-lang",
+      "nl": "按观看日期和渠道分组，统计 IndiaA 渠道在 2026-08-19 至 2026-08-25、指定影片类型为电影电视剧真人秀短剧动漫肥皂剧、四种内容语言的人均观看时长",
+      "should_refuse": false,
+      "tags": ["wide", "per_value", "colloquial", "aggregation"],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, channel,\nround(sumIf(watchSecond, contentLang='') / uniqIf(guid, contentLang=''), 0) AS a,\nround(sumIf(watchSecond, contentLang='te-IN') / uniqIf(guid, contentLang='te-IN'), 0) AS b,\nround(sumIf(watchSecond, contentLang='ta-IN') / uniqIf(guid, contentLang='ta-IN'), 0) AS c,\nround(sumIf(watchSecond, contentLang='ml-IN') / uniqIf(guid, contentLang='ml-IN'), 0) AS d\nFROM elt_watch_detail\nWHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25'\n  AND channel IN ('IndiaA')\n  AND movieType IN (1, 2, 3, 4, 10, 11)\nGROUP BY watchDate, channel\nORDER BY watchDate, channel"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold aligned with verified-queries.watch_avg_per_user_lang_wide; per-value wide (4 lang columns), not 2 SQLs"
+    },
+    {
+      "id": "ex-wide-uniq-lang",
+      "nl": "IndiaA 在 2026-08-19 至 2026-08-25 按语言宽表统计起播人数",
+      "should_refuse": false,
+      "tags": ["wide", "per_value", "aggregation"],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, channel,\nuniqIf(guid, contentLang='') AS a,\nuniqIf(guid, contentLang='te-IN') AS b,\nuniqIf(guid, contentLang='ta-IN') AS c,\nuniqIf(guid, contentLang='ml-IN') AS d\nFROM elt_watch_detail\nWHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25'\n  AND channel IN ('IndiaA')\n  AND movieType IN (1, 2, 3, 4, 10, 11)\nGROUP BY watchDate, channel\nORDER BY watchDate, channel"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold aligned with verified-queries.watch_uniq_users_lang_wide"
+    },
+    {
+      "id": "ex-wide-completion-lang",
+      "nl": "IndiaA 在 2026-08-19 至 2026-08-25 按语言宽表完播率",
+      "should_refuse": false,
+      "tags": ["wide", "per_value", "completion"],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT watchDate, channel,\nround(sumIf(a, contentLang='') / countIf(contentLang=''), 0) AS aa,\nround(sumIf(a, contentLang='te-IN') / countIf(contentLang='te-IN'), 0) AS bb,\nround(sumIf(a, contentLang='ta-IN') / countIf(contentLang='ta-IN'), 0) AS cc,\nround(sumIf(a, contentLang='ml-IN') / countIf(contentLang='ml-IN'), 0) AS dd\nFROM (\n  SELECT toDate(lastWatchTime) AS watchDate, channel, eid, contentLang, max(maxWatchProgress) AS a\n  FROM elt_watch_detail\n  WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25'\n    AND channel IN ('IndiaA')\n    AND movieType IN (1, 2, 3, 4, 10, 11)\n  GROUP BY watchDate, channel, guid, eid, contentLang\n)\nGROUP BY watchDate, channel\nORDER BY watchDate, channel"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold aligned with verified-queries.watch_completion_lang_wide"
+    },
+    {
+      "id": "ex-pay-rate-lang-wide",
+      "nl": "IndiaA 版本 2.4.1 在 2026-08-19 至 2026-08-25 按语言付费率",
+      "should_refuse": false,
+      "tags": ["wide", "per_value", "pay_rate", "join"],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT\n  round(a / total, 6) AS a2,\n  round(b / total, 6) AS b2,\n  round(c / total, 6) AS c2,\n  round(d / total, 6) AS d2\nFROM (\n  SELECT 1 AS i1, count() AS total\n  FROM elt_film_user\n  WHERE channel = 'IndiaA' AND appVersion = '2.4.1'\n) t1\nINNER JOIN (\n  SELECT 1 AS i,\n    uniqIf(uid, contentLang='') AS a,\n    uniqIf(uid, contentLang='te-IN') AS b,\n    uniqIf(uid, contentLang='ta-IN') AS c,\n    uniqIf(uid, contentLang='ml-IN') AS d\n  FROM elt_film_user AS aa\n  INNER JOIN elt_film_order AS bb ON aa._id = bb.uid\n  WHERE toDate(bb.createdTime) BETWEEN '2026-08-19' AND '2026-08-25'\n    AND bb.orderStatus = 6\n    AND bb.channelName = 'IndiaA'\n    AND aa.appVersion = '2.4.1'\n    AND bb.appVersion = '2.4.1'\n) t2 ON t1.i1 = t2.i"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold aligned with verified-queries.pay_rate_lang_wide"
+    },
+    {
+      "id": "ex-retention-d1-lang-wide",
+      "nl": "IndiaA 版本 2.4.1 在 2026-08-19 次日留存按语言",
+      "should_refuse": false,
+      "tags": ["wide", "per_value", "retention"],
+      "difficulty": "hard",
+      "requireLive": true,
+      "goldSqls": [
+        "WITH\n'IndiaA' AS targetChannel,\ntoDate('2026-08-19') AS targetDate,\ntodayGuid AS (\n  SELECT guid, argMax(contentLang, createTime) AS contentLang\n  FROM gather.gather\n  WHERE eventName = 'content_language_save_success'\n    AND toDate(createTime) = targetDate\n    AND channel = targetChannel\n    AND appVerName = '2.4.1'\n    AND guid IN (SELECT DISTINCT guid FROM elt_new_guid WHERE createDate = targetDate AND channel = targetChannel)\n  GROUP BY guid\n),\nretentionGuid AS (\n  SELECT b.guid, b.contentLang\n  FROM elt_active_guid AS a\n  INNER JOIN todayGuid AS b ON a.guid = b.guid\n  WHERE a.activeDate = addDays(targetDate, 1) AND a.channel = targetChannel\n),\ntodayCount AS (\n  SELECT countIf(contentLang='') AS a, countIf(contentLang='te-IN') AS b, countIf(contentLang='ta-IN') AS c, countIf(contentLang='ml-IN') AS d\n  FROM todayGuid\n),\nretentionCount AS (\n  SELECT countIf(contentLang='') AS aa, countIf(contentLang='te-IN') AS bb, countIf(contentLang='ta-IN') AS cc, countIf(contentLang='ml-IN') AS dd\n  FROM retentionGuid\n)\nSELECT t1.a, t1.b, t1.c, t1.d, t2.aa, t2.bb, t2.cc, t2.dd,\n  round(t2.aa / t1.a, 2), round(t2.bb / t1.b, 2), round(t2.cc / t1.c, 2), round(t2.dd / t1.d, 2)\nFROM todayCount AS t1, retentionCount AS t2"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold aligned with verified-queries.retention_d1_lang"
+    },
+    {
+      "id": "ex-movie-multi-type",
+      "nl": "2026-08-19到2026-08-25，电影、电视剧、真人秀、短剧、动漫、肥皂剧的观看人数，按天",
+      "should_refuse": false,
+      "tags": ["movieType", "multi_value", "dimension"],
+      "difficulty": "medium",
+      "requireLive": true,
+      "goldSqls": [
+        "SELECT toDate(lastWatchTime) AS watchDate, uniq(guid) AS users FROM elt_watch_detail WHERE toDate(lastWatchTime) BETWEEN '2026-08-19' AND '2026-08-25' AND movieType IN (1, 2, 3, 4, 10, 11) GROUP BY watchDate ORDER BY watchDate"
+      ],
+      "reviewStatus": "gold",
+      "reviewNote": "gold: 6 movie types resolve to numeric codes IN (1,2,3,4,10,11), not Chinese literals in WHERE"
     }
   ]
 }

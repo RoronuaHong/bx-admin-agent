@@ -3,7 +3,7 @@
 > **范围**：只比「一句话进 → 一张列和行都对的结果表出」。不比登录身份、Metabase 卡片 API、评测看板、多轮偏好。  
 > **对照**：Cortex Analyst / Looker Conversational Analytics / Cube / dbt Semantic Layer + 本仓 `analyticsAsk`（`pipeline.ts`）。  
 > **规格**：[`../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md)  
-> **核对日期**：2026-09-13（对照当日代码，不是 09-13 评审快照）
+> **核对日期**：2026-09-14（覆盖率 GATE 与扩表名单已对齐代码；NL→表步骤仍以实现为准）
 
 **正确表**：对的表、对的日期、对的指标公式、点过的过滤还在。能跑但换了分母、丢了渠道、少了最后一天，都不算。
 
@@ -50,7 +50,7 @@ NL → 护栏 → 目录 → 时间 → 检索表 → 锁口径 → 路由 A/B/C
 
 业界：只给已发布 / 有文档的表；点到 tmp、upload、字典表直接拒。
 
-本仓：活目录 **71 / 67 / 4**（总 / 可答 / 隐藏）。`catalogApplied.unmodeledTablesInNl` 非空立刻 `refuse`（`blocked_table`），不编 SQL。
+本仓：活目录 **72 / 67 / 5**（总 / 可答 / 隐藏）。`catalogApplied.unmodeledTablesInNl` 非空立刻 `refuse`（`blocked_table`），不编 SQL。覆盖率 GATE 见 `warehouse-coverage.ts`：与 EX 分母分开；扩表优先名单在 `config/analytics/warehouse-coverage.json`（batch 0 `elt_watch_detail` overlay；batch 1 付费/留存 VQR 五表；batch 2 首张 `gather_stat` 已升金样，其余影片/会员/邀请等 catalog_only）。
 
 ### 3. 时间由代码钉死
 
@@ -145,7 +145,8 @@ pack 三对关系（V1，覆盖付费 + 留存金样，**不**为了扩面乱加
 | 每表检索卡片（identity + synonyms） | **已修** | `catalog-cards.json`；对照/他表提及不进打分。避免「订单数」锁到邀请提现。 |
 | Path C `get_table_schema` | **已修** | 先卡片索引，再按需拉列；SQL 白名单 = 已 schema 的表。A/B 不动。 |
 | 执行后校对 + 解读 | **已修** | A/B 本地解读、不再额外打模型；C 校对+解读合并为 1 次调用。数字只许来自样例。 |
-| GATE coverage + Path C 分报 | **已修** | harness 打印 71/67/4；`llm_sql_ex` / `llm_sql_exec_ok` 不进 EX。隐藏表拒答入 gold refuse。 |
+| GATE coverage + Path C 分报 | **已修** | coverage 是可失败 GATE：`evaluateWarehouseCoverage`（spec `warehouse-coverage.json`）。无 catalog 时仍断言 overlay pack + 扩表名单；有 snapshot 时强制 **72 / 67 / 5** 与 overlay 活字段 23。8/23 为文档化缺口。`llm_sql_ex` / `llm_sql_exec_ok` 不进 EX。隐藏表拒答入 gold refuse。 |
+| batch 2 `gather_stat` 升 Path B | **已修** | 金样 `gather_stat_daily`：按日+事件 `sum(eventCount)` / `sum(activeUsers)`，`toDate(date)`。别名「埋点汇总」等；裸「埋点」仍走 Path C 明细。 |
 
 规格步 5 的三个 kind（`conditional_wide` / `ratio` / `retention_dn`）已落地。新形状仍先走 B 再升 A。
 
@@ -154,5 +155,6 @@ pack 三对关系（V1，覆盖付费 + 留存金样，**不**为了扩面乱加
 ## 3. 不要从本页推出的结论
 
 - 不要生成 71 份 pack。warehouse 已经是 67 可答。
-- 不要把「1/71 + Phase 0–4」当实现计划（见 `ANALYTICS_ARCHITECTURE_REVIEW.md` 文首更正）。
+- 不要把「1/71 + Phase 0–4」当实现计划（见 `ANALYTICS_ARCHITECTURE_REVIEW.md` 文首更正）。09-13 的 1/71 是当日 pack 锁表快照，不是今日覆盖率。
 - 不要把 Path C 的「能跑」算进发版正确率。
+- 语义层扩表按 `warehouse-coverage.json` 的 batch 0/1/2 排队（overlay → VQR → 下一批评方），不要一次铺 67 张 overlay。batch 2 首张 `gather_stat` 已升 Path B（`gather_stat_daily`，「埋点汇总」走金样，时间列 `date` 不是 `createTime`）。「埋点」明细仍走 Path C。

@@ -120,13 +120,27 @@ function stripPackChrome(transcript: string): string {
 
 /** Last user utterance from a formatted transcript (or raw single-turn text). */
 export function lastUserUtterance(transcript: string): string {
-  let last = "";
-  for (const line of stripPackChrome(transcript).split("\n")) {
-    const m =
+  const lines = stripPackChrome(transcript).split("\n");
+  let last: string[] = [];
+  let capturing = false;
+  for (const line of lines) {
+    const user =
       line.match(/^\s*(?:\[\d+\]\s*)?用户:\s*(.*)$/) || line.match(/^\s*user\s*:\s*(.*)$/i);
-    if (m) last = String(m[1] || "").trim();
+    if (user) {
+      last = [String(user[1] || "")];
+      capturing = true;
+      continue;
+    }
+    if (
+      /^\s*(?:\[\d+\]\s*)?助手:/.test(line) ||
+      /^\s*assistant\s*:/i.test(line)
+    ) {
+      capturing = false;
+      continue;
+    }
+    if (capturing) last.push(line);
   }
-  return last;
+  return last.join("\n").trim();
 }
 
 function isShortClarifyReply(text: string): boolean {
@@ -193,31 +207,81 @@ export function normalizeClarifySlot(slot: string): string {
   return s;
 }
 
-/** 从对话文本抽出 locale 码（含 澄清选择：contentLang=…、空语言、(empty)） */
+function isEmptyContentLangToken(raw: string): boolean {
+  const t = String(raw || "")
+    .trim()
+    .replace(/^['"`]+/, "")
+    .replace(/[)'"`”’)）]+$/g, "");
+  if (!t) return true;
+  return (
+    t === "(empty)" ||
+    t === "\u7a7a" ||
+    t.startsWith("\u7a7a\uff08") ||
+    t === "\u82f1\u8bed" ||
+    t.startsWith("\u82f1\u8bed\uff08") ||
+    /^english$/i.test(t) ||
+    /^en(-US)?$/i.test(t)
+  );
+}
+
+function canonicalLocaleCode(raw: string): string | undefined {
+  const t = String(raw || "").trim();
+  if (!/^[a-z]{2}-[A-Za-z]{2}$/i.test(t)) return undefined;
+  const [a, b] = t.split("-");
+  return `${a!.toLowerCase()}-${b!.toUpperCase()}`;
+}
+
+/** 从对话文本抽出 locale 码（含 澄清选择：contentLang=…、空语言、(empty)、英语（contentLang=''）） */
 export function extractLocalesFromText(text: string): string[] {
-  const found = new Set<string>();
-  for (const m of text.matchAll(/\b([a-z]{2}-[A-Za-z]{2})\b/g)) {
-    const [a, b] = m[1]!.split("-");
-    found.add(`${a!.toLowerCase()}-${b!.toUpperCase()}`);
+  const src = String(text || "");
+  const hits: Array<{ i: number; v: string }> = [];
+  const add = (i: number, v: string) => {
+    hits.push({ i: i < 0 ? 0 : i, v });
+  };
+
+  for (const m of src.matchAll(/\b([a-z]{2}-[A-Za-z]{2})\b/g)) {
+    const code = canonicalLocaleCode(m[1]!);
+    if (code) add(m.index ?? 0, code);
   }
-  for (const m of text.matchAll(/contentLang\s*=\s*([^\n；;]+)/gi)) {
+  // contentLang='' / contentLang="" — 英语在仓里是空串，不能只认 xx-YY
+  for (const m of src.matchAll(/contentLang\s*=\s*(?:''|""|['\"]\s*['\"])/gi)) {
+    add(m.index ?? 0, "(empty)");
+  }
+  for (const m of src.matchAll(/contentLang\s*=\s*([^\n；;]+)/gi)) {
     for (const part of m[1]!.split(/[,，、\s]+/)) {
       const t = part.trim();
       if (!t) continue;
-      if (t === "(empty)" || t === "\u7a7a" || t.startsWith("\u7a7a\uff08") || t === "\u82f1\u8bed" || t.startsWith("\u82f1\u8bed\uff08") || /^english$/i.test(t) || /^en(-US)?$/i.test(t)) {
-        found.add("(empty)");
+      if (isEmptyContentLangToken(t)) {
+        add(m.index ?? 0, "(empty)");
         continue;
       }
-      if (/^[a-z]{2}-[A-Za-z]{2}$/i.test(t)) {
-        const [a, b] = t.split("-");
-        found.add(`${a!.toLowerCase()}-${b!.toUpperCase()}`);
-      }
+      const code = canonicalLocaleCode(t.replace(/^['"]+|['"]+$/g, ""));
+      if (code) add(m.index ?? 0, code);
     }
   }
-  if (/(^|[,，、\s])\(empty\)([,，、\s]|$)/i.test(text) || /(?:^|[,，、\s])\u7a7a(?:\uff08[^\uff09]*\uff09)?(?=[,，、\s]|$)/.test(text) || /(?:^|[,，、\s])\u82f1\u8bed(?:\uff08[^\uff09]*\uff09)?(?=[,，、\s]|$)/.test(text) || /(?:^|[,，、\s])(?:english|en(?:-US)?)\b/i.test(text)) {
-    found.add("(empty)");
+  // 「英语（contentLang=''）的人均时长」：后面常接「的」，不能要求逗号/行尾
+  for (const m of src.matchAll(/\u82f1\u8bed(?:\uff08[^\uff09]*\uff09)?/g)) {
+    add(m.index ?? 0, "(empty)");
   }
-  return [...found];
+  for (const m of src.matchAll(/\(empty\)/gi)) {
+    add(m.index ?? 0, "(empty)");
+  }
+  for (const m of src.matchAll(/(?:^|[,，、\s])(\u7a7a(?:\uff08[^\uff09]*\uff09)?)/g)) {
+    add(m.index ?? 0, "(empty)");
+  }
+  for (const m of src.matchAll(/(?:^|[,，、\s])(?:english|en(?:-US)?)\b/gi)) {
+    add(m.index ?? 0, "(empty)");
+  }
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  hits.sort((a, b) => a.i - b.i);
+  for (const h of hits) {
+    if (seen.has(h.v)) continue;
+    seen.add(h.v);
+    out.push(h.v);
+  }
+  return out;
 }
 
 /** 末轮用户是否在回「全部/全选」确认上一轮候选 */
@@ -323,15 +387,7 @@ export function extractClarificationSlots(text: string): {
     if (key === "contentlang") {
       const langs: string[] = [];
       for (const t of parts) {
-        if (
-          t === "(empty)" ||
-          t === "\u7a7a" ||
-          t.startsWith("\u7a7a\uff08") ||
-          t === "\u82f1\u8bed" ||
-          t.startsWith("\u82f1\u8bed\uff08") ||
-          /^english$/i.test(t) ||
-          /^en(-US)?$/i.test(t)
-        ) {
+        if (isEmptyContentLangToken(t) || /^(?:''|"")$/.test(t)) {
           langs.push("(empty)");
         } else if (/^[a-z]{2}-[A-Za-z]{2}$/i.test(t)) {
           const [a, b] = t.split("-");
@@ -483,8 +539,6 @@ export function enforceStructurePolicy(
   if (slotAnswers.movieType?.length) filters.movieType = slotAnswers.movieType;
   if (slotAnswers.channel?.length) filters.channel = slotAnswers.channel;
 
-  const langs = filters.contentLang || [];
-
   const needMovieMembers =
     impliesMovieTypeSetWithoutMembers(lastUserText) && !(slotAnswers.movieType?.length);
   // 「N种小语种」未列码：一律先问 contentLang，丢掉模型臆造的 locale
@@ -515,43 +569,9 @@ export function enforceStructurePolicy(
     };
   }
 
-  // 用户已写出 locale 时：以对话为准；模型半臆造则过滤；模型漏填则回填
+  // 用户已写出 locale 时以对话为准（含英语空串）；模型漏填要回填，半臆造的多出来的丢掉
   if (chatLocales.length) {
-    if (langs.length) {
-      const allowed = new Set(chatLocales.map((x) => x.toLowerCase()));
-      const kept = langs.filter((l) => {
-        const key = String(l).trim().toLowerCase();
-        if (
-          key === "(empty)" ||
-          key === "" ||
-          key === "\u7a7a" ||
-          key.startsWith("\u7a7a\uff08") ||
-          key === "\u82f1\u8bed" ||
-          key.startsWith("\u82f1\u8bed\uff08") ||
-          key === "english" ||
-          key === "en" ||
-          key === "en-us"
-        ) {
-          return allowed.has("(empty)");
-        }
-        return allowed.has(key);
-      });
-      if (!kept.length) {
-        const partial = { ...filters };
-        delete partial.contentLang;
-        return {
-          status: "clarify",
-          clarify: "请确认要统计的具体内容语言列表（可多选）。",
-          clarifySlot: "contentLang",
-          mergedNl: mergedNl || undefined,
-          time: result.time,
-          partialFilters: partial,
-        };
-      }
-      filters.contentLang = kept;
-    } else {
-      filters.contentLang = chatLocales;
-    }
+    filters.contentLang = chatLocales;
   } else if (!langWanted) {
     // 用户未要求语言筛选：丢掉模型臆造的 contentLang，避免无故反问
     delete filters.contentLang;

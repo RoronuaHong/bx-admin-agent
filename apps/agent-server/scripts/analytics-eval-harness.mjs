@@ -35,6 +35,10 @@ import {
   softExMatchTables,
 } from "../src/analytics/eval-score.js";
 import { summarizeCatalogCoverage } from "../src/analytics/catalog.js";
+import {
+  evaluateWarehouseCoverage,
+  formatWarehouseCoverage,
+} from "../src/analytics/warehouse-coverage.js";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dir, "..");
@@ -306,13 +310,20 @@ async function main() {
   const smokeMetrics = emptyMetrics();
   const llmSqlMetrics = emptyLlmSqlReport();
   const lines = [];
+  const warehouse = evaluateWarehouseCoverage();
   const coverage = summarizeCatalogCoverage(databaseId);
+  console.log(`[analytics-eval] ${formatWarehouseCoverage(warehouse)}`);
   if (coverage) {
     console.log(
       `[analytics-eval] coverage total=${coverage.total} answerable=${coverage.answerable} hidden=${coverage.hidden} (not in EX denominator)`,
     );
   } else {
-    console.log("[analytics-eval] coverage n/a (no disk catalog yet)");
+    console.log("[analytics-eval] coverage n/a (no disk catalog; pack/expansion still gated)");
+  }
+  if (!warehouse.pass) {
+    console.error("[analytics-eval] GATE FAIL: warehouse coverage");
+    for (const f of warehouse.failures) console.error(`  - ${f}`);
+    process.exit(1);
   }
 
   for (const c of cases) {

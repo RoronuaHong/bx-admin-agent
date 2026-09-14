@@ -36,8 +36,9 @@
 
 | 项 | 今日 |
 |---|---|
-| Metabase db2 | 71 表；可答 67；隐藏 4（`_tmp` / `_dict` / `upload_*`） |
+| Metabase db2 | 72 表；可答 67；隐藏 5（`_tmp` / `_dict` / `upload_*` / `metabase_upload`） |
 | 白名单 | `allowedTableNames` = pack.tables ∪ warehouse.tables，**已不是 1/71** |
+| coverage GATE | `warehouse-coverage.json`：72/67/5 + overlay 8/23；扩表 batch 0/1/2。CI 可失败 |
 | LLM | schema-agent **只出 JSON 槽位**，`sqlSource` 只有 `intent_compile` |
 | 单表泛化 | 非 overlay 可编 `count:*` / `uniq:field` / `sum:field` / `avg:field` |
 | JOIN | AST 守卫已能抽出 FROM/JOIN 表名；**编译器永不产出 JOIN** |
@@ -281,7 +282,8 @@ scan/freshness **不改**（不是对话问数）。
 GATE：
 
 - overlay gold EX、RefuseRecall、CWR 门槛沿用 09-09 定稿（EX≥85%，RefuseRecall≥95%，CWR≤10%）。
-- **新增** `coverage` 输出：`answerableTables=67`、`hidden=4`，与 EX 并列打印，不进「EX=100%」的同一分母。
+- **coverage 是可失败 GATE**（不是只打印）：`evaluateWarehouseCoverage`，spec 在 `config/analytics/warehouse-coverage.json`。有磁盘 catalog 时强制 `total=71` / `answerable=67` / `hidden=4` 与 overlay 活字段 23；无 catalog 时仍断言 pack overlay + 扩表名单。8/23 为文档化缺口。coverage **不进**「EX=100%」同一分母；EX 全绿不能掩盖 coverage 红。
+- 语义层扩表优先：batch 0 overlay `elt_watch_detail` → batch 1 VQR（`elt_film_user` / `elt_film_order` / `gather` / `elt_new_guid` / `elt_active_guid`）→ batch 2 首张 `gather_stat` 已升 `gather_stat_daily`；其余 catalog_only（影片、会员、邀请等）。**禁止**生成 71 份 pack。
 - Path C 单独报表 `llm_sql_ex` / `llm_sql_exec_ok`，**不**用它宣称发版正确率。
 
 ---
@@ -291,7 +293,7 @@ GATE：
 | 旧结论 | 更正 |
 |---|---|
 | 09-09：B（LLM 写 SQL）为非目标 | 本文：B/C 为正式路径，A 仍是 KPI 权威 |
-| 09-13 评审：1/71、须生成 71 pack | 今日 warehouse 已 67 可答；禁止 71 pack |
+| 09-13 评审：1/71、须生成 71 pack | 今日 warehouse 已 67 可答；禁止 71 pack。coverage GATE 锁 72/67/5，不是 1/71 |
 | 09-13 评审 Phase 0–4 自动派生多 pack | **取消**。被本文 §5–§8 取代 |
 | capability-gate「超纲只能拒」 | 超纲 A 之后可以走 B/C；**仍禁止**超纲时改用 `uniq_users` 冒充 |
 

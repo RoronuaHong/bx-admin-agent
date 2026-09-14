@@ -64,7 +64,7 @@
     "buffer": { "synonyms": ["缓冲", "卡顿"] },
     "event_config": { "synonyms": ["事件配置"] },
     "gather": { "synonyms": ["埋点"] },
-    "gather_stat": { "synonyms": ["埋点汇总"] },
+    "gather_stat": { "synonyms": ["埋点汇总", "按日埋点", "事件次数汇总", "埋点日统计"] },
     "gather_stat_view": { "synonyms": ["埋点汇总视图"] },
     "gather_t": { "synonyms": ["埋点变体"] },
     "gather_w": { "synonyms": ["埋点窄切片"] },

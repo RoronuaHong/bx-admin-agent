@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   buildClarifyContinuation,
+  looksLikeAcceptSuggestionReply,
   looksLikeSlotOnlyReply,
   resolveOptionIndexes,
 } from "../src/analytics-clarify.ts";
@@ -196,6 +197,28 @@ const ORIG_TWO =
   assert.deepEqual(typed.slotAnswers?.table, ["elt_film_order"]);
   const picked = buildClarifyContinuation(prior, "2");
   assert.deepEqual(picked.slotAnswers?.table, ["elt_film_order"]);
+}
+
+{
+  const prior = [
+    { role: "user" as const, text: "昨天到今天的每日变现漏斗数据" },
+    {
+      role: "assistant" as const,
+      status: "clarify",
+      clarifySlot: "table",
+      text: "请选择表",
+      clarifyOptions: [
+        { id: "elt_film_app_channel", label: "1. 渠道变现方式" },
+        { id: "elt_film_order", label: "2. 会员付费漏斗" },
+        { id: "elt_active_guid", label: "3. 活跃观影付费" },
+      ],
+    },
+  ];
+  assert.equal(looksLikeAcceptSuggestionReply("按你说的来"), true);
+  assert.equal(looksLikeSlotOnlyReply("按你说的来"), true);
+  const r = buildClarifyContinuation(prior, "按你说的来");
+  assert.equal(r.text, "昨天到今天的每日变现漏斗数据");
+  assert.deepEqual(r.slotAnswers?.table, ["elt_film_app_channel"]);
 }
 
 console.log("analytics-clarify.test.ts OK");

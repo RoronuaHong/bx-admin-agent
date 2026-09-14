@@ -19,6 +19,7 @@ export type AnalyticsChartView = {
 type TableLike = {
   title?: string;
   cols: string[];
+  colTitles?: string[];
   rows: unknown[][];
   grain?: string;
 };
@@ -125,7 +126,7 @@ export function buildLocalChartFromTable(table: TableLike, opts?: { maxPoints?: 
 
   const chartType = preferChartType(table.grain, cols[xIndex], categories.length);
   const series: AnalyticsChartSeries[] = metricIndexes.map((mi, i) => ({
-    name: cols[mi] || `m${mi}`,
+    name: table.colTitles?.[mi] || cols[mi] || `m${mi}`,
     data: rows.map((r) => {
       const n = toNum(r[mi]);
       return Number.isFinite(n) ? n : 0;

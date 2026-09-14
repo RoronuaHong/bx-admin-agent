@@ -21,6 +21,11 @@ const pack = {
       { schema: "film_report", name: "elt_new_guid", fields: ["guid"] },
       { schema: "film_report", name: "elt_active_guid", fields: ["guid"] },
       { schema: "gather", name: "gather", fields: ["guid"] },
+      {
+        schema: "gather",
+        name: "gather_stat",
+        fields: ["date", "eventName", "eventCount", "activeUsers"],
+      },
     ],
   },
 };
@@ -90,5 +95,29 @@ assert.equal(compileCanCoverVerified(retentionTotal, "次日留存"), true);
 
 assert.equal(extractAppVersionFromNl("版本 2.4.1 的付费率"), "2.4.1");
 assert.equal(extractAppVersionFromNl("看看人数"), undefined);
+
+{
+  const hit = matchVerifiedQuery("埋点汇总", pack);
+  assert.ok(hit && "query" in hit);
+  if (hit && "query" in hit) assert.equal(hit.query.id, "gather_stat_daily");
+}
+
+{
+  const hit = matchVerifiedQuery("埋点", pack);
+  assert.equal(hit, null);
+}
+
+{
+  const q = queries.find((row) => row.id === "gather_stat_daily");
+  assert.ok(q);
+  const bound = bindVerifiedQuery(q!, { start: "2026-08-19", end: "2026-08-25" });
+  assert.equal(bound.ok, true);
+  if (bound.ok) {
+    assert.ok(bound.sql.includes("gather.gather_stat"));
+    assert.ok(bound.sql.includes("toDate(date)"));
+    assert.ok(!bound.sql.includes("createTime"));
+    assert.ok(!bound.sql.includes("{{"));
+  }
+}
 
 console.log("analytics-verified-query.test.ts OK");

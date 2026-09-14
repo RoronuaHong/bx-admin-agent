@@ -134,15 +134,15 @@ function pickWelcomeText(): string {
       ),
     () =>
       tx(
-        `欢迎使用数据分析 Agent。问数请带上日期或时间范围，避免口径模糊。示例：「${ex("zh")}」。`,
-        `Welcome to the Analytics Agent. Include a date or range so the metric scope is clear. Example: “${ex("en")}”.`,
+        `欢迎使用数据分析 Agent。问数请带上日期或时间范围。示例：「${ex("zh")}」。`,
+        `Welcome to the Analytics Agent. Include a date or range. Example: “${ex("en")}”.`,
         `Bem-vindo ao Agent de Analise. Inclua data ou intervalo para deixar o escopo claro. Exemplo: ${ex("pt")}.`,
         `एनालिटिक्स एजेंट में आपका स्वागत है। स्पष्ट तिथि/अवधि लिखें। उदाहरण: ${ex("hi")}।`,
       ),
     () =>
       tx(
-        `我可以帮你查 Metabase 指标。把渠道、维度和日期写清楚会更准，比如：「${ex("zh")}」。`,
-        `I can pull Metabase metrics for you. Naming channel, dimension, and dates helps — e.g. “${ex("en")}”.`,
+        `我可以帮你查 Metabase 指标。把渠道、看什么和日期写清楚会更准，比如：「${ex("zh")}」。`,
+        `I can pull Metabase metrics for you. Naming the channel, what to measure, and dates helps — e.g. “${ex("en")}”.`,
         `Posso buscar metricas no Metabase. Nomear canal, dimensao e datas ajuda — ex.: ${ex("pt")}.`,
         `मैं Metabase से मेट्रिक ला सकता हूँ। चैनल, आयाम और तिथि साफ़ लिखें — जैसे ${ex("hi")}।`,
       ),
@@ -381,10 +381,10 @@ async function undoLastAsk() {
         : "";
     const note = data.popped
       ? tx(
-          summary ? `已撤销上一 Ask，当前：${summary}` : "已撤销上一 Ask",
-          summary ? `Undid last Ask. Current: ${summary}` : "Undid last Ask",
+          summary ? `已撤销上一问，当前：${summary}` : "已撤销上一问",
+          summary ? `Undid the last question. Current: ${summary}` : "Undid the last question",
         )
-      : tx("没有可撤销的 Ask", "Nothing to undo");
+      : tx("没有可撤销的上一问", "Nothing to undo");
     touchConversation(id, (conv) => {
       conv.messages = [
         ...conv.messages,
@@ -555,7 +555,9 @@ const scanNote = ref("");
 const scanRefreshing = ref(false);
 
 function toTableView(table: AnalyticsAskTable): TableView {
-  const columns = table.cols.map((col) => ({ key: col, title: col }));
+  const titles =
+    table.colTitles?.length === table.cols.length ? table.colTitles : table.cols;
+  const columns = table.cols.map((col, i) => ({ key: col, title: titles[i] || col }));
   const rows = table.rows.map((row) => {
     const out: Record<string, string> = {};
     for (let i = 0; i < table.cols.length; i += 1) {
@@ -566,11 +568,18 @@ function toTableView(table: AnalyticsAskTable): TableView {
     return out;
   });
   return enrichTableView({
-    title: table.grain ? `${table.title} · ${table.grain}` : table.title,
+    title: askTableTitle(table),
     total: rows.length,
     columns,
     rows,
   });
+}
+
+function askTableTitle(table: AnalyticsAskTable): string {
+  if (table.grain !== "day") return table.title;
+  const byDay = tx("按天", "by day", "por dia", "दिन अनुसार");
+  if (table.title.includes(byDay) || /按天|by day/i.test(table.title)) return table.title;
+  return `${table.title} · ${byDay}`;
 }
 
 function formatRequestError(err: unknown): string {
@@ -937,10 +946,10 @@ function verifyLabel(item: AnalyticsBubble): string {
 
 function sqlTrustLabel(item: AnalyticsBubble): string {
   if (item.trust === "verified" || item.sqlSource === "verified_query") {
-    return tx("金样口径", "Verified query");
+    return tx("已核对查询", "Verified query");
   }
   if (item.trust === "unverified" || item.sqlSource === "llm_sql") {
-    return tx("未核验口径", "Unverified");
+    return tx("未核对查询", "Unverified");
   }
   return "";
 }
@@ -1311,7 +1320,7 @@ async function send(presetText?: string) {
   };
 
   try {
-    const data = await askAnalytics(text || askPayload.text, {
+    const data = await askAnalytics(askPayload.text || text, {
       model: selectedModel.value ?? undefined,
       signal: controller.signal,
       images: imageIds.length ? imageIds : undefined,
@@ -1588,10 +1597,11 @@ onUnmounted(() => {
           class="tab-undo"
           type="button"
           :disabled="!canUndoAsk || sending"
-          :title="tx('撤销上一 Ask', 'Undo last Ask')"
+          :title="tx('撤销上一问', 'Undo last question')"
+          :aria-label="tx('撤销上一问', 'Undo last question')"
           @click="undoLastAsk"
         >
-          {{ tx("撤销Ask", "Undo Ask") }}
+          {{ tx("撤销上一问", "Undo last") }}
         </button>
       </nav>
     </template>
@@ -2171,8 +2181,8 @@ onUnmounted(() => {
                 <h2>{{ tx("巡检", "Scan", "Varredura", "स्कैन") }}</h2>
                 <p class="scan-lead">
                   {{ tx(
-                    "手动触发 watch-users 规则集。仅启用 scan worker 的实例可入队；dryRun 不发钉钉。",
-                    "Enqueue watch-users. Only the scan-worker instance accepts runs; dryRun skips DingTalk.",
+                    "手动跑渠道日活。勾选「试跑」只检查、不发钉钉。",
+                    "Run channel daily-active checks. A trial run evaluates without sending DingTalk.",
                   ) }}
                 </p>
               </div>
@@ -2182,7 +2192,7 @@ onUnmounted(() => {
             <div class="scan-toolbar">
               <label class="dry-run">
                 <input v-model="scanDryRun" type="checkbox" :disabled="scanRunning" />
-                <span>{{ tx("dryRun（不发钉钉）", "dryRun (no DingTalk)") }}</span>
+                <span>{{ tx("试跑（不发钉钉）", "Trial run (no DingTalk)") }}</span>
               </label>
               <div class="scan-toolbar-actions">
                 <button type="button" class="ghost" :disabled="scanRefreshing || scanRunning" @click="refreshScanJobs">
@@ -2212,7 +2222,7 @@ onUnmounted(() => {
                   <div class="job-meta">
                     <span class="job-status" :data-status="job.status">{{ jobStatusLabel(job.status) }}</span>
                     <span class="job-date">{{ job.scanDate }}</span>
-                    <span v-if="job.dryRun" class="job-dry">dryRun</span>
+                    <span v-if="job.dryRun" class="job-dry">{{ tx("试跑", "trial") }}</span>
                     <span class="job-id" :title="job.jobId">{{ shortJobId(job.jobId) }}</span>
                   </div>
                   <p class="job-summary">{{ jobSummary(job) }}</p>

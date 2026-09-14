@@ -469,6 +469,7 @@ export async function fetchTraceRun(runId: string): Promise<{ release?: string; 
 export interface AnalyticsAskTable {
   title: string;
   cols: string[];
+  colTitles?: string[];
   rows: unknown[][];
   grain?: string;
 }

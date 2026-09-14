@@ -47,15 +47,18 @@ import { getTableSchemas } from "./catalog-schema.js";
 import {
   analyticsNonAskReply,
   buildAnalyticsHelpCard,
+  hasDataAskSignal,
+  isAcceptSuggestionTurn,
   isThanksTurn,
   shouldAnswerCapabilities,
 } from "./ask-kind.js";
-import { applyResolvedTime, resolveAskTimeRange } from "./time-resolve.js";
+import { applyResolvedTime, resolveAskTimeRange, turnMentionsTime } from "./time-resolve.js";
 import type { AnalyticsAskResult, DatasetResult } from "./types.js";
 import { verifyGrainDay, verifyMultiQueryIntent, verifyNamedChannel } from "./verify.js";
 import { reconcileNamedDimensions } from "./dim-reconcile.js";
 import { deriveFailureClass, newAskId, recordAskLedger } from "./audit-ledger.js";
 import { buildLocalChartsFromTables } from "./local-chart.js";
+import { withNlColumnTitles } from "./column-labels.js";
 import { buildAnalyticsIntentFromStructure, extractChannelsFromNl, intentToJson } from "./intent.js";
 import { compileAnalyticsIntent } from "./sql-compile.js";
 import {
@@ -328,9 +331,15 @@ function collectIssues(
   return [...new Set(issues)];
 }
 
-function sqlHasDayGrain(sql: string, pack: AnalyticsPack): boolean {
-  const f = packTimeField(pack).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`toDate\\s*\\(\\s*${f}\\s*\\)`, "i").test(sql);
+function sqlHasDayGrain(sql: string, pack: AnalyticsPack, table?: string): boolean {
+  const field = packTimeField(pack, table);
+  if (!field) return false;
+  const f = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const toDate = new RegExp(`toDate\\s*\\(\\s*${f}\\s*\\)`, "i");
+  if (toDate.test(sql)) {
+    return new RegExp(`group\\s+by[\\s\\S]*toDate\\s*\\(\\s*${f}\\s*\\)`, "i").test(sql);
+  }
+  return new RegExp(`group\\s+by[\\s\\S]*\\b${f}\\b`, "i").test(sql);
 }
 
 /** \u8986\u76d6\u7f3a\u53e3 / SQL \u5b89\u5168\u95ee\u9898 \u2192 refuse\uff1b\u5176\u4f59 \u2192 clarify */
@@ -358,7 +367,7 @@ async function runHybridSqls(input: {
   | {
       ok: true;
       sqls: string[];
-      tables: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+      tables: Array<{ title: string; cols: string[]; colTitles?: string[]; rows: unknown[][]; grain?: string }>;
       empty: boolean;
     }
   | { ok: false; sqls: string[]; issues: string[] }
@@ -397,12 +406,15 @@ async function runHybridSqls(input: {
   return {
     ok: true,
     sqls: execSqls,
-    tables: results.map((r, i) => ({
-      title: execSqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
-      cols: r.cols,
-      rows: r.rows,
-      grain: sqlHasDayGrain(execSqls[i]!, input.pack) ? "day" : undefined,
-    })),
+    tables: withNlColumnTitles(
+      results.map((r, i) => ({
+        title: execSqls.length > 1 ? `\u7ed3\u679c ${i + 1}` : "\u7ed3\u679c",
+        cols: r.cols,
+        rows: r.rows,
+        grain: sqlHasDayGrain(execSqls[i]!, input.pack, input.table) ? "day" : undefined,
+      })),
+      input.nl,
+    ),
     empty: allEmpty(results),
   };
 }
@@ -423,18 +435,20 @@ function ensureMaxRows(sql: string, maxRows: number): string {
 }
 
 function finalizeDeliveredTables(input: {
-  tables: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+  tables: Array<{ title: string; cols: string[]; colTitles?: string[]; rows: unknown[][]; grain?: string }>;
   message: string;
   askState?: AskState;
   mode?: DeliveryMode;
+  nl?: string;
 }): { tables: typeof input.tables; message: string } {
   const filled = applyDeliveryReconcile({
     tables: input.tables,
     requestedChannels: input.askState?.requested?.channels,
     mode: input.mode || "zero_fill",
   });
+  const tables = withNlColumnTitles(filled.tables, input.nl || "");
   return {
-    tables: filled.tables,
+    tables,
     message: filled.messageSuffix ? `${input.message}${filled.messageSuffix}` : input.message,
   };
 }
@@ -673,16 +687,76 @@ export async function analyticsAsk(
     }
 
     const userTexts = conversation.filter((m) => m.role === "user").map((m) => m.text);
-    const lastUserText = userTexts[userTexts.length - 1] || nlSafe || nlForResolve;
-    const priorUserTexts = userTexts.slice(0, -1).reverse();
+    let lastUserText = userTexts[userTexts.length - 1] || nlSafe || nlForResolve;
+    let priorUserTexts = userTexts.slice(0, -1).reverse();
     const prevAskStateEarly = parseAskState(opts?.prevAskState);
+    const pendingClarify = Boolean(opts?.lastClarifySlot);
+    const acceptSuggestion =
+      isAcceptSuggestionTurn(lastUserText) || (isThanksTurn(lastUserText) && pendingClarify);
+    if (acceptSuggestion) {
+      const priorData = priorUserTexts.find((t) => {
+        const s = String(t || "").trim();
+        if (!s || isAcceptSuggestionTurn(s) || isThanksTurn(s)) return false;
+        if (/^\u6f84\u6e05\u9009\u62e9[:\uff1a]/.test(s)) return false;
+        return hasDataAskSignal(s, pack) || turnMentionsTime(s);
+      });
+      if (priorData || pendingClarify || prevAskStateEarly) {
+        if (priorData) {
+          lastUserText = priorData;
+          for (let i = conversation.length - 1; i >= 0; i--) {
+            if (conversation[i]!.role === "user") {
+              conversation[i] = { role: "user", text: priorData };
+              break;
+            }
+          }
+          priorUserTexts = conversation
+            .filter((m) => m.role === "user")
+            .map((m) => m.text)
+            .slice(0, -1)
+            .reverse();
+        }
+        if (
+          pendingClarify &&
+          opts?.lastClarifySlot &&
+          opts.clarifyOptionIds?.length &&
+          !(opts.slotAnswers && Object.keys(opts.slotAnswers).length)
+        ) {
+          opts = {
+            ...opts,
+            slotAnswers: { [opts.lastClarifySlot]: [opts.clarifyOptionIds[0]!] },
+          };
+          const parts = Object.entries(opts.slotAnswers!).map(([k, vs]) => `${k}=${vs.join(",")}`);
+          conversation = [
+            ...conversation,
+            { role: "user", text: `\u6f84\u6e05\u9009\u62e9\uff1a${parts.join("\uff1b")}` },
+          ];
+        }
+      }
+    }
+    const catalogApplied = await refreshPackFromCatalog(pack, {
+      signal: opts?.signal,
+      nl: lastUserText,
+    });
+    pack = catalogApplied.pack;
+    const catalogFacts = formatCatalogFacts(pack, catalogApplied.notes);
+    const blocked = catalogApplied.unmodeledTablesInNl;
+    if (blocked.length) {
+      return seal({
+        status: "refuse",
+        message: `\u8868 ${blocked.join("\u3001")} \u5df2\u9690\u85cf\u6216\u4e0d\u53ef\u67e5\u8be2\uff08\u4e34\u65f6\u8868/\u5b57\u5178/\u4e0a\u4f20\u8868\uff09\uff0c\u4e0d\u4f1a\u751f\u6210 SQL\u3002`,
+        error: `blocked_table:${blocked.join(",")}`,
+        packVersion: pack.version,
+        semanticOk: false,
+        semanticIssues: catalogApplied.notes,
+      });
+    }
     if (
       !opts?.slotAnswers ||
       !Object.keys(opts.slotAnswers).length
     ) {
       if (shouldAnswerCapabilities(lastUserText, pack)) {
         turnKind = "help";
-        if (isThanksTurn(lastUserText) && prevAskStateEarly) {
+        if (isThanksTurn(lastUserText) && prevAskStateEarly && !pendingClarify) {
           return seal({
             status: "ok",
             message: analyticsNonAskReply({
@@ -741,24 +815,6 @@ export async function analyticsAsk(
         message: `${input.message}${verifyCaution(verify)}`,
       };
     };
-
-    const catalogApplied = await refreshPackFromCatalog(pack, {
-      signal: opts?.signal,
-      nl: lastUserText,
-    });
-    pack = catalogApplied.pack;
-    const catalogFacts = formatCatalogFacts(pack, catalogApplied.notes);
-    const blocked = catalogApplied.unmodeledTablesInNl;
-    if (blocked.length) {
-      return seal({
-        status: "refuse",
-        message: `\u8868 ${blocked.join("\u3001")} \u5df2\u9690\u85cf\u6216\u4e0d\u53ef\u67e5\u8be2\uff08\u4e34\u65f6\u8868/\u5b57\u5178/\u4e0a\u4f20\u8868\uff09\uff0c\u4e0d\u4f1a\u751f\u6210 SQL\u3002`,
-        error: `blocked_table:${blocked.join(",")}`,
-        packVersion: pack.version,
-        semanticOk: false,
-        semanticIssues: catalogApplied.notes,
-      });
-    }
 
     const timeResolved = resolveAskTimeRange({
       lastUserText,
@@ -2296,6 +2352,7 @@ export async function analyticsAsk(
           message,
           askState: currentAskState,
           mode: pack.delivery?.missingChannel,
+          nl: lastUserText,
         });
         const skipChannelDim = !canApplyTextChannelFilter(
           pack,
@@ -2558,6 +2615,7 @@ export async function analyticsAsk(
       message: `${range.echo}${emptyNote}`,
       askState: currentAskState,
       mode: pack.delivery?.missingChannel,
+      nl: lastUserText,
     });
     const skipChannelDim = !canApplyTextChannelFilter(
       pack,

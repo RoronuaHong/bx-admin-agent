@@ -48,10 +48,19 @@ export function looksLikeSelectAllReply(text: string): boolean {
   return /^(全部|全都要|全选|所有|都要|all|select\s*all)$/i.test(t);
 }
 
+/** 接受上一轮建议 / 第一种口径，不是新问也不是全选。 */
+export function looksLikeAcceptSuggestionReply(text: string): boolean {
+  const t = text.trim();
+  return /^(按你说的(?:来|做|办)?|就按你说的(?:来)?|就按这个|就这样(?:吧|查)?|你定|你看着办|随便(?:一个|选一个)?|第一种|选第一个|用第一个)[。.!！]*$/i.test(
+    t,
+  );
+}
+
 export function looksLikeSlotOnlyReply(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
   if (looksLikeSelectAllReply(t)) return true;
+  if (looksLikeAcceptSuggestionReply(t)) return true;
   if (extractLocaleCodes(t).length > 0 && t.length < 80) return true;
   if (looksLikeIndexOnlyReply(t)) return true;
   if (
@@ -98,6 +107,9 @@ export function resolveOptionIndexes(
 
   if (looksLikeSelectAllReply(t)) {
     return options.map((o) => o.id);
+  }
+  if (looksLikeAcceptSuggestionReply(t)) {
+    return [options[0]!.id];
   }
 
   const tokens = t.split(/[\s,，、;；]+/).filter(Boolean);

@@ -109,6 +109,20 @@ function parseNumberToken(token: string): number | null {
 
 const NUM = "[\\d一二三四五六七八九十两〇零]+";
 
+const REL_SPAN = `(?:最近|近|过去)\\s*(${NUM})\\s*(?:个)?\\s*(?:周|月|年)`;
+
+function addMonthsYmd(iso: string, tz: string, delta: number): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const total = y! * 12 + (m! - 1) + delta;
+  const ny = Math.floor(total / 12);
+  const nm = (total % 12) + 1;
+  const daysInTarget = new Date(Date.UTC(ny, nm, 0)).getUTCDate();
+  const nd = Math.min(d!, daysInTarget);
+  const target = `${ny}-${pad(nm)}-${pad(nd)}`;
+  // 跨月回推可能落在 tz 边界外，回读校正一次
+  return ymd(dateFromYmd(target, tz), tz);
+}
+
 function okRange(start: string, end: string): ResolveOk {
   return { ok: true, range: { start, end, echo: start === end ? `按 ${start}` : `按 ${start}～${end}` } };
 }
@@ -213,6 +227,7 @@ export function hasTimeSignal(nl: string): boolean {
   if (new RegExp(`(${NUM})\\s*天\\s*[前后内]`).test(nl)) return true;
   if (new RegExp(`最近\\s*(${NUM})\\s*天`).test(nl)) return true;
   if (/过去\s*\d+\s*天/.test(nl)) return true;
+  if (new RegExp(REL_SPAN).test(nl)) return true;
   return false;
 }
 
@@ -224,6 +239,7 @@ export function resolveTimeRange(nl: string, clock: Date, tz: string): ResolveRe
   if (
     /最近/.test(nl) &&
     !new RegExp(`最近\\s*(${NUM})\\s*天`).test(nl) &&
+    !new RegExp(REL_SPAN).test(nl) &&
     !/\d{1,2}\s*月/.test(nl) &&
     !/\d{4}-\d{2}-\d{2}/.test(nl) &&
     !/\d{4}-\d{2}(?!-\d)/.test(nl)
@@ -267,6 +283,36 @@ export function resolveTimeRange(nl: string, clock: Date, tz: string): ResolveRe
     }
     const start = addDaysYmd(today, tz, -(n - 1));
     return okRange(start, today);
+  }
+
+  // 近/最近/过去 N 周（含今天往前 7N 天，共 7N 天）
+  const recentWeeks = nl.match(new RegExp(`(?:最近|近|过去)\\s*(${NUM})\\s*周`));
+  if (recentWeeks) {
+    const n = parseNumberToken(recentWeeks[1]!);
+    if (n == null || n < 1 || n > 52) {
+      return { ok: false, clarify: "请提供分析的日期范围（例如 最近2周）。" };
+    }
+    return okRange(addDaysYmd(today, tz, -(n * 7 - 1)), today);
+  }
+
+  // 近/最近/过去 N 个月（含今天，回推 N 个日历月）
+  const recentMonths = nl.match(new RegExp(`(?:最近|近|过去)\\s*(${NUM})\\s*个?\\s*月`));
+  if (recentMonths) {
+    const n = parseNumberToken(recentMonths[1]!);
+    if (n == null || n < 1 || n > 36) {
+      return { ok: false, clarify: "请提供分析的日期范围（例如 最近3个月）。" };
+    }
+    return okRange(addMonthsYmd(today, tz, -n), today);
+  }
+
+  // 近/最近/过去 N 年（含今天，回推 N 个日历年）
+  const recentYears = nl.match(new RegExp(`(?:最近|近|过去)\\s*(${NUM})\\s*年`));
+  if (recentYears) {
+    const n = parseNumberToken(recentYears[1]!);
+    if (n == null || n < 1 || n > 10) {
+      return { ok: false, clarify: "请提供分析的日期范围（例如 最近1年）。" };
+    }
+    return okRange(addMonthsYmd(today, tz, -n * 12), today);
   }
 
   // N天前 / N天后（单日）

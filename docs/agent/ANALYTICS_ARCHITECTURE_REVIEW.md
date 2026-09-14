@@ -2,6 +2,8 @@
 
 > **2026-09-13 后续更正**：warehouse 已灌可答表（71 / 67 / 4），「1/71、生成 71 pack、Phase 0–4」不再作为实现计划。混合问数（编译 + 金样 + LLM 写 SQL）以 [`docs/superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md) 为准。**自然语言 → 正确结果表**的逐步对照见 [`ANALYTICS_NL_TO_TABLE.md`](./ANALYTICS_NL_TO_TABLE.md)。下文保留当日评审快照。
 >
+> **2026-09-14**：warehouse **coverage 已是可失败 GATE**（`evaluateWarehouseCoverage` / `warehouse-coverage.json`），与 EX 并列、**不进 EX 分母**。无 Metabase 时仍断言 pack overlay（1 表 / 8 声明字段）+ 扩表优先名单；有磁盘 catalog 时强制现行 **72 / 67 / 5** 与 overlay 活字段 **23**（Metabase 增 `metabase_upload.aa` 后由 71/67/4 漂到此数）。8/23 是文档化字段缺口。禁止用本文 §1「1/71」当作今日覆盖率。
+>
 > 日期：2026-09-13
 > 范围：`apps/agent-server/src/analytics/**` + `apps/agent-server/config/analytics/**`
 > 触发：对「EX=100%」评测结果的质疑 → 追查 gold 的能力边界 → 发现 1/71 表覆盖率问题
@@ -220,8 +222,8 @@ gold 是**手写**的，且只能写在**已建模表面之内**：24 条 gold S
 
 ### 8.3 建议同步做的两件事（低成本、高价值）
 
-1. **把 coverage 做成 GATE 一等输出**：`tablesCovered/totalTables`（现在 1/71）、`fieldsCovered`（现在 8/23），与 EX **并列**输出。**让 100% 旁边永远同时写着分母。**
-2. **补「未建模队列」的拒答精度测试**：对 70 张未建模表随机提问，验证系统**正确拒答、不跨表串答**（当前零覆盖，是真实生产风险）。
+1. **把 coverage 做成 GATE 一等输出**：~~`tablesCovered/totalTables`（现在 1/71）~~ **2026-09-14 已落地**：现行口径 **72 / 67 / 5** 与 overlay **8/23**（缺口记录，非 EX）。`evaluateWarehouseCoverage` 失败则 `test:analytics-gate` / eval harness 退出 1。不要再把 1/71 当现行覆盖率。
+2. **补「未建模队列」的拒答精度测试**：当日假设其余 70 张不可答。今日 67 张可答（Path A/B/C），隐藏 4 张仍须 refuse（gold `refuse-hidden-*`）。扩表优先名单见 `apps/agent-server/config/analytics/warehouse-coverage.json`，**不要**生成 71 份 pack。
 
 ---
 
@@ -238,5 +240,5 @@ gold 是**手写**的，且只能写在**已建模表面之内**：24 条 gold S
 
 ```powershell
 cd apps/agent-server
-node scripts/enumerate-metabase-tables.mjs     # 枚举 Metabase db 2 全部表，输出 71 表 + 覆盖率 1/71
+node scripts/enumerate-metabase-tables.mjs     # 枚举 Metabase db 2；今日口径 72/67/5，不是 1/71
 ```

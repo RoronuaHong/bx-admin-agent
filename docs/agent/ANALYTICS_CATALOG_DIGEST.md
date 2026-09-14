@@ -2,8 +2,8 @@
 
 > 由 live catalog 生成，**不要手改**。刷新：`pnpm --filter @bx/agent-server catalog-digest`
 
-- 生成时间：2026-09-13T01:49:11.567Z
-- metadata 拉取：2026-09-13T01:49:10.836Z
+- 生成时间：2026-09-14T06:54:46.737Z
+- metadata 拉取：2026-09-14T06:54:46.015Z
 - 数据库：Metabase db 2
 - 表：71（可答 67，隐藏 4）
 - 字段：1045（其中 284 个有 Metabase description）

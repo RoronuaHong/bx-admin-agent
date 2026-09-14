@@ -22,7 +22,7 @@ export interface AnalyticsAskResult {
   message: string;
   timeEcho?: string;
   sqls?: string[];
-  tables?: Array<{ title: string; cols: string[]; rows: unknown[][]; grain?: string }>;
+  tables?: Array<{ title: string; cols: string[]; colTitles?: string[]; rows: unknown[][]; grain?: string }>;
   probeSummary?: string;
   /** 待填槽位 id（如 contentLang / completion_rate / time_range） */
   clarifySlot?: string;

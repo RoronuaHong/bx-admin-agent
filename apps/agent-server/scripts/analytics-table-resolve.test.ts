@@ -193,6 +193,37 @@ assert.equal(overlayAskFromNl("观影日志的观看人数", pack), true);
 }
 
 {
+  const gpack = {
+    ...pack,
+    warehouse: {
+      tables: [
+        ...(pack.warehouse?.tables || []),
+        {
+          schema: "gather",
+          name: "gather",
+          fields: ["createTime", "eventName", "guid"],
+          description: "本表为埋点明细。核心信息：事件名、设备。",
+        },
+        {
+          schema: "gather",
+          name: "gather_stat",
+          fields: ["date", "eventName", "eventCount", "activeUsers"],
+          fieldTypes: { date: "type/Date", createTime: "type/DateTime" },
+          description:
+            "本表为埋点的按日+事件汇总。核心信息：统计日、事件名、事件次数、活跃用户数。",
+        },
+      ],
+    },
+  };
+  const r = resolveAskTable({ nl: "2026-08-19 到 2026-08-25 的埋点汇总", pack: gpack });
+  assert.equal(r.status, "ok");
+  if (r.status === "ok") {
+    assert.equal(r.table, "gather_stat");
+    assert.ok(r.confidence === "unique" || r.confidence === "named");
+  }
+}
+
+{
   const r = resolveAskTable({ nl: "2026-08-19 到 2026-08-25 活跃用户有多少", pack });
   assert.equal(r.status, "ok");
   if (r.status === "ok") {

@@ -27,6 +27,9 @@ import { reconcileNamedDimensions } from "../src/analytics/dim-reconcile.js";
   assert.equal(wantsMultiQuerySplit("各自按天"), true);
   assert.equal(wantsMultiQuerySplit("同时查"), true);
   assert.equal(wantsMultiQuerySplit("印度A按天"), false);
+  assert.equal(wantsMultiQuerySplit("viewers by day separately for IndiaA and FoxA"), true);
+  assert.equal(wantsMultiQuerySplit("viewers by channel for the last 7 days"), false);
+  assert.equal(wantsMultiQuerySplit("each channel"), false);
 }
 
 {

@@ -213,7 +213,7 @@ export function resolvePlanCardinality(input: {
     return {
       kind: "clarify",
       message:
-        "问句里包含多组不同的筛选×粒度，无法安全折成一张表。请拆成两次查询，或确认统一用同一套分组维度。",
+        "这句话里混了不同的分组方式（例如一个按天、一个按语言），不能收成一张表。请拆成两问，或统一用同一套分组。",
       notes: [...notes, "plan_cardinality:mixed_grain_clarify"],
     };
   }

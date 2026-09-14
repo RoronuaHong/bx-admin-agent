@@ -57,6 +57,14 @@
       "promoteTo": "retention_d1_total",
       "slots": ["start", "end", "channel", "appVersion"],
       "sql": "WITH\n'{{channel}}' AS targetChannel,\ntoDate('{{start}}') AS targetDate,\ntodayGuid AS (\n  SELECT guid, argMax(contentLang, createTime) AS contentLang\n  FROM gather.gather\n  WHERE eventName = 'content_language_save_success'\n    AND toDate(createTime) = targetDate\n    AND channel = targetChannel\n    AND appVerName = '{{appVersion}}'\n    AND guid IN (SELECT DISTINCT guid FROM elt_new_guid WHERE createDate = targetDate AND channel = targetChannel)\n  GROUP BY guid\n),\nretentionGuid AS (\n  SELECT b.guid AS guid, b.contentLang\n  FROM elt_active_guid AS a\n  INNER JOIN todayGuid AS b ON a.guid = b.guid\n  WHERE a.activeDate = addDays(targetDate, 1) AND a.channel = targetChannel\n),\ntodayCount AS (SELECT uniq(guid) AS a FROM todayGuid),\nretentionCount AS (SELECT uniq(guid) AS b FROM retentionGuid)\nSELECT t1.a, t2.b, round(t2.b / t1.a, 2)\nFROM todayCount AS t1, retentionCount AS t2"
+    },
+    {
+      "id": "gather_stat_daily",
+      "title": "埋点按日汇总",
+      "aliases": ["埋点汇总", "按日埋点", "事件次数汇总", "埋点日统计"],
+      "tables": ["gather_stat"],
+      "slots": ["start", "end"],
+      "sql": "SELECT toDate(date) AS watchDate, eventName,\nsum(eventCount) AS eventCount,\nsum(activeUsers) AS activeUsers\nFROM gather.gather_stat\nWHERE toDate(date) BETWEEN '{{start}}' AND '{{end}}'\nGROUP BY toDate(date), eventName\nORDER BY watchDate, eventName"
     }
   ]
 }

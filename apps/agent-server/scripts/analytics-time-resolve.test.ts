@@ -224,4 +224,37 @@ const tz = "Asia/Shanghai";
   }
 }
 
+{
+  // 近/最近/过去 N 周 / N 个月 / N 年（原来只有「最近N天」，N周会漏到兜底反问）
+  const w1 = resolveTimeRange("巴西和印度近2周的日活均值分别是多少？", clock, tz);
+  assert.equal(w1.ok, true);
+  if (w1.ok) {
+    assert.equal(w1.range.start, "2026-08-27"); // 14 天：09-09 往前 13 天
+    assert.equal(w1.range.end, "2026-09-09");
+  }
+  for (const q of ["近两周", "最近2周", "过去2周"]) {
+    const r = resolveTimeRange(q, clock, tz);
+    assert.equal(r.ok, true, q);
+    if (r.ok) {
+      assert.equal(r.range.start, "2026-08-27");
+      assert.equal(r.range.end, "2026-09-09");
+    }
+    assert.equal(hasTimeSignal(q), true, q);
+  }
+  const m3 = resolveTimeRange("最近3个月观看人数", clock, tz);
+  assert.equal(m3.ok, true);
+  if (m3.ok) {
+    assert.equal(m3.range.start, "2026-06-09");
+    assert.equal(m3.range.end, "2026-09-09");
+  }
+  const y1 = resolveTimeRange("近1年观看人数", clock, tz);
+  assert.equal(y1.ok, true);
+  if (y1.ok) {
+    assert.equal(y1.range.start, "2025-09-09");
+    assert.equal(y1.range.end, "2026-09-09");
+  }
+  // 裸「最近」仍必须反问
+  assert.equal(resolveTimeRange("最近看一下人数", clock, tz).ok, false);
+}
+
 console.log("analytics-time-resolve.test.ts OK");

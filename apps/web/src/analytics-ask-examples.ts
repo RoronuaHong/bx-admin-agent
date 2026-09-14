@@ -26,9 +26,9 @@ export const ANALYTICS_ASK_EXAMPLES: AnalyticsAskExample[] = [
   },
   {
     zh: "八月二十到二十一印度A和FoxA各自按天观看人数",
-    en: "viewers by day for IndiaA and FoxA from Aug 20–21",
-    pt: "visualizadores por dia IndiaA e FoxA de 20–21 ago",
-    hi: "IndiaA और FoxA 20–21 अगस्त दैनिक व्यूअर्स",
+    en: "viewers by day separately for IndiaA and FoxA from Aug 20–21",
+    pt: "visualizadores por dia separadamente IndiaA e FoxA de 20–21 ago",
+    hi: "IndiaA और FoxA 20–21 अगस्त अलग-अलग दैनिक व्यूअर्स",
   },
   {
     zh: "本周FoxA按语言观看人数",

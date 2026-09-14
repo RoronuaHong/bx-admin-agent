@@ -99,11 +99,11 @@
 ### `film_report.elt_invite_withdraw`
 
 - 对照：`elt_invite_invitee`、`elt_film_order`
-- 本表为邀请提现申请单（邀请赚钱兑会员），对照 elt_invite_invitee（邀请关系）与 elt_film_order（订单支付状态机）。
+- 本表为邀请提现申请单（邀请赚钱兑会员）。对照表见 basedOn，不参与检索。
 核心信息：申请人、渠道、提现金额与余额、申请单号与审核、支付单号与支付时间、是否退款。
 注意事项：
 1、金额用 sum(amount)，时间列优先 payTime（已支付）或 createTime（申请）。
-2、不是观影表，不要套观看人数。
+2、不是会员订单表，不要用本表回答「订单数」。
 
 ### `film_report.elt_sport_activity_guess`
 

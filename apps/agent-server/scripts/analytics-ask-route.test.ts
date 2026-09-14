@@ -27,6 +27,11 @@ const live = {
       { schema: "film_report", name: "elt_new_guid", fields: ["guid"] },
       { schema: "film_report", name: "elt_active_guid", fields: ["guid"] },
       { schema: "gather", name: "gather", fields: ["guid"] },
+      {
+        schema: "gather",
+        name: "gather_stat",
+        fields: ["date", "eventName", "eventCount", "activeUsers"],
+      },
     ],
   },
 };
@@ -191,6 +196,29 @@ assert.equal(llmSqlEnabled({ ANALYTICS_LLM_SQL: "off" } as NodeJS.ProcessEnv), f
   });
   assert.equal(r.path, "refuse");
   if (r.path === "refuse") assert.equal(r.reason, "no_route");
+}
+
+{
+  const r = routeAnalyticsAsk({
+    nl: "2026-08-19 到 2026-08-25 的埋点汇总",
+    pack: live,
+    lockedTable: "gather_stat",
+    linkedTables: ["gather_stat"],
+    llmSqlEnabled: true,
+  });
+  assert.equal(r.path, "verified_query");
+  if (r.path === "verified_query") assert.equal(r.query.id, "gather_stat_daily");
+}
+
+{
+  const r = routeAnalyticsAsk({
+    nl: "埋点",
+    pack: live,
+    lockedTable: "gather",
+    linkedTables: ["gather"],
+    llmSqlEnabled: true,
+  });
+  assert.equal(r.path, "llm_sql");
 }
 
 console.log("analytics-ask-route.test.ts OK");

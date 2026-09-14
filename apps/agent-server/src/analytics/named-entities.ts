@@ -96,7 +96,9 @@ export function entityReferencedInSql(
   return new RegExp(`\\b(?:${dims})\\s*(?:=|IN\\b)`, "i").test(sql);
 }
 
-/** Split-intent markers: parallel / per-entity queries. */
+/** Split-intent markers: parallel / per-entity queries. Do not match bare “each channel”. */
 export function wantsMultiQuerySplit(nl: string): boolean {
-  return /各自|同时|分别|分开|各一张/.test(nl);
+  return /各自|同时|分别|分开|各一张|separately|respectively|at the same time|side by side|separadamente|ao mesmo tempo|अलग-अलग|एक साथ/i.test(
+    nl,
+  );
 }

@@ -73,14 +73,15 @@ function exampleText(ex: AnalyticsAskExample) {
 
         <div class="cap-body">
           <p class="cap-intro">
-            {{ tx("我是数据分析 Agent：用自然语言问观看人数等指标，结果来自 Metabase。尽量写明", "I am the Analytics Agent. Ask metrics like viewers in natural language; results come from Metabase. Prefer an explicit ", "Sou o Agent de Analise. Pergunte metricas como visualizadores em linguagem natural; resultados do Metabase. Prefira ", "मैं एनालिटिक्स एजेंट हूँ। प्राकृतिक भाषा में व्यूअर्स जैसे मेट्रिक पूछें — परिणाम Metabase से। स्पष्ट ") }}<strong>{{ tx("日期或时间范围", "date or range", "data ou intervalo", "तिथि या अवधि") }}</strong>{{ tx("；缺日期会反问，不编造口径。", "; if it is missing I will ask — I will not invent definitions.", "; se faltar, eu pergunto — sem inventar definicoes.", "; तिथि न हो तो मैं पूछूंगा — काल्पनिक परिभाषा नहीं।") }}
+            {{ tx("我是数据分析 Agent：用自然语言问观看人数等指标，结果来自 Metabase。尽量写明", "I am the Analytics Agent. Ask metrics like viewers in natural language; results come from Metabase. Prefer an explicit ", "Sou o Agent de Analise. Pergunte metricas como visualizadores em linguagem natural; resultados do Metabase. Prefira ", "मैं एनालिटिक्स एजेंट हूँ। प्राकृतिक भाषा में व्यूअर्स जैसे मेट्रिक पूछें — परिणाम Metabase से। स्पष्ट ") }}<strong>{{ tx("日期或时间范围", "date or range", "data ou intervalo", "तिथि या अवधि") }}</strong>{{ tx("；缺日期会反问，不会自己猜指标怎么算。", "; if it is missing I will ask — I will not invent definitions.", "; se faltar, eu pergunto — sem inventar definicoes.", "; तिथि न हो तो मैं पूछूंगा — काल्पनिक परिभाषा नहीं।") }}
           </p>
 
           <section>
             <h3>{{ tx("怎么问", "How to ask", "Como perguntar", "कैसे पूछें") }}</h3>
             <ul>
-              <li>{{ tx("一次说清：渠道 / 维度 + 指标 + 日期（「昨天」「最近 7 天」也可以）", "Spell out channel/dimension + metric + dates (“yesterday” or “last 7 days” also works)", "Diga canal/dimensao + metrica + datas (“ontem” ou “ultimos 7 dias” tambem vale)", "एक साथ बताएं: चैनल/आयाम + मेट्रिक + तिथि (“कल” या “पिछले 7 दिन” भी चलता है)") }}</li>
-              <li>{{ tx("对比、或「按天」和「按渠道」混在一句里时，会拆成多张表", "Comparisons, or mixing daily and by-channel in one ask, return multiple tables", "Comparacoes, ou misturar por dia e por canal na mesma pergunta, retornam varias tabelas", "तुलना, या एक ही सवाल में दैनिक और चैनल अनुसार मिलाने पर कई तालिकाएं मिलेंगी") }}</li>
+              <li>{{ tx("一次说清：渠道 + 指标 + 日期（「昨天」「最近 7 天」也可以）", "Spell out channel + metric + dates (“yesterday” or “last 7 days” also works)", "Diga canal + metrica + datas (“ontem” ou “ultimos 7 dias” tambem vale)", "एक साथ बताएं: चैनल + मेट्रिक + तिथि (“कल” या “पिछले 7 दिन” भी चलता है)") }}</li>
+              <li>{{ tx("同一句里说「各自 / 同时 / 分别」会拆成多张表。只说「各渠道」通常还是一张表。一句里 A 按天、B 按语言，也会拆开。", "Saying “separately / at the same time” in one sentence splits into several tables. “Each channel” is usually still one table. Mixing “A by day” and “B by language” also splits.", "Dizer “separadamente / ao mesmo tempo” na mesma frase vira varias tabelas. “Cada canal” costuma ser uma so. Misturar “A por dia” e “B por idioma” tambem separa.", "एक वाक्य में “अलग-अलग / एक साथ” कहने पर कई टेबल बनती हैं। “हर चैनल” आमतौर पर एक टेबल ही रहता है। “A दिन अनुसार, B भाषा अनुसार” मिलाने पर भी अलग हो जाता है।") }}</li>
+              <li>{{ tx("「最近 7 天」从今天往回数，含当天（当天可能还不完整）。", "“Last 7 days” counts back from today and includes today (today may still be incomplete).", "“Últimos 7 dias” conta a partir de hoje e inclui hoje (hoje pode estar incompleto).", "“पिछले 7 दिन” आज से पीछे गिनते हैं और आज शामिल है (आज अधूरा हो सकता है)।") }}</li>
             </ul>
           </section>
 
@@ -104,7 +105,7 @@ function exampleText(ex: AnalyticsAskExample) {
             <h3>{{ tx("巡检", "Scan", "Varredura", "स्कैन") }}</h3>
             <ul>
               <li>{{ tx("顶栏「巡检」可手动跑渠道日活", "Header “Scan” runs channel daily-active checks", "O “Varredura” no topo roda a checagem de ativos diarios por canal", "हेडर “स्कैन” चैनल दैनिक एक्टिव जांच चलाता है") }}</li>
-              <li>{{ tx("勾选 dryRun 只试跑、不发钉钉", "Check dryRun to trial the job without sending DingTalk", "Marque dryRun para testar sem enviar DingTalk", "dryRun चुनें तो सिर्फ ट्रायल होगा, DingTalk नहीं जाएगा") }}</li>
+              <li>{{ tx("勾选「试跑」只检查、不发钉钉", "Check “trial run” to evaluate without sending DingTalk", "Marque “teste” para avaliar sem enviar DingTalk", "“ट्रायल” चुनें तो जांच होगी, DingTalk नहीं जाएगा") }}</li>
               <li>{{ tx("自动巡检开启后，每天汇总昨日日活（不是投放 ROI）", "When auto-scan is on, yesterday’s daily actives are summarized each day (not ad ROI)", "Com a varredura automatica, os ativos de ontem sao resumidos todo dia (nao e ROI de ads)", "ऑटो-स्कैन चालू हो तो हर दिन कल के दैनिक एक्टिव का सार आता है (विज्ञापन ROI नहीं)") }}</li>
             </ul>
           </section>
@@ -125,7 +126,7 @@ function exampleText(ex: AnalyticsAskExample) {
           </section>
 
           <p class="cap-note">
-            {{ tx("问数会话与后台管理 Agent 隔离，不能改后台数据。会话 Tab 先保存在本机。", "Analytics chats are separate from the Admin Agent and cannot change backend data. Conversation tabs stay on this device for now.", "As conversas de analise ficam isoladas do Agent de Backoffice e nao alteram dados. As abas ficam neste dispositivo por enquanto.", "एनालिटिक्स चैट एडमिन एजेंट से अलग हैं और बैकएंड डेटा नहीं बदलतीं। टैब अभी इसी डिवाइस पर रहते हैं।") }}
+            {{ tx("问数会话与后台管理 Agent 隔离，不能改后台数据。会话会记在本机，登录后也会从服务器拉回。", "Analytics chats are separate from the Admin Agent and cannot change backend data. Conversations are cached on this device and also pulled from the server after login.", "As conversas de analise ficam isoladas do Agent de Backoffice e nao alteram dados. As abas ficam neste dispositivo e tambem voltam do servidor apos o login.", "एनालिटिक्स चैट एडमिन एजेंट से अलग हैं और बैकएंड डेटा नहीं बदलतीं। टैब इस डिवाइस पर रहते हैं और लॉगिन के बाद सर्वर से भी आते हैं।") }}
           </p>
         </div>
 
