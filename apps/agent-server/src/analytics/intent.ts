@@ -4,10 +4,13 @@
  */
 
 import { extractNamedEntities } from "./named-entities.js";
+import { nlWantsDim, nlWantsGrain } from "./nl-signals.js";
 import {
   extractAliasedEnumValues,
   isOverlayTable,
+  packDefaultEntityKey,
   packFieldsForTable,
+  packGrainId,
   canApplyTextChannelFilter,
   pruneFiltersToTable,
   remapEnumTokens,
@@ -32,12 +35,23 @@ export type CompileMetricKind =
 
 const GENERIC_METRIC_RE = /^(uniq|sum|avg|count):([A-Za-z_][A-Za-z0-9_]*|\*)$/;
 
-export function parseGenericMetricId(metricId: string): AnalyticsIntent["metric"] | null {
+/**
+ * `uniq:field|*` / `sum:field` / `avg:field` / `count:field|*`.
+ * `*` resolves to the pack's first declared entity key — never a hard-coded column.
+ */
+export function parseGenericMetricId(
+  metricId: string,
+  defaultEntityKey?: string,
+): AnalyticsIntent["metric"] | null {
   const m = String(metricId || "").trim().match(GENERIC_METRIC_RE);
   if (!m) return null;
   const op = m[1] as "uniq" | "sum" | "avg" | "count";
   const field = m[2]!;
-  if (op === "uniq") return { id: metricId, kind: "uniq", distinctField: field === "*" ? "guid" : field };
+  if (op === "uniq") {
+    const key = field === "*" ? String(defaultEntityKey || "").trim() : field;
+    if (!key) return null;
+    return { id: metricId, kind: "uniq", distinctField: key };
+  }
   if (op === "sum") return { id: metricId, kind: "sum", valueField: field };
   if (op === "avg") return { id: metricId, kind: "avg", valueField: field };
   return { id: metricId, kind: "count", valueField: field === "*" ? undefined : field };
@@ -120,6 +134,10 @@ export function extractChannelsFromNl(nl: string, pack?: AnalyticsPack): string[
   return remapEnumTokens([...found], pack, "channel");
 }
 
+/**
+ * `metricDefs[].options[].compile` is the only source of a metric's SQL recipe.
+ * No metric id / field name fallbacks in code — adding a pack needs zero code change.
+ */
 function resolveMetricCompile(
   metricId: string,
   pack: AnalyticsPack,
@@ -128,17 +146,7 @@ function resolveMetricCompile(
     for (const opt of def.options || []) {
       if (opt.id !== metricId) continue;
       const c = opt.compile;
-      if (!c?.kind) {
-        if (metricId === "avg_max_progress") {
-          return {
-            id: metricId,
-            kind: "avg_of_max",
-            valueField: "maxWatchProgress",
-            entityKeys: ["guid", "eid"],
-          };
-        }
-        return null;
-      }
+      if (!c?.kind) return null;
       return {
         id: metricId,
         kind: c.kind as AnalyticsIntent["metric"]["kind"],
@@ -148,29 +156,7 @@ function resolveMetricCompile(
       };
     }
   }
-  if (metricId === "avg_max_progress") {
-    return {
-      id: metricId,
-      kind: "avg_of_max",
-      valueField: "maxWatchProgress",
-      entityKeys: ["guid", "eid"],
-    };
-  }
-  if (metricId === "uniq_users") {
-    return { id: metricId, kind: "uniq", distinctField: "guid" };
-  }
-  if (metricId === "sum_watch_second") {
-    return { id: metricId, kind: "sum", valueField: "watchSecond" };
-  }
-  if (metricId === "avg_watch_second_per_user") {
-    return {
-      id: metricId,
-      kind: "avg_per_user",
-      valueField: "watchSecond",
-      distinctField: "guid",
-    };
-  }
-  return parseGenericMetricId(metricId);
+  return parseGenericMetricId(metricId, packDefaultEntityKey(pack));
 }
 
 /** 由对话结构化结果组装 Intent。 */
@@ -221,31 +207,37 @@ export function buildAnalyticsIntentFromStructure(input: {
     if (ver) filters.appVersion = [ver];
   }
   const overlayFields = pack.tables[0]?.fields || [];
+  // 默认类型过滤的落槽字段来自 pack 声明（guards.defaultMovieTypesField），不写死维字段名。
+  const defaultTypesField = String(pack.guards.defaultMovieTypesField || "").trim();
   if (
+    defaultTypesField &&
     isOverlayTable(pack, table) &&
-    !filters.movieType?.length &&
+    !filters[defaultTypesField]?.length &&
     pack.guards.defaultMovieTypes?.length &&
-    (!overlayFields.length || overlayFields.includes("movieType"))
+    (!overlayFields.length || overlayFields.includes(defaultTypesField))
   ) {
-    filters.movieType = pack.guards.defaultMovieTypes.map(String);
+    filters[defaultTypesField] = pack.guards.defaultMovieTypes.map(String);
   }
 
   let outputDims = [...structure.outputDims];
-  // 用户显式提及的分组维兜底补齐（复用既有推断正则）：模型 structure 偶发漏填 outputDims
-  //（如点名「按观看日期和渠道分组」却只输出 watch_date），导致 SELECT/GROUP BY 缺列。
   // 用户点名了分组维就必须出现在结果列中（2026-09-14 ground truth 对齐）。
-  if (/按天|按日|按.*日期|每天|观看日期/.test(fallbackNl) && !outputDims.includes("watch_date")) {
-    outputDims.unshift("watch_date");
+  // 是否点名由 pack 维度/粒度同义词判定，不在代码里写死业务词。
+  const grainId = packGrainId(pack);
+  if (grainId && nlWantsGrain(fallbackNl, pack) && !outputDims.includes(grainId)) {
+    outputDims.unshift(grainId);
   }
-  if (
-    tableHasField(pack, table, "channel") &&
-    /按.*渠道|各渠道|观看日期.*渠道|渠道.*维度/.test(fallbackNl) &&
-    !outputDims.includes("channel")
-  ) {
-    outputDims.push("channel");
+  // Pack-flagged output dims the NL names, limited to columns the target table really has.
+  // The pivot dim is excluded on purpose: it becomes columns (layout), not a group-by key,
+  // and auto-adding it would defeat the missing-layout gate below.
+  for (const d of pack.enumDimensions || []) {
+    if (!d.outputDim) continue;
+    const col = d.field || d.id;
+    if (!col || col === structure.pivotDim || outputDims.includes(col)) continue;
+    if (d.field && !tableHasField(pack, table, d.field)) continue;
+    if (nlWantsDim(fallbackNl, pack, d.id || col)) outputDims.push(col);
   }
   if (knownFields.size) {
-    outputDims = outputDims.filter((d) => d === "watch_date" || knownFields.has(d));
+    outputDims = outputDims.filter((d) => d === grainId || knownFields.has(d));
   }
 
   const pivotDim = structure.pivotDim;

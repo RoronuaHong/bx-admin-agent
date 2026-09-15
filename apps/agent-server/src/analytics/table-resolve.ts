@@ -5,13 +5,14 @@
  * close scores → Path C with top-k rich schemas + compact catalog.
  */
 
-import { tableIdentity, tableSynonyms } from "./catalog-card.js";
+import { tableDeclaredSynonyms, tableIdentity, tableSynonyms } from "./catalog-card.js";
 import { answerableTableNamedInNl } from "./catalog.js";
 import { inferMetricIdFromNl } from "./metric-infer.js";
 import {
   expandLinkedTables,
   findMetricOption,
   overlayTableName,
+  packFieldsForTable,
   type AnalyticsPack,
   type WarehouseTable,
 } from "./semantic-layer.js";
@@ -43,34 +44,24 @@ export type TableResolveClarify = {
 };
 export type TableResolveResult = TableResolveOk | TableResolveClarify;
 
-/** NL stems → table-name tokens. Used only to rank, never to invent metrics. */
-const STEM_ALIASES: Array<{ re: RegExp; stems: string[] }> = [
-  { re: /订单|下单|付款|支付|成交|营收|\bpay\b|\bgmv\b/i, stems: ["order", "pay"] },
-  { re: /充值|recharge/i, stems: ["recharge"] },
-  { re: /设备|device/i, stems: ["device"] },
-  { re: /邀请|invite/i, stems: ["invite"] },
-  { re: /安装|referrer/i, stems: ["referrer", "install"] },
-  { re: /登录|login/i, stems: ["login"] },
-  { re: /会员|vip/i, stems: ["vip"] },
-];
-
+/**
+ * Ranking is doc-driven only: Metabase table/field docs (catalog-card identity + synonyms,
+ * field displayName/description) and the NL's own Latin identifiers. Business wording for
+ * retrieval belongs in the warehouse metadata or config/analytics/catalog-cards.json —
+ * never in code.
+ */
 export function overlayAskFromNl(nl: string, pack?: AnalyticsPack): boolean {
   const text = String(nl || "");
   if (!text.trim()) return false;
+  const overlay = overlayTableName(pack);
   if (pack) {
     const named = answerableTableNamedInNl(text, pack);
-    if (named && named !== overlayTableName(pack)) return false;
+    if (named && named !== overlay) return false;
   }
-  if (
-    /观影日志|观影行为|偏好行为|播放错误|播放缓冲/i.test(text) &&
-    !/观看人数|完播率|人均观看|人均时长/i.test(text)
-  ) {
-    return false;
-  }
-  if (/观看|观影|完播|人均观看|观看人数|watchSecond|maxWatchProgress|lastWatchTime/i.test(text)) {
+  // Any column of the overlay table named verbatim in the NL is an overlay signal.
+  if (overlay && packFieldsForTable(pack, overlay).some((f) => f.length >= 4 && text.includes(f))) {
     return true;
   }
-  const overlay = overlayTableName(pack);
   for (const def of pack?.metricDefs || []) {
     if (def.tables?.length && overlay && !def.tables.includes(overlay)) continue;
     if ((def.aliases || []).some((a) => a && text.includes(a))) return true;
@@ -95,14 +86,6 @@ function nlLatinTokens(nl: string): Set<string> {
     out.add(m[1]!.toLowerCase());
   }
   return out;
-}
-
-function stemHits(nl: string): string[] {
-  const hits: string[] = [];
-  for (const row of STEM_ALIASES) {
-    if (row.re.test(nl)) hits.push(...row.stems);
-  }
-  return [...new Set(hits)];
 }
 
 const DOC_STOP = new Set([
@@ -164,17 +147,30 @@ const DOC_STOP = new Set([
   "说明",
 ]);
 
+/**
+ * Title-weight phrases come from the table's **headline sentence only**. Later sentences in
+ * a Metabase description are often cross-references ("…对照 <other table>…", "…不是本表"),
+ * and letting those carry title weight mis-routes asks to the wrong table.
+ */
 function tableTitleText(t: WarehouseTable): string {
-  return tableIdentity(t);
+  const identity = tableIdentity(t);
+  return identity.split(/[。.;；\n]/)[0]?.trim() || identity;
 }
 
+/**
+ * Doc-derived phrases for retrieval: everything in the Metabase description beyond the
+ * identity (first) line, split into short items. Document section names live in the
+ * warehouse metadata, not in code.
+ */
 function tableCoreItems(t: WarehouseTable): string[] {
   const desc = String(t.description || "");
-  const m = desc.match(/核心信息[：:]([\s\S]*?)(?:注意事项|$)/);
-  if (!m?.[1]) return [];
-  return m[1]
+  if (!desc.trim()) return [];
+  const lines = desc.split(/\n/);
+  const body = (lines.length > 1 ? lines.slice(1).join("\n") : desc).trim();
+  if (!body) return [];
+  return body
     .split(/[、，,;；。\n]/)
-    .map((s) => s.trim())
+    .map((s) => s.replace(/^[-*\s·•]+/, "").replace(/[：:]\s*$/, "").trim())
     .filter((s) => s.length >= 2 && s.length <= 16);
 }
 
@@ -237,6 +233,19 @@ function scoreDocOverlap(nl: string, pack: AnalyticsPack): Map<string, number> {
 
 function scoreSynonymHits(nl: string, pack: AnalyticsPack): Map<string, number> {
   const text = String(nl || "");
+  const hits = new Map<string, number>();
+  const bump = (name: string, points: number) => hits.set(name, (hits.get(name) || 0) + points);
+
+  // 1) Declared synonyms (config/warehouse-curated) are trusted surface forms: short or
+  //    shared ones still retrieve their tables instead of being filtered out as noise.
+  for (const t of pack.warehouse?.tables || []) {
+    if (!t.name) continue;
+    for (const syn of tableDeclaredSynonyms(t)) {
+      if (syn && text.includes(syn)) bump(t.name, syn.length >= 3 ? 6 : 5);
+    }
+  }
+
+  // 2) Derived synonyms (display name / identity tails) are noisy → keep the idf filters.
   const owners = new Map<string, string[]>();
   for (const t of pack.warehouse?.tables || []) {
     for (const syn of tableSynonyms(t)) {
@@ -245,7 +254,6 @@ function scoreSynonymHits(nl: string, pack: AnalyticsPack): Map<string, number> 
       owners.set(syn, list);
     }
   }
-  const hits = new Map<string, number>();
   const syns = [...owners.keys()].sort((a, b) => b.length - a.length);
   for (const syn of syns) {
     if (!text.includes(syn)) continue;
@@ -255,9 +263,7 @@ function scoreSynonymHits(nl: string, pack: AnalyticsPack): Map<string, number> 
     const idf = tables.length === 1 ? 8 : tables.length === 2 ? 3 : 1;
     const lenBonus = syn.length >= 4 ? 4 : syn.length >= 3 ? 2 : 0;
     const points = idf + lenBonus;
-    for (const name of tables) {
-      hits.set(name, (hits.get(name) || 0) + points);
-    }
+    for (const name of tables) bump(name, points);
   }
   return hits;
 }
@@ -305,7 +311,6 @@ function scoreFieldOverlap(nl: string, pack: AnalyticsPack): Map<string, number>
 export function scoreAnswerableTables(nl: string, pack: AnalyticsPack): Array<{ name: string; score: number }> {
   const text = String(nl || "");
   const latin = nlLatinTokens(text);
-  const stems = stemHits(text);
   const docHits = scoreDocOverlap(text, pack);
   const fieldHits = scoreFieldOverlap(text, pack);
   const synHits = scoreSynonymHits(text, pack);
@@ -318,7 +323,10 @@ export function scoreAnswerableTables(nl: string, pack: AnalyticsPack): Array<{ 
     if (latin.has(lower)) score += 8;
     for (const tok of tableTokens(name)) {
       if (latin.has(tok)) score += 4;
-      if (stems.includes(tok)) score += 3;
+    }
+    // A column identifier named in the NL also points at its table (generic, doc-driven).
+    for (const f of t.fields || []) {
+      if (f.length >= 5 && (latin.has(f.toLowerCase()) || text.includes(f))) score += 3;
     }
     if (score > 0) ranked.push({ name, score });
   }
@@ -360,7 +368,7 @@ export function resolveAskTable(input: {
   /** Previous Ask table; used when this turn does not name/score a different table. */
   fallback?: string;
 }): TableResolveResult {
-  const overlay = overlayTableName(input.pack) || "elt_watch_detail";
+  const overlay = overlayTableName(input.pack) || input.pack.tables?.[0]?.name || "";
   const named = answerableTableNamedInNl(input.nl, input.pack);
   if (named) return okResult(input.pack, named, "named_in_nl", "named");
 

@@ -2,6 +2,13 @@
  * Analytics M2 Task 6 — local chart track (no Metabase temp card).
  * Convert result tables → ChartView when there is a category/date X + numeric Y.
  */
+import {
+  packGrainAlias,
+  packGrainId,
+  packTimeField,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
+
 export type AnalyticsChartSeries = {
   name: string;
   data: number[];
@@ -24,10 +31,31 @@ type TableLike = {
   grain?: string;
 };
 
-const DATEISH =
-  /^(d|day|date|statdate|stat_date|lastwatchtime|dt|周期|日期|天)$/i;
-const DIMISH =
-  /^(channel|contentlang|lang|language|package|packname|name|label|title|category|dim|渠道|语言|包)$/i;
+/**
+ * Column-name cues for chart axis picking. Core tokens are generic words; the warehouse's
+ * own time column / dim fields / dim aliases come from the pack (see setActiveColumnNames).
+ */
+const DATEISH_CORE = /^(d|day|date|statdate|stat_date|dt|周期|日期|天)$/i;
+const DIMISH_CORE = /^(name|label|title|category|dim)$/i;
+
+let activeDateNames: string[] = [];
+let activeDimNames: string[] = [];
+
+/** Called once per buildLocalChartsFromTables (the build itself is synchronous). */
+function setActiveColumnNames(pack?: AnalyticsPack): void {
+  activeDateNames = [packTimeField(pack), packGrainAlias(pack), packGrainId(pack)]
+    .filter(Boolean)
+    .map((s) => String(s).toLowerCase());
+  activeDimNames = (pack?.enumDimensions || [])
+    .flatMap((d) => [d.field, d.id, ...(d.aliases || [])])
+    .filter(Boolean)
+    .map((s) => String(s).toLowerCase());
+}
+
+function nameInPool(name: string, pool: string[]): boolean {
+  const n = String(name || "").toLowerCase();
+  return Boolean(n) && pool.includes(n);
+}
 
 function toNum(v: unknown): number {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -39,7 +67,7 @@ function toNum(v: unknown): number {
 }
 
 function colLooksDate(name: string, sample: unknown[]): boolean {
-  if (DATEISH.test(name)) return true;
+  if (DATEISH_CORE.test(name) || nameInPool(name, activeDateNames)) return true;
   let dateHits = 0;
   for (const cell of sample.slice(0, 8)) {
     const s = String(cell ?? "");
@@ -49,7 +77,7 @@ function colLooksDate(name: string, sample: unknown[]): boolean {
 }
 
 function colLooksDim(name: string): boolean {
-  return DIMISH.test(name);
+  return DIMISH_CORE.test(name) || nameInPool(name, activeDimNames);
 }
 
 function isMostlyNumeric(values: unknown[]): boolean {
@@ -100,7 +128,7 @@ export function preferChartType(
   xCol: string,
   categoryCount: number,
 ): "line" | "bar" {
-  if (grain === "day" || DATEISH.test(xCol)) return "line";
+  if (grain === "day" || DATEISH_CORE.test(xCol) || nameInPool(xCol, activeDateNames)) return "line";
   if (categoryCount <= 12) return "bar";
   return "line";
 }
@@ -145,8 +173,9 @@ export function buildLocalChartFromTable(table: TableLike, opts?: { maxPoints?: 
 
 export function buildLocalChartsFromTables(
   tables: TableLike[] | undefined,
-  opts?: { maxPoints?: number; maxCharts?: number },
+  opts?: { maxPoints?: number; maxCharts?: number; pack?: AnalyticsPack },
 ): AnalyticsChartView[] {
+  setActiveColumnNames(opts?.pack);
   if (!tables?.length) return [];
   const maxCharts = Math.max(1, opts?.maxCharts ?? 4);
   const out: AnalyticsChartView[] = [];

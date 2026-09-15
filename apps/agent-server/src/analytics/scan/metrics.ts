@@ -1,6 +1,6 @@
 import { config } from "../../config.js";
 import { runNativeDataset } from "../metabase-client.js";
-import { loadAnalyticsPack, packTimeField } from "../semantic-layer.js";
+import { loadAnalyticsPack, packDefaultEntityKey, packTimeField } from "../semantic-layer.js";
 import {
   assertReadonlySingleSelect,
   assertTablesWhitelisted,
@@ -11,55 +11,68 @@ import { assertYmd, normalizeDateCell } from "./freshness.js";
 import type { ScanMetricRow } from "./threshold.js";
 
 const IDENT_RE = /^[a-zA-Z_][\w]*$/;
-const DEFAULT_TABLE = "elt_watch_detail";
 
+/**
+ * Every identifier is supplied by config (rule set `dimensions.rollup` + pack), never
+ * defaulted in code — a different warehouse only changes config.
+ */
 export interface ChannelUsersSqlOpts {
   scanDate: string;
   dodDate: string;
   wowDate: string;
-  /** Fact table (must be pack-whitelisted). Default elt_watch_detail. */
-  table?: string;
-  /** Optional movieType IN (…) from pack.guards.defaultMovieTypes. */
-  movieTypes?: number[];
+  /** Fact table (must be pack-whitelisted). */
+  table: string;
+  /** Group-by entity column (rule set `dimensions.rollup`). */
+  entityField: string;
+  /** Distinct-count column (pack entity key). */
+  distinctField: string;
+  /** Business time column (pack.time.field). */
+  timeField: string;
+  /** Optional equality filter, e.g. pack.guards.defaultMovieTypesField + defaultMovieTypes. */
+  filterField?: string;
+  filterValues?: number[];
   /** Distinct-count fn; default uniq. */
   distinctCountFn?: "uniq" | "uniqExact";
-  /** Business time column; default lastWatchTime. */
-  timeField?: string;
 }
 
 export type ChannelDailyUserRow = ScanMetricRow & { sample: number | null };
 
+function ident(value: string | undefined, label: string): string {
+  const v = String(value || "").trim();
+  if (!IDENT_RE.test(v)) {
+    throw new Error(`invalid ${label} identifier: ${v}`);
+  }
+  return v;
+}
+
 /**
- * One GROUP BY channel + date query covering scan / dod / wow days.
- * Pivot to per-channel scan/dod/wow values happens in JS.
+ * One GROUP BY <entity> + date query covering scan / dod / wow days.
+ * Pivot to per-entity scan/dod/wow values happens in JS.
  */
 export function buildChannelUsersSql(opts: ChannelUsersSqlOpts): string {
-  const table = opts.table ?? DEFAULT_TABLE;
-  if (!IDENT_RE.test(table)) {
-    throw new Error(`invalid table identifier: ${table}`);
-  }
   const scanDate = assertYmd(opts.scanDate, "scanDate");
   const dodDate = assertYmd(opts.dodDate, "dodDate");
   const wowDate = assertYmd(opts.wowDate, "wowDate");
+  const table = ident(opts.table, "table");
+  const entityField = ident(opts.entityField, "entityField");
+  const distinctField = ident(opts.distinctField, "distinctField");
+  const timeField = ident(opts.timeField, "timeField");
   const fn = opts.distinctCountFn ?? "uniq";
-  const timeField = opts.timeField || "lastWatchTime";
-  if (!IDENT_RE.test(timeField)) {
-    throw new Error(`invalid timeField identifier: ${timeField}`);
-  }
 
-  let movieFilter = "";
-  if (opts.movieTypes?.length) {
-    if (!opts.movieTypes.every((n) => Number.isInteger(n))) {
-      throw new Error("movieTypes must be integers");
+  let valueFilter = "";
+  if (opts.filterValues?.length) {
+    const filterField = ident(opts.filterField, "filterField");
+    if (!opts.filterValues.every((n) => Number.isInteger(n))) {
+      throw new Error("filterValues must be integers");
     }
-    movieFilter = ` AND movieType IN (${opts.movieTypes.join(",")})`;
+    valueFilter = ` AND ${filterField} IN (${opts.filterValues.join(",")})`;
   }
 
   return [
-    `SELECT channel AS entity_key, toDate(${timeField}) AS d, ${fn}(guid) AS users`,
+    `SELECT ${entityField} AS entity_key, toDate(${timeField}) AS d, ${fn}(${distinctField}) AS users`,
     `FROM ${table}`,
-    `WHERE toDate(${timeField}) IN ('${scanDate}', '${dodDate}', '${wowDate}')${movieFilter}`,
-    `GROUP BY channel, d`,
+    `WHERE toDate(${timeField}) IN ('${scanDate}', '${dodDate}', '${wowDate}')${valueFilter}`,
+    `GROUP BY ${entityField}, d`,
   ].join(" ");
 }
 
@@ -131,13 +144,16 @@ export function pivotChannelDailyUsers(
 
 export interface FetchChannelDailyUsersOpts {
   packId?: string;
+  /** Fact table; defaults to the pack's first modeled table. */
   table?: string;
+  /** Group-by entity column; rule set `dimensions.rollup`. */
+  entityField?: string;
   runDataset?: NativeDatasetRunner;
 }
 
 /**
- * Fetch channel_daily_users for scan/dod/wow via one native Metabase query.
- * Whitelists pack tables; applies defaultMovieTypes when present.
+ * Fetch the per-entity daily-users metric for scan/dod/wow via one native Metabase query.
+ * Table / entity column / time column / filter column all come from config (pack + rule set).
  */
 export async function fetchChannelDailyUsers(
   scanDate: string,
@@ -146,20 +162,24 @@ export async function fetchChannelDailyUsers(
   opts?: FetchChannelDailyUsersOpts,
 ): Promise<ChannelDailyUserRow[]> {
   const pack = loadAnalyticsPack(opts?.packId || "watch-detail");
-  const table = opts?.table ?? DEFAULT_TABLE;
+  const table = String(opts?.table || pack.tables[0]?.name || "").trim();
   const allowedTables = pack.tables.map((t) => t.name);
-  if (!allowedTables.includes(table)) {
+  if (!table || !allowedTables.includes(table)) {
     throw new Error(`table not in whitelist: ${table}`);
   }
+  const filterField = String(pack.guards.defaultMovieTypesField || "").trim();
 
   let sql = buildChannelUsersSql({
     scanDate,
     dodDate,
     wowDate,
     table,
-    movieTypes: pack.guards.defaultMovieTypes,
-    distinctCountFn: config.metabase.distinctCountFn,
+    entityField: String(opts?.entityField || "").trim(),
+    distinctField: packDefaultEntityKey(pack),
     timeField: packTimeField(pack),
+    filterField: filterField || undefined,
+    filterValues: filterField ? pack.guards.defaultMovieTypes : undefined,
+    distinctCountFn: config.metabase.distinctCountFn,
   });
   sql = normalizeDistinctCount(sql, config.metabase.distinctCountFn);
   assertReadonlySingleSelect(sql);

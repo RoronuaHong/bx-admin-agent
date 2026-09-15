@@ -69,7 +69,7 @@ export function formatInferredCatalogMarkdown(
     "> 对照同族已有 Metabase 说明 + 列名推断，**不是仓库官方文档**。官方说明补上后删 JSON 对应条目并重跑 `pnpm --filter @bx/agent-server catalog-digest`。",
     "",
     `- 表数：${names.length}`,
-    "- 问数选表会读取 JSON；观看人数 / 完播 / 人均时长默认仍走 `elt_watch_detail`。",
+    "- 问数选表会读取 JSON；默认表由语义层 pack 声明。",
     "",
   ];
   for (const schema of [...bySchema.keys()].sort()) {

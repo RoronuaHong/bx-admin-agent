@@ -22,7 +22,7 @@ watch(
 
 <template>
   <a class="skip-link" href="#app-main">{{ tx("跳到主要内容", "Skip to content", "Pular para o conteudo", "मुख्य सामग्री पर जाएं") }}</a>
-  <div ref="routeFocus" class="route-focus-anchor" tabindex="-1" aria-hidden="true"></div>
+  <div ref="routeFocus" class="route-focus-anchor" tabindex="-1"></div>
   <div id="app-main">
     <RouterView />
   </div>

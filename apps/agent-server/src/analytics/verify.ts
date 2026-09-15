@@ -7,12 +7,19 @@ import {
   extractNamedEntities,
   wantsMultiQuerySplit,
 } from "./named-entities.js";
+import { nlWantsGrain } from "./nl-signals.js";
+import { packTimeField, type AnalyticsPack } from "./semantic-layer.js";
 
-/** NL contains 按天 → SQL must group by toDate(timeField). */
-export function verifyGrainDay(nl: string, sql: string, timeField = "lastWatchTime"): string[] {
+/**
+ * Grain verify: when the NL requests the pack's time grain (pack.time.grainAliases), the SQL
+ * must group by toDate(<pack time field>). Both the grain surface forms and the physical
+ * time column come from the pack — never hard-coded.
+ */
+export function verifyGrainDay(nl: string, sql: string, pack: AnalyticsPack): string[] {
   const issues: string[] = [];
-  if (!/按天|每天|按日/.test(nl)) return issues;
-  const field = String(timeField || "lastWatchTime").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!nlWantsGrain(nl, pack)) return issues;
+  const field = String(packTimeField(pack)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!field) return issues;
   if (!new RegExp(`toDate\\s*\\(\\s*${field}\\s*\\)`, "i").test(sql)) {
     issues.push("missing_day_grain_toDate");
   }

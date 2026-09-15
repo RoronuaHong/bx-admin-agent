@@ -3,7 +3,16 @@
  * SQL 仍由 sql-compile 确定性编译；本模块只做 schema 填充与澄清。
  */
 
-import type { AnalyticsPack } from "./semantic-layer.js";
+import type { AnalyticsPack, EnumDimensionDef } from "./semantic-layer.js";
+import {
+  canonicalDimSlot,
+  enumDimForField,
+  enumDimsByMemberKind,
+  languageDimension,
+  loadAnalyticsPack,
+  packGrainId,
+} from "./semantic-layer.js";
+import { isMetricQueryNl, nlWantsLongShape, nlWantsWideShape } from "./nl-signals.js";
 import type { ResultLayout } from "./types.js";
 import { parseAskPlan, type AskPlan } from "./ask-plan.js";
 import { formatDocumentedCatalogHint } from "./catalog-digest.js";
@@ -57,15 +66,10 @@ function packCatalogHint(pack: AnalyticsPack): string {
       metrics.push(`${opt.id} (${opt.label})`);
     }
   }
-  metrics.push(
-    "uniq_users (观看人数/UV)",
-    "sum_watch_second (观看时长合计)",
-    "avg_watch_second_per_user (人均观看时长)",
-  );
   const answerable = pack.warehouse?.tables || [];
   const tableLines = answerable.length
     ? formatDocumentedCatalogHint(pack)
-    : `${table?.name || "elt_watch_detail"} (overlay only; live catalog unavailable)`;
+    : `${table?.name || pack.tables[0]?.name || "?"} (overlay only; live catalog unavailable)`;
   const caps = pack.capabilities;
   const supportedOps = (caps?.ops || ["base_aggregate", "pivot_wide", "pivot_long"]).join(", ");
   const unsupported = Object.keys(caps?.unsupportedOpsHint || {}).join(", ") || "(none listed)";
@@ -77,7 +81,7 @@ function packCatalogHint(pack: AnalyticsPack): string {
   return [
     catalogLine,
     tableLines,
-    `Default overlay table: ${table?.name || "elt_watch_detail"} fields: ${(table?.fields || []).join(", ")}`,
+    `Default overlay table: ${table?.name || pack.tables[0]?.name || "?"} fields: ${(table?.fields || []).join(", ")}`,
     `Probe dimensions: ${(pack.probeDimensions || []).join(", ")}`,
     `Enum dims (lexicon/probe — no invented codes): ${(pack.enumDimensions || [])
       .map((d) => d.field)
@@ -89,12 +93,35 @@ function packCatalogHint(pack: AnalyticsPack): string {
     }`,
     `Supported ops: ${supportedOps}`,
     `Known-but-unsupported ops (declare in ops if user asks; gate will refuse): ${unsupported}`,
-    "outputDims soft ids: watch_date, channel, contentLang, movieType",
-    "layout/pivotDim: when the question is '<N values> of <enum dim>' for a per-user/total/uniq metric and the dim is NOT in outputDims, it means per-value columns — output layout=wide + pivotDim=<dim field>, keeping confirmed members in filters.<dim>. For avg_max_progress the wide/long choice still needs the user to pick.",
+    `outputDims soft ids: ${outputDimIds(pack).join(", ") || "(none modeled)"}`,
+    `layout/pivotDim: when the question is '<N values> of <enum dim>' for a per-user/total/uniq metric and the dim is NOT in outputDims, it means per-value columns — output layout=wide + pivotDim=<dim field>, keeping confirmed members in filters.<dim>. For ${
+      wideShapeMetricId(pack) || "the wide-shape metric"
+    } the wide/long choice still needs the user to pick.`,
     "Pre-defined semantics — do NOT clarify as gaps (the semantic layer owns these definitions): per-user average = sum(value)/uniq(entity) with the unit of the value field; watch/behavior date = the pack time field; a ratio metric split 'per enum value' = one column per value (conditional aggregation); a blank/empty member is written as \"(empty)\". Clarify ONLY when a required slot is truly missing (time range / metric / a filter the user clearly wants but gave no member for).",
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+/** outputDims soft ids = pack 声明的粒度维 + 标记为 outputDim 的枚举维（不再写死）。 */
+function outputDimIds(pack: AnalyticsPack): string[] {
+  const ids = [
+    packGrainId(pack),
+    ...(pack.enumDimensions || []).filter((d) => d.outputDim).map((d) => d.id || d.field || ""),
+    // 未被标记 outputDim 的枚举维也允许作为软 id（模型可显式指定）
+    ...(pack.enumDimensions || []).filter((d) => !d.outputDim).map((d) => d.id || d.field || ""),
+  ];
+  return [...new Set(ids.filter(Boolean))];
+}
+
+/** 宽表形状的指标 id（compile.kind=avg_of_max）——来自 pack，不在 prompt 里写死。 */
+function wideShapeMetricId(pack: AnalyticsPack): string {
+  for (const def of pack.metricDefs || []) {
+    for (const opt of def.options || []) {
+      if (opt.compile?.kind === "avg_of_max") return opt.id;
+    }
+  }
+  return "";
 }
 
 export function formatConversationTranscript(messages: ConversationTurn[]): string {
@@ -143,16 +170,16 @@ export function lastUserUtterance(transcript: string): string {
   return last.join("\n").trim();
 }
 
-function isShortClarifyReply(text: string): boolean {
+function isShortClarifyReply(text: string, pack?: AnalyticsPack): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
-  if (/^(全部|全选|all|宽表|长表|wide|long)$/i.test(t)) return true;
+  // 全部/全选/all = 通用全选语义；wide/long = 布局协议枚举值；形状词来自 pack cues。
+  if (/^(全部|全选|all)$/i.test(t)) return true;
+  if (/^(wide|long)$/i.test(t)) return true;
+  const p = pack || loadAnalyticsPack();
+  if ((p.wideShapeCues || []).includes(t) || (p.longShapeCues || []).includes(t)) return true;
   if (/^\d+([、,，]\d+)*$/.test(t)) return true;
-  if (
-    extractLocalesFromText(t).length &&
-    t.length < 80 &&
-    !/(观看|人数|完播|时长|按天)/.test(t)
-  ) {
+  if (extractLocalesFromText(t).length && t.length < 80 && !isMetricQueryNl(t, pack)) {
     return true;
   }
   return false;
@@ -183,8 +210,8 @@ function normalizeFilters(raw: unknown): Record<string, string[]> {
   return out;
 }
 
-/** 归一 clarifySlot：layout → result_layout 等 */
-export function normalizeClarifySlot(slot: string): string {
+/** 归一 clarifySlot：layout → result_layout 等；dim 名经 pack 解析到 canonical id。 */
+export function normalizeClarifySlot(slot: string, pack?: AnalyticsPack): string {
   const s = String(slot || "").trim();
   if (!s) return "unknown";
   const lower = s.toLowerCase();
@@ -192,7 +219,7 @@ export function normalizeClarifySlot(slot: string): string {
     return "result_layout";
   }
   if (lower === "lang" || lower === "language" || lower === "locale" || lower === "content_lang") {
-    return "contentLang";
+    return languageDimension(pack || loadAnalyticsPack())?.id || "contentLang";
   }
   if (lower === "time" || lower === "timerange" || lower === "date_range") {
     return "time_range";
@@ -203,24 +230,30 @@ export function normalizeClarifySlot(slot: string): string {
   if (lower === "tables" || lower === "table_name" || lower === "tablename") {
     return "table";
   }
-  return s;
+  return canonicalDimSlot(s, pack || loadAnalyticsPack());
 }
 
-function isEmptyContentLangToken(raw: string): boolean {
+/**
+ * 成员空值判定：复用 dim 声明的 emptyLabel / emptyAliases / emptyAlias（不再写死 英语/empty/en）。
+ * 通用 NLP 空词「空」与「英语」空标记前缀仍属功能词，非业务词。
+ */
+function isEmptyMemberToken(raw: string, dim?: EnumDimensionDef): boolean {
   const t = String(raw || "")
     .trim()
     .replace(/^['"`]+/, "")
     .replace(/[)'"`”’)）]+$/g, "");
   if (!t) return true;
-  return (
-    t === "(empty)" ||
-    t === "\u7a7a" ||
-    t.startsWith("\u7a7a\uff08") ||
-    t === "\u82f1\u8bed" ||
-    t.startsWith("\u82f1\u8bed\uff08") ||
-    /^english$/i.test(t) ||
-    /^en(-US)?$/i.test(t)
-  );
+  if (t === "(empty)") return true;
+  const label = dim?.emptyLabel || "";
+  if (label) {
+    if (t === label || t.startsWith(label)) return true;
+    const base = label.split("（")[0].split("(")[0].trim();
+    if (base && (t === base || t.startsWith(base + "（") || t.startsWith(base + "("))) return true;
+  }
+  if (dim?.emptyAliases?.some((a) => a && (t === a || t.toLowerCase() === String(a).toLowerCase()))) return true;
+  if (dim?.emptyAlias && (t === dim.emptyAlias || t.toLowerCase() === dim.emptyAlias.toLowerCase())) return true;
+  if (t === "空" || t.startsWith("空（") || t.startsWith("空(")) return true;
+  return false;
 }
 
 function canonicalLocaleCode(raw: string): string | undefined {
@@ -230,8 +263,15 @@ function canonicalLocaleCode(raw: string): string | undefined {
   return `${a!.toLowerCase()}-${b!.toUpperCase()}`;
 }
 
-/** 从对话文本抽出 locale 码（含 澄清选择：contentLang=…、空语言、(empty)、英语（contentLang=''）） */
-export function extractLocalesFromText(text: string): string[] {
+/**
+ * 从对话文本抽出「语言维度」成员码（含 澄清选择：<field>=…、空成员、(empty)、emptyLabel（…））。
+ * 字段名与空成员语义全部来自 pack 的 memberKind=locale 维度声明，不再写死 contentLang/英语/en。
+ */
+export function extractLocalesFromText(text: string, pack?: AnalyticsPack): string[] {
+  const langDim = languageDimension(pack || loadAnalyticsPack());
+  const field = langDim?.field || "contentLang";
+  const label = langDim?.emptyLabel || "";
+  const labelBase = label.split("（")[0].split("(")[0].trim();
   const src = String(text || "");
   const hits: Array<{ i: number; v: string }> = [];
   const add = (i: number, v: string) => {
@@ -242,15 +282,15 @@ export function extractLocalesFromText(text: string): string[] {
     const code = canonicalLocaleCode(m[1]!);
     if (code) add(m.index ?? 0, code);
   }
-  // contentLang='' / contentLang="" — 英语在仓里是空串，不能只认 xx-YY
-  for (const m of src.matchAll(/contentLang\s*=\s*(?:''|""|['\"]\s*['\"])/gi)) {
+  // <field>='' / <field>="" — 空语言在仓里是空串，不能只认 xx-YY
+  for (const m of src.matchAll(new RegExp(`${escapeRe(field)}\\s*=\\s*(?:''|""|['\"]\\s*['\"])`, "gi"))) {
     add(m.index ?? 0, "(empty)");
   }
-  for (const m of src.matchAll(/contentLang\s*=\s*([^\n；;]+)/gi)) {
+  for (const m of src.matchAll(new RegExp(`${escapeRe(field)}\\s*=\\s*([^\\n；;]+)`, "gi"))) {
     for (const part of m[1]!.split(/[,，、\s]+/)) {
       const t = part.trim();
       if (!t) continue;
-      if (isEmptyContentLangToken(t)) {
+      if (isEmptyMemberToken(t, langDim)) {
         add(m.index ?? 0, "(empty)");
         continue;
       }
@@ -258,9 +298,11 @@ export function extractLocalesFromText(text: string): string[] {
       if (code) add(m.index ?? 0, code);
     }
   }
-  // 「英语（contentLang=''）的人均时长」：后面常接「的」，不能要求逗号/行尾
-  for (const m of src.matchAll(/\u82f1\u8bed(?:\uff08[^\uff09]*\uff09)?/g)) {
-    add(m.index ?? 0, "(empty)");
+  // 「emptyLabel（…）的人均时长」：后面常接「的」，不能要求逗号/行尾
+  if (labelBase) {
+    for (const m of src.matchAll(new RegExp(`${escapeRe(labelBase)}(?:\\uff08[^\\uff09]*\\uff09)?`, "g"))) {
+      add(m.index ?? 0, "(empty)");
+    }
   }
   for (const m of src.matchAll(/\(empty\)/gi)) {
     add(m.index ?? 0, "(empty)");
@@ -301,10 +343,12 @@ export function lastUserSaidSelectAll(transcript: string): boolean {
 }
 
 /**
- * 从上一轮助手反问/probe 中抽出已展示的 contentLang 候选。
- * 用户回「全部」时，这些码来自真实 probe，不算臆造。
+ * 从上一轮助手反问/probe 中抽出已展示的语言维度候选。
+ * 用户回「全部」时，这些码来自真实 probe，不算臆造。字段名来自 pack 的语言维度声明。
  */
-export function extractOfferedContentLangs(transcript: string): string[] {
+export function extractOfferedContentLangs(transcript: string, pack?: AnalyticsPack): string[] {
+  const langDim = languageDimension(pack || loadAnalyticsPack());
+  const field = langDim?.field || "contentLang";
   const lines = transcript.split("\n");
   let lastAssistantBlock = "";
   let buf: string[] = [];
@@ -333,7 +377,7 @@ export function extractOfferedContentLangs(transcript: string): string[] {
 
   const found = new Set<string>();
   for (const block of blocks) {
-    for (const m of block.matchAll(/contentLang\s*:\s*([^\n]+)/gi)) {
+    for (const m of block.matchAll(new RegExp(`${escapeRe(field)}\\s*:\\s*([^\\n]+)`, "gi"))) {
       for (const part of m[1]!.split(/[,，、\s]+/)) {
         const t = part.trim();
         if (!t) continue;
@@ -357,15 +401,25 @@ export function extractOfferedContentLangs(transcript: string): string[] {
   return [...found];
 }
 
-/** 解析「澄清选择：slot=a,b」等确定性短答，供 enforceStructurePolicy 落槽。 */
-export function extractClarificationSlots(text: string): {
+/** 解析「澄清选择：slot=a,b」等确定性短答，供 enforceStructurePolicy 落槽。slot 名经 pack 解析到 canonical dim id。 */
+export function extractClarificationSlots(
+  text: string,
+  pack?: AnalyticsPack,
+): {
   contentLang?: string[];
   movieType?: string[];
   channel?: string[];
   result_layout?: Array<"wide" | "long">;
   metric?: string[];
   table?: string[];
+  [k: string]: string[] | Array<"wide" | "long"> | undefined;
 } {
+  const p = pack || loadAnalyticsPack();
+  const langDim = languageDimension(p);
+  const langId = (langDim?.id || "contentLang").trim();
+  const lexiconDims = enumDimsByMemberKind(p, "lexicon");
+  const movieId = (lexiconDims[0]?.id || "movieType").trim();
+  const channelId = (p.enumDimensions?.find((d) => d.field === "channel")?.id || "channel").trim();
   const out: {
     contentLang?: string[];
     movieType?: string[];
@@ -373,20 +427,26 @@ export function extractClarificationSlots(text: string): {
     result_layout?: Array<"wide" | "long">;
     metric?: string[];
     table?: string[];
+    [k: string]: string[] | Array<"wide" | "long"> | undefined;
   } = {};
-  for (const m of text.matchAll(
-    /(contentLang|movieType|channel|result_layout|metric|table)\s*=\s*([^\n；;]+)/gi,
-  )) {
-    const key = m[1]!.toLowerCase();
+  const dimKeys = (p.enumDimensions || [])
+    .flatMap((d) => [d.id, d.field, ...(d.aliases || [])])
+    .filter(Boolean)
+    .map(escapeRe);
+  const keyAlt = [...new Set(dimKeys), "result_layout", "metric", "table"].join("|");
+  const re = new RegExp(`(${keyAlt})\\s*=\\s*([^\\n；;]+)`, "gi");
+  for (const m of text.matchAll(re)) {
+    const keyRaw = m[1]!;
+    const canonical = canonicalDimSlot(keyRaw, p);
     const parts = m[2]!
       .split(/[,，、\s]+/)
       .map((x) => x.trim())
       .filter(Boolean);
     if (!parts.length) continue;
-    if (key === "contentlang") {
+    if (canonical === langId) {
       const langs: string[] = [];
       for (const t of parts) {
-        if (isEmptyContentLangToken(t) || /^(?:''|"")$/.test(t)) {
+        if (isEmptyMemberToken(t, langDim) || /^(?:''|"")$/.test(t)) {
           langs.push("(empty)");
         } else if (/^[a-z]{2}-[A-Za-z]{2}$/i.test(t)) {
           const [a, b] = t.split("-");
@@ -394,21 +454,23 @@ export function extractClarificationSlots(text: string): {
         }
       }
       if (langs.length) out.contentLang = [...new Set(langs)];
-    } else if (key === "movietype") {
+    } else if (canonical === movieId) {
       out.movieType = [...new Set(parts)];
-    } else if (key === "channel") {
+    } else if (canonical === channelId) {
       out.channel = [...new Set(parts)];
-    } else if (key === "result_layout") {
+    } else if (canonical === "result_layout") {
       const layouts: Array<"wide" | "long"> = [];
       for (const t of parts) {
         if (/^wide$/i.test(t) || t === "\u5bbd\u8868") layouts.push("wide");
         if (/^long$/i.test(t) || t === "\u957f\u8868") layouts.push("long");
       }
       if (layouts.length) out.result_layout = layouts;
-    } else if (key === "metric") {
+    } else if (canonical === "metric") {
       out.metric = [...new Set(parts)];
-    } else if (key === "table") {
+    } else if (canonical === "table") {
       out.table = [...new Set(parts)];
+    } else {
+      out[canonical] = [...new Set(parts)];
     }
   }
   return out;
@@ -426,51 +488,94 @@ function userFacingTranscript(transcript: string): string {
     .join("\n");
 }
 
-/** 「多种影片类型」等集合信号，但未列具体类型 */
-export function impliesMovieTypeSetWithoutMembers(text: string): boolean {
-  const userText = userFacingTranscript(text);
-  const t = userText.replace(/\s+/g, "");
-  const setNearType =
-    /([一二三四五六七八九十两几多各\d]+种|几种|多种|各类).{0,16}(影片类型|内容类型|影片|类型)/.test(t) ||
-    /(影片类型|内容类型|影片).{0,16}([一二三四五六七八九十两几多各\d]+种|几种|多种|各类)/.test(t);
-  if (!setNearType) return false;
-  return !/(电影|电视剧|短剧|动漫|真人秀|肥皂剧)/.test(t);
+/** 通用「N 种 / 几种 / 多种 / 各类」集合量词（NLP 功能词，非业务词）。 */
+const SET_QUANT = "([一二三四五六七八九十两几多各\\d]+种|几种|多种|各类)";
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 「三种小语种/几种语言」等集合信号，但未列成员 */
-export function impliesLangSetWithoutMembers(text: string): boolean {
+/**
+ * 「N 种 <维度>」集合信号但未列成员。维度的叫法（aliases）与成员面词（memberCues）
+ * 全部来自 pack——代码里不再有「影片类型 / 电影 / 小语种」这类词表。
+ */
+function impliesSetWithoutMembers(
+  text: string,
+  pack: AnalyticsPack | undefined,
+  dimField: string,
+  memberNamed: (userText: string) => boolean,
+): boolean {
   const userText = userFacingTranscript(text);
   const t = userText.replace(/\s+/g, "");
-  const setNearLang =
-    /([一二三四五六七八九十两几多各\d]+种|几种|多种|各类).{0,16}(小语种|语种|语言|locale|contentLang)/.test(
-      t,
-    ) ||
-    /(小语种|语种|语言|locale|contentLang).{0,16}([一二三四五六七八九十两几多各\d]+种|几种|多种|各类)/.test(
-      t,
+  const dim = enumDimForField(pack, dimField);
+  const names = [dim?.field, dim?.id, ...(dim?.aliases || [])]
+    .filter(Boolean)
+    .map(String)
+    .map(escapeRe);
+  if (!names.length) return false;
+  const nameAlt = names.join("|");
+  const setNear =
+    new RegExp(`${SET_QUANT}.{0,16}(${nameAlt})`).test(t) ||
+    new RegExp(`(${nameAlt}).{0,16}${SET_QUANT}`).test(t);
+  if (!setNear) return false;
+  return !memberNamed(userText);
+}
+
+/** 任意「lexicon 型」维度（memberCues 来自 pack）出现集合信号但未列具体类型 → 需澄清成员。 */
+export function impliesMovieTypeSetWithoutMembers(text: string, pack?: AnalyticsPack): boolean {
+  const p = pack || loadAnalyticsPack();
+  for (const d of enumDimsByMemberKind(p, "lexicon")) {
+    const memberNamed = (d.memberCues || []).some((c) =>
+      c && userFacingTranscript(text).replace(/\s+/g, "").includes(c),
     );
-  if (!setNearLang) return false;
-  return extractLocalesFromText(userText).length === 0;
+    if (impliesSetWithoutMembers(text, p, d.field, () => memberNamed)) return true;
+  }
+  return false;
+}
+
+/** 「三种小语种/几种语言」等集合信号，但未列成员（维度叫法来自 pack aliases）。 */
+export function impliesLangSetWithoutMembers(text: string, pack?: AnalyticsPack): boolean {
+  const p = pack || loadAnalyticsPack();
+  const dim = languageDimension(p);
+  const field = dim?.field || "contentLang";
+  return impliesSetWithoutMembers(text, p, field, (userText) => {
+    return extractLocalesFromText(userText, p).length > 0;
+  });
 }
 
 /**
  * User actually asked for language filtering / locale set.
- * Used to block LLM from inventing contentLang clarify on plain UV/duration asks.
+ * Used to block LLM from inventing language-dim clarify on plain UV/duration asks.
+ * 语言维的叫法（字段名 + id + 别名）来自 pack 的 memberKind=locale 维度声明。
  */
-export function userDemandsLangFilter(text: string): boolean {
+export function userDemandsLangFilter(text: string, pack?: AnalyticsPack): boolean {
   const userText = userFacingTranscript(text);
-  if (impliesLangSetWithoutMembers(userText)) return true;
-  if (extractLocalesFromText(userText).length > 0) return true;
-  const compact = userText.replace(/\s+/g, "");
-  return /(小语种|语种|内容语言|contentLang|按语言|各语言|语言筛选|语言过滤|分语言)/.test(compact);
+  if (impliesLangSetWithoutMembers(userText, pack)) return true;
+  if (extractLocalesFromText(userText, pack).length > 0) return true;
+  const p = pack || loadAnalyticsPack();
+  const langDim = languageDimension(p);
+  const names = [langDim?.field, langDim?.id, ...(langDim?.aliases || [])]
+    .filter(Boolean)
+    .map(String)
+    .map(escapeRe);
+  if (!names.length) return false;
+  return new RegExp(names.join("|")).test(userText.replace(/\s+/g, ""));
 }
 
 /** JIT probe fields for this turn — empty means do not pre-probe. */
-export function neededProbeFields(nl: string): string[] {
+export function neededProbeFields(nl: string, pack?: AnalyticsPack): string[] {
+  const p = pack || loadAnalyticsPack();
   const t = String(nl || "");
+  const compact = t.replace(/\s+/g, "");
   const fields: string[] = [];
-  if (impliesLangSetWithoutMembers(t)) fields.push("contentLang");
-  if (impliesMovieTypeSetWithoutMembers(t) || /电影|电视剧|短剧|动漫|真人秀|肥皂剧/.test(t)) {
-    fields.push("movieType");
+  const langDim = languageDimension(p);
+  if (langDim && impliesLangSetWithoutMembers(t, p)) fields.push(langDim.field);
+  const memberNamed = (p.enumDimensions || []).some((d) =>
+    (d.memberCues || []).some((c) => c && compact.includes(c)),
+  );
+  if (impliesMovieTypeSetWithoutMembers(t, p) || memberNamed) {
+    const lex = enumDimsByMemberKind(p, "lexicon");
+    if (lex[0]) fields.push(lex[0].field);
   }
   return fields;
 }
@@ -479,20 +584,62 @@ export function needsDimensionProbe(nl: string): boolean {
   return neededProbeFields(nl).length > 0;
 }
 
-function isCompletionMetric(metricId: string | undefined, mergedNl: string): boolean {
-  return (
-    metricId === "avg_max_progress" ||
-    (/完播|最大进度/.test(mergedNl) && !/人均/.test(mergedNl))
-  );
+/** Pack 声明的指标 compile kinds（按 metric option id 精确匹配；generic id 返回空集）。 */
+function packMetricKindsById(pack: AnalyticsPack, metricId?: string): Set<string> {
+  const kinds = new Set<string>();
+  if (!metricId) return kinds;
+  for (const def of pack.metricDefs || []) {
+    for (const opt of def.options || []) {
+      if (opt.id === metricId && opt.compile?.kind) kinds.add(opt.compile.kind);
+    }
+  }
+  return kinds;
 }
 
-function isNonPivotMetric(metricId: string | undefined, mergedNl: string): boolean {
-  return (
-    metricId === "avg_watch_second_per_user" ||
-    metricId === "uniq_users" ||
-    metricId === "sum_watch_second" ||
-    (/人均/.test(mergedNl) && !/完播|最大进度/.test(mergedNl))
-  );
+/** NL 命中 pack 指标族（aliases / option label / groundSignals）时收集其 compile kinds。 */
+function packMetricKindsFromNl(pack: AnalyticsPack, mergedNl: string): Set<string> {
+  const kinds = new Set<string>();
+  const text = String(mergedNl || "");
+  if (!text) return kinds;
+  for (const def of pack.metricDefs || []) {
+    const hit =
+      (def.aliases || []).some((a) => a && text.includes(a)) ||
+      (def.options || []).some(
+        (o) =>
+          (o.label && text.includes(o.label)) ||
+          (o.groundSignals || []).some((g) => g && text.includes(g)),
+      );
+    if (!hit) continue;
+    for (const opt of def.options || []) if (opt.compile?.kind) kinds.add(opt.compile.kind);
+  }
+  return kinds;
+}
+
+/** 宽表 pivot 类指标（compile.kind=avg_of_max）——判定来自 pack，不写死指标 id 或业务词。 */
+function isCompletionMetric(
+  metricId: string | undefined,
+  mergedNl: string,
+  pack: AnalyticsPack,
+): boolean {
+  const byId = packMetricKindsById(pack, metricId);
+  if (byId.size) return byId.has("avg_of_max");
+  const byNl = packMetricKindsFromNl(pack, mergedNl);
+  return byNl.has("avg_of_max") && !byNl.has("avg_per_user");
+}
+
+const NON_PIVOT_KINDS = new Set(["avg_per_user", "uniq", "sum"]);
+
+/** 非 pivot 指标（人均/去重/合计类）——判定来自 pack compile kinds。 */
+function isNonPivotMetric(
+  metricId: string | undefined,
+  mergedNl: string,
+  pack: AnalyticsPack,
+): boolean {
+  const hasNonPivot = (kinds: Set<string>) => [...NON_PIVOT_KINDS].some((k) => kinds.has(k));
+  const byId = packMetricKindsById(pack, metricId);
+  if (byId.size) return hasNonPivot(byId);
+  const byNl = packMetricKindsFromNl(pack, mergedNl);
+  return hasNonPivot(byNl) && !byNl.has("avg_of_max");
 }
 
 /**
@@ -506,15 +653,24 @@ export function enforceStructurePolicy(
   const userText = userFacingTranscript(transcript);
   const lastUserText = lastUserUtterance(transcript) || userText;
   const slotAnswers = extractClarificationSlots(userText);
+  // 语言/lexicon/channel 维度全部来自 pack 声明（memberKind + field/id）：
+  // 不再写死 contentLang/movieType 字面量，clarify 槽与 filters 键都由 dim 推导。
+  const packPolicy = loadAnalyticsPack();
+  const langDim = languageDimension(packPolicy);
+  const langId = (langDim?.id || "contentLang").trim();
+  const langField = (langDim?.field || "contentLang").trim();
+  const lexiconDims = enumDimsByMemberKind(packPolicy, "lexicon");
+  const movieId = (lexiconDims[0]?.id || "movieType").trim();
+  const channelId = (packPolicy.enumDimensions?.find((d) => d.field === "channel")?.id || "channel").trim();
   // 用户回「全部」：把上一轮助手已展示的 probe/编号候选视为已确认（非臆造）
   const selectAllLangs =
     lastUserSaidSelectAll(transcript) ? extractOfferedContentLangs(transcript) : [];
-  if (selectAllLangs.length && !slotAnswers.contentLang?.length) {
-    slotAnswers.contentLang = selectAllLangs;
+  if (selectAllLangs.length && !slotAnswers[langId]?.length) {
+    slotAnswers[langId] = selectAllLangs;
   }
   const lastLocales = extractLocalesFromText(lastUserText);
   const historyLocales = extractLocalesFromText(userText);
-  const localePool = isShortClarifyReply(lastUserText) ? historyLocales : lastLocales;
+  const localePool = isShortClarifyReply(lastUserText, loadAnalyticsPack()) ? historyLocales : lastLocales;
   const chatLocales = [
     ...new Set([...(slotAnswers.contentLang || []), ...localePool, ...selectAllLangs]),
   ];
@@ -534,21 +690,21 @@ export function enforceStructurePolicy(
       : { ...(result.partialFilters || {}) };
 
   // 澄清选择优先落槽（不依赖模型复述）
-  if (slotAnswers.contentLang?.length) filters.contentLang = slotAnswers.contentLang;
-  if (slotAnswers.movieType?.length) filters.movieType = slotAnswers.movieType;
-  if (slotAnswers.channel?.length) filters.channel = slotAnswers.channel;
+  if (slotAnswers[langId]?.length) filters[langField] = slotAnswers[langId] as string[];
+  if (slotAnswers[movieId]?.length) filters[movieId] = slotAnswers[movieId] as string[];
+  if (slotAnswers[channelId]?.length) filters[channelId] = slotAnswers[channelId] as string[];
 
   const needMovieMembers =
-    impliesMovieTypeSetWithoutMembers(lastUserText) && !(slotAnswers.movieType?.length);
-  // 「N种小语种」未列码：一律先问 contentLang，丢掉模型臆造的 locale
+    impliesMovieTypeSetWithoutMembers(lastUserText) && !(slotAnswers[movieId]?.length);
+  // 「N种小语种」未列码：一律先问语言维度，丢掉模型臆造的 locale
   if (needLangMembers) {
     const partial = { ...filters };
-    delete partial.contentLang;
+    delete partial[langField];
     return {
       status: "clarify",
       clarify:
         "请确认要统计的具体内容语言列表（可多选）。请回复下方序号或语言码，不要猜测未说明的语种。",
-      clarifySlot: "contentLang",
+      clarifySlot: langId,
       mergedNl: mergedNl || undefined,
       time: result.time,
       partialFilters: partial,
@@ -557,11 +713,11 @@ export function enforceStructurePolicy(
 
   if (needMovieMembers) {
     const partial = { ...filters };
-    delete partial.movieType;
+    delete partial[movieId];
     return {
       status: "clarify",
       clarify: "请确认要统计的影片类型（可多选）。请回复下方序号或类型名，不要猜测未说明的类型。",
-      clarifySlot: "movieType",
+      clarifySlot: movieId,
       mergedNl: mergedNl || undefined,
       time: result.time,
       partialFilters: partial,
@@ -570,23 +726,23 @@ export function enforceStructurePolicy(
 
   // 用户已写出 locale 时以对话为准（含英语空串）；模型漏填要回填，半臆造的多出来的丢掉
   if (chatLocales.length) {
-    filters.contentLang = chatLocales;
+    filters[langField] = chatLocales;
   } else if (!langWanted) {
-    // 用户未要求语言筛选：丢掉模型臆造的 contentLang，避免无故反问
-    delete filters.contentLang;
+    // 用户未要求语言筛选：丢掉模型臆造的语言维度，避免无故反问
+    delete filters[langField];
   }
 
   if (result.status === "clarify") {
     const slot = normalizeClarifySlot(result.clarifySlot);
     // 无语言诉求时，吞掉模型臆造的 contentLang clarify，改走后续缺槽检查 / ok
-    if (slot === "contentLang" && !langWanted) {
-      delete filters.contentLang;
+    if (slot === langId && !langWanted) {
+      delete filters[langField];
       const time = result.time;
       const metricId =
         slotAnswers.metric?.[0] ||
-        // 空 pack：这里只要内置口径兜底，不走语义层指标定义
-        inferMetricIdFromNl(`${lastUserText}\n${modelMerged}`, { metricDefs: [] } as unknown as AnalyticsPack);
-      const outputDims = inferOutputDimsFromNl(`${lastUserText}\n${modelMerged}`);
+        // 内置口径兜底：用默认 pack 走语义层指标定义
+        inferMetricIdFromNl(`${lastUserText}\n${modelMerged}`, loadAnalyticsPack());
+      const outputDims = inferOutputDimsFromNl(`${lastUserText}\n${modelMerged}`, loadAnalyticsPack());
       if (time?.start && time?.end && metricId) {
         return {
           status: "ok",
@@ -601,7 +757,7 @@ export function enforceStructurePolicy(
       if (time?.start && time?.end && !metricId) {
         return {
           status: "clarify",
-          clarify: "请确认指标口径（例如人均观看时长、观看人数、最大进度平均值）。",
+          clarify: "请确认指标口径（如均值、求和、去重计数等聚合方式）。",
           clarifySlot: "metric",
           mergedNl: mergedNl || undefined,
           time,
@@ -637,7 +793,7 @@ export function enforceStructurePolicy(
   if (!metricId) {
     return {
       status: "clarify",
-      clarify: "请确认指标口径（例如人均观看时长、观看人数、最大进度平均值）。",
+      clarify: "请确认指标口径（如均值、求和、去重计数等聚合方式）。",
       clarifySlot: "metric",
       mergedNl: mergedNl || undefined,
       time,
@@ -645,16 +801,18 @@ export function enforceStructurePolicy(
     };
   }
 
-  const finalLangs = filters.contentLang || [];
+  // 宽表 pivot 维来自 pack 声明（guards.widePivotDim）；未声明时退化为普通筛选，不猜。
+  const widePivotDim = String(packPolicy.guards.widePivotDim || "").trim();
+  const finalLangs = widePivotDim ? filters[widePivotDim] || [] : [];
   if (
-    isCompletionMetric(metricId, mergedNl) &&
+    isCompletionMetric(metricId, mergedNl, packPolicy) &&
     finalLangs.length > 1 &&
-    !outputDims.includes("contentLang") &&
+    (!widePivotDim || !outputDims.includes(widePivotDim)) &&
     outputDims.length > 0 &&
     !layout
   ) {
-    if (/宽表|wide/i.test(userText)) layout = "wide";
-    else if (/长表|(?:\blong\b)/i.test(userText)) layout = "long";
+    if (nlWantsWideShape(userText, packPolicy) || /\bwide\b/i.test(userText)) layout = "wide";
+    else if (nlWantsLongShape(userText, packPolicy) || /\blong\b/i.test(userText)) layout = "long";
     else {
       return {
         status: "clarify",
@@ -668,23 +826,25 @@ export function enforceStructurePolicy(
     }
   }
 
-  // 非 pivot 指标（人均/合计/去重人数类）+ 多语言成员已确认 + 不按语言分组：
+  // 非 pivot 指标（均值/求和/去重计数类）+ 多语言成员已确认 + 不按语言分组：
   // 「N种语言的<人均/合计指标>」的语义即每种语言各一列（条件聚合展开），直接宽表，不反问。
   // 语言成员未列出（只说 N 种没给代码）时走上游 contentLang clarify，确认后进本分支；
   // pivot 成员来自 filters（用户确认），缺失时编译层回落 pack defaultWideLangs（probe/pack 提供）。
   if (
-    isNonPivotMetric(metricId, mergedNl) &&
+    isNonPivotMetric(metricId, mergedNl, packPolicy) &&
     !layout &&
     finalLangs.length > 1 &&
-    !outputDims.includes("contentLang")
+    (!widePivotDim || !outputDims.includes(widePivotDim))
   ) {
     layout = "wide";
-    pivotDim = "contentLang";
+    pivotDim = widePivotDim || undefined;
   }
 
-  if (!layout && /宽表|wide/i.test(userText)) layout = "wide";
-  if (!layout && /长表|(?:\blong\b)/i.test(userText)) layout = "long";
-  if (layout && finalLangs.length > 1 && !pivotDim) pivotDim = "contentLang";
+  if (!layout && (nlWantsWideShape(userText, packPolicy) || /\bwide\b/i.test(userText)))
+    layout = "wide";
+  if (!layout && (nlWantsLongShape(userText, packPolicy) || /\blong\b/i.test(userText)))
+    layout = "long";
+  if (layout && finalLangs.length > 1 && !pivotDim) pivotDim = widePivotDim || undefined;
 
   return {
     status: "ok",
@@ -707,27 +867,35 @@ export function buildStructureSystemPrompt(
   pack: AnalyticsPack,
   extras?: { untrustedRule?: string },
 ): string {
+  const langDim = languageDimension(pack);
+  const langId = (langDim?.id || "contentLang").trim();
+  const lexiconDims = enumDimsByMemberKind(pack, "lexicon");
+  const movieId = (lexiconDims[0]?.id || "movieType").trim();
+  const channelId = (pack.enumDimensions?.find((d) => d.field === "channel")?.id || "channel").trim();
+  const metricHints = (pack.metricDefs || [])
+    .flatMap((d) => (d.options || []).map((o) => `${o.label} → metricId ${o.id}`))
+    .join("; ");
   return [
     "You are an analytics slot-filling engine. Use AskState + recent turns only; emit ONE JSON object.",
     "Do NOT write SQL. Do not recover slots from omitted history. Assistant clarify messages are context only.",
     "Do NOT rewrite user wording for understanding — extract slots from the original turns.",
-    "Clarify priority (ask ONE slot at a time): time_range → contentLang → metric → result_layout.",
+    `Clarify priority (ask ONE slot at a time): time_range → ${langId} → metric → result_layout.`,
     "When status=clarify and candidates exist, the pipeline will attach numbered options (1. 2. 3…) for the user; write clarify text that invites 序号 or code replies.",
-    "NEVER invent contentLang/movieType codes. If user says N种小语种/几种语言 without listing codes, status=clarify clarifySlot=contentLang (probe first). Do NOT guess te-IN/ta-IN/ml-IN.",
-    "Do NOT clarify contentLang when the user did not ask about languages/locales — omit filters.contentLang and proceed.",
-    "Only put a locale into filters.contentLang if it appears in a USER turn, 澄清选择, OR the user replies 全部/全选/all to confirm the candidates you just listed (those candidates are probe-grounded).",
-    "When user lists locales like te-IN, put filters.contentLang.",
-    "When user names a channel (IndiaA), put filters.channel.",
+    `NEVER invent ${langId}/${movieId} codes. If user says N种小语种/几种语言 without listing codes, status=clarify clarifySlot=${langId} (probe first). Do NOT guess te-IN/ta-IN/ml-IN.`,
+    `Do NOT clarify ${langId} when the user did not ask about languages/locales — omit filters.${langId} and proceed.`,
+    `Only put a locale into filters.${langId} if it appears in a USER turn, 澄清选择, OR the user replies 全部/全选/all to confirm the candidates you just listed (those candidates are probe-grounded).`,
+    `When user lists locales like te-IN, put filters.${langId}.`,
+    `When user names a channel (IndiaA), put filters.${channelId}.`,
     "If the user names an answerable catalog table, or facts lock a table, set table to that exact name.",
     "If Catalog lists a documented table whose description uniquely matches the ask, set table to that name.",
-    "Watch/完播/观看人数 asks default to the overlay table. Other business asks without a unique table → status=clarify clarifySlot=table (do not silently stay on overlay).",
+    "Watch-domain asks default to the overlay table. Other business asks without a unique table → status=clarify clarifySlot=table (do not silently stay on overlay).",
     "For a non-overlay table, metricId MUST be uniq:<field>|sum:<field>|avg:<field>|count:* using a live column on that table. Do not invent columns.",
-    "人均观看时长 → metricId avg_watch_second_per_user; 观看人数/UV → uniq_users; 时长合计 → sum_watch_second; 最大进度平均（须点名最大进度） → avg_max_progress.",
-    "Bare 完播/完播率 without 最大进度 or 阈值 → status=clarify clarifySlot=metric. Do NOT silently pick avg_max_progress.",
+    metricHints ? `Metric → metricId hints (from pack): ${metricHints}.` : "",
+    "Bare completion-rate phrasing without naming the avg_max_progress metric or a threshold → status=clarify clarifySlot=metric. Do NOT silently pick avg_max_progress.",
     "IMPORTANT ops rule: put every required capability id into ops (from Catalog supported + known-but-unsupported). Supported growth: yoy / mom / growth_rate (server dual-window + merge_ratio). Still unsupported examples: top_n, percentile — list them in ops; do NOT silently drop to base_aggregate.",
     "Default ops includes base_aggregate; add pivot_wide/pivot_long when layout is set.",
-    "IMPORTANT layout rule: only require layout wide|long when metricId is avg_max_progress. For avg_watch_second_per_user / uniq_users / sum_watch_second, multi contentLang = WHERE IN — do NOT clarify result_layout.",
-    "If avg_max_progress and multiple grounded contentLang and outputDims are watch_date+channel (contentLang not in outputDims), clarify result_layout (clarifySlot MUST be result_layout, never layout).",
+    `IMPORTANT layout rule: only require layout wide|long when metricId is avg_max_progress. For avg_watch_second_per_user / uniq_users / sum_watch_second, multi ${langId} = WHERE IN — do NOT clarify result_layout.`,
+    `If avg_max_progress and multiple grounded ${langId} and outputDims are watch_date+channel (${langId} not in outputDims), clarify result_layout (clarifySlot MUST be result_layout, never layout).`,
     "If the user asks two (filters × grain) tuples (e.g. channel A by day AND channel B by language), emit plan.steps (≥2) + merge.kind=side_by_side. Do NOT fold them into one filters.channel IN + stacked outputDims.",
     extras?.untrustedRule || "",
     "",
@@ -740,9 +908,9 @@ export function buildStructureSystemPrompt(
     '  "mergedNl": string,',
     '  "askSummary": string,',
     '  "clarify": string,',
-    '  "clarifySlot": "time_range"|"contentLang"|"movieType"|"result_layout"|"metric"|"table",',
+    `  "clarifySlot": "time_range"|"${langId}"|"${movieId}"|"result_layout"|"metric"|"table",`,
     '  "time": { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },',
-    '  "filters": { "channel"?: string[], "contentLang"?: string[], "movieType"?: string[] },',
+    `  "filters": { "${channelId}"?: string[], "${langId}"?: string[], "${movieId}"?: string[] },`,
     '  "outputDims": string[],',
     '  "layout": "wide"|"long",',
     '  "pivotDim": string,',
@@ -775,7 +943,7 @@ export function parseStructureResponse(raw: string, transcript = ""): Structured
     const clarifySlot = normalizeClarifySlot(String(obj.clarifySlot || "unknown"));
     if (
       clarifySlot === "result_layout" &&
-      isNonPivotMetric(metricIdEarly, mergedNl) &&
+      isNonPivotMetric(metricIdEarly, mergedNl, loadAnalyticsPack()) &&
       time?.start &&
       time?.end &&
       metricIdEarly

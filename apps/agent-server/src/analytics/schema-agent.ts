@@ -7,13 +7,16 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ModelEntry } from "../config.js";
-import { pickAnalyticsModel } from "./pick-analytics-model.js";
+import { markAnalyticsModelSuccess, pickAnalyticsModel } from "./pick-analytics-model.js";
+import { reportModelFailure, reportModelQualityFailure } from "./model-fallback.js";
 import * as trace from "../trace.js";
 import { isAbortError, runNativeDataset } from "./metabase-client.js";
 import { beginAnalyticsLlmSignal } from "./llm-error.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
 import {
   compileTableRef,
+  enumDimsByMemberKind,
+  languageDimension,
   overlayTableName,
   packFieldsForTable,
   packTimeField,
@@ -79,6 +82,10 @@ function loadSqlStyle(id: string): string {
 }
 
 function catalogPayload(pack: AnalyticsPack, resolvedTable?: string): Record<string, unknown> {
+  const langDim = languageDimension(pack);
+  const langId = (langDim?.id || "contentLang").trim();
+  const lexiconDims = enumDimsByMemberKind(pack, "lexicon");
+  const movieId = (lexiconDims[0]?.id || "movieType").trim();
   const metrics: Array<{ id: string; label: string; kind?: string }> = [];
   for (const def of pack.metricDefs || []) {
     for (const opt of def.options || []) {
@@ -89,11 +96,6 @@ function catalogPayload(pack: AnalyticsPack, resolvedTable?: string): Record<str
       });
     }
   }
-  metrics.push(
-    { id: "uniq_users", label: "观看人数/UV", kind: "uniq" },
-    { id: "sum_watch_second", label: "观看时长合计", kind: "sum" },
-    { id: "avg_watch_second_per_user", label: "人均观看时长", kind: "avg_per_user" },
-  );
   const resolved = String(resolvedTable || "").trim() || pack.tables[0]?.name;
   return {
     table: resolved,
@@ -120,9 +122,9 @@ function catalogPayload(pack: AnalyticsPack, resolvedTable?: string): Record<str
     sqlStyleIds: listSqlStyleIds(),
     capabilities: catalogCapabilitiesPayload(pack),
     notes: [
-      "Do NOT invent locale/movieType dictionaries in your head.",
-      "For movieType Chinese names (电影/电视剧/…): call metabase_resolve_dimension_values — codes come from Metabase field values/description.",
-      "For contentLang membership: call metabase_probe_dimension.",
+      `Do NOT invent locale/${movieId} dictionaries in your head.`,
+      `For ${movieId} Chinese names (电影/电视剧/…): call metabase_resolve_dimension_values — codes come from Metabase field values/description.`,
+      `For ${langId} membership: call metabase_probe_dimension.`,
       "Declare required ops ids from capabilities.supportedOps / knownButUnsupportedOps. Never status=ok after silently dropping unsupported ops.",
       "If unsure which values, status=clarify.",
       "If user names an answerable table, set JSON table to that name and use analytics_describe_table.",
@@ -146,11 +148,14 @@ const TOOLS = [
     function: {
       name: "metabase_probe_dimension",
       description:
-        "Probe distinct values for a dimension via Metabase/ClickHouse (Top-N by count). Use for contentLang, channel. For movieType labels→codes prefer metabase_resolve_dimension_values.",
+        "Probe distinct values for a dimension via Metabase/ClickHouse (Top-N by count). Use for the language dimension and channel. For lexicon-type dims (e.g. movieType) labels→codes prefer metabase_resolve_dimension_values.",
       parameters: {
         type: "object",
         properties: {
-          field: { type: "string", description: "Physical field name, e.g. contentLang / movieType / channel" },
+          field: {
+            type: "string",
+            description: "Physical field name, e.g. contentLang / movieType / channel (from catalog enumDimensions)",
+          },
           start: { type: "string", description: "YYYY-MM-DD inclusive start; required for meaningful probe" },
           end: { type: "string", description: "YYYY-MM-DD inclusive end" },
           limit: { type: "number", description: "Max distinct values, default 30" },
@@ -189,7 +194,7 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Exact table name, e.g. elt_film_order" },
+          name: { type: "string", description: "Exact warehouse table name from analytics_list_catalog.tables" },
         },
         required: ["name"],
         additionalProperties: false,
@@ -253,9 +258,10 @@ async function probeField(
   signal?: AbortSignal,
   tableName?: string,
 ): Promise<string> {
-  const table = tableName || pack.tables[0]?.name || "elt_watch_detail";
+  const table = String(tableName || "").trim() || overlayTableName(pack);
   const safeField = String(field).replace(/[^a-zA-Z0-9_]/g, "");
   if (!safeField) return JSON.stringify({ ok: false, error: "invalid field" });
+  if (!table) return JSON.stringify({ ok: false, error: "table_unresolved", field: safeField });
   const from = compileTableRef(pack, table);
   const timeField = packTimeField(pack, table);
   const where =
@@ -293,31 +299,36 @@ async function probeField(
 }
 
 function buildSystem(pack: AnalyticsPack): string {
+  const langDim = languageDimension(pack);
+  const langId = (langDim?.id || "contentLang").trim();
+  const lexiconDims = enumDimsByMemberKind(pack, "lexicon");
+  const movieId = (lexiconDims[0]?.id || "movieType").trim();
+  const channelId = (pack.enumDimensions?.find((d) => d.field === "channel")?.id || "channel").trim();
   return [
     "You are an analytics SCHEMA agent. Use AskState + recent turns only.",
     "Use tools to probe Metabase for real dimension values. Do NOT invent Chinese→code dictionaries.",
     "Goal: emit ONE JSON schema for deterministic SQL compile, OR clarify.",
-    "Clarify priority (ONE slot): time_range → table → contentLang → result_layout → metric. clarifySlot must use these ids (never 'layout').",
-    "NEVER invent contentLang codes. If user says 三种小语种/几种语言 without listing codes → probe contentLang then clarify contentLang. Do NOT guess te-IN/ta-IN/ml-IN.",
-    "Do NOT clarify contentLang when the user did not ask about languages/locales — omit filters.contentLang and proceed.",
-    "Only put locale into filters.contentLang if a USER turn (or 澄清选择) literally contains that code, OR user replies 全部/全选/all to confirm the candidates you just listed from probe.",
-    "When user says 电影/电视剧/真人秀 etc.: call metabase_resolve_dimension_values(movieType, tokens) and put RESOLVED numeric codes into filters.movieType. If unresolved → clarify movieType.",
+    `Clarify priority (ONE slot): time_range → table → ${langId} → result_layout → metric. clarifySlot must use these ids (never 'layout').`,
+    `NEVER invent ${langId} codes. If user says 三种小语种/几种语言 without listing codes → probe ${langId} then clarify ${langId}. Do NOT guess te-IN/ta-IN/ml-IN.`,
+    `Do NOT clarify ${langId} when the user did not ask about languages/locales — omit filters.${langId} and proceed.`,
+    `Only put locale into filters.${langId} if a USER turn (or 澄清选择) literally contains that code, OR user replies 全部/全选/all to confirm the candidates you just listed from probe.`,
+    `When user says 电影/电视剧/真人秀 etc.: call metabase_resolve_dimension_values(${movieId}, tokens) and put RESOLVED numeric codes into filters.${movieId}. If unresolved → clarify ${movieId}.`,
     "Declare ops from catalog capabilities (supported + known-but-unsupported). If user needs yoy/mom/growth_rate, include those op ids — server will run dual-window + merge_ratio. For top_n/percentile still unsupported: include the op id (do NOT silently drop to base_aggregate).",
     "If time range missing → clarify time_range.",
     "metricId: overlay recipes OR uniq:<field>|sum:<field>|avg:<field>|count:* on a live column.",
-    "Set table when the user names an answerable table, or facts lock one. Watch/完播/观看人数 → overlay. Other asks without a unique table → clarify clarifySlot=table.",
+    "Set table when the user names an answerable table, or facts lock one. Watch-domain asks → overlay. Other asks without a unique table → clarify clarifySlot=table.",
     "Call analytics_describe_table before filling metricId on a non-overlay table.",
-    "For avg_watch_second_per_user / uniq / sum: multi contentLang = WHERE IN; do NOT require result_layout.",
-    "For avg_max_progress with multi grounded contentLang not in outputDims: clarify result_layout (wide|long).",
+    `For avg_per_user / uniq / sum kinds: multi ${langId} = WHERE IN; do NOT require result_layout.`,
+    `For avg_of_max kind with multi grounded ${langId} not in outputDims: clarify result_layout (wide|long).`,
     "You may load SQL style templates for shape reference only.",
     `Pack id=${pack.id} v=${pack.version}.`,
     UNTRUSTED_USER_CONTENT_RULE,
     "Final reply MUST be JSON only (no chain-of-thought):",
-    '{ "status":"ok"|"clarify", "mergedNl":"...", "clarify":"...", "clarifySlot":"contentLang"|"result_layout"|...,',
+    `{ "status":"ok"|"clarify", "mergedNl":"...", "clarify":"...", "clarifySlot":"${langId}"|"result_layout"|...,`,
     '  "time":{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"},',
-    '  "filters":{"channel":[],"contentLang":[],"movieType":[]},',
-    '  "outputDims":["watch_date","channel"], "layout":"wide"|"long", "pivotDim":"contentLang",',
-    '  "table":"elt_watch_detail", "metricId":"...", "ops":["base_aggregate"], "askSummary":"...", "notes":[] }',
+    `  "filters":{"${channelId}":[],"${langId}":[],"${movieId}":[]},`,
+    `  "outputDims":["watch_date","${channelId}"], "layout":"wide"|"long", "pivotDim":"${langId}",`,
+    `  "table":"${overlayTableName(pack) || "<overlay>"}", "metricId":"...", "ops":["base_aggregate"], "askSummary":"...", "notes":[] }`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -363,13 +374,30 @@ async function chatCompletions(input: {
     }>;
     error?: unknown;
   };
-  if (!resp.ok) throw new Error(JSON.stringify(data).slice(0, 400));
+  if (!resp.ok) {
+    const err = new Error(JSON.stringify(data).slice(0, 400)) as Error & { status?: number };
+    err.status = resp.status;
+    reportModelFailure(input.model.id, err);
+    throw err;
+  }
   const msg = data.choices?.[0]?.message;
   return {
     content: String(msg?.content || "").trim(),
     tool_calls: msg?.tool_calls || [],
     raw: data,
   };
+}
+
+/** 解析失败 = 模型 HTTP 200 但给不出可用 schema（质量信号）：短冷却该模型，下一次尝试自动换候选 */
+function parseStructureOrReport(model: ModelEntry, content: string, transcript: string): StructuredAskResult {
+  try {
+    const result = parseStructureResponse(content, transcript);
+    markAnalyticsModelSuccess(model.id);
+    return result;
+  } catch (e) {
+    reportModelQualityFailure(model.id);
+    throw e;
+  }
 }
 
 /**
@@ -449,7 +477,7 @@ export async function runStructureOnce(input: {
     });
     if (input.traceRunId) trace.setRunModel(input.traceRunId, model.id);
     return {
-      result: parseStructureResponse(content, packed.transcript),
+      result: parseStructureOrReport(model, content, packed.transcript),
       meta: { mode: "single_forward", formatConstraint, modelId: model.id },
     };
   } catch (e) {
@@ -558,7 +586,7 @@ export async function runSchemaAgent(input: {
               String(args.end || ""),
               Number(args.limit || 15),
               input.signal,
-              args.table ? String(args.table) : undefined,
+              args.table ? String(args.table) : input.resolvedTable,
             );
           } else if (name === "metabase_resolve_dimension_values") {
             const tokens = Array.isArray(args.tokens)
@@ -587,7 +615,7 @@ export async function runSchemaAgent(input: {
 
       handle?.end({ status: "ok", meta: { rounds: round + 1, mode: "tool_loop", context: packed.usage } });
       if (input.traceRunId) trace.setRunModel(input.traceRunId, model.id);
-      return parseStructureResponse(r.content, packed.transcript);
+      return parseStructureOrReport(model, r.content, packed.transcript);
     }
 
     messages.push({
@@ -618,7 +646,7 @@ export async function runSchemaAgent(input: {
       content = finalR.content;
     }
     handle?.end({ status: "ok", meta: { rounds: maxRounds, forced: true, context: packed.usage } });
-    return parseStructureResponse(content, packed.transcript);
+    return parseStructureOrReport(model, content, packed.transcript);
   } catch (e) {
     handle?.end({ status: "error", error: e instanceof Error ? e.message : String(e) });
     throw e;

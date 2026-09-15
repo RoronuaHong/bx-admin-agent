@@ -218,5 +218,12 @@ export const config = {
     get cronHhmm() {
       return (process.env.ANALYTICS_SCAN_CRON_HHMM || "10:00").trim();
     },
+    /**
+     * 前端页面基地址（含协议+域名，不含尾斜杠）。巡检深链用它拼成可点击绝对 URL；
+     * 未配（空）则深链退化为相对路径 /analytics?...，钉钉里只是纯文本、无法点击（即"打开无效"根因）。
+     */
+    get webBaseUrl() {
+      return (process.env.ANALYTICS_WEB_BASE_URL || "").trim().replace(/\/+$/, "");
+    },
   },
 };

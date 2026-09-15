@@ -77,7 +77,7 @@ export function tableIdentity(
   const explicit = String(override || t.identity || "").trim();
   if (explicit) return stripCrossRefs(explicit);
   const desc = String(t.description || "");
-  const first = desc.split(/\n|注意事项|核心信息/)[0] || "";
+  const first = desc.split(/\n/)[0] || "";
   return stripCrossRefs([t.displayName, first].filter(Boolean).join(" "));
 }
 
@@ -111,15 +111,32 @@ function identityTails(identity: string): string[] {
   return out;
 }
 
+/**
+ * Declared (curated) synonyms: `catalog-cards.json` overrides + catalog-level synonyms.
+ * These are operator/warehouse-authored, so short or shared surface forms stay trustworthy
+ * — unlike derived phrases, which need the noise filters in scoreSynonymHits.
+ */
+export function tableDeclaredSynonyms(t: WarehouseTable): string[] {
+  const out = new Set<string>();
+  const card = t.name ? loadCatalogCards()[t.name] : undefined;
+  for (const s of card?.synonyms || []) {
+    const v = String(s || "").trim();
+    if (v) out.add(v);
+  }
+  for (const s of t.synonyms || []) {
+    const v = String(s || "").trim();
+    if (v) out.add(v);
+  }
+  return [...out];
+}
+
 export function tableSynonyms(t: WarehouseTable): string[] {
   const out = new Set<string>();
   const add = (s?: string) => {
     const p = cleanPhrase(s || "");
     if (p) out.add(p);
   };
-  const card = t.name ? loadCatalogCards()[t.name] : undefined;
-  for (const s of card?.synonyms || []) add(s);
-  for (const s of t.synonyms || []) add(s);
+  for (const s of tableDeclaredSynonyms(t)) add(s);
   for (const s of displayNameSynonyms(t.displayName)) add(s);
   for (const s of identityTails(tableIdentity(t))) add(s);
   return [...out];

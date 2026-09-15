@@ -22,6 +22,47 @@ export interface EnumDimensionDef {
   valueAliases?: Record<string, string>;
   /** NL 未提及时用 defaultMovieTypes，不反问 */
   defaultWhenAbsent?: boolean;
+  /**
+   * SQL lint: the empty value is a real member of this dimension, so `field != ''`
+   * must not silently drop it. Config, not code — the field name lives in the pack.
+   */
+  denyEmptyExclusion?: boolean;
+  /** NL naming this dim implies it is an output dim (group-by column). Config, not code. */
+  outputDim?: boolean;
+  /**
+   * Human label for the empty value of this dim in clarify options
+   * (e.g. blank locale means English). Config, not code.
+   */
+  emptyLabel?: string;
+  /**
+   * Surface forms that mean the empty member of this dim (label prefix from
+   * emptyLabel + these aliases). Config, not code — no built-in token lists.
+   */
+  emptyAliases?: string[];
+  /** SQL column alias for the empty member in wide/pivot shapes. Config, not code. */
+  emptyAlias?: string;
+  /**
+   * Stored values of this dim are numeric codes; non-numeric filter tokens must be
+   * refused instead of string-compared. Config, not code.
+   */
+  numericValues?: boolean;
+  /**
+   * Member-value pattern: how stored values / user tokens map to members.
+   * - locale: members are locale codes (xx-YY) plus an empty member (英语/empty); the
+   *   pack-declared "language dimension" carries this. Extracted from free text via the
+   *   locale regex + emptyAliases; NOT a code↔label lexicon.
+   * - lexicon: members are code↔label pairs resolved through Metabase field values; user
+   *   names (电影/电视剧…) are memberCues that must be probed/resolved, never guessed.
+   * - literal: tokens are stored values as-is (channel codes, named values).
+   * Declaring this per dim removes every hard-coded contentLang/movieType reference from
+   * the clarify slot cluster — the code reads memberKind instead of naming a dimension.
+   */
+  memberKind?: "locale" | "lexicon" | "literal";
+  /**
+   * Surface forms of *members* of this dim (e.g. 电影/电视剧/短剧…) used to tell
+   * 「N 种 <dim>」集合问法 from「已点名成员」。Aligned with the warehouse lexicon.
+   */
+  memberCues?: string[];
 }
 
 export type RatioCompileSpec = {
@@ -70,6 +111,8 @@ export interface MetricDefOption {
     valueField?: string;
     entityKeys?: string[];
     distinctField?: string;
+    /** SQL output column alias for single-value results; defaults to safeAlias(option id). */
+    outputAlias?: string;
     ratio?: RatioCompileSpec;
     retention?: RetentionCompileSpec;
   };
@@ -119,20 +162,22 @@ export type WarehouseTable = {
   fieldMeta?: Record<string, WarehouseFieldMeta>;
 };
 
-/** Higher = better default query window. ≤0 means do not use as the ask time column. */
+/**
+ * Fallback heuristic for tables NOT declared in pack time.tableFields — generic English
+ * warehouse naming conventions only (no business-system column names in code).
+ * Higher = better default query window. ≤0 means do not use as the ask time column.
+ */
 export function timeFieldRank(name: string): number {
   const n = String(name || "");
   if (!n) return -100;
   if (/birthday/i.test(n)) return -100;
-  if (/forbiddenEnd|logoutTime|lastNickNameModify/i.test(n)) return -90;
   if (/expire/i.test(n)) return -80;
   if (/^(endTime|endDate)$/i.test(n)) return -70;
-  if (/^(lastWatchTime|watchTime|actionTime|payTime)$/i.test(n)) return 100;
   if (/^(reportDate|recordDate|activeDate|onlineTime|publishTime|day)$/i.test(n)) return 90;
   if (/^(date)$/i.test(n)) return 88;
   if (/^(createdTime|createTime|createDate|createdDate)$/i.test(n)) return 80;
   if (/^(serverTime|eventTime|eventDate)$/i.test(n)) return 70;
-  if (/^(lastLoginTime|latestActiveDate)$/i.test(n)) return 60;
+  if (/^(lastLoginTime)$/i.test(n)) return 60;
   if (/^(date|time|ct)$/i.test(n)) return 50;
   if (/updateTime|updateDate/i.test(n)) return 15;
   if (/(?:time|date|at)$/i.test(n)) return 10;
@@ -241,10 +286,43 @@ export function allowedTableNames(pack: AnalyticsPack | undefined): string[] {
 
 export function packTimeField(pack: AnalyticsPack | undefined, table?: string): string {
   if (isOverlayTable(pack, table)) {
-    return String(pack?.time?.field || "lastWatchTime").trim() || "lastWatchTime";
+    return String(pack?.time?.field || "").trim();
   }
   const w = warehouseTable(pack, table);
-  return inferTimeFieldFromTypes(w?.fieldTypes, w?.fields) || "";
+  // Pack-declared per-table ask window wins — validated against the live field list
+  // (a stale declaration for a column the table no longer has must degrade, not guess).
+  const declared = String(pack?.time?.tableFields?.[bareTableName(table || "")] || "").trim();
+  if (declared && (!w?.fields?.length || w.fields.includes(declared))) {
+    return declared;
+  }
+  // Fallback: generic naming heuristic; pack-excluded columns never qualify.
+  const excluded = new Set((pack?.time?.excludeFields || []).map((f) => String(f).toLowerCase()));
+  const candidates = (w?.fields || []).filter((f) => !excluded.has(String(f).toLowerCase()));
+  return inferTimeFieldFromTypes(w?.fieldTypes, candidates) || "";
+}
+
+/**
+ * Logical id of the pack's time grain dim (used in outputDims / grain verify).
+ * Empty when the pack does not model a grain — callers must degrade, not guess.
+ */
+export function packGrainId(pack: AnalyticsPack | undefined): string {
+  return String(pack?.time?.grainId || "").trim();
+}
+
+/** SQL/result alias for the grain column (e.g. the day column). Empty when undeclared. */
+export function packGrainAlias(pack: AnalyticsPack | undefined): string {
+  return String(pack?.time?.grainColumnAlias || "").trim();
+}
+
+/** First declared entity key — default column for a bare `uniq:*`. Empty when undeclared. */
+export function packDefaultEntityKey(pack: AnalyticsPack | undefined): string {
+  for (const e of pack?.entities || []) {
+    for (const k of e.keys || []) {
+      const key = String(k || "").trim();
+      if (key) return key;
+    }
+  }
+  return "";
 }
 
 /** True when this table has a usable analytics time column. */
@@ -365,7 +443,42 @@ export interface AnalyticsPack {
     missingYearDefault: string;
     /** Physical time column; live catalog must still contain it. */
     field?: string;
+    /**
+     * Per-table ask-time column overrides (bare table name → physical column).
+     * Config, not code; validated against the live field list before use — a stale
+     * declaration degrades to the naming heuristic instead of being trusted blindly.
+     */
+    tableFields?: Record<string, string>;
+    /** Columns that must never be picked as the ask time window. Config, not code. */
+    excludeFields?: string[];
+    /**
+     * Logical id of the time grain dimension (e.g. day grain) used in outputDims.
+     * Config, not code — callers read packGrainId(pack) instead of naming a grain.
+     */
+    grainId?: string;
+    /** Result/SQL column alias for the grain column. Config, not code. */
+    grainColumnAlias?: string;
+    /** Human title for the grain column when the NL names it. Config, not code. */
+    grainColumnLabel?: string;
+    /**
+     * CJK surface forms that request day-grain (by-day). Config, not code — keep all
+     * business wording here so the analytics red line (no hard-coded business words) holds.
+     */
+    grainAliases?: string[];
   };
+  /**
+   * NL intent signals that relax a lint rule. CJK surface forms live here, never in code.
+   * allowDropEmptyLang: user explicitly permits dropping empty-language rows.
+   * allowLimit1: user explicitly asks for a single top row.
+   */
+  intentSignals?: {
+    allowDropEmptyLang?: string[];
+    allowLimit1?: string[];
+  };
+  /** CJK surface forms that request a wide (language-split) result shape. Config, not code. */
+  wideShapeCues?: string[];
+  /** CJK surface forms that request a long (row-per-member) result shape. Config, not code. */
+  longShapeCues?: string[];
   /**
    * Runtime-only warehouse snapshot (not stored in pack JSON).
    * Filled by applyCatalogToPack after Metabase metadata refresh.
@@ -378,8 +491,21 @@ export interface AnalyticsPack {
     maxRewriteRounds: number;
     parallelism: number;
     defaultMovieTypes: number[];
+    /** Column that `defaultMovieTypes` filters on. Config, not code. */
+    defaultMovieTypesField?: string;
     /** Language-wide columns when NL says 宽表 but does not name ≥2 locales. */
     defaultWideLangs?: string[];
+    /**
+     * Dimension id the wide (per-value conditional-aggregation) shape pivots on
+     * (e.g. the language column). Config, not code — empty means no wide pivot,
+     * callers must degrade instead of guessing.
+     */
+    widePivotDim?: string;
+    /**
+     * Dimension id that multi-intent plan tuples split on (one step per member,
+     * e.g. channel compare). Config, not code — empty means no entity-split planning.
+     */
+    entityCompareDim?: string;
     /** Metabase/CH 单次查询超时（毫秒）；缺省读 ANALYTICS_QUERY_TIMEOUT_MS 或 120000 */
     queryTimeoutMs?: number;
     /**
@@ -422,6 +548,34 @@ export function enumDimForField(
   field: string,
 ): EnumDimensionDef | undefined {
   return (pack?.enumDimensions || []).find((d) => d.field === field);
+}
+
+/** The pack-declared "language" dimension — members are locale codes with a special empty member. */
+export function languageDimension(pack: AnalyticsPack | undefined): EnumDimensionDef | undefined {
+  return (pack?.enumDimensions || []).find((d) => d.memberKind === "locale");
+}
+
+/** Enum dims by member-kind (locale = language codes, lexicon = metabase code↔label, literal = as-is). */
+export function enumDimsByMemberKind(
+  pack: AnalyticsPack | undefined,
+  kind: "locale" | "lexicon" | "literal",
+): EnumDimensionDef[] {
+  return (pack?.enumDimensions || []).filter((d) => d.memberKind === kind);
+}
+
+/**
+ * Resolve a user/assistant slot name to a canonical enum-dim id. Matches dim.id, dim.field,
+ * or any alias — so a pack can name its language dimension anything and the model's
+ * clarifySlot still routes. Unknown slot → returned unchanged (callers fall through).
+ */
+export function canonicalDimSlot(slot: string, pack: AnalyticsPack | undefined): string {
+  const s = String(slot || "").trim().toLowerCase();
+  if (!s || !pack?.enumDimensions?.length) return slot;
+  for (const d of pack.enumDimensions) {
+    const ids = [d.id, d.field, ...(d.aliases || [])].map((x) => String(x || "").toLowerCase());
+    if (ids.includes(s)) return d.id || d.field || slot;
+  }
+  return slot;
 }
 
 /** Pack-owned surface→code map (印度A → IndiaA). Empty when pack/field has no aliases. */

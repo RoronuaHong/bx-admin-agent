@@ -6,6 +6,7 @@ import {
   tableHasTimeField,
   type AnalyticsPack,
 } from "./semantic-layer.js";
+import { nlHasIntentSignal } from "./nl-signals.js";
 
 export { analyzeSqlAst, assertSqlAstSafe } from "./sql-ast.js";
 
@@ -20,20 +21,32 @@ export function normalizeDistinctCount(sql: string, fn: DistinctCountFn): string
 }
 
 /** Deterministic SQL lint checks aligned with spec §7.1（业务规则；结构项交给 AST）。 */
-export function lintSql(sql: string, nl: string, opts?: { timeField?: string }): string[] {
+export function lintSql(sql: string, nl: string, opts?: { pack?: AnalyticsPack; timeField?: string }): string[] {
   const issues: string[] = [];
   const ast = analyzeSqlAst(sql);
   issues.push(...ast.issues.filter((x) => x === "multi_statement" || x === "non_readonly" || x === "into_outfile" || x === "not_select"));
 
-  const timeField = String(opts?.timeField || "lastWatchTime").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`${timeField}\\s*=\\s*'?\\d{4}-\\d{2}-\\d{2}'?`, "i").test(sql)) {
-    issues.push("datetime_eq_date_string");
+  // Time column comes from the caller (packTimeField) — no schema default in code.
+  const timeField = String(opts?.timeField || "").trim();
+  if (timeField) {
+    const escaped = timeField.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`${escaped}\\s*=\\s*'?\\d{4}-\\d{2}-\\d{2}'?`, "i").test(sql)) {
+      issues.push("datetime_eq_date_string");
+    }
   }
-  const allowDropEmpty = /不要没标|排除空|不要空语言/.test(nl);
-  if (!allowDropEmpty && /contentLang\s*(!=|<>)\s*''/i.test(sql)) {
-    issues.push("forbid_exclude_empty_lang");
+  const allowDropEmpty = nlHasIntentSignal(nl, opts?.pack, "allowDropEmptyLang");
+  if (!allowDropEmpty) {
+    // Dims whose empty value is a real member (pack-owned flag) must not be excluded.
+    for (const d of opts?.pack?.enumDimensions || []) {
+      if (!d.denyEmptyExclusion || !d.field) continue;
+      const f = d.field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`${f}\\s*(?:!=|<>)\\s*''`, "i").test(sql)) {
+        issues.push("forbid_exclude_empty_lang");
+        break;
+      }
+    }
   }
-  if (/limit\s+1\b/i.test(sql) && !/只要第|第一名|top\s*1/i.test(nl)) {
+  if (/limit\s+1\b/i.test(sql) && !nlHasIntentSignal(nl, opts?.pack, "allowLimit1")) {
     issues.push("avoid_limit_1_unless_asked");
   }
   return [...new Set(issues)];

@@ -4,7 +4,14 @@
  */
 
 import { extractChannelsFromNl } from "./intent.js";
-import type { AnalyticsPack } from "./semantic-layer.js";
+import {
+  enumDimForField,
+  enumDimsByMemberKind,
+  languageDimension,
+  loadAnalyticsPack,
+  overlayTableName,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
 import type { StructuredAskOk } from "./conversation-structure.js";
 import type { ResultLayout } from "./types.js";
 
@@ -57,6 +64,28 @@ function uniq(xs: string[]): string[] {
   return [...new Set(xs.map(String).filter((x) => x !== undefined && x !== null && String(x).length))];
 }
 
+/**
+ * 维度 field → AskRequested 契约字段（channels/contentLangs/movieTypes）。
+ * 路由由 pack 的 memberKind 声明推导，不再写死 contentLang/movieType 字面量。
+ */
+function requestedContractKey(pack: AnalyticsPack | undefined, field: string): keyof AskRequested {
+  const d = enumDimForField(pack, field);
+  if (d?.memberKind === "locale") return "contentLangs";
+  if (d?.memberKind === "lexicon") return "movieTypes";
+  return "channels";
+}
+
+/** 维度 canonical slot（id/field）→ AskRequested 契约字段；未知 slot 返回 undefined（不落槽）。 */
+function requestedContractKeyForSlot(
+  pack: AnalyticsPack | undefined,
+  slot: string,
+): keyof AskRequested | undefined {
+  const p = pack || loadAnalyticsPack();
+  const d = (p.enumDimensions || []).find((x) => (x.id || x.field) === slot) || enumDimForField(p, slot);
+  if (!d) return undefined;
+  return requestedContractKey(p, d.field);
+}
+
 function asStringArray(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return uniq(v.map(String));
@@ -68,28 +97,47 @@ export function extractChannelTokensFromText(text: string, pack?: AnalyticsPack)
 }
 
 const CHANNEL_REPLACE_CUE = /换成|改成|改为|替换成/;
+/** Generic Chinese filler/verb particles (NLP功能词) — dim wording comes from the pack. */
+const SLOT_FILLER_RE = /那|换成|改成|改为|替换成|吧|呢|啊|呀|用|看/g;
 
 /** True when leftover text after named codes is only a channel-slot answer (换成/吧/呢). */
-export function isChannelSlotAnswer(text: string, channels: string[]): boolean {
+export function isChannelSlotAnswer(
+  text: string,
+  channels: string[],
+  pack?: AnalyticsPack,
+): boolean {
   if (!channels.length) return false;
   let rest = String(text || "");
   for (const ch of channels) rest = rest.split(ch).join(" ");
+  // Dim surface forms (渠道/语言/…) are pack-owned, not code.
+  for (const d of pack?.enumDimensions || []) {
+    for (const alias of [d.id, d.field, ...(d.aliases || [])]) {
+      if (alias && alias.length >= 2) rest = rest.split(alias).join(" ");
+    }
+  }
   rest = rest
-    .replace(/那|换成|改成|改为|替换成|吧|呢|啊|呀|用|看|渠道/g, " ")
+    .replace(SLOT_FILLER_RE, " ")
     .replace(/[。.!！,，;；?\s]+/g, " ")
     .trim();
   return rest.length === 0;
 }
 
-/** Map NL / option id / index to wide|long. Unknown → undefined (do not default to long). */
-export function normalizeResultLayout(v: unknown): "wide" | "long" | undefined {
+/**
+ * Map NL / option id / index to wide|long. Unknown → undefined (do not default to long).
+ * Shape surface forms come from the pack (wideShapeCues / longShapeCues).
+ */
+export function normalizeResultLayout(
+  v: unknown,
+  pack?: AnalyticsPack,
+): "wide" | "long" | undefined {
   const raw = String(v ?? "").trim();
   if (!raw) return undefined;
   const t = raw.toLowerCase();
-  if (t === "wide" || t === "1" || raw === "宽表" || /^wide\b/.test(t)) return "wide";
-  if (t === "long" || t === "2" || raw === "长表" || /^long\b/.test(t)) return "long";
-  if (/宽表/.test(raw)) return "wide";
-  if (/长表/.test(raw)) return "long";
+  if (t === "wide" || t === "1" || /^wide\b/.test(t)) return "wide";
+  if (t === "long" || t === "2" || /^long\b/.test(t)) return "long";
+  const hit = (cues?: string[]) => (cues || []).some((c) => c && raw.includes(c));
+  if (hit(pack?.wideShapeCues)) return "wide";
+  if (hit(pack?.longShapeCues)) return "long";
   return undefined;
 }
 
@@ -106,7 +154,7 @@ export function completeTurnIntentSlots(input: {
   lastClarifySlot?: string;
 }): TurnIntent {
   if (input.lastClarifySlot === "result_layout") {
-    const layout = normalizeResultLayout(input.lastUserText);
+    const layout = normalizeResultLayout(input.lastUserText, input.pack || undefined);
     if (layout) {
       return {
         kind: "clarify_answer",
@@ -194,7 +242,7 @@ export function inferTurnIntentFallback(input: {
   if (!text) return { kind: "new_ask", notes: ["empty"] };
 
   if (input.lastClarifySlot === "result_layout") {
-    const layout = normalizeResultLayout(text);
+    const layout = normalizeResultLayout(text, input.pack || undefined);
     if (layout) {
       return {
         kind: "clarify_answer",
@@ -209,7 +257,7 @@ export function inferTurnIntentFallback(input: {
   if (
     input.lastClarifySlot === "channel" &&
     namedChannels.length &&
-    isChannelSlotAnswer(text, namedChannels)
+    isChannelSlotAnswer(text, namedChannels, input.pack || undefined)
   ) {
     return {
       kind: "clarify_answer",
@@ -384,13 +432,13 @@ export function validateTurnIntent(raw: unknown, prevAskState?: AskState | null)
   return { kind: "new_ask", notes: [...notes, "turn_intent_invalid:kind"] };
 }
 
-function setPath(state: AskState, path: string, value: unknown): void {
+function setPath(state: AskState, path: string, value: unknown, pack?: AnalyticsPack | null): void {
   if (path === "metricId" && typeof value === "string") {
     state.metricId = value;
     return;
   }
   if (path === "layout") {
-    const layout = normalizeResultLayout(value);
+    const layout = normalizeResultLayout(value, pack || undefined);
     if (layout) state.layout = layout;
     return;
   }
@@ -440,22 +488,11 @@ function clearPath(state: AskState, path: string): void {
     state.filters = next;
     return;
   }
-  if (path === "requested.contentLangs") {
+  if (path.startsWith("requested.")) {
     const next = { ...state.requested };
-    delete next.contentLangs;
+    delete next[path.slice("requested.".length) as keyof AskRequested];
     state.requested = next;
     return;
-  }
-  if (path === "requested.channels") {
-    const next = { ...state.requested };
-    delete next.channels;
-    state.requested = next;
-    return;
-  }
-  if (path === "requested.movieTypes") {
-    const next = { ...state.requested };
-    delete next.movieTypes;
-    state.requested = next;
   }
 }
 
@@ -479,6 +516,8 @@ export function mergeAskState(input: {
   prev: AskState;
   intent: TurnIntent;
   askId?: string;
+  /** Pack that owns the shape surface forms (宽表/长表) — no built-in aliases in code. */
+  pack?: AnalyticsPack | null;
 }): { ok: true; state: AskState; notes: string[] } | { ok: false; reason: string } {
   if (input.intent.kind === "new_ask") {
     return { ok: false, reason: "new_ask_has_no_merge" };
@@ -501,18 +540,19 @@ export function mergeAskState(input: {
       delete state.filters.table;
     } else if (slot === "metric" || slot === "metricId") state.metricId = values[0] || state.metricId;
     else if (slot === "result_layout") {
-      const layout = normalizeResultLayout(values[0]);
+      const layout = normalizeResultLayout(values[0], input.pack || undefined);
       if (layout) state.layout = layout;
-      const langs = state.filters.contentLang || [];
-      if (langs.length > 1 && !state.pivotDim) state.pivotDim = "contentLang";
+      const langDim = languageDimension(input.pack || undefined);
+      const langField = langDim?.field || "contentLang";
+      const langs = state.filters[langField] || [];
+      if (langs.length > 1 && !state.pivotDim) state.pivotDim = langField;
     }
     else if (slot === "time_range" && values.length >= 2) {
       state.time = { start: values[0]!, end: values[1]! };
     } else {
       state.filters = { ...state.filters, [slot]: values };
-      if (slot === "channel") state.requested = { ...state.requested, channels: values };
-      if (slot === "contentLang") state.requested = { ...state.requested, contentLangs: values };
-      if (slot === "movieType") state.requested = { ...state.requested, movieTypes: values };
+      const rkey = requestedContractKeyForSlot(input.pack, slot);
+      if (rkey) state.requested = { ...state.requested, [rkey]: values };
     }
     state.summary = summarizeAskState(state);
     return { ok: true, state, notes: [...notes, `clarify_answer:${slot}`] };
@@ -521,7 +561,7 @@ export function mergeAskState(input: {
   // revise
   for (const path of input.intent.clear || []) clearPath(state, path);
   for (const [path, value] of Object.entries(input.intent.set || {})) {
-    setPath(state, path, value);
+    setPath(state, path, value, input.pack);
   }
 
   const patch = input.intent.requestedPatch?.channels;
@@ -550,6 +590,7 @@ export function applySlotAnswersToAskState(input: {
   prev: AskState;
   slotAnswers?: Record<string, string[]>;
   askId?: string;
+  pack?: AnalyticsPack | null;
 }): { ok: true; state: AskState; notes: string[] } | { ok: false; reason: string } {
   const entries = Object.entries(input.slotAnswers || {}).filter(([, vs]) => Array.isArray(vs) && vs.length);
   if (!entries.length) return { ok: false, reason: "no_slot_answers" };
@@ -560,6 +601,7 @@ export function applySlotAnswersToAskState(input: {
     const merged = mergeAskState({
       prev: state,
       intent: { kind: "clarify_answer", slot, values: [...values] },
+      pack: input.pack,
     });
     if (!merged.ok) return merged;
     state = merged.state;
@@ -568,13 +610,20 @@ export function applySlotAnswersToAskState(input: {
   return { ok: true, state, notes };
 }
 
-export function summarizeAskState(state: AskState): string {
+export function summarizeAskState(state: AskState, pack?: AnalyticsPack): string {
+  // Filter bullets are driven by whatever dims the pack declares (label = first alias).
+  const dimLabel = (field: string): string => {
+    const d = (pack?.enumDimensions || []).find((x) => x.field === field || x.id === field);
+    return String(d?.aliases?.[0] || d?.id || field);
+  };
+  const filterBits = Object.entries(state.filters || {})
+    .filter(([, values]) => Array.isArray(values) && values.length)
+    .map(([field, values]) => `${dimLabel(field)} ${(values as string[]).join(",")}`);
+  const overlay = overlayTableName(pack);
   const parts = [
     state.time?.start && state.time?.end ? `${state.time.start}～${state.time.end}` : null,
-    state.filters.channel?.length ? `渠道 ${state.filters.channel.join(",")}` : null,
-    state.filters.contentLang?.length ? `语言 ${state.filters.contentLang.join(",")}` : null,
-    state.filters.movieType?.length ? `类型 ${state.filters.movieType.join(",")}` : null,
-    state.table && state.table !== "elt_watch_detail" ? `表 ${state.table}` : null,
+    ...filterBits,
+    state.table && overlay && state.table !== overlay ? `表 ${state.table}` : null,
     state.metricId || null,
     state.ops?.filter((o) => o !== "base_aggregate").join(",") || null,
   ];
@@ -626,16 +675,41 @@ export function buildAskStateFromStructure(input: {
 }): AskState {
   const s = input.structure;
   const filters = { ...(s.filters || {}) };
-  const requested: AskRequested = {
-    channels: filters.channel ? [...filters.channel] : undefined,
-    contentLangs: filters.contentLang ? [...filters.contentLang] : undefined,
-    movieTypes: filters.movieType ? [...filters.movieType] : undefined,
-  };
+  const packForReq = loadAnalyticsPack();
+  const requested: AskRequested = {};
+  for (const d of packForReq.enumDimensions || []) {
+    const key = requestedContractKey(packForReq, d.field);
+    const vals = (filters[d.field] as string[]) || [];
+    if (vals.length) requested[key] = [...new Set([...(requested[key] || []), ...vals])];
+  }
+  const metricId = String(s.metricId || "");
+  const computedSummary = summarizeAskState({
+    askId: input.askId,
+    packId: input.packId,
+    packVersion: input.packVersion,
+    metricId,
+    time: { start: s.time!.start, end: s.time!.end },
+    filters,
+    outputDims: [...(s.outputDims || [])],
+    ops: [...(s.ops || [])],
+    requested,
+    summary: "",
+    updatedAt: Date.now(),
+  });
+  const carriedSummary = String(s.askSummary || s.mergedNl || "").trim();
+  // The model routinely carries the previous turn's summary forward verbatim, so it can still name
+  // a metric this turn just changed. That summary is injected into the next turn's context as
+  // mergedNl, so a stale one would drag the old metric back. Regenerate whenever the carried
+  // summary does not name the metric actually resolved for this turn.
+  const summary =
+    metricId && carriedSummary && !carriedSummary.includes(metricId)
+      ? computedSummary
+      : carriedSummary || computedSummary;
   const state: AskState = {
     askId: input.askId,
     packId: input.packId,
     packVersion: input.packVersion,
-    metricId: String(s.metricId || ""),
+    metricId,
     table: s.table,
     time: { start: s.time!.start, end: s.time!.end },
     filters,
@@ -645,19 +719,7 @@ export function buildAskStateFromStructure(input: {
     ops: [...(s.ops || ["base_aggregate"])],
     requested,
     defaultsApplied: input.defaultsApplied,
-    summary: s.askSummary || s.mergedNl || summarizeAskState({
-      askId: input.askId,
-      packId: input.packId,
-      packVersion: input.packVersion,
-      metricId: String(s.metricId || ""),
-      time: { start: s.time!.start, end: s.time!.end },
-      filters,
-      outputDims: [...(s.outputDims || [])],
-      ops: [...(s.ops || [])],
-      requested,
-      summary: "",
-      updatedAt: Date.now(),
-    }),
+    summary,
     updatedAt: Date.now(),
   };
   state.summary = state.summary || summarizeAskState(state);
@@ -687,6 +749,15 @@ export function parseAskState(raw: unknown): AskState | null {
     string,
     unknown
   >;
+  const packForReq = loadAnalyticsPack();
+  const requested: AskRequested = {};
+  for (const d of packForReq.enumDimensions || []) {
+    const key = requestedContractKey(packForReq, d.field);
+    const fromRaw = asStringArray(requestedRaw[key as string]);
+    const fromFilters = (filters[d.field] as string[]) || [];
+    const vals = fromRaw.length ? fromRaw : fromFilters;
+    if (vals.length) requested[key] = [...new Set(vals)];
+  }
   return {
     askId: String(o.askId || ""),
     packId: String(o.packId || "watch-detail"),
@@ -699,17 +770,7 @@ export function parseAskState(raw: unknown): AskState | null {
     layout: o.layout === "wide" || o.layout === "long" ? o.layout : undefined,
     pivotDim: o.pivotDim ? String(o.pivotDim) : undefined,
     ops: asStringArray(o.ops).length ? asStringArray(o.ops) : ["base_aggregate"],
-    requested: {
-      channels: asStringArray(requestedRaw.channels).length
-        ? asStringArray(requestedRaw.channels)
-        : filters.channel,
-      contentLangs: asStringArray(requestedRaw.contentLangs).length
-        ? asStringArray(requestedRaw.contentLangs)
-        : filters.contentLang,
-      movieTypes: asStringArray(requestedRaw.movieTypes).length
-        ? asStringArray(requestedRaw.movieTypes)
-        : filters.movieType,
-    },
+    requested,
     defaultsApplied:
       o.defaultsApplied && typeof o.defaultsApplied === "object"
         ? (o.defaultsApplied as AskState["defaultsApplied"])

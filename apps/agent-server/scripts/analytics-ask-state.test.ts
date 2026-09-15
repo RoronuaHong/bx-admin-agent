@@ -266,14 +266,20 @@ const base: AskState = {
 }
 
 {
-  assert.equal(normalizeResultLayout("宽表"), "wide");
-  assert.equal(normalizeResultLayout("1"), "wide");
-  assert.equal(normalizeResultLayout("长表"), "long");
-  assert.equal(normalizeResultLayout("ghost"), undefined);
+  // Shape 面词来自 pack（wideShapeCues / longShapeCues），英文 id 与序号是协议值。
+  const pack = loadAnalyticsPack("watch-detail");
+  assert.equal(normalizeResultLayout("宽表", pack), "wide");
+  assert.equal(normalizeResultLayout("1", pack), "wide");
+  assert.equal(normalizeResultLayout("长表", pack), "long");
+  assert.equal(normalizeResultLayout("ghost", pack), undefined);
+  // 无 pack 时只剩协议值（不再有内置中文面词）
+  assert.equal(normalizeResultLayout("宽表"), undefined);
+  assert.equal(normalizeResultLayout("wide"), "wide");
   const fromNl = inferTurnIntentFallback({
     lastUserText: "宽表",
     prevAskState: base,
     lastClarifySlot: "result_layout",
+    pack,
   });
   assert.equal(fromNl.kind, "clarify_answer");
   if (fromNl.kind === "clarify_answer") {
@@ -283,6 +289,7 @@ const base: AskState = {
   const merged = mergeAskState({
     prev: base,
     intent: { kind: "clarify_answer", slot: "result_layout", values: ["宽表"] },
+    pack,
   });
   assert.ok(merged.ok);
   if (merged.ok) assert.equal(merged.state.layout, "wide");

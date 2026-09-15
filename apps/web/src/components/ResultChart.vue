@@ -6,12 +6,13 @@ import {
   GridComponent,
   LegendComponent,
   TooltipComponent,
+  LegacyGridContainLabel,
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { ChartView } from "../types";
 import { formatDisplayDate } from "../table-columns";
 
-echarts.use([LineChart, BarChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
+echarts.use([LineChart, BarChart, GridComponent, LegendComponent, TooltipComponent, LegacyGridContainLabel, CanvasRenderer]);
 
 const props = defineProps<{ chart: ChartView }>();
 const elRef = ref<HTMLDivElement | null>(null);

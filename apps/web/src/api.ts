@@ -315,6 +315,9 @@ export interface StoredMessage {
   clarifySlot?: string;
   clarifyOptions?: Array<{ id: string; label: string }>;
   insight?: string;
+  headline?: string;
+  caution?: string;
+  followups?: string[];
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
   turnKind?: string;
 }
@@ -485,6 +488,12 @@ export interface AnalyticsAskResult {
   error?: string;
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
   insight?: string;
+  /** 头号答案：一句直接回答（含关键数字），卡片顶部主结论 */
+  headline?: string;
+  /** 口径/风险提示（校对未通过等），卡片收尾区展示 */
+  caution?: string;
+  /** 追问建议（模型基于本次结果生成，1-3 条），答尾 chip */
+  followups?: string[];
   modelId?: string;
   packVersion?: string;
   sqlSource?: "intent_compile" | "verified_query" | "llm_sql";
@@ -566,35 +575,48 @@ export async function askAnalytics(
     uiLocale?: string;
   },
 ): Promise<AnalyticsAskResult> {
-  const resp = await fetch("/agent/analytics/ask", {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      model: opts?.model,
-      images: opts?.images,
-      files: opts?.files,
-      slotAnswers: opts?.slotAnswers,
-      messages: opts?.messages,
-      prevAskState: opts?.prevAskState,
-      lastClarifySlot: opts?.lastClarifySlot,
-      clarifyOptionIds: opts?.clarifyOptionIds,
-      uiLocale: opts?.uiLocale,
-    }),
-    signal: opts?.signal,
-  });
-  if (!resp.ok) {
-    const data = await resp.json().catch(() => ({}));
-    const payload = data as Partial<ApiErrorPayload> & { message?: string; code?: string };
-    const token = normalizeToken(payload.error, payload.code);
-    throw new ApiError(payload.message || token?.defaultMessage || `analytics ask ${resp.status}`, {
-      status: resp.status,
-      token,
-      code: payload.code,
+  try {
+    const resp = await fetch("/agent/analytics/ask", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model: opts?.model,
+        images: opts?.images,
+        files: opts?.files,
+        slotAnswers: opts?.slotAnswers,
+        messages: opts?.messages,
+        prevAskState: opts?.prevAskState,
+        lastClarifySlot: opts?.lastClarifySlot,
+        clarifyOptionIds: opts?.clarifyOptionIds,
+        uiLocale: opts?.uiLocale,
+      }),
+      signal: opts?.signal,
     });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      const payload = data as Partial<ApiErrorPayload> & { message?: string; code?: string };
+      const token = normalizeToken(payload.error, payload.code);
+      throw new ApiError(payload.message || token?.defaultMessage || `analytics ask ${resp.status}`, {
+        status: resp.status,
+        token,
+        code: payload.code,
+      });
+    }
+    return resp.json() as Promise<AnalyticsAskResult>;
+  } catch (err) {
+    // 中止（用户取消 / 超时）不应作为未捕获异常抛出，转为哨兵结果；
+    // 调用方 send() 已按 data.error === "aborted" 处理取消 / 超时分支。
+    if (
+      opts?.signal?.aborted ||
+      (err instanceof DOMException && err.name === "AbortError") ||
+      (err instanceof Error && err.name === "AbortError")
+    ) {
+      return { error: "aborted", status: "error" } as AnalyticsAskResult;
+    }
+    throw err;
   }
-  return resp.json() as Promise<AnalyticsAskResult>;
 }
 
 // ---- Analytics 会话持久化（Mongo analytics_conversations，与 chat 隔离）----
@@ -690,6 +712,7 @@ export interface AnalyticsScanJob {
   status: AnalyticsScanJobStatus;
   dryRun: boolean;
   forceRerun: boolean;
+  digest?: boolean;
   rerunSeq: number;
   createdAt: string;
   updatedAt: string;
@@ -706,6 +729,7 @@ export async function runAnalyticsScan(payload?: {
   scanDate?: string;
   forceRerun?: boolean;
   dryRun?: boolean;
+  digest?: boolean;
 }): Promise<{ jobId: string }> {
   return (await jsonFetch("/agent/analytics/scan/run", {
     method: "POST",

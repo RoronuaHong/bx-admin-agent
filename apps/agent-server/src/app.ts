@@ -36,6 +36,9 @@ import { resolvePortalPermissions } from "./permissions.js";
 import { loadUserPreferences } from "./user-prefs.js";
 import { buildStoredAssistantMessageFromEvents } from "./chat-task-persistence.js";
 import { analyticsAsk } from "./analytics/pipeline.js";
+import { loadScanReport } from "./analytics/scan/report-store.js";
+import { getReportPng, getReportPdf } from "./analytics/scan/report-image.js";
+import { buildScanReportXlsx } from "./analytics/scan/report-export.js";
 import {
   listFeedbackCandidates,
   reviewFeedbackCandidate,
@@ -934,6 +937,64 @@ export function createApp() {
       return errorJson(c, 404, "SCAN_JOB_NOT_FOUND", undefined, "scan job 不存在");
     }
     return c.json(job);
+  });
+
+  // 巡检报告分享页数据源：匿名只读，token 即访问凭证（钉钉告警文案里的链接指向此）。
+  app.get("/analytics/report/:token", (c) => {
+    const report = loadScanReport(c.req.param("token"));
+    if (!report) return c.json({ error: "not_found" }, 404);
+    c.header("Cache-Control", "public, max-age=300");
+    return c.json(report);
+  });
+
+  // 巡检报告图片（钉钉 markdown 内嵌 `![](url)` 用）：headless 浏览器渲染报告页并缓存。
+  // 未装浏览器 → 503，调用方退回「文本柱状图 + 报告链接」，不影响推送。
+  app.get("/analytics/report/:token/image.png", async (c) => {
+    const token = c.req.param("token");
+    if (!loadScanReport(token)) return c.json({ error: "not_found" }, 404);
+    const base = config.scan.webBaseUrl;
+    if (!base) return c.json({ error: "web_base_url_not_configured" }, 503);
+    const png = await getReportPng(token, `${base}/analytics/report/${token}`);
+    if (!png) return c.json({ error: "image_render_unavailable" }, 503);
+    c.header("Cache-Control", "public, max-age=300");
+    return c.body(new Uint8Array(png), 200, { "Content-Type": "image/png" });
+  });
+
+  // 巡检报告 PDF（报告页「下载 PDF」+ 钉钉卡片「下载 PDF」按钮的数据源）：整页渲染图包成 A4 宽单页。
+  app.get("/analytics/report/:token/report.pdf", async (c) => {
+    const token = c.req.param("token");
+    const report = loadScanReport(token);
+    if (!report) return c.json({ error: "not_found" }, 404);
+    const base = config.scan.webBaseUrl;
+    if (!base) return c.json({ error: "web_base_url_not_configured" }, 503);
+    const pdf = await getReportPdf(token, `${base}/analytics/report/${token}`);
+    if (!pdf) return c.json({ error: "pdf_render_unavailable" }, 503);
+    const ascii = `report-${report.scanDate}.pdf`;
+    const utf8 = encodeURIComponent(`巡检报告-${report.scanDate}.pdf`);
+    c.header(
+      "Content-Disposition",
+      `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`,
+    );
+    c.header("Cache-Control", "public, max-age=300");
+    return c.body(new Uint8Array(pdf), 200, { "Content-Type": "application/pdf" });
+  });
+
+  // 巡检报告 Excel 导出（报告页「下载 Excel」+ 钉钉卡片「下载 Excel」按钮的数据源）。
+  app.get("/analytics/report/:token/export.xlsx", async (c) => {
+    const token = c.req.param("token");
+    const report = loadScanReport(token);
+    if (!report) return c.json({ error: "not_found" }, 404);
+    const buf = await buildScanReportXlsx(report);
+    const ascii = `report-${report.scanDate}.xlsx`;
+    const utf8 = encodeURIComponent(`巡检报告-${report.scanDate}.xlsx`);
+    c.header(
+      "Content-Disposition",
+      `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`,
+    );
+    c.header("Cache-Control", "public, max-age=300");
+    return c.body(new Uint8Array(buf), 200, {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
   });
 
   // M3 巡检内部 API：Bearer SCAN_INTERNAL_TOKEN + ANALYTICS_SCAN_WORKER=1

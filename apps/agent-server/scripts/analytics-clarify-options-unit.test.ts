@@ -8,10 +8,14 @@ import {
   parseProbeValuesForDim,
   withOptionNumbers,
 } from "../src/analytics/clarify-options.ts";
+import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 
+// 空值标签由 pack `enumDimensions[].emptyLabel` 提供（生产路径也传 pack）。
+const pack = loadAnalyticsPack("watch-detail");
 const parsed = parseProbeValuesForDim(
   "contentLang: (empty), ta-IN, te-IN, ml-IN\nchannel: IndiaA",
   "contentLang",
+  pack,
 );
 assert.deepEqual(
   parsed.map((o) => o.id),

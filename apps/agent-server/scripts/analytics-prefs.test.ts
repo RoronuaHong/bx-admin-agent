@@ -12,6 +12,10 @@ import {
 } from "../src/analytics/analytics-prefs.js";
 import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
 
+// NL-driven signals (multi-channel ask / named channel) come from the pack — the production
+// caller always passes it (pipeline.ts), so the unit test must too.
+const pack = loadAnalyticsPack("watch-detail");
+
 const dir = mkdtempSync(join(tmpdir(), "analytics-prefs-"));
 _setAnalyticsPrefsDirForTest(dir);
 
@@ -47,6 +51,7 @@ try {
     filters: { channel: ["IndiaB"] },
     prefs: loaded,
     nl: "IndiaB 按天观看人数",
+    pack,
   });
   assert.deepEqual(keep.filters.channel, ["IndiaB"]);
   assert.ok(!keep.notes.some((n) => n.startsWith("prefs_default_channel")));
@@ -56,6 +61,7 @@ try {
     filters: { channel: ["IndiaA"] },
     prefs: loaded,
     nl: "2026-08-19到2026-08-25按天观看人数",
+    pack,
   });
   assert.deepEqual(soft.filters.channel, ["IndiaA"]);
   assert.ok(soft.notes.some((n) => n.startsWith("prefs_default_channel")));
@@ -72,6 +78,7 @@ try {
     filters: {},
     prefs: loaded,
     nl: "各渠道观看人数的同比增长率",
+    pack,
   });
   assert.equal(multi.filters.channel, undefined);
 
@@ -80,6 +87,7 @@ try {
     filters: {},
     prefs: loaded,
     nl: "FoxA 按天观看人数",
+    pack,
   });
   assert.equal(named.filters.channel, undefined);
 

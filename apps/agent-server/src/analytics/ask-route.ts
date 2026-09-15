@@ -1,10 +1,16 @@
 /**
  * Hybrid ask router: verified_query → intent_compile → llm_sql.
  */
+import { tableDeclaredSynonyms } from "./catalog-card.js";
 import { parseGenericMetricId } from "./intent.js";
 import { inferMetricIdFromNl } from "./metric-infer.js";
 import { overlayAskFromNl, RICH_TABLE_CAP, type TableConfidence } from "./table-resolve.js";
-import { findMetricOption, isOverlayTable, type AnalyticsPack } from "./semantic-layer.js";
+import {
+  findMetricOption,
+  isOverlayTable,
+  packFieldsForTable,
+  type AnalyticsPack,
+} from "./semantic-layer.js";
 import { matchVerifiedQuery, type VerifiedQuery } from "./verified-query.js";
 
 export type AskRoute =
@@ -19,10 +25,28 @@ export type AskRoute =
     }
   | { path: "refuse"; reason: string; message: string };
 
-/** Documented-table default `count:*` is not a user-asked compile; leave those for Path C. */
-const EXPLICIT_GENERIC =
-  /金额|实付|收入|\bGMV\b|\bgmv\b|时长合计|总时长|总观看|人数|UV|uv|用户数|用户有多少|有多少.*用户|多少|数量|条数|笔数|次数|订单数|有多少|统计|一共/;
+/**
+ * Did the user actually ask for a measure? Grounded on the pack's own metric vocabulary
+ * (aliases / labels / groundSignals) or a column of the target table named in the NL.
+ * No business word list in code — a new pack/warehouse needs zero changes here.
+ */
+function explicitMeasureInNl(nl: string, pack: AnalyticsPack, table?: string): boolean {
+  const text = String(nl || "");
+  if (!text) return false;
+  for (const def of pack.metricDefs || []) {
+    if ((def.aliases || []).some((a) => a && text.includes(a))) return true;
+    for (const opt of def.options || []) {
+      if (opt.label && text.includes(opt.label)) return true;
+      if ((opt.groundSignals || []).some((s) => s && text.includes(s))) return true;
+    }
+  }
+  if (packFieldsForTable(pack, table).some((f) => f.length >= 3 && text.includes(f))) return true;
+  // Naming the table (or one of its declared synonyms) is itself an explicit ask.
+  const t = (pack.warehouse?.tables || []).find((x) => x.name === table);
+  return Boolean(t && tableDeclaredSynonyms(t).some((s) => s && text.includes(s)));
+}
 
+/** Documented-table default `count:*` is not a user-asked compile; leave those for Path C. */
 function compilableByIntent(
   nl: string,
   generic: string,
@@ -41,7 +65,7 @@ function compilableByIntent(
     parsed.kind === "count" &&
     table &&
     !isOverlayTable(pack, table) &&
-    !EXPLICIT_GENERIC.test(nl)
+    !explicitMeasureInNl(nl, pack, table)
   ) {
     return false;
   }

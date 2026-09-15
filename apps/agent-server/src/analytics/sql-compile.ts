@@ -5,14 +5,18 @@
 
 import type { AnalyticsIntent, OutputDimId } from "./intent.js";
 import { sqlStringLiteral } from "./intent.js";
+import { EMPTY_PROBE_TOKEN } from "./clarify-options.js";
 import {
   compileTableRef,
   findMetricOption,
   isNumericWarehouseType,
   isOverlayTable,
+  packDefaultEntityKey,
   packDefaultWideLangs,
   packFieldType,
   packFieldsForTable,
+  packGrainAlias,
+  packGrainId,
   packRelationships,
   packTimeField,
   type AnalyticsPack,
@@ -20,11 +24,16 @@ import {
   type RetentionCompileSpec,
 } from "./semantic-layer.js";
 
-export function dayGrainSelect(timeField: string): { select: string; group: string; alias: string } {
+/** Grain column alias comes from pack.time.grainColumnAlias — not from code. */
+export function dayGrainSelect(
+  pack: AnalyticsPack,
+  timeField: string,
+): { select: string; group: string; alias: string } {
+  const alias = packGrainAlias(pack) || timeField;
   return {
-    select: `toDate(${timeField}) AS watchDate`,
-    group: "watchDate",
-    alias: "watchDate",
+    select: `toDate(${timeField}) AS ${alias}`,
+    group: alias,
+    alias,
   };
 }
 
@@ -35,32 +44,47 @@ export type CompileResult = CompileOk | CompileFail;
 function dimSelectExpr(
   dim: OutputDimId,
   timeField: string,
+  pack: AnalyticsPack,
 ): { select: string; group: string; alias: string } {
-  if (dim === "watch_date") {
-    return dayGrainSelect(timeField);
+  if (packGrainId(pack) && dim === packGrainId(pack)) {
+    return dayGrainSelect(pack, timeField);
   }
-  if (dim === "channel") {
-    return { select: "channel", group: "channel", alias: "channel" };
-  }
-  // 物理字段名
+  // 物理字段名（含已建模维）
   return { select: dim, group: dim, alias: dim };
 }
 
-/** Probe/clarify may use "(empty)" for blank dimension values → SQL empty string. */
-function normalizeFilterToken(v: string): string {
+/**
+ * Empty-member surface forms come from the pack (emptyLabel prefix + emptyAliases).
+ * "(empty)" / 空 are generic blank tokens; no dim-specific word lives in code.
+ */
+function packEmptyTokenMatcher(pack?: AnalyticsPack): (t: string) => boolean {
+  const forms: Array<{ raw: string; lower: string }> = [];
+  for (const d of pack?.enumDimensions || []) {
+    const label = String(d.emptyLabel || "").trim();
+    if (label) {
+      const prefix = label.split(/（|\(/)[0]!.trim();
+      if (prefix) forms.push({ raw: prefix, lower: prefix.toLowerCase() });
+    }
+    for (const a of d.emptyAliases || []) {
+      const s = String(a || "").trim();
+      if (s) forms.push({ raw: s, lower: s.toLowerCase() });
+    }
+  }
+  return (t: string) => {
+    const lower = t.toLowerCase();
+    return forms.some(
+      (f) => lower === f.lower || t.startsWith(`${f.raw}（`) || t.startsWith(`${f.raw}(`),
+    );
+  };
+}
+
+/** Probe/clarify may use the empty probe token for blank dimension values → SQL empty string. */
+function normalizeFilterToken(v: string, pack?: AnalyticsPack): string {
   const t = String(v).trim();
-  if (
-    !t ||
-    t === "(empty)" ||
-    t === "\u7a7a" ||
-    t.startsWith("\u7a7a\uff08") ||
-    t === "\u82f1\u8bed" ||
-    t.startsWith("\u82f1\u8bed\uff08") ||
-    /^english$/i.test(t) ||
-    /^en(-US)?$/i.test(t)
-  ) {
+  if (!t || t === EMPTY_PROBE_TOKEN || t === "\u7a7a" || t.startsWith("\u7a7a\uff08") || t.startsWith("\u7a7a(")) {
     return "";
   }
+  if (packEmptyTokenMatcher(pack)(t)) return "";
   return t;
 }
 
@@ -104,9 +128,10 @@ function buildWhere(
     if (knownFields.size && !knownFields.has(field)) {
       return { ok: false, reason: `filter_field_not_in_catalog:${field}` };
     }
-    const normalized = values.map(normalizeFilterToken);
+    const normalized = values.map((v) => normalizeFilterToken(v, pack));
     const typedNumeric = isNumericWarehouseType(packFieldType(pack, field, intent.table));
-    const forceNumeric = typedNumeric || field === "movieType";
+    const dimDef = pack?.enumDimensions?.find((d) => d.field === field);
+    const forceNumeric = typedNumeric || dimDef?.numericValues === true;
     if (forceNumeric) {
       const bad = assertNumericFilterValues(field, normalized);
       if (bad) return bad;
@@ -127,6 +152,12 @@ function safeAlias(code: string): string {
   return String(code).replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "") || "v";
 }
 
+/** SQL alias for the pivot dim's empty member — pack-declared (emptyAlias), generic fallback. */
+function emptyValueAlias(pack: AnalyticsPack | undefined, dimField: string | undefined): string {
+  const d = pack?.enumDimensions?.find((x) => x.field && x.field === dimField);
+  return String(d?.emptyAlias || "").trim() || "v";
+}
+
 /**
  * Canonicalize output dimensions for deterministic SQL grain.
  * - 用户/模型显式声明的 outputDims 全部保留（即使某维被单值 filter 固定，如 channel='X'）：
@@ -136,24 +167,29 @@ function safeAlias(code: string): string {
  */
 function canonicalDims(intent: AnalyticsIntent, pack?: AnalyticsPack): OutputDimId[] {
   const dims = [...(intent.outputDims || [])];
-  if (!dims.length) return isOverlayTable(pack, intent.table) ? ["watch_date"] : [];
-  return dims;
+  if (dims.length) return dims;
+  // Overlay with no explicit breakout → the pack's declared grain dim; degrade when undeclared.
+  const grain = packGrainId(pack);
+  return isOverlayTable(pack, intent.table) && grain ? [grain] : [];
 }
 
 function resolveWidePivotValues(intent: AnalyticsIntent, pack?: AnalyticsPack): string[] {
   const pivot = intent.pivotDim;
   if (intent.layout !== "wide" || !pivot) return [];
-  const fromFilters = (intent.filters[pivot] || []).map(normalizeFilterToken);
+  const fromFilters = (intent.filters[pivot] || []).map((v) => normalizeFilterToken(v, pack));
   if (fromFilters.length >= 2) return fromFilters;
   return packDefaultWideLangs(pack);
 }
 
 function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileResult {
-  const valueField = intent.metric.valueField || "maxWatchProgress";
-  const entityKeys = intent.metric.entityKeys?.length ? intent.metric.entityKeys : ["guid", "eid"];
+  const valueField = intent.metric.valueField;
+  if (!valueField) return { ok: false, reason: "metric_field_missing:valueField" };
+  const entityKeys = intent.metric.entityKeys?.length
+    ? intent.metric.entityKeys
+    : [packDefaultEntityKey(pack)].filter(Boolean);
   const timeField = packTimeField(pack, intent.table);
   const dims = canonicalDims(intent, pack);
-  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField, pack));
   const whereBuilt = buildWhere(intent, pack);
   if (!whereBuilt.ok) return whereBuilt;
   const where = whereBuilt.where;
@@ -161,15 +197,12 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   const pivot = intent.pivotDim;
   const pivotValues = resolveWidePivotValues(intent, pack);
   const useWide = intent.layout === "wide" && pivot && pivotValues.length > 1;
+  const emptyAlias = emptyValueAlias(pack, pivot);
 
   if (useWide) {
     // Pivot dim is expanded as columns — do not also select/group it as a row dim.
-    const wideDims = dims.filter((d) => d !== pivot);
-    const wideMeta = (wideDims.length ? wideDims : dims.filter((d) => d !== pivot)).map((d) =>
-      dimSelectExpr(d, timeField),
-    );
     // If all dims were pivot-only, keep empty outer grain (single row of pivot columns)
-    const innerDimMeta = wideMeta.length ? wideMeta : [];
+    const innerDimMeta = dims.filter((d) => d !== pivot).map((d) => dimSelectExpr(d, timeField, pack));
     const innerSelectParts = [
       ...innerDimMeta.map((d) => d.select),
       ...entityKeys,
@@ -199,13 +232,12 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
     const outerMetrics = pivotValues
       .map((v) => {
         const lit = sqlStringLiteral(v);
-        const alias = safeAlias(v === "" ? "en" : v);
+        const alias = safeAlias(v === "" ? emptyAlias : v);
         return `round(sumIf(a, ${pivot} = ${lit}) / nullIf(countIf(${pivot} = ${lit}), 0), 0) AS ${alias}`;
       })
       .join(",\n  ");
     const outerGroup = innerDimMeta.map((d) => d.group).join(", ");
     const outerSelect = [...innerDimMeta.map((d) => d.group), outerMetrics].filter(Boolean).join(",\n  ");
-    const order = outerGroup || outerMetrics.split(" AS ").pop()?.trim() || "1";
     const sql = [
       `SELECT`,
       `  ${outerSelect}`,
@@ -224,7 +256,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   // LONG / 单值：输出维（+ 可选 pivot）上对 max 再 avg
   const longDims = [...dims];
   if (intent.layout === "long" && pivot && !longDims.includes(pivot)) longDims.push(pivot);
-  const longMeta = longDims.map((d) => dimSelectExpr(d, timeField));
+  const longMeta = longDims.map((d) => dimSelectExpr(d, timeField, pack));
   const innerSelect = [
     ...longMeta.map((d) => d.select),
     ...entityKeys,
@@ -235,7 +267,7 @@ function compileAvgOfMax(intent: AnalyticsIntent, pack?: AnalyticsPack): Compile
   const sql = [
     `SELECT`,
     `  ${longMeta.map((d) => d.group).join(",\n  ")},`,
-    `  round(avg(a), 0) AS avg_max_progress`,
+    `  round(avg(a), 0) AS ${intent.metric.id}`,
     `FROM (`,
     `  SELECT`,
     `    ${innerSelect}`,
@@ -257,31 +289,35 @@ function compileWideAggregates(intent: AnalyticsIntent, pack?: AnalyticsPack): C
 
   const timeField = packTimeField(pack, intent.table);
   const dims = canonicalDims(intent, pack).filter((d) => d !== pivot);
-  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField, pack));
   const whereBuilt = buildWhere(intent, pack);
   if (!whereBuilt.ok) return whereBuilt;
   const where = whereBuilt.where;
 
+  // Metric fields must be declared by the pack/intent — no schema defaults in code.
+  const needsValue = intent.metric.kind === "avg_per_user" || intent.metric.kind === "sum" || intent.metric.kind === "avg";
+  const needsDistinct = intent.metric.kind === "uniq" || intent.metric.kind === "avg_per_user";
+  if (needsValue && !intent.metric.valueField) return { ok: false, reason: "metric_field_missing:valueField" };
+  if (needsDistinct && !intent.metric.distinctField) return { ok: false, reason: "metric_field_missing:distinctField" };
+  const valueField = intent.metric.valueField!;
+  const distinctField = intent.metric.distinctField!;
+  const emptyAlias = emptyValueAlias(pack, pivot);
+
   const cols = pivotValues.map((v) => {
     const lit = sqlStringLiteral(v);
-    const alias = safeAlias(v === "" ? "en" : v);
+    const alias = safeAlias(v === "" ? emptyAlias : v);
     const pred = `${pivot} = ${lit}`;
     if (intent.metric.kind === "uniq") {
-      const f = intent.metric.distinctField || "guid";
-      return `uniqIf(${f}, ${pred}) AS ${alias}`;
+      return `uniqIf(${distinctField}, ${pred}) AS ${alias}`;
     }
     if (intent.metric.kind === "avg_per_user") {
-      const valueField = intent.metric.valueField || "watchSecond";
-      const distinctField = intent.metric.distinctField || "guid";
       return `round(sumIf(${valueField}, ${pred}) / nullIf(uniqIf(${distinctField}, ${pred}), 0), 0) AS ${alias}`;
     }
     if (intent.metric.kind === "sum") {
-      const f = intent.metric.valueField || "watchSecond";
-      return `sumIf(${f}, ${pred}) AS ${alias}`;
+      return `sumIf(${valueField}, ${pred}) AS ${alias}`;
     }
     if (intent.metric.kind === "avg") {
-      const f = intent.metric.valueField || "watchSecond";
-      return `round(avgIf(${f}, ${pred}), 2) AS ${alias}`;
+      return `round(avgIf(${valueField}, ${pred}), 2) AS ${alias}`;
     }
     if (intent.metric.kind === "count") {
       return `countIf(${pred}) AS ${alias}`;
@@ -307,24 +343,30 @@ function compileUniqOrSum(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
   if (wide) return wide;
   const timeField = packTimeField(pack, intent.table);
   const dims = canonicalDims(intent, pack);
-  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField));
+  const dimMeta = dims.map((d) => dimSelectExpr(d, timeField, pack));
   const whereBuilt = buildWhere(intent, pack);
   if (!whereBuilt.ok) return whereBuilt;
   const where = whereBuilt.where;
   let metricExpr: string;
   if (intent.metric.kind === "uniq") {
-    const f = intent.metric.distinctField || "guid";
-    metricExpr = `uniq(${f}) AS users`;
+    const f = intent.metric.distinctField;
+    if (!f) return { ok: false, reason: "metric_field_missing:distinctField" };
+    const out = findMetricOption(pack, intent.metric.id)?.opt.compile?.outputAlias;
+    metricExpr = `uniq(${f}) AS ${out || safeAlias(intent.metric.id)}`;
   } else if (intent.metric.kind === "sum") {
-    const f = intent.metric.valueField || "watchSecond";
+    const f = intent.metric.valueField;
+    if (!f) return { ok: false, reason: "metric_field_missing:valueField" };
     metricExpr = `sum(${f}) AS ${f}`;
   } else if (intent.metric.kind === "avg") {
-    const f = intent.metric.valueField || "watchSecond";
+    const f = intent.metric.valueField;
+    if (!f) return { ok: false, reason: "metric_field_missing:valueField" };
     metricExpr = `round(avg(${f}), 2) AS ${f}`;
   } else if (intent.metric.kind === "avg_per_user") {
-    const valueField = intent.metric.valueField || "watchSecond";
-    const distinctField = intent.metric.distinctField || "guid";
-    metricExpr = `round(sum(${valueField}) / nullIf(uniq(${distinctField}), 0), 2) AS avg_watch_second`;
+    const valueField = intent.metric.valueField;
+    const distinctField = intent.metric.distinctField;
+    if (!valueField || !distinctField) return { ok: false, reason: "metric_field_missing:avg_per_user_fields" };
+    const out = findMetricOption(pack, intent.metric.id)?.opt.compile?.outputAlias;
+    metricExpr = `round(sum(${valueField}) / nullIf(uniq(${distinctField}), 0), 2) AS ${out || safeAlias(intent.metric.id)}`;
   } else if (intent.metric.kind === "count") {
     const f = intent.metric.valueField;
     metricExpr = f ? `count(${f}) AS ${f}` : "count() AS rows";
@@ -375,11 +417,15 @@ function compileRatio(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileRes
   const denTbl = compileTableRef(pack, spec.denominatorTable);
   const leftTbl = compileTableRef(pack, rel.left.table);
   const rightTbl = compileTableRef(pack, spec.numeratorTable);
-  const denCh = spec.filterFields.channel?.[spec.denominatorTable] || "channel";
-  const denVer = spec.filterFields.appVersion?.[spec.denominatorTable] || "appVersion";
-  const numCh = spec.filterFields.channel?.[spec.numeratorTable] || "channel";
-  const numVerLeft = spec.filterFields.appVersion?.[spec.denominatorTable] || "appVersion";
-  const numVerRight = spec.filterFields.appVersion?.[spec.numeratorTable] || "appVersion";
+  // Physical filter columns must be declared per table in the pack (filterFields) — no defaults.
+  const denCh = spec.filterFields.channel?.[spec.denominatorTable];
+  const denVer = spec.filterFields.appVersion?.[spec.denominatorTable];
+  const numCh = spec.filterFields.channel?.[spec.numeratorTable];
+  const numVerLeft = spec.filterFields.appVersion?.[spec.denominatorTable];
+  const numVerRight = spec.filterFields.appVersion?.[spec.numeratorTable];
+  if (!denCh || !denVer || !numCh || !numVerLeft || !numVerRight) {
+    return { ok: false, reason: "ratio_filter_fields_missing" };
+  }
   const extra = Object.entries(spec.numeratorFilters || {})
     .flatMap(([field, values]) => {
       if (!values?.length) return [];
@@ -391,12 +437,13 @@ function compileRatio(intent: AnalyticsIntent, pack?: AnalyticsPack): CompileRes
     })
     .join("\n    AND ");
 
+  const ratioEmptyAlias = emptyValueAlias(pack, spec.pivotField);
   const uniqCols = pivotValues.map((v, i) => {
-    const alias = aliases?.[i] || safeAlias(v === "" ? "en" : v);
+    const alias = aliases?.[i] || safeAlias(v === "" ? ratioEmptyAlias : v);
     return `uniqIf(${spec.numeratorDistinctField}, ${spec.pivotField} = ${sqlStringLiteral(v)}) AS ${alias}`;
   });
   const rateCols = pivotValues.map((v, i) => {
-    const src = aliases?.[i] || safeAlias(v === "" ? "en" : v);
+    const src = aliases?.[i] || safeAlias(v === "" ? ratioEmptyAlias : v);
     const alias = aliases ? `${src}2` : `${src}_rate`;
     return `round(${src} / total, 6) AS ${alias}`;
   });
@@ -442,7 +489,8 @@ function compileRetention(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
   const cohortRef = compileTableRef(pack, spec.cohortTable);
   const activeRef = compileTableRef(pack, spec.activeTable);
   const langRef = langTableRef(spec.lang, pack);
-  const key = spec.keyField || "guid";
+  const key = spec.keyField;
+  if (!key) return { ok: false, reason: "retention_key_field_missing" };
   const header = [
     `WITH`,
     `${sqlStringLiteral(channel)} AS targetChannel,`,
@@ -480,7 +528,9 @@ function compileRetention(intent: AnalyticsIntent, pack?: AnalyticsPack): Compil
   const langs = resolveWidePivotValues({ ...intent, layout: "wide", pivotDim: spec.lang.langField }, pack);
   const pivotValues = langs.length >= 2 ? langs : packDefaultWideLangs(pack);
   if (pivotValues.length < 2) return { ok: false, reason: "retention_need_wide_langs" };
-  const aliases = defaultLangAliases(pivotValues, pack) || pivotValues.map((v) => safeAlias(v === "" ? "en" : v));
+  const aliases =
+    defaultLangAliases(pivotValues, pack) ||
+    pivotValues.map((v) => safeAlias(v === "" ? emptyValueAlias(pack, spec.lang.langField) : v));
   const todayCols = pivotValues.map((v, i) => `countIf(${spec.lang.langField} = ${sqlStringLiteral(v)}) AS ${aliases[i]}`);
   const retAliases = aliases.map((a) => (a.length === 1 ? `${a}${a}` : `${a}_r`));
   const retCols = pivotValues.map((v, i) => `countIf(${spec.lang.langField} = ${sqlStringLiteral(v)}) AS ${retAliases[i]}`);

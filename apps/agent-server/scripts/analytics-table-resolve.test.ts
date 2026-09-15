@@ -35,9 +35,16 @@ const pack = {
         fields: ["guid", "latestActiveDate"],
         description: "记录每个设备的活跃日期，此表是以设备维度记录活跃数据",
       },
-      { schema: "film_report", name: "film_user_device_info_simple", fields: ["guid"] },
-      { schema: "film_report", name: "elt_ul_activity_device", fields: ["guid"] },
-      { schema: "film_report", name: "user_watch_movie_activity_device_log", fields: ["guid"] },
+      // 中文 NL → 英文表名的桥接来自**声明式** synonyms（生产放 catalog-cards.json），
+      // 不再有内置「设备/订单/充值…→ 英文词干」映射表。
+      { schema: "film_report", name: "film_user_device_info_simple", fields: ["guid"], synonyms: ["设备"] },
+      { schema: "film_report", name: "elt_ul_activity_device", fields: ["guid"], synonyms: ["设备"] },
+      {
+        schema: "film_report",
+        name: "user_watch_movie_activity_device_log",
+        fields: ["guid"],
+        synonyms: ["设备"],
+      },
       {
         schema: "film_report",
         name: "watch_log",

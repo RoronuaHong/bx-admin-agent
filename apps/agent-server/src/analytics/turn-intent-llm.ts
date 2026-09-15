@@ -13,12 +13,16 @@ import {
   type TurnIntent,
 } from "./ask-state.js";
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
+import { reportModelFailure } from "./model-fallback.js";
 import type { AnalyticsPack } from "./semantic-layer.js";
+import { enumDimsByMemberKind, languageDimension } from "./semantic-layer.js";
 import { packAnalyticsLlmContext, renderAnalyticsLlmUserText } from "./context-pack.js";
 import { beginAnalyticsLlmSignal } from "./llm-error.js";
 
 
-function buildSystemPrompt(): string {
+function buildSystemPrompt(pack?: AnalyticsPack | null): string {
+  const langDim = languageDimension(pack || undefined);
+  const langId = (langDim?.id || "contentLang").trim();
   return [
     "You classify the user's LATEST turn against the current analytics AskState.",
     "Return ONE JSON object only (no markdown).",
@@ -32,13 +36,13 @@ function buildSystemPrompt(): string {
     "- 「换成/改成 X」channel → revise + requestedPatch.channels.mode=replace with X only (drop previous channels).",
     "- If lastClarifySlot is channel and the user names a code, use clarify_answer or replace; never keep ungrounded prev codes.",
     "- Multi-channel compare → set.outputDims must include \"channel\" (and keep watch_date if day grain).",
-    "- 「按天/按日」grain → revise set.outputDims to include watch_date; do NOT invent contentLang.",
+    "- Day-grain request → revise set.outputDims to include the day-grain dimension; do not invent a language dimension.",
     "- Without prevAskState you must use new_ask (never revise).",
     "- Never invent SQL. Never invent dimension codes not in the user text or prev Ask.",
     "Schema:",
     '{ "kind":"revise"|"new_ask"|"clarify_answer"|"meta",',
     '  "set": { "metricId"?:string, "outputDims"?:string[], "layout"?: "wide"|"long",',
-    '          "filters.channel"?:string[], "filters.contentLang"?:string[], "time"?:{start,end} },',
+    `          "filters.channel"?:string[], "filters.${langId}"?:string[], "time"?:{start,end} },`,
     '  "clear": string[],',
     '  "requestedPatch": { "channels": { "mode":"union"|"replace", "values": string[] } },',
     '  "slot": string, "values": string[],',
@@ -166,7 +170,12 @@ async function chatJson(input: {
       const data = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string | null } }>;
       };
-      if (!resp.ok) throw new Error(JSON.stringify(data).slice(0, 300));
+      if (!resp.ok) {
+        const err = new Error(JSON.stringify(data).slice(0, 300)) as Error & { status?: number };
+        err.status = resp.status;
+        reportModelFailure(model.id, err);
+        throw err;
+      }
       content = String(data.choices?.[0]?.message?.content || "").trim();
     }
     handle?.end({ status: "ok", meta: { bytes: content.length, context: input.context } });
@@ -247,7 +256,7 @@ export async function resolveTurnIntent(input: {
     });
     const raw = await chatJson({
       modelId: input.modelId,
-      system: buildSystemPrompt(),
+      system: buildSystemPrompt(input.pack),
       user: prompt.text,
       signal: input.signal,
       traceRunId: input.traceRunId,

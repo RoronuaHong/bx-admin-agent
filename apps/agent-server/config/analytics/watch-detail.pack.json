@@ -46,10 +46,24 @@
   ],
   "probeDimensions": ["channel", "contentLang", "movieType"],
   "required_filters": ["time_range"],
+  "intentSignals": {
+    "allowDropEmptyLang": ["不要没标", "排除空", "不要空语言"],
+    "allowLimit1": ["只要第", "第一名", "前1名", "top 1", "top1"]
+  },
+  "wideShapeCues": ["宽表", "语言宽表", "按语言拆列", "按语种拆", "小语种列"],
+  "longShapeCues": ["长表", "竖表"],
   "time": {
     "businessTimezone": "Asia/Shanghai",
     "missingYearDefault": "clock_year",
-    "field": "lastWatchTime"
+    "field": "lastWatchTime",
+    "grainId": "watch_date",
+    "grainColumnAlias": "watchDate",
+    "grainColumnLabel": "观看日期",
+    "grainAliases": ["按天", "每天", "按日", "按日期", "观看日期"],
+    "tableFields": {
+      "elt_film_order": "payTime"
+    },
+    "excludeFields": ["forbiddenEnd", "logoutTime", "lastNickNameModify"]
   },
   "guards": {
     "distinctCountFn": "uniq",
@@ -58,7 +72,10 @@
     "maxRewriteRounds": 2,
     "parallelism": 4,
     "defaultMovieTypes": [1, 2, 3, 4, 10, 11],
+    "defaultMovieTypesField": "movieType",
     "defaultWideLangs": ["", "te-IN", "ta-IN", "ml-IN"],
+    "widePivotDim": "contentLang",
+    "entityCompareDim": "channel",
     "queryTimeoutMs": 120000,
     "forcedFilters": {}
   },
@@ -67,8 +84,10 @@
       "id": "channel",
       "field": "channel",
       "aliases": ["渠道", "频道", "channel"],
+      "outputDim": true,
       "domain": "probe",
       "valueDomain": "literal",
+      "memberKind": "literal",
       "valueAliases": {
         "印度A": "IndiaA",
         "印度B": "IndiaB",
@@ -81,16 +100,25 @@
       "aliases": ["语言", "语种", "小语种", "contentLang", "英语", "英文"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类", "小语种"],
       "domain": "probe",
-      "valueDomain": "literal"
+      "valueDomain": "literal",
+      "denyEmptyExclusion": true,
+      "memberKind": "locale",
+      "outputDim": true,
+      "emptyLabel": "英语（contentLang 为空）",
+      "emptyAliases": ["english", "en", "en-US"],
+      "emptyAlias": "en"
     },
     {
       "id": "movieType",
       "field": "movieType",
       "aliases": ["影片类型", "内容类型", "影片", "movieType"],
       "setSignals": ["\\d+种", "[一二三四五六七八九十两几多各]种", "几种", "多种", "各类"],
+      "memberCues": ["电影", "电视剧", "短剧", "动漫", "真人秀", "肥皂剧"],
       "domain": "probe",
       "valueDomain": "metabase_lexicon",
-      "defaultWhenAbsent": true
+      "memberKind": "lexicon",
+      "defaultWhenAbsent": true,
+      "numericValues": true
     }
   ],
   "metricDefs": [
@@ -126,7 +154,8 @@
           "compile": {
             "kind": "avg_per_user",
             "valueField": "watchSecond",
-            "distinctField": "guid"
+            "distinctField": "guid",
+            "outputAlias": "avg_watch_second"
           }
         },
         {
@@ -247,6 +276,21 @@
           "compile": {
             "kind": "uniq",
             "distinctField": "guid"
+          }
+        }
+      ]
+    },
+    {
+      "id": "uniq_users",
+      "aliases": ["人数", "UV", "uv", "用户数", "观看人数"],
+      "options": [
+        {
+          "id": "uniq_users",
+          "label": "观看人数/UV",
+          "compile": {
+            "kind": "uniq",
+            "distinctField": "guid",
+            "outputAlias": "users"
           }
         }
       ]

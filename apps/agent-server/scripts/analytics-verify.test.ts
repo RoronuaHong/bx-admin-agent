@@ -14,6 +14,7 @@ import {
   splitSqls,
 } from "../src/analytics/verify.js";
 import { reconcileNamedDimensions } from "../src/analytics/dim-reconcile.js";
+import { loadAnalyticsPack, packTimeField } from "../src/analytics/semantic-layer.js";
 
 {
   const named = extractNamedEntities("八月二十到二十一印度A按天观看人数，同时FoxA按语言");
@@ -44,21 +45,27 @@ import { reconcileNamedDimensions } from "../src/analytics/dim-reconcile.js";
   assert.equal(entityReferencedInSql("印度A", "SELECT uniq(guid) FROM t"), false);
 }
 
-// ---- verifyGrainDay ----
+// ---- verifyGrainDay (grain aliases + time column both come from the pack) ----
 {
   const nl = "八月二十到二十一印度A按天观看人数";
-  const okSql =
-    "SELECT toDate(lastWatchTime) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' GROUP BY d";
-  assert.deepEqual(verifyGrainDay(nl, okSql), []);
+  const pack = loadAnalyticsPack("watch-detail");
+  const timeField = packTimeField(pack);
+  const okSql = `SELECT toDate(${timeField}) AS d, uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' GROUP BY d`;
+  assert.deepEqual(verifyGrainDay(nl, okSql, pack), []);
   assert.ok(
-    verifyGrainDay(nl, "SELECT lastWatchTime AS d, uniq(guid) FROM t GROUP BY d").includes(
+    verifyGrainDay(nl, `SELECT ${timeField} AS d, uniq(guid) FROM t GROUP BY d`, pack).includes(
       "missing_day_grain_toDate",
     ),
   );
+  // Same aliases, different physical column → driven by pack.time.field, not code.
+  const altPack = { ...pack, time: { ...pack.time, field: "eventAt" } };
   assert.deepEqual(
-    verifyGrainDay(nl, "SELECT toDate(eventAt) AS d, uniq(guid) FROM t GROUP BY d", "eventAt"),
+    verifyGrainDay(nl, "SELECT toDate(eventAt) AS d, uniq(guid) FROM t GROUP BY d", altPack),
     [],
   );
+  // Pack without a time column → nothing to verify, no hidden default.
+  const noTime = { ...pack, time: { ...pack.time, field: undefined } };
+  assert.deepEqual(verifyGrainDay(nl, `SELECT ${timeField} AS d FROM t GROUP BY d`, noTime), []);
 }
 
 // ---- verifyNamedChannel (generic single entity) ----

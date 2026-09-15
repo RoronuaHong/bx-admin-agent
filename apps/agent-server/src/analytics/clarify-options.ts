@@ -4,29 +4,35 @@
  * so message + clarifyOptions always carry 1-based sequence numbers.
  */
 
+import type { AnalyticsPack } from "./semantic-layer.js";
+
 export type ClarifyOption = { id: string; label: string };
 
 export const EMPTY_PROBE_TOKEN = "(empty)";
-/** Generic empty label for non-lang dims. */
+/** Generic empty label; a dim can override it with pack `enumDimensions[].emptyLabel`. */
 export const EMPTY_OPTION_LABEL = "\u7a7a\uff08\u672a\u6807\u6ce8\uff09"; // 空（未标注）
-/** Business rule: blank contentLang means English. */
-export const EMPTY_CONTENT_LANG_LABEL =
-  "\u82f1\u8bed\uff08contentLang \u4e3a\u7a7a\uff09"; // 英语（contentLang 为空）
 
-export function normalizeProbeToken(v: string, dimField?: string): ClarifyOption {
+export function normalizeProbeToken(
+  v: string,
+  dimField?: string,
+  pack?: AnalyticsPack,
+): ClarifyOption {
   const token = v.trim();
   if (!token || token === EMPTY_PROBE_TOKEN) {
-    const label =
-      dimField && dimField.toLowerCase() === "contentlang"
-        ? EMPTY_CONTENT_LANG_LABEL
-        : EMPTY_OPTION_LABEL;
-    return { id: EMPTY_PROBE_TOKEN, label };
+    const dim = (pack?.enumDimensions || []).find(
+      (d) => d.field === dimField || d.id === dimField,
+    );
+    return { id: EMPTY_PROBE_TOKEN, label: dim?.emptyLabel || EMPTY_OPTION_LABEL };
   }
   return { id: token, label: token };
 }
 
 /** Parse `dim: a, b, (empty)` probe summary lines into selectable options (empty kept). */
-export function parseProbeValuesForDim(probeSummary: string, dimField: string): ClarifyOption[] {
+export function parseProbeValuesForDim(
+  probeSummary: string,
+  dimField: string,
+  pack?: AnalyticsPack,
+): ClarifyOption[] {
   const line = probeSummary
     .split("\n")
     .map((l) => l.trim())
@@ -39,7 +45,7 @@ export function parseProbeValuesForDim(probeSummary: string, dimField: string): 
   for (const part of raw.split(",")) {
     const token = part.trim();
     if (!token) continue;
-    const opt = normalizeProbeToken(token, dimField);
+    const opt = normalizeProbeToken(token, dimField, pack);
     if (seen.has(opt.id)) continue;
     seen.add(opt.id);
     out.push(opt);
@@ -169,16 +175,6 @@ export function metricClarifyOptionsFromPack(pack: {
       if (!o?.id || !o.compile) continue;
       push(o.id, o.label || o.id);
     }
-  }
-  const builtins: Array<{ id: string; label: string }> = [
-    { id: "uniq_users", label: "观看人数/UV" },
-    { id: "avg_watch_second_per_user", label: "人均观看时长（秒）" },
-    { id: "sum_watch_second", label: "观看时长合计（秒）" },
-    { id: "avg_max_progress", label: "最大观看进度平均值" },
-  ];
-  for (const b of builtins) {
-    if (pack.capabilities?.metrics?.length && !pack.capabilities.metrics.includes(b.id)) continue;
-    push(b.id, b.label);
   }
   return metricClarifyOptions(flat);
 }

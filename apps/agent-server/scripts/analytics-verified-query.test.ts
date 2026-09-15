@@ -36,13 +36,12 @@ const avgWide = queries.find((q) => q.id === "watch_avg_per_user_lang_wide");
 const completion = queries.find((q) => q.id === "watch_completion_lang_wide");
 const pay = queries.find((q) => q.id === "pay_rate_lang_wide");
 assert.ok(avgWide && completion && pay);
-assert.equal(compileCanCoverVerified(completion, "完播率宽表"), true);
-assert.equal(compileCanCoverVerified(completion, "完播率宽表 te-IN ta-IN"), true);
-assert.equal(compileCanCoverVerified(avgWide, "人均时长宽表"), true);
-assert.equal(compileCanCoverVerified(pay, "付费率"), true);
+assert.equal(compileCanCoverVerified(completion, pack), true);
+assert.equal(compileCanCoverVerified(avgWide, pack), true);
+assert.equal(compileCanCoverVerified(pay, pack), true);
 const retentionTotal = queries.find((q) => q.id === "retention_d1_total");
 assert.ok(retentionTotal);
-assert.equal(compileCanCoverVerified(retentionTotal, "次日留存"), true);
+assert.equal(compileCanCoverVerified(retentionTotal, pack), true);
 
 {
   const hit = matchVerifiedQuery("人均时长宽表", pack);

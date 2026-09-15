@@ -3,7 +3,7 @@
  * YoY / MoM = current window + prior window (timeOffset) + merge_ratio.
  */
 
-import type { AnalyticsPack } from "./semantic-layer.js";
+import { packGrainId, type AnalyticsPack } from "./semantic-layer.js";
 import type { AnalyticsIntent } from "./intent.js";
 import { buildAnalyticsIntentFromStructure } from "./intent.js";
 import { compileAnalyticsIntent } from "./sql-compile.js";
@@ -83,9 +83,33 @@ export function parseAskPlan(raw: unknown): AskPlan | null {
   };
 }
 
+/**
+ * Plan-tuple dims are pack-declared, never code constants:
+ * - compare entity dim = guards.entityCompareDim (dim id → field via enumDimensions)
+ * - wide pivot dim = guards.widePivotDim
+ * Missing declarations degrade honestly (no entity/pivot extraction, no split plan).
+ */
+function dimFieldOf(pack: AnalyticsPack | undefined, dimId: string): string {
+  if (!dimId) return "";
+  const ed = (pack?.enumDimensions || []).find((d) => d.id === dimId || d.field === dimId);
+  return String(ed?.field || dimId);
+}
+function entityDimOf(pack?: AnalyticsPack): string {
+  return String(pack?.guards?.entityCompareDim || "").trim();
+}
+/** Physical filter field of the pack-declared compare dim; "" when undeclared. */
+export function entityCompareField(pack?: AnalyticsPack): string {
+  return dimFieldOf(pack, entityDimOf(pack));
+}
+function widePivotFieldOf(pack?: AnalyticsPack): string {
+  return dimFieldOf(pack, String(pack?.guards?.widePivotDim || "").trim());
+}
+
 export type PlanTuple = {
-  channels: string[];
-  contentLangs: string[];
+  /** Member values of the pack-declared compare dim (guards.entityCompareDim). */
+  entity: string[];
+  /** Member values of the pack-declared wide pivot dim (guards.widePivotDim). */
+  pivot: string[];
   outputDims: string[];
 };
 
@@ -102,52 +126,61 @@ export function inferPlanTuples(
   lexicons?: Record<string, DimLexicon>,
   pack?: AnalyticsPack,
 ): PlanTuple[] {
-  const channelLex = lexicons?.channel;
+  const entityField = entityCompareField(pack);
+  const pivotField = widePivotFieldOf(pack);
+  const entityLex = entityField ? lexicons?.[entityField] : undefined;
   const out: PlanTuple[] = [];
   for (const clause of splitAskClauses(nl)) {
-    const fromLex = channelLex ? extractCodesFromText(clause, channelLex) : [];
-    const channels = [...new Set([...fromLex, ...extractChannelsFromNl(clause, pack)])];
-    const contentLangs = extractLocalesFromText(clause);
-    const outputDims = inferOutputDimsFromNl(clause);
-    if (!channels.length && !contentLangs.length && !outputDims.length) continue;
-    out.push({ channels, contentLangs, outputDims });
+    const fromLex = entityLex ? extractCodesFromText(clause, entityLex) : [];
+    const entity = entityField
+      ? [...new Set([...fromLex, ...extractChannelsFromNl(clause, pack)])]
+      : [];
+    const pivot = pivotField ? extractLocalesFromText(clause) : [];
+    const outputDims = inferOutputDimsFromNl(clause, pack);
+    if (!entity.length && !pivot.length && !outputDims.length) continue;
+    out.push({ entity, pivot, outputDims });
   }
   return out;
 }
 
-function dimSig(dims: string[]): string {
-  return [...new Set(dims.filter((d) => d !== "channel"))].sort().join("+");
+function dimSig(dims: string[], entityDim: string): string {
+  return [...new Set(dims.filter((d) => d !== entityDim))].sort().join("+");
 }
 
 function expandTuplesToSteps(input: {
   base: StructuredAskOk;
   tuples: PlanTuple[];
+  pack?: AnalyticsPack;
 }): PlanStep[] {
+  const entityDim = entityDimOf(input.pack);
+  const entityField = entityCompareField(input.pack);
+  const pivotField = widePivotFieldOf(input.pack);
+  const grain = packGrainId(input.pack);
   const steps: PlanStep[] = [];
   let i = 1;
   const metricId = String(input.base.metricId || "").trim();
   if (!metricId) return [];
   for (const t of input.tuples) {
     const dims = (t.outputDims.length ? t.outputDims : input.base.outputDims || []).filter(
-      (d) => d !== "channel",
+      (d) => d !== entityDim,
     );
-    const channels = t.channels.length ? t.channels : [];
-    const langs = t.contentLangs;
-    const targets = channels.length ? channels : [""];
-    for (const ch of targets) {
+    const targets = t.entity.length ? t.entity : [""];
+    for (const ev of targets) {
       const filters: Record<string, string[]> = { ...(input.base.filters || {}) };
-      if (ch) filters.channel = [ch];
-      else delete filters.channel;
-      if (langs.length) filters.contentLang = langs;
-      else if (!t.contentLangs.length && dimSig(dims) === "watch_date") {
-        delete filters.contentLang;
+      if (entityField) {
+        if (ev) filters[entityField] = [ev];
+        else delete filters[entityField];
+      }
+      if (pivotField) {
+        if (t.pivot.length) filters[pivotField] = t.pivot;
+        else if (grain && dimSig(dims, entityDim) === grain) delete filters[pivotField];
       }
       steps.push({
         id: `s${i++}`,
         metricId,
         ops: ["base_aggregate"],
         filters,
-        outputDims: dims.length ? dims : ["watch_date"],
+        outputDims: dims.length ? dims : grain ? [grain] : [],
       });
     }
   }
@@ -157,6 +190,7 @@ function expandTuplesToSteps(input: {
 export function synthesizeEntityComparePlan(input: {
   base: StructuredAskOk;
   tuples: PlanTuple[];
+  pack?: AnalyticsPack;
 }): AskPlan | null {
   const steps = expandTuplesToSteps(input);
   if (steps.length < 2) return null;
@@ -185,17 +219,24 @@ export function resolvePlanCardinality(input: {
   if ((input.structure.plan?.steps?.length || 0) >= 2) {
     return { kind: "keep", notes: ["plan_cardinality:llm_plan"] };
   }
+  const entityDim = entityDimOf(input.pack);
+  const entityField = entityCompareField(input.pack);
+  const pivotDim = String(input.pack?.guards?.widePivotDim || "").trim();
+  const grain = packGrainId(input.pack);
   const tuples = inferPlanTuples(input.nl, input.lexicons, input.pack);
-  const syn = synthesizeEntityComparePlan({ base: input.structure, tuples });
+  const syn = synthesizeEntityComparePlan({ base: input.structure, tuples, pack: input.pack });
   const sigs = new Set(
-    (syn?.steps || []).map((s) => dimSig(s.outputDims || [])),
+    (syn?.steps || []).map((s) => dimSig(s.outputDims || [], entityDim)),
   );
-  const channels = input.structure.filters?.channel || [];
+  const entities = entityField ? input.structure.filters?.[entityField] || [] : [];
   const dims = input.structure.outputDims || [];
   const mixedCollapsed =
-    channels.length >= 2 &&
-    dims.includes("watch_date") &&
-    dims.includes("contentLang");
+    Boolean(entityDim) &&
+    entities.length >= 2 &&
+    Boolean(grain) &&
+    dims.includes(grain) &&
+    Boolean(pivotDim) &&
+    dims.includes(pivotDim);
   const wantSplit = wantsMultiQuerySplit(input.nl);
 
   if (syn && (sigs.size >= 2 || wantSplit || mixedCollapsed)) {
@@ -213,7 +254,7 @@ export function resolvePlanCardinality(input: {
     return {
       kind: "clarify",
       message:
-        "这句话里混了不同的分组方式（例如一个按天、一个按语言），不能收成一张表。请拆成两问，或统一用同一套分组。",
+        "Mixed grouping dimensions in one sentence cannot be folded into a single table. Split into separate questions, or unify on one grouping set.",
       notes: [...notes, "plan_cardinality:mixed_grain_clarify"],
     };
   }
@@ -315,10 +356,12 @@ function synthesizeRelativePlan(
   base: StructuredAskOk,
   priorId: string,
   timeOffset: string,
+  pack?: AnalyticsPack,
 ): AskPlan | null {
   const metricId = String(base.metricId || "").trim();
   if (!metricId || !base.time?.start || !base.time?.end) return null;
-  const dims = base.outputDims?.length ? base.outputDims : ["channel"];
+  const entityDim = entityDimOf(pack);
+  const dims = base.outputDims?.length ? base.outputDims : entityDim ? [entityDim] : [];
   return {
     steps: [
       {
@@ -344,13 +387,13 @@ function synthesizeRelativePlan(
 }
 
 /** Build a 2-step YoY growth plan from a single-intent structure. */
-export function synthesizeYoyPlan(base: StructuredAskOk): AskPlan | null {
-  return synthesizeRelativePlan(base, "prior_yoy", "yoy_window");
+export function synthesizeYoyPlan(base: StructuredAskOk, pack?: AnalyticsPack): AskPlan | null {
+  return synthesizeRelativePlan(base, "prior_yoy", "yoy_window", pack);
 }
 
 /** Build a 2-step MoM growth plan (equal-length prior window). */
-export function synthesizeMomPlan(base: StructuredAskOk): AskPlan | null {
-  return synthesizeRelativePlan(base, "prior_mom", "mom_window");
+export function synthesizeMomPlan(base: StructuredAskOk, pack?: AnalyticsPack): AskPlan | null {
+  return synthesizeRelativePlan(base, "prior_mom", "mom_window", pack);
 }
 
 /**
@@ -520,7 +563,8 @@ export function compileAskPlanSteps(input: {
 }
 
 function isDateLikeCol(name: string): boolean {
-  return /watch_?date|date|dt|day/i.test(name);
+  // Generic English warehouse naming only — the pack grain alias (watchDate) matches via /date/.
+  return /date|dt|day/i.test(name);
 }
 
 export type DateAlign = { years?: number; days?: number };

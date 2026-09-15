@@ -118,7 +118,9 @@ export function applyAnalyticsPrefsDefaults(input: {
   const notes: string[] = [];
   let layout = input.layout;
   const nl = String(input.nl || "");
-  const multiChannelAsk = /各渠道|所有渠道|全部渠道|每个渠道|分渠道/.test(nl);
+  const channelDim = (input.pack?.enumDimensions || []).find((d) => d.id === "channel" || d.field === "channel");
+  const channelPhrase = (channelDim?.aliases || []).some((a) => a && nl.includes(a));
+  const multiChannelAsk = channelPhrase && /各|所有|全部|每个|分/.test(nl);
   const prefsChannels = input.prefs.defaultChannels || [];
   const applyChannelPrefs = !input.table || isOverlayTable(input.pack, input.table);
   const channelOnTable =

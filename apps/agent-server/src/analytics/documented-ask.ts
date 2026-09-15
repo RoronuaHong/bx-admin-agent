@@ -5,17 +5,24 @@
 
 import { inferMetricIdFromNl } from "./metric-infer.js";
 import {
+  findMetricOption,
   isOverlayTable,
+  overlayTableName,
   packFieldsForTable,
   type AnalyticsPack,
 } from "./semantic-layer.js";
 
-const OVERLAY_METRIC_IDS = new Set([
-  "uniq_users",
-  "sum_watch_second",
-  "avg_watch_second_per_user",
-  "avg_max_progress",
-]);
+/**
+ * Tables a metric id belongs to. `MetricDef.tables` wins; a def without `tables` is
+ * overlay-scoped by definition (it describes the pack's modeled table). Config-driven —
+ * no metric id list in code.
+ */
+function metricOwnerTables(pack: AnalyticsPack, id: string): string[] {
+  const def = findMetricOption(pack, id)?.def;
+  if (def?.tables?.length) return def.tables;
+  const overlay = overlayTableName(pack) || pack.tables[0]?.name || "";
+  return overlay ? [overlay] : [];
+}
 
 export function coerceMetricForWarehouseTable(
   metricId: string | undefined,
@@ -26,7 +33,9 @@ export function coerceMetricForWarehouseTable(
   if (!table || isOverlayTable(pack, table)) return String(metricId || "").trim();
   const id = String(metricId || "").trim();
   const live = new Set(packFieldsForTable(pack, table));
-  if (OVERLAY_METRIC_IDS.has(id)) {
+  const owners = metricOwnerTables(pack, id);
+  if (owners.length && !owners.includes(table)) {
+    // The metric is modeled for another table → re-infer against this one.
     return inferMetricIdFromNl(nl, pack, table) || "count:*";
   }
   const generic = id.match(/^(uniq|sum|avg|count):([A-Za-z_][A-Za-z0-9_]*|\*)$/);

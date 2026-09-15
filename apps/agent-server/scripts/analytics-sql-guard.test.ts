@@ -13,7 +13,12 @@ import {
   normalizeDistinctCount,
   sqlRequiresWhere,
 } from "../src/analytics/sql-guard.ts";
-import { loadAnalyticsPack } from "../src/analytics/semantic-layer.js";
+import { loadAnalyticsPack, packTimeField } from "../src/analytics/semantic-layer.js";
+
+// The lint contract is pack-driven: callers pass the pack + the pack's time column.
+// (No schema defaults live in code.)
+const pack = loadAnalyticsPack("watch-detail");
+const timeField = packTimeField(pack);
 
 const okSelect =
   "SELECT uniq(guid) AS users FROM elt_watch_detail WHERE channel='IndiaA' LIMIT 100";
@@ -44,12 +49,14 @@ assert.ok(
   lintSql(
     "SELECT count(*) FROM elt_watch_detail WHERE lastWatchTime = '2026-08-20'",
     "8月20日人数",
+    { timeField },
   ).includes("datetime_eq_date_string"),
 );
 assert.ok(
   !lintSql(
     "SELECT count(*) FROM elt_watch_detail WHERE toDate(lastWatchTime) = '2026-08-20'",
     "8月20日人数",
+    { timeField },
   ).includes("datetime_eq_date_string"),
 );
 assert.ok(
@@ -59,24 +66,42 @@ assert.ok(
     { timeField: "eventAt" },
   ).includes("datetime_eq_date_string"),
 );
+// No time column supplied → rule is inert (no hidden schema default).
+assert.ok(
+  !lintSql(
+    "SELECT count(*) FROM elt_watch_detail WHERE lastWatchTime = '2026-08-20'",
+    "8月20日人数",
+  ).includes("datetime_eq_date_string"),
+);
 
-// ---- lintSql: forbid_exclude_empty_lang ----
+// ---- lintSql: forbid_exclude_empty_lang (pack-owned denyEmptyExclusion) ----
 assert.ok(
   lintSql(
     "SELECT contentLang, uniq(guid) FROM elt_watch_detail GROUP BY contentLang",
     "按语言看人数",
+    { pack },
   ).includes("forbid_exclude_empty_lang") === false,
 );
 assert.ok(
   lintSql(
     "SELECT contentLang, uniq(guid) FROM elt_watch_detail WHERE contentLang != '' GROUP BY contentLang",
     "按语言看人数",
+    { pack },
   ).includes("forbid_exclude_empty_lang"),
 );
 assert.ok(
   !lintSql(
     "SELECT contentLang, uniq(guid) FROM elt_watch_detail WHERE contentLang != '' GROUP BY contentLang",
     "按语言看人数，排除空语言",
+    { pack },
+  ).includes("forbid_exclude_empty_lang"),
+);
+// Channel is not flagged: only dims with denyEmptyExclusion opt in.
+assert.ok(
+  !lintSql(
+    "SELECT channel, uniq(guid) FROM elt_watch_detail WHERE channel != '' GROUP BY channel",
+    "按渠道看人数",
+    { pack },
   ).includes("forbid_exclude_empty_lang"),
 );
 
@@ -85,12 +110,14 @@ assert.ok(
   lintSql(
     "SELECT channel, uniq(guid) FROM elt_watch_detail GROUP BY channel ORDER BY 2 DESC LIMIT 1",
     "各渠道人数排行",
+    { pack },
   ).includes("avoid_limit_1_unless_asked"),
 );
 assert.ok(
   !lintSql(
     "SELECT channel, uniq(guid) FROM elt_watch_detail GROUP BY channel ORDER BY 2 DESC LIMIT 1",
     "只要第一名 top 1",
+    { pack },
   ).includes("avoid_limit_1_unless_asked"),
 );
 

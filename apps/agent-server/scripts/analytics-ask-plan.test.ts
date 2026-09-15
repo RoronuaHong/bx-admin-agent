@@ -75,7 +75,7 @@ assert.equal(ambiguousMetricFamilyClarify("最大进度的平均值，也就是�
     "bare first-turn 完播率 still clarifies",
   );
 }
-assert.ok(inferOutputDimsFromNl("按天观看人数").includes("watch_date"));
+assert.ok(inferOutputDimsFromNl("按天观看人数", pack).includes("watch_date"));
 assert.equal(shiftYmdYears("2024-02-29", -1), "2023-02-28");
 assert.equal(shiftYmdYears("2026-08-19", -1), "2025-08-19");
 assert.equal(shiftYmdDays("2026-08-19", -7), "2026-08-12");
@@ -184,7 +184,7 @@ assert.equal(relativeGrowthKind(["growth_rate"]), "yoy");
     outputDims: ["channel"],
     metricId: "uniq_users",
     ops: ["yoy", "growth_rate"],
-  });
+  }, pack);
   assert.ok(syn);
   assert.equal(syn!.merge.kind, "ratio");
   assert.equal(syn!.steps[1]!.timeOffset, "yoy_window");
@@ -199,7 +199,7 @@ assert.equal(relativeGrowthKind(["growth_rate"]), "yoy");
     outputDims: ["channel"],
     metricId: "uniq_users",
     ops: ["mom"],
-  });
+  }, pack);
   assert.ok(syn);
   assert.equal(syn!.steps[1]!.timeOffset, "mom_window");
   const g = gateAskPlan(syn!, pack, {
@@ -281,9 +281,9 @@ assert.equal(relativeGrowthKind(["growth_rate"]), "yoy");
   const mixedNl = "八月二十到二十一印度A按天观看人数，同时FoxA按语言观看人数";
   const tuples = inferPlanTuples(mixedNl, lexicons, pack);
   assert.equal(tuples.length, 2);
-  assert.deepEqual(tuples[0]!.channels, ["IndiaA"]);
+  assert.deepEqual(tuples[0]!.entity, ["IndiaA"]);
   assert.ok(tuples[0]!.outputDims.includes("watch_date"));
-  assert.deepEqual(tuples[1]!.channels, ["FoxA"]);
+  assert.deepEqual(tuples[1]!.entity, ["FoxA"]);
   assert.ok(tuples[1]!.outputDims.includes("contentLang"));
 
   const base = {

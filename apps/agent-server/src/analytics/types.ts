@@ -33,6 +33,12 @@ export interface AnalyticsAskResult {
   verify?: { verdict: "pass" | "fail" | "unclear"; codes: string[]; reason: string };
   /** Post-exec reading; numbers must come from the result sample */
   insight?: string;
+  /** Headline answer: one direct sentence with the top-line number (same LLM call as insight) */
+  headline?: string;
+  /** Verification caution (e.g. verify fail); rendered at the tail, never appended to message */
+  caution?: string;
+  /** Next questions worth asking (same LLM call as insight); rendered as chips at the tail */
+  followups?: string[];
   modelId?: string;
   packVersion?: string;
   /** M2 审计账本 id；UI 反馈挂靠 */

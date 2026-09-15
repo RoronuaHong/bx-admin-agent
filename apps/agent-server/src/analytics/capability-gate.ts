@@ -47,17 +47,8 @@ export function resolvePackCapabilities(pack: AnalyticsPack): {
   downgradePolicy: "strict" | "ask_downgrade";
 } {
   const caps = pack.capabilities;
-  const metrics = new Set<string>(
-    caps?.metrics?.length
-      ? caps.metrics
-      : [
-          "uniq_users",
-          "sum_watch_second",
-          "avg_watch_second_per_user",
-          "avg_max_progress",
-        ],
-  );
-  // Also allow metricDefs option ids
+  // metrics 只来自 pack 声明（capabilities.metrics + metricDefs 编译项），代码不设默认指标表。
+  const metrics = new Set<string>(caps?.metrics?.length ? caps.metrics : []);
   for (const def of pack.metricDefs || []) {
     for (const opt of def.options || []) {
       if (opt.compile?.kind) metrics.add(opt.id);

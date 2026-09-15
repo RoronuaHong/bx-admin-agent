@@ -2,6 +2,7 @@
  * Path C: find tables (cards) → get_table_schema → write read-only SQL.
  */
 import { pickAnalyticsModel } from "./pick-analytics-model.js";
+import { reportModelFailure } from "./model-fallback.js";
 import * as trace from "../trace.js";
 import { formatAnswerableCatalogHint } from "./catalog-digest.js";
 import { getTableSchemas } from "./catalog-schema.js";
@@ -185,7 +186,12 @@ export async function runSqlAgent(input: {
       const data = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string | null } }>;
       };
-      if (!resp.ok) throw new Error(JSON.stringify(data).slice(0, 400));
+      if (!resp.ok) {
+        const err = new Error(JSON.stringify(data).slice(0, 400)) as Error & { status?: number };
+        err.status = resp.status;
+        reportModelFailure(model.id, err);
+        throw err;
+      }
       const raw = String(data.choices?.[0]?.message?.content || "");
       const parsed = parseSqlAgentTurn(raw);
       if (parsed.status === "get_schema") {

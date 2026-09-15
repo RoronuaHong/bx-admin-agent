@@ -83,6 +83,12 @@ type AnalyticsBubble = {
   feedback?: "useful" | "wrong";
   charts?: ChartView[];
   insight?: string;
+  /** 头号答案（顶部主结论，含关键数字） */
+  headline?: string;
+  /** 口径/风险提示（收尾区） */
+  caution?: string;
+  /** 追问建议（答尾 chip，点击即问） */
+  followups?: string[];
   verify?: AnalyticsAskResult["verify"];
   turnKind?: string;
 };
@@ -192,6 +198,15 @@ function settleStalePending(m: AnalyticsBubble): AnalyticsBubble {
   };
 }
 
+/** ok 答复里 message 常与时间回显完全同字；顶部状态行/条件回显已有时间，正文不再重复渲染。
+ *  仅做协议级字段比对（message vs timeEcho），不涉及业务词判定。 */
+function isRedundantEcho(item: AnalyticsBubble): boolean {
+  const text = (item.text || "").trim();
+  if (!text) return false;
+  const echo = (item.timeEcho || "").trim();
+  return Boolean(echo) && text === echo;
+}
+
 function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
   if (m.pending || m.welcome) return null;
   return {
@@ -223,6 +238,9 @@ function bubbleToStored(m: AnalyticsBubble): StoredMessage | null {
     feedback: m.feedback,
     charts: m.charts,
     insight: m.insight,
+    headline: m.headline,
+    caution: m.caution,
+    followups: m.followups,
     verify: m.verify,
     turnKind: m.turnKind,
   };
@@ -255,6 +273,9 @@ function storedToBubble(m: StoredMessage, fallbackId: string): AnalyticsBubble {
     feedback: m.feedback === "useful" || m.feedback === "wrong" ? m.feedback : undefined,
     charts: m.charts as ChartView[] | undefined,
     insight: m.insight,
+    headline: m.headline,
+    caution: m.caution,
+    followups: m.followups,
     verify: m.verify,
     welcome: m.welcome,
     pending: false,
@@ -282,6 +303,9 @@ function slimAnalyticsConversations(list: AnalyticsConversation[]): AnalyticsCon
         m.welcome ||
         m.role === "user" ||
         Boolean(m.text?.trim()) ||
+        Boolean(m.headline?.trim()) ||
+        Boolean(m.caution?.trim()) ||
+        Boolean(m.followups?.length) ||
         Boolean(m.tables?.length) ||
         Boolean(m.sqls?.length) ||
         Boolean(m.images?.length) ||
@@ -493,7 +517,8 @@ const helpOpen = ref(false);
 const activeController = ref<AbortController | null>(null);
 /** 仅用户主动点停止时为 true；网络中断/HMR/组件卸载不展示「已取消」 */
 let userInitiatedCancel = false;
-const ASK_TIMEOUT_MS = 45_000;
+/** 问数整体超时：链路含 structure 工具循环 + 意图 + 执行 + 解读，正常 45-90s；候选链重试还会再加 */
+const ASK_TIMEOUT_MS = 120_000;
 let threadScrollbarCleanup: (() => void) | null = null;
 
 const activeConversation = computed(
@@ -544,6 +569,7 @@ function startComposerDrag(e: PointerEvent | MouseEvent | TouchEvent) {
 
 const scanOpen = ref(false);
 const scanDryRun = ref(false);
+const scanDigest = ref(false);
 const scanRunning = ref(false);
 const scanJobs = shallowRef<AnalyticsScanJob[]>([]);
 const scanError = ref("");
@@ -715,6 +741,7 @@ async function runScan() {
     const { jobId } = await runAnalyticsScan({
       ruleSetId: "watch-users",
       dryRun: scanDryRun.value,
+      digest: scanDigest.value,
     });
     scanNote.value = tx(`已入队 ${shortJobId(jobId)}`, `Queued ${shortJobId(jobId)}`);
     scanJobs.value = [
@@ -724,6 +751,7 @@ async function runScan() {
         scanDate: "—",
         status: "queued",
         dryRun: scanDryRun.value,
+        digest: scanDigest.value,
         forceRerun: false,
         rerunSeq: 0,
         createdAt: new Date().toISOString(),
@@ -915,8 +943,17 @@ function useHelpExample(text: string) {
 }
 
 async function copyBody(item: AnalyticsBubble) {
-  if (!item.text) return;
-  const ok = await copyText(item.text);
+  // 复制「可见答案」：头号答案 + 正文（去掉纯回显）+ 解读 + 口径提示
+  const body = [
+    item.headline?.trim(),
+    item.text?.trim() && !isRedundantEcho(item) ? item.text.trim() : "",
+    item.insight?.trim(),
+    item.caution?.trim(),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  if (!body) return;
+  const ok = await copyText(body);
   if (ok) {
     copiedId.value = item.id;
     setTimeout(() => {
@@ -1011,7 +1048,8 @@ async function sendFeedback(item: AnalyticsBubble, verdict: "useful" | "wrong") 
 }
 
 function editInComposer(item: AnalyticsBubble) {
-  input.value = item.text;
+  // 编辑的是「问题」：助手气泡的 text 只是时间回显，优先回填原始问句
+  input.value = item.userNl || item.text;
   composerH.value = null;
   document.documentElement.style.setProperty("--composer-max", "");
   nextTick(() => {
@@ -1383,6 +1421,9 @@ async function send(presetText?: string) {
         userNl: text,
         charts: data.charts,
         insight: data.insight,
+        headline: data.headline,
+        caution: data.caution,
+        followups: data.followups,
         verify: data.verify,
         turnKind: data.turnKind,
       });
@@ -1506,7 +1547,15 @@ onMounted(async () => {
   const from = typeof route.query.from === "string" ? route.query.from.trim() : "";
   const to = typeof route.query.to === "string" ? route.query.to.trim() : "";
   if (q) {
+    // 深链携带显式查询 q：预填后自动发送，让"来源条"直接呈现，
+    // 避免深链打开后还要手动点发送（体验上像"打开无效"）。
     input.value = q;
+    nextTick(async () => {
+      resizeComposer();
+      composerInput.value?.focus();
+      if (!sending.value) await send();
+    });
+    return;
   } else if (from && to) {
     input.value = tx(`${from}到${to}按天观看人数`, `daily users from ${from} to ${to}`);
   } else if (from) {
@@ -1613,12 +1662,12 @@ onUnmounted(() => {
         </div>
 
         <div
-          v-if="item.text || item.insight || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
+          v-if="item.text || item.headline || item.insight || item.caution || item.followups?.length || item.askSummary || item.defaultsNote || item.tables?.length || item.charts?.length || item.sqls?.length || item.probeSummary || item.images?.length || item.files?.length"
           class="body-wrap"
         >
           <p v-if="item.status && item.role === 'assistant' && !item.pending" class="status-line" :data-status="item.status">
             <span class="status-pill">{{ item.status }}</span>
-            <span v-if="item.timeEcho" class="time-echo">{{ item.timeEcho }}</span>
+            <span v-if="item.timeEcho && !item.askSummary" class="time-echo">{{ item.timeEcho }}</span>
             <span v-if="item.packVersion || item.modelId" class="meta-echo">
               <template v-if="item.packVersion">pack {{ item.packVersion }}</template>
               <template v-if="item.packVersion && item.modelId"> · </template>
@@ -1671,18 +1720,43 @@ onUnmounted(() => {
             <span v-for="f in item.files" :key="f.id" class="msg-file-chip">{{ f.name }}</span>
           </div>
 
+          <p
+            v-if="item.headline && !item.pending"
+            class="ask-headline"
+            :title="item.headline"
+          >{{ item.headline }}</p>
+
           <div
-            v-if="item.text && !item.pending"
+            v-if="item.text && !item.pending && !isRedundantEcho(item)"
             class="body"
             :class="{ error: item.status === 'error' || item.status === 'refuse' }"
             v-html="renderMarkdown(item.text)"
           />
+
+          <div v-if="item.charts?.length" class="msg-charts">
+            <ResultChart
+              v-for="(ch, ci) in item.charts"
+              :key="`${item.id}-c${ci}-${ch.title}-${ch.categories?.length || 0}`"
+              :chart="ch"
+            />
+          </div>
+
+          <div v-if="item.tables?.length" class="msg-tables">
+            <ResultTable
+              v-for="(table, idx) in item.tables"
+              :key="`${item.id}-t${idx}`"
+              :table="toTableView(table)"
+              :empty-hint="item.timeEcho || undefined"
+            />
+          </div>
 
           <div
             v-if="item.insight && !item.pending"
             class="ask-insight"
             v-html="renderMarkdown(item.insight)"
           />
+
+          <p v-if="item.caution && !item.pending" class="ask-caution">{{ item.caution }}</p>
 
           <details v-if="item.sqls?.length" class="sql">
             <summary class="sql-summary">
@@ -1700,21 +1774,18 @@ onUnmounted(() => {
             <pre v-for="(sql, idx) in item.sqls" :key="idx">{{ sql }}</pre>
           </details>
 
-          <div v-if="item.charts?.length" class="msg-charts">
-            <ResultChart
-              v-for="(ch, ci) in item.charts"
-              :key="`${item.id}-c${ci}-${ch.title}-${ch.categories?.length || 0}`"
-              :chart="ch"
-            />
-          </div>
-
-          <div v-if="item.tables?.length" class="msg-tables">
-            <ResultTable
-              v-for="(table, idx) in item.tables"
-              :key="`${item.id}-t${idx}`"
-              :table="toTableView(table)"
-              :empty-hint="item.timeEcho || undefined"
-            />
+          <div v-if="item.followups?.length && !item.pending" class="ask-followups">
+            <button
+              v-for="(q, qi) in item.followups"
+              :key="`${item.id}-f${qi}`"
+              type="button"
+              class="followup-chip"
+              :disabled="sending"
+              :title="q"
+              @click="send(q)"
+            >
+              {{ q }}
+            </button>
           </div>
 
           <p v-if="item.probeSummary && item.status !== 'ok'" class="probe">
@@ -2166,8 +2237,8 @@ onUnmounted(() => {
                 <h2>{{ tx("巡检", "Scan", "Varredura", "स्कैन") }}</h2>
                 <p class="scan-lead">
                   {{ tx(
-                    "手动跑渠道日活。勾选「试跑」只检查、不发钉钉。",
-                    "Run channel daily-active checks. A trial run evaluates without sending DingTalk.",
+                    "手动跑渠道日活。钉钉模式：告警=仅异常时推送，日报=每天推送。勾选「试跑」只检查、不发钉钉。",
+                    "Run channel daily-active checks. DingTalk mode: alerts push only on anomalies; digest pushes daily. A trial run evaluates without sending DingTalk.",
                   ) }}
                 </p>
               </div>
@@ -2175,10 +2246,42 @@ onUnmounted(() => {
             </header>
 
             <div class="scan-toolbar">
-              <label class="dry-run">
-                <input v-model="scanDryRun" type="checkbox" :disabled="scanRunning" />
-                <span>{{ tx("试跑（不发钉钉）", "Trial run (no DingTalk)") }}</span>
-              </label>
+              <div class="scan-toolbar-controls">
+                <label class="dry-run">
+                  <input v-model="scanDryRun" type="checkbox" :disabled="scanRunning" />
+                  <span>{{ tx("试跑（不发钉钉）", "Trial run (no DingTalk)") }}</span>
+                </label>
+                <div
+                  class="notify-mode"
+                  role="radiogroup"
+                  :aria-label="tx('钉钉模式', 'DingTalk mode')"
+                >
+                  <button
+                    type="button"
+                    role="radio"
+                    class="mode-btn"
+                    :aria-checked="!scanDigest"
+                    :class="{ active: !scanDigest }"
+                    :disabled="scanRunning"
+                    :title="tx('仅检测到异常时推送钉钉告警', 'Push DingTalk alerts only when anomalies are found')"
+                    @click="scanDigest = false"
+                  >
+                    {{ tx("告警", "Alerts") }}
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    class="mode-btn"
+                    :aria-checked="scanDigest"
+                    :class="{ active: scanDigest }"
+                    :disabled="scanRunning"
+                    :title="tx('无论有无异常都推送巡检日报', 'Push the daily digest whether or not there are anomalies')"
+                    @click="scanDigest = true"
+                  >
+                    {{ tx("日报", "Digest") }}
+                  </button>
+                </div>
+              </div>
               <div class="scan-toolbar-actions">
                 <button type="button" class="ghost" :disabled="scanRefreshing || scanRunning" @click="refreshScanJobs">
                   {{ scanRefreshing ? tx("刷新中…", "Refreshing…") : tx("刷新", "Refresh") }}
@@ -2208,6 +2311,7 @@ onUnmounted(() => {
                     <span class="job-status" :data-status="job.status">{{ jobStatusLabel(job.status) }}</span>
                     <span class="job-date">{{ job.scanDate }}</span>
                     <span v-if="job.dryRun" class="job-dry">{{ tx("试跑", "trial") }}</span>
+                    <span v-else-if="job.digest" class="job-digest">{{ tx("日报", "digest") }}</span>
                     <span class="job-id" :title="job.jobId">{{ shortJobId(job.jobId) }}</span>
                   </div>
                   <p class="job-summary">{{ jobSummary(job) }}</p>
@@ -2795,11 +2899,71 @@ onUnmounted(() => {
   gap: 6px;
 }
 
+/* 头号答案：卡片顶部主结论（一句 + 关键数字） */
+.ask-headline {
+  margin: 0 0 8px;
+  max-width: min(860px, 100%);
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+/* 结论性阅读（总结 + 趋势）固定收在数据之后 */
 .ask-insight {
-  margin: 0 0 12px;
+  margin: 12px 0 0;
+  max-width: min(860px, 100%);
   font-size: 13px;
   color: var(--ink);
   line-height: 1.55;
+}
+
+/* 口径/风险提示：与 SQL 同属「方法与出处」收尾层（多行时保留换行） */
+.ask-caution {
+  margin: 10px 0 0;
+  max-width: min(860px, 100%);
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #f59e0b 12%, transparent);
+  font-size: 12.5px;
+  color: var(--ink);
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+/* 追问建议：答尾 chip，点击即问 */
+.ask-followups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+  max-width: min(860px, 100%);
+}
+
+.followup-chip {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--ink) 14%, transparent);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.followup-chip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent, #2f6df6) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #2f6df6) 35%, transparent);
+}
+
+.followup-chip:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .ask-insight p {
@@ -3809,6 +3973,47 @@ onUnmounted(() => {
   gap: 8px;
 }
 
+.scan-toolbar-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.notify-mode {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode-btn + .mode-btn {
+  border-left: 1px solid var(--line);
+}
+
+.mode-btn.active {
+  background: #0f766e;
+  color: #fff;
+  font-weight: 700;
+}
+
+.mode-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .dry-run {
   display: inline-flex;
   align-items: center;
@@ -3997,6 +4202,15 @@ onUnmounted(() => {
   font-weight: 700;
 }
 
+.job-digest {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #0f766e 14%, transparent);
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .job-id {
   margin-left: auto;
   color: var(--muted);
@@ -4025,6 +4239,10 @@ onUnmounted(() => {
 @media (max-width: 560px) {
   .scan-toolbar {
     align-items: stretch;
+  }
+
+  .scan-toolbar-controls {
+    justify-content: space-between;
   }
 
   .scan-toolbar-actions {

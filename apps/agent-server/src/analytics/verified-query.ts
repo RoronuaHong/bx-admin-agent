@@ -45,25 +45,19 @@ export function _resetVerifiedQueriesForTest(): void {
   cache = null;
 }
 
-const WIDE_SHAPE = /宽表|按语言拆列|小语种列|语言宽表|按语种拆/;
-
-export function nlWantsWideShape(nl: string): boolean {
-  return WIDE_SHAPE.test(String(nl || ""));
-}
-
-/** Metrics Path A can compile — skip Path B. */
-const COMPILE_PROMOTE = new Set([
-  "avg_max_progress",
-  "avg_watch_second_per_user",
-  "uniq_users",
-  "pay_rate_lang_wide",
-  "retention_d1_lang",
-  "retention_d1_total",
-]);
-
-export function compileCanCoverVerified(q: VerifiedQuery, _nl: string): boolean {
-  if (q.promoteTo && COMPILE_PROMOTE.has(q.promoteTo)) return true;
-  return false;
+/**
+ * Whether Path A can compile `promoteTo` — derived from the pack (declared option
+ * compile kind or generic metric id), never from a hard-coded metric id list.
+ */
+export function compileCanCoverVerified(q: VerifiedQuery, pack?: AnalyticsPack): boolean {
+  const id = String(q.promoteTo || "").trim();
+  if (!id || !pack) return false;
+  for (const def of pack.metricDefs || []) {
+    for (const opt of def.options || []) {
+      if (opt.id === id) return Boolean(opt.compile?.kind);
+    }
+  }
+  return /^(uniq|sum|avg|count):([A-Za-z_][A-Za-z0-9_]*|\*)$/.test(id);
 }
 
 function aliasHits(nl: string, aliases: string[]): { hit: boolean; maxLen: number } {
@@ -92,7 +86,7 @@ export function matchVerifiedQuery(
     const alias = aliasHits(nl, q.aliases);
     if (!alias.hit) continue;
     if (!tablesAnswerable(pack, q.tables)) continue;
-    if (compileCanCoverVerified(q, nl)) continue;
+    if (compileCanCoverVerified(q, pack)) continue;
     hits.push({ query: q, score: alias.maxLen });
   }
   if (!hits.length) return null;
@@ -138,10 +132,12 @@ export function bindVerifiedQuery(q: VerifiedQuery, slots: BindSlots): { ok: tru
   return { ok: true, sql };
 }
 
+/**
+ * Extract a dotted version from the NL. Only generic "version/版本" wording (通用显示词) —
+ * warehouse column names are not hard-coded here.
+ */
 export function extractAppVersionFromNl(nl: string): string | undefined {
-  const m = String(nl || "").match(
-    /(?:appVersion|appVerName|版本号|版本)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)+)/i,
-  );
+  const m = String(nl || "").match(/(?:version|版本|编辑版)[号]?\s*[:=]?\s*([0-9]+(?:\.[0-9]+)+)/i);
   if (m) return m[1];
   const bare = String(nl || "").match(/\b(\d+\.\d+\.\d+)\b/);
   return bare?.[1];

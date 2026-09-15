@@ -14,10 +14,26 @@ import {
   pivotChannelDailyUsers,
 } from "../src/analytics/scan/metrics.js";
 import { loadRuleset } from "../src/analytics/scan/ruleset.js";
+import {
+  loadAnalyticsPack,
+  packDefaultEntityKey,
+  packTimeField,
+} from "../src/analytics/semantic-layer.js";
 import { assertTablesWhitelisted, extractFromTables } from "../src/analytics/sql-guard.js";
 import type { DatasetResult } from "../src/analytics/types.js";
 
 const ruleSet = loadRuleset("watch-users");
+const pack = loadAnalyticsPack(ruleSet.packId || "watch-detail");
+
+// 标识符全部来自 config（rule set + pack），代码里不再有表名/列名默认值。
+const metricSqlBase = {
+  table: ruleSet.freshnessCheck.table,
+  entityField: ruleSet.dimensions.rollup,
+  distinctField: packDefaultEntityKey(pack),
+  timeField: packTimeField(pack),
+  filterField: pack.guards.defaultMovieTypesField,
+  filterValues: pack.guards.defaultMovieTypes,
+};
 
 {
   const sql = buildFreshnessSql(ruleSet.freshnessCheck);
@@ -88,23 +104,24 @@ const ruleSet = loadRuleset("watch-users");
     scanDate: "2026-09-08",
     dodDate: "2026-09-07",
     wowDate: "2026-09-01",
-    movieTypes: [1, 2, 3, 4, 10, 11],
+    ...metricSqlBase,
   });
-  assert.match(sql, /uniq\(guid\)/);
-  assert.match(sql, /GROUP BY channel, d/);
+  assert.match(sql, new RegExp(`uniq\\(${metricSqlBase.distinctField}\\)`));
+  assert.match(sql, new RegExp(`GROUP BY ${metricSqlBase.entityField}, d`));
   assert.match(
     sql,
-    /toDate\(lastWatchTime\) IN \('2026-09-08', '2026-09-07', '2026-09-01'\)/,
+    new RegExp(`toDate\\(${metricSqlBase.timeField}\\) IN \\('2026-09-08', '2026-09-07', '2026-09-01'\\)`),
   );
-  assert.match(sql, /movieType IN \(1,2,3,4,10,11\)/);
-  assert.deepEqual(extractFromTables(sql), ["elt_watch_detail"]);
-  assertTablesWhitelisted(sql, ["elt_watch_detail"]);
+  assert.match(sql, new RegExp(`${metricSqlBase.filterField} IN \\(1,2,3,4,10,11\\)`));
+  assert.deepEqual(extractFromTables(sql), [metricSqlBase.table]);
+  assertTablesWhitelisted(sql, [metricSqlBase.table]);
 }
 
 {
   assert.throws(
     () =>
       buildChannelUsersSql({
+        ...metricSqlBase,
         scanDate: "not-a-date",
         dodDate: "2026-09-07",
         wowDate: "2026-09-01",
@@ -147,6 +164,8 @@ const ruleSet = loadRuleset("watch-users");
 {
   let capturedSql = "";
   const rows = await fetchChannelDailyUsers("2026-09-08", "2026-09-07", "2026-09-01", {
+    table: metricSqlBase.table,
+    entityField: metricSqlBase.entityField,
     runDataset: async (sql) => {
       capturedSql = sql;
       return {
@@ -174,6 +193,8 @@ const ruleSet = loadRuleset("watch-users");
   await assert.rejects(
     () =>
       fetchChannelDailyUsers("2026-09-08", "2026-09-07", "2026-09-01", {
+        table: metricSqlBase.table,
+        entityField: metricSqlBase.entityField,
         runDataset: async () => ({
           ok: false,
           cols: [],

@@ -78,6 +78,18 @@ NL → 护栏 → 目录 → 组包(时钟+已算日期进 facts) → LLM 抽槽
 - 检索为空 → `confidence=catalog`，Path C 只带 67 张一行目录，不默认 `elt_watch_detail`。
 - 隐藏表仍 `blocked_table` refuse。JOIN 仍只允许已声明 relationship。
 
+**打分来源（2026-09-15 起全部为「配置 + 仓库元数据」，代码零业务词）**：
+
+| 通道 | 来源 | 说明 |
+|---|---|---|
+| 声明式同义词 | `catalog-cards.json` `synonyms` + catalog 自带 synonyms | **可信**：短词（2 字）/多表共享也参与打分 |
+| 派生同义词 | `display_name` / identity 尾词 | 噪声大：保留 idf 与「2 字多表不采」过滤 |
+| 表文档短语 | Metabase `description` 正文（标题权重只取**首句**） | 首句是该表自述；后续句常是 `…对照 <他表>…`「不是本表」这类交叉引用，**不得**带标题权重（否则「充值」会被误算到竞猜表） |
+| 字段文档短语 | 每列 `display_name`/`description` | 覆盖「用户点名的业务说法」落到列 |
+| 标识符 | 表名 token、**列标识符**（≥5 字符）出现在 NL 的 Latin 片段里 | 不再有「中文业务词 → 英文词干」的内置映射表 |
+
+配套 pack 配置：`longShapeCues`（长表面词）、`time.grainId` / `grainColumnAlias` / `grainColumnLabel`（粒度维与结果列别名/标题）、`enumDimensions[].outputDim`（该维被点名即进结果列）、`enumDimensions[].denyEmptyExclusion`（空值是真实成员，禁止 `!= ''`）、`enumDimensions[].emptyLabel`（空值澄清标签，如「英语（contentLang 为空）」）、`guards.defaultMovieTypesField`（默认过滤列）。
+
 ### 5. 锁对口径（指标 + 形状）
 
 业界：同一业务词多口径先澄清；形状（按天 / 宽表 / 交叉）也要唯一。
@@ -156,6 +168,8 @@ pack 三对关系（V1，覆盖付费 + 留存金样，**不**为了扩面乱加
 | 执行后校对 + 解读 | **已修** | A/B 本地解读、不再额外打模型；C 校对+解读合并为 1 次调用。数字只许来自样例。 |
 | GATE coverage + Path C 分报 | **已修** | coverage 是可失败 GATE：`evaluateWarehouseCoverage`（spec `warehouse-coverage.json`）。无 catalog 时仍断言 overlay pack + 扩表名单；有 snapshot 时强制 **72 / 67 / 5** 与 overlay 活字段 23。8/23 为文档化缺口。`llm_sql_ex` / `llm_sql_exec_ok` 不进 EX。隐藏表拒答入 gold refuse。 |
 | batch 2 `gather_stat` 升 Path B | **已修** | 金样 `gather_stat_daily`：按日+事件 `sum(eventCount)` / `sum(activeUsers)`，`toDate(date)`。别名「埋点汇总」等；裸「埋点」仍走 Path C 明细。 |
+| 取表/取字段链路去业务词 | **已修（2026-09-15）** | 见 `ANALYTICS_ARCHITECTURE_REVIEW.md` §7.1：删除中文→英文词干映射表、指标 id / 字段名兜底、「中文业务正则」；业务语义改由 pack / `catalog-cards.json` / Metabase 文档提供。**契约变化**：`lintSql`/`verifyGrainDay`/`normalizeResultLayout`/`parseProbeValuesForDim`/`mergeAskState`/`withNlColumnTitles` 现要求传 pack，漏传会静默降级。 |
+| 结构抽取 / 编排 prompt 去业务词 | **待修** | `conversation-structure.ts`(76) / `schema-agent.ts`(22) / `pipeline.ts`(~26) / `ask-plan.ts`(11)：维度 id 与 `电影\|电视剧\|短剧\|动漫\|真人秀\|肥皂剧`、`小语种` 等面词待迁入 pack。 |
 
 规格步 5 的三个 kind（`conditional_wide` / `ratio` / `retention_dn`）已落地。新形状仍先走 B 再升 A。
 

@@ -58,6 +58,12 @@ export function loadAnalyticsPack(id = "watch-detail"): AnalyticsPack
 
 > 附带发现：`elt_watch_detail` 在 Metabase 实际有 **23 个 active 字段**，pack 只声明 8 个，说明 pack 本身是手工挑选的子集而非全字段。
 
+> **2026-09-15 校正（本节前半部分已过期，勿再引用「物理封死 70 张表」）**：
+> 现在的白名单**不是** pack 的 `tables`，而是**实时 Metabase 目录**——`allowedTableNames(pack)` = `pack.tables` ∪ `pack.warehouse.tables`，
+> 而 `warehouse.tables` 由 `refreshPackFromCatalog`（`catalog.ts`，运行时按 TTL 拉 `/api/database/2/metadata`）填充为**全部可答表**（隐藏 `_tmp`/`_dict`/`upload_*`/schema `metabase_upload` 除外）。
+> 实测（本机 `apps/agent-server/.data/analytics-catalog/db-2.json`）：`catalog tables=72 answerable=67`，白名单 = 67 张（**不是 1 张**）。
+> `assertTableAllowed` 对目录内表放行，仅对隐藏表拒绝。§8.3 的 72/67/5 是现行口径。
+
 ---
 
 ## 2. 当前架构全链路
@@ -85,9 +91,9 @@ export function loadAnalyticsPack(id = "watch-detail"): AnalyticsPack
 
 守卫层**能**放行多表：`sql-ast.ts:107` 的正则是 `(?:from|join)\s+`，`sql-guard.ts:42-45` 也声明「Extract bare table names from FROM / JOIN clauses」。
 
-但：`intent.table` 恒等于 `pack.tables[0].name`（`intent.ts:138`），编译只拼 `FROM ${intent.table}`（`sql-compile.ts:261` 单表），pack 内亦无 join 声明。
+`intent.table` 默认锁 overlay `pack.tables[0]`，单表聚合（uniq/sum/avg/count）只拼 `FROM ${intent.table}`；但 **ratio / retention_dn 两条 pack 声明路径已产出 JOIN**（`sql-compile.ts` `compileRatio` 按 `packRelationships` + `filterFields` 生成 `INNER JOIN`，`compileRetention` 以 WITH CTE 串联 cohort/active/lang 三表）——表与字段全部来自 pack 声明，不是硬编码 schema。
 
-> **结论：守卫允许 JOIN，但编译器永远产不出 JOIN —— 实际是单表系统。**
+> **结论（2026-09-15 修正）：守卫允许 JOIN，通用单表聚合仍是单表；ratio/retention 已是 pack 声明驱动的多表编译。**
 
 ---
 
@@ -190,17 +196,51 @@ gold 是**手写**的，且只能写在**已建模表面之内**：24 条 gold S
 
 ## 7. 违反自身红线：代码中写死的业务词
 
-项目最高红线（`AGENT_CHARTER.md`「禁止写死」）规定：**任何位置不得出现业务词形态正则**。主 orchestrate 链路已清理干净，但**后起的 analytics 子系统未清理**：
+项目最高红线（`AGENT_CHARTER.md`「禁止写死」）规定：**任何位置不得出现业务词形态正则**。主 orchestrate 链路与 **analytics 的取表/取字段/编译/输出链路**已于 2026-09-15 清理完毕。
 
-| 文件 | 行 | 写死的中文业务正则 / 字段 |
+### 7.1 已清理（2026-09-15）
+
+判据统一为：**业务语义只允许出现在 pack / ruleset / catalog-cards.json / Metabase 文档里**，代码只做「读配置 + 通用结构判定」。
+
+| 位置 | 原写死内容 | 现来源 |
 |---|---|---|
-| `intent.ts` | :162 | `按天\|按日\|按.*日期\|每天\|观看日期` |
-| `intent.ts` | :163 | `按.*渠道\|各渠道\|观看日期.*渠道\|渠道.*维度` |
-| `intent.ts` | :144-158 | 硬编码 `channel` / `movieType` 字段 |
-| `sql-guard.ts` | :26 | `不要没标\|排除空\|不要空语言` |
-| `sql-guard.ts` | :29 | `只要第\|第一名\|top\s*1` |
+| `table-resolve.ts` | `STEM_ALIASES`（`订单/充值/设备/邀请/安装/登录/会员 → 英文词干`） | 删除；`catalog-cards.json` 声明式 `synonyms`（新增「声明式同义词」独立评分通道：短词/共享词可信，派生短语仍走 idf 过滤） |
+| `table-resolve.ts` | `/watchSecond\|maxWatchProgress\|lastWatchTime/`、overlay 兜底 `elt_watch_detail` | pack 字段集 + `pack.tables[0].name` |
+| `table-resolve.ts` | 描述章节名 `核心信息/注意事项` | 标题权重只取描述**首句**（交叉引用句 `…对照 <表>…` 不再污染检索） |
+| `semantic-layer.ts` | `packTimeField` 兜底 `lastWatchTime` | 空字符串（缺配置就诚实退化） |
+| `sql-guard.ts` | 时间列兜底 `lastWatchTime`、`contentLang != ''` 特判 | 调用方传 `packTimeField(pack)`；`enumDimensions[].denyEmptyExclusion` |
+| `verify.ts` | 粒度校验兜底 + 写死 `"watch_date"` | `packGrainId(pack)` |
+| `intent.ts` | 4 个指标 id + `maxWatchProgress/watchSecond/guid/eid` 兜底；写死 `channel/watch_date` outputDim | `metricDefs[].options[].compile`、`entities`、`enumDimensions[].outputDim`、`time.grainId`（并排除 pivotDim，避免绕过缺 layout 闸门） |
+| `metric-infer.ts` | `金额\|实付\|收入\|时长\|人数\|UV\|订单数…` + 字段名正则 | 文档驱动：NL 命中列名 / NL 与列文档 CJK bigram 相交 + 通用聚合词 → `sum`；pack 实体键 → `uniq` |
+| `ask-route.ts` | `/金额\|实付\|…\|订单数\|统计/` 大正则 | `explicitMeasureInNl`：pack metricDefs 别名/label/groundSignals ∪ 目标表列名 ∪ 该表声明式 synonyms |
+| `ask-state.ts` | `宽表/长表`、`渠道`、`elt_watch_detail`、过滤项标签 | `wideShapeCues`/`longShapeCues`、`enumDimensions` 别名、`overlayTableName` |
+| `sql-compile.ts` | `AS watchDate`、`dim === "watch_date"`/`"channel"`、`["guid","eid"]` | `time.grainColumnAlias`、`packGrainId`、`packDefaultEntityKey` |
+| `column-labels.ts` | `lastWatchTime\|watchDate\|观看日期`、`channel`/`渠道`、`contentLang=''` | `time.grainColumnAlias`+`grainColumnLabel`、`enumDimensions` |
+| `clarify-options.ts` | `英语（contentLang 为空）`、`dimField === "contentlang"` | `enumDimensions[].emptyLabel` |
+| `local-chart.ts` | `lastwatchtime/channel/contentlang/package/packname` | 通用词干 + pack 池（time 列 / dim 字段/别名） |
+| `documented-ask.ts` | `OVERLAY_METRIC_IDS` 白名单 | `MetricDef.tables`（无 `tables` 即 overlay 归属） |
+| `catalog-digest.ts` | 生成文档里的「观影人数/完播/人均时长 + `elt_watch_detail`」 | 通用表述「已建模 KPI 由 pack 编译」 |
+| `scan/metrics.ts` | `DEFAULT_TABLE`/`lastWatchTime`/`channel`/`guid`/`movieType` | ruleset `dimensions.rollup`/`freshnessCheck.table` + pack `time.field`/`entities`/`guards.defaultMovieTypesField` |
 
-**后果**：这不只是「黑话奶茶失 hygiene」问题——它意味着**加一张新表需要改 TS 代码**（往正则里塞新表的时间字段/维度名），而不是加配置。这是「扩到 71 张表」的结构性阻塞点，比「pack 少」更根深蒂固。
+**契约变化（重要）**：这些函数不再自带 schema 兜底——`lintSql(sql, nl, { pack, timeField })`、`verifyGrainDay(nl, sql, pack)`、`normalizeResultLayout(v, pack)`、`parseProbeValuesForDim(..., pack)`、`mergeAskState({ ..., pack })`、`withNlColumnTitles(..., pack)` 都必须拿到 pack，否则诚实降级（不再偷偷按 watch-detail schema 判定）。生产调用点已全部透传，单测同步按此契约传 pack。
+
+**新增 pack 配置项（本次迁移引入）**：`time.grainId`、`time.grainColumnAlias`、`time.grainColumnLabel`、`longShapeCues`、`guards.defaultMovieTypesField`、`enumDimensions[].denyEmptyExclusion`、`enumDimensions[].outputDim`、`enumDimensions[].emptyLabel`。
+
+### 7.2 待清理（下一轮）
+
+> 状态口径（2026-09-15 第六轮同步）：数量为审计时点统计；**四个大件的具名维/prompt 示例文案已全部参数化**（2026-09-15 第六轮：语言 clarify 槽位簇 → pack `enumDimensions[].memberKind` 声明驱动）。残余仅「小件」中的 `named-entities.ts` 默认维列名等（判定逻辑类）。逐项进度以 [`2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md) §8 进度注为准。
+
+| 文件 | 数量 | 内容 | 状态 |
+|---|---|---|---|
+| `conversation-structure.ts` | 76 | 结构抽取 prompt 里的 `watch_date/channel/contentLang/movieType`、`电影\|电视剧\|短剧\|动漫\|真人秀\|肥皂剧`、`小语种` | ✅ 已清（2026-09-15 第六轮：代码侧此前已清；本轮 prompt 示例与 JSON schema 槽名、`extractLocalesFromText`/`isEmptyMemberToken`/`extractClarificationSlots`/`normalizeClarifySlot`/`implies*`/`neededProbeFields`/`enforceStructurePolicy` 全部改 pack `memberKind` 声明驱动） |
+| `schema-agent.ts` | 22 | 同一批维度 id 与业务词示例（工具描述/系统提示） | ✅ 已清（2026-09-15：probe/默认表跟已解析表，缺失诚实 `table_unresolved`；system/工具描述业务表名字面量清除；第六轮 system 示例/JSON schema/notes/工具字段示例改 pack 声明维） |
+| `pipeline.ts` | ~26 | 剩余 `contentLang/movieType` 槽位特判、写死表名比较 | ✅ 已清（2026-09-15 第六轮：probe 表名/时间列死兜底已清；plan 实体维写死已清（`entityCompareField(pack)`）；clarifySlot 槽位簇经 `ask-state.ts`/`conversation-structure.ts` 的 `memberKind` 路由清零） |
+| `ask-plan.ts` | 11 | op/metric 示例与提示文案 | ✅ 已清（2026-09-15：`PlanTuple` 改 `entity/pivot` 双 pack 声明维（`guards.entityCompareDim` 新增 + `widePivotDim` 复用），`filters` 键/`watch_date` 兜底/`dimSig`/`mixedCollapsed`/`isDateLikeCol` 全部 pack 驱动或通用命名，未声明诚实降级） |
+| 小件 | — | `capability-gate.ts`、`coverage-gate.ts`、`named-entities.ts`、`types.ts`、`sql-agent.ts`、`audit-ledger.ts` | 🟡 `capability-gate` 写死指标 id 表已删（pack compile kind 推导）；`verified-query` 重复 `nlWantsWideShape` 已去重；其余未动 |
+
+**保留不动（属红线允许）**：`time-resolve.ts` 的中文日历词（今天/昨天/本周/年月日）、通用中文 UI 文案与错误提示、`DOC_STOP`/`CARD_STOP` 通用停用词表、`AGG_CUES` 通用聚合词。
+
+**后果（2026-09-15 第六轮更新）**：7.2 的 4 个大件已清完，**语义维（语言/类型/渠道）的槽位判定、clarify 契约与 prompt 示例现在全部由 pack `enumDimensions[].memberKind` + `guards.*` 声明驱动，改一张表的语义不必再动 TS**；「加表 = 加配置 + 补 Metabase 文档」已对语义维闭环。残余：`named-entities.ts` 的默认维列名表等小件（判定逻辑类）仍待清，以及 §8 改进方案（元数据自动派生多 pack）未落地。
 
 ---
 
@@ -216,8 +256,8 @@ gold 是**手写**的，且只能写在**已建模表面之内**：24 条 gold S
 |---|---|---|
 | **0** | 元数据 → pack 生成器（含 soft money 修保例：时间字段/维度/指标）+ 71 张表产物 + manifest | ⚪ 未开始（`enumerate-metabase-tables.mjs` 已可用，产出 71 表清单；生成器本体待写） |
 | **1** | `loadAnalyticsPack` 支持多 pack（子目录 `packs/`）+ 新增 **NL→表路由**（LLM 从多表 catalog 选表）；`watch-detail` 保留为手工精调默认，确保不退化 | ⚪ 未开始 |
-| **2** | 放松守卫：`assertTableAllowed` / `sql-guard` allowedTables 改为元数据表全集；`requireWhere` 改为「仅当表含时间字段且 NL 含时段」；probeField 时间字段改读 `pack.time.field` | ⚪ 未开始 |
-| **3** | 通用指标编译：`intent.resolveMetricCompile` 支持任意字段 sum/avg/uniq/count(\*)，替代 watch-detail 专属 `avg_of_max`；**同时清理 #16 写死的中文业务正则** | ⚪ 未开始 |
+| **2** | 放松守卫：`assertTableAllowed` / `sql-guard` allowedTables 改为元数据表全集；`requireWhere` 改为「仅当表含时间字段且 NL 含时段」；probeField 时间字段改读 `pack.time.field` | 🟢 已落地：白名单 = 实时目录（72/67/5，见 §1 校正）；`allowedTableNames` 覆盖 `warehouse.tables`；时间列一律 `packTimeField(pack)`（不再有 `lastWatchTime` 兜底）。`requireWhere` 见 §9 |
+| **3** | 通用指标编译：`intent.resolveMetricCompile` 支持任意字段 sum/avg/uniq/count(\*)，替代 watch-detail 专属 `avg_of_max`；**同时清理 #16 写死的中文业务正则** | 🟡 部分：`resolveMetricCompile` 只读 pack `compile`，通用 `uniq:/sum:/avg:/count:` 的 `uniq:*` 默认列改读 `pack.entities`；取表/取字段/编译/输出链路的业务词已清（§7.1）。未清：结构抽取与编排 prompt（§7.2） |
 | **4** | 基于派生 pack 扩 gold：每表至少 1 条可答 + 跨表路由正确（选对表）；重测 `watch-detail` 回归 24/24 | ⚪ 未开始 |
 
 ### 8.3 建议同步做的两件事（低成本、高价值）
@@ -230,6 +270,7 @@ gold 是**手写**的，且只能写在**已建模表面之内**：24 条 gold S
 ## 9. 遗留与风险
 
 - **Phase 1+ 触碰运行时管线**，存在使 `watch-detail` 24/24 退化的风险，需以 red-green 回归为前提推进。
+- **清理 §7.2 必须带 pack 单测同步**：`lintSql` / `verifyGrainDay` / `normalizeResultLayout` / `parseProbeValuesForDim` / `mergeAskState` / `withNlColumnTitles` 已改为 pack-必填契约（自带兜底已删）。改造时若调用点漏传 pack，会**静默降级**（判定失效而非报错），务必逐点核对透传。
 - `requireWhere` 全局强制（`sql-guard.ts:53`）对非日志类表表述可能造成误拒，Phase 2 需一并处理。
 - 自动派生的启发式（时间字段 / 维度 / 指标判定）**必须人工抽检**，否则会把错误的语义固化进 71 个 pack。
 - gold 应从「穷举手写」退化为「抽样验证」，否则 71 张表手写 gold 会重演今日问题。

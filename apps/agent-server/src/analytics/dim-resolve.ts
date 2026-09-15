@@ -53,18 +53,13 @@ export async function loadFieldLexicon(
 
 function wantsLexiconResolve(
   dim: EnumDimensionDef | undefined,
-  field: string,
   tokens: string[],
-  nl?: string,
 ): boolean {
   if (dim?.domain === "pack") return false;
   if (dim?.valueDomain === "literal") return false;
   if (dim?.valueDomain === "metabase_lexicon") return true;
-  if (field === "movieType") return true;
-  // Generic: CJK (or other non-code) tokens / NL hints need label→code mapping
-  if (tokens.some((t) => /[\u4e00-\u9fff]/.test(t))) return true;
-  if (nl && field === "movieType" && /[\u4e00-\u9fff]/.test(nl)) return true;
-  return false;
+  // Generic: CJK (or other non-code) tokens need label→code mapping from the warehouse
+  return tokens.some((t) => /[\u4e00-\u9fff]/.test(t));
 }
 
 export type FilterResolveOk = {
@@ -111,7 +106,7 @@ export async function resolvePackFilters(input: {
       filters[field] = tokens;
       notes.push(`pack_alias:${field}:${tokens.join(",")}`);
     }
-    if (!wantsLexiconResolve(dim, field, tokens, input.nl)) continue;
+    if (!wantsLexiconResolve(dim, tokens)) continue;
 
     const loaded = await loadFieldLexicon(input.pack, field, {
       ...input.opts,

@@ -44,7 +44,7 @@
 | JOIN | AST 守卫已能抽出 FROM/JOIN 表名；**编译器永不产出 JOIN** |
 | WITH | AST 已认 `with_select` |
 | overlay | `elt_watch_detail` 上 `uniq_users` / `sum_watch_second` / `avg_watch_second_per_user` / `avg_max_progress`（wide 仅完播） |
-| 泄漏 | probe / grounding-gate / dim-resolve / schema-agent 默认 table 仍钉 `pack.tables[0]`；`requireWhere` 全局强制 |
+| 泄漏 | **已清零（2026-09-15）**：probe / grounding-gate / dim-resolve / schema-agent 默认 table 全部跟已解析表；`requireWhere` 按表（有至少一张时间列才强制）；`intent.ts` 中文正则已迁 pack（`nl-signals.ts`）。残余挂账见 §8 进度注 |
 
 **不做**：为 67 张表各生成一份 pack。目录已经在 warehouse 里。
 
@@ -244,10 +244,26 @@ V1 只收录上面三对（覆盖付费 + 两条留存）。其它跨表问 → 
 | probe | `pipeline.ts` | `FROM` 已解析表；时间列 `packTimeField(pack, table)`；维不在该表则 SKIP |
 | channel 接地 | `grounding-gate.ts` | 目标表无文本 `channel` 则跳过 |
 | 词典 | `dim-resolve.ts` | `findMetabaseField(db, 目标表, field)` |
-| schema-agent 默认 | `schema-agent.ts` | `table`/`fields` 跟已解析表；warehouse 列表已有则保持 |
+| schema-agent 默认 ✅ 2026-09-15 | `schema-agent.ts` | `table`/`fields` 跟已解析表；warehouse 列表已有则保持。probe 兜底链=调用侧已解析表 → pack overlay（`overlayTableName`），均缺失时诚实 `table_unresolved`；system/工具描述业务表名字面量清除 |
 | `requireWhere` | `sql-guard.ts` / `sql-ast.ts` | 本轮用到的表**至少一张有时间列**才强制 WHERE；纯维表聚合不强制日期 |
 
 scan/freshness **不改**（不是对话问数）。
+
+**进度（2026-09-15）**：上表五处泄漏全部清零 + `intent.ts` 中文正则已迁 `nl-signals.ts`（pack aliases / setSignals / intentSignals 驱动，全语言通用）。同轮顺带去写死：`catalogPayload` / `capability-gate` / `verified-query COMPILE_PROMOTE` 三处写死指标 id 表删除（改 pack compile kind 推导）；`sql-compile` avg_of_max 输出别名改 `${intent.metric.id}`；probe 表名/时间列死兜底（`elt_watch_detail` / `lastWatchTime`）清除；宽表 pivot 维改 pack `guards.widePivotDim` 声明；宽/长表形状词判定改 `wideShapeCues` / `longShapeCues`；`userDemandsLangFilter` / `isCompletionMetric` / `isNonPivotMetric` 的中文正则与指标 id 写死全部改 pack 驱动。回归：analytics 17 个单测套件全绿。
+
+**进度（2026-09-15 第六轮）**：挂账 2「语言 clarify 槽位簇」清零——pack 新增 `enumDimensions[].memberKind`（`locale`/`lexicon`/`literal`）作为「语言维 + 成员值模式」声明，`semantic-layer` 加 `languageDimension()`/`enumDimsByMemberKind()`/`canonicalDimSlot()`，槽位簇全链路参数化（详见挂账 2 条目）。对现 pack 行为逐字节不变。回归：analytics 47 套件 + hardening verify 13/13 全绿（`analytics-scan-notify` 断言红为既有标题 emoji 不一致，与语义层无关）。
+
+**挂账（下一轮候选，均属章程红线残余）**：
+1. ~~`sql-compile.ts` 残余 schema 兜底~~ **已清零（2026-09-15 第二轮）**：`||"guid"`/`||"watchSecond"`/`||"maxWatchProgress"`/`spec.keyField||"guid"`/ratio `filterFields` 兜底全部改为必须声明（缺失诚实 `metric_field_missing:*` / `retention_key_field_missing` / `ratio_filter_fields_missing`）；输出别名 `AS users`/`AS avg_watch_second` 改 pack `compile.outputAlias` 声明；空成员列别名 `"en"` 改 pack `emptyAlias`；空成员表面形式（英语/english/en-US）改 pack `emptyAliases`+`emptyLabel` 前缀；数值维强制（原 `field==="movieType"`）改 pack `numericValues`；overlay 默认分组维 `"watch_date"` 改 `packGrainId`。回归：analytics 21 套件全绿，本文件 SQL 输出对现 pack 逐字节不变（别名/形状均由 pack 声明回填）。
+   - **收尾去冗（2026-09-15 第四轮，SQL 输出逐字节不变）**：删 `compileAvgOfMax` 宽表分支死变量 `order` 与两处恒等三元（`wideDims.length ? wideDims : dims.filter(...)` / `innerDimMeta = wideMeta.length ? wideMeta : []`）；`normalizeFilterToken` 的 `"(empty)"` 字面量改引用 `clarify-options.EMPTY_PROBE_TOKEN` 协议常量；`compileRatio`/`compileRetention` 的 `filters.channel`/`appVersion` 为 `MetricDef.requiredSlots` 类型化逻辑槽名契约（物理列仍由 `spec.filterFields`/retention 各声明字段驱动），保留并注释。
+2. ~~语言 clarify 槽位簇泛化~~ **已清零（2026-09-15 第六轮）**：pack 新增 `enumDimensions[].memberKind` 声明（`locale` = 语言维 / `lexicon` = Metabase 码↔标签维 / `literal` = 原样存值；现 pack 三维分别声明），配 `semantic-layer` 三个纯函数 `languageDimension()` / `enumDimsByMemberKind()` / `canonicalDimSlot()`，把槽位簇整体参数化：
+   - `conversation-structure.ts`：`isEmptyContentLangToken` → `isEmptyMemberToken(raw, dim)`（空成员语义改由 dim `emptyLabel`/`emptyAliases`/`emptyAlias` 推导）；`extractLocalesFromText` 字段名/空标记前缀改语言维声明（xx-YY 正则与「空」等通用 NLP 词保留）；`extractOfferedContentLangs` 字段名改语言维声明；`extractClarificationSlots` 的键集改由 `enumDimensions` id/field/aliases 动态构建（+ `result_layout`/`metric`/`table` 协议槽），键经 `canonicalDimSlot` 归一后按 `langId`/`movieId`/`channelId` 落槽；`impliesMovieTypeSetWithoutMembers` 改遍历全部 lexicon 维；`impliesLangSetWithoutMembers`/`userDemandsLangFilter` 改语言维声明（后者不再把 channel 等其它 literal 维别名算作「语言筛选」）；`neededProbeFields` 改语言维 + lexicon 维遍历；`normalizeClarifySlot` 的 lang/language/locale 别名与兜底改 `canonicalDimSlot`；`enforceStructurePolicy` 的 slot 落槽/clarify 槽名/filters 键全部改 `langId`/`langField`/`movieId`/`channelId` 变量；`buildStructureSystemPrompt` 的示例与 JSON schema 槽名改声明值。
+   - `ask-state.ts`：新增 `requestedContractKey`/`requestedContractKeyForSlot`（dim field/slot → 契约字段 channels/contentLangs/movieTypes，由 `memberKind` 路由），`mergeAskState` clarify 落槽、`clearPath` requested 清理、`buildAskStateFromStructure`/`parseAskState` 的 requested 构建全部改 pack 维遍历；`AskRequested` 对外契约形状保持不变（前端/会话持久化零改动）。
+   - `turn-intent-llm.ts` / `schema-agent.ts`：`filters.<语言维>` 示例、JSON schema 槽名、`catalogPayload` notes、`buildTools` 描述的字段示例全部改 pack 声明值。
+   - 降级语义：`memberKind` 未声明的 pack → `languageDimension()` 返回 undefined，语言维相关分支诚实不落槽/不问，不再按字段名硬猜。对现 pack 行为逐字节不变。回归：analytics 47 套件 + hardening verify 13/13 全绿（唯一 `analytics-scan-notify` 断言红为 `scan/notify.ts` 标题 📊 前缀与 `alert-notify.ts` 未提交改动不一致的既有问题，与本轮无关）。
+3. ~~`semantic-layer.ts` 时间列推断启发式~~ **已清零（2026-09-15 第三轮）**：时间列解析改三级——overlay 用 `pack.time.field` → 非 overlay 先查 pack `time.tableFields`（按表声明，带实时字段校验，声明列不存在则降级）→ 通用英文命名启发式兜底（`timeFieldRank` 删 lastWatchTime/watchTime/actionTime/payTime/forbiddenEnd/logoutTime/lastNickNameModify/latestActiveDate 全部业务列名）；永不作为时间窗的列改 pack `time.excludeFields` 声明。pack JSON 已声明 `elt_film_order → payTime` 与三条排除列。语义层测试全绿（原 rank 钉死用例改为声明路径命中）。
+4. ~~重复实现与死参数清零~~ **已清零（2026-09-15 第四轮）**：`nlWantsWideShape` 双实现去重（`verified-query.ts` 副本删除，`metric-infer.ts` 改从 `nl-signals.ts` 单一读取路径导入）；`compileCanCoverVerified` 未用 `_nl` 参数删除（调用点与测试同步）。回归：analytics 47 套件全绿 + hardening verify 13/13。
+5. ~~`ask-plan.ts` 写死维 id~~ **已清零（2026-09-15 第五轮）**：`PlanTuple.channels/contentLangs` 改 `entity/pivot`（pack `guards.entityCompareDim` **新声明** + 复用 `guards.widePivotDim`，dim id → 物理字段经 `enumDimensions` 解析）；`filters.channel/contentLang`、`["watch_date"]` 兜底（改 `packGrainId`）、`dimSig`/`mixedCollapsed` 判定全部 pack 驱动，未声明时诚实降级（不产 split plan）；`isDateLikeCol` 删 `watch_?date` 业务词（`watchDate` 由通用 `/date/` 命中）；pipeline `planChannels` 写死 `filters.channel` 改 `entityCompareField(pack)`；`synthesizeYoyPlan/MomPlan` 透传 pack。对现 pack 行为逐字节不变；未声明 `entityCompareDim` 的 pack 诚实不拆步。回归：analytics 47 套件全绿。
 
 `intent.ts` 里「按天/按渠道」中文正则：本设计实现时迁到 pack `enumDimensions` / dim aliases，禁止继续靠 TS 业务词扩表。这是章程红线，不是顺手重构。
 

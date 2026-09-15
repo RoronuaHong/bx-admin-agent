@@ -15,3 +15,8 @@ _test_result.txt
 coverage
 # 长工具结果临时文件（Cursor 式动态上下文，运行时产物，可清理）
 .agent-context
+# 调试抓包产物（Chrome DevTools 导出的 request/response dump）
+*.network-request
+*.network-response
+# 一次性排查脚本（任意层级的 scripts/tmp-*）
+**/scripts/tmp-*

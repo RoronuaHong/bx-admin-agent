@@ -137,9 +137,11 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
     markTimeoutIfNeeded(jobId, ruleSet.jobTimeoutMs);
     if (getJob(jobId)?.status === "failed") return;
 
-    const metric = ruleSet.metrics[0] || "channel_daily_users";
+    const metric = ruleSet.metrics[0] || "";
     const rows = await fetchUsers(window.scanDate, window.dodDate, window.wowDate, {
       packId: ruleSet.packId,
+      table: ruleSet.freshnessCheck.table,
+      entityField: ruleSet.dimensions.rollup,
     });
     if (getJob(jobId)?.status === "failed") return;
 
@@ -171,6 +173,7 @@ export async function processJob(jobId: string, deps?: ScanDeps): Promise<void> 
         rerunSeq: job.rerunSeq,
         dryRun: false,
         threshold,
+        rows,
       });
       if (job.digest) {
         await notifyDigest({

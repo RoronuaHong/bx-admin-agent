@@ -114,8 +114,8 @@ export function buildLlmVerifyPrompt(input: {
     "- pass: grain/filters/metrics are consistent with the question and sample rows are usable",
     "- fail: concrete mismatch visible in SQL or sample (wrong grain, missing entity filter, invented metric)",
     "- unclear: ONLY when the sample is too truncated/ambiguous to judge AND you see no concrete fail",
-    "If named entities appear in WHERE filters, day grain matches 按天/每天/按日, and sample rows are non-empty for the window → prefer pass.",
-    "If compiled metricId contradicts a uniquely grounded pack metric in the question (e.g. 人均 vs 最大进度), fail with metric_nl_mismatch.",
+    "If named entities appear in WHERE filters, the day-grain request is honored, and sample rows are non-empty for the window → prefer pass.",
+    "If compiled metricId contradicts a uniquely grounded pack metric in the question, fail with metric_nl_mismatch.",
     "Do not invent business synonyms. Prefer fail over silent wrong pass; do not overuse unclear.",
   ].join("\n");
 
@@ -273,9 +273,11 @@ export function buildInsightPrompt(input: {
 }): { system: string; user: string } {
   const system = [
     "You write a short analytics reading of ALREADY EXECUTED SQL results.",
-    "Output ONLY JSON: {\"summary\":\"...\",\"trend\":\"...\"}",
+    "Output ONLY JSON: {\"headline\":\"...\",\"summary\":\"...\",\"trend\":\"...\",\"followups\":[\"...\"]}",
+    "headline: ONE short sentence that directly answers the question with the top-line number from the sample (top line only, no full ranking, no caveat, no SQL, no hedging).",
     "summary: 2-4 sentences in the user's language (default Chinese).",
     "trend: one sentence on the pattern visible in the shown rows (rank, concentration, day-to-day direction).",
+    "followups: 1-3 short next questions worth asking next about the shown rows (same language; no invented numbers; do not restate the current question).",
     "HARD RULES:",
     "- Use ONLY numbers/versions that appear in the sample rows or the resolved time window.",
     "- Do not invent totals, rates, or forecasts. No next-week / next-month numeric prediction.",
@@ -302,22 +304,37 @@ export function buildInsightPrompt(input: {
   return { system, user };
 }
 
-export function parseInsightResponse(raw: string): { summary: string; trend: string } {
+export function parseInsightResponse(raw: string): {
+  headline: string;
+  summary: string;
+  trend: string;
+  followups: string[];
+} {
   const text = String(raw || "").trim();
-  if (!text) return { summary: "", trend: "" };
+  if (!text) return { headline: "", summary: "", trend: "", followups: [] };
   let jsonText = text;
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) jsonText = fence[1].trim();
   const brace = jsonText.match(/\{[\s\S]*\}/);
   if (brace) jsonText = brace[0];
   try {
-    const obj = JSON.parse(jsonText) as { summary?: unknown; trend?: unknown; insight?: unknown };
+    const obj = JSON.parse(jsonText) as {
+      headline?: unknown;
+      summary?: unknown;
+      trend?: unknown;
+      insight?: unknown;
+      followups?: unknown;
+    };
     return {
+      headline: String(obj.headline || "").trim(),
       summary: String(obj.summary || obj.insight || "").trim(),
       trend: String(obj.trend || "").trim(),
+      followups: Array.isArray(obj.followups)
+        ? obj.followups.map((f) => String(f ?? "").trim()).filter(Boolean)
+        : [],
     };
   } catch {
-    return { summary: text.slice(0, 600).trim(), trend: "" };
+    return { headline: "", summary: text.slice(0, 600).trim(), trend: "", followups: [] };
   }
 }
 
@@ -327,38 +344,91 @@ export function composeInsightMarkdown(parsed: { summary: string; trend: string 
   return [summary, trend].filter(Boolean).join("\n\n").trim();
 }
 
+/** Headline keeps ONE sentence; sentences carrying ungrounded numbers are skipped, never rewritten. */
+export function composeHeadline(parsed: { headline: string }, grounded: Set<string>): string {
+  const raw = String(parsed.headline || "").trim();
+  if (!raw) return "";
+  const sentences = raw
+    .split(/(?<=[。！？])|(?<=[.!?])\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  for (const sentence of sentences) {
+    const clean = sanitizeInsightText(sentence, grounded);
+    if (!clean) continue;
+    return clean.length > 200 ? `${clean.slice(0, 200)}…` : clean;
+  }
+  return "";
+}
+
 export type PostExecLlm = {
   verify?: LlmVerifyResult;
   insight?: string;
+  headline?: string;
+  followups?: string[];
 };
 
-/** Instant reading from the result table — no extra LLM. Used for Path A/B. */
-export function buildLocalInsight(input: {
-  timeEcho: string;
-  tables: Array<{ title?: string; cols: string[]; rows: unknown[][] }>;
-}): string {
-  const tables = input.tables || [];
-  const first = tables[0];
-  if (!first?.rows?.length) return "";
-  const echo = String(input.timeEcho || "").trim();
-  if (tables.length === 1 && first.rows.length === 1) {
-    const row = first.rows[0] || [];
-    const nums = first.cols.map((c, i) => {
-      const v = row[i];
-      if (v == null || v === "") return "";
-      return first.cols.length === 1 ? String(v) : `${c} ${v}`;
-    }).filter(Boolean);
-    if (!nums.length) return "";
-    return echo ? `${echo}，结果为 ${nums.join("，")}。` : `结果为 ${nums.join("，")}。`;
+const MAX_FOLLOWUPS = 3;
+const MAX_FOLLOWUP_CHARS = 80;
+
+/** 追问建议：逐条接地过滤 + 去重 + 截断；不复述当前问句，不编造数字 */
+export function composeFollowups(list: string[] | undefined, grounded: Set<string>, asked = ""): string[] {
+  const askedNorm = String(asked || "").replace(/\s+/g, "");
+  const out: string[] = [];
+  for (const raw of list || []) {
+    const stripped = String(raw || "")
+      .replace(/^\s*(?:[-*•]\s+|\d+[.)]\s+)/, "")
+      .trim();
+    const clean = sanitizeInsightText(stripped, grounded).trim();
+    if (!clean) continue;
+    if (askedNorm && clean.replace(/\s+/g, "") === askedNorm) continue;
+    const item = clean.length > MAX_FOLLOWUP_CHARS ? `${clean.slice(0, MAX_FOLLOWUP_CHARS)}…` : clean;
+    if (out.includes(item)) continue;
+    out.push(item);
+    if (out.length >= MAX_FOLLOWUPS) break;
   }
-  const n = tables.reduce((s, t) => s + (t.rows?.length || 0), 0);
+  return out;
+}
+
+/** headline / insight / followups 来自同一次解读，且共用同一套接地过滤（避免各处各写一遍） */
+function composeReading(
+  parsed: { headline: string; summary: string; trend: string; followups: string[] },
+  grounded: Set<string>,
+  asked = "",
+): { insight?: string; headline?: string; followups?: string[] } {
+  const insight = composeInsightMarkdown(parsed, grounded);
+  const headline = composeHeadline(parsed, grounded);
+  const followups = composeFollowups(parsed.followups, grounded, asked);
+  return {
+    insight: insight || undefined,
+    headline: headline || undefined,
+    followups: followups.length ? followups : undefined,
+  };
+}
+
+/** Deterministic reading from the result table — no LLM, no time echo (numbers come from the rows).
+ *  Used as the headline fallback when the model is unavailable / produced nothing usable. */
+export function buildLocalReading(tables: Array<{ title?: string; cols: string[]; rows: unknown[][] }>): string {
+  const list = tables || [];
+  const first = list[0];
+  if (!first?.rows?.length) return "";
   const row = first.rows[0] || [];
+  if (list.length === 1 && first.rows.length === 1) {
+    const nums = first.cols
+      .map((c, i) => {
+        const v = row[i];
+        if (v == null || v === "") return "";
+        return first.cols.length === 1 ? String(v) : `${c} ${v}`;
+      })
+      .filter(Boolean);
+    return nums.length ? `结果为 ${nums.join("，")}。` : "";
+  }
+  const n = list.reduce((s, t) => s + (t.rows?.length || 0), 0);
   const head = first.cols
     .map((c, i) => (row[i] == null || row[i] === "" ? "" : `${c} ${row[i]}`))
     .filter(Boolean)
     .slice(0, 3)
     .join(" / ");
-  const bits = [echo, `共 ${n} 行`, head ? `首位 ${head}` : ""].filter(Boolean);
+  const bits = [`共 ${n} 行`, head ? `首位 ${head}` : ""].filter(Boolean);
   return bits.length ? `${bits.join("，")}。` : "";
 }
 
@@ -373,10 +443,12 @@ export function buildPostExecCombinedPrompt(input: {
     "You are an analytics SQL result verifier AND reader.",
     "The SQL already ran. Do not rewrite numbers.",
     "Output ONLY JSON:",
-    '{"verdict":"pass"|"fail"|"unclear","codes":["..."],"reason":"...","summary":"...","trend":"..."}',
+    '{"verdict":"pass"|"fail"|"unclear","codes":["..."],"reason":"...","headline":"...","summary":"...","trend":"...","followups":["..."]}',
     "verdict: pass if SQL/filters/grain match the question; fail if a concrete mismatch is visible; unclear only if the sample is too short AND you see no concrete fail.",
+    "headline: ONE sentence that directly answers the question with the top-line number from the sample.",
     "summary: 2-4 sentences in the user's language (default Chinese).",
     "trend: one observed pattern from shown rows. No future numeric forecast.",
+    "followups: 1-3 short next questions worth asking next about the shown rows (same language; no invented numbers).",
     "Use ONLY numbers/versions that appear in the sample or resolved time window.",
   ].join("\n");
   const verify = buildLlmVerifyPrompt(input);
@@ -384,7 +456,34 @@ export function buildPostExecCombinedPrompt(input: {
   return { system, user: verify.user + "\n\n" + insight.user.split("Return JSON only.")[0] + "Return one JSON object only." };
 }
 
-/** Path A/B already compiled or gold — skip extra LLM. Path C = one combined call, no retry. */
+/** Insight-only LLM reading of executed rows. Used when SQL is already trusted/compiled and we
+ *  skip the M2 verify — but still feed the rows back so the summary references real data.
+ *  Returns only model-produced parts; the caller owns the deterministic fallback. */
+async function generateLlmInsight(input: {
+  nl: string;
+  timeEcho: string;
+  sqls: string[];
+  sampleTables: Array<{ title: string; cols: string[]; rows: unknown[][] }>;
+  llmText: (system: string, user: string, spanName: string) => Promise<string>;
+}): Promise<{ insight?: string; headline?: string; followups?: string[] }> {
+  if (!llmInsightEnabled()) return {};
+  try {
+    const prompt = buildInsightPrompt({
+      nl: input.nl,
+      timeEcho: input.timeEcho,
+      sqls: input.sqls,
+      sampleTables: input.sampleTables,
+    });
+    const raw = await input.llmText(prompt.system, prompt.user, "analytics.llm_insight");
+    const parsed = parseInsightResponse(raw);
+    const grounded = collectGroundedNumbers(input.sampleTables, [input.timeEcho, input.nl, ...input.sqls]);
+    return composeReading(parsed, grounded, input.nl);
+  } catch {
+    return {};
+  }
+}
+
+/** Path A/B already compiled or gold — skip extra LLM verify. Path C = one combined call, no retry. */
 export async function runPostExecLlm(input: {
   nl: string;
   timeEcho: string;
@@ -399,21 +498,31 @@ export async function runPostExecLlm(input: {
     return { verify: { verdict: "pass", codes: ["empty_skip"], reason: "empty result skip verify" } };
   }
   const sampleTables = sampleTablesForVerify(input.tables, 8);
-  const local = llmInsightEnabled() ? buildLocalInsight({ timeEcho: input.timeEcho, tables: input.tables }) : "";
+  const localCore = llmInsightEnabled() ? buildLocalReading(input.tables) : "";
+  // 模型不可用 / 未产出可用读数时：确定性读数补到 headline 位（顶部直答），不再重复到解读区
+  const finishReading = (out: PostExecLlm): PostExecLlm =>
+    out.insight || out.headline || !localCore ? out : { ...out, headline: localCore };
   const compiled = input.trust === "trusted" || input.trust === "verified";
-  if (compiled || (!llmVerifyEnabled() && !llmInsightEnabled())) {
-    return {
-      verify: {
-        verdict: "pass",
-        codes: [compiled ? "verify_skipped_compiled" : "verify_disabled"],
-        reason: compiled ? "compiled/gold SQL; skipped extra LLM verify" : "ANALYTICS_LLM_VERIFY=0",
-      },
-      insight: local || undefined,
+  // Trusted/compiled/gold SQL: the SQL itself is trusted, so skip the M2 verify — but still
+  // feed the executed rows to the LLM so the summary references real data, not a first-row echo.
+  if (compiled) {
+    const out: PostExecLlm = {
+      verify: { verdict: "pass", codes: ["verify_skipped_compiled"], reason: "compiled/gold SQL; skipped extra LLM verify" },
     };
+    const llm = await generateLlmInsight({ nl: input.nl, timeEcho: input.timeEcho, sqls: input.sqls, sampleTables, llmText: input.llmText });
+    if (llm.insight) out.insight = llm.insight;
+    if (llm.headline) out.headline = llm.headline;
+    if (llm.followups) out.followups = llm.followups;
+    return finishReading(out);
   }
 
-  const out: PostExecLlm = { insight: local || undefined };
-  if (!llmVerifyEnabled() && !llmInsightEnabled()) return out;
+  if (!llmVerifyEnabled() && !llmInsightEnabled()) {
+    return finishReading({
+      verify: { verdict: "pass", codes: ["verify_disabled"], reason: "ANALYTICS_LLM_VERIFY=0" },
+    });
+  }
+
+  const out: PostExecLlm = {};
   try {
     const prompt = buildPostExecCombinedPrompt({
       nl: input.nl,
@@ -429,8 +538,10 @@ export async function runPostExecLlm(input: {
     if (llmInsightEnabled()) {
       const parsed = parseInsightResponse(raw);
       const grounded = collectGroundedNumbers(sampleTables, [input.timeEcho, input.nl, ...input.sqls]);
-      const insight = composeInsightMarkdown(parsed, grounded) || local;
-      if (insight) out.insight = insight;
+      const reading = composeReading(parsed, grounded, input.nl);
+      if (reading.insight) out.insight = reading.insight;
+      if (reading.headline) out.headline = reading.headline;
+      if (reading.followups) out.followups = reading.followups;
     }
   } catch {
     if (llmVerifyEnabled()) {
@@ -440,10 +551,11 @@ export async function runPostExecLlm(input: {
   if (!out.verify && llmVerifyEnabled()) {
     out.verify = { verdict: "pass", codes: ["verify_disabled"], reason: "ANALYTICS_LLM_VERIFY=0" };
   }
-  return out;
+  return finishReading(out);
 }
 
+/** Caution line for the answer tail; returned as its own field (never appended to message). */
 export function verifyCaution(verify?: LlmVerifyResult): string {
-  if (verify?.verdict === "fail" && verify.reason) return `\n\n校对未通过：${verify.reason}`;
+  if (verify?.verdict === "fail" && verify.reason) return `校对未通过：${verify.reason}`;
   return "";
 }

@@ -163,7 +163,7 @@ export function buildCatalogDigest(catalog: AnalyticsCatalog, generatedAt = Date
     notes: [
       "Source: Metabase GET /api/database/{id}/metadata (REST), not MCP.",
       "Hidden: _tmp / _dict / upload_* / schema metabase_upload — not queryable.",
-      "Watch overlay (观看人数=uniq(guid) etc.) is only authored for elt_watch_detail.",
+      "Overlay metrics are only authored for the pack's overlay table.",
       "Other tables: compile uniq|sum|avg|count on live columns; do not invent metrics from names.",
     ],
     tables,
@@ -193,8 +193,7 @@ export function formatCatalogDigestMarkdown(digest: CatalogDigest): string {
     "",
     "## 怎么用",
     "",
-    "- 问数 agent 用这份说明对表/列；已建模 KPI 由代码编译，其余由模型对着目录写 SQL。",
-    "- 观影人数 / 完播 / 人均时长：默认 `elt_watch_detail` + overlay 口径。",
+    "- 问数 agent 用这份说明对表/列；已建模 KPI 由 pack 编译（overlay 口径），其余由模型对着目录写 SQL。",
     "- 其它可答表：按文档/字段检索后写 SQL，不要求用户先点名表。",
     "- `_tmp` / `_dict` / `upload_*` 不可查。",
     "- 无表级 description 的表：暂存推断见 [ANALYTICS_CATALOG_INFERRED.md](./ANALYTICS_CATALOG_INFERRED.md)。",

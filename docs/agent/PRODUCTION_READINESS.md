@@ -90,6 +90,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - 设计原则：零业务词（维度仅时间/模型/会话/耗时）、零新依赖（Node 标准库）、采集侧零感知。
 - 遗留：多 key 轮转（NVIDIA_API_KEYS）按 key 成本分摊。
 - **告警推送（2026-09-04）**：`alert-notify.ts` 钉钉自定义机器人 Webhook（`ALERT_DINGTALK_WEBHOOK`）；预算告警（`inspect-cost` + `/cost/summary`）与劣化 `degradeHint`（`/trace/runs`）可推送；`ALERT_DEDUP_MS` 默认 30min 去重；`ALERT_BUDGET_NOTIFY` / `ALERT_DEGRADE_NOTIFY` 可关；未配 webhook 静默。
+- **推送形态与配色（2026-09-15 实机验收）**：`ALERT_MSGTYPE=action_card` 时卡片正文 + 底部 4 实体按钮（查看完整报告/下载 Excel/下载 PDF/去问数追问）；`ALERT_FONT_COLOR=1` 用 `<font color>` 上色。**配色口径（2026-09-15 二次统一）**：**异常与预警一律红 `#f5222d`**（异常细分条目 / `异常：N 条` 摘要 / `← 异常` 标记 / 预警与严重徽标 / 下跌，全站只用一个红，`#cf1322` 与橙 `#fa8c16` 均已废弃移除 —— 预警 vs 严重只由**徽标文字**区分）；绿 `#52c41a` = 正常徽标 / 上涨；蓝 `#2f54eb` = 日报徽标（日报有无异常都不变蓝→异常时摘要转红）；蓝 `#597ef7` = 柱条。**标题约定**：告警 `🚨 [bx-agent] 巡检预警 <日期>：N 个渠道异常`、日报 `📊 [bx-agent] 巡检日报 <日期>：渠道日活 + 异常汇总`——告警与日报经 emoji + 文案 + 配色三重区分。钉钉机器人「关键词安全设置」须配 `ALERT_KEYWORD`（如 `Agent`），sender 发送前注入正文+标题，否则被静默拒收（HTTP 200 + errcode 310000）；sender 已校验 `errcode!=0` 抛错，杜绝「假 sent」。
 - **挂账（后续）**：①生产 Webhook 尚未写入 `.env`（需在钉钉群创建「自定义机器人」后配置 `ALERT_DINGTALK_WEBHOOK` 并实推验收）；②真·单聊推个人（企业应用 OpenAPI + userid）未做，与群机器人 Webhook 不同通道。
 
 ### 2.6 安全 Security ✅ P1 已落地（审计 + 限流 + Prompt 结构护栏）

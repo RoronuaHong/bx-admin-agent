@@ -23,6 +23,12 @@ export const router = createRouter({
       // 问数可匿名使用；已登录时会话走 Mongo（与后台同 cookie），未登录仅本地缓存
       meta: { agent: "analytics" },
     },
+    {
+      // 巡检报告分享页：匿名只读，token 即访问凭证（钉钉告警文案里的链接指向此）。
+      path: "/analytics/report/:token",
+      component: () => import("./pages/AnalyticsReportPage.vue"),
+      meta: { agent: "analytics" },
+    },
     { path: "/agents/analytics", redirect: "/analytics" },
     { path: "/login", redirect: "/agents/admin/login" },
     { path: "/chat", redirect: "/agents/admin/chat" },
