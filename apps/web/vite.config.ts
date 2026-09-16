@@ -36,12 +36,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes("/node_modules/echarts/core/")) return "vendor-echarts-core";
-          if (id.includes("/node_modules/echarts/charts/")) return "vendor-echarts-charts";
-          if (id.includes("/node_modules/echarts/components/")) return "vendor-echarts-components";
-          if (id.includes("/node_modules/echarts/renderers/")) return "vendor-echarts-renderers";
-          if (id.includes("/node_modules/zrender/")) return "vendor-zrender";
-          if (id.includes("/node_modules/echarts/")) return "vendor-echarts";
           if (id.includes("/node_modules/markdown-it/") || id.includes("/node_modules/dompurify/")) {
             return "vendor-richtext";
           }

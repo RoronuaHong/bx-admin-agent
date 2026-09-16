@@ -35,9 +35,3 @@ export function setUiLocale(locale: UiLocale) {
     /* ignore */
   }
 }
-
-export function toggleUiLocale() {
-  const order: UiLocale[] = ["zh", "en", "pt-BR", "hi"];
-  const idx = order.indexOf(uiLocale.value);
-  setUiLocale(order[(idx + 1) % order.length] || "zh");
-}

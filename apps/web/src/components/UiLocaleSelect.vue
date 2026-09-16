@@ -89,20 +89,16 @@ onBeforeUnmount(() => {
   min-width: 148px;
   height: 32px;
   padding: 0 11px 0 12px;
-  border: 1px solid color-mix(in srgb, var(--line) 92%, var(--ink) 8%);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--panel) 84%, var(--fill));
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
   color: var(--muted);
   cursor: pointer;
   overflow: hidden;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 22%, transparent),
-    0 1px 1px color-mix(in srgb, var(--ink) 3%, transparent);
   transition:
-    color 0.15s ease,
-    background 0.15s ease,
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
+    color 0.2s ease,
+    background 0.2s ease,
+    border-color 0.2s ease;
   font: inherit;
 }
 
@@ -125,7 +121,7 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink);
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 1;
 }
@@ -141,21 +137,16 @@ onBeforeUnmount(() => {
 }
 
 .locale-select:hover {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--panel) 76%, var(--fill-soft));
-  border-color: color-mix(in srgb, var(--ink) 14%, var(--line));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 28%, transparent),
-    0 2px 8px color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--accent, #0f766e);
+  background: var(--panel);
+  border-color: var(--accent, #0f766e);
 }
 
 .locale-select:focus-within {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--panel) 78%, var(--fill-soft));
-  border-color: color-mix(in srgb, var(--ink) 18%, var(--line));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 24%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--ink) 8%, transparent);
+  color: var(--accent, #0f766e);
+  background: var(--panel);
+  border-color: var(--accent, #0f766e);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #0f766e) 12%, transparent);
 }
 
 .locale-select:focus-within .locale-caret {
@@ -163,7 +154,7 @@ onBeforeUnmount(() => {
 }
 
 .locale-select:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ink) 28%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--accent, #0f766e) 45%, transparent);
   outline-offset: 2px;
 }
 

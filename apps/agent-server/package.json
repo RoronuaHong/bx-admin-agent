@@ -1,53 +1,21 @@
 {
   "name": "@bx/agent-server",
   "version": "0.0.1",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "generate-api-index": "node scripts/generate-api-index.mjs",
-    "build-symbol-index": "tsx src/symbol-index.ts",
-    "build-knowledge-index": "tsx scripts/build-knowledge-index.mjs",
-    "generate-api-operation-index": "node scripts/generate-api-operation-index.mjs",
-    "test:regression": "tsx scripts/test-regression.mjs",
-    "eval-intent-routing": "node scripts/eval-intent-routing.mjs",
-    "eval-routing-batch": "node scripts/eval-routing-batch.mjs",
-    "eval-clarification-gate": "tsx scripts/eval-clarification-gate.mjs",
-    "eval-enterprise-regression": "tsx scripts/eval-enterprise-regression.mjs",
-    "eval-full-chain": "tsx scripts/eval-full-chain.mjs",
-    "eval-e2e-chat": "tsx scripts/eval-e2e-chat.mjs",
-    "eval:ui-locale": "tsx scripts/eval-ui-locale-smoke.mjs",
-    "test": "tsx scripts/eval-core.test.ts && tsx scripts/rate-limit.test.ts && tsx scripts/alert-notify.test.ts && tsx scripts/prompt-guard.test.ts && tsx scripts/api-op-path-segment.test.ts && tsx scripts/user-prefs.test.ts && tsx scripts/tool-result-contract.test.ts && tsx scripts/permissions.test.ts && tsx scripts/chat-task-persistence.test.ts && tsx scripts/trace-empty-stats.test.ts",
-    "eval:core": "tsx scripts/eval-core.test.ts",
-    "eval:trace-gate": "tsx scripts/eval-trace-gate.mjs",
-    "eval:full": "tsx scripts/eval-full-chain.mjs && tsx scripts/eval-core.test.ts",
-    "eval": "tsx scripts/eval-core.test.ts",
-    "catalog-digest": "tsx scripts/analytics-catalog-digest.ts",
-    "test:analytics": "tsx scripts/analytics-semantic-layer.test.ts && tsx scripts/analytics-catalog.test.ts && tsx scripts/analytics-catalog-digest.test.ts && tsx scripts/analytics-catalog-inferred.test.ts && tsx scripts/analytics-catalog-card.test.ts && tsx scripts/analytics-catalog-schema.test.ts && tsx scripts/analytics-documented-ask.test.ts && tsx scripts/analytics-table-resolve.test.ts && tsx scripts/analytics-time-resolve.test.ts && tsx scripts/analytics-input-guard.test.ts && tsx scripts/analytics-intent-compile.test.ts && tsx scripts/analytics-conversation-structure.test.ts && tsx scripts/analytics-column-labels.test.ts && tsx scripts/analytics-context-pack.test.ts && tsx scripts/analytics-prefs.test.ts && tsx scripts/analytics-ask-state.test.ts && tsx scripts/analytics-ask-stack.test.ts && tsx scripts/analytics-ask-stack-persist.test.ts && tsx scripts/analytics-delivery.test.ts && tsx scripts/analytics-clarify-options-unit.test.ts && tsx scripts/analytics-schema-agent-unit.test.ts && tsx scripts/analytics-sql-guard.test.ts && tsx scripts/analytics-verified-query.test.ts && tsx scripts/analytics-ask-route.test.ts && tsx scripts/analytics-sql-agent.test.ts && tsx scripts/analytics-sql-ast.test.ts && tsx scripts/analytics-verify.test.ts && tsx scripts/analytics-metabase-client.test.ts && tsx scripts/analytics-dim-lexicon.test.ts && tsx scripts/analytics-capability-gate.test.ts && tsx scripts/analytics-coverage-gate.test.ts && tsx scripts/analytics-warehouse-coverage.test.ts && tsx scripts/analytics-ask-plan.test.ts && tsx scripts/analytics-pipeline-unit.test.ts && tsx scripts/analytics-eval-score.test.ts && tsx scripts/analytics-llm-verify.test.ts && tsx scripts/analytics-dim-reconcile.test.ts && tsx scripts/analytics-audit-ledger.test.ts && tsx scripts/analytics-local-chart.test.ts && tsx scripts/analytics-scan-window.test.ts && tsx scripts/analytics-scan-job-store.test.ts && tsx scripts/analytics-scan-threshold.test.ts && tsx scripts/analytics-scan-freshness-metrics.test.ts && tsx scripts/analytics-scan-notify.test.ts && tsx scripts/analytics-scan-scheduler.test.ts && tsx scripts/analytics-scan-runner-unit.test.ts && tsx scripts/analytics-semantic-hardening-verify.ts",
-    "test:analytics-askstate-smoke": "node --import tsx ./scripts/analytics-askstate-smoke.ts",
-    "test:analytics-gate": "tsx scripts/analytics-warehouse-coverage.test.ts && tsx scripts/analytics-eval-score.test.ts && tsx scripts/analytics-eval-harness.mjs --refuse-only",
-    "test:analytics-production": "tsx scripts/analytics-intent-compile.test.ts && tsx scripts/analytics-sampling-matrix.test.ts && tsx scripts/analytics-eval-harness.mjs --refuse-only",
-    "eval:analytics": "tsx scripts/analytics-eval-harness.mjs"
+    "start": "tsx src/index.ts"
   },
   "dependencies": {
     "@bx/shared": "workspace:*",
     "@hono/node-server": "^1.19.0",
-    "@langchain/core": "^1.2.8",
-    "@langchain/langgraph": "^1.4.10",
-    "@modelcontextprotocol/core": "^2.0.0",
-    "@modelcontextprotocol/hono": "^2.0.0",
-    "@modelcontextprotocol/server": "^2.0.0",
     "dotenv": "^16.4.5",
-    "exceljs": "^4.4.0",
     "hono": "^4.9.8",
-    "mongodb": "^7.5.0",
-    "pdfkit": "^0.19.1",
-    "unpdf": "^1.8.1",
-    "zod": "^4.4.3"
+    "mongodb": "^7.5.0"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
-    "@types/pdfkit": "^0.17.6",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   }

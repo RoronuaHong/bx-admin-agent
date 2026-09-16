@@ -1,88 +1,29 @@
-// 聊天 / Analytics 会话服务端持久化，存 MongoDB。
-// chat：登录 session → ownerKey = `${countryId}:${loginName}`。
-// analytics：登录同 chat；未登录用 bx_analytics_aid → ownerKey = `anon:<aid>`（app.ts resolveAnalyticsOwner）。
+// 聊天会话持久化，存 MongoDB（连不上则降级进程内存）。
 //
 // 设计要点：
 //  - MongoClient 单例懒连接；失败降级进程内存 Map。
-//  - chat → 集合 chat_conversations；analytics → analytics_conversations（互不串台）。
+//  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
-import type { SessionUser } from "@bx/shared";
-import type { LocalizedToken } from "./i18n";
-import {
-  emptyAskStateStack,
-  parseAskStateStack,
-  pushAskState,
-  undoAskState,
-  type AskStateStack,
-} from "./analytics/ask-stack.js";
-import { parseAskState, type AskState } from "./analytics/ask-state.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
-
-export type ConversationStore = "chat" | "analytics";
-
-const COLL_BY_STORE: Record<ConversationStore, string> = {
-  chat: "chat_conversations",
-  analytics: "analytics_conversations",
-};
-
-/** 断线兜底会话稳定 id（按 ownerKey 一份）；旧版 task-<sessionId> 为孤儿。 */
-export const TASK_RESULTS_CONV_ID = "task-results";
-
-export function isLegacyTaskConversationId(id: string): boolean {
-  return id.startsWith("task-") && id !== TASK_RESULTS_CONV_ID;
-}
+const COLL = "chat_conversations";
 
 export interface StoredMessage {
   id?: string | number;
   role: "user" | "assistant";
   text: string;
   images?: Array<{ id: string; name: string }>;
-  tables?: unknown[];
-  charts?: unknown[];
-  files?: unknown[];
-  cancelled?: boolean;
-  status?: string;
-  error?: string;
-  errorToken?: LocalizedToken;
-  reasoning?: string;
-  toolResults?: Array<{ name: string; result: string }>;
-  toolStep?: number;
-  currentTool?: string;
-  /** Analytics ask extras */
-  timeEcho?: string;
-  sqls?: string[];
-  probeSummary?: string;
-  askId?: string;
-  modelId?: string;
-  packVersion?: string;
-  userNl?: string;
-  feedback?: string;
-  welcome?: boolean;
-  pending?: boolean;
-  clarifySlot?: string;
 }
 
 export interface ConversationDoc {
   _id?: ObjectId;
   id: string;
-  ownerKey: string;
-  countryId: string;
-  loginName: string;
   title: string;
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
-  /** Analytics P2: linear AskState stack (top = current) */
-  askStateStack?: AskStateStack;
-}
-
-/** 从 session 用户推导归属 key（国家线 + 登录名）。 */
-export function ownerKeyOf(user: SessionUser | undefined, countryId: string): string {
-  const loginName = user?.loginName || String(user?.id ?? "anon");
-  return `${countryId}:${loginName}`;
 }
 
 // ---- Mongo 单例 ----
@@ -111,28 +52,18 @@ function getClient(): Promise<MongoClient> {
   return clientPromise;
 }
 
-async function getColl(store: ConversationStore = "chat"): Promise<Collection<ConversationDoc> | null> {
+async function getColl(): Promise<Collection<ConversationDoc> | null> {
   try {
     const client = await getClient();
     const db: Db = client.db(MONGO_DB);
-    return db.collection<ConversationDoc>(COLL_BY_STORE[store]);
+    return db.collection<ConversationDoc>(COLL);
   } catch {
     return null;
   }
 }
 
-// ---- 内存降级（按 store 分桶） ----
-const memoryByStore: Record<ConversationStore, Map<string, ConversationDoc[]>> = {
-  chat: new Map(),
-  analytics: new Map(),
-};
-
-function memGet(store: ConversationStore, ownerKey: string): ConversationDoc[] {
-  return memoryByStore[store].get(ownerKey) || [];
-}
-function memSet(store: ConversationStore, ownerKey: string, list: ConversationDoc[]) {
-  memoryByStore[store].set(ownerKey, list);
-}
+// ---- 内存降级 ----
+const memory = new Map<string, ConversationDoc>();
 
 function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
   const byId = new Map<string, ConversationDoc>();
@@ -143,313 +74,120 @@ function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
   return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-function resolveStore(store?: ConversationStore): ConversationStore {
-  return store === "analytics" ? "analytics" : "chat";
-}
-
 // ---- CRUD ----
-export async function listConversations(
-  ownerKey: string,
-  store: ConversationStore = "chat",
-): Promise<ConversationDoc[]> {
-  const s = resolveStore(store);
-  const coll = await getColl(s);
-  if (!coll) {
-    const list = dedupeDocs(memGet(s, ownerKey));
-    return s === "chat" ? purgeLegacyTaskConversations(ownerKey, list) : list;
-  }
-  const docs = await coll.find({ ownerKey }).sort({ updatedAt: -1 }).toArray();
-  const mapped = dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
-  return s === "chat" ? purgeLegacyTaskConversations(ownerKey, mapped) : mapped;
+export async function listConversations(): Promise<ConversationDoc[]> {
+  const coll = await getColl();
+  if (!coll) return dedupeDocs([...memory.values()]);
+  const docs = await coll.find({}).sort({ updatedAt: -1 }).toArray();
+  return dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
 }
 
-async function purgeLegacyTaskConversations(
-  ownerKey: string,
-  list: ConversationDoc[],
-): Promise<ConversationDoc[]> {
-  const legacy = list.filter((d) => isLegacyTaskConversationId(d.id));
-  if (!legacy.length) return list;
-  await Promise.all(legacy.map((d) => deleteConversation(ownerKey, d.id, "chat").catch(() => {})));
-  return list.filter((d) => !isLegacyTaskConversationId(d.id));
-}
-
-export async function getConversation(
-  ownerKey: string,
-  id: string,
-  store: ConversationStore = "chat",
-): Promise<ConversationDoc | null> {
-  const s = resolveStore(store);
-  const coll = await getColl(s);
-  if (!coll) return dedupeDocs(memGet(s, ownerKey).filter((c) => c.id === id))[0] || null;
-  const doc = await coll.find({ ownerKey, id }).sort({ updatedAt: -1 }).limit(1).next();
+export async function getConversation(id: string): Promise<ConversationDoc | null> {
+  const coll = await getColl();
+  if (!coll) return memory.get(id) || null;
+  const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
   return rest as ConversationDoc;
 }
 
-export async function createConversation(input: {
-  ownerKey: string;
-  countryId: string;
-  loginName: string;
-  id: string;
-  title: string;
-  store?: ConversationStore;
-}): Promise<ConversationDoc> {
-  const s = resolveStore(input.store);
+export async function createConversation(input: { id: string; title: string }): Promise<ConversationDoc> {
   const now = Date.now();
   const doc: ConversationDoc = {
     id: input.id,
-    ownerKey: input.ownerKey,
-    countryId: input.countryId,
-    loginName: input.loginName,
     title: input.title || "新对话",
     messages: [],
     createdAt: now,
     updatedAt: now,
   };
-  const coll = await getColl(s);
+  const coll = await getColl();
   if (!coll) {
-    const list = memGet(s, input.ownerKey);
-    const idx = list.findIndex((c) => c.id === input.id);
-    if (idx >= 0) {
-      const existing = list[idx]!;
-      existing.title = input.title || existing.title || "新对话";
+    const existing = memory.get(input.id);
+    if (existing) {
+      existing.title = input.title || existing.title;
       existing.updatedAt = now;
-      if (!existing.createdAt) existing.createdAt = now;
-      memSet(s, input.ownerKey, dedupeDocs(list));
       return existing;
     }
-    list.unshift(doc);
-    memSet(s, input.ownerKey, dedupeDocs(list));
+    memory.set(input.id, doc);
     return doc;
   }
   await coll.updateMany(
-    { ownerKey: input.ownerKey, id: input.id },
-    {
-      $set: {
-        title: input.title || "新对话",
-        updatedAt: now,
-      },
-      $setOnInsert: {
-        countryId: input.countryId,
-        loginName: input.loginName,
-        createdAt: now,
-      },
-    },
+    { id: input.id },
+    { $set: { title: input.title || "新对话", updatedAt: now }, $setOnInsert: { createdAt: now } },
     { upsert: true },
   );
-  const saved = await getConversation(input.ownerKey, input.id, s);
+  const saved = await getConversation(input.id);
   return saved || doc;
 }
 
 export async function upsertMessages(input: {
-  ownerKey: string;
-  countryId: string;
-  loginName: string;
   id: string;
   messages: StoredMessage[];
   title?: string;
-  store?: ConversationStore;
-  askStateStack?: AskStateStack | null;
 }): Promise<void> {
-  const s = resolveStore(input.store);
-  const coll = await getColl(s);
-  const stackPatch =
-    input.askStateStack === undefined
-      ? {}
-      : {
-          askStateStack: input.askStateStack
-            ? parseAskStateStack(input.askStateStack) || emptyAskStateStack()
-            : emptyAskStateStack(),
-        };
+  const coll = await getColl();
   if (!coll) {
-    const list = memGet(s, input.ownerKey);
-    let doc = list.find((c) => c.id === input.id);
+    let doc = memory.get(input.id);
     if (!doc) {
       doc = {
         id: input.id,
-        ownerKey: input.ownerKey,
-        countryId: input.countryId,
-        loginName: input.loginName,
         title: input.title || "新对话",
         messages: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
-      list.unshift(doc);
+      memory.set(input.id, doc);
     }
     doc.messages = input.messages;
     doc.updatedAt = Date.now();
     if (input.title) doc.title = input.title;
-    if (input.askStateStack !== undefined) {
-      doc.askStateStack = stackPatch.askStateStack;
-    }
-    memSet(s, input.ownerKey, dedupeDocs(list));
     return;
   }
   await coll.updateMany(
-    { ownerKey: input.ownerKey, id: input.id },
+    { id: input.id },
     {
       $set: {
         messages: input.messages,
         updatedAt: Date.now(),
         ...(input.title ? { title: input.title } : {}),
-        ...stackPatch,
       },
-      $setOnInsert: {
-        countryId: input.countryId,
-        loginName: input.loginName,
-        createdAt: Date.now(),
-      },
+      $setOnInsert: { createdAt: Date.now() },
     },
     { upsert: true },
   );
 }
 
-async function writeAskStateStack(
-  ownerKey: string,
-  id: string,
-  stack: AskStateStack,
-  store: ConversationStore,
-  meta?: { countryId?: string; loginName?: string },
-): Promise<AskStateStack> {
-  const s = resolveStore(store);
-  const normalized = parseAskStateStack(stack) || emptyAskStateStack();
-  const coll = await getColl(s);
+export async function renameConversation(id: string, title: string): Promise<void> {
+  const coll = await getColl();
   if (!coll) {
-    const list = memGet(s, ownerKey);
-    let doc = list.find((c) => c.id === id);
-    if (!doc) {
-      doc = {
-        id,
-        ownerKey,
-        countryId: meta?.countryId || "",
-        loginName: meta?.loginName || "",
-        title: "新对话",
-        messages: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      list.unshift(doc);
+    const doc = memory.get(id);
+    if (doc) {
+      doc.title = title;
+      doc.updatedAt = Date.now();
     }
-    doc.askStateStack = normalized;
-    doc.updatedAt = Date.now();
-    memSet(s, ownerKey, dedupeDocs(list));
-    return normalized;
-  }
-  await coll.updateMany(
-    { ownerKey, id },
-    {
-      $set: { askStateStack: normalized, updatedAt: Date.now() },
-      $setOnInsert: {
-        countryId: meta?.countryId || "",
-        loginName: meta?.loginName || "",
-        title: "新对话",
-        messages: [],
-        createdAt: Date.now(),
-      },
-    },
-    { upsert: true },
-  );
-  return normalized;
-}
-
-export async function pushConversationAskState(input: {
-  ownerKey: string;
-  id: string;
-  askState: AskState | Record<string, unknown>;
-  store?: ConversationStore;
-  countryId?: string;
-  loginName?: string;
-}): Promise<{ stack: AskStateStack; current: AskState | null }> {
-  const s = resolveStore(input.store);
-  const state = parseAskState(input.askState);
-  if (!state) throw new Error("invalid_ask_state");
-  const existing = await getConversation(input.ownerKey, input.id, s);
-  const next = pushAskState(existing?.askStateStack, state);
-  const stack = await writeAskStateStack(input.ownerKey, input.id, next, s, {
-    countryId: input.countryId ?? existing?.countryId,
-    loginName: input.loginName ?? existing?.loginName,
-  });
-  return { stack, current: stack.states[stack.states.length - 1] || null };
-}
-
-export async function undoConversationAskState(input: {
-  ownerKey: string;
-  id: string;
-  store?: ConversationStore;
-}): Promise<{ stack: AskStateStack; popped: AskState | null; current: AskState | null }> {
-  const s = resolveStore(input.store);
-  const existing = await getConversation(input.ownerKey, input.id, s);
-  const result = undoAskState(existing?.askStateStack);
-  await writeAskStateStack(input.ownerKey, input.id, result.stack, s, {
-    countryId: existing?.countryId,
-    loginName: existing?.loginName,
-  });
-  return result;
-}
-
-export async function renameConversation(
-  ownerKey: string,
-  id: string,
-  title: string,
-  store: ConversationStore = "chat",
-): Promise<void> {
-  const s = resolveStore(store);
-  const coll = await getColl(s);
-  if (!coll) {
-    const list = memGet(s, ownerKey);
-    for (const doc of list) {
-      if (doc.id === id) {
-        doc.title = title;
-        doc.updatedAt = Date.now();
-      }
-    }
-    memSet(s, ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateMany({ ownerKey, id }, { $set: { title, updatedAt: Date.now() } });
+  await coll.updateMany({ id }, { $set: { title, updatedAt: Date.now() } });
 }
 
-export async function deleteConversation(
-  ownerKey: string,
-  id: string,
-  store: ConversationStore = "chat",
-): Promise<void> {
-  const s = resolveStore(store);
-  const coll = await getColl(s);
+export async function deleteConversation(id: string): Promise<void> {
+  const coll = await getColl();
   if (!coll) {
-    memSet(
-      s,
-      ownerKey,
-      memGet(s, ownerKey).filter((c) => c.id !== id),
-    );
+    memory.delete(id);
     return;
   }
-  await coll.deleteMany({ ownerKey, id });
+  await coll.deleteMany({ id });
 }
 
-export async function clearConversation(
-  ownerKey: string,
-  id: string,
-  store: ConversationStore = "chat",
-): Promise<void> {
-  const s = resolveStore(store);
-  const coll = await getColl(s);
+export async function clearConversation(id: string): Promise<void> {
+  const coll = await getColl();
   if (!coll) {
-    const list = memGet(s, ownerKey);
-    for (const doc of list) {
-      if (doc.id === id) {
-        doc.messages = [];
-        doc.askStateStack = emptyAskStateStack();
-        doc.updatedAt = Date.now();
-      }
+    const doc = memory.get(id);
+    if (doc) {
+      doc.messages = [];
+      doc.updatedAt = Date.now();
     }
-    memSet(s, ownerKey, dedupeDocs(list));
     return;
   }
-  await coll.updateMany(
-    { ownerKey, id },
-    { $set: { messages: [], askStateStack: emptyAskStateStack(), updatedAt: Date.now() } },
-  );
+  await coll.updateMany({ id }, { $set: { messages: [], updatedAt: Date.now() } });
 }

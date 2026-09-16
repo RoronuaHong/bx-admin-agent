@@ -16,7 +16,31 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
     :title="theme === 'dark' ? tx('浅色', 'Light', 'Claro', 'लाइट') : tx('深色', 'Dark', 'Escuro', 'डार्क')"
     @click="toggle"
   >
-    <span class="icon" aria-hidden="true">{{ theme === "dark" ? "○" : "●" }}</span>
+    <span class="icon" aria-hidden="true">
+      <svg v-if="theme === 'dark'" viewBox="0 0 24 24" width="15" height="15">
+        <path
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8Z"
+        />
+      </svg>
+      <svg v-else viewBox="0 0 24 24" width="15" height="15">
+        <circle cx="12" cy="12" r="4.2" fill="currentColor" />
+        <g stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <line x1="12" y1="2.5" x2="12" y2="5" />
+          <line x1="12" y1="19" x2="12" y2="21.5" />
+          <line x1="2.5" y1="12" x2="5" y2="12" />
+          <line x1="19" y1="12" x2="21.5" y2="12" />
+          <line x1="4.9" y1="4.9" x2="6.7" y2="6.7" />
+          <line x1="17.3" y1="17.3" x2="19.1" y2="19.1" />
+          <line x1="4.9" y1="19.1" x2="6.7" y2="17.3" />
+          <line x1="17.3" y1="6.7" x2="19.1" y2="4.9" />
+        </g>
+      </svg>
+    </span>
     <span class="label">{{ theme === "dark" ? tx("浅色", "Light", "Claro", "लाइट") : tx("深色", "Dark", "Escuro", "डार्क") }}</span>
   </button>
 </template>
@@ -32,32 +56,27 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
   min-height: 32px;
   min-width: 32px;
   padding: 0 12px;
-  border: 1px solid color-mix(in srgb, var(--line) 92%, var(--ink) 8%);
-  background: color-mix(in srgb, var(--panel) 84%, var(--fill));
+  border: 1px solid var(--line);
+  background: var(--panel);
   color: var(--muted);
   cursor: pointer;
   font: inherit;
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 1;
-  border-radius: var(--radius-sm);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 22%, transparent),
-    0 1px 1px color-mix(in srgb, var(--ink) 3%, transparent);
+  border-radius: 6px;
   transition:
-    color 0.15s ease,
-    background 0.15s ease,
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
+    color 0.2s ease,
+    background 0.2s ease,
+    border-color 0.2s ease;
+  white-space: nowrap;
+  flex: none;
 }
 
 .theme-toggle:hover {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--panel) 76%, var(--fill-soft));
-  border-color: color-mix(in srgb, var(--ink) 14%, var(--line));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 28%, transparent),
-    0 2px 8px color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--accent, #0f766e);
+  background: var(--panel);
+  border-color: var(--accent, #0f766e);
 }
 
 .icon {

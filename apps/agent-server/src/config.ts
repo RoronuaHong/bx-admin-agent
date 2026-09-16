@@ -1,31 +1,3 @@
-import type { CountryConfig, CountryPublic } from "@bx/shared";
-
-function readCountry(id: string, envKey: string): CountryConfig | null {
-  const label = process.env[`COUNTRY_${envKey}_LABEL`] || id;
-  const backendUrl = process.env[`COUNTRY_${envKey}_BACKEND_URL`] || "";
-  const userUrl = process.env[`COUNTRY_${envKey}_USER_URL`] || "";
-  const filmUrl = process.env[`COUNTRY_${envKey}_FILM_URL`] || "";
-  const gatherUrl = process.env[`COUNTRY_${envKey}_GATHER_URL`] || "";
-  const mock = process.env.MOCK_UPSTREAM === "true";
-  if (!mock && !backendUrl) return null;
-  return { id, label, backendUrl, userUrl, filmUrl, gatherUrl };
-}
-
-export function listCountries(): CountryConfig[] {
-  return [
-    readCountry("india", "INDIA"),
-    readCountry("brazil", "BRAZIL"),
-  ].filter((item): item is CountryConfig => Boolean(item));
-}
-
-export function listPublicCountries(): CountryPublic[] {
-  return listCountries().map(({ id, label }) => ({ id, label }));
-}
-
-export function getCountry(id: string) {
-  return listCountries().find((item) => item.id === id);
-}
-
 // ---- 模型注册表 ----
 // MODEL_PROVIDERS=hy3,ollama 注册模型 id（逗号分隔，第一个为默认）。
 // 每个模型的环境变量前缀 MODEL_<ID>_：
@@ -46,20 +18,8 @@ export interface ModelEntry {
   apiKeys: string[];
   vision: "direct" | "ocr" | "none";
   timeoutMs: number;
-  // 上下文能力（字符），MODEL_<ID>_CONTEXT 可声明；auto 模式长内容会优先大上下文模型。
+  // 上下文能力（字符），MODEL_<ID>_CONTEXT 可声明。
   contextChars: number;
-  // 是否支持 function calling（tools + tool_choice）；不支持的模型走纯文本 tool_calls 解析。
-  tools: boolean;
-  // 是否默认开启思考/推理模式（MODEL_<ID>_THINKING，默认 false）。思考模型（如 TokenHub
-  // DeepSeek-V4-Pro）在开启 reasoning 时不允许 tool_choice != auto（实测报 400001）。标记后
-  // 请求体显式传 thinking.type=disabled 关闭思考，从而恢复 tool_choice 的 required/auto 语义，
-  // 让首轮强制工具调用机制（方案 C）对其完全生效；代价是不再输出 reasoning 思考链（业务 agent
-  // 场景无影响，工具调用链另有 reasoning 事件展示）。
-  thinking: boolean;
-  // 是否具备 agent 能力（MODEL_<ID>_AGENT，默认 true；false = 不进多轮工具循环，走纯问答）。
-  // 对齐 Cursor「Agent 模式对模型有硬性要求」：弱模型只开放普通对话，不开放多轮 agent。
-  // 当前默认全部开启（zen 免费链下保持现状）；未来强模型可用时可按实测把弱模型标注为 false。
-  agentCapable: boolean;
 }
 
 export function listModels(): ModelEntry[] {
@@ -101,9 +61,6 @@ export function listModels(): ModelEntry[] {
       vision,
       timeoutMs: Number(process.env[`${prefix}TIMEOUT_MS`] || 120000),
       contextChars: Number(process.env[`${prefix}CONTEXT`] || 16000),
-      tools: (process.env[`${prefix}TOOLS`] || "true") !== "false",
-      thinking: (process.env[`${prefix}THINKING`] || "false") === "true",
-      agentCapable: (process.env[`${prefix}AGENT`] || "true") !== "false",
     });
   }
   return entries;
@@ -122,108 +79,6 @@ export function defaultModel(): ModelEntry | null {
 export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
-  // 惰性读取，确保测试/运行时环境变量在任意时刻生效（避免模块加载期被冻结）。
-  get mockUpstream() {
-    return process.env.MOCK_UPSTREAM === "true";
-  },
   sessionTtlMs: Number(process.env.SESSION_TTL_MS || 8 * 60 * 60 * 1000),
   modelTimeoutMs: Number(process.env.MODEL_TIMEOUT_MS || 120000),
-  // 本地文档白名单目录（Agent 可读的服务器本地文件目录），空则不启用。
-  agentDocsDir: process.env.AGENT_DOCS_DIR || "",
-  // 链接抓取限制。
-  linkMaxBytes: Number(process.env.LINK_MAX_BYTES || 2 * 1024 * 1024),
-  linkTimeoutMs: Number(process.env.LINK_TIMEOUT_MS || 15000),
-  // 注入内容截断（字符）。
-  contextMaxChars: Number(process.env.CONTEXT_MAX_CHARS || 20000),
-  // 兼容旧配置：MODEL_PROVIDER / ANTHROPIC_*（仅当 MODEL_PROVIDERS 未配置时使用）。
-  get legacyAnthropic() {
-    return (
-      (process.env.MODEL_PROVIDERS || "").trim() === "" &&
-      (process.env.MODEL_PROVIDER || "") !== "" &&
-      Boolean(process.env.ANTHROPIC_AUTH_TOKEN || process.env.MODEL_API_KEY)
-    );
-  },
-  // call_api 工具允许访问的主机白名单（逗号分隔，空则允许所有 http/https，生产环境建议配置）。
-  // 示例：ALLOWED_API_HOSTS=localhost:3100,api.internal.example.com
-  get allowedApiHosts(): string[] {
-    const raw = process.env.ALLOWED_API_HOSTS || "";
-    return raw ? raw.split(",").map((h) => h.trim()).filter(Boolean) : [];
-  },
-  // Trace 门户权限白名单；空=允许所有已登录用户查看。
-  get traceAllowedOwners(): string[] {
-    const raw = process.env.TRACE_ALLOWED_OWNERS || "";
-    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
-  },
-  // Trace 门户权限黑名单；命中后优先拒绝。
-  get traceDeniedOwners(): string[] {
-    const raw = process.env.TRACE_DENIED_OWNERS || "";
-    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
-  },
-  // Trace 门户国家线白名单；空=不按国家线收紧。
-  get traceAllowedCountries(): string[] {
-    const raw = process.env.TRACE_ALLOWED_COUNTRIES || "";
-    return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : [];
-  },
-  // OCR 转录器：本地 ollama 视觉模型
-  visionOllamaUrl: process.env.VISION_OLLAMA_URL || "http://localhost:11434",
-  visionOllamaModel: process.env.VISION_OLLAMA_MODEL || "qwen2.5vl",
-  // OCR 转录器：远程 OpenAI 兼容视觉端点
-  visionBaseUrl: process.env.VISION_BASE_URL || "https://api.openai.com",
-  visionApiKey: process.env.VISION_API_KEY || "",
-  visionModel: process.env.VISION_MODEL || "gpt-4o-mini",
-  // 本 Agent 默认绑定影视后台；会话无 activeProject 时自动补齐，避免反复问「哪个项目」。
-  get defaultProject(): { key: string; label: string } {
-    return {
-      key: (process.env.DEFAULT_PROJECT_KEY || "bx-film-admin").trim(),
-      label: (process.env.DEFAULT_PROJECT_LABEL || "影视后台管理系统").trim(),
-    };
-  },
-  // Metabase Analytics（M1）：惰性读取，便于测试改 env。
-  metabase: {
-    get url() {
-      return (process.env.METABASE_URL || "https://bi.vmovs.com").replace(/\/$/, "");
-    },
-    get username() {
-      return (process.env.METABASE_USERNAME || process.env.METABASE_USER_EMAIL || "").trim();
-    },
-    get password() {
-      return process.env.METABASE_PASSWORD || "";
-    },
-    get databaseId() {
-      const n = Number(process.env.METABASE_DATABASE_ID || 2);
-      return Number.isFinite(n) ? n : 2;
-    },
-    get distinctCountFn() {
-      const v = (process.env.DISTINCT_COUNT_FN || "uniq").toLowerCase();
-      return v === "uniqexact" ? "uniqExact" : "uniq";
-    },
-    get businessTimezone() {
-      return process.env.ANALYTICS_BUSINESS_TIMEZONE || "Asia/Shanghai";
-    },
-  },
-  // M3 巡检：内部 token + 单 scan worker 开关（惰性读取，便于测试改 env）。
-  scan: {
-    get internalToken() {
-      return (process.env.SCAN_INTERNAL_TOKEN || "").trim();
-    },
-    /** Only instances with ANALYTICS_SCAN_WORKER=1 accept enqueue. */
-    get workerEnabled() {
-      return process.env.ANALYTICS_SCAN_WORKER === "1";
-    },
-    /** In-process daily enqueue (T-1). Requires workerEnabled. */
-    get cronEnabled() {
-      return process.env.ANALYTICS_SCAN_CRON === "1";
-    },
-    /** HH:mm in businessTimezone. */
-    get cronHhmm() {
-      return (process.env.ANALYTICS_SCAN_CRON_HHMM || "10:00").trim();
-    },
-    /**
-     * 前端页面基地址（含协议+域名，不含尾斜杠）。巡检深链用它拼成可点击绝对 URL；
-     * 未配（空）则深链退化为相对路径 /analytics?...，钉钉里只是纯文本、无法点击（即"打开无效"根因）。
-     */
-    get webBaseUrl() {
-      return (process.env.ANALYTICS_WEB_BASE_URL || "").trim().replace(/\/+$/, "");
-    },
-  },
 };
