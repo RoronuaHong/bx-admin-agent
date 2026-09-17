@@ -1,42 +1,4 @@
-export interface LocalizedToken {
-  code: string;
-  params?: Record<string, string | number | boolean | null>;
-  defaultMessage?: string;
-}
-
-export interface ApiErrorPayload {
-  error: LocalizedToken;
-}
-
-/** 任务规划条目（与后端 @bx/shared 对齐）。 */
-export interface TodoItem {
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-}
-
-export type ChatEvent =
-  | { type: "text"; text: string }
-  | { type: "text_delta"; text: string }
-  | { type: "model"; id: string; label: string }
-  | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
-  | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
-  | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
-  | { type: "confirmation_response"; id: string; confirmed: boolean }
-  | { type: "todos"; todos: TodoItem[] }
-  | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
-  | {
-      /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
-      type: "usage";
-      tokens: number;
-      budget: number;
-      window: number;
-      turns: number;
-      dropped: number;
-      summarized?: boolean;
-      toolResultsCleared: number;
-      toolResultsOffloaded?: number;
-    }
-  | { type: "done" };
+import type { LocalizedToken, ApiErrorPayload, ChatEvent } from "@bx/shared";
 
 export class ApiError extends Error {
   status?: number;

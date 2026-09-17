@@ -4,6 +4,8 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
 export default defineConfig({
+  // @bx/shared 以 TS 源码形式经 workspace 链接；不预打包，让 vite 走常规转换管线处理 .ts。
+  optimizeDeps: { exclude: ["@bx/shared"] },
   plugins: [
     vue(),
     {

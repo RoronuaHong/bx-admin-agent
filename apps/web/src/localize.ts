@@ -1,5 +1,5 @@
 import type { UiLocale } from "./ui-locale";
-import type { LocalizedToken } from "./api";
+import type { LocalizedToken } from "@bx/shared";
 
 export type LocalizedTextStrict = {
   zh: string;

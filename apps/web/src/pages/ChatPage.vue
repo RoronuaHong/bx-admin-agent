@@ -31,9 +31,9 @@ import {
   type ModelInfo,
   type PendingMessage,
   type StoredMessage,
-  type TodoItem,
   type UploadResult,
 } from "../api";
+import type { TodoItem } from "@bx/shared";
 
 /** 气泡里的一个工具步骤（MCP 工具调用）。 */
 interface ToolStep {

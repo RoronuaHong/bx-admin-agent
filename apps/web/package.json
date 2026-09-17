@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@bx/shared": "workspace:*",
     "dompurify": "^3.4.13",
     "markdown-it": "^15.0.0",
     "vue": "^3.5.18",
