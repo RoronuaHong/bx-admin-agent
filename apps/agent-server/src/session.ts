@@ -21,11 +21,20 @@ export interface ChatTurn {
   handles?: ToolHandle[];
 }
 
+/** 会话列表排序模式。 */
+export type ConvSortMode = "recent" | "manual";
+
 /** 设备级 UI 偏好（原前端 localStorage，现改为后端持久化）。 */
 export interface SessionPreferences {
   theme?: "light" | "dark";
   /** 客户端默认语言；单个对话未显式设置 locale 时使用。 */
   locale?: string;
+  /**
+   * 会话列表排序模式：
+   *  - `recent`（默认）：普通区按最近活动自动上浮；
+   *  - `manual`：按用户手动顺序（`conversation.sortOrder`），新消息不再自动上浮。
+   */
+  convSortMode?: ConvSortMode;
   /**
    * 客户端完成过一次偏好同步的时间戳。
    * 前端据此判断「旧的 3 个 localStorage 键是否已迁移」，避免换设备/清缓存后重复迁移。

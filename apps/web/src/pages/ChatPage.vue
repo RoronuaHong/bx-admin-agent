@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+} from "vue";
 import ModelSelect from "../components/ModelSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
@@ -20,6 +29,7 @@ import {
   getApiErrorToken,
   patchConversation,
   reloadMcpServer,
+  reorderConversations,
   saveChatPreferences,
   saveConversationMessages,
   setChatMcpServers,
@@ -27,6 +37,7 @@ import {
   uploadFiles,
   type ChatPreferences,
   type ConversationDto,
+  type ConvSortMode,
   type McpServerStatus,
   type ModelInfo,
   type PendingMessage,
@@ -34,6 +45,126 @@ import {
   type UploadResult,
 } from "../api";
 import type { TodoItem } from "@bx/shared";
+
+/** 侧栏视图：对话列表 / 定时任务。为后续接入定时任务预留结构化入口（占位面板）。 */
+const view = ref<"chat" | "tasks">("chat");
+
+/* ===========================================================================
+ * 定时任务（前端脚手架）
+ * 数据暂存 localStorage，结构对齐真实接口：
+ *   { id, name, prompt, scheduleType: 'recurring'|'once',
+ *     rrule?, scheduledAt?, status: 'active'|'paused', createdAt, nextRun? }
+ * 接入后端时只需把 load/save 换成 GET/POST /agent/automations。
+ * =========================================================================== */
+interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  scheduleType: "recurring" | "once";
+  rrule?: string;
+  scheduledAt?: string;
+  status: "active" | "paused";
+  createdAt: number;
+  nextRun?: number | null;
+}
+
+const TASKS_KEY = "bx-agent-automations";
+
+function loadTasks(): ScheduledTask[] {
+  try {
+    const raw = localStorage.getItem(TASKS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? (arr as ScheduledTask[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveTasks() {
+  try {
+    localStorage.setItem(TASKS_KEY, JSON.stringify(tasks.value));
+  } catch {
+    /* 隐私模式等写入失败时忽略 */
+  }
+}
+
+const tasks = ref<ScheduledTask[]>(loadTasks());
+
+const showTaskForm = ref(false);
+const taskError = ref("");
+const taskDraft = reactive({
+  name: "",
+  prompt: "",
+  scheduleType: "recurring" as "recurring" | "once",
+  rrule: "FREQ=DAILY;INTERVAL=1",
+  scheduledAt: "",
+});
+
+function openTaskForm() {
+  taskDraft.name = "";
+  taskDraft.prompt = "";
+  taskDraft.scheduleType = "recurring";
+  taskDraft.rrule = "FREQ=DAILY;INTERVAL=1";
+  taskDraft.scheduledAt = "";
+  taskError.value = "";
+  showTaskForm.value = true;
+}
+
+function closeTaskForm() {
+  showTaskForm.value = false;
+}
+
+/** 脚手架阶段对 recurring 给粗略估算（每日=明天此刻），真实 nextRun 由后端计算。 */
+function draftNextRun(): number | null {
+  if (taskDraft.scheduleType === "once") {
+    const t = taskDraft.scheduledAt ? new Date(taskDraft.scheduledAt).getTime() : NaN;
+    return Number.isNaN(t) ? null : t;
+  }
+  return Date.now() + 24 * 3600 * 1000;
+}
+
+function createTask() {
+  const name = taskDraft.name.trim();
+  const prompt = taskDraft.prompt.trim();
+  if (!name) return (taskError.value = tx("请填写任务名称", "Name is required"));
+  if (!prompt) return (taskError.value = tx("请填写任务内容", "Task prompt is required"));
+  if (taskDraft.scheduleType === "once" && !taskDraft.scheduledAt)
+    return (taskError.value = tx("请选择执行时间", "Pick a run time"));
+  tasks.value.unshift({
+    id: "t_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name,
+    prompt,
+    scheduleType: taskDraft.scheduleType,
+    rrule: taskDraft.scheduleType === "recurring" ? taskDraft.rrule.trim() : undefined,
+    scheduledAt: taskDraft.scheduleType === "once" ? taskDraft.scheduledAt : undefined,
+    status: "active",
+    createdAt: Date.now(),
+    nextRun: draftNextRun(),
+  });
+  saveTasks();
+  closeTaskForm();
+}
+
+function toggleTask(id: string) {
+  const t = tasks.value.find((x) => x.id === id);
+  if (!t) return;
+  t.status = t.status === "active" ? "paused" : "active";
+  saveTasks();
+}
+
+function removeTask(id: string) {
+  tasks.value = tasks.value.filter((x) => x.id !== id);
+  saveTasks();
+}
+
+function taskNextRunText(t: ScheduledTask): string {
+  if (t.status !== "active") return tx("已暂停", "Paused");
+  if (t.scheduleType === "once") {
+    if (!t.scheduledAt) return tx("未设置", "Unscheduled");
+    return tx("执行于 ", "Runs at ") + new Date(t.scheduledAt).toLocaleString();
+  }
+  return t.nextRun ? tx("下次 ", "Next ") + new Date(t.nextRun).toLocaleString() : "—";
+}
 
 /** 气泡里的一个工具步骤（MCP 工具调用）。 */
 interface ToolStep {
@@ -134,6 +265,42 @@ const threadEl = ref<HTMLElement | null>(null);
 const models = ref<ModelInfo[]>([]);
 const conversations = ref<ConversationDto[]>([]);
 const currentId = ref("");
+/** 会话项上下文菜单（右键触发）：视口坐标绝对定位，渲染后做边界翻转。 */
+const ctxMenu = ref<{ open: boolean; x: number; y: number; targetId: string }>({
+  open: false,
+  x: 0,
+  y: 0,
+  targetId: "",
+});
+const ctxMenuEl = ref<HTMLElement | null>(null);
+/** 触发菜单的元素（会话项 / ⋯ 按钮）：Esc 关闭后把焦点还回去（WAI-ARIA menu pattern）。 */
+let ctxTriggerEl: HTMLElement | null = null;
+/** 正在内联重命名的会话（id 为空 = 无）。 */
+const renaming = ref<{ id: string; value: string }>({ id: "", value: "" });
+const renameInputEl = ref<HTMLInputElement | null>(null);
+/** 标题长度上限：只做体验层收敛，防误粘贴超长文本。 */
+const RENAME_MAX = 100;
+/** 删除撤销窗口：窗口内可撤销，超时才真正落库删除。 */
+const UNDO_DELETE_MS = 5000;
+const undoDelete = ref<{ conv: ConversationDto; index: number; wasCurrent: boolean } | null>(null);
+let undoDeleteTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * 会话列表排序模式（设备级偏好，后端持久化）：
+ * - `recent`：普通区按最近活动自动上浮（默认）；
+ * - `manual`：按用户手动顺序，新消息不再自动上浮。
+ * 见 `docs/conversation-list-ux-plan.md` §3.4「方案 A：拖拽即固化」。
+ */
+const sortMode = ref<ConvSortMode>("recent");
+/** 会话列表容器引用：拖拽到上下边缘时自动滚动。 */
+const convListEl = ref<HTMLElement | null>(null);
+/** 正在被拖拽的会话 id（非空 = 拖拽中）。 */
+const draggingId = ref("");
+/** 拖拽落点：目标会话 id + 落在其上/下半区（决定插入到前还是后）。 */
+const dropTarget = ref<{ id: string; after: boolean } | null>(null);
+/** 自动滚动步长 / 触发边距。 */
+const DRAG_SCROLL_STEP = 12;
+const DRAG_SCROLL_EDGE = 24;
 const fileInput = ref<HTMLInputElement | null>(null);
 /** 输入框元素引用：用于按内容自动撑高（交互优化）。 */
 const inputEl = ref<HTMLTextAreaElement | null>(null);
@@ -342,7 +509,7 @@ function selectConversation(conv: ConversationDto) {
     state.bubbles = (conv.messages || []).map((m) => ({
       id: ++seq,
       role: m.role,
-      text: m.text || "",
+      text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
       images: m.images,
     }));
   }
@@ -360,6 +527,13 @@ function selectConversation(conv: ConversationDto) {
 async function newConversation() {
   const conv = await createConversation({ title: tx("新对话", "New chat") });
   conversations.value = [conv, ...conversations.value.filter((c) => c.id !== conv.id)];
+  // 直接前插会让新对话跑到置顶区之上：按统一排序规则归位（新对话在普通区最上）。
+  resortConversations();
+  // 手动排序模式下，新对话没有 sortOrder 会沉到普通区底部：显式把它排到普通区最前。
+  if (sortMode.value === "manual") {
+    const firstRegular = conversations.value.find((c) => !c.pinnedAt && c.id !== conv.id);
+    if (firstRegular) void applyConversationOrder(conv.id, firstRegular.id, false);
+  }
   // 新对话默认不带模型 / MCP（干净起点），但**继承当前界面语言**：
   // 语言是 UI 偏好，不该每开一个对话都重设；写成对话自己的 locale 后仍与其它对话互不影响。
   const locale = uiLocale.value;
@@ -371,21 +545,436 @@ async function newConversation() {
   );
 }
 
+/** 手动顺序步长（须与服务端 `ORDER_STEP` 一致）：相邻项间隔，便于中间插入。 */
+const CONV_ORDER_STEP = 1000;
+
+/**
+ * 排序规则：
+ * ① 置顶组永远在普通组之上；
+ * ② 组内：`manual` 模式先按手动顺序（没排过的沉到最后），否则按默认序；
+ * ③ 默认序：置顶组按置顶时间（新的在上），普通组按最近活动。
+ */
+function convRank(a: ConversationDto, b: ConversationDto): number {
+  const ap = a.pinnedAt ? 1 : 0;
+  const bp = b.pinnedAt ? 1 : 0;
+  if (ap !== bp) return bp - ap;
+  if (sortMode.value === "manual") {
+    const ao = a.sortOrder ?? Number.POSITIVE_INFINITY;
+    const bo = b.sortOrder ?? Number.POSITIVE_INFINITY;
+    if (ao !== bo) return ao - bo;
+  }
+  if (ap && bp) return (b.pinnedAt || 0) - (a.pinnedAt || 0);
+  return b.updatedAt - a.updatedAt;
+}
+
+/** 本地按同一套规则重排：乐观更新后立刻反映到侧栏，不等服务端回包。 */
+function resortConversations() {
+  conversations.value = [...conversations.value].sort(convRank);
+}
+
+/**
+ * 把 `fromId` 移动到 `targetId` 前 / 后，并按新顺序整体固化（拖拽与 `Alt+↑/↓` 共用）。
+ *
+ * 「拖拽即固化」（方案 A）：首次移动即切到 `manual` 模式并写入全部顺序——所见即所得，
+ * 不会出现「拖完再发条消息就弹回去」。
+ * `pinOverride`：跨区拖拽时顺带改置顶（`null` = 取消置顶，`undefined` = 不动）。
+ */
+async function applyConversationOrder(
+  fromId: string,
+  targetId: string,
+  after: boolean,
+  pinOverride?: number | null,
+) {
+  if (fromId === targetId) return;
+  const prevOrder = conversations.value;
+  const prevMode = sortMode.value;
+  const moved = prevOrder.find((c) => c.id === fromId);
+  if (!moved) return;
+  const nextList = prevOrder.filter((c) => c.id !== fromId);
+  const anchor = nextList.findIndex((c) => c.id === targetId);
+  if (anchor < 0) return;
+  const movedNext: ConversationDto = pinOverride === undefined ? moved : { ...moved, pinnedAt: pinOverride };
+  nextList.splice(after ? anchor + 1 : anchor, 0, movedNext);
+
+  // 乐观更新：切手动模式 + 按下标写本地 sortOrder（下标即新顺序，与服务端分配规则一致）。
+  sortMode.value = "manual";
+  conversations.value = nextList.map((c, i) => ({ ...c, sortOrder: i * CONV_ORDER_STEP }));
+  resortConversations();
+
+  try {
+    if (pinOverride !== undefined) await patchConversation(fromId, { pinnedAt: pinOverride });
+    await reorderConversations(conversations.value.map((c) => c.id));
+    if (prevMode !== "manual") void saveChatPreferences({ convSortMode: "manual" }).catch(() => undefined);
+  } catch (err) {
+    // 失败时可能是「置顶已生效、顺序没落库」：以服务端为准重新拉一次，避免本地与后端分叉。
+    sortMode.value = prevMode;
+    conversations.value = await fetchConversations().catch(() => prevOrder);
+    resortConversations();
+    showSettingsError(
+      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("排序失败", "Reorder failed")),
+    );
+  }
+}
+
+/** 退出手动排序：普通区恢复「最近活动」自动上浮（手动顺序留在库里，下次拖拽会重新固化）。 */
+function restoreRecentSort() {
+  closeCtxMenu();
+  sortMode.value = "recent";
+  resortConversations();
+  void saveChatPreferences({ convSortMode: "recent" }).catch(() => undefined);
+}
+
+// ---- 拖拽排序 ----
+
+/** 拖拽开始：记录被拖会话。重命名编辑中不允许拖拽（否则输入框没法选中文字）。 */
+function onConvDragStart(e: DragEvent, conv: ConversationDto) {
+  if (renaming.value.id) {
+    e.preventDefault();
+    return;
+  }
+  draggingId.value = conv.id;
+  dropTarget.value = null;
+  e.dataTransfer?.setData("text/plain", conv.id);
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+}
+
+/** 拖拽经过：按指针落在目标项的上/下半区决定插入位置，并在贴近容器边缘时自动滚动。 */
+function onConvDragOver(e: DragEvent, conv: ConversationDto) {
+  if (!draggingId.value || draggingId.value === conv.id) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  dropTarget.value = { id: conv.id, after: e.clientY > rect.top + rect.height / 2 };
+  const list = convListEl.value;
+  if (!list) return;
+  const listRect = list.getBoundingClientRect();
+  if (e.clientY < listRect.top + DRAG_SCROLL_EDGE) list.scrollTop -= DRAG_SCROLL_STEP;
+  else if (e.clientY > listRect.bottom - DRAG_SCROLL_EDGE) list.scrollTop += DRAG_SCROLL_STEP;
+}
+
+/** 拖拽结束（无论是否落点成功）：清空拖拽态。 */
+function onConvDragEnd() {
+  draggingId.value = "";
+  dropTarget.value = null;
+}
+
+/** 放置：移动到落点；跨区拖拽顺带置顶 / 取消置顶。 */
+function onConvDrop(e: DragEvent) {
+  e.preventDefault();
+  const fromId = draggingId.value;
+  const target = dropTarget.value;
+  draggingId.value = "";
+  dropTarget.value = null;
+  if (!fromId || !target || fromId === target.id) return;
+  const moved = conversations.value.find((c) => c.id === fromId);
+  const anchor = conversations.value.find((c) => c.id === target.id);
+  if (!moved || !anchor) return;
+  // 拖进置顶区 = 置顶，拖出置顶区 = 取消置顶。
+  const crossGroup = !!moved.pinnedAt !== !!anchor.pinnedAt;
+  const pinOverride: number | null | undefined = crossGroup ? (moved.pinnedAt ? null : Date.now()) : undefined;
+  void applyConversationOrder(fromId, target.id, target.after, pinOverride);
+}
+
+// ---- 键盘（拖拽的等价路径）----
+
+/** `Alt+↑/↓`：在所在组内上移 / 下移一位。 */
+async function moveConversation(conv: ConversationDto, delta: number) {
+  const group = conversations.value.filter((c) => !!c.pinnedAt === !!conv.pinnedAt);
+  const index = group.findIndex((c) => c.id === conv.id);
+  const swap = group[index + delta];
+  if (!swap) return;
+  await applyConversationOrder(conv.id, swap.id, delta > 0);
+  // 元素被 Vue 移到新位置后保住焦点，键盘用户不迷路。
+  await nextTick();
+  document.querySelector<HTMLElement>(`.conv-item[data-conv-id="${conv.id}"]`)?.focus();
+}
+
+/** 会话项键盘：Enter/Space 选中、↑/↓ 移动焦点、`Alt+↑/↓` 调序、F2 重命名。 */
+function onConvKeydown(e: KeyboardEvent, conv: ConversationDto) {
+  if (e.key === "F2") {
+    e.preventDefault();
+    void startRename(conv);
+    return;
+  }
+  if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+    e.preventDefault();
+    void moveConversation(conv, e.key === "ArrowUp" ? -1 : 1);
+    return;
+  }
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    const items = Array.from(document.querySelectorAll<HTMLElement>(".conv-item"));
+    const index = items.indexOf(e.currentTarget as HTMLElement);
+    items[index + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
+    return;
+  }
+  // Enter/Space 落在内层的 ⋯/× 按钮或重命名输入框上时，交给它们自己处理（否则会既开菜单又切对话）。
+  if (e.key === "Enter" || e.key === " ") {
+    const target = e.target as HTMLElement;
+    if (target !== e.currentTarget && target.closest("button, input, textarea")) return;
+    e.preventDefault();
+    selectConversation(conv);
+  }
+}
+
+/** 置顶项数量：模板据此在最后一置顶项后插入分隔线。 */
+const pinnedCount = computed(() => conversations.value.filter((c) => c.pinnedAt).length);
+
+/** 菜单当前指向的会话（模板渲染菜单项状态用）。 */
+const ctxTarget = computed(() => conversations.value.find((c) => c.id === ctxMenu.value.targetId) || null);
+
+// ---- 删除（带撤销窗口）----
+
+/**
+ * 删除会话：**先本地消失、服务端延迟落库**，窗口内可撤销（对齐 Gmail / Notion 的 undo 模式）。
+ * 流的中断与运行时状态清理不可恢复，撤销只还原列表项本身。
+ */
 async function removeConversation(id: string) {
+  closeCtxMenu();
+  const index = conversations.value.findIndex((c) => c.id === id);
+  const conv = conversations.value[index];
+  if (!conv) return;
+  const wasCurrent = currentId.value === id;
   // 只中断这个对话自己的流，其它对话不受影响。
   states.get(id)?.controller?.abort();
   states.delete(id);
   conversations.value = conversations.value.filter((c) => c.id !== id);
-  try {
-    await apiDeleteConversation(id);
-  } catch {
-    /* ignore */
-  }
-  if (currentId.value === id) {
+  scheduleUndoDelete(conv, index, wasCurrent);
+  if (wasCurrent) {
     const next = conversations.value[0];
     if (next) selectConversation(next);
     else await newConversation();
   }
+}
+
+/** 把上一笔待删会话真正落库（新删除到来 / 撤销窗口结束 / 离开页面时调用），避免删除被无限推迟。 */
+function flushPendingDelete() {
+  if (undoDeleteTimer) {
+    clearTimeout(undoDeleteTimer);
+    undoDeleteTimer = null;
+  }
+  const pending = undoDelete.value;
+  undoDelete.value = null;
+  if (pending) void apiDeleteConversation(pending.conv.id).catch(() => undefined);
+}
+
+/** 登记一笔待删会话并启动撤销倒计时。 */
+function scheduleUndoDelete(conv: ConversationDto, index: number, wasCurrent: boolean) {
+  flushPendingDelete();
+  undoDelete.value = { conv, index, wasCurrent };
+  undoDeleteTimer = setTimeout(() => {
+    undoDeleteTimer = null;
+    const pending = undoDelete.value;
+    undoDelete.value = null;
+    if (pending) void apiDeleteConversation(pending.conv.id).catch(() => undefined);
+  }, UNDO_DELETE_MS);
+}
+
+/** 撤销最近一次删除：放回原位置（服务端尚未删除，无需重建）。 */
+function undoRemoveConversation() {
+  if (undoDeleteTimer) {
+    clearTimeout(undoDeleteTimer);
+    undoDeleteTimer = null;
+  }
+  const pending = undoDelete.value;
+  undoDelete.value = null;
+  if (!pending) return;
+  const next = [...conversations.value];
+  next.splice(Math.max(0, Math.min(pending.index, next.length)), 0, pending.conv);
+  conversations.value = next;
+  resortConversations();
+  if (pending.wasCurrent) selectConversation(pending.conv);
+}
+
+// ---- 上下文菜单 ----
+
+/** 打开会话上下文菜单（右键触发），按菜单实际尺寸做视口边界翻转，避免被屏幕边缘裁切。 */
+async function openCtxMenu(e: MouseEvent, conv: ConversationDto) {
+  e.preventDefault();
+  e.stopPropagation();
+  ctxTriggerEl = (e.currentTarget as HTMLElement | null) || null;
+  // 键盘触发（Shift+F10 / 菜单键）时 clientX/Y 为 0，直接用会把菜单甩到屏幕左上角：退回到该项定位。
+  const itemRect = ctxTriggerEl?.getBoundingClientRect();
+  const keyboardTriggered = !e.clientX && !e.clientY && !!itemRect;
+  const anchorX = keyboardTriggered && itemRect ? itemRect.left + 12 : e.clientX;
+  const anchorY = keyboardTriggered && itemRect ? itemRect.bottom : e.clientY;
+  ctxMenu.value = { open: true, x: anchorX, y: anchorY, targetId: conv.id };
+  await nextTick();
+  const el = ctxMenuEl.value;
+  if (!el) return;
+  const rect = el.getBoundingClientRect();
+  const pad = 8;
+  let { x, y } = ctxMenu.value;
+  if (x + rect.width + pad > window.innerWidth) x = Math.max(pad, anchorX - rect.width);
+  if (y + rect.height + pad > window.innerHeight) y = Math.max(pad, anchorY - rect.height);
+  ctxMenu.value = { ...ctxMenu.value, x, y };
+  // WAI-ARIA menu pattern：打开即把焦点移入首个菜单项。
+  el.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+}
+
+/** 关闭上下文菜单；restoreFocus 用于键盘路径（Esc）把焦点还给触发元素。 */
+function closeCtxMenu(restoreFocus = false) {
+  if (!ctxMenu.value.open) return;
+  ctxMenu.value = { ...ctxMenu.value, open: false };
+  if (restoreFocus) ctxTriggerEl?.focus();
+  ctxTriggerEl = null;
+}
+
+/** 菜单键盘导航：↑/↓ 循环、Home/End、Tab 关闭。Esc 走全局监听（保证焦点在外时也生效）。 */
+function onCtxMenuKeydown(e: KeyboardEvent) {
+  const el = ctxMenuEl.value;
+  if (!el) return;
+  if (e.key === "Tab") {
+    closeCtxMenu();
+    return;
+  }
+  const items = Array.from(el.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+  if (!items.length) return;
+  const idx = items.indexOf(document.activeElement as HTMLElement);
+  let next = -1;
+  if (e.key === "ArrowDown") next = idx < 0 ? 0 : (idx + 1) % items.length;
+  else if (e.key === "ArrowUp") next = idx < 0 ? items.length - 1 : (idx - 1 + items.length) % items.length;
+  else if (e.key === "Home") next = 0;
+  else if (e.key === "End") next = items.length - 1;
+  if (next >= 0) {
+    e.preventDefault();
+    items[next]?.focus();
+  }
+}
+
+/** 菜单收起时机：Esc（归还焦点）、任意滚动（scroll 不冒泡，用捕获阶段）、窗口尺寸变化。 */
+function onCtxEscape(e: KeyboardEvent) {
+  if (!ctxMenu.value.open) return;
+  if (e.key === "Escape") closeCtxMenu(true);
+  // 菜单项上标注的快捷键：菜单开着时按 F2 直接进入重命名。
+  else if (e.key === "F2") {
+    const target = ctxTarget.value;
+    if (target) void startRename(target);
+  }
+}
+
+function onCtxDismiss() {
+  if (ctxMenu.value.open) closeCtxMenu();
+}
+
+// ---- 重命名 ----
+
+/**
+ * 重命名输入框的函数式 ref：模板里在 `v-for` 内部用字符串 ref 会被收集成数组，
+ * 只有函数 ref 能稳定拿到那个唯一在渲染的 input 元素。
+ */
+function setRenameInput(el: Element | ComponentPublicInstance | null) {
+  renameInputEl.value = el instanceof HTMLInputElement ? el : null;
+}
+
+/** 就地重命名：标题变输入框，自动聚焦并全选（便于直接覆盖）。 */
+async function startRename(conv: ConversationDto) {
+  closeCtxMenu();
+  renaming.value = { id: conv.id, value: conv.title || "" };
+  await nextTick();
+  renameInputEl.value?.focus();
+  renameInputEl.value?.select();
+}
+
+/** 取消重命名，恢复原标题。 */
+function cancelRename() {
+  renaming.value = { id: "", value: "" };
+}
+
+/** 提交重命名：乐观更新 → PATCH → 失败回滚提示。空值 / 未改动直接放弃。 */
+async function commitRename() {
+  const id = renaming.value.id;
+  if (!id) return;
+  const raw = renaming.value.value.trim();
+  renaming.value = { id: "", value: "" };
+  const prev = conversations.value.find((c) => c.id === id)?.title || "";
+  const next = raw.slice(0, RENAME_MAX);
+  if (!next || next === prev) return;
+  syncConvLocal(id, { title: next });
+  try {
+    await patchConversation(id, { title: next });
+  } catch (err) {
+    syncConvLocal(id, { title: prev });
+    showSettingsError(
+      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("重命名失败", "Rename failed")),
+    );
+  }
+}
+
+/** 重命名输入框按键：Enter 提交、Esc 取消。中文输入法组合态的 Enter 是「选词」，不能当作提交。 */
+function onRenameKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.isComposing) {
+    e.preventDefault();
+    void commitRename();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    cancelRename();
+  }
+}
+
+// ---- 置顶 ----
+
+/** 置顶 / 取消置顶：乐观更新 + 本地重排，失败回滚。 */
+async function togglePin(conv: ConversationDto) {
+  closeCtxMenu();
+  const prev = conv.pinnedAt ?? null;
+  const next = prev ? null : Date.now();
+  syncConvLocal(conv.id, { pinnedAt: next });
+  resortConversations();
+  try {
+    await patchConversation(conv.id, { pinnedAt: next });
+  } catch (err) {
+    syncConvLocal(conv.id, { pinnedAt: prev });
+    resortConversations();
+    showSettingsError(
+      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("置顶失败", "Pin failed")),
+    );
+  }
+}
+
+// ---- 清空指定会话 ----
+
+/** 清空某一会话（菜单里对非当前会话也能操作）：重置 UI 快照 + 服务端上下文。 */
+async function clearConversationById(id: string) {
+  closeCtxMenu();
+  const state = states.get(id);
+  if (state?.sending) {
+    showSettingsError(tx("生成中，请先停止", "Still generating — stop it first"));
+    return;
+  }
+  if (state) {
+    state.bubbles = [];
+    state.error = "";
+  }
+  await Promise.all([
+    clearConversation(id).catch(() => undefined),
+    clearConversationContext(id).catch(() => undefined),
+  ]);
+}
+
+/**
+ * 关闭其它对话（保留右键点击的那一个）：中断各自的流、清本地状态、服务端删除，
+ * 并把保留项设为当前对话。复制 removeConversation 的清理语义，批量处理。
+ */
+async function closeOtherConversations(keepId: string) {
+  // 撤销窗口里那一条也在被关闭之列：先落实删除并清掉撤销条，避免留下「撤销一个已删会话」的悬空状态。
+  flushPendingDelete();
+  const others = conversations.value.filter((c) => c.id !== keepId);
+  for (const c of others) {
+    states.get(c.id)?.controller?.abort();
+    states.delete(c.id);
+    try {
+      if (c.id) await apiDeleteConversation(c.id);
+    } catch {
+      /* ignore */
+    }
+  }
+  conversations.value = conversations.value.filter((c) => c.id === keepId);
+  if (currentId.value !== keepId) {
+    const keep = conversations.value[0];
+    if (keep) selectConversation(keep);
+  }
+  closeCtxMenu();
 }
 
 async function clearCurrent() {
@@ -593,7 +1182,19 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           reply.pending = null;
           queueScrollIfCurrent(convId);
         } else if (event.type === "confirmation_required") {
-          reply.pending = { id: event.id, name: event.name, args: event.args, reason: event.reason };
+          // 只读查询（如 BI 的 SELECT）自动确认，不弹确认卡，避免每次查数都点一下。
+          const argsObj = tryParseJson(event.args || "{}");
+          const sql = (argsObj.query ?? argsObj.sql ?? "");
+          if (typeof sql === "string" && sql && isReadOnlyQuery(sql)) {
+            const step = (reply.steps || []).find((s) => s.id === event.id);
+            if (step) {
+              step.status = "ok";
+              step.result = (step.result ? `${step.result}\n` : "") + tx("（只读查询，已自动确认）", "(read-only query, auto-approved)");
+            }
+            void confirmToolCall(event.id, true).catch(() => undefined);
+          } else {
+            reply.pending = { id: event.id, name: event.name, args: event.args, reason: event.reason };
+          }
           queueScrollIfCurrent(convId);
         } else if (event.type === "confirmation_response") {
           reply.pending = null;
@@ -618,6 +1219,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
             toolResultsOffloaded: event.toolResultsOffloaded,
           };
         } else if (event.type === "done") {
+          // 收束时清理模型回声式重复（只改内存展示，不改落库文本）。
+          reply.text = dedupeRepeats(reply.text);
           reply.streaming = false;
           openReasoning.delete(reply.id);
         }
@@ -839,6 +1442,102 @@ function usageText(usage: NonNullable<Bubble["usage"]>): string {
   return parts.join(" · ");
 }
 
+/** 轻量 JSON 解析（前端用，不依赖服务端工具）。 */
+function tryParseJson(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw || "{}") as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 只读查询判定（保守口径）：只放行 SELECT / SHOW / DESCRIBE / EXPLAIN / PRAGMA / CTE(SELECT) 起头、
+ * 且不含任何写操作的单语句。多语句直接判为非只读。用于「查询型工具自动确认，写操作仍弹卡」。
+ */
+function isReadOnlyQuery(sql: string): boolean {
+  if (!sql) return false;
+  const s = sql
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/--[^\n]*/g, "")
+    .replace(/#[^\n]*/g, "")
+    .trim();
+  if (!s) return false;
+  // 多语句（除尾随分号外还有分号）→ 保守视为非只读。
+  if (s.slice(0, -1).includes(";")) return false;
+  const first = s.split(/\s+/)[0]?.toUpperCase();
+  const okStart =
+    first === "SELECT" ||
+    first === "SHOW" ||
+    first === "DESCRIBE" ||
+    first === "DESC" ||
+    first === "EXPLAIN" ||
+    first === "PRAGMA" ||
+    first === "WITH";
+  if (!okStart) return false;
+  return !/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|MERGE|REPLACE|GRANT|REVOKE|ATTACH|DETACH)\b/i.test(s);
+}
+
+/**
+ * 防御性展示去重：模型偶发把同一段文本原样重复多遍（回声 / 重复循环），两种形态都要兜住：
+ *  1) 整段回答被原样重复 2~N 次（全文 = 某单元的整数倍）；
+ *  2) 段中某句话/某段被连续重复（如「找到关键表了…结构。」连发 4 遍，前后还夹着别的文字）。
+ * 只折叠「连续、原样、完全一致」的重复块（最短 12 字，避免误伤正常列表/强调）。
+ * 只作用于渲染层：在收束 / 载入时各算一次，不在流式进行中反复跑（省开销）。
+ */
+function dedupeRepeats(text: string): string {
+  const MIN = 12;
+  let s = text;
+  // 多轮折叠，处理「折叠后与新内容又构成重复」的边界情况。
+  for (let guard = 0; guard < 6; guard++) {
+    const n = s.length;
+    let replaced = false;
+    // 重复块长度从大到小试：优先折叠最长（最像整段回声）的重复单元。
+    for (let L = Math.min(n >> 1, 600); L >= MIN && !replaced; L--) {
+      let i = 0;
+      while (i + 2 * L <= n) {
+        const block = s.slice(i, i + L);
+        if (s.slice(i + L, i + 2 * L) === block) {
+          // 统计从 i 起连续相同的块数（含第一份）。
+          let count = 2;
+          while (i + count * L <= n && s.slice(i + (count - 1) * L, i + count * L) === block) count++;
+          if (count >= 2) {
+            s = s.slice(0, i) + block + s.slice(i + count * L);
+            replaced = true;
+            break;
+          }
+        }
+        i++;
+      }
+    }
+    if (!replaced) break;
+  }
+  return s;
+}
+
+/** 复制气泡文本（assistant 复制原始 markdown，user 复制纯文本），带瞬时反馈。 */
+const copyToast = ref("");
+let copyToastTimer: ReturnType<typeof setTimeout> | null = null;
+async function copyBubble(b: Bubble) {
+  try {
+    await navigator.clipboard.writeText(b.text);
+    copyToast.value = tx("已复制", "Copied");
+  } catch {
+    copyToast.value = tx("复制失败", "Copy failed");
+  }
+  if (copyToastTimer) clearTimeout(copyToastTimer);
+  copyToastTimer = setTimeout(() => (copyToast.value = ""), 1600);
+}
+
+/** 编辑用户气泡：把原文拿回输入框（对齐队列编辑的体验），聚焦等待再发。 */
+function editUserBubble(b: Bubble) {
+  const state = current.value;
+  state.input = b.text;
+  void nextTick(() => autoGrow());
+  inputEl.value?.focus();
+}
+
 function onKeydown(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -902,18 +1601,25 @@ onMounted(async () => {
   // 不在这里 loadMcp()：此刻还没选中对话，请求会回退到服务端的 activeConversationId（可能是别的对话）。
   // 交给下面的 selectConversation / newConversation 按对话加载。
   window.addEventListener("mousedown", onOutsideMcp);
+  window.addEventListener("keydown", onCtxEscape);
+  // scroll 不冒泡：用捕获阶段才能收到 .conv-list 自身的滚动。
+  window.addEventListener("scroll", onCtxDismiss, true);
+  window.addEventListener("resize", onCtxDismiss);
 
   // 设备态偏好（主题 / 默认语言 / 上次打开的对话）以后端为唯一真相；顺带跑一次性迁移。
   const prefs = await fetchChatPreferences().catch(() => null);
   if (prefs) {
     if (isUiLocale(prefs.locale)) deviceLocale.value = prefs.locale;
     adoptTheme(prefs.theme);
+    sortMode.value = prefs.convSortMode;
     initialConversationId = prefs.activeConversationId;
     await migrateLocalPrefs(prefs);
   }
 
   const list = await fetchConversations().catch(() => [] as ConversationDto[]);
   conversations.value = list;
+  // 服务端给的是一份稳定默认序；「按最近活动」模式下要忽略 sortOrder 复算一次。
+  resortConversations();
   const target = list.find((c) => c.id === initialConversationId) || list[0];
   if (target) selectConversation(target);
   else await newConversation();
@@ -921,52 +1627,246 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("mousedown", onOutsideMcp);
+  window.removeEventListener("keydown", onCtxEscape);
+  window.removeEventListener("scroll", onCtxDismiss, true);
+  window.removeEventListener("resize", onCtxDismiss);
+  // 离开页面时把还没到点的删除落实，避免撤销窗口内的删除被永久搁置。
+  flushPendingDelete();
 });
 </script>
 
 <template>
-  <div class="chat">
+  <div class="chat" @click="closeCtxMenu()">
     <aside class="sidebar">
+      <div class="brand">
+        <span class="brand__name">{{ tx("小助手", "Assistant") }}</span>
+      </div>
+      <nav class="nav" :aria-label="tx('主导航', 'Primary')">
+        <button
+          type="button"
+          class="nav-seg"
+          :class="{ active: view === 'chat' }"
+          :aria-current="view === 'chat' ? 'page' : undefined"
+          @click="view = 'chat'"
+        >{{ tx("对话", "Chats") }}</button>
+        <button
+          type="button"
+          class="nav-seg"
+          :class="{ active: view === 'tasks' }"
+          :aria-current="view === 'tasks' ? 'page' : undefined"
+          @click="view = 'tasks'"
+        >{{ tx("定时任务", "Scheduled") }}</button>
+      </nav>
+      <template v-if="view === 'chat'">
       <button class="new-chat" type="button" @click="newConversation">
         + {{ tx("新对话", "New chat") }}
       </button>
-      <div class="conv-list">
-        <div
-          v-for="conv in conversations"
-          :key="conv.id"
-          class="conv-item"
-          :class="{ active: conv.id === currentId }"
-          @click="selectConversation(conv)"
-        >
-          <span
-            v-if="convStatus(conv)"
-            class="conv-dot"
-            :class="convStatus(conv)"
-            :title="convStatusText(convStatus(conv))"
-            :aria-label="convStatusText(convStatus(conv))"
-            role="img"
-          ></span>
-          <span class="conv-title">{{ conv.title || tx("新对话", "New chat") }}</span>
-          <span
-            v-if="queueCount(conv)"
-            class="conv-queue"
-            :title="tx('有排队消息', 'Has queued messages')"
-            :aria-label="tx('有排队消息', 'Has queued messages')"
-          >{{ queueCount(conv) }}</span>
-          <button
-            class="conv-del"
-            type="button"
-            :title="tx('删除对话', 'Delete chat')"
-            @click.stop="removeConversation(conv.id)"
+      <div ref="convListEl" class="conv-list">
+        <template v-for="(conv, i) in conversations" :key="conv.id">
+          <div v-if="pinnedCount > 0 && i === pinnedCount" class="conv-divider" role="separator">
+            {{ tx("置顶", "Pinned") }}
+          </div>
+          <div
+            class="conv-item"
+            :class="{
+              active: conv.id === currentId,
+              pinned: !!conv.pinnedAt,
+              dragging: draggingId === conv.id,
+              'drop-before': dropTarget?.id === conv.id && !dropTarget?.after,
+              'drop-after': dropTarget?.id === conv.id && !!dropTarget?.after,
+            }"
+            :data-conv-id="conv.id"
+            role="button"
+            tabindex="0"
+            :aria-current="conv.id === currentId ? 'true' : undefined"
+            aria-haspopup="menu"
+            :draggable="renaming.id !== conv.id"
+            @click="selectConversation(conv)"
+            @contextmenu.prevent="openCtxMenu($event, conv)"
+            @keydown="onConvKeydown($event, conv)"
+            @dragstart="onConvDragStart($event, conv)"
+            @dragover="onConvDragOver($event, conv)"
+            @drop="onConvDrop"
+            @dragend="onConvDragEnd"
           >
-            ×
-          </button>
-        </div>
+            <span
+              v-if="convStatus(conv)"
+              class="conv-dot"
+              :class="convStatus(conv)"
+              :title="convStatusText(convStatus(conv))"
+              :aria-label="convStatusText(convStatus(conv))"
+              role="img"
+            ></span>
+            <input
+              v-if="renaming.id === conv.id"
+              :ref="setRenameInput"
+              v-model="renaming.value"
+              class="conv-rename"
+              type="text"
+              :maxlength="RENAME_MAX"
+              :aria-label="tx('重命名对话', 'Rename chat')"
+              @keydown="onRenameKeydown"
+              @blur="commitRename"
+              @click.stop
+            />
+            <template v-else>
+              <span class="conv-title">{{ conv.title || tx("新对话", "New chat") }}</span>
+              <span
+                v-if="queueCount(conv)"
+                class="conv-queue"
+                :title="tx('有排队消息', 'Has queued messages')"
+                :aria-label="tx('有排队消息', 'Has queued messages')"
+              >{{ queueCount(conv) }}</span>
+              <button
+                class="conv-del"
+                type="button"
+                :title="tx('删除对话', 'Delete chat')"
+                @click.stop="removeConversation(conv.id)"
+              >
+                ×
+              </button>
+            </template>
+          </div>
+        </template>
       </div>
       <button class="ghost-btn" type="button" @click="clearCurrent">
         {{ tx("清空当前对话", "Clear current chat") }}
       </button>
+      </template>
+      <template v-else>
+        <div class="tasks">
+          <div class="tasks-head">
+            <button class="primary-btn" type="button" @click="openTaskForm">
+              + {{ tx("新建定时任务", "New scheduled task") }}
+            </button>
+          </div>
+          <div v-if="!tasks.length" class="tasks-empty">
+            <span class="tasks-empty__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7.5V12l3.2 1.9" />
+              </svg>
+            </span>
+            <div class="tasks-empty__title">{{ tx("还没有定时任务", "No scheduled tasks yet") }}</div>
+            <p class="tasks-empty__desc">{{ tx("点击「新建定时任务」创建第一个：把周期性的查询、监控与报告交给智能体自动执行。", "Click “New scheduled task” to create your first — schedule recurring queries, monitors and reports to run automatically.") }}</p>
+          </div>
+          <div v-else class="task-list">
+            <div v-for="t in tasks" :key="t.id" class="task-card">
+              <div class="task-card__main">
+                <div class="task-card__title">{{ t.name }}</div>
+                <div class="task-card__prompt">{{ t.prompt }}</div>
+                <div class="task-card__meta">
+                  <span class="task-badge" :class="t.scheduleType">{{ t.scheduleType === 'once' ? tx('一次性', 'Once') : tx('周期', 'Recurring') }}</span>
+                  <span class="task-next">{{ taskNextRunText(t) }}</span>
+                </div>
+              </div>
+              <div class="task-card__ops">
+                <button
+                  class="task-toggle"
+                  type="button"
+                  :class="{ on: t.status === 'active' }"
+                  role="switch"
+                  :aria-checked="t.status === 'active'"
+                  :title="t.status === 'active' ? tx('暂停', 'Pause') : tx('启用', 'Enable')"
+                  @click="toggleTask(t.id)"
+                ><span class="task-toggle__knob"></span></button>
+                <button class="task-del" type="button" :title="tx('删除', 'Delete')" @click="removeTask(t.id)">×</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
     </aside>
+    <Teleport to="body">
+      <div
+        v-if="ctxMenu.open"
+        ref="ctxMenuEl"
+        class="ctx-menu"
+        role="menu"
+        :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
+        @click.stop
+        @contextmenu.prevent
+        @keydown="onCtxMenuKeydown"
+      >
+        <button type="button" class="ctx-item" role="menuitem" @click="ctxTarget && startRename(ctxTarget)">
+          <span>{{ tx("重命名", "Rename") }}</span>
+          <kbd class="ctx-kbd">F2</kbd>
+        </button>
+        <button type="button" class="ctx-item" role="menuitem" @click="ctxTarget && togglePin(ctxTarget)">
+          {{ ctxTarget?.pinnedAt ? tx("取消置顶", "Unpin") : tx("置顶", "Pin") }}
+        </button>
+        <button
+          v-if="sortMode === 'manual'"
+          type="button"
+          class="ctx-item"
+          role="menuitem"
+          @click="restoreRecentSort"
+        >
+          {{ tx("恢复自动排序", "Sort by recent") }}
+        </button>
+        <div class="ctx-sep" role="separator"></div>
+        <button type="button" class="ctx-item" role="menuitem" @click="clearConversationById(ctxMenu.targetId)">
+          {{ tx("清空对话", "Clear chat") }}
+        </button>
+        <button type="button" class="ctx-item" role="menuitem" @click="closeOtherConversations(ctxMenu.targetId)">
+          {{ tx("关闭其它对话", "Close other chats") }}
+        </button>
+        <div class="ctx-sep" role="separator"></div>
+        <button type="button" class="ctx-item danger" role="menuitem" @click="removeConversation(ctxMenu.targetId)">
+          {{ tx("删除对话", "Delete chat") }}
+        </button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="undoDelete" class="undo-toast" role="status" aria-live="polite">
+        <span class="undo-toast__text">{{ tx("已删除对话", "Chat deleted") }}</span>
+        <button type="button" class="undo-toast__undo" @click="undoRemoveConversation">
+          {{ tx("撤销", "Undo") }}
+        </button>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="showTaskForm" class="modal-mask" @click.self="closeTaskForm">
+        <div class="modal" role="dialog" aria-modal="true" :aria-label="tx('新建定时任务', 'New scheduled task')">
+          <div class="modal__head">
+            <span class="modal__title">{{ tx("新建定时任务", "New scheduled task") }}</span>
+            <button class="modal__close" type="button" aria-label="Close" @click="closeTaskForm">×</button>
+          </div>
+          <div class="modal__body">
+            <label class="field">
+              <span class="field__label">{{ tx("名称", "Name") }}</span>
+              <input class="field__input" v-model="taskDraft.name" :placeholder="tx('例如：每日流量日报', 'e.g. Daily traffic report')" />
+            </label>
+            <label class="field">
+              <span class="field__label">{{ tx("任务内容", "Task prompt") }}</span>
+              <textarea class="field__input field__textarea" v-model="taskDraft.prompt" rows="3" :placeholder="tx('智能体要自动执行的自然语言指令…', 'Natural-language instruction for the agent…')"></textarea>
+            </label>
+            <div class="field">
+              <span class="field__label">{{ tx("频率", "Schedule") }}</span>
+              <div class="seg">
+                <button type="button" class="seg__btn" :class="{ active: taskDraft.scheduleType === 'recurring' }" @click="taskDraft.scheduleType = 'recurring'">{{ tx("周期", "Recurring") }}</button>
+                <button type="button" class="seg__btn" :class="{ active: taskDraft.scheduleType === 'once' }" @click="taskDraft.scheduleType = 'once'">{{ tx("一次性", "Once") }}</button>
+              </div>
+            </div>
+            <label v-if="taskDraft.scheduleType === 'recurring'" class="field">
+              <span class="field__label">{{ tx("重复规则 (RRULE)", "Repeat rule (RRULE)") }}</span>
+              <input class="field__input" v-model="taskDraft.rrule" placeholder="FREQ=DAILY;INTERVAL=1" />
+            </label>
+            <label v-else class="field">
+              <span class="field__label">{{ tx("执行时间", "Run at") }}</span>
+              <input class="field__input" type="datetime-local" v-model="taskDraft.scheduledAt" />
+            </label>
+            <p v-if="taskError" class="field__error">{{ taskError }}</p>
+          </div>
+          <div class="modal__foot">
+            <button class="ghost-btn" type="button" @click="closeTaskForm">{{ tx("取消", "Cancel") }}</button>
+            <button class="primary-btn" type="button" @click="createTask">{{ tx("创建", "Create") }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <main class="main">
       <header class="top">
@@ -1021,18 +1921,19 @@ onBeforeUnmount(() => {
                     <span class="mcp-row__text">
                       <span class="mcp-row__label">{{ s.label }}</span>
                       <span class="mcp-row__meta">
-                        <span class="mcp-dot" :class="s.connected ? 'ok' : s.error ? 'err' : 'idle'"></span>
-                        {{ s.transport }} ·
-                        {{
-                          s.connected
-                            ? tx("已连接", "connected")
-                            : s.connecting
-                              ? tx("连接中", "connecting")
-                              : s.error
-                                ? tx("失败", "failed")
-                                : tx("未连接", "not connected")
-                        }}
-                        · {{ s.tools }} {{ tx("工具", "tools") }}
+                        <span class="mcp-status" :class="s.connected ? 'ok' : s.error ? 'err' : s.connecting ? 'running' : 'idle'">
+                          <span class="mcp-dot" :class="s.connected ? 'ok' : s.error ? 'err' : s.connecting ? 'running' : 'idle'"></span>
+                          {{
+                            s.connected
+                              ? tx("已连接", "connected")
+                              : s.connecting
+                                ? tx("连接中", "connecting")
+                                : s.error
+                                  ? tx("失败", "failed")
+                                  : tx("未连接", "not connected")
+                          }}
+                        </span>
+                        <span class="mcp-row__sub">{{ s.transport }} · {{ s.tools }} {{ tx("工具", "tools") }}</span>
                       </span>
                       <span v-if="s.error" class="mcp-row__err">{{ s.error }}</span>
                       <span v-if="s.toolsError" class="mcp-row__err">{{ s.toolsError }}</span>
@@ -1070,6 +1971,7 @@ onBeforeUnmount(() => {
           {{ tx("随便问点什么吧。", "Ask anything to get started.") }}
         </div>
         <div v-for="b in current.bubbles" :key="b.id" class="row" :class="b.role">
+          <div class="bubble-wrap">
           <div class="bubble">
             <div
               v-if="b.todos?.length || b.steps?.length"
@@ -1140,6 +2042,24 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="b.error" class="err">{{ b.error }}</div>
             <div v-if="b.usage" class="usage-line">{{ usageText(b.usage) }}</div>
+          </div>
+          <div class="bubble-actions">
+            <button
+              v-if="b.role === 'user'"
+              type="button"
+              class="bubble-act"
+              :title="tx('编辑', 'Edit')"
+              :aria-label="tx('编辑', 'Edit')"
+              @click="editUserBubble(b)"
+            >✎</button>
+            <button
+              type="button"
+              class="bubble-act"
+              :title="tx('复制', 'Copy')"
+              :aria-label="tx('复制', 'Copy')"
+              @click="copyBubble(b)"
+            >⧉</button>
+          </div>
           </div>
         </div>
       </div>
@@ -1255,6 +2175,9 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </footer>
+      <transition name="fade">
+        <div v-if="copyToast" class="copy-toast" role="status">{{ copyToast }}</div>
+      </transition>
     </main>
   </div>
 </template>
@@ -1270,15 +2193,468 @@ onBeforeUnmount(() => {
 }
 
 .sidebar {
-  width: 248px;
-  flex: 0 0 248px;
+  width: 256px;
+  flex: 0 0 256px;
   border-right: 1px solid var(--line);
   background: var(--panel);
-  padding: 14px;
+  padding: 16px 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   min-height: 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  padding: 4px 6px 2px;
+}
+
+.brand__name {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+/* 主导航：分段控件，对话 / 定时任务 切换，为接入预留入口 */
+.nav {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--fill-soft);
+}
+
+.nav-seg {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 8px;
+  border-radius: calc(var(--radius) - 4px);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.nav-seg:hover {
+  color: var(--ink);
+}
+
+.nav-seg.active {
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+.nav-seg:focus-visible {
+  box-shadow: var(--ring);
+}
+
+/* 定时任务占位面板（为后续接入预留结构与入口） */
+.tasks {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow-y: auto;
+}
+
+.tasks-empty {
+  margin: auto;
+  width: 100%;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+}
+
+.tasks-empty__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--fill-soft);
+  color: var(--muted);
+}
+
+.tasks-empty__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.tasks-empty__desc {
+  max-width: 260px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.coming-soon {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+/* 定时任务：列表与卡片 */
+.tasks-head {
+  display: flex;
+  padding-bottom: 2px;
+}
+
+.primary-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--ink);
+  color: var(--bg);
+  border-radius: var(--radius);
+  padding: 9px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 0.15s var(--ease),
+    box-shadow 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.primary-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px color-mix(in srgb, var(--ink) 20%, transparent);
+}
+
+.primary-btn:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.primary-btn:focus-visible {
+  box-shadow: var(--ring);
+}
+
+.task-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 2px;
+}
+
+.task-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.task-card:hover {
+  border-color: color-mix(in srgb, var(--ink) 26%, var(--line));
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.task-card__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.task-card__title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 3px;
+}
+
+.task-card__prompt {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.task-card__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.task-badge {
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.task-badge.once {
+  color: color-mix(in srgb, #d99a1f 85%, var(--ink));
+  border-color: color-mix(in srgb, #d99a1f 40%, var(--line));
+  background: color-mix(in srgb, #d99a1f 12%, transparent);
+}
+
+.task-card__ops {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.task-toggle {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--fill-soft);
+  position: relative;
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease;
+}
+
+.task-toggle__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition:
+    transform 0.18s var(--ease),
+    background 0.18s ease;
+}
+
+.task-toggle.on {
+  background: color-mix(in srgb, var(--stop) 80%, transparent);
+  border-color: transparent;
+}
+
+.task-toggle.on .task-toggle__knob {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+.task-toggle:focus-visible {
+  box-shadow: var(--ring);
+}
+
+.task-del {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.5;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.task-del:hover,
+.task-del:focus-visible {
+  opacity: 1;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+/* 弹窗：新建定时任务 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: color-mix(in srgb, var(--ink) 38%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.modal {
+  width: 100%;
+  max-width: 460px;
+  max-height: 90dvh;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.modal__title {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.modal__close {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.modal__close:hover {
+  background: var(--fill-soft);
+  color: var(--ink);
+}
+
+.modal__body {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal__foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.field__input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 9px 11px;
+  background: var(--fill);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.field__input:focus {
+  outline: none;
+  border-color: var(--ink);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+.field__textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.field__error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.seg {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--fill-soft);
+}
+
+.seg__btn {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 8px;
+  border-radius: calc(var(--radius) - 4px);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.seg__btn:hover {
+  color: var(--ink);
+}
+
+.seg__btn.active {
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+.seg__btn:focus-visible {
+  box-shadow: var(--ring);
 }
 
 .new-chat {
@@ -1332,15 +2708,53 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 13px;
+  /* 拖拽落点指示线相对本项定位 */
+  position: relative;
 }
 
 .conv-item:hover {
   background: var(--fill-soft);
 }
 
+/* 键盘可达（role=button + tabindex）：焦点必须可见。 */
+.conv-item:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* 拖拽中的被拖项：半透明表示"正在搬动"。 */
+.conv-item.dragging {
+  opacity: 0.5;
+}
+
+/*
+ * 落点指示线用伪元素而不是 box-shadow：`.conv-item.active` 已经占了 box-shadow（左侧选中条），
+ * 两者叠加会互相覆盖。
+ */
+.conv-item.drop-before::before,
+.conv-item.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ink);
+  pointer-events: none;
+}
+
+.conv-item.drop-before::before {
+  top: -3px;
+}
+
+.conv-item.drop-after::after {
+  bottom: -3px;
+}
+
 .conv-item.active {
   background: var(--fill-soft);
   border: 1px solid var(--line);
+  box-shadow: inset 2px 0 0 var(--ink);
 }
 
 /* 侧栏状态点：生成中 / 待确认 / 出错。不只靠颜色区分（同时带 title 与 aria-label 文案）。 */
@@ -1386,6 +2800,46 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+/* 置顶区与普通区之间的分隔（只有两组都存在时才渲染）。 */
+.conv-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px 2px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.conv-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.conv-item.pinned .conv-title {
+  font-weight: 600;
+}
+
+/* 就地重命名输入框：占满标题位，视觉上尽量贴近原文本。 */
+.conv-rename {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 6px;
+  outline: none;
+}
+
+.conv-rename:focus {
+  border-color: color-mix(in srgb, var(--ink) 34%, var(--line));
+  box-shadow: var(--ring);
+}
+
 .conv-del {
   display: inline-flex;
   align-items: center;
@@ -1416,6 +2870,106 @@ onBeforeUnmount(() => {
   opacity: 1;
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger);
+}
+
+/* 右键上下文菜单：Teleport 到 body，scoped 样式不生效，用 :global 命中。 */
+:global(.ctx-menu) {
+  position: fixed;
+  z-index: 1000;
+  min-width: 168px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  /* 面板色 token 是 --panel（styles.css）。曾误写 var(--surface)：变量不存在 → background 无效 → 菜单全透明。 */
+  background: var(--panel);
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--ink) 22%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+:global(.ctx-item) {
+  appearance: none;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  white-space: nowrap;
+}
+
+:global(.ctx-item:hover),
+:global(.ctx-item:focus-visible) {
+  background: var(--fill-soft);
+  outline: none;
+}
+
+/* 危险动作（删除）独立配色，与常用项拉开距离，降低误点。 */
+:global(.ctx-item.danger) {
+  color: var(--danger);
+}
+
+:global(.ctx-item.danger:hover),
+:global(.ctx-item.danger:focus-visible) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+:global(.ctx-kbd) {
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+:global(.ctx-sep) {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+
+/* 删除撤销条：Teleport 到 body，scoped 样式不生效，用 :global 命中。 */
+:global(.undo-toast) {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 13px;
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--ink) 22%, transparent);
+}
+
+:global(.undo-toast__undo) {
+  appearance: none;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+:global(.undo-toast__undo:hover),
+:global(.undo-toast__undo:focus-visible) {
+  background: var(--fill-soft);
 }
 
 .ghost-btn {
@@ -1541,15 +3095,15 @@ onBeforeUnmount(() => {
   top: calc(100% + 8px);
   right: 0;
   z-index: 30;
-  width: 340px;
+  width: 360px;
   max-width: calc(100vw - 32px);
-  padding: 10px;
+  padding: 12px;
   border: 1px solid color-mix(in srgb, var(--line) 88%, var(--ink) 12%);
-  border-radius: calc(var(--radius-sm) + 2px);
+  border-radius: var(--radius-lg);
   background: color-mix(in srgb, var(--panel) 92%, white 8%);
   box-shadow:
-    0 12px 28px color-mix(in srgb, var(--ink) 12%, transparent),
-    0 2px 8px color-mix(in srgb, var(--ink) 6%, transparent);
+    0 16px 40px color-mix(in srgb, var(--ink) 14%, transparent),
+    0 2px 10px color-mix(in srgb, var(--ink) 7%, transparent);
   backdrop-filter: blur(10px);
   color: var(--ink);
   font-size: 13px;
@@ -1560,34 +3114,48 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 2px 2px 8px;
+  padding: 2px 2px 10px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mcp-panel__head > span:first-child {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .mcp-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  max-height: 300px;
+  gap: 6px;
+  max-height: 320px;
   overflow-y: auto;
 }
 
 .mcp-empty {
-  padding: 10px 4px;
+  padding: 14px 4px;
   color: var(--muted);
   font-size: 12px;
+  text-align: center;
 }
 
 .mcp-row {
   display: flex;
   align-items: flex-start;
-  gap: 6px;
-  padding: 6px;
-  border-radius: var(--radius-sm);
-  transition: background 0.15s ease;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--fill);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
 }
 
 .mcp-row:hover {
-  background: color-mix(in srgb, var(--fill-soft) 78%, var(--panel));
+  background: var(--fill-soft);
+  border-color: color-mix(in srgb, var(--ink) 22%, var(--line));
 }
 
 .mcp-row__main {
@@ -1602,23 +3170,23 @@ onBeforeUnmount(() => {
 .mcp-row__text {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   min-width: 0;
 }
 
 .mcp-row__label {
-  font-weight: 500;
+  font-size: 13px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .mcp-row__meta {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 5px;
-  color: var(--muted);
-  font-size: 12px;
+  gap: 6px;
 }
 
 .mcp-row__err {
@@ -1633,6 +3201,43 @@ onBeforeUnmount(() => {
   font-size: 11px;
   line-height: 1.5;
   word-break: break-word;
+}
+
+.mcp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px 1px 7px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--fill-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.mcp-status.ok {
+  color: color-mix(in srgb, #2f9e63 82%, var(--ink));
+  background: color-mix(in srgb, #2f9e63 14%, transparent);
+  border-color: color-mix(in srgb, #2f9e63 32%, var(--line));
+}
+
+.mcp-status.err {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 32%, var(--line));
+}
+
+.mcp-status.running {
+  color: color-mix(in srgb, var(--stop) 85%, var(--ink));
+  background: color-mix(in srgb, var(--stop) 14%, transparent);
+  border-color: color-mix(in srgb, var(--stop) 32%, var(--line));
+}
+
+.mcp-row__sub {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .mcp-dot {
@@ -1672,13 +3277,13 @@ onBeforeUnmount(() => {
 }
 
 .mcp-mini {
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: none;
-  border-radius: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
   background: transparent;
   color: var(--muted);
   font-size: 13px;
@@ -1861,8 +3466,25 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
 }
 
-.bubble {
+.row.assistant {
+  justify-content: flex-start;
+}
+
+/* 气泡 + 其下方操作栏绑成一组：宽度随气泡收缩，操作栏右对齐到气泡右侧，
+   故按钮始终落在「气泡下方的右侧」，而非整屏最右。
+   宽度上限放在这一层（.row 的直接子项），.bubble 用 100% 相对它，
+   避免百分比 max-width 相对自身 width: fit-content 造成循环、把气泡压窄。 */
+.bubble-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   max-width: min(760px, 92%);
+  min-width: 0;
+}
+
+.bubble {
+  position: relative;
+  max-width: 100%;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   padding: 12px 14px;
@@ -1900,9 +3522,37 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.md :deep(.table-wrapper) {
+  overflow-x: auto;
+  margin: 0 0 8px;
+}
+
+/* 前端折叠块：内部工具轨迹 / 超长表格默认收起，点击展开 */
+.md :deep(details.agent-tool-trace),
+.md :deep(details.agent-long-table) {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--fill-soft);
+  padding: 2px 10px;
+  margin: 0 0 8px;
+}
+.md :deep(details.agent-tool-trace > summary),
+.md :deep(details.agent-long-table > summary) {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  user-select: none;
+  padding: 4px 0;
+}
+.md :deep(details.agent-tool-trace[open] > summary),
+.md :deep(details.agent-long-table[open] > summary) {
+  margin-bottom: 4px;
+}
+
 .md :deep(table) {
   border-collapse: collapse;
   width: 100%;
+  min-width: max-content;
 }
 
 .md :deep(th),
@@ -1937,6 +3587,86 @@ onBeforeUnmount(() => {
   font-size: 11px;
   color: var(--muted);
   word-break: break-all;
+}
+
+/* 气泡操作栏（编辑 / 复制）：置于气泡正下方、靠右，悬停整行时淡入。
+   下方布局从根上杜绝遮挡，且借助 .bubble-wrap 的 align-items: flex-end
+   始终对齐到「气泡本体的右下角」，不会因助手气泡不满宽而漂到整屏最右。 */
+.bubble-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 3px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.row:hover .bubble-actions,
+.row:focus-within .bubble-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 触屏无 hover：常驻可见，保证可点。 */
+@media (hover: none) {
+  .bubble-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.bubble-act {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.bubble-act:hover,
+.bubble-act:focus-visible {
+  color: var(--ink);
+  background: var(--fill-soft);
+}
+
+/* 复制成功瞬时提示：浮在输入区上方，不抢占滚动条。 */
+.copy-toast {
+  position: absolute;
+  bottom: calc(100% - 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  box-shadow: var(--shadow);
+  color: var(--ink);
+  font-size: 12px;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 4px);
 }
 
 .warn-line {

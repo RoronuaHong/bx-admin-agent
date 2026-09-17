@@ -159,6 +159,10 @@ export interface ConversationDto {
   mcpServers?: string[];
   locale?: string;
   pendingQueue?: PendingMessage[];
+  /** 置顶时间戳；null / 缺省 = 未置顶。置顶项固定排在列表最上（新的置顶在上）。 */
+  pinnedAt?: number | null;
+  /** 手动顺序（「手动排序」模式下生效）；未排过的项没有该字段。 */
+  sortOrder?: number;
 }
 
 export async function fetchConversations(): Promise<ConversationDto[]> {
@@ -193,7 +197,14 @@ export async function clearConversation(id: string) {
 /** 更新对话级设置（只传要改的字段；服务端未提供的字段保持不变）。 */
 export async function patchConversation(
   id: string,
-  patch: { title?: string; model?: string; mcpServers?: string[]; locale?: string; pendingQueue?: PendingMessage[] },
+  patch: {
+    title?: string;
+    model?: string;
+    mcpServers?: string[];
+    locale?: string;
+    pendingQueue?: PendingMessage[];
+    pinnedAt?: number | null;
+  },
 ): Promise<ConversationDto> {
   const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -202,12 +213,24 @@ export async function patchConversation(
   return data.conversation;
 }
 
-// ---- 设备级偏好（原前端 localStorage：主题 / 默认语言 / 上次打开的对话）----
+/** 批量写入手动顺序：`ids` 的下标即新顺序（一次提交，服务端按下标写 `sortOrder`）。 */
+export async function reorderConversations(ids: string[]) {
+  return jsonFetch("/agent/chat/conversations/reorder", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+}
+
+// ---- 设备级偏好（原前端 localStorage：主题 / 默认语言 / 上次打开的对话 / 会话排序模式）----
+
+/** 会话列表排序模式：recent = 普通区按最近活动；manual = 按用户手动顺序。 */
+export type ConvSortMode = "recent" | "manual";
 
 export interface ChatPreferences {
   activeConversationId: string;
   theme: "" | "light" | "dark";
   locale: string;
+  convSortMode: ConvSortMode;
   /** 非 0 = 客户端已完成过偏好同步（据此跳过旧 localStorage 的一次性迁移）。 */
   migratedAt: number;
 }
@@ -217,6 +240,7 @@ function toPreferences(data: Partial<ChatPreferences>): ChatPreferences {
     activeConversationId: data.activeConversationId || "",
     theme: data.theme || "",
     locale: data.locale || "",
+    convSortMode: data.convSortMode === "manual" ? "manual" : "recent",
     migratedAt: data.migratedAt || 0,
   };
 }
@@ -229,6 +253,7 @@ export async function saveChatPreferences(patch: {
   activeConversationId?: string;
   theme?: "light" | "dark";
   locale?: string;
+  convSortMode?: ConvSortMode;
 }): Promise<ChatPreferences> {
   const data = (await jsonFetch("/agent/chat/preferences", {
     method: "PUT",

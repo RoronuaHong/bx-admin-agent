@@ -92,6 +92,8 @@ chatStream
 | **D4 子代理（委派）** | 内置 `task` 工具：`{description, subagent_type}`；子代理 = `runWithTools` + **该任务允许的最小工具集** + 独立上下文（只看 task 描述）+ 回传摘要（长度上限）；支持单轮多个 `task` 并行（`Promise.all`）；NDJSON 增加 `subagent_start/delta/end` 事件；取消级联（abort 主流 → abort 子代理）；通用型子代理继承主代理工具，专用型（如 `bi-explorer`）白名单 | 长查询被隔离：主上下文只见摘要；两个子代理并行跑同一个对话不串写；取消生效 |
 | **D5（可选）代码执行** | 沙箱 `execute`/`eval`（QuickJS 起步），用于数据二次加工 | 沙箱内无网络/文件越界 |
 
+> 注：D5 与「图表可视化」不是同一件事——**出图不需要代码执行沙箱**（图表由工具/前端渲染即可，27 种图已有现成方案），D5 只在「数据需要二次加工」时才需要。图表方案见 `docs/chart-visualization-plan.md`（挂账待实施）。
+>
 > 每期都跑既有回归清单：NDJSON 流式、确认卡、usage、队列、MCP 面板、BI 工具、`tsc` + `vite build`。
 
 ---

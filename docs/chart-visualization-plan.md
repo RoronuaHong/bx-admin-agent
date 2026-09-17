@@ -1,0 +1,144 @@
+# 图表可视化接入方案（AntV）
+
+> 版本：v1（2026-09-17）
+> **状态：挂账（评估与实测已完成，未实施）**——本轮只做方案定性与可行性实测，代码不动。
+> 定位：回答「对话里能不能出图、用 AntV 行不行、怎么落地」；实施时按本文第 6/7 节开工。
+> 相关：`docs/mcp-guide.md`（MCP 接入权威实现）、`docs/deep-agents-plan.md` §5 D5（代码执行沙箱）、`apps/agent-server/scripts/metabase-mcp.mjs`（现有 BI MCP）。
+
+---
+
+## 0. 一句话结论
+
+**可行，已实测通过。** AntV 的 `@antv/mcp-server-chart` 提供 27 个出图工具（饼图/柱状图/雷达图/组织结构图/思维导图/网络图/桑基图…），能直接挂到我们现有的 MCP 通道上，**前端零改动**（`img` 白名单已允许）。默认走蚂蚁官方出图服务（数据出内网 + 图片落在公有 CDN），生产应切自托管 GPT-Vis-SSR。
+
+**唯一的阻塞点是数据合规口径**，口径未定前不动手。
+
+---
+
+## 1. 现状核查（代码级，纠正已有说法）
+
+| 能力 | 落点 | 判定 |
+|---|---|---|
+| 查数据 | `.env` 的 `MCP_BUILTIN_SERVERS` → `scripts/metabase-mcp.mjs`（`list_databases`/`get_database_schema`/`run_native_query`/`list_cards`/`list_dashboards`/`get_dashboard`/`get_card`/`search`） | ✅ 8 个**只读**工具（**没有**建卡工具） |
+| 存数据 | `src/fs-store.ts` + `fs_write/read/edit/ls`，对话级工作区 `.data/fs/<convId>/` | ✅ |
+| **对话内显示图片** | `apps/web/src/chat-richtext.ts`：DOMPurify 白名单**已含 `img`**（`src/width/height`），URI 放行 `https` 与相对路径 | ✅ **不需要改前端** |
+| 出图工具 | —— | ❌ 无 |
+| 工作区静态路由 | `src/app.ts` 只有 `/chat/upload/:id` | ❌ 无（本地生成的图无法交给浏览器） |
+| 图表事件契约 | `packages/shared/src/index.ts` 的 `ChatEvent` 无 chart 相关类型 | ❌ 无 |
+| 前端图表库 | `apps/web/package.json` 只有 vue / markdown-it / dompurify | ❌ 无 |
+
+> 上一轮曾考虑「服务端自研 SVG + 新增静态路由」——**该方案作废**：AntV 的方案白拿 27 种图 + 主题 + 自动布局，自己抽 SVG 属重复造轮子。
+
+## 2. Metabase 能不能帮我们出图（连实例实测，结论：不能）
+
+对 `https://bi.vmovs.com`（`.env` 里的 key，只读探测）：
+
+| 探测 | 结果 |
+|---|---|
+| `/api/health` | 200 |
+| `/api/user/current` | 服务账号 `Mac-Agent-MCP`，`can_create_queries / can_create_native_queries = true` |
+| `/api/card?f=all` | 99 张卡片，**`public_uuid` 全为 null**（0 张已开公开链接） |
+| `/api/setting/enable-public-sharing` | **403**（API Key 非管理员，读不到也开不了） |
+| `GET /api/pulse/preview_card_png/96` | **404**（该版本无此端点） |
+| `POST /api/card/96/query/png｜svg｜html` | **全部 404** |
+| `POST /api/card/96/query/xlsx｜json` | 200（导出格式只有 csv/json/xlsx） |
+
+**结论**：该实例通过 REST **出不了图**；公开链接是 SPA 页面而非图片，且需管理员权限开 `public sharing`。→「接 Metabase 渲染」这条路在当前实例上不成立。
+
+## 3. AntV 方案实测证据（2026-09-17，本机）
+
+| 验证项 | 结果 |
+|---|---|
+| 以 stdio MCP 拉起 `npx -y @antv/mcp-server-chart` | ✅ 成功，`tools/list` 返回 **27 个工具** |
+| 官方出图服务可达性 | ✅ `POST https://antv-studio.alipay.com/api/gpt-vis` → `{"success":true,"resultObj":"https://mdn.alipayobjects.com/one_clip/afts/img/.../original"}`；再拉该图 `200 image/jpeg 36546`，**无鉴权、无需 API Key** |
+| MCP 配置能否传 env | ✅ `src/mcp/config.ts` 的 `McpServerConfig.env`；`src/mcp/hub.ts` spawn 时 `process.env + cfg.env` 合并 |
+| Windows 下能否起 | ✅ SDK 依赖 `cross-spawn ^7.0.5`，`command: "npx"` 会自动解析 `npx.cmd` |
+| 私有化自托管 | ✅ npm `@antv/gpt-vis-ssr@0.3.8`（deps：`canvas` + `@antv/g2-ssr`/`g6-ssr`/`s2-ssr`）；MCP 侧用 `VIS_REQUEST_SERVER` 指向自建服务；官方仓库另有 docker 编排。**限制：3 个地理图不支持私有化** |
+| 27 个工具名 | `generate_area_chart, generate_bar_chart, generate_boxplot_chart, generate_column_chart, generate_district_map, generate_dual_axes_chart, generate_fishbone_diagram, generate_flow_diagram, generate_funnel_chart, generate_histogram_chart, generate_line_chart, generate_liquid_chart, generate_mind_map, generate_network_graph, generate_organization_chart, generate_path_map, generate_pie_chart, generate_pin_map, generate_radar_chart, generate_sankey_chart, generate_scatter_chart, generate_treemap_chart, generate_venn_chart, generate_violin_chart, generate_waterfall_chart, generate_word_cloud_chart, generate_spreadsheet` |
+
+## 4. 图种覆盖度对照
+
+| 需求图种 | 对应工具 | 备注 |
+|---|---|---|
+| 饼图 | `generate_pie_chart` | |
+| 柱状图 | `generate_bar_chart`（横向）/ `generate_column_chart`（纵向） | |
+| 雷达图 | `generate_radar_chart` | |
+| 结构图 | `generate_organization_chart`（组织架构）/ `generate_mind_map`（思维导图）/ `generate_flow_diagram`（流程）/ `generate_fishbone_diagram`（鱼骨）/ `generate_treemap_chart`（矩形树图） | 层级数据用 `children` 嵌套 |
+| 关系图 | `generate_network_graph` / `generate_sankey_chart` / `generate_venn_chart` | |
+| 其余统计图 | 折线/面积/散点/漏斗/直方图/箱线图/小提琴/瀑布/双轴/词云/水波 | |
+| 表格 | `generate_spreadsheet` | 与现有 Markdown 表格二选一 |
+| 地理图 | `generate_district_map` / `generate_path_map` / `generate_pin_map` | ⚠️ 走**高德地图且仅支持中国境内**；本项目是海外线 → **直接禁用** |
+
+## 5. 三条落地路线
+
+### 路线 1 · MCP + 官方服务（最快，零代码，约 10 分钟）
+`.env` 的 `MCP_BUILTIN_SERVERS` 追加一条（现有两条 `bi` / `yapi` 之间用逗号连接）：
+
+```json
+{"id":"chart","label":"图表","transport":"stdio","command":"npx","args":["-y","@antv/mcp-server-chart"],"env":{"DISABLED_TOOLS":"generate_district_map,generate_path_map,generate_pin_map"},"timeoutMs":120000}
+```
+
+链路：模型取数 → 调 `generate_*_chart` → 返回图片 URL → 模型用 `![](url)` 贴进回复 → 前端 `img` 直接渲染。
+
+- ✅ 零代码、当天可见效果
+- ⚠️ **数据发往蚂蚁公开服务**，图片落在**公有 CDN**（实测无需鉴权即可访问）
+- 建议：先给该服务器加 `"requireConfirm": true`（每次出图用户确认一次），把数据外发的动作显式化
+
+### 路线 2 · MCP + 自托管 GPT-Vis-SSR（生产推荐，约 0.5～1 天）
+同上配置，只加一个 env：
+
+```json
+"env":{"VIS_REQUEST_SERVER":"http://<内网渲染服务地址>","DISABLED_TOOLS":"generate_district_map,generate_path_map,generate_pin_map"}
+```
+
+- 需部署 `@antv/gpt-vis-ssr`（HTTP 渲染服务）：Docker（抄 `antvis/mcp-server-chart` 仓库的 docker 编排）或 Node + `canvas`（原生模块，Windows 需预编译，建议 Linux 容器）
+- ✅ 数据不出内网；图片 URL 指向自己的服务
+- ⚠️ 多一个内部服务要运维；3 个地理图不支持
+
+### 路线 3 · 前端本地渲染（体验最好，约 1.5～2 天）
+web 引入 `@antv/g2`（统计图）＋ `@antv/g6`（结构/关系/树图，G2 不覆盖）± `@antv/s2`（透视表）；配套新增：
+
+1. `packages/shared` 增加 `{ type: "chart", spec, title }` 事件；
+2. 内置 `render_chart` 工具（**spec 由模型给、数值由服务端从真实工具结果注入**，防编造）；
+3. 前端图表卡片组件（深浅主题、tooltip、导出 PNG）。
+
+- ✅ 可交互、零外链、无合规风险、历史消息里长期有效、图片不会因 CDN 失效
+- ⚠️ 包体积约 +2MB；事件/组件/工具三处新代码；spec→图表的字段映射要自己定
+
+## 6. 落地必补的小件（与选哪条路线无关）
+
+1. **收窄工具位**：27 个工具会吃 schema 预算（`MCP_MAX_TOOLS=80`，超阈值会自动切 `search_tools` 按需加载）。建议 `DISABLED_TOOLS` 掉地图 3 个 + 少用的 `generate_word_cloud_chart`/`generate_liquid_chart`/`generate_violin_chart`，保留 20 个左右。
+2. **新增 chart skill**（用现有 `skills/<name>/SKILL.md` 机制，不改代码）：约束三件事——
+   - 先取数再出图，`data` 必须来自工具真实返回，**禁止编造数据点**；
+   - 只画聚合后的序列（建议 ≤50 个数据点），别把明细塞进图；
+   - 出图后**必须用 `![标题](url)` Markdown 图片语法贴进回复**，不要只给一个链接。
+3. **数据回喂**：工具返回的是图片 URL，模型看不到图本身；若要求"图与数一致"的核对，需在 skill 里要求它复述出图用的数据摘要。
+
+## 7. 风险与坑
+
+| 风险 | 说明 / 缓解 |
+|---|---|
+| 数据合规 | 路线 1 数据出内网且图在公有 CDN；缓解 = 路线 2 自托管，或路线 1 加 `requireConfirm` 显式确认 |
+| 图片可达性 | 官方 CDN 在用户网络环境可能被墙/被代理拦；自托管则只需内网可达 |
+| 工具位超载 | 27 个工具 + 现有 bi/yapi 工具，可能触发按需加载模式；用 `DISABLED_TOOLS` 收窄 |
+| Token 成本 | 模型要把数据数组塞进工具参数，明细大时很贵；skill 里限制只传聚合序列 |
+| 地理图 | 高德、仅中国境内 → 与本项目海外业务无关，直接禁用 |
+| 原生依赖 | 自托管 SSR 需 `canvas`（node-canvas）；Windows 本机编译风险高，建议容器化 |
+| 与「禁止写死」红线 | 出图选型、图表类型判断全部交模型（skill 只给通用约定，不写业务词） |
+
+## 8. 验收口径（实施时用）
+
+1. 提问「按渠道看用户分布」→ 模型先跑 `run_native_query` 取数 → 调出图工具 → **气泡内直接显示图片**，刷新后仍在；
+2. 图片 URL 来源符合选定路线（官方 CDN / 内网服务），且不暴露 API Key；
+3. 工具清单按 `DISABLED_TOOLS` 生效，工具数与服务器状态回报正确；
+4. **未勾选 chart 服务器时零回归**：纯直连路径行为与改动前一致；
+5. 抽查图表数值与 `run_native_query` 返回一致（模型未编造数据点）。
+
+## 9. 待办（下次开工从这里继续）
+
+- [ ] **决策**：数据合规口径——走官方服务（快）还是自托管（稳）
+- [ ] 路线 1 最小验证：`MCP_BUILTIN_SERVERS` 加 `chart` 条目 → 重启 agent-server-dev → 端到端出一张饼图
+- [ ] 写 `skills/chart-visualization/SKILL.md`（见 §6.2 三条约束）
+- [ ] （若自托管）部署 `@antv/gpt-vis-ssr` 并配 `VIS_REQUEST_SERVER`，验证数据不出内网
+- [ ] （若需交互）路线 3：`chart` 事件 + `render_chart` 工具 + 前端 g2/g6 组件
+- [ ] 运维提醒：改 `.env` 后需重启后端进程方可生效

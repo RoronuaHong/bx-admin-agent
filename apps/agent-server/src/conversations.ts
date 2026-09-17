@@ -48,6 +48,10 @@ interface ConversationDoc {
   pendingQueue?: PendingMessage[];
   /** 任务规划（write_todos 全量替换），跨轮持久化、前端可见。 */
   todos?: TodoItem[];
+  /** 置顶时间戳；null / 缺省 = 未置顶。置顶区固定在列表最上（新的置顶在上）。 */
+  pinnedAt?: number | null;
+  /** 手动顺序（「手动排序」模式下生效）；按下标 × `ORDER_STEP` 分配，便于中间插入。 */
+  sortOrder?: number;
 
   // ---- 模型上下文（thread）----
   /** 发往模型的对话历史（含工具轻量句柄），是上下文的唯一真相。 */
@@ -100,13 +104,37 @@ async function getColl(): Promise<Collection<ConversationDoc> | null> {
 // ---- 内存降级 ----
 const memory = new Map<string, ConversationDoc>();
 
+/**
+ * 手动顺序步长：相邻项间隔 1000，方便将来在中间插入而不必整体重排。
+ * 服务端按下标 × 本值分配 `sortOrder`。
+ */
+export const ORDER_STEP = 1000;
+
+/**
+ * 列表排序规则：置顶优先 → 手动顺序（排过的在前）→ 默认序。
+ * 默认序：置顶组按置顶时间（新的在上），普通组按最近活动。
+ *
+ * 注意：排序模式的最终裁决在前端（`convRank`）——「按最近活动」模式下前端会忽略 `sortOrder`。
+ * 这里给的是一份稳定的默认序（也是「手动排序」模式下的正确序）。
+ */
+function conversationRank(a: ConversationDoc, b: ConversationDoc): number {
+  const ap = a.pinnedAt ? 1 : 0;
+  const bp = b.pinnedAt ? 1 : 0;
+  if (ap !== bp) return bp - ap;
+  const ao = a.sortOrder ?? Number.POSITIVE_INFINITY;
+  const bo = b.sortOrder ?? Number.POSITIVE_INFINITY;
+  if (ao !== bo) return ao - bo;
+  if (ap && bp) return (b.pinnedAt || 0) - (a.pinnedAt || 0);
+  return b.updatedAt - a.updatedAt;
+}
+
 function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
   const byId = new Map<string, ConversationDoc>();
   for (const doc of list) {
     const prev = byId.get(doc.id);
     if (!prev || doc.updatedAt >= prev.updatedAt) byId.set(doc.id, doc);
   }
-  return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  return [...byId.values()].sort(conversationRank);
 }
 
 // ---- CRUD ----
@@ -256,14 +284,28 @@ export interface ConversationPatch {
   mcpServers?: string[];
   locale?: string;
   pendingQueue?: PendingMessage[];
+  /** 置顶时间戳；null = 取消置顶。 */
+  pinnedAt?: number | null;
 }
 
-/** 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。 */
+/**
+ * 只改变「列表怎么组织」、不代表对话有新活动的字段：
+ * 改它们不应刷新 `updatedAt`，否则在「按最近活动排序」下会把该对话弹到列表最前（与用户预期不符）。
+ */
+const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt"]);
+
+/**
+ * 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。
+ *
+ * 排序只应由真实活动（新消息）驱动：重命名 / 置顶这类整理动作不刷新 `updatedAt`。
+ */
 export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
-  const set: Record<string, unknown> = { updatedAt: Date.now() };
-  for (const key of ["title", "model", "mcpServers", "locale", "pendingQueue"] as const) {
+  const set: Record<string, unknown> = {};
+  for (const key of ["title", "model", "mcpServers", "locale", "pendingQueue", "pinnedAt"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
+  if (!Object.keys(set).length) return getConversation(id);
+  if (Object.keys(set).some((key) => !ACTIVITY_NEUTRAL_KEYS.has(key))) set.updatedAt = Date.now();
   const coll = await getColl();
   if (!coll) {
     const doc = memory.get(id);
@@ -273,6 +315,28 @@ export async function patchConversation(id: string, patch: ConversationPatch): P
   }
   await coll.updateOne({ id }, { $set: set });
   return getConversation(id);
+}
+
+/**
+ * 批量写入手动顺序：`ids` 的下标即新顺序（`sortOrder = index × ORDER_STEP`）。
+ *
+ * 单请求原子提交（而不是逐条 PATCH），避免中途失败留下半套顺序、以及多次请求间的竞态。
+ * 与重命名 / 置顶同理：**整理动作不刷新 `updatedAt`**，否则排序一改就会污染「最近活动」。
+ */
+export async function reorderConversations(ids: string[]): Promise<void> {
+  const unique = [...new Set(ids.filter((id) => typeof id === "string" && id))];
+  if (!unique.length) return;
+  const coll = await getColl();
+  if (!coll) {
+    unique.forEach((id, index) => {
+      const doc = memory.get(id);
+      if (doc) doc.sortOrder = index * ORDER_STEP;
+    });
+    return;
+  }
+  await Promise.all(
+    unique.map((id, index) => coll.updateOne({ id }, { $set: { sortOrder: index * ORDER_STEP } })),
+  );
 }
 
 /** 任意对话启用的 MCP server id 集合（连接引用计数用：还有对话在用就不要断开）。 */

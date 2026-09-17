@@ -309,5 +309,6 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 ## 12. 关联文档
 
 - `docs/mcp-connect-plan.md`：设计稿（含交互原型、验收标准、实施步骤）。
+- `docs/chart-visualization-plan.md`：图表可视化接入方案（AntV Chart MCP，**挂账待实施**）——含 27 个出图工具实测、官方服务 vs 自托管两条路线、数据合规口径待决策。
 - `docs/agent-infrastructure.md`：通用 Agent 基建指南，第 3/4/5/14 章对应当前实现与缺口。
 - 历史参考实现（已瘦身的登录/权限/审计/RAG/异步任务等）：`.data/trash-20260916/code/`，按需按新契约裁剪恢复。

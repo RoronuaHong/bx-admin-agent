@@ -25,6 +25,7 @@ import {
   listEnabledMcpServers,
   patchConversation,
   pullMcpServerFromAllConversations,
+  reorderConversations,
   resolveConversation,
   upsertMessages,
   type ConversationPatch,
@@ -347,7 +348,7 @@ export function createApp() {
     return c.json({ conversation: { ...doc, running: runningStreams.has(doc.id) } });
   });
 
-  // 更新对话设置：标题 / 模型 / MCP 启用集 / 语言 / 待发队列（未提供的字段保持不变）。
+  // 更新对话设置：标题 / 模型 / MCP 启用集 / 语言 / 待发队列 / 置顶（未提供的字段保持不变）。
   app.patch("/chat/conversations/:id", async (c) => {
     const body = await readJson<{
       title?: string;
@@ -355,6 +356,7 @@ export function createApp() {
       mcpServers?: string[];
       locale?: string;
       pendingQueue?: PendingMessage[];
+      pinnedAt?: number | null;
     }>(c);
     const patch: ConversationPatch = {};
     if (typeof body.title === "string") patch.title = body.title;
@@ -364,9 +366,22 @@ export function createApp() {
     }
     if (typeof body.locale === "string") patch.locale = body.locale;
     if (Array.isArray(body.pendingQueue)) patch.pendingQueue = body.pendingQueue;
+    // 置顶：null = 取消置顶，数字 = 置顶时间戳。
+    if (body.pinnedAt === null) patch.pinnedAt = null;
+    else if (typeof body.pinnedAt === "number") patch.pinnedAt = body.pinnedAt;
     const updated = await patchConversation(c.req.param("id"), patch);
     if (!updated) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     return c.json({ conversation: updated });
+  });
+
+  // 手动排序：body.ids 的下标即新顺序（一次提交，避免逐条 PATCH 的中间态与竞态）。
+  app.post("/chat/conversations/reorder", async (c) => {
+    const body = await readJson<{ ids?: string[] }>(c);
+    if (!Array.isArray(body.ids)) {
+      return errorJson(c, 400, "CHAT_CONVERSATION_INVALID_ORDER", "ids 必须为数组");
+    }
+    await reorderConversations(body.ids.filter((id): id is string => typeof id === "string"));
+    return c.json({ ok: true });
   });
 
   // 清空该对话的模型上下文（不影响 UI 消息快照）。
@@ -375,12 +390,13 @@ export function createApp() {
     return c.json({ ok: true });
   });
 
-  // ---- 设备级偏好（原前端 localStorage：主题 / 客户端默认语言 / 上次打开的对话）----
+  // ---- 设备级偏好（原前端 localStorage：主题 / 客户端默认语言 / 上次打开的对话 / 会话排序模式）----
   function prefsPayload(session: ReturnType<typeof ensureSession>) {
     return {
       activeConversationId: session.activeConversationId || "",
       theme: session.preferences?.theme || "",
       locale: session.preferences?.locale || "",
+      convSortMode: session.preferences?.convSortMode || "recent",
       // 客户端据此判断是否需要跑「旧的 localStorage 一次性迁移」。
       migratedAt: session.preferences?.migratedAt || 0,
     };
@@ -392,12 +408,18 @@ export function createApp() {
   });
 
   app.put("/chat/preferences", async (c) => {
-    const body = await readJson<{ activeConversationId?: string; theme?: "light" | "dark"; locale?: string }>(c);
+    const body = await readJson<{
+      activeConversationId?: string;
+      theme?: "light" | "dark";
+      locale?: string;
+      convSortMode?: string;
+    }>(c);
     const session = c.get("session") as Session;
     if (typeof body.activeConversationId === "string") session.activeConversationId = body.activeConversationId;
     const prefs = session.preferences || {};
     if (body.theme === "light" || body.theme === "dark") prefs.theme = body.theme;
     if (typeof body.locale === "string") prefs.locale = body.locale;
+    if (body.convSortMode === "recent" || body.convSortMode === "manual") prefs.convSortMode = body.convSortMode;
     // 首次成功写偏好 = 客户端已把（可能来自旧 localStorage 的）偏好交到后端，迁移完成。
     if (!prefs.migratedAt) prefs.migratedAt = Date.now();
     session.preferences = prefs;

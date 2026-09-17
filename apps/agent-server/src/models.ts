@@ -213,9 +213,10 @@ function toAnthropicMessages(
   return out;
 }
 
-function safeJsonParse(raw: string): unknown {
+export function safeJsonParse(raw: string): Record<string, unknown> {
   try {
-    return JSON.parse(raw || "{}");
+    const parsed = JSON.parse(raw || "{}") as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
   } catch {
     return {};
   }
@@ -415,6 +416,17 @@ function toOpenAiMessages(
   return out;
 }
 
+/**
+ * 重复惩罚（repetition penalty）：默认关闭（返回 null），避免某些网关不支持该参数时整体 400。
+ * 模型偶发把同一句话回声式重复多遍，根因在模型侧；设 MODEL_FREQUENCY_PENALTY / MODEL_PRESENCE_PENALTY
+ * 开启（0.2 / 0.1 较温和）可从源头抑制。设为 0 或 off 等同关闭。
+ */
+function parseModelPenalty(raw: string | undefined): number | null {
+  if (raw == null || raw.trim() === "") return null;
+  const v = Number(raw.trim());
+  return Number.isFinite(v) && v !== 0 ? v : null;
+}
+
 async function callOpenAi(
   model: ModelEntry,
   turns: Turn[],
@@ -429,12 +441,16 @@ async function callOpenAi(
     ...(system ? [{ role: "system", content: system }] : []),
     ...toOpenAiMessages(model, turns, images),
   ];
+  const freqPenalty = parseModelPenalty(process.env.MODEL_FREQUENCY_PENALTY);
+  const presPenalty = parseModelPenalty(process.env.MODEL_PRESENCE_PENALTY);
   const body: Record<string, unknown> = {
     model: model.name,
     max_tokens: config.maxOutputTokens,
     // 流式：边生成边回包，避免网关对慢模型整包超时。
     stream: true,
     messages,
+    ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
+    ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
     ...(hasTools(opts)
       ? {
           tools: (opts.tools || []).map((tool) => ({

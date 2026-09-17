@@ -4,8 +4,8 @@
 //           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
-import type { ChatEvent, TodoItem } from "@bx/shared";
-import { config, defaultModel, getModel, type ModelEntry } from "./config.js";
+import type { ChatEvent } from "@bx/shared";
+import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
 import { waitForConfirmation } from "./confirm.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
@@ -14,6 +14,7 @@ import {
   callAgent,
   estimateTokens,
   estimateTokensOf,
+  safeJsonParse,
   type OptionImage,
   type ToolCall,
   type ToolSpec,
@@ -26,7 +27,7 @@ import {
   toolNeedsConfirm,
   type McpToolInfo,
 } from "./mcp/hub.js";
-import type { ChatTurn, ToolHandle } from "./session.js";
+import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
 import { getUploadImage } from "./uploads.js";
 import { assembleContext } from "./history.js";
@@ -54,6 +55,14 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
+// 循环内层瞬时重试：某轮模型调用遇 SSE 断流 / 超时 / 限流等瞬态错误时重试，
+// 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
+const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
+// 成本护栏：单轮对话累计 prompt token 上限（0 = 关闭）。轮次上限之外的第二道成本闸门，
+// 防止「每轮调不同工具、不触发 Doom Loop」时轮次未到但 token 已爆。
+const MAX_TOTAL_TOKENS = Math.max(0, Number(process.env.MCP_MAX_TOTAL_TOKENS || 0));
+// 失败熔断：同一工具连续失败达阈值后，本对话内不再实际执行（避免对已挂的上游反复空耗）。
+const TOOL_FAILURE_LIMIT = Math.max(1, Number(process.env.MCP_TOOL_FAILURE_LIMIT || 3));
 
 // 子代理护栏：轮次、回传摘要上限、并发数（对齐 Deep Agents「同步子代理」语义）。
 const SUBAGENT_MAX_ROUNDS = Number(process.env.SUBAGENT_MAX_ROUNDS || 10);
@@ -81,6 +90,36 @@ async function summarizeWith(model: ModelEntry, prompt: string, signal?: AbortSi
 function truncateArgs(raw: string): string {
   const text = (raw || "").trim();
   return text.length > HANDLE_ARGS_CHARS ? `${text.slice(0, HANDLE_ARGS_CHARS)}…` : text;
+}
+
+/** 判定模型调用错误是否瞬态（可重试）：限流/5xx/超时/中断/网络抖动。4xx 等永久错误返回 false。 */
+function isTransientModelError(msg: string | null): boolean {
+  if (!msg) return false;
+  return /(?:429|503|5\d\d|timeout|timed?\s*out|abort|rate\s*limit|freeusagelimit|econn|fetch failed|network|socket|模型服务暂时不可用|gateway)/i.test(
+    msg,
+  );
+}
+
+/** 伪工具调用被拦截后的纠正提示（回灌给模型，要求走函数调用通道）。 */
+const PSEUDO_CALL_HINT =
+  "上一条回复把工具调用写成了正文文本（而不是通过函数调用通道发起），该文本已作废。\n" +
+  "请通过函数调用（tool_calls）发起工具调用；不要在回复正文里书写调用语句（JSON / XML / 方括号等）。";
+
+/**
+ * 运行时答案校验（协议级）：识别「把工具调用写成正文文本」的伪调用。
+ * 判据是「调用形态 + 已知工具名」双重命中，不涉及任何业务词：
+ * XML 标签、行首方括号、或 JSON 中 name 字段命中真实工具名。
+ */
+export function looksLikePseudoToolCall(text: string, toolNames: ReadonlySet<string>): boolean {
+  if (!text || !toolNames.size) return false;
+  for (const name of toolNames) {
+    if (!name) continue;
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`</?${esc}(?:\\s|/?>)`, "i").test(text)) return true; // <tool_name> / </tool_name> / <tool_name/>
+    if (new RegExp(`(?:^|\\n)\\s*\\[${esc}\\](?!\\()`, "i").test(text)) return true; // 行首 [tool_name]（排除 markdown 链接）
+    if (new RegExp(`"(?:name|tool|tool_name)"\\s*:\\s*"${esc}"`, "i").test(text)) return true; // {"name"/"tool":"tool_name",...}
+  }
+  return false;
 }
 
 /** 结果规模摘要（供跨轮句柄使用，不含正文）。 */
@@ -225,15 +264,6 @@ function imagesOf(ids: string[] | undefined): OptionImage[] {
     if (img) out.push({ base64: img.data.toString("base64"), mediaType: img.mediaType });
   }
   return out;
-}
-
-function parseToolArgs(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw || "{}") as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
 }
 
 /** 截断工具结果；尽量切在行边界，避免把 TSV / JSON 的某一行从中间劈开。 */
@@ -398,6 +428,16 @@ interface LoopOutcome {
   offloadedToolResults: number;
   /** 执行的工具调用次数（子代理回传规模摘要用）。 */
   toolCallCount: number;
+  /** 工具循环实际使用的轮次（模型调用次数）。 */
+  rounds: number;
+  /** 模型调用瞬时失败重试次数。 */
+  modelRetries: number;
+  /** 因连续失败被熔断跳过的工具调用次数。 */
+  toolFusions: number;
+  /** 伪工具调用被拦截纠正的次数。 */
+  pseudoCallRetries: number;
+  /** 累计发送的 prompt token 估算（成本护栏开启时统计）。 */
+  spentTokens: number;
 }
 
 /** 工具循环：模型 → tool_calls → 执行（内置 / MCP / 委派）→ 回灌 → 再调用，直到结论或轮次上限。 */
@@ -423,15 +463,65 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const executedSigs = new Set<string>();
   let roundExecuted: string[] = [];
   const guard = new LoopGuard(DOOM_LOOP_MAX_ROUNDS);
+  // 成本护栏：累计本轮已发送的 prompt token 估算；失败熔断：各工具连续失败计数。
+  let spentTokens = 0;
+  const failedTools = new Map<string, number>();
+  // 运行时统计（回填 usage 事件）：轮次 / 重试 / 熔断 / 伪调用纠正。
+  let rounds = 0;
+  let modelRetries = 0;
+  let toolFusions = 0;
+  let pseudoCallRetries = 0;
+  let pseudoCallRetried = false;
 
   for (let round = 0; round < ctx.maxRounds; round++) {
-    const outcome = yield* streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system);
+    // 成本护栏：轮次上限之外的第二道闸门。累计每轮实际发送的 prompt（历史 + 工具 schema）
+    // 估算，超过预算即停止继续调用（已生成内容仍会正常返回）。
+    if (MAX_TOTAL_TOKENS > 0) {
+      spentTokens +=
+        estimateTokensOf(conversation.map((turn) => turn.content)) +
+        (specs.length ? estimateTokens(JSON.stringify(specs)) : 0);
+      if (spentTokens > MAX_TOTAL_TOKENS) {
+        text +=
+          `\n\n（本轮已累计约 ${spentTokens} token，达到预算上限 ${MAX_TOTAL_TOKENS}，` +
+          "已停止继续调用以避免超额消耗；如需继续，请收窄问题范围或新开对话。）";
+        break;
+      }
+    }
+    let outcome: CallOutcome;
+    let callAttempt = 0;
+    // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
+    // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
+    while (true) {
+      outcome = yield* streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system);
+      if (!outcome.failure) break;
+      if (callAttempt < MODEL_CALL_RETRIES && isTransientModelError(outcome.failure)) {
+        callAttempt += 1;
+        modelRetries += 1;
+        console.log(`[chat:retry] 模型调用瞬时失败，重试 ${callAttempt}/${MODEL_CALL_RETRIES}：${outcome.failure}`);
+        continue;
+      }
+      break;
+    }
     text += outcome.text;
+    rounds = round + 1;
     if (outcome.failure) {
       failure = outcome.failure;
       break;
     }
-    if (!outcome.toolCalls.length) break;
+    if (!outcome.toolCalls.length) {
+      // 运行时校验：模型把工具调用写成正文文本（伪调用）→ 不当作终态，
+      // 作废该段文本并回灌纠正提示继续下一轮（只纠正一次，避免陷入循环）。
+      if (!pseudoCallRetried && looksLikePseudoToolCall(outcome.text, new Set(specs.map((s) => s.name)))) {
+        pseudoCallRetried = true;
+        pseudoCallRetries += 1;
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        conversation.push({ role: "assistant", content: outcome.text });
+        conversation.push({ role: "user", content: PSEUDO_CALL_HINT });
+        console.log("[chat:pseudo-call] 检出文本形式的工具调用，已作废并回灌纠正提示");
+        continue;
+      }
+      break;
+    }
 
     // 每轮重置同轮去重集合（跨轮允许重新执行，避免误杀「重新取数」等合法重复）。
     executedSigs.clear();
@@ -503,7 +593,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         executedSigs.add(sig);
         roundExecuted.push(sig);
         yield { type: "tool_call", id: call.id, name: call.name, server: BUILTIN_SERVER, args: call.argsJson };
-        const args = parseToolArgs(call.argsJson);
+        const args = safeJsonParse(call.argsJson);
         const query = String(args.query || "").trim();
         const matches = query ? searchMcpTools(ctx.mcpTools, query, Number(args.limit)) : [];
         let ok = matches.length > 0;
@@ -547,6 +637,24 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         });
         continue;
       }
+      // 失败熔断：某工具连续失败达上限后，本对话内不再实际执行（避免对已挂的上游反复空耗）。
+      const failCount = failedTools.get(call.name) || 0;
+      if (failCount >= TOOL_FAILURE_LIMIT) {
+        index += 1;
+        toolFusions += 1;
+        const fused =
+          `工具 ${call.name} 已连续失败 ${failCount} 次，本对话内暂时跳过；` +
+          "请改用其他工具，或换一种方式完成任务。";
+        yield { type: "tool_call", id: call.id, name: call.name, server: serverOf.get(call.name), args: call.argsJson };
+        yield { type: "tool_result", id: call.id, name: call.name, ok: false, text: fused };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: fused });
+        handles.push({
+          name: call.name,
+          args: truncateArgs(call.argsJson),
+          summary: `已熔断（连续失败 ${failCount} 次）`,
+        });
+        continue;
+      }
       index += 1;
       toolCallCount += 1;
       yield {
@@ -587,6 +695,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       executedSigs.add(sig);
       roundExecuted.push(sig);
       const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId);
+      // executed=false 表示并未真正执行（如按需加载模式下未检索的工具）——不计入失败熔断。
+      let executed = true;
       if (builtin) {
         ok = builtin.ok;
         rawText = builtin.text;
@@ -595,11 +705,17 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       } else if (ctx.toolSearch && specOfTool.has(call.name) && !ctx.loadedTools.has(call.name)) {
         // 按需加载模式：没检索加载过的工具不给调用（模型是照着索引里的名字猜的，参数说明它没见过）。
         ok = false;
+        executed = false;
         rawText = `工具 ${call.name} 尚未加载：请先调用 ${TOOL_SEARCH_NAME} 检索它（关键词可用工具名），加载后再调用。`;
       } else {
-        const result = await callMcpTool(call.name, parseToolArgs(call.argsJson), ctx.signal);
+        const result = await callMcpTool(call.name, safeJsonParse(call.argsJson), ctx.signal);
         ok = !result.isError;
         rawText = result.text;
+      }
+      // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
+      if (executed) {
+        if (ok) failedTools.delete(call.name);
+        else failedTools.set(call.name, (failedTools.get(call.name) || 0) + 1);
       }
       content = truncateResult(rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
@@ -624,7 +740,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     }
   }
 
-  return { text, failure, handles, clearedToolResults, offloadedToolResults, toolCallCount };
+  return {
+    text,
+    failure,
+    handles,
+    clearedToolResults,
+    offloadedToolResults,
+    toolCallCount,
+    rounds,
+    modelRetries,
+    toolFusions,
+    pseudoCallRetries,
+    spentTokens,
+  };
 }
 
 interface SubagentResult {
@@ -663,7 +791,7 @@ export function resolveSubagentTools(
  * 只回摘要（单一交接）。取消级联：沿用主代理的 abort signal。
  */
 async function runSubagent(call: ToolCall, ctx: LoopContext): Promise<SubagentResult> {
-  const args = parseToolArgs(call.argsJson);
+  const args = safeJsonParse(call.argsJson);
   const description = String(args.description || args.task || "").trim();
   if (!description) {
     return { id: call.id, args: call.argsJson, ok: false, text: "task 需要提供 description（要委派的具体任务）", toolCalls: 0 };
@@ -802,78 +930,122 @@ export async function* chatStream(
   }
   // 预算先算：窗口 − 输出预留 − 工具 schema − 本轮工具结果预算（工具定义也是纯开销）。
   const toolSchemaTokens = specs.length ? estimateTokens(JSON.stringify(specs)) : 0;
-  const budget = historyBudgetTokens(model, toolSchemaTokens);
-  // 统一上下文装配（history.ts）：窗口 → 无损裁剪 → 超预算时 LLM 摘要（水位线增量）→ 硬丢弃。
-  const assembled = await assembleContext({
-    history: conversation?.context || [],
-    userText,
-    budgetTokens: budget,
-    summary: conversation?.summary,
-    summaryCovered: conversation?.summaryCovered,
-    compact: (prompt) => summarizeWith(model, prompt, signal),
-  });
-  const turns = assembled.turns;
-  // 本次请求实际占用的估算 token（历史原文 + 摘要 + 当前输入），用于透明度展示。
-  const totalTokens =
-    estimateTokensOf(turns.map((turn) => turn.content)) + estimateTokens(assembled.summary);
-  // 摘要只在确实发生压缩时写回（水位线单调前移，下一轮增量扩展）。
-  if (assembled.usage.compacted) {
-    await setConversationSummary(conversationId, assembled.summary, assembled.summaryCovered).catch(() => undefined);
-  }
-  // 系统提示两段式：稳定前缀（角色守则 + skills 索引，可被 prompt cache 命中）
-  // + 动态后缀（长期记忆 / 历史摘要 / 回复语言）。
-  const system = buildSystemPrompt({
-    locale: conversation?.locale,
-    summary: assembled.summary || null,
-    tooling,
-    todos: conversation?.todos,
-  });
-  // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
-  const images = opts.images?.length && model.vision === "direct" ? imagesOf(opts.images) : [];
 
+  // 候选模型链：选定模型失败（瞬态 / 限流）时按注册表顺序切到下一个可用模型重试（韧性降级）。
+  // 永久错误（4xx / 配额耗尽）不切模型。每段依赖模型的预算 / 上下文装配在循环内基于候选模型重算。
+  const allModels = listModels();
+  const candidates = [model, ...allModels.filter((m) => m.id !== model.id)];
   let text = "";
   let failure: string | null = null;
   let handles: ToolHandle[] = [];
   let clearedToolResults = 0;
   let offloadedToolResults = 0;
-  if (toolMode) {
-    const outcome = yield* runLoop(
-      {
-        conversationId,
-        model,
-        images,
-        mcpTools: collected.tools,
-        specs,
-        toolSearch,
-        loadedTools: new Set<string>(),
-        system,
-        signal,
-        allowTask: true,
-        maxRounds: MAX_TOOL_ROUNDS,
-      },
-      turns,
-    );
+  let budget = 0;
+  let usedWindow = model.contextWindow;
+  let turnsCount = 0;
+  let droppedCount = 0;
+  let summarized = false;
+  let totalTokens = 0;
+  // 运行时统计（回填 usage 事件，便于可观测与成本归因）。
+  let rounds = 0;
+  let toolCalls = 0;
+  let modelRetries = 0;
+  let toolFusions = 0;
+  let pseudoCallRetries = 0;
+  let costTokens = 0;
+  let modelFallbacks = 0;
+
+  for (const m of candidates) {
+    budget = historyBudgetTokens(m, toolSchemaTokens);
+    // 上下文装配（history.ts）：窗口 → 无损裁剪 → 超预算时 LLM 摘要（水位线增量）→ 硬丢弃。
+    const assembled = await assembleContext({
+      history: conversation?.context || [],
+      userText,
+      budgetTokens: budget,
+      summary: conversation?.summary,
+      summaryCovered: conversation?.summaryCovered,
+      compact: (prompt) => summarizeWith(m, prompt, signal),
+    });
+    turnsCount = assembled.usage.turns;
+    droppedCount = assembled.usage.dropped;
+    summarized = assembled.usage.summarized;
+    const turns = assembled.turns;
+    totalTokens = estimateTokensOf(turns.map((turn) => turn.content)) + estimateTokens(assembled.summary);
+    // 摘要只在确实发生压缩时写回（水位线单调前移，下一轮增量扩展）。
+    if (assembled.usage.compacted) {
+      await setConversationSummary(conversationId, assembled.summary, assembled.summaryCovered).catch(() => undefined);
+    }
+    // 系统提示两段式：稳定前缀（角色守则 + skills 索引，可被 prompt cache 命中）
+    // + 动态后缀（长期记忆 / 历史摘要 / 回复语言）。
+    const system = buildSystemPrompt({
+      locale: conversation?.locale,
+      summary: assembled.summary || null,
+      tooling,
+      todos: conversation?.todos,
+    });
+    // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
+    const images = opts.images?.length && m.vision === "direct" ? imagesOf(opts.images) : [];
+    // 重 yield model 事件：前端据此更新当前模型标签，用户可感知已切换到备用模型。
+    yield { type: "model", id: m.id, label: m.label };
+    usedWindow = m.contextWindow;
+
+    const outcome: LoopOutcome | CallOutcome =
+      toolMode
+        ? yield* runLoop(
+            {
+              conversationId,
+              model: m,
+              images,
+              mcpTools: collected.tools,
+              specs,
+              toolSearch,
+              loadedTools: new Set<string>(),
+              system,
+              signal,
+              allowTask: true,
+              maxRounds: MAX_TOOL_ROUNDS,
+            },
+            turns,
+          )
+        : yield* streamCall(m, turns, images, [], signal, system);
     text = outcome.text;
+    const loop = outcome as LoopOutcome;
+    handles = loop.handles || [];
+    clearedToolResults = loop.clearedToolResults || 0;
+    offloadedToolResults = loop.offloadedToolResults || 0;
+    rounds = loop.rounds || 0;
+    toolCalls = loop.toolCallCount || 0;
+    modelRetries = loop.modelRetries || 0;
+    toolFusions = loop.toolFusions || 0;
+    pseudoCallRetries = loop.pseudoCallRetries || 0;
+    costTokens = loop.spentTokens || 0;
+    if (!outcome.failure) break;
     failure = outcome.failure;
-    handles = outcome.handles;
-    clearedToolResults = outcome.clearedToolResults;
-    offloadedToolResults = outcome.offloadedToolResults;
-  } else {
-    const outcome = yield* streamCall(model, turns, images, [], signal, system);
-    text = outcome.text;
-    failure = outcome.failure;
+    if (!isTransientModelError(failure)) break; // 永久错误不切模型
+    // 安全护栏：已执行过工具调用（可能含写操作 / 用户已确认的调用）时不再换模型重跑，
+    // 避免重复副作用；此时直接按失败收束（下方会保留已生成的中间结果）。
+    if (toolCalls > 0) break;
+    modelFallbacks += 1;
+    console.log(`[chat:fallback] model ${m.label} failed (${failure}); trying next candidate`);
   }
 
   const usage: ChatEvent = {
     type: "usage",
     tokens: totalTokens,
     budget,
-    window: model.contextWindow,
-    turns: assembled.usage.turns,
-    dropped: assembled.usage.dropped,
-    summarized: assembled.usage.summarized,
+    window: usedWindow,
+    turns: turnsCount,
+    dropped: droppedCount,
+    summarized,
     toolResultsCleared: clearedToolResults,
     toolResultsOffloaded: offloadedToolResults,
+    rounds,
+    toolCalls,
+    modelRetries,
+    modelFallbacks,
+    toolFusions,
+    pseudoCallRetries,
+    costTokens,
   };
 
   if (failure) {
@@ -884,12 +1056,21 @@ export async function* chatStream(
         conversationId,
         [{ role: "user", text: userText }, { role: "assistant", text: text.trim() }],
       ).catch(() => undefined);
+    } else if (text.trim()) {
+      // 模型调用中途失败：保留已生成的中间结论，避免整轮成果丢失（如限流前已产出的部分答案），
+      // 并附中断说明。仅当完全无产出时才退回纯错误提示。
+      yield {
+        type: "text",
+        text: `${text.trim()}\n\n⚠️ 生成因以下原因中断：${failure}（以上为中断前的中间结果，可能不完整）`,
+      };
     }
-    yield {
-      type: "error",
-      error: { code: "MODEL_ERROR", defaultMessage: failure },
-      message: failure,
-    };
+    if (!text.trim()) {
+      yield {
+        type: "error",
+        error: { code: "MODEL_ERROR", defaultMessage: failure },
+        message: failure,
+      };
+    }
     yield usage;
     yield { type: "done" };
     return;

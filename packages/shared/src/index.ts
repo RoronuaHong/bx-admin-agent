@@ -46,5 +46,19 @@ export type ChatEvent =
       toolResultsCleared: number;
       /** 本轮被卸载到虚拟文件系统（可 fs_read 取回）的工具结果条数。 */
       toolResultsOffloaded?: number;
+      /** 工具循环实际使用的轮次（模型调用次数）。 */
+      rounds?: number;
+      /** 本轮实际执行的工具调用次数。 */
+      toolCalls?: number;
+      /** 模型调用瞬时失败的重试次数（对用户透明的重试）。 */
+      modelRetries?: number;
+      /** 因主模型失败而切换到备用模型的次数（韧性降级）。 */
+      modelFallbacks?: number;
+      /** 因连续失败被熔断跳过的工具调用次数。 */
+      toolFusions?: number;
+      /** 伪工具调用（把调用写成文本）被拦截并纠正的次数。 */
+      pseudoCallRetries?: number;
+      /** 循环累计发送的 prompt token 估算（成本护栏开启时统计）。 */
+      costTokens?: number;
     }
   | { type: "done" };

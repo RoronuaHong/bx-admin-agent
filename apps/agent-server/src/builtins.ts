@@ -4,7 +4,7 @@
 import type { TodoItem } from "@bx/shared";
 import { fsEdit, fsList, fsRead, fsWrite } from "./fs-store.js";
 import { setConversationTodos } from "./conversations.js";
-import type { ToolSpec } from "./models.js";
+import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
 
 export const BUILTIN_SERVER = "builtin";
@@ -141,15 +141,6 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
   ];
 }
 
-function parse(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw || "{}") as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
 function str(args: Record<string, unknown>, key: string): string {
   const value = args[key];
   return typeof value === "string" ? value : "";
@@ -180,7 +171,7 @@ export async function execBuiltin(
   argsJson: string,
   conversationId: string,
 ): Promise<BuiltinOutcome | null> {
-  const args = parse(argsJson);
+  const args = safeJsonParse(argsJson);
   switch (name) {
     case "fs_write": {
       const result = fsWrite(conversationId, str(args, "path"), str(args, "content"));
