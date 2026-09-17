@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import ModelSelect from "../components/ModelSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
@@ -8,8 +8,8 @@ import { getUiLocale, detectDefaultLocale, isUiLocale, setUiLocale, type UiLocal
 import { localizeToken } from "../localize";
 import { readStoredTheme, useTheme } from "../theme";
 import {
-  clearChatContext,
   clearConversation,
+  clearConversationContext,
   confirmToolCall,
   createConversation,
   deleteConversation as apiDeleteConversation,
@@ -31,6 +31,7 @@ import {
   type ModelInfo,
   type PendingMessage,
   type StoredMessage,
+  type TodoItem,
   type UploadResult,
 } from "../api";
 
@@ -52,8 +53,8 @@ interface Bubble {
   streaming?: boolean;
   error?: string;
   steps?: ToolStep[];
-  /** 等待用户确认的工具调用（requireConfirm 的服务器）。 */
-  pending?: { id: string; name: string; args?: string } | null;
+  /** 等待用户确认的工具调用（服务器级 requireConfirm 或该工具声明为破坏性操作）。 */
+  pending?: { id: string; name: string; args?: string; reason?: string } | null;
   /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
   usage?: {
     tokens: number;
@@ -61,8 +62,12 @@ interface Bubble {
     window: number;
     turns: number;
     dropped: number;
+    summarized?: boolean;
     toolResultsCleared: number;
+    toolResultsOffloaded?: number;
   };
+  /** 任务规划（write_todos 产出，随执行推进状态）。 */
+  todos?: TodoItem[];
 }
 
 /**
@@ -130,6 +135,18 @@ const models = ref<ModelInfo[]>([]);
 const conversations = ref<ConversationDto[]>([]);
 const currentId = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
+/** 输入框元素引用：用于按内容自动撑高（交互优化）。 */
+const inputEl = ref<HTMLTextAreaElement | null>(null);
+
+/** 输入框随内容自动长高，超过上限回到滚动（交互优化）。 */
+function autoGrow() {
+  const el = inputEl.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+}
+
+watch(() => current.value.input, () => autoGrow());
 /** 设备默认语言（来自 `GET /chat/preferences`；对话未显式设置 locale 时兜底）。 */
 const deviceLocale = ref<UiLocale>(detectDefaultLocale());
 /** 设置类操作的失败提示（乐观更新回滚后告诉用户，避免"点了没反应"）。 */
@@ -269,6 +286,26 @@ function queueScroll() {
   });
 }
 
+// ---- 推理过程（任务计划 + 工具步骤）折叠：生成中默认展开，收束后自动折叠，避免长过程刷屏 ----
+const openReasoning = reactive(new Set<number>());
+
+function toggleReasoning(id: number) {
+  if (openReasoning.has(id)) openReasoning.delete(id);
+  else openReasoning.add(id);
+}
+
+function hasRunningStep(b: Bubble): boolean {
+  return !!b.steps?.some((s) => s.status === "running");
+}
+
+function reasoningTitle(b: Bubble): string {
+  const n = b.steps?.length || 0;
+  if (b.streaming && hasRunningStep(b)) return tx("推理中…", "Reasoning…");
+  if (n) return tx(`推理过程 · ${n} 步`, `Reasoning · ${n} step${n > 1 ? "s" : ""}`);
+  if (b.todos?.length) return tx("任务计划", "Plan");
+  return tx("推理过程", "Reasoning");
+}
+
 function toStored(list: Bubble[]): StoredMessage[] {
   return list
     .filter((b) => b.text || b.images?.length)
@@ -355,9 +392,10 @@ async function clearCurrent() {
   state.bubbles = [];
   state.error = "";
   // 同时清掉服务端上下文，否则旧历史仍会被带进下一轮模型请求。
+  // 必须带上对话 id：不带 id 的旧端点按“服务端活跃对话”清，切换过对话时会清错对象。
   await Promise.all([
     currentId.value ? clearConversation(currentId.value).catch(() => undefined) : Promise.resolve(),
-    clearChatContext().catch(() => undefined),
+    currentId.value ? clearConversationContext(currentId.value).catch(() => undefined) : Promise.resolve(),
   ]);
 }
 
@@ -474,6 +512,9 @@ async function send() {
     return;
   }
   const images = state.pendingImages.slice();
+  // 发送后清空输入框与待发图片（仅在这条「用户主动发送」路径清；出队/立即发送走各自入参，不碰当前输入）。
+  state.input = "";
+  state.pendingImages = [];
   await runTurn(convId, text, images.map((i) => i.id), images.map((i) => ({ id: i.id, name: i.name })));
 }
 
@@ -520,7 +561,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
   try {
     await streamChat(
       text,
-      { model: chosenModel || undefined, images: imageIds },
+      // conversationId 显式带上：不依赖服务端的活跃对话回退（多标签页时会串）。
+      { conversationId: convId, model: chosenModel || undefined, images: imageIds },
       (event) => {
         if (event.type === "text_delta") {
           reply.text += event.text;
@@ -538,6 +580,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
             args: event.args,
             status: "running",
           });
+          openReasoning.add(reply.id);
           queueScrollIfCurrent(convId);
         } else if (event.type === "tool_result") {
           const step = (reply.steps || []).find((s) => s.id === event.id);
@@ -548,7 +591,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           reply.pending = null;
           queueScrollIfCurrent(convId);
         } else if (event.type === "confirmation_required") {
-          reply.pending = { id: event.id, name: event.name, args: event.args };
+          reply.pending = { id: event.id, name: event.name, args: event.args, reason: event.reason };
           queueScrollIfCurrent(convId);
         } else if (event.type === "confirmation_response") {
           reply.pending = null;
@@ -556,6 +599,11 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
           reply.error = message;
           state.error = message;
+        } else if (event.type === "todos") {
+          // 任务规划（write_todos）：挂到当前回复气泡上，随执行推进状态。
+          reply.todos = event.todos;
+          openReasoning.add(reply.id);
+          queueScrollIfCurrent(convId);
         } else if (event.type === "usage") {
           reply.usage = {
             tokens: event.tokens,
@@ -563,10 +611,13 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
             window: event.window,
             turns: event.turns,
             dropped: event.dropped,
+            summarized: event.summarized,
             toolResultsCleared: event.toolResultsCleared,
+            toolResultsOffloaded: event.toolResultsOffloaded,
           };
         } else if (event.type === "done") {
           reply.streaming = false;
+          openReasoning.delete(reply.id);
         }
       },
       controller.signal,
@@ -778,7 +829,11 @@ function usageText(usage: NonNullable<Bubble["usage"]>): string {
     `${tx("窗口", "window")} ${usage.window}`,
   ];
   if (usage.dropped) parts.push(`${tx("已丢弃较早消息", "dropped")} ${usage.dropped}`);
+  if (usage.summarized) parts.push(tx("已生成历史摘要", "summary"));
   if (usage.toolResultsCleared) parts.push(`${tx("已清理工具结果", "cleared")} ${usage.toolResultsCleared}`);
+  if (usage.toolResultsOffloaded) {
+    parts.push(`${tx("已卸载到工作区", "offloaded")} ${usage.toolResultsOffloaded}`);
+  }
   return parts.join(" · ");
 }
 
@@ -966,10 +1021,19 @@ onBeforeUnmount(() => {
                       <span class="mcp-row__meta">
                         <span class="mcp-dot" :class="s.connected ? 'ok' : s.error ? 'err' : 'idle'"></span>
                         {{ s.transport }} ·
-                        {{ s.connected ? tx("已连接", "connected") : s.error ? tx("失败", "failed") : tx("未连接", "not connected") }}
+                        {{
+                          s.connected
+                            ? tx("已连接", "connected")
+                            : s.connecting
+                              ? tx("连接中", "connecting")
+                              : s.error
+                                ? tx("失败", "failed")
+                                : tx("未连接", "not connected")
+                        }}
                         · {{ s.tools }} {{ tx("工具", "tools") }}
                       </span>
                       <span v-if="s.error" class="mcp-row__err">{{ s.error }}</span>
+                      <span v-if="s.toolsError" class="mcp-row__err">{{ s.toolsError }}</span>
                       <span v-if="mcpExpanded === s.id && s.toolNames.length" class="mcp-tools">{{ s.toolNames.join("、") }}</span>
                     </span>
                   </label>
@@ -1005,24 +1069,55 @@ onBeforeUnmount(() => {
         </div>
         <div v-for="b in current.bubbles" :key="b.id" class="row" :class="b.role">
           <div class="bubble">
-            <div v-if="b.images?.length" class="thumbs">
-              <img v-for="img in b.images" :key="img.id" :src="`/agent/chat/upload/${img.id}`" :alt="img.name" />
-            </div>
-            <div v-if="b.steps?.length" class="steps">
-              <div v-for="step in b.steps" :key="step.id" class="step">
-                <div class="step-head">
-                  <span class="mcp-dot" :class="stepClass(step.status)"></span>
-                  <span class="step-name">{{ step.name }}</span>
-                  <span v-if="step.server" class="step-server">{{ step.server }}</span>
-                  <span class="step-status">{{ stepStatusText(step.status) }}</span>
+            <div
+              v-if="b.todos?.length || b.steps?.length"
+              class="reasoning"
+              :class="{ open: openReasoning.has(b.id) }"
+            >
+              <button class="reasoning__head" type="button" @click="toggleReasoning(b.id)">
+                <span class="reasoning__caret" aria-hidden="true"></span>
+                <span class="reasoning__title">{{ reasoningTitle(b) }}</span>
+                <span v-if="b.streaming && hasRunningStep(b)" class="reasoning__spinner" aria-hidden="true"></span>
+              </button>
+              <div v-show="openReasoning.has(b.id)" class="reasoning__body">
+                <div v-if="b.todos?.length" class="todos">
+                  <div class="todos__head">{{ tx("任务计划", "Plan") }}</div>
+                  <div v-for="(item, i) in b.todos" :key="i" class="todos__item">
+                    <span class="todos__mark" :class="item.status" aria-hidden="true">
+                      {{
+                        item.status === "completed"
+                          ? "✓"
+                          : item.status === "in_progress"
+                            ? "•"
+                            : item.status === "cancelled"
+                              ? "×"
+                              : "○"
+                      }}
+                    </span>
+                    <span
+                      class="todos__text"
+                      :class="{ done: item.status === 'completed' || item.status === 'cancelled' }"
+                    >{{ item.content }}</span>
+                  </div>
                 </div>
-                <pre v-if="step.result" class="step-result">{{ step.result }}</pre>
+                <div v-if="b.steps?.length" class="steps">
+                  <div v-for="step in b.steps" :key="step.id" class="step">
+                    <div class="step-head">
+                      <span class="mcp-dot" :class="stepClass(step.status)"></span>
+                      <span class="step-name">{{ step.name }}</span>
+                      <span v-if="step.server" class="step-server">{{ step.server }}</span>
+                      <span class="step-status">{{ stepStatusText(step.status) }}</span>
+                    </div>
+                    <pre v-if="step.result" class="step-result">{{ step.result }}</pre>
+                  </div>
+                </div>
               </div>
             </div>
             <div v-if="b.pending" class="confirm-card">
               <div class="confirm-text">
                 {{ tx("工具调用需要确认", "This tool call needs your approval") }}：<b>{{ b.pending.name }}</b>
               </div>
+              <div v-if="b.pending.reason" class="confirm-reason">{{ b.pending.reason }}</div>
               <pre v-if="b.pending.args" class="confirm-args">{{ b.pending.args }}</pre>
               <div class="confirm-ops">
                 <button type="button" class="mcp-primary" @click="answerToolConfirm(b, true)">
@@ -1032,6 +1127,9 @@ onBeforeUnmount(() => {
                   {{ tx("拒绝", "Deny") }}
                 </button>
               </div>
+            </div>
+            <div v-if="b.images?.length" class="thumbs">
+              <img v-for="img in b.images" :key="img.id" :src="`/agent/chat/upload/${img.id}`" :alt="img.name" />
             </div>
             <div v-if="b.role === 'user'" class="plain">{{ b.text }}</div>
             <div v-else-if="b.text" class="md" v-html="renderChatMarkdown(b.text)"></div>
@@ -1138,11 +1236,13 @@ onBeforeUnmount(() => {
           </button>
           <textarea
             id="chat-input"
+            ref="inputEl"
             v-model="current.input"
             class="input"
             name="message"
             rows="1"
             :placeholder="tx('输入消息，Enter 发送，Shift+Enter 换行', 'Type a message. Enter to send, Shift+Enter for a new line')"
+            @input="autoGrow"
             @keydown="onKeydown"
           ></textarea>
           <button v-if="current.sending" class="send stop" type="button" @click="stop">
@@ -1453,19 +1553,12 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
-.mcp-panel__head,
-.mcp-panel__foot {
+.mcp-panel__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   padding: 2px 2px 8px;
-}
-
-.mcp-panel__foot {
-  padding: 8px 2px 0;
-  border-top: 1px solid var(--line);
-  margin-top: 6px;
 }
 
 .mcp-list {
@@ -1630,55 +1723,6 @@ onBeforeUnmount(() => {
   word-break: break-word;
 }
 
-.mcp-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-}
-
-.mcp-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.mcp-input {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--fill);
-  color: var(--ink);
-  padding: 6px 8px;
-  font: inherit;
-  font-size: 13px;
-  resize: vertical;
-}
-
-.mcp-input:focus-visible {
-  outline: none;
-  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
-  box-shadow: var(--ring);
-}
-
-.mcp-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.mcp-form__ops {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .mcp-primary {
   display: inline-flex;
   align-items: center;
@@ -1768,6 +1812,12 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--stop) 8%, transparent);
   font-size: 13px;
+}
+
+.confirm-reason {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .confirm-args {
@@ -1891,6 +1941,132 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
   font-size: 12px;
   color: var(--danger);
+}
+
+/* 任务计划（write_todos）：状态标记不只靠颜色（✓/•/○/× 字形 + 文案删除线）。 */
+.todos {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.todos__head {
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.todos__item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 2px 0;
+  line-height: 1.5;
+}
+
+.todos__mark {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.todos__mark.completed {
+  color: color-mix(in srgb, #2f9e63 85%, var(--ink));
+}
+
+.todos__mark.in_progress {
+  color: var(--stop);
+}
+
+.todos__mark.cancelled {
+  color: var(--danger);
+}
+
+.todos__text.done {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+/* 推理过程（任务计划 + 工具步骤）折叠：生成中展开、收束后折叠，避免长过程刷屏。 */
+.reasoning {
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fill-soft) 55%, transparent);
+  overflow: hidden;
+}
+
+.reasoning__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.15s ease;
+}
+
+.reasoning__head:hover {
+  color: var(--ink);
+}
+
+.reasoning__caret {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.18s ease;
+}
+
+.reasoning.open .reasoning__caret {
+  transform: rotate(45deg);
+}
+
+.reasoning__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning__spinner {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid color-mix(in srgb, var(--ink) 22%, transparent);
+  border-top-color: var(--stop);
+  border-radius: 50%;
+  animation: reason-spin 0.7s linear infinite;
+}
+
+@keyframes reason-spin {
+  to { transform: rotate(360deg); }
+}
+
+.reasoning__body {
+  padding: 2px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reasoning__body .todos,
+.reasoning__body .steps {
+  margin-bottom: 0;
 }
 
 /* 待发队列：忙时入队、成功收束后按序自动发；出错/待确认时停下等用户。 */

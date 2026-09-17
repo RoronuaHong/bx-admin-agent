@@ -83,7 +83,6 @@ export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
   sessionTtlMs: Number(process.env.SESSION_TTL_MS || 8 * 60 * 60 * 1000),
-  modelTimeoutMs: Number(process.env.MODEL_TIMEOUT_MS || 120000),
   /** 单次回复输出上限（token）。上下文预算会为它预留空间，故必须与实际请求值一致。 */
   maxOutputTokens: Number(process.env.MODEL_MAX_OUTPUT_TOKENS || 8192),
 };

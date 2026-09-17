@@ -3,7 +3,7 @@ import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { config, defaultModel, listModels } from "./config.js";
 import { listEnabledMcpServers } from "./conversations.js";
-import { connect, disconnectAll } from "./mcp/hub.js";
+import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
 
 const app = createApp();
 
@@ -20,6 +20,8 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   if (!defaultModel()) {
     console.warn("[警告] 未配置任何模型（MODEL_PROVIDERS），聊天将提示未配置。");
   }
+  // 周期回收空闲 MCP 连接（stdio 子进程不常驻），下次用到时自动重连。
+  startIdleSweeper();
   // 任意对话启用了的 MCP 服务器：启动后自动重连，否则面板会一直显示"未连接"，与勾选状态矛盾。
   void listEnabledMcpServers().then((ids) => {
     for (const id of ids) void connect(id);

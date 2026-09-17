@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { getCookie, setCookie } from "hono/cookie";
 import { config, listModels } from "./config.js";
 import { answerConfirmation } from "./confirm.js";
-import { connect, disconnect, disconnectAll, listStatuses, reload } from "./mcp/hub.js";
+import { connect, disconnect, listStatuses, reload } from "./mcp/hub.js";
 import {
   deleteServer,
   loadServers,
@@ -13,7 +13,8 @@ import {
   validateServerInput,
   type McpServerConfig,
 } from "./mcp/config.js";
-import { clearSessionContext, ensureSession, SESSION_COOKIE, touchSession } from "./session.js";
+import { ensureSession, SESSION_COOKIE, touchSession, type Session } from "./session.js";
+import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import {
   clearContext,
   clearConversation,
@@ -31,16 +32,24 @@ import {
   type StoredMessage,
 } from "./conversations.js";
 import { chatStream } from "./chat.js";
+import { fsRemoveConversation } from "./fs-store.js";
 import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 
 const COOKIE = SESSION_COOKIE;
+
+// 会话中间件写入的上下文变量类型声明，使 c.set("session") / c.get("session") 类型安全。
+declare module "hono" {
+  interface ContextVariableMap {
+    session: Session;
+  }
+}
 
 /**
  * 正在进行的对话流（对话级并发保护，非全局）：
  * 同一对话同时只允许一条流在写 context —— 第二个请求返回 409，由前端转入待发队列。
  * 不同对话互不影响，可真正并行。
  */
-const runningStreams = new Map<string, number>();
+const runningStreams = new Set<string>();
 // 单条用户输入上限（字符）：超出直接截断，避免超长输入打爆模型上下文。
 const MAX_INPUT_LEN = Math.max(1, Number(process.env.CHAT_MAX_INPUT_LEN || 8000));
 
@@ -81,19 +90,53 @@ function resolveModelSource(baseUrl: string, provider: string): string {
 
 export function createApp() {
   const app = new Hono();
+  // CORS 来源：以配置 webOrigin 为主，额外允许 CHAT_CORS_ORIGINS（逗号分隔）与本地开发端口。
+  const corsOrigins = Array.from(
+    new Set([
+      config.webOrigin,
+      ...(process.env.CHAT_CORS_ORIGINS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      "http://localhost:5173",
+      "http://localhost:5174",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:5174",
+    ]),
+  );
+
   app.use(
     "*",
     cors({
-      origin: [
-        config.webOrigin,
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-      ],
+      origin: corsOrigins,
       credentials: true,
     }),
   );
+
+  // 请求日志：method / path / 状态码 / 耗时，便于排查与审计。
+  app.use("*", async (c, next) => {
+    const start = Date.now();
+    await next();
+    console.log(`[http] ${c.req.method} ${c.req.path} ${c.res.status} ${Date.now() - start}ms`);
+  });
+
+  // 基础安全响应头（内联实现，避免额外依赖）。
+  app.use("*", async (c, next) => {
+    await next();
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("X-Frame-Options", "DENY");
+    c.header("Referrer-Policy", "no-referrer");
+  });
+
+  // 会话中间件（仅 chat 域）：统一解析匿名 cookie 会话并在新会话时回写 cookie，
+  // handler 直接取 c.get("session")，消除各路由重复解析与回写不一致。
+  app.use("/chat/*", async (c, next) => {
+    const sessionId = getCookie(c, COOKIE);
+    const session = ensureSession(sessionId);
+    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+    c.set("session", session);
+    await next();
+  });
 
   app.get("/health", (c) => c.json({ ok: true }));
 
@@ -126,9 +169,7 @@ export function createApp() {
   // ---- 对话级 MCP 启用集（按对话持久化，不再是 cookie 级的全局启用集）----
   // 会话靠匿名 cookie 识别：首次访问要回写 cookie，否则每次请求都是新会话。
   app.get("/chat/mcp/servers", async (c) => {
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
-    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+    const session = c.get("session") as Session;
     const conversationId = c.req.query("conversationId") || session.activeConversationId || "";
     const doc = conversationId ? await getConversation(conversationId) : null;
     return c.json({
@@ -140,9 +181,7 @@ export function createApp() {
 
   app.put("/chat/mcp/servers", async (c) => {
     const body = await readJson<{ conversationId?: string; enabled?: string[] }>(c);
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
-    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+    const session = c.get("session") as Session;
     const conversationId = await resolveConversation(
       session,
       typeof body.conversationId === "string" && body.conversationId ? body.conversationId : undefined,
@@ -189,9 +228,7 @@ export function createApp() {
       const body = await readJson<{ text?: string; model?: string; images?: string[]; conversationId?: string }>(c);
       const text = String(body.text || "").trim().slice(0, MAX_INPUT_LEN);
       if (!text) return errorJson(c, 400, "CHAT_EMPTY_INPUT", "请输入内容");
-      const sessionId = getCookie(c, COOKIE);
-      const session = ensureSession(sessionId);
-      if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+      const session = c.get("session") as Session;
 
       // 解析本次所属对话（thread）：显式传入优先；否则用会话的活跃对话
       // （首次访问会创建「默认对话」并把旧 session.messages / mcpServers 迁移进去）。
@@ -208,7 +245,7 @@ export function createApp() {
       if (runningStreams.has(conversationId)) {
         return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
       }
-      runningStreams.set(conversationId, Date.now());
+      runningStreams.add(conversationId);
 
       return streamNdjson(async (send) => {
         try {
@@ -235,16 +272,21 @@ export function createApp() {
     }
   });
 
-  // 清空服务端上下文（兼容旧前端）。@deprecated 请改用 POST /chat/conversations/:id/context/clear
-  app.post("/chat/context/clear", async (c) => {
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
-    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
-    // 上下文的唯一真相已迁到对话，这里同步清掉，避免旧调用"看起来没生效"。
-    const conversationId = await resolveConversation(session);
-    await clearContext(conversationId);
-    const ok = clearSessionContext(sessionId);
-    return c.json({ ok, conversationId });
+  // ---- 长期记忆（跨对话注入的小体积事实，持久化在 .data/memory.json）----
+  app.get("/chat/memory", (c) => c.json({ memory: listMemory() }));
+
+  app.post("/chat/memory", async (c) => {
+    const body = await readJson<{ text?: string }>(c);
+    const text = String(body.text || "").trim();
+    if (!text) return errorJson(c, 400, "MEMORY_EMPTY_TEXT", "请输入要记住的内容");
+    return c.json({ memory: addMemory(text) });
+  });
+
+  // 删单条；不带 id 的 DELETE /chat/memory 表示清空。
+  app.delete("/chat/memory/:id", (c) => c.json({ ok: removeMemory(c.req.param("id")) }));
+  app.delete("/chat/memory", (c) => {
+    clearMemory();
+    return c.json({ ok: true });
   });
 
   // ---- 聊天记录持久化 ----
@@ -263,7 +305,7 @@ export function createApp() {
     const doc = await createConversation({ id, title: body.title || "新对话" });
     // 新建即激活：让仍不带 conversationId 的旧客户端也落在新对话上，
     // 否则回退到 activeConversationId 会读到上一个对话的启用集（新对话看起来"默认勾了 MCP"）。
-    const session = ensureSession(getCookie(c, COOKIE));
+    const session = c.get("session") as Session;
     session.activeConversationId = id;
     touchSession(session);
     return c.json({ conversation: { ...doc, running: runningStreams.has(id) } });
@@ -281,9 +323,9 @@ export function createApp() {
   app.delete("/chat/conversations/:id", async (c) => {
     const id = c.req.param("id");
     await deleteConversation(id);
+    fsRemoveConversation(id); // 级联清理该对话的虚拟工作区
     // 删掉的正好是活跃对话时清空指针，避免回退到一个已不存在的 id。
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
+    const session = c.get("session") as Session;
     if (session.activeConversationId === id) {
       session.activeConversationId = "";
       touchSession(session);
@@ -345,17 +387,13 @@ export function createApp() {
   }
 
   app.get("/chat/preferences", (c) => {
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
-    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+    const session = c.get("session") as Session;
     return c.json(prefsPayload(session));
   });
 
   app.put("/chat/preferences", async (c) => {
     const body = await readJson<{ activeConversationId?: string; theme?: "light" | "dark"; locale?: string }>(c);
-    const sessionId = getCookie(c, COOKIE);
-    const session = ensureSession(sessionId);
-    if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
+    const session = c.get("session") as Session;
     if (typeof body.activeConversationId === "string") session.activeConversationId = body.activeConversationId;
     const prefs = session.preferences || {};
     if (body.theme === "light" || body.theme === "dark") prefs.theme = body.theme;
@@ -412,6 +450,15 @@ export function createApp() {
       },
     });
   });
+
+  // 全局兜底：未捕获异常统一返回 JSON 错误（而非 Hono 默认 HTML 500）。
+  app.onError((err, c) => {
+    console.error("[http] unhandled error:", err);
+    return errorJson(c, 500, "INTERNAL_ERROR", "服务器内部错误");
+  });
+
+  // 未知路由统一返回 JSON 404（而非 Hono 默认 HTML 404）。
+  app.notFound((c) => errorJson(c, 404, "NOT_FOUND", "资源不存在"));
 
   return app;
 }

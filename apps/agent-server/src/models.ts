@@ -74,8 +74,12 @@ export interface AgentResult {
 export interface CallOptions {
   tools?: ToolSpec[];
   toolChoice?: "auto" | "none" | "required";
-  /** 追加到系统提示的内容（长期记忆、历史摘要等），保持在同一条 system 消息里利于命中缓存。 */
-  systemExtra?: string;
+  /**
+   * 系统提示的两段式形态（Deep Agents 的 prompt caching 思路）：
+   * `stable` 跨轮不变（角色守则 + skills 索引）→ anthropic 加 cache_control 标记缓存；
+   * `dynamic` 低频变化（记忆 / 摘要 / 语言）。OpenAI 兼容通道的隐式前缀缓存无需标记。
+   */
+  systemParts?: { stable: string; dynamic: string };
 }
 
 export async function callAgent(
@@ -88,7 +92,7 @@ export async function callAgent(
 ): Promise<AgentResult> {
   switch (model.provider) {
     case "anthropic":
-      return callAnthropic(model, turns, images, signal, opts);
+      return callAnthropic(model, turns, images, signal, onDelta, opts);
     case "openai":
       return callOpenAi(model, turns, images, signal, onDelta, opts);
     default:
@@ -100,9 +104,28 @@ function hasTools(opts: CallOptions): boolean {
   return Array.isArray(opts.tools) && opts.tools.length > 0;
 }
 
-/** 系统提示 = 固定引导 + 本次额外上下文（记忆/摘要）。 */
+/** 系统提示 = 两段式（稳定段 + 动态段），缺失时退化为固定引导。 */
 function systemPrompt(opts: CallOptions): string {
-  return [chatGuideSystem(), opts.systemExtra].filter((part) => part && part.trim()).join("\n\n");
+  const parts: string[] = [chatGuideSystem()];
+  if (opts.systemParts) parts.push(opts.systemParts.stable, opts.systemParts.dynamic);
+  return parts.filter((part) => part && part.trim()).join("\n\n");
+}
+
+/**
+ * anthropic 的 system 形态：两段式时把稳定段标记为可缓存（cache_control ephemeral），
+ * 动态段跟随其后 —— 摘要/记忆变化只破坏后缀，前缀仍命中。
+ */
+function anthropicSystem(opts: CallOptions): string | Array<Record<string, unknown>> | undefined {
+  if (!opts.systemParts) {
+    const system = systemPrompt(opts);
+    return system || undefined;
+  }
+  const { stable, dynamic } = opts.systemParts;
+  if (!stable && !dynamic) return undefined;
+  const blocks: Array<Record<string, unknown>> = [];
+  if (stable) blocks.push({ type: "text", text: stable, cache_control: { type: "ephemeral" } });
+  if (dynamic) blocks.push({ type: "text", text: dynamic });
+  return blocks;
 }
 
 // ---- 多 key 轮询与限流重试 ----
@@ -202,15 +225,18 @@ async function callAnthropic(
   model: ModelEntry,
   turns: Turn[],
   images: OptionImage[],
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  onDelta: ((chunk: string) => void) | undefined,
   opts: CallOptions = {},
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
   const messages = toAnthropicMessages(model, turns, images);
-  const system = systemPrompt(opts);
+  const system = anthropicSystem(opts);
   const body: Record<string, unknown> = {
     model: model.name,
     max_tokens: config.maxOutputTokens,
+    // 流式：边生成边回包，避免网关对慢模型整包超时（不支持时按非流式降级解析）。
+    stream: true,
     ...(system ? { system } : {}),
     messages,
     ...(hasTools(opts)
@@ -236,29 +262,114 @@ async function callAnthropic(
       signal: timeoutSignalOf(model, signal),
     }),
   );
-  const bodyResult = (await response.json().catch(() => null)) as {
-    content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
-  } | null;
+  const isStream = (response.headers.get("content-type") || "").includes("text/event-stream");
+  if (!isStream) {
+    // 网关不支持流式：按整包 JSON 解析（保持原有语义）。
+    const bodyResult = (await response.json().catch(() => null)) as {
+      content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
+    } | null;
+    if (!response.ok) {
+      const detail = bodyResult ? JSON.stringify(bodyResult).slice(0, 500) : "";
+      if (response.status === 503) {
+        throw new Error(
+          `model http 503: 模型服务暂时不可用（过载或维护中），请稍后重试（${model.name}）。原始错误：${detail}`,
+        );
+      }
+      throw new Error(`model http ${response.status}: ${detail}`);
+    }
+    const blocks = bodyResult?.content || [];
+    return {
+      text: blocks
+        .filter((block) => block.type === "text")
+        .map((block) => block.text || "")
+        .join("")
+        .trim(),
+      toolCalls: blocks
+        .filter((block) => block.type === "tool_use")
+        .map((block, index) => ({
+          id: block.id || `tool_${index}`,
+          name: block.name || "",
+          argsJson: JSON.stringify(block.input ?? {}),
+        })),
+    };
+  }
   if (!response.ok) {
-    const detail = bodyResult ? JSON.stringify(bodyResult).slice(0, 500) : "";
+    const detail = (await response.text().catch(() => "")).slice(0, 500);
     if (response.status === 503) {
       throw new Error(`model http 503: 模型服务暂时不可用（过载或维护中），请稍后重试（${model.name}）。原始错误：${detail}`);
     }
     throw new Error(`model http ${response.status}: ${detail}`);
   }
-  const blocks = bodyResult?.content || [];
-  const text = blocks
-    .filter((block) => block.type === "text")
-    .map((block) => block.text || "")
-    .join("")
-    .trim();
-  const toolCalls: ToolCall[] = blocks
-    .filter((block) => block.type === "tool_use")
-    .map((block, index) => ({
-      id: block.id || `tool_${index}`,
-      name: block.name || "",
-      argsJson: JSON.stringify(block.input ?? {}),
-    }));
+  if (!response.body) throw new Error("model http 200: 响应缺少流式 body");
+
+  // 解析 SSE：event 行给出事件名，data 行是 JSON 负载（text_delta / input_json_delta / message_stop）。
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "";
+  let text = "";
+  // 工具调用按 content block 的 index 累积：start 给 id/name，delta 给 arguments 片段。
+  const pendingTools = new Map<number, { id: string; name: string; args: string }>();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim();
+        continue;
+      }
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      let event: {
+        type?: string;
+        index?: number;
+        delta?: { type?: string; text?: string; partial_json?: string; stop_reason?: string };
+        content_block?: { type?: string; id?: string; name?: string };
+      };
+      try {
+        event = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+        const index = typeof event.index === "number" ? event.index : 0;
+        pendingTools.set(index, {
+          id: event.content_block.id || "",
+          name: event.content_block.name || "",
+          args: "",
+        });
+        continue;
+      }
+      if (event.type === "content_block_delta") {
+        const index = typeof event.index === "number" ? event.index : 0;
+        if (event.delta?.type === "text_delta" && event.delta.text) {
+          text += event.delta.text;
+          onDelta?.(event.delta.text);
+        } else if (event.delta?.type === "input_json_delta" && event.delta.partial_json) {
+          const current = pendingTools.get(index) || { id: "", name: "", args: "" };
+          current.args += event.delta.partial_json;
+          pendingTools.set(index, current);
+        }
+        continue;
+      }
+      if (event.type === "error") {
+        throw new Error(`model stream error: ${payload.slice(0, 300)}`);
+      }
+      if (eventName === "message_stop" || event.type === "message_stop") break;
+    }
+  }
+  const toolCalls: ToolCall[] = [...pendingTools.entries()]
+    .map(([index, call]) => ({
+      id: call.id || `tool_${index}`,
+      name: call.name,
+      argsJson: call.args || "{}",
+    }))
+    .filter((call) => call.name);
   return { text, toolCalls };
 }
 
@@ -367,7 +478,8 @@ async function callOpenAi(
   let text = "";
   // 流式工具调用是分片增量（index/id/name/arguments 分别到达），按 index 累积拼接。
   const pendingTools = new Map<number, { id: string; name: string; args: string }>();
-  while (true) {
+  let finished = false;
+  while (!finished) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -377,7 +489,10 @@ async function callOpenAi(
       const line = rawLine.trim();
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") break;
+      if (payload === "[DONE]") {
+        finished = true;
+        break;
+      }
       let chunk: {
         choices?: Array<{
           delta?: {
@@ -401,7 +516,8 @@ async function callOpenAi(
         const index = typeof part.index === "number" ? part.index : 0;
         const current = pendingTools.get(index) || { id: "", name: "", args: "" };
         if (part.id) current.id = part.id;
-        if (part.function?.name) current.name += part.function.name;
+        // 工具名只在首个分片出现；重复分片时不要拼接成 "namenamename"（部分网关每片都回传 name）。
+        if (part.function?.name && !current.name) current.name = part.function.name;
         if (part.function?.arguments) current.args += part.function.arguments;
         pendingTools.set(index, current);
       }
@@ -433,7 +549,7 @@ async function callOllama(
       : { role: turn.role, content: turn.content },
   );
   const last = plain[plain.length - 1];
-  const system = chatGuideSystem();
+  const system = systemPrompt(opts);
   const ollamaMessages = [
     ...(system ? [{ role: "system", content: system }] : []),
     ...plain.slice(0, -1).map((turn) => ({ role: turn.role, content: turn.content })),

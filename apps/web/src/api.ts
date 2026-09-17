@@ -8,6 +8,12 @@ export interface ApiErrorPayload {
   error: LocalizedToken;
 }
 
+/** 任务规划条目（与后端 @bx/shared 对齐）。 */
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+}
+
 export type ChatEvent =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
@@ -16,6 +22,7 @@ export type ChatEvent =
   | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
   | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
   | { type: "confirmation_response"; id: string; confirmed: boolean }
+  | { type: "todos"; todos: TodoItem[] }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
   | {
       /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
@@ -25,7 +32,9 @@ export type ChatEvent =
       window: number;
       turns: number;
       dropped: number;
+      summarized?: boolean;
       toolResultsCleared: number;
+      toolResultsOffloaded?: number;
     }
   | { type: "done" };
 
@@ -110,7 +119,7 @@ export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
 /** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
 export async function streamChat(
   text: string,
-  opts: { model?: string; images?: string[] },
+  opts: { conversationId?: string; model?: string; images?: string[] },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ) {
@@ -155,8 +164,9 @@ export async function streamChat(
   }
 }
 
-export async function clearChatContext() {
-  return jsonFetch("/agent/chat/context/clear", { method: "POST" });
+/** 清空指定对话的服务端模型上下文（不影响 UI 消息快照）。 */
+export async function clearConversationContext(id: string) {
+  return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/context/clear`, { method: "POST" });
 }
 
 // ---- 会话持久化（服务端存储）----
@@ -218,17 +228,6 @@ export async function clearConversation(id: string) {
 }
 
 /** 取单个对话全量文档（含 context；切换对话时载入用）。 */
-export async function fetchConversation(id: string): Promise<ConversationDto | null> {
-  try {
-    const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`)) as {
-      conversation: ConversationDto;
-    };
-    return data.conversation || null;
-  } catch {
-    return null;
-  }
-}
-
 /** 更新对话级设置（只传要改的字段；服务端未提供的字段保持不变）。 */
 export async function patchConversation(
   id: string,
@@ -298,7 +297,11 @@ export interface McpServerStatus {
   transport: string;
   enabled: boolean;
   connected: boolean;
+  /** 连接过程进行中（尚未列完工具）。 */
+  connecting?: boolean;
   error?: string;
+  /** 连接正常但工具清单（listTools）获取失败的原因。 */
+  toolsError?: string;
   tools: number;
   toolNames: string[];
 }
@@ -309,6 +312,8 @@ export interface McpServerInput extends Partial<Omit<McpServerPublic, "envKeys" 
   headers?: Record<string, string>;
 }
 
+// 以下三个是「服务器增删改」的 API 层：当前前端只有启用/禁用（按对话持久化），
+// 暂无管理面板 UI；保留给后续管理界面或直接 curl 服务端端点使用。
 export async function fetchMcpServers(): Promise<McpServerPublic[]> {
   const data = (await jsonFetch("/agent/mcp/servers")) as { servers: McpServerPublic[] };
   return data.servers || [];

@@ -13,6 +13,7 @@
 //   YAPI_CALL_BASES        可选：调用真实接口的地址，格式 `项目id=基地址` 逗号分隔，如 23=http://x,69=http://y
 //   YAPI_CALL_HEADERS      可选：全局请求头，格式 `名: 值` 逗号分隔（如 clientType: 5）
 //   YAPI_CALL_HEADERS_<id> 可选：某项目的请求头（同上格式），优先级高于全局
+//   YAPI_CALL_QUERY_<id>   可选：某项目的固定 query 参数（`键=值` 逗号分隔；某些服务缺了会返回加密响应，如 clientType=5）
 //   YAPI_CALL_TOKEN        可选：固定 Bearer token（填了就不再自动登录）
 //   YAPI_CALL_LOGIN_NAME   业务后台账号（自动登录换 token 用）
 //   YAPI_CALL_LOGIN_PASSWORD 业务后台密码
@@ -242,6 +243,19 @@ function parseHeaders(raw) {
   return out;
 }
 
+/** 解析 `键=值` 列表（用于项目级固定 query 参数）。 */
+function parsePairs(raw) {
+  const out = [];
+  for (const item of String(raw || "").split(",")) {
+    const eq = item.indexOf("=");
+    if (eq <= 0) continue;
+    const key = item.slice(0, eq).trim();
+    const value = item.slice(eq + 1).trim();
+    if (key) out.push([key, value]);
+  }
+  return out;
+}
+
 /** 该项目调用时要带的请求头：全局 + 项目级（覆盖同名），不含 Authorization。 */
 function baseHeaders(projectId) {
   const merged = new Map();
@@ -283,8 +297,11 @@ async function bizToken(projectId, { refresh = false } = {}) {
 
   const base = await callBaseFor(projectId);
   if (!base) return "";
+  // 登录网关可能与调用域名不同（同一账号体系下的不同服务域名）
+  const loginBase =
+    (process.env[`YAPI_CALL_LOGIN_BASE_${projectId}`] || "").trim().replace(/\/+$/, "") || base;
   const nameField = (process.env[`YAPI_CALL_LOGIN_FIELD_${projectId}`] || "loginName").trim();
-  const res = await fetch(`${base}${loginPath.startsWith("/") ? loginPath : `/${loginPath}`}`, {
+  const res = await fetch(`${loginBase}${loginPath.startsWith("/") ? loginPath : `/${loginPath}`}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...baseHeaders(projectId) },
     body: JSON.stringify({ [nameField]: name, password }),
@@ -326,7 +343,9 @@ async function callBaseFor(projectId) {
 
 /**
  * Authorization 的写法在不同后端不一样：有的要 `Bearer <token>`，有的直接放裸 token。
- * 默认先按 Bearer 试，401 就换另一种，成功的那种在进程内记住（也可用 YAPI_CALL_AUTH_SCHEME 固定）。
+ * 实测：电影后台网关（13100）对 Bearer 返回 401，stat-report 对 Bearer 返回 400，
+ * 所以默认先按裸 token 试，鉴权不符（401 或 400 参数校验错）自动换另一种，成功的在进程内记住
+ * （也可用 YAPI_CALL_AUTH_SCHEME 固定）。
  */
 const AUTH_BEARER = "bearer";
 const AUTH_RAW = "raw";
@@ -343,7 +362,8 @@ function authStyles(projectId) {
   if (configured === "raw") return [AUTH_RAW];
   if (configured === "bearer") return [AUTH_BEARER];
   const cachedStyle = authStyleCache.get(projectId);
-  return cachedStyle ? [cachedStyle, cachedStyle === AUTH_RAW ? AUTH_BEARER : AUTH_RAW] : [AUTH_BEARER, AUTH_RAW];
+  if (cachedStyle) return [cachedStyle, cachedStyle === AUTH_RAW ? AUTH_BEARER : AUTH_RAW];
+  return [AUTH_RAW, AUTH_BEARER];
 }
 
 const normPath = (p) =>
@@ -489,7 +509,6 @@ const TOOLS = [
         title: d.title,
         method: String(d.method || "").toUpperCase(),
         path: d.path,
-        status: d.status,
         project_id: d.project_id === undefined ? undefined : String(d.project_id),
         catid: d.catid === undefined ? undefined : String(d.catid),
         tag: Array.isArray(d.tag) ? d.tag : undefined,
@@ -510,7 +529,7 @@ const TOOLS = [
   {
     name: "call_api",
     description:
-      "只读调用接口：按文档里的路径发一个 **GET** 请求，拿真实响应（用于核对文档与实际数据是否一致）。仅支持 GET —— 写操作（POST/PUT/DELETE）一律不执行、也不要尝试。鉴权由服务端配置（固定 token 或自动登录），调用方不需要也不能传 token。",
+      "只读调用接口：按文档里的路径发一个 **GET** 请求，拿真实响应。用户问到某类数据时，先用它调用接口拿到真实数据，再整理成表格回答。仅支持 GET —— 写操作（POST/PUT/DELETE）一律不执行、也不要尝试。鉴权由服务端配置（固定 token 或自动登录），调用方不需要也不能传 token。",
     inputSchema: {
       type: "object",
       properties: {
@@ -554,6 +573,8 @@ const TOOLS = [
       } catch {
         return json(`调用地址拼接失败：${base} + ${apiPath}`, true);
       }
+      // 项目级固定 query 优先（某些服务缺了它会返回加密响应），用户传的同名参数可覆盖
+      for (const [k, v] of parsePairs(process.env[`YAPI_CALL_QUERY_${pid}`])) url.searchParams.set(k, v);
       for (const [k, v] of Object.entries(query || {})) {
         if (v === undefined || v === null || v === "") continue;
         url.searchParams.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
@@ -566,10 +587,10 @@ const TOOLS = [
         return json(String(err?.message || err), true);
       }
 
-      const send = (bearer, style) => {
+      const sendTo = (target, bearer, style) => {
         const headers = { Accept: "application/json", ...baseHeaders(pid) };
         if (bearer) headers.Authorization = authHeaderValue(bearer, style);
-        return fetch(url, {
+        return fetch(target, {
           method: "GET",
           headers,
           redirect: "manual",
@@ -579,35 +600,60 @@ const TOOLS = [
 
       const started = Date.now();
       const cap = Math.max(200, Math.min(num(response_chars, 4000), MAX_CALL_CHARS));
+      let res = null;
+      let text = "";
+      let usedStyle = "";
+      let prefixNote = "";
+      /** 该网关鉴权写法不符时的表现：401，或 400 + Parameter checking failed。 */
+      const authLooksBad = () =>
+        res && (res.status === 401 || (res.status === 400 && /parameter checking failed/i.test(text)));
       try {
-        let res = null;
-        let text = "";
-        let usedStyle = "";
-        for (const style of authStyles(pid)) {
-          res = await send(token, style);
+        const runOnce = async (target, bearer, style) => {
+          res = await sendTo(target, bearer, style);
           text = await res.text();
           usedStyle = style;
-          if (res.status !== 401) break;
+        };
+        const fixed = Boolean((process.env.YAPI_CALL_TOKEN || "").trim());
+        for (const style of authStyles(pid)) {
+          await runOnce(url, token, style);
+          if (!authLooksBad()) break;
         }
-        // token 过期：自动重登一次再试（手工 YAPI_CALL_TOKEN 不重登，避免误导）
-        if (res.status === 401 && !(process.env.YAPI_CALL_TOKEN || "").trim()) {
+        // 鉴权仍不符：token 过期（自动重登）或写法不对（换另一种），两种都各试一次
+        if (authLooksBad() && !fixed) {
           const fresh = await bizToken(pid, { refresh: true }).catch(() => "");
           if (fresh) {
-            for (const style of authStyles(pid)) {
-              res = await send(fresh, style);
-              text = await res.text();
-              usedStyle = style;
-              if (res.status !== 401) break;
+            for (const style of new Set([...authStyles(pid), AUTH_BEARER, AUTH_RAW])) {
+              await runOnce(url, fresh, style);
+              if (!authLooksBad()) break;
             }
           }
         }
-        if (res.status < 400) authStyleCache.set(pid, usedStyle);
+        if (res && res.status < 400) authStyleCache.set(pid, usedStyle);
+
+        // 404：文档路径可能缺网关前缀 —— 该组织的 YApi 习惯把前缀写在分类名里（如「…接口（/stat-report）」）。
+        if (res && res.status === 404) {
+          const prefixes = new Set();
+          for (const c of cats) {
+            for (const m of String(c.name || "").matchAll(/[(（](\/[A-Za-z0-9._-]+)[)）]/g)) prefixes.add(m[1]);
+          }
+          for (const prefix of [...prefixes].slice(0, 3)) {
+            const alt = new URL(url.toString());
+            alt.pathname = `${prefix}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`;
+            await runOnce(alt, token, usedStyle || authStyles(pid)[0]);
+            if (res.status !== 404) {
+              url = alt;
+              prefixNote = `文档路径 404，已按分类标注的网关前缀 ${prefix} 重试`;
+              break;
+            }
+          }
+        }
         return json(
           {
             request: `GET ${url.toString()}`,
             status: res.status,
             ms: Date.now() - started,
             ...(token ? { auth: usedStyle === AUTH_RAW ? "裸 token" : "Bearer" } : {}),
+            ...(prefixNote ? { note: prefixNote } : {}),
             bytes: text.length,
             ...(res.headers.get("content-type") ? { content_type: res.headers.get("content-type") } : {}),
             ...(res.status === 401

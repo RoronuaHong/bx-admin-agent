@@ -123,11 +123,3 @@ export function touchSession(session: Session) {
   if (sessions.has(session.id)) persist();
 }
 
-export function clearSessionContext(id?: string | null): boolean {
-  if (!id) return false;
-  const session = sessions.get(id);
-  if (!session) return false;
-  session.messages = [];
-  persist();
-  return true;
-}

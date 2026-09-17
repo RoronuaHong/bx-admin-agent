@@ -1,60 +1,57 @@
-// 上下文构建：把「某个对话框的完整历史」压缩成一次模型请求能吃的上下文。
-// 三层策略（对齐主流 Agent：分层压缩 + LLM 摘要）：
-//   1) 窗口：只取最近 N 轮；
-//   2) 无损裁剪：超长消息保头尾、长表格折叠（零模型调用）；
-//   3) 摘要：仍超预算时对更早的部分做摘要，摘要进系统提示，近期轮次原文保留。
-import type { Turn } from "./models.js";
-
-export interface ContextUsage {
-  /** 参与本次请求的对话轮数（不含当前输入） */
-  turns: number;
-  /** 上下文总字符数 */
-  chars: number;
-  /** 因预算被丢弃的较早消息条数 */
-  dropped: number;
-  /** 是否使用了历史摘要 */
-  summarized: boolean;
-  /** 是否触发了长内容裁剪 */
-  pruned: boolean;
-}
-
-export interface BuildResult {
-  turns: Turn[];
-  systemExtra: string;
-  usage: ContextUsage;
-}
-
-export interface BuildInput {
-  history: Array<{ role: "user" | "assistant"; text: string }>;
-  userText: string;
-  /** 该会话上次生成的摘要（可选） */
-  summary?: string;
-  maxTurns?: number;
-  budget?: number;
-  /** 摘要回调；不传则跳过 LLM 摘要（只做窗口与裁剪） */
-  compact?: (olderTurns: Turn[]) => Promise<string>;
-}
+// 上下文装配（唯一实现，chat.ts 与测试共用）。
+// 四层策略（对齐 Deep Agents 的 context management 与 Claude Code 的 compaction）：
+//   1) 摘要水位线：`summary` + `summaryCovered` 之外的更早对话不重复压缩，增量扩展；
+//   2) 窗口：只取最近 N 轮原文；
+//   3) 无损裁剪：超长消息保头尾、长表格折叠（零模型调用）；
+//   4) 压缩：仍超预算时，把更早的部分交给 LLM 生成/扩展摘要（产物持久化，跨轮复用）；
+//      仍超则从最旧开始丢弃（硬保证）。
+// 摘要进入 system 提示动态段，不占消息序列。
+import { estimateTokens, estimateTokensOf, type Turn } from "./models.js";
+import type { ToolHandle } from "./session.js";
 
 const DEFAULT_MAX_TURNS = Number(process.env.HISTORY_MAX_TURNS || 8);
-const DEFAULT_BUDGET = Number(process.env.HISTORY_CHAR_BUDGET || 24_000);
 const KEEP_RECENT_TURNS = Number(process.env.HISTORY_KEEP_RECENT_TURNS || 3);
 const AUTO_COMPACT = (process.env.HISTORY_AUTO_COMPACT || "on").toLowerCase() !== "off";
 const LONG_MSG_CHARS = 3000;
 const TABLE_MAX_LINES = 12;
 
+/** 摘要生成的输入上限（字符）：更早的部分已被逐条裁剪，正常到不了这里。 */
+const COMPACT_INPUT_CHARS = 24_000;
+
+export const SUMMARIZE_PROMPT =
+  "把以下对话压缩成一份摘要，供后续对话作为背景使用。必须保留：\n" +
+  "1) 用户的目标与约束；2) 已确认的结论与关键数字；3) 执行过的工具调用（工具名 + 关键参数）；4) 未完成事项。\n" +
+  "不要评论、不要输出标题以外的客套话，直接输出摘要正文。\n\n对话内容：\n";
+
+/** 把某轮的工具句柄渲染成可读行（只有「查过什么」，不含结果正文）。 */
+export function renderHandles(handles: ToolHandle[] | undefined): string {
+  if (!handles?.length) return "";
+  const lines = handles.map(
+    (handle) => `- ${handle.name}${handle.args ? ` ${handle.args}` : ""}${handle.summary ? ` → ${handle.summary}` : ""}`,
+  );
+  return `\n\n[本轮已执行的工具]\n${lines.join("\n")}`;
+}
+
+/** 单轮对话在上下文里的文本形态：正文 + 工具句柄。 */
+export function turnContent(turn: { text: string; handles?: ToolHandle[] }): string {
+  return `${turn.text}${renderHandles(turn.handles)}`;
+}
+
 function prunedText(text: string): { text: string; changed: boolean } {
   let out = text;
   let changed = false;
-  // 长 markdown 表格折叠：保留表头与首行，避免整段表格占满预算。
+  // 长 markdown 表格折叠：保留前 N 行表格（表头 + 首几行），避免整段表格占满预算。
   if (/\n\|.*\|/.test(out)) {
     const lines = out.split("\n");
-    const tableLines = lines.filter((line) => line.trim().startsWith("|"));
-    if (tableLines.length > TABLE_MAX_LINES) {
-      const head = tableLines.slice(0, TABLE_MAX_LINES);
-      const tableWrapped = lines
-        .map((line) => (!head.includes(line) && line.trim().startsWith("|") ? null : line))
-        .filter((line): line is string => line !== null);
-      out = `${tableWrapped.join("\n")}\n…（表格已折叠，共 ${tableLines.length} 行）`;
+    // 用行号集合判定，避免按内容判重时把内容相同的重复行整段保留下来。
+    const tableRows = lines.reduce<number[]>((rows, line, index) => {
+      if (line.trim().startsWith("|")) rows.push(index);
+      return rows;
+    }, []);
+    if (tableRows.length > TABLE_MAX_LINES) {
+      const all = new Set(tableRows);
+      const keep = new Set(tableRows.slice(0, TABLE_MAX_LINES));
+      out = `${lines.filter((_, index) => !all.has(index) || keep.has(index)).join("\n")}\n…（表格已折叠，共 ${tableRows.length} 行）`;
       changed = true;
     }
   }
@@ -65,69 +62,133 @@ function prunedText(text: string): { text: string; changed: boolean } {
   return { text: out, changed };
 }
 
-function charsOf(turns: Turn[]): number {
-  return turns.reduce((acc, turn) => acc + turn.content.length, 0);
+export interface AssembleUsage {
+  /** 发给模型的历史条数（不含当前输入）。 */
+  turns: number;
+  /** 因预算被丢弃的较早消息条数（被摘要吸收的不计）。 */
+  dropped: number;
+  /** 是否触发了长内容裁剪。 */
+  pruned: boolean;
+  /** 发送时是否带历史摘要。 */
+  summarized: boolean;
+  /** 本轮是否新生成/扩展了摘要（发生 LLM 压缩调用）。 */
+  compacted: boolean;
 }
 
-function toTurns(history: BuildInput["history"]): { turns: Turn[]; pruned: boolean } {
-  let pruned = false;
-  const turns: Turn[] = [];
-  for (const item of history) {
-    if (!item.text) continue;
-    const result = prunedText(item.text);
-    pruned = pruned || result.changed;
-    turns.push({ role: item.role, content: result.text });
-  }
-  return { turns, pruned };
+export interface AssembleInput {
+  /** 该对话的 `context`（thread 唯一真相）。 */
+  history: Array<{ role: "user" | "assistant"; text: string; handles?: ToolHandle[] }>;
+  userText: string;
+  /** 历史 token 预算（窗口 − 输出预留 − 工具 schema − 本轮工具结果预算）× 安全系数。 */
+  budgetTokens: number;
+  maxTurns?: number;
+  /** 已有摘要（跨轮复用）。 */
+  summary?: string | null;
+  /** 摘要水位线：已覆盖到 history 的第几条。 */
+  summaryCovered?: number | null;
+  /** LLM 压缩回调；不传则跳过摘要（只做窗口与裁剪）。 */
+  compact?: (prompt: string) => Promise<string>;
 }
 
-export async function buildContext(input: BuildInput): Promise<BuildResult> {
+export interface AssembleResult {
+  turns: Turn[];
+  /** 最新摘要（可能沿用已有值；无摘要为空串）。 */
+  summary: string;
+  /** 最新水位线。 */
+  summaryCovered: number;
+  usage: AssembleUsage;
+}
+
+/** 组装一次模型请求的上下文（消息序列 + 摘要水位线）。 */
+export async function assembleContext(input: AssembleInput): Promise<AssembleResult> {
   const maxTurns = input.maxTurns ?? DEFAULT_MAX_TURNS;
-  const budget = input.budget ?? DEFAULT_BUDGET;
-  const windowed = input.history.slice(-maxTurns * 2);
-  const { turns: prunedTurns, pruned } = toTurns(windowed);
+  const history = Array.isArray(input.history) ? input.history : [];
 
-  const usage: ContextUsage = {
-    turns: prunedTurns.length,
-    chars: 0,
-    dropped: input.history.length - windowed.length,
-    summarized: false,
-    pruned,
+  let summary = (input.summary || "").trim();
+  let covered = Math.min(Math.max(0, input.summaryCovered || 0), history.length);
+  let dropped = 0;
+  let pruned = false;
+  let compacted = false;
+
+  const toTurn = (item: { role: "user" | "assistant"; text: string; handles?: ToolHandle[] }): Turn => {
+    const result = prunedText(turnContent(item));
+    pruned = pruned || result.changed;
+    return { role: item.role, content: result.text };
   };
 
-  const all: Turn[] = [...prunedTurns, { role: "user", content: input.userText }];
-  const hasSummary = Boolean(input.summary);
-  let systemExtra = input.summary ? `以下是该会话更早部分的摘要：\n${input.summary}` : "";
+  // 未被摘要覆盖的部分里，取最近 N 轮原文；更早的先尝试吸收进摘要。
+  let rest = history.slice(covered);
+  let older = rest.slice(0, Math.max(0, rest.length - maxTurns * 2));
+  let windowed = rest.slice(older.length);
 
-  // 预算内：直接用（超出则先摘要、仍超再逐条丢弃最早的）。
-  let working = all;
-  let total = charsOf(working) + systemExtra.length;
-  if (hasSummary) usage.summarized = true;
-
-  if (total > budget && input.compact && AUTO_COMPACT) {
-    // 摘要：保留最近若干轮原文，更早的部分交给摘要模型。
-    const keepCount = KEEP_RECENT_TURNS * 2;
-    const older = working.slice(0, Math.max(0, working.length - keepCount));
-    if (older.length) {
-      const summaryText = await input.compact(older).catch(() => "");
-      if (summaryText) {
-        working = working.slice(older.length);
-        systemExtra = systemExtra
-          ? `${systemExtra}\n\n${summaryText}`
-          : `以下是该会话更早部分的摘要：\n${summaryText}`;
-        usage.summarized = true;
-        total = charsOf(working) + systemExtra.length;
-      }
+  const buildTurns = (): Turn[] => {
+    const turns = windowed.map(toTurn);
+    turns.push({ role: "user", content: input.userText });
+    // 部分 provider（如 anthropic）要求消息以 user 开头。
+    while (turns.length > 1 && turns[0].role !== "user") {
+      turns.shift();
+      dropped += 1;
     }
+    return turns;
+  };
+  const totalOf = (turns: Turn[]): number =>
+    estimateTokensOf(turns.map((turn) => turn.content)) + estimateTokens(summary);
+
+  let turns = buildTurns();
+  let total = totalOf(turns);
+
+  const absorbIntoSummary = async (absorb: Array<{ role: "user" | "assistant"; text: string; handles?: ToolHandle[] }>): Promise<boolean> => {
+    if (!input.compact || !AUTO_COMPACT || !absorb.length) return false;
+    const body = absorb
+      .map((item) => `${item.role === "user" ? "用户" : "助手"}: ${turnContent(item)}`)
+      .join("\n\n")
+      .slice(0, COMPACT_INPUT_CHARS);
+    const prompt = summary ? `已有摘要：\n${summary}\n\n新增对话：\n${body}` : body;
+    const next = await input.compact(SUMMARIZE_PROMPT + prompt).catch(() => "");
+    if (!next || !next.trim()) return false;
+    summary = next.trim();
+    covered += absorb.length;
+    compacted = true;
+    return true;
+  };
+
+  // 仍超预算：优先压缩（先吸收窗口外的更早部分，再牺牲窗口内较早的轮次），最后才硬丢弃。
+  let guard = 0;
+  while (total > input.budgetTokens && turns.length > 1 && guard < 32) {
+    guard += 1;
+    if (older.length && (await absorbIntoSummary(older))) {
+      rest = history.slice(covered);
+      windowed = rest.slice(-maxTurns * 2);
+      older = rest.slice(0, Math.max(0, rest.length - windowed.length));
+      turns = buildTurns();
+      total = totalOf(turns);
+      continue;
+    }
+    const keepCount = KEEP_RECENT_TURNS * 2;
+    const sacrificable = Math.max(0, windowed.length - keepCount);
+    if (sacrificable > 0 && (await absorbIntoSummary(windowed.slice(0, sacrificable)))) {
+      rest = history.slice(covered);
+      windowed = rest.slice(-Math.max(keepCount, maxTurns * 2));
+      older = rest.slice(0, Math.max(0, rest.length - windowed.length));
+      turns = buildTurns();
+      total = totalOf(turns);
+      continue;
+    }
+    const removed = turns.shift() as Turn;
+    total -= estimateTokens(removed.content);
+    dropped += 1;
   }
 
-  while (total > budget && working.length > 1) {
-    const removed = working.shift() as Turn;
-    total -= removed.content.length;
-    usage.dropped += 1;
-  }
-
-  usage.turns = Math.max(0, working.length - 1);
-  usage.chars = total;
-  return { turns: working, systemExtra, usage };
+  return {
+    turns,
+    summary,
+    summaryCovered: covered,
+    usage: {
+      turns: Math.max(0, turns.length - 1),
+      dropped,
+      pruned,
+      summarized: Boolean(summary),
+      compacted,
+    },
+  };
 }

@@ -1,11 +1,15 @@
-// 聊天引擎。
-// 未勾选 MCP：一次模型调用 + 流式输出（与瘦身后的直连行为完全一致）。
-// 勾选 MCP：把 MCP 工具注入模型，按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，
-//           直到模型给出结论或达到轮次上限。
-import type { ChatEvent } from "@bx/shared";
+// 聊天引擎（自研 agent harness，路线 B 补齐 Deep Agents 能力）。
+// 未勾选 MCP：一次模型调用 + 流式输出（直连语义，零工具）。
+// 勾选 MCP：MCP 工具 + 内置工具（fs_* / write_todos / read_skill / task）注入模型，
+//           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
+// 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
+//         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
+import type { ChatEvent, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, type ModelEntry } from "./config.js";
+import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
 import { waitForConfirmation } from "./confirm.js";
-import { appendContext, getConversation } from "./conversations.js";
+import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
+import { offloadToolResult } from "./fs-store.js";
 import {
   callAgent,
   estimateTokens,
@@ -15,11 +19,18 @@ import {
   type ToolSpec,
   type Turn,
 } from "./models.js";
-import { callMcpTool, collectTools, toolNeedsConfirm, type McpToolInfo } from "./mcp/hub.js";
+import {
+  callMcpTool,
+  collectToolsDetailed,
+  confirmReasonOf,
+  toolNeedsConfirm,
+  type McpToolInfo,
+} from "./mcp/hub.js";
 import type { ChatTurn, ToolHandle } from "./session.js";
+import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
 import { getUploadImage } from "./uploads.js";
+import { assembleContext } from "./history.js";
 
-const HISTORY_MAX_TURNS = Number(process.env.HISTORY_MAX_TURNS || 8);
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
 // 本轮工具结果预算（token）与「最近 N 组不清理」——沿用 trigger / keep 的语义。
@@ -40,32 +51,20 @@ const MCP_MAX_TOOLS = Number(process.env.MCP_MAX_TOOLS || 80);
 const MAX_TOOL_ROUNDS = Number(process.env.MCP_MAX_TOOL_ROUNDS || 14);
 const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12_000);
 
-// 对话语言 → 回复语言指令（通用 i18n 语言名，与业务无关）。
-const LOCALE_DIRECTIVES: Record<string, string> = {
-  zh: "Respond in Simplified Chinese.",
-  en: "Respond in English.",
-  "pt-BR": "Respond in Brazilian Portuguese.",
-  hi: "Respond in Hindi.",
-};
+// 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
+const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
+const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
 
-/** 该对话指定的语言 → 一条 system 指令；未指定语言时返回空串（不打扰模型）。 */
-function languageDirective(locale?: string | null): string {
-  return LOCALE_DIRECTIVES[locale || ""] || "";
-}
+// 子代理护栏：轮次、回传摘要上限、并发数（对齐 Deep Agents「同步子代理」语义）。
+const SUBAGENT_MAX_ROUNDS = Number(process.env.SUBAGENT_MAX_ROUNDS || 10);
+const SUBAGENT_RESULT_CHARS = Number(process.env.SUBAGENT_RESULT_CHARS || 4000);
+const SUBAGENT_MAX_PARALLEL = Number(process.env.SUBAGENT_MAX_PARALLEL || 3);
 
-/** 把某轮的工具句柄渲染成可读行（只有「查过什么」，不含结果正文）。 */
-export function renderHandles(handles: ToolHandle[] | undefined): string {
-  if (!handles?.length) return "";
-  const lines = handles.map(
-    (handle) => `- ${handle.name}${handle.args ? ` ${handle.args}` : ""}${handle.summary ? ` → ${handle.summary}` : ""}`,
-  );
-  return `\n\n[本轮已执行的工具]\n${lines.join("\n")}`;
-}
-
-/** 单轮对话在上下文里的文本形态：正文 + 工具句柄。 */
-function turnContent(turn: { text: string; handles?: ToolHandle[] }): string {
-  return `${turn.text}${renderHandles(turn.handles)}`;
-}
+// 工具按需加载（对齐 Claude Code 的 ToolSearch：工具定义占用超过窗口一定比例时改为「按需检索加载」）。
+const TOOL_SEARCH_MODE = (process.env.TOOL_SEARCH_MODE || "auto").toLowerCase(); // auto | on | off
+const TOOL_SEARCH_RATIO = Number(process.env.TOOL_SEARCH_RATIO || 0.1);
+const TOOL_SEARCH_RESULTS = Number(process.env.TOOL_SEARCH_RESULTS || 8);
+const TOOL_SEARCH_MAX_RESULTS = 20;
 
 /** 历史预算 = (窗口 − 输出预留 − 工具 schema − 本轮工具结果预算) × 安全系数。 */
 function historyBudgetTokens(model: ModelEntry, toolSchemaTokens: number): number {
@@ -73,28 +72,10 @@ function historyBudgetTokens(model: ModelEntry, toolSchemaTokens: number): numbe
   return Math.max(1000, Math.floor((model.contextWindow - reserved) * CONTEXT_SAFETY_RATIO));
 }
 
-/**
- * 构造发往模型的跨轮上下文：窗口内最近若干轮（正文 + 工具句柄），再按 token 预算丢弃最早的消息。
- * 丢弃时保证首条是 user —— 部分 provider（如 anthropic）要求消息以 user 开头。
- * `history` 即该对话的 `conversation.context`（thread 的唯一真相）。
- */
-export function buildTurns(
-  history: ChatTurn[],
-  userText: string,
-  budgetTokens: number,
-): { turns: Turn[]; dropped: number; tokens: number } {
-  const all = Array.isArray(history) ? history : [];
-  const windowed = all.slice(-HISTORY_MAX_TURNS * 2);
-  const turns: Turn[] = windowed.map((m) => ({ role: m.role, content: turnContent(m) }));
-  turns.push({ role: "user", content: userText });
-  let tokens = estimateTokensOf(turns.map((turn) => turn.content));
-  let dropped = all.length - windowed.length;
-  while (turns.length > 1 && (tokens > budgetTokens || turns[0].role !== "user")) {
-    const removed = turns.shift() as Turn;
-    tokens -= estimateTokens(removed.content);
-    dropped += 1;
-  }
-  return { turns, dropped, tokens };
+/** 摘要生成：用同一个模型做一次无工具的普通调用。 */
+async function summarizeWith(model: ModelEntry, prompt: string, signal?: AbortSignal): Promise<string> {
+  const result = await callAgent(model, [{ role: "user", content: prompt }], [], signal);
+  return result.text;
 }
 
 function truncateArgs(raw: string): string {
@@ -108,36 +89,133 @@ function handleSummary(content: string): string {
   return `${lines} 行 / ${content.length} 字符`;
 }
 
-function toolSpecsOf(tools: McpToolInfo[]): ToolSpec[] {
-  return tools.slice(0, MCP_MAX_TOOLS).map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.inputSchema,
-  }));
+/**
+ * MCP 工具 → 模型 schema。顺序由 hub 保证确定性（serverId、工具名双排序）：
+ * 工具清单是注入模型的 system 前缀的一部分，顺序稳定才谈得上 prompt 缓存命中。
+ * 超出 MCP_MAX_TOOLS 时按顺序截断，并把「被裁掉的服务器」回报给调用方 —— 不静默丢弃。
+ */
+export function selectMcpToolSpecs(tools: McpToolInfo[]): { specs: ToolSpec[]; droppedServers: string[] } {
+  const specs: ToolSpec[] = [];
+  const dropped = new Set<string>();
+  for (const tool of tools) {
+    if (specs.length >= MCP_MAX_TOOLS) {
+      dropped.add(tool.serverId);
+      continue;
+    }
+    specs.push({ name: tool.name, description: tool.description, parameters: tool.inputSchema });
+  }
+  return { specs, droppedServers: [...dropped].sort() };
+}
+
+/** 工具索引（仅名称）：按需加载模式下注入系统提示，让模型知道「有哪些工具可以检索」。 */
+function catalogOf(
+  tools: McpToolInfo[],
+  labels: Map<string, string>,
+): Array<{ id: string; label: string; tools: string[] }> {
+  const byId = new Map<string, { id: string; label: string; tools: string[] }>();
+  for (const tool of tools) {
+    const entry = byId.get(tool.serverId) || {
+      id: tool.serverId,
+      label: labels.get(tool.serverId) || tool.serverId,
+      tools: [],
+    };
+    entry.tools.push(tool.tool);
+    byId.set(tool.serverId, entry);
+  }
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /**
- * 本轮工具结果治理：超出预算时从最旧的开始清理并替换为占位文本，
- * 但永远保留最近 TOOL_RESULT_KEEP 组、且不清理白名单工具。返回清理条数。
+ * 是否改用「按需检索加载」：off = 永远全量注入；on = 强制；auto（默认）= 工具定义超过窗口的
+ * TOOL_SEARCH_RATIO（默认 10%，对齐 Claude Code `ENABLE_TOOL_SEARCH=auto` 的口径）时改成按需。
  */
-export function governToolResults(conversation: Turn[]): number {
+export function toolSearchEnabled(model: ModelEntry, eagerToolTokens: number): boolean {
+  if (TOOL_SEARCH_MODE === "off") return false;
+  if (TOOL_SEARCH_MODE === "on") return true;
+  return eagerToolTokens > model.contextWindow * TOOL_SEARCH_RATIO;
+}
+
+/** 通用关键词切分：按非字母数字/非中日韩字符切分（不含任何业务词）。 */
+function keywordsOf(query: string): string[] {
+  return String(query || "")
+    .toLowerCase()
+    .split(/[^0-9a-z\u4e00-\u9fa5]+/i)
+    .map((term) => term.trim())
+    .filter(Boolean);
+}
+
+export interface ToolMatch {
+  tool: McpToolInfo;
+  score: number;
+}
+
+/**
+ * 工具检索（本地关键词匹配，确定性排序）：
+ * 命中工具名（含原始名）权重最高，其次描述，最后服务器标识；多关键词时未命中的词扣分。
+ */
+export function searchMcpTools(tools: McpToolInfo[], query: string, limit?: number): ToolMatch[] {
+  const terms = keywordsOf(query);
+  if (!terms.length) return [];
+  const matched: ToolMatch[] = [];
+  for (const tool of tools) {
+    const name = tool.name.toLowerCase();
+    const bare = tool.tool.toLowerCase();
+    const description = (tool.description || "").toLowerCase();
+    const server = tool.serverId.toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (bare === term || name.endsWith(`__${term}`)) score += 100;
+      else if (name.includes(term)) score += 60;
+      else if (description.includes(term)) score += 20;
+      else if (server.includes(term)) score += 10;
+      else score -= 5;
+    }
+    if (score > 0) matched.push({ tool, score });
+  }
+  const capped = Math.max(
+    1,
+    Math.min(TOOL_SEARCH_MAX_RESULTS, Math.floor(Number(limit)) || TOOL_SEARCH_RESULTS),
+  );
+  return matched.sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name)).slice(0, capped);
+}
+
+/** 判断某条工具结果是否已被治理过（占位/卸载），避免重复处理。 */
+function isGovernedPlaceholder(content: string): boolean {
+  return content === TOOL_RESULT_CLEARED || content.startsWith("…（该工具结果已卸载");
+}
+
+/**
+ * 本轮工具结果治理：超出预算时从最旧的开始处理，但永远保留最近 TOOL_RESULT_KEEP 组、
+ * 且不处理白名单工具。处理方式（Deep Agents 的 offloading 思路）：
+ * 大结果先**卸载到工作区文件**（保留 fs_read 指针，可取回），落盘失败才退化为纯占位符。
+ */
+export function governToolResults(
+  conversation: Turn[],
+  conversationId: string,
+): { cleared: number; offloaded: number } {
   const toolTurns = conversation.filter((turn) => turn.role === "tool");
-  if (!toolTurns.length) return 0;
+  if (!toolTurns.length) return { cleared: 0, offloaded: 0 };
   let total = estimateTokensOf(toolTurns.map((turn) => turn.content));
   const older = toolTurns.filter(
     (turn, index) =>
       index < toolTurns.length - TOOL_RESULT_KEEP &&
       !TOOL_RESULT_PROTECTED.has(turn.name || "") &&
-      turn.content !== TOOL_RESULT_CLEARED,
+      !isGovernedPlaceholder(turn.content),
   );
   let cleared = 0;
+  let offloaded = 0;
   for (const turn of older) {
     if (total <= TOOL_RESULT_BUDGET) break;
     total -= estimateTokens(turn.content);
-    turn.content = TOOL_RESULT_CLEARED;
-    cleared += 1;
+    const saved = offloadToolResult(conversationId, turn.toolCallId || "unknown", turn.name || "tool", turn.content);
+    turn.content =
+      "error" in saved
+        ? TOOL_RESULT_CLEARED
+        : `…（该工具结果已卸载到工作区文件 ${saved.path}，${saved.bytes} 字节；需要时用 fs_read 读取，或重新调用工具）`;
+    if ("error" in saved) cleared += 1;
+    else offloaded += 1;
   }
-  return cleared;
+  return { cleared, offloaded };
 }
 
 function imagesOf(ids: string[] | undefined): OptionImage[] {
@@ -167,6 +245,58 @@ function truncateResult(text: string): string {
   return `${kept}\n…（结果已截断，原始长度 ${text.length} 字符）`;
 }
 
+/** 递归按 key 排序对象，产出确定性 JSON（同语义不同 key 顺序的参数视为同一调用）。 */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = sortKeys((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * 工具调用签名（name + 规范化参数）：同轮去重与跨轮 Doom Loop 检测都基于它。
+ * 参数按 key 排序后序列化，保证「语义相同但 key 顺序不同」不误判为不同调用。
+ */
+export function toolCallSignature(name: string, argsJson: string): string {
+  let canonical = argsJson || "{}";
+  try {
+    canonical = JSON.stringify(sortKeys(JSON.parse(argsJson || "{}")));
+  } catch {
+    /* 非法 JSON 退化为原文比较 */
+  }
+  return `${name}::${canonical}`;
+}
+
+/**
+ * 跨轮 Doom Loop 熔断：记录每轮「实际执行的调用指纹」（去重后的签名集合）。
+ * 同一指纹**连续**重复达到阈值即判定陷入无效循环（如每次都执行同一组工具却拿不到进展），
+ * 返回 true 让上层主动收束，避免无限循环空耗 token。空轮（无执行）不计入连击。
+ */
+export class LoopGuard {
+  private lastFp = "";
+  private streak = 0;
+  constructor(private readonly maxRepeats: number) {}
+  record(roundExecuted: string[]): boolean {
+    if (roundExecuted.length === 0) {
+      this.lastFp = "";
+      this.streak = 0;
+      return false;
+    }
+    const fp = JSON.stringify([...new Set(roundExecuted)].sort());
+    if (fp === this.lastFp) this.streak += 1;
+    else {
+      this.lastFp = fp;
+      this.streak = 1;
+    }
+    return this.streak >= this.maxRepeats;
+  }
+}
+
 interface CallOutcome {
   text: string;
   toolCalls: ToolCall[];
@@ -180,13 +310,16 @@ async function* streamCall(
   images: OptionImage[],
   tools: ToolSpec[],
   signal?: AbortSignal,
-  systemExtra?: string,
+  system?: SystemPrompt,
 ): AsyncGenerator<ChatEvent, CallOutcome> {
   const chunks: string[] = [];
   let settled = false;
   let failure: string | null = null;
   let wake: (() => void) | null = null;
   let toolCalls: ToolCall[] = [];
+  // 是否收到过增量回调：用于区分「流式通道（增量已逐片推进 chunks）」与
+  // 「非流式通道（ollama / 不支持 SSE 的网关，onDelta 永不触发）」。
+  let streamed = false;
 
   const running = callAgent(
     model,
@@ -195,12 +328,20 @@ async function* streamCall(
     signal,
     (chunk) => {
       chunks.push(chunk);
+      streamed = true;
       wake?.();
     },
-    tools.length ? { tools, toolChoice: "auto", ...(systemExtra ? { systemExtra } : {}) } : systemExtra ? { systemExtra } : {},
+    tools.length
+      ? { tools, toolChoice: "auto", systemParts: system }
+      : { systemParts: system },
   )
     .then((result) => {
       toolCalls = result.toolCalls || [];
+      // 非流式通道（如 ollama、不支持 SSE 的网关）没有增量回调，整包文本在这里补齐，
+      // 否则模型明明有输出，最终却拼出空回复。注意：判据用 streamed 而非 chunks.length——
+      // 流式通道的 chunks 在消费循环里会被即时 shift 清空，若按 chunks.length 判断会在
+      // 流式结束后误把整段最终文本再压入一次，导致最终回复翻倍。
+      if (result.text && !streamed) chunks.push(result.text);
     })
     .catch((err) => {
       failure = String((err as Error)?.message || err);
@@ -229,28 +370,62 @@ async function* streamCall(
   return { text, toolCalls, failure };
 }
 
-/** MCP 工具循环：执行工具 → 结果回灌 → 再次调用模型，直到模型不再要工具。 */
-async function* runWithTools(
-  model: ModelEntry,
-  turns: Turn[],
-  images: OptionImage[],
-  tools: McpToolInfo[],
-  specs: ToolSpec[],
-  signal?: AbortSignal,
-  systemExtra?: string,
-): AsyncGenerator<
-  ChatEvent,
-  { text: string; failure: string | null; handles: ToolHandle[]; clearedToolResults: number }
-> {
-  const serverOf = new Map(tools.map((tool) => [tool.name, tool.serverId]));
+/** 工具循环的运行上下文：主代理与子代理共用同一个循环，差别在工具集 / 系统提示 / 轮次上限。 */
+interface LoopContext {
+  conversationId: string;
+  model: ModelEntry;
+  images: OptionImage[];
+  /** MCP 工具（执行用）。 */
+  mcpTools: McpToolInfo[];
+  /** 初始工具 schema（内置 + 已加载的 MCP）；按需加载模式下会在循环内增长。 */
+  specs: ToolSpec[];
+  /** 按需加载模式：MCP 工具 schema 未全量注入，需经检索工具加载后才可调用。 */
+  toolSearch: boolean;
+  /** 已加载的 MCP 工具名（按需加载模式下的可调用集合）；子代理各自独立一份。 */
+  loadedTools: Set<string>;
+  system: SystemPrompt;
+  signal?: AbortSignal;
+  /** 主代理 = true（可用 task 委派）；子代理 = false（防递归）。 */
+  allowTask: boolean;
+  maxRounds: number;
+}
+
+interface LoopOutcome {
+  text: string;
+  failure: string | null;
+  handles: ToolHandle[];
+  clearedToolResults: number;
+  offloadedToolResults: number;
+  /** 执行的工具调用次数（子代理回传规模摘要用）。 */
+  toolCallCount: number;
+}
+
+/** 工具循环：模型 → tool_calls → 执行（内置 / MCP / 委派）→ 回灌 → 再调用，直到结论或轮次上限。 */
+async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEvent, LoopOutcome> {
+  const serverOf = new Map<string, string>(ctx.mcpTools.map((tool) => [tool.name, tool.serverId]));
+  for (const item of builtinToolSpecs({ toolSearch: ctx.toolSearch })) serverOf.set(item.name, BUILTIN_SERVER);
+  // 按需加载模式下 specs 会随检索增长，用局部变量（ctx.specs 只作初始值）。
+  let specs = ctx.specs;
+  const specOfTool = new Map<string, ToolSpec>(
+    ctx.mcpTools.map((tool) => [
+      tool.name,
+      { name: tool.name, description: tool.description, parameters: tool.inputSchema },
+    ]),
+  );
   const conversation: Turn[] = [...turns];
   const handles: ToolHandle[] = [];
   let text = "";
   let failure: string | null = null;
   let clearedToolResults = 0;
+  let offloadedToolResults = 0;
+  let toolCallCount = 0;
+  // 循环护栏：同轮去重集合（每轮重置）+ 跨轮 Doom Loop 检测器。
+  const executedSigs = new Set<string>();
+  let roundExecuted: string[] = [];
+  const guard = new LoopGuard(DOOM_LOOP_MAX_ROUNDS);
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const outcome = yield* streamCall(model, conversation, images, specs, signal, systemExtra);
+  for (let round = 0; round < ctx.maxRounds; round++) {
+    const outcome = yield* streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system);
     text += outcome.text;
     if (outcome.failure) {
       failure = outcome.failure;
@@ -258,8 +433,122 @@ async function* runWithTools(
     }
     if (!outcome.toolCalls.length) break;
 
+    // 每轮重置同轮去重集合（跨轮允许重新执行，避免误杀「重新取数」等合法重复）。
+    executedSigs.clear();
+    roundExecuted = [];
+
     conversation.push({ role: "assistant", content: outcome.text, toolCalls: outcome.toolCalls });
-    for (const call of outcome.toolCalls) {
+
+    // 逐个处理；**连续的** task 委派合并成一批并行执行（对齐 Deep Agents：单轮多个 task 并行）。
+    const calls = outcome.toolCalls;
+    let index = 0;
+    while (index < calls.length) {
+      const call = calls[index]!;
+      // 同轮去重：本轮已执行过的相同调用（name + 规范化参数）不再重复执行，仍回灌结果保持模型上下文对齐。
+      const sig = toolCallSignature(call.name, call.argsJson);
+      if (TOOL_DEDUP_SAME_ROUND && executedSigs.has(sig)) {
+        index += 1;
+        yield { type: "tool_call", id: call.id, name: call.name, server: serverOf.get(call.name), args: call.argsJson };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok: false,
+          text: `跳过：本轮已执行过相同调用（${call.name} + 相同参数），不重复执行。`,
+        };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: "（重复调用已跳过）" });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "已跳过（同轮重复）" });
+        continue;
+      }
+      if (call.name === "task" && ctx.allowTask) {
+        const batch: ToolCall[] = [];
+        while (index < calls.length && calls[index]!.name === "task") {
+          const t = calls[index]!;
+          const tsig = toolCallSignature(t.name, t.argsJson);
+          if (TOOL_DEDUP_SAME_ROUND && executedSigs.has(tsig)) {
+            // 重复子任务：单独回灌跳过结果，不进并行批量。
+            yield { type: "tool_call", id: t.id, name: "task", server: BUILTIN_SERVER, args: t.argsJson };
+            yield { type: "tool_result", id: t.id, name: "task", ok: false, text: "跳过：本轮已委派过相同子任务。" };
+            conversation.push({ role: "tool", toolCallId: t.id, name: "task", content: "（重复子任务已跳过）" });
+            handles.push({ name: "task", args: truncateArgs(t.argsJson), summary: "已跳过（同轮重复）" });
+            index += 1;
+            continue;
+          }
+          batch.push(t);
+          executedSigs.add(tsig);
+          index += 1;
+        }
+        if (!batch.length) continue;
+        toolCallCount += batch.length;
+        for (const item of batch) {
+          yield { type: "tool_call", id: item.id, name: "task", server: BUILTIN_SERVER, args: item.argsJson };
+        }
+        const results = await runSubagentBatch(batch, ctx);
+        for (const result of results) {
+          yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: result.text };
+          conversation.push({ role: "tool", toolCallId: result.id, name: "task", content: result.text });
+          roundExecuted.push(toolCallSignature("task", result.args));
+          handles.push({
+            name: "task",
+            args: truncateArgs(result.args),
+            summary: result.ok ? `子代理 · ${result.toolCalls} 次工具调用` : "子代理执行失败",
+          });
+        }
+        continue;
+      }
+      // 工具检索（按需加载模式）：把命中的 MCP 工具 schema 加载进来，后续轮次即可直接调用。
+      if (ctx.toolSearch && call.name === TOOL_SEARCH_NAME) {
+        index += 1;
+        toolCallCount += 1;
+        executedSigs.add(sig);
+        roundExecuted.push(sig);
+        yield { type: "tool_call", id: call.id, name: call.name, server: BUILTIN_SERVER, args: call.argsJson };
+        const args = parseToolArgs(call.argsJson);
+        const query = String(args.query || "").trim();
+        const matches = query ? searchMcpTools(ctx.mcpTools, query, Number(args.limit)) : [];
+        let ok = matches.length > 0;
+        let rawText: string;
+        if (!query) {
+          const servers = [...new Set(ctx.mcpTools.map((tool) => tool.serverId))].sort();
+          rawText =
+            `请提供检索关键词（工具名 / 能力描述 / 服务器名）。当前可用 ${ctx.mcpTools.length} 个工具，` +
+            `来自：${servers.join("、") || "（无）"}。`;
+        } else if (!matches.length) {
+          rawText = `没有匹配「${query}」的工具。换个关键词再试，或参考系统提示里的工具索引（服务器 + 工具名）。`;
+        } else {
+          const loaded: string[] = [];
+          const capped: string[] = [];
+          for (const match of matches) {
+            if (ctx.loadedTools.has(match.tool.name)) continue;
+            const spec = specOfTool.get(match.tool.name);
+            if (!spec || specs.length >= MCP_MAX_TOOLS) {
+              capped.push(match.tool.name);
+              continue;
+            }
+            specs = [...specs, spec];
+            ctx.loadedTools.add(match.tool.name);
+            loaded.push(match.tool.name);
+          }
+          rawText = [
+            `命中 ${matches.length} 个工具（本次新加载 ${loaded.length} 个，现在可直接调用）：`,
+            ...matches.map((match) => `- ${match.tool.name}：${match.tool.description}`),
+            capped.length ? `注意：已达单次工具数上限 ${MCP_MAX_TOOLS}，以下命中未加载：${capped.join("、")}。` : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+        const searched = truncateResult(rawText);
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: searched };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: searched });
+        handles.push({
+          name: call.name,
+          args: truncateArgs(call.argsJson),
+          summary: ok ? `${matches.length} 个命中` : "无命中",
+        });
+        continue;
+      }
+      index += 1;
+      toolCallCount += 1;
       yield {
         type: "tool_call",
         id: call.id,
@@ -269,40 +558,172 @@ async function* runWithTools(
       };
 
       let content: string;
+      let rawText: string;
       let ok = true;
       if (toolNeedsConfirm(call.name)) {
         // 先登记等待器再下发确认事件：避免调用方在 waiter 注册前应答导致永久挂起（竞态）。
         const pendingConfirm = waitForConfirmation(call.id);
-        yield { type: "confirmation_required", id: call.id, name: call.name, args: call.argsJson };
+        const reason = confirmReasonOf(call.name);
+        yield {
+          type: "confirmation_required",
+          id: call.id,
+          name: call.name,
+          args: call.argsJson,
+          ...(reason ? { reason } : {}),
+        };
         const answer = await pendingConfirm;
         yield { type: "confirmation_response", id: call.id, confirmed: answer.confirmed };
         if (!answer.confirmed) {
           ok = false;
-          content = answer.timedOut ? "等待确认超时，已取消该工具调用" : "用户已拒绝该工具调用";
-          yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
-          conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content });
+          rawText = answer.timedOut ? "等待确认超时，已取消该工具调用" : "用户已拒绝该工具调用";
+          yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+          conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
           handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未确认）" });
           continue;
         }
       }
 
-      const result = await callMcpTool(call.name, parseToolArgs(call.argsJson));
-      ok = !result.isError;
-      content = truncateResult(result.text);
+      // 内置工具优先（fs_* / write_todos / read_skill）；其余走 MCP 通道。
+      executedSigs.add(sig);
+      roundExecuted.push(sig);
+      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId);
+      if (builtin) {
+        ok = builtin.ok;
+        rawText = builtin.text;
+        // 任务规划即时可见（事件流），同时已持久化到 conversation.todos。
+        if (builtin.todos) yield { type: "todos", todos: builtin.todos };
+      } else if (ctx.toolSearch && specOfTool.has(call.name) && !ctx.loadedTools.has(call.name)) {
+        // 按需加载模式：没检索加载过的工具不给调用（模型是照着索引里的名字猜的，参数说明它没见过）。
+        ok = false;
+        rawText = `工具 ${call.name} 尚未加载：请先调用 ${TOOL_SEARCH_NAME} 检索它（关键词可用工具名），加载后再调用。`;
+      } else {
+        const result = await callMcpTool(call.name, parseToolArgs(call.argsJson), ctx.signal);
+        ok = !result.isError;
+        rawText = result.text;
+      }
+      content = truncateResult(rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
       conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content });
       // 句柄记录的是「原文规模」而非回灌后正文，便于下一轮按需重取。
       handles.push({
         name: call.name,
         args: truncateArgs(call.argsJson),
-        summary: ok ? handleSummary(result.text) : "执行失败",
+        summary: ok ? handleSummary(rawText) : "执行失败",
       });
     }
-    // 每轮结束治理一次：给下一轮模型调用留出预算。
-    clearedToolResults += governToolResults(conversation);
+    // 每轮结束治理一次：给下一轮模型调用留出预算（超预算的大结果卸载到工作区）。
+    const governed = governToolResults(conversation, ctx.conversationId);
+    clearedToolResults += governed.cleared;
+    offloadedToolResults += governed.offloaded;
+    // 跨轮 Doom Loop 熔断：同一组工具调用连续重复达阈值 → 主动收束，避免无效循环空耗 token。
+    if (guard.record(roundExecuted)) {
+      text +=
+        "\n\n（检测到工具调用陷入重复循环，已主动停止以避免无效消耗；如需继续，请调整问题、换用更具体的检索词，" +
+        "或收窄勾选的服务器范围后再试。）";
+      break;
+    }
   }
 
-  return { text, failure, handles, clearedToolResults };
+  return { text, failure, handles, clearedToolResults, offloadedToolResults, toolCallCount };
+}
+
+interface SubagentResult {
+  id: string;
+  args: string;
+  ok: boolean;
+  text: string;
+  toolCalls: number;
+}
+
+/**
+ * 解析子代理的服务器白名单（纯函数，便于测试）：
+ * 空数组 = 不做限定（继承主代理全部工具）；给了 id 但没有匹配到任何工具 → 返回 error 让模型纠正。
+ */
+export function resolveSubagentTools(
+  tools: McpToolInfo[],
+  requested: string[],
+): { tools: McpToolInfo[]; error?: string } {
+  const wanted = [...new Set(requested.map((id) => String(id || "").trim()).filter(Boolean))].sort();
+  if (!wanted.length) return { tools };
+  const allowed = new Set(wanted);
+  const filtered = tools.filter((tool) => allowed.has(tool.serverId));
+  if (!filtered.length) {
+    const known = [...new Set(tools.map((tool) => tool.serverId))].sort();
+    return {
+      tools: [],
+      error: `task 的 servers 没有可用工具：${wanted.join("、")}。当前可用服务器：${known.join("、") || "（无）"}`,
+    };
+  }
+  return { tools: filtered };
+}
+
+/**
+ * 子代理（Deep Agents 的 task 工具，通用型）：独立上下文（只看任务描述）+
+ * 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄到指定服务器）+
+ * 只回摘要（单一交接）。取消级联：沿用主代理的 abort signal。
+ */
+async function runSubagent(call: ToolCall, ctx: LoopContext): Promise<SubagentResult> {
+  const args = parseToolArgs(call.argsJson);
+  const description = String(args.description || args.task || "").trim();
+  if (!description) {
+    return { id: call.id, args: call.argsJson, ok: false, text: "task 需要提供 description（要委派的具体任务）", toolCalls: 0 };
+  }
+  // 可选白名单：把子代理的工具限定在它真正需要的服务器上（对齐 Deep Agents「只给它需要的工具」）。
+  const resolved = resolveSubagentTools(
+    ctx.mcpTools,
+    Array.isArray(args.servers) ? args.servers.map((id) => String(id || "")) : [],
+  );
+  if (resolved.error) {
+    return { id: call.id, args: call.argsJson, ok: false, text: resolved.error, toolCalls: 0 };
+  }
+  const subTools = resolved.tools;
+  const subBuiltins = builtinToolSpecs({ toolSearch: ctx.toolSearch }).filter(
+    (spec) => spec.name !== "task" && spec.name !== "write_todos",
+  );
+  const subCtx: LoopContext = {
+    ...ctx,
+    images: [],
+    mcpTools: subTools,
+    // 按需加载模式：子代理同样只拿内置工具 + 检索入口，自己检索加载。
+    specs: [...subBuiltins, ...(ctx.toolSearch ? [] : selectMcpToolSpecs(subTools).specs)],
+    toolSearch: ctx.toolSearch,
+    loadedTools: new Set<string>(),
+    system: { stable: SUBAGENT_PROMPT, dynamic: "" },
+    allowTask: false,
+    maxRounds: SUBAGENT_MAX_ROUNDS,
+  };
+  const gen = runLoop(subCtx, [{ role: "user", content: description }]);
+  let next = await gen.next();
+  let toolCalls = 0;
+  while (!next.done) {
+    if (next.value.type === "tool_call") toolCalls += 1;
+    next = await gen.next();
+  }
+  const outcome = next.value;
+  if (outcome.failure) {
+    return { id: call.id, args: call.argsJson, ok: false, text: `子代理执行失败：${outcome.failure}`, toolCalls };
+  }
+  const summary = outcome.text.trim() || "（子代理未返回内容）";
+  const clipped =
+    summary.length > SUBAGENT_RESULT_CHARS
+      ? `${summary.slice(0, SUBAGENT_RESULT_CHARS)}\n…（已截断；如需完整数据，让子代理先用 fs_write 落盘，再用 fs_read 读取）`
+      : summary;
+  return { id: call.id, args: call.argsJson, ok: true, text: clipped, toolCalls };
+}
+
+/** 一批子代理并行执行（并发上限 SUBAGENT_MAX_PARALLEL），结果按调用顺序返回。 */
+async function runSubagentBatch(batch: ToolCall[], ctx: LoopContext): Promise<SubagentResult[]> {
+  const results: SubagentResult[] = new Array(batch.length);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < batch.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await runSubagent(batch[index]!, ctx);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(SUBAGENT_MAX_PARALLEL, batch.length) }, () => worker()));
+  return results;
 }
 
 /**
@@ -331,17 +752,82 @@ export async function* chatStream(
   }
   yield { type: "model", id: model.id, label: model.label };
 
-  const enabled = (conversation?.mcpServers || []).filter(Boolean);
-  const tools = enabled.length ? await collectTools(enabled) : [];
-  // 工具 schema 只序列化一次：既用于预算估算，也用于后续每轮的模型调用。
-  const specs = tools.length ? toolSpecsOf(tools) : [];
+  // 去重 + 排序：工具清单的确定性来自这里（顺序稳定 → system+tools 前缀稳定 → prompt 缓存命中）。
+  const enabled = [...new Set((conversation?.mcpServers || []).map((id) => String(id || "").trim()))]
+    .filter(Boolean)
+    .sort();
+  // 「工具模式」由「是否勾选了 MCP」决定，而不是「是否成功发现到 MCP 工具」：
+  // 否则某个服务器连不上会让整个对话静默降级成直连（内置工具一并消失），且模型无从知晓原因。
+  const toolMode = enabled.length > 0;
+  const collected = toolMode
+    ? await collectToolsDetailed(enabled)
+    : { tools: [] as McpToolInfo[], unavailable: [], ready: [] };
+  const selection = selectMcpToolSpecs(collected.tools);
+  // 工具定义本身就是纯开销：超过窗口的一定比例就改成「按需检索加载」（对齐 Claude Code ToolSearch 阈值策略）。
+  const eagerTokens = selection.specs.length ? estimateTokens(JSON.stringify(selection.specs)) : 0;
+  const toolSearch = toolMode && collected.tools.length > 0 && toolSearchEnabled(model, eagerTokens);
+  // 内置工具（fs_* / write_todos / read_skill / task / search_tools）只在工具模式注入 —— 直连模式保持零工具语义。
+  const builtinSpecs = toolMode ? builtinToolSpecs({ toolSearch }) : [];
+  const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
+  const labels = new Map<string, string>();
+  for (const server of [...collected.ready, ...collected.unavailable]) labels.set(server.id, server.label);
+  // 工具通道现状 → 进系统提示动态段：让模型知道「哪些域这次真的能查、哪些缺席、为什么缺席」。
+  const tooling: ToolingStatus | null = toolMode
+    ? {
+        mcpToolCount: toolSearch ? 0 : selection.specs.length,
+        totalMcpTools: collected.tools.length,
+        builtinToolCount: builtinSpecs.length,
+        ready: collected.ready,
+        unavailable: collected.unavailable,
+        dropped: toolSearch ? [] : selection.droppedServers.map((id) => labels.get(id) || id),
+        limit: MCP_MAX_TOOLS,
+        ...(toolSearch
+          ? {
+              deferred: true,
+              searchToolName: TOOL_SEARCH_NAME,
+              catalog: catalogOf(collected.tools, labels),
+            }
+          : {}),
+      }
+    : null;
+  if (toolMode) {
+    // 工具通道一行日志：排查「模型说没有这个能力」时，先看这里（谁缺席、为什么）。
+    console.log(
+      `[chat:tools] mode=${toolSearch ? "search" : "eager"} ` +
+        `mcp=${specs.length - builtinSpecs.length}/${collected.tools.length} builtin=${builtinSpecs.length} ` +
+        `ready=${collected.ready.map((item) => `${item.id}(${item.tools})`).join(",") || "-"} ` +
+        `unavailable=${collected.unavailable.map((item) => `${item.id}(${item.reason})`).join("|") || "-"} ` +
+        `dropped=${toolSearch ? "-" : selection.droppedServers.join(",") || "-"}`,
+    );
+  }
   // 预算先算：窗口 − 输出预留 − 工具 schema − 本轮工具结果预算（工具定义也是纯开销）。
   const toolSchemaTokens = specs.length ? estimateTokens(JSON.stringify(specs)) : 0;
   const budget = historyBudgetTokens(model, toolSchemaTokens);
-  const built = buildTurns(conversation?.context || [], userText, budget);
-  const turns = built.turns;
-  // 该对话指定的语言 → 一条通用回复语言指令（未指定则不注入）。
-  const systemExtra = languageDirective(conversation?.locale) || undefined;
+  // 统一上下文装配（history.ts）：窗口 → 无损裁剪 → 超预算时 LLM 摘要（水位线增量）→ 硬丢弃。
+  const assembled = await assembleContext({
+    history: conversation?.context || [],
+    userText,
+    budgetTokens: budget,
+    summary: conversation?.summary,
+    summaryCovered: conversation?.summaryCovered,
+    compact: (prompt) => summarizeWith(model, prompt, signal),
+  });
+  const turns = assembled.turns;
+  // 本次请求实际占用的估算 token（历史原文 + 摘要 + 当前输入），用于透明度展示。
+  const totalTokens =
+    estimateTokensOf(turns.map((turn) => turn.content)) + estimateTokens(assembled.summary);
+  // 摘要只在确实发生压缩时写回（水位线单调前移，下一轮增量扩展）。
+  if (assembled.usage.compacted) {
+    await setConversationSummary(conversationId, assembled.summary, assembled.summaryCovered).catch(() => undefined);
+  }
+  // 系统提示两段式：稳定前缀（角色守则 + skills 索引，可被 prompt cache 命中）
+  // + 动态后缀（长期记忆 / 历史摘要 / 回复语言）。
+  const system = buildSystemPrompt({
+    locale: conversation?.locale,
+    summary: assembled.summary || null,
+    tooling,
+    todos: conversation?.todos,
+  });
   // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
   const images = opts.images?.length && model.vision === "direct" ? imagesOf(opts.images) : [];
 
@@ -349,29 +835,56 @@ export async function* chatStream(
   let failure: string | null = null;
   let handles: ToolHandle[] = [];
   let clearedToolResults = 0;
-  if (tools.length) {
-    const outcome = yield* runWithTools(model, turns, images, tools, specs, signal, systemExtra);
+  let offloadedToolResults = 0;
+  if (toolMode) {
+    const outcome = yield* runLoop(
+      {
+        conversationId,
+        model,
+        images,
+        mcpTools: collected.tools,
+        specs,
+        toolSearch,
+        loadedTools: new Set<string>(),
+        system,
+        signal,
+        allowTask: true,
+        maxRounds: MAX_TOOL_ROUNDS,
+      },
+      turns,
+    );
     text = outcome.text;
     failure = outcome.failure;
     handles = outcome.handles;
     clearedToolResults = outcome.clearedToolResults;
+    offloadedToolResults = outcome.offloadedToolResults;
   } else {
-    const outcome = yield* streamCall(model, turns, images, [], signal, systemExtra);
+    const outcome = yield* streamCall(model, turns, images, [], signal, system);
     text = outcome.text;
     failure = outcome.failure;
   }
 
   const usage: ChatEvent = {
     type: "usage",
-    tokens: built.tokens,
+    tokens: totalTokens,
     budget,
     window: model.contextWindow,
-    turns: Math.max(0, turns.length - 1),
-    dropped: built.dropped,
+    turns: assembled.usage.turns,
+    dropped: assembled.usage.dropped,
+    summarized: assembled.usage.summarized,
     toolResultsCleared: clearedToolResults,
+    toolResultsOffloaded: offloadedToolResults,
   };
 
   if (failure) {
+    // 用户主动中断（点「停止」/ 关页面）：这一轮已经发生了，仍要写回上下文，
+    // 否则下一轮模型看不到它，而界面上用户已经看到这段内容 —— 上下文与界面不一致。
+    if (signal?.aborted) {
+      await appendContext(
+        conversationId,
+        [{ role: "user", text: userText }, { role: "assistant", text: text.trim() }],
+      ).catch(() => undefined);
+    }
     yield {
       type: "error",
       error: { code: "MODEL_ERROR", defaultMessage: failure },

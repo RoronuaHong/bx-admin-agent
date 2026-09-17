@@ -68,10 +68,13 @@ function drop(id: string, path: string) {
   }
 }
 
-// 惰性清理：每次写入/读取时顺带清理过期项。
+// 惰性清理：按时间间隔节流（不是按条目数取模 —— 删除会改变条目数，取模几乎永远不命中）。
+const PRUNE_INTERVAL_MS = 10 * 60_000;
+let lastPruneAt = 0;
 function lazyPrune() {
-  if (!store.size || store.size % 16 !== 0) return;
   const now = Date.now();
+  if (now - lastPruneAt < PRUNE_INTERVAL_MS) return;
+  lastPruneAt = now;
   for (const [id, item] of store) {
     if (now - item.createdAt > IMAGE_TTL_MS) drop(id, item.path);
   }

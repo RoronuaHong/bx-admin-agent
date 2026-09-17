@@ -8,9 +8,15 @@ export interface ApiErrorPayload {
   error: LocalizedToken;
 }
 
+/** 任务规划条目（Deep Agents 的 write_todos 形态：全量替换，非增量）。 */
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+}
+
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
-// 与写操作确认事件。
+// 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
 export type ChatEvent =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
@@ -19,6 +25,7 @@ export type ChatEvent =
   | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
   | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
   | { type: "confirmation_response"; id: string; confirmed: boolean }
+  | { type: "todos"; todos: TodoItem[] }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
   | {
       /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
@@ -33,7 +40,11 @@ export type ChatEvent =
       turns: number;
       /** 因预算被丢弃的较早消息条数。 */
       dropped: number;
+      /** 本次请求是否携带了历史摘要（上下文压缩产物）。 */
+      summarized?: boolean;
       /** 本轮被清理（占位化）的工具结果条数。 */
       toolResultsCleared: number;
+      /** 本轮被卸载到虚拟文件系统（可 fs_read 取回）的工具结果条数。 */
+      toolResultsOffloaded?: number;
     }
   | { type: "done" };

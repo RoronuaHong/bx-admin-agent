@@ -5,6 +5,7 @@
 //  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
+import type { TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
@@ -45,6 +46,8 @@ interface ConversationDoc {
   locale?: string;
   /** 忙碌期间排队的待发消息。 */
   pendingQueue?: PendingMessage[];
+  /** 任务规划（write_todos 全量替换），跨轮持久化、前端可见。 */
+  todos?: TodoItem[];
 
   // ---- 模型上下文（thread）----
   /** 发往模型的对话历史（含工具轻量句柄），是上下文的唯一真相。 */
@@ -192,55 +195,12 @@ export async function upsertMessages(input: {
   );
 }
 
-/**
- * 服务端权威追加：一轮对话结束后由服务器落库（不依赖前端上报，避免关页面丢一轮）。
- * 会话不存在时自动创建（标题取首条用户输入前若干字）。
- */
-export async function appendMessages(input: {
-  id: string;
-  messages: StoredMessage[];
-  title?: string;
-}): Promise<void> {
-  if (!input.messages.length) return;
-  const title =
-    input.title ||
-    (() => {
-      const first = input.messages.find((m) => m.role === "user" && m.text);
-      return first ? first.text.slice(0, 24) : undefined;
-    })();
-  const now = Date.now();
-  const coll = await getColl();
-  if (!coll) {
-    let doc = memory.get(input.id);
-    if (!doc) {
-      doc = { id: input.id, title: title || "新对话", messages: [], createdAt: now, updatedAt: now };
-      memory.set(input.id, doc);
-    }
-    doc.messages = [...doc.messages, ...input.messages];
-    doc.updatedAt = now;
-    if (title && doc.messages.length <= input.messages.length) doc.title = title;
-    return;
-  }
-  await coll.updateMany(
-    { id: input.id },
-    {
-      $push: { messages: { $each: input.messages } },
-      $set: { updatedAt: now, ...(title ? { title } : {}) },
-      $setOnInsert: { createdAt: now },
-    },
-    { upsert: true },
-  );
-  // 首次插入时标题可能还是默认值：仅在会话原本无用户输入时补全标题。
-  if (title) {
-    await coll.updateOne(
-      { id: input.id, title: "新对话" },
-      { $set: { title } },
-    );
-  }
-}
-
-/** 写入/更新会话摘要（上下文压缩产物跨轮复用）。 */
-export async function setConversationSummary(id: string, summary: string): Promise<void> {
+/** 写入/更新会话摘要与水位线（上下文压缩产物跨轮复用，水位线单调前移）。 */
+export async function setConversationSummary(
+  id: string,
+  summary: string,
+  summaryCovered: number,
+): Promise<void> {
   const now = Date.now();
   const coll = await getColl();
   if (!coll) {
@@ -248,10 +208,22 @@ export async function setConversationSummary(id: string, summary: string): Promi
     if (doc) {
       doc.summary = summary;
       doc.summaryAt = now;
+      doc.summaryCovered = summaryCovered;
     }
     return;
   }
-  await coll.updateMany({ id }, { $set: { summary, summaryAt: now } });
+  await coll.updateMany({ id }, { $set: { summary, summaryAt: now, summaryCovered } });
+}
+
+/** 写入任务规划（write_todos 全量替换；跨轮持久化）。 */
+export async function setConversationTodos(id: string, todos: TodoItem[]): Promise<void> {
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (doc) doc.todos = todos;
+    return;
+  }
+  await coll.updateMany({ id }, { $set: { todos, updatedAt: Date.now() } });
 }
 
 export async function deleteConversation(id: string): Promise<void> {
