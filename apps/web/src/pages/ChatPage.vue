@@ -146,7 +146,6 @@ function autoGrow() {
   el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
 }
 
-watch(() => current.value.input, () => autoGrow());
 /** 设备默认语言（来自 `GET /chat/preferences`；对话未显式设置 locale 时兜底）。 */
 const deviceLocale = ref<UiLocale>(detectDefaultLocale());
 /** 设置类操作的失败提示（乐观更新回滚后告诉用户，避免"点了没反应"）。 */
@@ -170,6 +169,9 @@ function stateOf(id: string): ConvState {
 
 /** 当前对话的状态；纯查找，不产生副作用。 */
 const current = computed<ConvState>(() => (currentId.value ? states.get(currentId.value) : undefined) ?? blank);
+
+/** 输入内容变化（含切换对话）时让输入框自动长高。必须放在 current 声明之后，避免 setup 期 TDZ。 */
+watch(() => current.value.input, () => autoGrow());
 
 /** 当前对话的模型选择；空 = 服务端默认，UI 兜底展示列表首个（与旧行为一致）。 */
 const modelId = computed({
