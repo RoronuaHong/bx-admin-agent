@@ -153,7 +153,7 @@ const LOCALE_DIRECTIVES: Record<string, string> = {
   hi: "Respond in Hindi.",
 };
 
-export function languageDirective(locale?: string | null): string {
+function languageDirective(locale?: string | null): string {
   return LOCALE_DIRECTIVES[locale || ""] || "";
 }
 

@@ -18,7 +18,7 @@ const TABLE_MAX_LINES = 12;
 /** 摘要生成的输入上限（字符）：更早的部分已被逐条裁剪，正常到不了这里。 */
 const COMPACT_INPUT_CHARS = 24_000;
 
-export const SUMMARIZE_PROMPT =
+const SUMMARIZE_PROMPT =
   "把以下对话压缩成一份摘要，供后续对话作为背景使用。必须保留：\n" +
   "1) 用户的目标与约束；2) 已确认的结论与关键数字；3) 执行过的工具调用（工具名 + 关键参数）；4) 未完成事项。\n" +
   "不要评论、不要输出标题以外的客套话，直接输出摘要正文。\n\n对话内容：\n";
@@ -33,7 +33,7 @@ export function renderHandles(handles: ToolHandle[] | undefined): string {
 }
 
 /** 单轮对话在上下文里的文本形态：正文 + 工具句柄。 */
-export function turnContent(turn: { text: string; handles?: ToolHandle[] }): string {
+function turnContent(turn: { text: string; handles?: ToolHandle[] }): string {
   return `${turn.text}${renderHandles(turn.handles)}`;
 }
 
@@ -62,7 +62,7 @@ function prunedText(text: string): { text: string; changed: boolean } {
   return { text: out, changed };
 }
 
-export interface AssembleUsage {
+interface AssembleUsage {
   /** 发给模型的历史条数（不含当前输入）。 */
   turns: number;
   /** 因预算被丢弃的较早消息条数（被摘要吸收的不计）。 */
@@ -75,7 +75,7 @@ export interface AssembleUsage {
   compacted: boolean;
 }
 
-export interface AssembleInput {
+interface AssembleInput {
   /** 该对话的 `context`（thread 唯一真相）。 */
   history: Array<{ role: "user" | "assistant"; text: string; handles?: ToolHandle[] }>;
   userText: string;
@@ -90,7 +90,7 @@ export interface AssembleInput {
   compact?: (prompt: string) => Promise<string>;
 }
 
-export interface AssembleResult {
+interface AssembleResult {
   turns: Turn[];
   /** 最新摘要（可能沿用已有值；无摘要为空串）。 */
   summary: string;

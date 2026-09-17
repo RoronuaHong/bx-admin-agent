@@ -204,7 +204,7 @@ export async function disconnectAll(): Promise<void> {
  * 下次用到时自动重连（connect 是幂等的）。正在连接或正在调用的连接不动。
  * 返回被回收的 serverId 列表（测试与日志用）。
  */
-export async function reclaimIdleConnections(now = Date.now()): Promise<string[]> {
+async function reclaimIdleConnections(now = Date.now()): Promise<string[]> {
   if (IDLE_TIMEOUT_MS <= 0) return [];
   const idle: string[] = [];
   for (const [id, conn] of conns) {
