@@ -4,16 +4,50 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
 
+/** 工具调用的轻量句柄：跨轮只保留「查过什么」，不保留结果正文（正文由本轮预算管理并可被清理）。 */
+export interface ToolHandle {
+  /** 工具名（MCP 命名空间名，数据驱动）。 */
+  name: string;
+  /** 调用参数原文（截断后）。 */
+  args?: string;
+  /** 结果规模摘要（行数/字符数），不含正文。 */
+  summary?: string;
+}
+
 export interface ChatTurn {
   role: "user" | "assistant";
   text: string;
+  /** 该轮执行过的工具句柄，跨轮注入上下文，便于追问时复用或重新取数。 */
+  handles?: ToolHandle[];
 }
 
-/** 匿名本地会话：只用于承载历史上下文，无登录态。 */
+/** 设备级 UI 偏好（原前端 localStorage，现改为后端持久化）。 */
+export interface SessionPreferences {
+  theme?: "light" | "dark";
+  /** 客户端默认语言；单个对话未显式设置 locale 时使用。 */
+  locale?: string;
+  /**
+   * 客户端完成过一次偏好同步的时间戳。
+   * 前端据此判断「旧的 3 个 localStorage 键是否已迁移」，避免换设备/清缓存后重复迁移。
+   */
+  migratedAt?: number;
+}
+
+/**
+ * 匿名本地会话：只承载**设备态**（活跃对话、UI 偏好）。
+ * 对话内容与对话级设置（context / model / mcpServers / locale）见 conversation 文档。
+ */
 export interface Session {
   id: string;
   createdAt: number;
+  /** @deprecated 上下文唯一真相已迁到 `conversation.context`（resolveConversation 一次性拷贝迁移，此后不再写入）。 */
   messages: ChatTurn[];
+  /** @deprecated MCP 启用集已按对话持久化（`conversation.mcpServers`），仅在迁移路径读取。 */
+  mcpServers: string[];
+  /** 上次打开的对话 id（原前端 localStorage）。 */
+  activeConversationId?: string;
+  /** 设备级 UI 偏好（主题等）。 */
+  preferences?: SessionPreferences;
 }
 
 /** 会话 cookie 名。 */
@@ -35,6 +69,7 @@ function loadFromDisk() {
     for (const s of arr) {
       if (now - s.createdAt > config.sessionTtlMs) continue;
       if (!Array.isArray(s.messages)) s.messages = [];
+      if (!Array.isArray(s.mcpServers)) s.mcpServers = [];
       sessions.set(s.id, s);
     }
   } catch {
@@ -64,26 +99,22 @@ function persist() {
 
 loadFromDisk();
 
+// 只接受服务端签发的会话 id（UUID），避免伪造/异常 cookie 造成会话串用。
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** 取会话，不存在则新建（无需登录）。 */
 export function ensureSession(id?: string | null): Session {
   const existing = id ? sessions.get(id) : undefined;
   if (existing && Date.now() - existing.createdAt <= config.sessionTtlMs) return existing;
   if (existing) sessions.delete(existing.id);
-  const session: Session = { id: id && id.length > 8 ? id : randomUUID(), createdAt: Date.now(), messages: [] };
+  const session: Session = {
+    id: id && UUID_RE.test(id) ? id : randomUUID(),
+    createdAt: Date.now(),
+    messages: [],
+    mcpServers: [],
+  };
   sessions.set(session.id, session);
   persist();
-  return session;
-}
-
-export function getSession(id?: string | null): Session | null {
-  if (!id) return null;
-  const session = sessions.get(id);
-  if (!session) return null;
-  if (Date.now() - session.createdAt > config.sessionTtlMs) {
-    sessions.delete(id);
-    persist();
-    return null;
-  }
   return session;
 }
 

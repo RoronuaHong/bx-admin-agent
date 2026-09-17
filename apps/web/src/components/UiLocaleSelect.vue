@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { getUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 
+const emit = defineEmits<{ change: [UiLocale] }>();
+
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
@@ -23,6 +25,8 @@ function toggleOpen() {
 
 function choose(value: UiLocale) {
   setUiLocale(value);
+  // 持久化交给父组件：语言是对话级设置，需要连同 conversationId 一起落库。
+  emit("change", value);
   open.value = false;
 }
 
@@ -85,20 +89,21 @@ onBeforeUnmount(() => {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  min-width: 148px;
-  height: 32px;
+  gap: 7px;
+  min-width: 132px;
+  height: var(--ctrl-h);
   padding: 0 11px 0 12px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--panel);
   color: var(--muted);
   cursor: pointer;
   overflow: hidden;
   transition:
-    color 0.2s ease,
-    background 0.2s ease,
-    border-color 0.2s ease;
+    color 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
   font: inherit;
 }
 
@@ -121,7 +126,7 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   line-height: 1;
 }
@@ -136,26 +141,30 @@ onBeforeUnmount(() => {
   opacity: 0.58;
 }
 
-.locale-select:hover {
-  color: var(--accent, #0f766e);
-  background: var(--panel);
-  border-color: var(--accent, #0f766e);
+.locale-select:hover,
+.locale-select[aria-expanded="true"] {
+  background: var(--fill-soft);
+  border-color: color-mix(in srgb, var(--ink) 28%, var(--line));
 }
 
-.locale-select:focus-within {
-  color: var(--accent, #0f766e);
-  background: var(--panel);
-  border-color: var(--accent, #0f766e);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #0f766e) 12%, transparent);
+.locale-select:hover .locale-value,
+.locale-select[aria-expanded="true"] .locale-value {
+  color: var(--ink);
 }
 
-.locale-select:focus-within .locale-caret {
+.locale-select[aria-expanded="true"] {
+  box-shadow: var(--ring);
+}
+
+.locale-select[aria-expanded="true"] .locale-caret,
+.locale-select:hover .locale-caret {
   opacity: 1;
 }
 
 .locale-select:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent, #0f766e) 45%, transparent);
-  outline-offset: 2px;
+  outline: none;
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
+  box-shadow: var(--ring);
 }
 
 .locale-menu-wrap {

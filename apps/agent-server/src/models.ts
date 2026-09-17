@@ -1,4 +1,4 @@
-import type { ModelEntry } from "./config.js";
+import { config, type ModelEntry } from "./config.js";
 
 // 统一模型调用层：三种协议适配（anthropic / openai / ollama），均返回纯文本。
 //
@@ -6,46 +6,103 @@ import type { ModelEntry } from "./config.js";
 // 如需极小的固定角色说明，可通过 AGENT_GUIDE 显式注入。
 const DEFAULT_CHAT_GUIDE = "";
 
-export function chatGuideSystem(): string {
+function chatGuideSystem(): string {
   return process.env.AGENT_GUIDE || DEFAULT_CHAT_GUIDE;
+}
+
+/**
+ * 粗略 token 估算（无外部分词器依赖）：CJK/全角字符约 1 token/字，其余约 4 字符/token。
+ * 只用于上下文预算，不要求精确；比按字符计数更接近真实占用。
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  const chars = Array.from(text);
+  let wide = 0;
+  for (const ch of chars) {
+    const cp = ch.codePointAt(0) || 0;
+    if (cp > 0x2e80) wide++;
+  }
+  return Math.ceil(wide + (chars.length - wide) / 4);
+}
+
+/** 一组文本的 token 合计。 */
+export function estimateTokensOf(texts: string[]): number {
+  return texts.reduce((sum, text) => sum + estimateTokens(text), 0);
 }
 
 export interface ModelTurn {
   role: "user" | "assistant";
   content: string;
+  /** assistant 消息携带的工具调用（上一轮模型产出，需回灌给模型保持上下文）。 */
+  toolCalls?: ToolCall[];
 }
+
+/** 工具执行结果消息（OpenAI 的 role:tool / anthropic 的 tool_result）。 */
+export interface ToolResultTurn {
+  role: "tool";
+  toolCallId: string;
+  name: string;
+  content: string;
+}
+
+export type Turn = ModelTurn | ToolResultTurn;
 
 export interface OptionImage {
   base64: string;
   mediaType: string;
 }
 
-export interface AgentResult {
-  text: string;
-  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+/** 注入模型的工具定义（OpenAI function 形状，anthropic 在适配层转换）。 */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
 }
 
-export interface CallAgentOptions {
-  /** 附加 system 前缀（可选）。 */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** 参数 JSON 字符串（流式增量拼接；解析失败时为空对象字符串）。 */
+  argsJson: string;
+}
+
+export interface AgentResult {
+  text: string;
+  toolCalls: ToolCall[];
+}
+
+export interface CallOptions {
+  tools?: ToolSpec[];
+  toolChoice?: "auto" | "none" | "required";
+  /** 追加到系统提示的内容（长期记忆、历史摘要等），保持在同一条 system 消息里利于命中缓存。 */
   systemExtra?: string;
 }
 
 export async function callAgent(
   model: ModelEntry,
-  turns: ModelTurn[],
+  turns: Turn[],
   images: OptionImage[],
   signal?: AbortSignal,
-  opts: CallAgentOptions = {},
   onDelta?: (chunk: string) => void,
+  opts: CallOptions = {},
 ): Promise<AgentResult> {
   switch (model.provider) {
     case "anthropic":
       return callAnthropic(model, turns, images, signal, opts);
     case "openai":
-      return callOpenAi(model, turns, images, signal, opts, onDelta);
+      return callOpenAi(model, turns, images, signal, onDelta, opts);
     default:
-      return { text: await callOllama(model, turns, images, signal) };
+      return { text: await callOllama(model, turns, images, signal, opts), toolCalls: [] };
   }
+}
+
+function hasTools(opts: CallOptions): boolean {
+  return Array.isArray(opts.tools) && opts.tools.length > 0;
+}
+
+/** 系统提示 = 固定引导 + 本次额外上下文（记忆/摘要）。 */
+function systemPrompt(opts: CallOptions): string {
+  return [chatGuideSystem(), opts.systemExtra].filter((part) => part && part.trim()).join("\n\n");
 }
 
 // ---- 多 key 轮询与限流重试 ----
@@ -91,33 +148,81 @@ function timeoutSignalOf(model: ModelEntry, signal?: AbortSignal): AbortSignal {
     : AbortSignal.timeout(model.timeoutMs);
 }
 
+/** 转成 anthropic 消息：工具结果用 user 消息里的 tool_result 块回灌（与官方文档一致）。 */
+function toAnthropicMessages(
+  model: ModelEntry,
+  turns: Turn[],
+  images: OptionImage[],
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    const isLast = i === turns.length - 1;
+    if (turn.role === "tool") {
+      const block = { type: "tool_result", tool_use_id: turn.toolCallId, content: turn.content };
+      const prev = out[out.length - 1];
+      if (prev && prev.role === "user" && Array.isArray(prev.content)) {
+        (prev.content as unknown[]).push(block);
+      } else {
+        out.push({ role: "user", content: [block] });
+      }
+      continue;
+    }
+    if (turn.role === "assistant" && turn.toolCalls?.length) {
+      const content: unknown[] = [];
+      if (turn.content) content.push({ type: "text", text: turn.content });
+      for (const call of turn.toolCalls) {
+        content.push({ type: "tool_use", id: call.id, name: call.name, input: safeJsonParse(call.argsJson) });
+      }
+      out.push({ role: "assistant", content });
+      continue;
+    }
+    if (turn.role === "user" && isLast && model.vision === "direct" && images.length) {
+      const content: unknown[] = [{ type: "text", text: turn.content }];
+      for (const image of images) {
+        content.push({ type: "image", source: { type: "base64", media_type: image.mediaType, data: image.base64 } });
+      }
+      out.push({ role: "user", content });
+      continue;
+    }
+    out.push({ role: turn.role, content: turn.content });
+  }
+  return out;
+}
+
+function safeJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return {};
+  }
+}
+
 async function callAnthropic(
   model: ModelEntry,
-  turns: ModelTurn[],
+  turns: Turn[],
   images: OptionImage[],
   signal?: AbortSignal,
-  opts: CallAgentOptions = {},
+  opts: CallOptions = {},
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
-  const messages: Array<Record<string, unknown>> = turns.map((turn, index) => {
-    if (index !== turns.length - 1) return { role: turn.role, content: turn.content };
-    const content: Array<Record<string, unknown>> = [{ type: "text", text: turn.content }];
-    if (model.vision === "direct") {
-      for (const image of images) {
-        content.push({
-          type: "image",
-          source: { type: "base64", media_type: image.mediaType, data: image.base64 },
-        });
-      }
-    }
-    return { role: "user", content };
-  });
-  const system = [chatGuideSystem(), opts.systemExtra || ""].filter(Boolean).join("\n\n");
+  const messages = toAnthropicMessages(model, turns, images);
+  const system = systemPrompt(opts);
   const body: Record<string, unknown> = {
     model: model.name,
-    max_tokens: 8192,
+    max_tokens: config.maxOutputTokens,
     ...(system ? { system } : {}),
     messages,
+    ...(hasTools(opts)
+      ? {
+          tools: (opts.tools || []).map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.parameters,
+          })),
+          tool_choice: { type: opts.toolChoice || "auto" },
+        }
+      : {}),
   };
   const response = await fetchWithKeyRotation(model, (key) =>
     fetch(`${base}/v1/messages`, {
@@ -132,8 +237,7 @@ async function callAnthropic(
     }),
   );
   const bodyResult = (await response.json().catch(() => null)) as {
-    content?: Array<{ type: string; text?: string }>;
-    usage?: { input_tokens?: number; output_tokens?: number };
+    content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
   } | null;
   if (!response.ok) {
     const detail = bodyResult ? JSON.stringify(bodyResult).slice(0, 500) : "";
@@ -142,55 +246,93 @@ async function callAnthropic(
     }
     throw new Error(`model http ${response.status}: ${detail}`);
   }
-  const text = (bodyResult?.content || [])
+  const blocks = bodyResult?.content || [];
+  const text = blocks
     .filter((block) => block.type === "text")
     .map((block) => block.text || "")
     .join("")
     .trim();
-  return {
-    text,
-    usage: bodyResult?.usage
-      ? {
-          promptTokens: bodyResult.usage.input_tokens || 0,
-          completionTokens: bodyResult.usage.output_tokens || 0,
-          totalTokens: (bodyResult.usage.input_tokens || 0) + (bodyResult.usage.output_tokens || 0),
-        }
-      : undefined,
-  };
+  const toolCalls: ToolCall[] = blocks
+    .filter((block) => block.type === "tool_use")
+    .map((block, index) => ({
+      id: block.id || `tool_${index}`,
+      name: block.name || "",
+      argsJson: JSON.stringify(block.input ?? {}),
+    }));
+  return { text, toolCalls };
+}
+
+/** 转成 OpenAI 消息：assistant 带 tool_calls，工具结果用 role:tool 回灌。 */
+function toOpenAiMessages(
+  model: ModelEntry,
+  turns: Turn[],
+  images: OptionImage[],
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    const isLast = i === turns.length - 1;
+    if (turn.role === "tool") {
+      out.push({ role: "tool", tool_call_id: turn.toolCallId, content: turn.content });
+      continue;
+    }
+    if (turn.role === "assistant" && turn.toolCalls?.length) {
+      out.push({
+        role: "assistant",
+        content: turn.content || null,
+        tool_calls: turn.toolCalls.map((call) => ({
+          id: call.id,
+          type: "function",
+          function: { name: call.name, arguments: call.argsJson },
+        })),
+      });
+      continue;
+    }
+    if (turn.role === "user" && isLast && model.vision === "direct" && images.length) {
+      const content: Array<Record<string, unknown>> = [{ type: "text", text: turn.content }];
+      for (const image of images) {
+        content.push({
+          type: "image_url",
+          image_url: { url: `data:${image.mediaType};base64,${image.base64}` },
+        });
+      }
+      out.push({ role: "user", content });
+      continue;
+    }
+    out.push({ role: turn.role, content: turn.content });
+  }
+  return out;
 }
 
 async function callOpenAi(
   model: ModelEntry,
-  turns: ModelTurn[],
+  turns: Turn[],
   images: OptionImage[],
   signal?: AbortSignal,
-  opts: CallAgentOptions = {},
   onDelta?: (chunk: string) => void,
+  opts: CallOptions = {},
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
-  const system = [chatGuideSystem(), opts.systemExtra || ""].filter(Boolean).join("\n\n");
+  const system = systemPrompt(opts);
   const messages: Array<Record<string, unknown>> = [
     ...(system ? [{ role: "system", content: system }] : []),
-    ...turns.map((turn, index) => {
-      if (index !== turns.length - 1) return { role: turn.role, content: turn.content };
-      const content: Array<Record<string, unknown>> = [{ type: "text", text: turn.content }];
-      if (model.vision === "direct") {
-        for (const image of images) {
-          content.push({
-            type: "image_url",
-            image_url: { url: `data:${image.mediaType};base64,${image.base64}` },
-          });
-        }
-      }
-      return { role: "user", content };
-    }),
+    ...toOpenAiMessages(model, turns, images),
   ];
   const body: Record<string, unknown> = {
     model: model.name,
-    max_tokens: 8192,
+    max_tokens: config.maxOutputTokens,
     // 流式：边生成边回包，避免网关对慢模型整包超时。
     stream: true,
     messages,
+    ...(hasTools(opts)
+      ? {
+          tools: (opts.tools || []).map((tool) => ({
+            type: "function",
+            function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+          })),
+          tool_choice: opts.toolChoice || "auto",
+        }
+      : {}),
   };
   const response = await fetchWithKeyRotation(model, (key) =>
     fetch(`${base}/chat/completions`, {
@@ -223,7 +365,8 @@ async function callOpenAi(
   const decoder = new TextDecoder();
   let buffer = "";
   let text = "";
-  let lastUsage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+  // 流式工具调用是分片增量（index/id/name/arguments 分别到达），按 index 累积拼接。
+  const pendingTools = new Map<number, { id: string; name: string; args: string }>();
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -236,46 +379,64 @@ async function callOpenAi(
       const payload = line.slice(5).trim();
       if (payload === "[DONE]") break;
       let chunk: {
-        choices?: Array<{ delta?: { content?: string | null } }>;
-        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+        choices?: Array<{
+          delta?: {
+            content?: string | null;
+            tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
+          };
+        }>;
       };
       try {
         chunk = JSON.parse(payload);
       } catch {
         continue;
       }
-      if (chunk.usage) lastUsage = chunk.usage;
-      const content = chunk.choices?.[0]?.delta?.content;
+      const delta = chunk.choices?.[0]?.delta;
+      const content = delta?.content;
       if (content) {
         text += content;
         onDelta?.(content);
       }
+      for (const part of delta?.tool_calls || []) {
+        const index = typeof part.index === "number" ? part.index : 0;
+        const current = pendingTools.get(index) || { id: "", name: "", args: "" };
+        if (part.id) current.id = part.id;
+        if (part.function?.name) current.name += part.function.name;
+        if (part.function?.arguments) current.args += part.function.arguments;
+        pendingTools.set(index, current);
+      }
     }
   }
-  return {
-    text: text.trim(),
-    usage: lastUsage
-      ? {
-          promptTokens: lastUsage.prompt_tokens,
-          completionTokens: lastUsage.completion_tokens,
-          totalTokens: lastUsage.total_tokens,
-        }
-      : undefined,
-  };
+  const toolCalls: ToolCall[] = [...pendingTools.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, call]) => ({
+      id: call.id || `call_${index}`,
+      name: call.name,
+      argsJson: call.args || "{}",
+    }))
+    .filter((call) => Boolean(call.name));
+  return { text: text.trim(), toolCalls };
 }
 
 async function callOllama(
   model: ModelEntry,
-  turns: ModelTurn[],
+  turns: Turn[],
   images: OptionImage[],
   signal?: AbortSignal,
+  opts: CallOptions = {},
 ): Promise<string> {
   const base = model.baseUrl.replace(/\/+$/, "");
-  const last = turns[turns.length - 1];
+  // ollama 通道不接工具：工具结果降级为 user 文本，保证多轮上下文仍然连贯。
+  const plain = turns.map((turn) =>
+    turn.role === "tool"
+      ? { role: "user" as const, content: `[工具 ${turn.name} 返回]\n${turn.content}` }
+      : { role: turn.role, content: turn.content },
+  );
+  const last = plain[plain.length - 1];
   const system = chatGuideSystem();
   const ollamaMessages = [
     ...(system ? [{ role: "system", content: system }] : []),
-    ...turns.slice(0, -1).map((turn) => ({ role: turn.role, content: turn.content })),
+    ...plain.slice(0, -1).map((turn) => ({ role: turn.role, content: turn.content })),
     {
       role: last.role,
       content: last.content,

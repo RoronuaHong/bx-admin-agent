@@ -52,31 +52,43 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
   align-items: center;
   justify-content: center;
   gap: 7px;
-  height: 32px;
-  min-height: 32px;
-  min-width: 32px;
+  height: var(--ctrl-h);
+  min-height: var(--ctrl-h);
+  min-width: var(--ctrl-h);
   padding: 0 12px;
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--muted);
   cursor: pointer;
   font: inherit;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   line-height: 1;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   transition:
-    color 0.2s ease,
-    background 0.2s ease,
-    border-color 0.2s ease;
+    color 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.15s var(--ease);
   white-space: nowrap;
   flex: none;
 }
 
 .theme-toggle:hover {
-  color: var(--accent, #0f766e);
-  background: var(--panel);
-  border-color: var(--accent, #0f766e);
+  color: var(--ink);
+  background: var(--fill-soft);
+  border-color: color-mix(in srgb, var(--ink) 28%, var(--line));
+}
+
+.theme-toggle:active {
+  transform: scale(0.97);
+}
+
+.theme-toggle:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
+  box-shadow: var(--ring);
 }
 
 .icon {
@@ -100,9 +112,9 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 
   .theme-toggle {
     padding: 0;
-    min-width: 32px;
-    width: 32px;
-    height: 32px;
+    min-width: var(--ctrl-h);
+    width: var(--ctrl-h);
+    height: var(--ctrl-h);
   }
 }
 </style>

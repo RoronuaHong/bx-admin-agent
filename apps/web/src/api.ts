@@ -12,7 +12,21 @@ export type ChatEvent =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
   | { type: "model"; id: string; label: string }
+  | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
+  | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
+  | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
+  | { type: "confirmation_response"; id: string; confirmed: boolean }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
+  | {
+      /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
+      type: "usage";
+      tokens: number;
+      budget: number;
+      window: number;
+      turns: number;
+      dropped: number;
+      toolResultsCleared: number;
+    }
   | { type: "done" };
 
 export class ApiError extends Error {
@@ -83,7 +97,6 @@ export interface UploadResult {
   id: string;
   name: string;
   size: number;
-  kind: "image" | "text";
 }
 
 export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
@@ -94,7 +107,7 @@ export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
   return data.files || [];
 }
 
-/** 一轮对话（SSE）：text_delta 流式增量，text 为最终全文，done 结束。 */
+/** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
 export async function streamChat(
   text: string,
   opts: { model?: string; images?: string[] },
@@ -125,13 +138,13 @@ export async function streamChat(
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const chunks = buffer.split("\n\n");
-      buffer = chunks.pop() || "";
-      for (const chunk of chunks) {
-        const line = chunk.split("\n").find((item) => item.startsWith("data: "));
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
         if (!line) continue;
         try {
-          onEvent(JSON.parse(line.slice(6)) as ChatEvent);
+          onEvent(JSON.parse(line) as ChatEvent);
         } catch {
           // 单条事件非法时跳过，不中断流
         }
@@ -154,12 +167,26 @@ export interface StoredMessage {
   images?: { id: string; name: string }[];
 }
 
+/** 排队中的待发消息（后端持久化，`conversation.pendingQueue`）。 */
+export interface PendingMessage {
+  text: string;
+  images?: string[];
+  at: number;
+}
+
 export interface ConversationDto {
   id: string;
   title: string;
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
+  /** 服务端是否正在为该对话生成（进程内存态）→ 侧栏状态点。 */
+  running?: boolean;
+  // ---- 对话级设置（每个对话独立；空 = 用服务端/设备默认）----
+  model?: string;
+  mcpServers?: string[];
+  locale?: string;
+  pendingQueue?: PendingMessage[];
 }
 
 export async function fetchConversations(): Promise<ConversationDto[]> {
@@ -182,17 +209,155 @@ export async function saveConversationMessages(id: string, messages: StoredMessa
   });
 }
 
-export async function renameConversation(id: string, title: string) {
-  return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, {
-    method: "PUT",
-    body: JSON.stringify({ title }),
-  });
-}
-
 export async function deleteConversation(id: string) {
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export async function clearConversation(id: string) {
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/clear`, { method: "POST" });
+}
+
+/** 取单个对话全量文档（含 context；切换对话时载入用）。 */
+export async function fetchConversation(id: string): Promise<ConversationDto | null> {
+  try {
+    const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`)) as {
+      conversation: ConversationDto;
+    };
+    return data.conversation || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 更新对话级设置（只传要改的字段；服务端未提供的字段保持不变）。 */
+export async function patchConversation(
+  id: string,
+  patch: { title?: string; model?: string; mcpServers?: string[]; locale?: string; pendingQueue?: PendingMessage[] },
+): Promise<ConversationDto> {
+  const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  })) as { conversation: ConversationDto };
+  return data.conversation;
+}
+
+// ---- 设备级偏好（原前端 localStorage：主题 / 默认语言 / 上次打开的对话）----
+
+export interface ChatPreferences {
+  activeConversationId: string;
+  theme: "" | "light" | "dark";
+  locale: string;
+  /** 非 0 = 客户端已完成过偏好同步（据此跳过旧 localStorage 的一次性迁移）。 */
+  migratedAt: number;
+}
+
+function toPreferences(data: Partial<ChatPreferences>): ChatPreferences {
+  return {
+    activeConversationId: data.activeConversationId || "",
+    theme: data.theme || "",
+    locale: data.locale || "",
+    migratedAt: data.migratedAt || 0,
+  };
+}
+
+export async function fetchChatPreferences(): Promise<ChatPreferences> {
+  return toPreferences((await jsonFetch("/agent/chat/preferences")) as Partial<ChatPreferences>);
+}
+
+export async function saveChatPreferences(patch: {
+  activeConversationId?: string;
+  theme?: "light" | "dark";
+  locale?: string;
+}): Promise<ChatPreferences> {
+  const data = (await jsonFetch("/agent/chat/preferences", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  })) as Partial<ChatPreferences>;
+  return toPreferences(data);
+}
+
+// ---- MCP 服务器（全局配置 + 会话启用集）----
+export interface McpServerPublic {
+  id: string;
+  label: string;
+  transport: "stdio" | "http";
+  enabled: boolean;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  url?: string;
+  timeoutMs?: number;
+  requireConfirm?: boolean;
+  envKeys: string[];
+  headerKeys: string[];
+}
+
+export interface McpServerStatus {
+  id: string;
+  label: string;
+  transport: string;
+  enabled: boolean;
+  connected: boolean;
+  error?: string;
+  tools: number;
+  toolNames: string[];
+}
+
+export interface McpServerInput extends Partial<Omit<McpServerPublic, "envKeys" | "headerKeys">> {
+  id: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+export async function fetchMcpServers(): Promise<McpServerPublic[]> {
+  const data = (await jsonFetch("/agent/mcp/servers")) as { servers: McpServerPublic[] };
+  return data.servers || [];
+}
+
+export async function saveMcpServer(payload: McpServerInput): Promise<McpServerPublic> {
+  const data = (await jsonFetch("/agent/mcp/servers", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })) as { server: McpServerPublic };
+  return data.server;
+}
+
+export async function deleteMcpServer(id: string) {
+  return jsonFetch(`/agent/mcp/servers/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function reloadMcpServer(id: string): Promise<McpServerStatus> {
+  const data = (await jsonFetch(`/agent/mcp/servers/${encodeURIComponent(id)}/reload`, {
+    method: "POST",
+  })) as { status: McpServerStatus };
+  return data.status;
+}
+
+export async function fetchChatMcpServers(
+  conversationId?: string,
+): Promise<{ available: McpServerStatus[]; enabled: string[] }> {
+  const query = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
+  const data = (await jsonFetch(`/agent/chat/mcp/servers${query}`)) as {
+    available: McpServerStatus[];
+    enabled: string[];
+  };
+  return { available: data.available || [], enabled: data.enabled || [] };
+}
+
+export async function setChatMcpServers(
+  enabled: string[],
+  conversationId?: string,
+): Promise<{ available: McpServerStatus[]; enabled: string[] }> {
+  const data = (await jsonFetch("/agent/chat/mcp/servers", {
+    method: "PUT",
+    body: JSON.stringify({ enabled, ...(conversationId ? { conversationId } : {}) }),
+  })) as { available: McpServerStatus[]; enabled: string[] };
+  return { available: data.available || [], enabled: data.enabled || [] };
+}
+
+export async function confirmToolCall(callId: string, confirmed: boolean) {
+  return jsonFetch("/agent/chat/confirm", {
+    method: "POST",
+    body: JSON.stringify({ callId, confirmed }),
+  });
 }

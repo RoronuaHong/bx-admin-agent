@@ -1,11 +1,12 @@
 // ---- 模型注册表 ----
-// MODEL_PROVIDERS=hy3,ollama 注册模型 id（逗号分隔，第一个为默认）。
+// MODEL_PROVIDERS=modelA,modelB 注册模型 id（逗号分隔，第一个为默认）。
 // 每个模型的环境变量前缀 MODEL_<ID>_：
 //   PROVIDER  anthropic | openai | ollama
 //   NAME      模型名（anthropic/openai 必填，ollama 可缺省）
 //   BASE_URL  端点地址
 //   API_KEY   anthropic/openai 必填
 //   VISION    direct | ocr | none（图片处理）
+//   CONTEXT_WINDOW  该模型上下文窗口（token），用于推导上下文预算；缺省用全局 MODEL_CONTEXT_WINDOW
 export interface ModelEntry {
   id: string;
   label: string;
@@ -18,8 +19,8 @@ export interface ModelEntry {
   apiKeys: string[];
   vision: "direct" | "ocr" | "none";
   timeoutMs: number;
-  // 上下文能力（字符），MODEL_<ID>_CONTEXT 可声明。
-  contextChars: number;
+  /** 上下文窗口（token）。上下文预算由此推导，不再用与模型无关的固定字符数。 */
+  contextWindow: number;
 }
 
 export function listModels(): ModelEntry[] {
@@ -59,8 +60,10 @@ export function listModels(): ModelEntry[] {
       apiKey: keys[0] || "",
       apiKeys: keys,
       vision,
-      timeoutMs: Number(process.env[`${prefix}TIMEOUT_MS`] || 120000),
-      contextChars: Number(process.env[`${prefix}CONTEXT`] || 16000),
+      timeoutMs: Number(process.env[`${prefix}TIMEOUT_MS`] || process.env.MODEL_TIMEOUT_MS || 120000),
+      contextWindow: Number(
+        process.env[`${prefix}CONTEXT_WINDOW`] || process.env.MODEL_CONTEXT_WINDOW || 128000,
+      ),
     });
   }
   return entries;
@@ -81,4 +84,6 @@ export const config = {
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
   sessionTtlMs: Number(process.env.SESSION_TTL_MS || 8 * 60 * 60 * 1000),
   modelTimeoutMs: Number(process.env.MODEL_TIMEOUT_MS || 120000),
+  /** 单次回复输出上限（token）。上下文预算会为它预留空间，故必须与实际请求值一致。 */
+  maxOutputTokens: Number(process.env.MODEL_MAX_OUTPUT_TOKENS || 8192),
 };

@@ -1,0 +1,10 @@
+import "dotenv/config";
+const BASE = (process.env.BI_BASE_URL || "").replace(/\/+$/, "");
+const KEY = process.env.BI_API_KEY || "";
+console.log("BASE=", BASE, "KEY?", !!KEY, "KEY_PREFIX=", KEY.slice(0, 3));
+const res = await fetch(`${BASE}/api/database`, { headers: { "X-API-Key": KEY } });
+console.log("status=", res.status, "content-type=", res.headers.get("content-type"));
+const text = await res.text();
+console.log("BODY_HEAD>>>");
+console.log(text.slice(0, 800));
+console.log("<<<BODY_TAIL");

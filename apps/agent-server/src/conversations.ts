@@ -5,6 +5,7 @@
 //  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
+import { touchSession, type ChatTurn, type Session } from "./session.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -15,15 +16,46 @@ export interface StoredMessage {
   role: "user" | "assistant";
   text: string;
   images?: Array<{ id: string; name: string }>;
+  /** 该助手消息用到的工具步骤摘要（便于历史还原"它做了什么"）。 */
+  steps?: Array<{ name: string; status: string }>;
 }
 
-export interface ConversationDoc {
+/** 忙碌期间排队的待发消息（按对话持久化，先进先出）。 */
+export interface PendingMessage {
+  text: string;
+  images?: string[];
+  at: number;
+}
+
+interface ConversationDoc {
   _id?: ObjectId;
   id: string;
   title: string;
+  /** UI 展示快照（含工具步骤摘要、图片）；与模型上下文 `context` 互不自动同步。 */
   messages: StoredMessage[];
   createdAt: number;
   updatedAt: number;
+
+  // ---- 对话级设置（所有配置按对话独立，全部后端持久化）----
+  /** 该对话使用的模型 id；空 = 服务端默认模型。 */
+  model?: string;
+  /** 该对话启用的 MCP server id。 */
+  mcpServers?: string[];
+  /** 该对话的界面语言，同时决定回复语言；空 = 客户端默认。 */
+  locale?: string;
+  /** 忙碌期间排队的待发消息。 */
+  pendingQueue?: PendingMessage[];
+
+  // ---- 模型上下文（thread）----
+  /** 发往模型的对话历史（含工具轻量句柄），是上下文的唯一真相。 */
+  context?: ChatTurn[];
+  /** 原子序列计数器：并发追加时判定顺序。 */
+  contextSeq?: number;
+  /** 历史摘要（上下文超限后由服务端生成，供后续轮次复用）。 */
+  summary?: string;
+  summaryAt?: number;
+  /** 摘要水位线：已覆盖到 context 的第几条。 */
+  summaryCovered?: number;
 }
 
 // ---- Mongo 单例 ----
@@ -77,8 +109,11 @@ function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
 // ---- CRUD ----
 export async function listConversations(): Promise<ConversationDoc[]> {
   const coll = await getColl();
-  if (!coll) return dedupeDocs([...memory.values()]);
-  const docs = await coll.find({}).sort({ updatedAt: -1 }).toArray();
+  // 列表不返回 context（体积大）：切对话时用 GET /chat/conversations/:id 单独取。
+  if (!coll) {
+    return dedupeDocs([...memory.values()].map(({ context, ...rest }) => rest as ConversationDoc));
+  }
+  const docs = await coll.find({}, { projection: { context: 0 } }).sort({ updatedAt: -1 }).toArray();
   return dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
 }
 
@@ -157,17 +192,66 @@ export async function upsertMessages(input: {
   );
 }
 
-export async function renameConversation(id: string, title: string): Promise<void> {
+/**
+ * 服务端权威追加：一轮对话结束后由服务器落库（不依赖前端上报，避免关页面丢一轮）。
+ * 会话不存在时自动创建（标题取首条用户输入前若干字）。
+ */
+export async function appendMessages(input: {
+  id: string;
+  messages: StoredMessage[];
+  title?: string;
+}): Promise<void> {
+  if (!input.messages.length) return;
+  const title =
+    input.title ||
+    (() => {
+      const first = input.messages.find((m) => m.role === "user" && m.text);
+      return first ? first.text.slice(0, 24) : undefined;
+    })();
+  const now = Date.now();
+  const coll = await getColl();
+  if (!coll) {
+    let doc = memory.get(input.id);
+    if (!doc) {
+      doc = { id: input.id, title: title || "新对话", messages: [], createdAt: now, updatedAt: now };
+      memory.set(input.id, doc);
+    }
+    doc.messages = [...doc.messages, ...input.messages];
+    doc.updatedAt = now;
+    if (title && doc.messages.length <= input.messages.length) doc.title = title;
+    return;
+  }
+  await coll.updateMany(
+    { id: input.id },
+    {
+      $push: { messages: { $each: input.messages } },
+      $set: { updatedAt: now, ...(title ? { title } : {}) },
+      $setOnInsert: { createdAt: now },
+    },
+    { upsert: true },
+  );
+  // 首次插入时标题可能还是默认值：仅在会话原本无用户输入时补全标题。
+  if (title) {
+    await coll.updateOne(
+      { id: input.id, title: "新对话" },
+      { $set: { title } },
+    );
+  }
+}
+
+/** 写入/更新会话摘要（上下文压缩产物跨轮复用）。 */
+export async function setConversationSummary(id: string, summary: string): Promise<void> {
+  const now = Date.now();
   const coll = await getColl();
   if (!coll) {
     const doc = memory.get(id);
     if (doc) {
-      doc.title = title;
-      doc.updatedAt = Date.now();
+      doc.summary = summary;
+      doc.summaryAt = now;
     }
     return;
   }
-  await coll.updateMany({ id }, { $set: { title, updatedAt: Date.now() } });
+  await coll.updateMany({ id }, { $set: { summary, summaryAt: now } });
 }
 
 export async function deleteConversation(id: string): Promise<void> {
@@ -190,4 +274,145 @@ export async function clearConversation(id: string): Promise<void> {
     return;
   }
   await coll.updateMany({ id }, { $set: { messages: [], updatedAt: Date.now() } });
+}
+
+// ---- 对话级设置 ----
+
+export interface ConversationPatch {
+  title?: string;
+  model?: string;
+  mcpServers?: string[];
+  locale?: string;
+  pendingQueue?: PendingMessage[];
+}
+
+/** 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。 */
+export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
+  const set: Record<string, unknown> = { updatedAt: Date.now() };
+  for (const key of ["title", "model", "mcpServers", "locale", "pendingQueue"] as const) {
+    if (patch[key] !== undefined) set[key] = patch[key];
+  }
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (!doc) return null;
+    Object.assign(doc, set);
+    return doc;
+  }
+  await coll.updateOne({ id }, { $set: set });
+  return getConversation(id);
+}
+
+/** 任意对话启用的 MCP server id 集合（连接引用计数用：还有对话在用就不要断开）。 */
+export async function listEnabledMcpServers(): Promise<Set<string>> {
+  const docs = await listConversations();
+  const used = new Set<string>();
+  for (const doc of docs) for (const id of doc.mcpServers || []) used.add(id);
+  return used;
+}
+
+/** 从所有对话的启用集里摘除某 MCP server（配置被删除时调用，避免留下悬空引用）。 */
+export async function pullMcpServerFromAllConversations(id: string): Promise<void> {
+  const coll = await getColl();
+  if (!coll) {
+    for (const doc of memory.values()) {
+      if (doc.mcpServers?.includes(id)) doc.mcpServers = doc.mcpServers.filter((x) => x !== id);
+    }
+    return;
+  }
+  await coll.updateMany({ mcpServers: id }, { $pull: { mcpServers: id } });
+}
+
+// ---- 对话上下文（thread）----
+
+/**
+ * 原子追加一轮上下文：单文档 $push + $inc，保证并发追加顺序可判定
+ * （对齐 OpenAI Agents SDK MongoDBSession 的「原子序列计数器」做法）。
+ */
+export async function appendContext(id: string, turns: ChatTurn[]): Promise<void> {
+  if (!turns.length) return;
+  const now = Date.now();
+  const coll = await getColl();
+  if (!coll) {
+    let doc = memory.get(id);
+    if (!doc) {
+      doc = { id, title: "新对话", messages: [], createdAt: now, updatedAt: now };
+      memory.set(id, doc);
+    }
+    doc.context = [...(doc.context || []), ...turns];
+    doc.contextSeq = (doc.contextSeq || 0) + turns.length;
+    doc.updatedAt = now;
+    return;
+  }
+  await coll.updateOne(
+    { id },
+    {
+      $push: { context: { $each: turns } },
+      $inc: { contextSeq: turns.length },
+      $set: { updatedAt: now },
+      $setOnInsert: { title: "新对话", messages: [], createdAt: now },
+    },
+    { upsert: true },
+  );
+}
+
+/** 清空该对话的上下文与摘要（不影响 UI 消息快照 messages）。 */
+export async function clearContext(id: string): Promise<void> {
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (doc) {
+      doc.context = [];
+      doc.summary = "";
+      doc.summaryCovered = 0;
+      doc.contextSeq = 0;
+      doc.updatedAt = Date.now();
+    }
+    return;
+  }
+  await coll.updateMany(
+    { id },
+    { $set: { context: [], summary: "", summaryCovered: 0, contextSeq: 0, updatedAt: Date.now() } },
+  );
+}
+
+/**
+ * 解析本次请求所属的对话（thread）：
+ * - 显式传入 conversationId → 用它（不存在则创建）；
+ * - 否则用会话里记录的活跃对话；
+ * - 都没有 → 创建「默认对话」，并把旧 session.messages / mcpServers **拷贝**迁移进去
+ *   （源字段保留一个版本以支持回退，不再写入）。
+ */
+export async function resolveConversation(session: Session, conversationId?: string): Promise<string> {
+  if (conversationId) {
+    if (!(await getConversation(conversationId))) {
+      await createConversation({ id: conversationId, title: "新对话" });
+    }
+    return conversationId;
+  }
+  if (session.activeConversationId && (await getConversation(session.activeConversationId))) {
+    return session.activeConversationId;
+  }
+  const legacyTurns = (session.messages || []).filter((m) => m.text);
+  const id = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await createConversation({ id, title: legacyTurns[0] ? legacyTurns[0].text.slice(0, 24) : "新对话" });
+  if (legacyTurns.length || (session.mcpServers || []).length) {
+    await appendContext(
+      id,
+      legacyTurns.map((turn) => ({
+        role: turn.role,
+        text: turn.text,
+        ...(turn.handles?.length ? { handles: turn.handles } : {}),
+      })),
+    );
+    if ((session.mcpServers || []).length) {
+      await patchConversation(id, { mcpServers: session.mcpServers });
+    }
+    console.log(
+      `[conversations] 迁移旧会话：上下文 ${legacyTurns.length} 条 / MCP ${(session.mcpServers || []).length} 个 → ${id}`,
+    );
+  }
+  session.activeConversationId = id;
+  touchSession(session);
+  return id;
 }

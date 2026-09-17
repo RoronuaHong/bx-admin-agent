@@ -10,18 +10,19 @@
   --danger: #8f2b22;
   /* 停止生成按钮语义色（赤陶橙）：更通透温暖，与纸感主题协调 */
   --stop: #c25c2c;
-  --ok: #1f1f1c;
   --shadow: 0 20px 50px rgba(20, 20, 19, 0.07);
   --font-display: "Newsreader", "Noto Serif SC", serif;
   --font-body: "Noto Sans SC", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
-  --pad: 22px;
   --radius-sm: 8px;
   --radius: 12px;
   --radius-lg: 18px;
   --radius-pill: 999px;
-  --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* 控件基准：按钮/下拉统一高度、焦点环与缓动 */
+  --ctrl-h: 34px;
+  --ring: 0 0 0 3px color-mix(in srgb, var(--ink) 13%, transparent);
+  --ease: cubic-bezier(0.2, 0.8, 0.28, 1);
   color-scheme: light;
 }
 
@@ -37,7 +38,6 @@ html[data-theme="dark"] {
   --danger: #e07a70;
   /* 停止生成按钮语义色（暖杏金）：深色下柔和醒目 */
   --stop: #f2b386;
-  --ok: #f2f2ec;
   --shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
   color-scheme: dark;
 }
@@ -139,34 +139,11 @@ a,
   touch-action: manipulation;
 }
 
-.brand-mark {
-  font-family: var(--font-display);
-  font-weight: 700;
-  letter-spacing: 0.04em;
-}
-
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation: none !important;
     transition: none !important;
-  }
-}
-
-@media (max-width: 720px) {
-  :root {
-    --pad: 16px;
   }
 }

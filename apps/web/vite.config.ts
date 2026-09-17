@@ -51,6 +51,14 @@ export default defineConfig({
         target: "http://localhost:8787",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/agent/, ""),
+        configure: (proxy) => {
+          // 只关闭上游压缩，避免代理侧对分块流做缓冲。
+          // 不要再注册 proxyRes 监听里手动 pipe：http-proxy 默认已自动透传响应，
+          // 手动再 pipe 会叠加成双管道，导致每个流事件重复两遍。
+          proxy.on("proxyReq", (proxyReq) => {
+            proxyReq.setHeader("Accept-Encoding", "identity");
+          });
+        },
       },
     },
   },

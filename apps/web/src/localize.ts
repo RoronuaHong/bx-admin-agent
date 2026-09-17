@@ -1,26 +1,12 @@
 import type { UiLocale } from "./ui-locale";
 import type { LocalizedToken } from "./api";
 
-export type LocalizedText = {
-  zh: string;
-  en: string;
-  pt?: string;
-  hi?: string;
-};
-
 export type LocalizedTextStrict = {
   zh: string;
   en: string;
   pt: string;
   hi: string;
 };
-
-export function pickLocalized(locale: UiLocale, item: LocalizedText): string {
-  if (locale === "zh") return item.zh;
-  if (locale === "pt-BR") return item.pt || item.en;
-  if (locale === "hi") return item.hi || item.en;
-  return item.en;
-}
 
 export function pickStrictLocalized(locale: UiLocale, item: LocalizedTextStrict): string {
   if (locale === "zh") return item.zh;
@@ -61,7 +47,6 @@ const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
   },
   CHAT_STREAM_FAILED: GENERIC_FALLBACKS.GENERIC_UNKNOWN_ERROR,
   STREAM_ERROR: GENERIC_FALLBACKS.GENERIC_UNKNOWN_ERROR,
-  CHAT_CONVERSATION_NOT_FOUND: GENERIC_FALLBACKS.GENERIC_NOT_FOUND,
   UPLOAD_NO_FILES: {
     zh: "未收到文件。",
     en: "No file received.",

@@ -1,9 +1,4 @@
 // PM2 统一开发配置（dev 环境 = agent-server + web）
-// 启动：pm2 start ecosystem.dev.config.cjs
-// 重启：pm2 restart ecosystem.dev.config.cjs
-// 停止：pm2 stop ecosystem.dev.config.cjs / pm2 delete ecosystem.dev.config.cjs
-// 保存：pm2 save
-// PM2 统一开发配置（dev 环境 = agent-server + web）
 // 启动：pm2 start ecosystem.dev.config.cjs（或 pm2 startOrReload）
 // 重启：pm2 restart ecosystem.dev.config.cjs
 // 停止：pm2 stop ecosystem.dev.config.cjs / pm2 delete ecosystem.dev.config.cjs
