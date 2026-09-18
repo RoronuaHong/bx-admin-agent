@@ -299,19 +299,15 @@ onBeforeUnmount(() => {
               <span v-for="img in b.images" :key="img.id" class="mc-img">{{ img.name }}</span>
             </div>
             <div v-if="b.role === 'user'" class="mc-plain">{{ b.text }}</div>
-            <div
-              v-else-if="b.text"
-              class="mc-md"
-              v-html="renderChatMarkdown(b.text)"
-            ></div>
-            <div v-else-if="b.streaming && !b.error" class="mc-typing">
-              <span></span><span></span><span></span>
-            </div>
-            <!-- 已有正文但仍在流式（工具调用/长生成期）：补一个轻量进度提示，避免长时间无反馈。 -->
-            <div v-if="b.streaming && b.text" class="mc-generating">
-              <span class="mc-generating__dot"></span>
-              {{ tx("生成中…", "Generating…", "Gerando…", "उत्पन्न हो रहा है…") }}
-            </div>
+            <template v-else>
+              <div v-if="b.text" class="mc-md" v-html="renderChatMarkdown(b.text)"></div>
+              <!-- 流式正文尾部闪烁光标：传达「还有更多」，比独立「生成中」行更接近最佳实践。 -->
+              <span v-if="b.streaming && b.text" class="mc-cursor" aria-hidden="true"></span>
+              <div v-else-if="b.streaming && !b.error" class="mc-typing">
+                <span></span><span></span><span></span>
+                <span class="mc-typing__label">{{ tx("正在思考…", "Thinking…", "Pensando…", "सोच रहा है…") }}</span>
+              </div>
+            </template>
             <div v-if="b.error" class="mc-error">{{ b.error }}</div>
           </div>
         </div>
@@ -781,8 +777,15 @@ html[data-theme="dark"] .mc-welcome__hint {
 
 .mc-typing {
   display: inline-flex;
+  align-items: center;
   gap: 4px;
   padding: 4px 2px;
+}
+
+.mc-typing__label {
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .mc-typing span {
@@ -816,21 +819,21 @@ html[data-theme="dark"] .mc-error {
   color: #fca5a5;
 }
 
-.mc-generating {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--muted);
+/* 流式正文尾部的闪烁光标：块级文本后内联显示，传达「还有更多内容在生成」。 */
+.mc-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: linear-gradient(135deg, #7cb3f7, #f5a462);
+  animation: mc-cursor-blink 1s steps(1, end) infinite;
 }
 
-.mc-generating__dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #7cb3f7, #f5a462);
-  animation: mc-blink 1.2s infinite ease-in-out;
+@keyframes mc-cursor-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
 }
 
 .mc-imgs {

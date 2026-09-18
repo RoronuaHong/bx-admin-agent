@@ -946,6 +946,9 @@ function hasRunningStep(b: Bubble): boolean {
 function reasoningTitle(b: Bubble): string {
   const n = b.steps?.length || 0;
   const sn = b.subagents?.length || 0;
+  // 静默规划期（流式但还没有任何步骤/子代理）：显式标「正在规划」，而非空白或通用「推理」。
+  if (b.streaming && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
+    return tx("正在规划…", "Planning…", "Planejando…", "योजना बना रहा है…");
   if (b.streaming && hasRunningStep(b)) return tx("推理中…", "Reasoning…", "Pensando…", "तर्क कर रहा है…");
   if (b.streaming && sn) {
     return tx(`子代理运行中 · ${sn} 个`, `Subagents running · ${sn}`, `Subagentes rodando · ${sn}`, `उप-एजेंट चल रहे · ${sn}`);
@@ -1771,6 +1774,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
     subagents: [],
   });
   state.bubbles.push(reply);
+  // 流式开始即展开推理面板：loading 期直接显示「正在规划…」，避免只剩空白/圆点像卡死。
+  openReasoning.add(reply.id);
   state.sending = true;
   state.error = "";
   const chosenModel = state.settings.modelId || models.value[0]?.id || "";
@@ -3317,7 +3322,7 @@ onBeforeUnmount(() => {
           <div class="bubble-wrap">
           <div class="bubble">
             <div
-              v-if="b.todos?.length || b.steps?.length || b.subagents?.length"
+              v-if="b.todos?.length || b.steps?.length || b.subagents?.length || (b.streaming && !b.text)"
               class="reasoning"
               :class="{ open: openReasoning.has(b.id) }"
             >
@@ -3327,6 +3332,14 @@ onBeforeUnmount(() => {
                 <span v-if="b.streaming && hasRunningStep(b)" class="reasoning__spinner" aria-hidden="true"></span>
               </button>
               <div v-show="openReasoning.has(b.id)" class="reasoning__body">
+                <!-- 规划/思考阶段：尚无具体步骤，先给一个「正在规划」状态，避免静默加载像卡死。 -->
+                <div
+                  v-if="b.streaming && !b.steps?.length && !b.todos?.length && !b.subagents?.length"
+                  class="reasoning__planning"
+                >
+                  <span class="reasoning__planning-dot" aria-hidden="true"></span>
+                  {{ tx("正在分析你的请求，规划执行步骤…", "Analyzing your request and planning the next steps…", "Analisando sua solicitação e planejando os próximos passos…", "आपका अनुरोध विश्लेषण कर रहा हूँ और अगले चरणों की योजना बना रहा हूँ…") }}
+                </div>
                 <div v-if="b.todos?.length" class="todos">
                   <div class="todos__head">{{ tx("任务计划", "Plan", "Plano", "कार्य योजना") }}</div>
                   <div v-for="(item, i) in b.todos" :key="i" class="todos__item">
@@ -3418,10 +3431,14 @@ onBeforeUnmount(() => {
               <img v-for="img in b.images" :key="img.id" :src="`/agent/chat/upload/${img.id}`" :alt="img.name" />
             </div>
             <div v-if="b.role === 'user'" class="plain">{{ b.text }}</div>
-            <div v-else-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b))"></div>
-            <div v-else-if="!b.error && b.streaming" class="typing">
-              <span></span><span></span><span></span>
-            </div>
+            <template v-else>
+              <div v-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b))"></div>
+              <!-- 流式正文尾部闪烁光标：传达「还有更多」，与 MoviePage 同一套语义。 -->
+              <span v-if="b.streaming && b.text" class="gen-cursor" aria-hidden="true"></span>
+              <div v-else-if="!b.error && b.streaming" class="typing">
+                <span></span><span></span><span></span>
+              </div>
+            </template>
             <div v-if="isStoppedBubble(b)" class="stopped-tag">
               <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true">
                 <rect x="6" y="6" width="12" height="12" rx="2" />
@@ -6554,6 +6571,25 @@ onBeforeUnmount(() => {
   gap: 6px;
 }
 
+/* 规划/思考阶段的状态行：比纯圆点更明确地传达「agent 正在规划」，缓解静默加载的卡顿感。 */
+.reasoning__planning {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 2px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.reasoning__planning-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #7cb3f7, #f5a462);
+  animation: blink 1.2s infinite ease-in-out;
+}
+
 .reasoning__body .todos,
 .reasoning__body .steps {
   margin-bottom: 0;
@@ -6660,6 +6696,23 @@ onBeforeUnmount(() => {
 @keyframes blink {
   0%, 80%, 100% { opacity: 0.25; }
   40% { opacity: 1; }
+}
+
+/* 流式正文尾部的闪烁光标：与 MoviePage 的 mc-cursor 同一语义（块级文本后内联显示）。 */
+.gen-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--accent, var(--muted));
+  animation: gen-cursor-blink 1s steps(1, end) infinite;
+}
+
+@keyframes gen-cursor-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
 }
 
 .composer {
