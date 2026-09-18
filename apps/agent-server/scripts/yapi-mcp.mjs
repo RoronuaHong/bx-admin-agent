@@ -678,8 +678,23 @@ const TOOLS = [
 
 const server = new Server({ name: "yapi-docs", version: "1.0.0" }, { capabilities: { tools: {} } });
 
+/**
+ * 工具注解（MCP 标准字段 ToolAnnotations）：本适配器**全部工具都是只读的**——
+ * 文档查询只读 YApi；call_api 在 run 内把方法硬编码为 GET（文档里标注为非 GET 的路径直接拒绝）；
+ * 唯一的非 GET 请求是适配器内部自动登录换 token，不暴露成工具。
+ * 声明事实而非放行：服务端风险闸门（src/risk.ts 第 4 条注解判定）据此按只读处理，不再对每个只读查询弹确认卡。
+ * 若某服务存在非规范的 GET 写接口，在服务器配置（MCP_BUILTIN_SERVERS 的 toolRisks）里覆盖本声明即可——
+ * 服务端策略优先级高于工具自述。
+ */
+const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, destructiveHint: false };
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+  tools: TOOLS.map(({ name, description, inputSchema }) => ({
+    name,
+    description,
+    inputSchema,
+    annotations: READ_ONLY_ANNOTATIONS,
+  })),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {

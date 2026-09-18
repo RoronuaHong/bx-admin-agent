@@ -58,7 +58,7 @@
 **代价（都要落到我们的契约上）**：
 1. **运行时替换**：LangGraph 的 checkpointer/store 要接我们的 Mongo（否则又多一份状态真相，违背"对话即唯一真相"）。
 2. **流式契约重写**：我们对外是 NDJSON `ChatEvent`（text_delta/tool_call/confirmation_required/usage/done…），deepagents 的事件模型不同，要写一层转换；确认卡要映射到 `interrupt_on`（LangGraph interrupts）——而我们已有自研确认门 + 前端确认卡 + 「队列在确认等待时停下」的语义。
-3. **并发/队列重做**：对话级 409、`runningStreams`、pendingQueue 出队，都要包在 LangGraph run 外面。
+3. **并发/队列重做**：对话级 409、任务注册表（当时的 `runningStreams`，现已是 `chat-tasks.ts`）、pendingQueue 出队，都要包在 LangGraph run 外面。
 4. **依赖面**：langchain + @langchain/core + langgraph 进服务端；我们目前是零框架自研（~2k 行），排障成本可控。
 5. 自研的上下文治理（预算/句柄/治理）与 Deep Agents 内置的 summary/offload **职责重叠**，等于两套上下文管理并存，得关掉一套。
 
@@ -70,7 +70,7 @@
 chatStream
   → 系统提示层（静态前缀 + 记忆 + skill 渐进注入）        [D1]
   → 上下文装配（现有 buildTurns + 预算）                   [已有]
-  → 工具注入（MCP + 内置工具：fs / todos / task）          [D2/D3/D4]
+  → 工具注入（MCP + 内置工具：fs / todos / task / skill / 知识库检索）[D2/D3/D4]
   → runWithTools 循环（现有）+ 子代理执行器                [D4]
   → 事件流（现有 ChatEvent + 子代理维度）                  [D4]
 ```
@@ -136,12 +136,14 @@ chatStream
 - 直连模式冒烟 ✓（事件序列 model→text_delta→text→usage→done，无工具注入）。
 
 **已知待办（后续期）**：
+- 2026-09-17 追加（输入框左下角统一「工具」入口，对齐 ima 等主流产品）：①**MCP（连接器）按钮从顶栏迁移到 composer 左下角**，并与新增的技能入口合并为**单个「＋」工具菜单**（菜单项：添加文件 / 技能 / 连接器；原独立上传图标收进菜单「添加文件」）；点或悬停「技能」「连接器」在菜单**右侧飞出面板**（顶部搜索框 + 图标+名称+描述列表 + 底部操作，选中行右侧打勾，列表按名称/描述/标识本地过滤），打开菜单即预取两份列表；②**新增「技能（Skills）」面板**（此前 skills 只有服务端能力，无任何前端入口）：`GET/PUT /chat/skills` 两个端点——`available` 来自 skills 目录索引（`skills.ts listSkillMetas`），`enabled` 持久化到 `conversation.skillsEnabled`（与 `mcpServers` 同构的对话级设置，PATCH keys 同步放开）；用户**勾选的 skill 全文注入系统提示动态后缀**（`renderEnabledSkills`），稳定前缀（skills 索引段）不动 → prompt cache 命中不受影响；未勾选保持渐进加载现状（索引 + `read_skill` 按需取全文）。语义：勾选 = 用户明确「本对话要用这个技能」，跳过按需加载直接全文注入；不勾 ≠ 禁用（模型仍可通过索引 + read_skill 自主加载）。前端 `ConvSettings` 增加 `skillsEnabled` 镜像 + 乐观更新 + 失败回滚，交互与 MCP 面板完全一致。
 - 2026-09-17 追加（多 MCP 服务器加固轮）：①**工具按需加载**（Tool Search：schema 占窗口 >10% 时只注入工具名 + `search_tools`，命中后加载；未加载的工具调用被拒并引导）——对齐 Claude Code `ENABLE_TOOL_SEARCH=auto` 与 Anthropic「Code execution with MCP」；②**确认门按工具注解**（`readOnlyHint` / `destructiveHint`，服务器级 `requireConfirm` 优先，无注解默认不确认、`MCP_CONFIRM_STRICT=on` 转保守，确认卡带原因）；③**子代理服务器白名单**（`task.servers`，对齐「only give subagents the tools they need」）；④**空闲连接回收**（30 分钟未用即断开，在途调用不动）；⑤多服务器稳定性修复（工具顺序确定化、缺席服务器上报、静默截断改为如实回报、连接单飞、失败冷却、取消信号透传、失败即关传输）。回归：`scripts/_mcp-multi-server-check.mjs` 46/46；实链路 `mode=search mcp=0/5`（模型自主检索后取数）/`mode=eager mcp=5/5`（常规路径零回归）。
 - 2026-09-17 追加（循环护栏轮）：⑥**同轮同参数去重**（`toolCallSignature` 规范化签名 + 每轮已执行集合，一轮内重复调用只执行一次，其余回灌「已跳过」）；⑦**跨轮 Doom Loop 熔断**（`LoopGuard`：同一组工具调用连续重复达 `MCP_DOOM_LOOP_MAX`（默认 3）即主动收束并提示，指纹变化/空轮重置连击）。均纯函数化、已单测覆盖。回归 `55/55`。待补：并发工具调用、断点恢复。
 - ~~`history.ts buildContext` 与 `setConversationSummary` 未接线~~ ✅ 已接线（见 §9）：`chat.ts` 改用 `history.ts assembleContext` 统一上下文装配，摘要层（LLM 压缩 + 水位线跨轮复用）已生效，两套实现合并为一套；
-- 子代理目前是「同步阻塞」语义，中途 steer/取消独立子代理（Async subagents）与 `subagent_start/end` 独立事件维度未做；
-- 前端尚无工作区文件浏览（fs 内容只在工具步骤里可见）；
-- 长期记忆（`.data/memory.json`）已有 HTTP 增删改查端点，但前端没有管理界面（现阶段用 curl / 直接改文件）。
+- ~~子代理目前是「同步阻塞」语义，中途 steer/取消独立子代理（Async subagents）与 `subagent_start/end` 独立事件维度未做~~ ✅ 已落地（2026-09-17）：①**独立事件维度**——`runSubagent` 改为 async generator，产出 `subagent_start`（id + parentId + description）/ `subagent_delta`（子代理文本增量）/ `subagent_end`（ok + status: done|cancelled|error + 摘要），主循环逐片转发，旧前端忽略未知 type 即向后兼容；子代理内部工具调用不再静默丢弃（计数 + 文本增量可见），交接摘要仍经 `tool_result` 回灌模型上下文；②**独立取消**——模块级 `subagentRegistry`（key = `sa_<conversationId>_<seq>`）登记运行中实例与其 `AbortController`，新增 `POST /chat/subagent/:conversationId/:subagentId/cancel` 可单独取消某一个子代理（不影响主代理继续运行），取消后子代理以 `status=cancelled` 收束、主代理拿到「已被取消」交接继续编排；③**级联**——`POST /chat/cancel` 主取消与父 signal 中止均级联 abort 该会话所有子代理；④前端推理区新增「子代理」面板（描述 + 状态 + 增量文本 + 运行中可点 × 独立取消）；⑤纵深防御——子代理的交接摘要回灌主上下文时同样按 `src/untrusted.ts` 定界为不可信数据（子代理自身消费的工具结果也已定界），避免外部内容借子代理通道越权指挥主代理。回归 `scripts/_async-subagent-check.mjs` 6/6（注册表单测 + 端点 404/未命中/级联 + 契约冒烟）。**未做（刻意）**：真异步编排（父模型不等待子代理、结果异步回灌）与 mid-flight steer（中途改指令）——前者要重写 `runLoop` 的轮次驱动契约，风险高于收益；后者需要子代理侧消息注入通道，收益有限。
+- 子代理活路径 e2e ✅ 已实测（2026-09-17，`scripts/_rag-e2e.mjs` 场景 2）：内置 MCP 服务器 `chart`（`defaultEnabled`）使新对话天然处于工具模式，模型自主调 `task` 并行委派两个子代理 → 事件流 `subagent_start ×2 / subagent_delta ×184 / subagent_end ×2` 完整到达前端（26.9s）；子代理写操作被安全闸门拒绝（子代理默认只读）后主代理自行改为直接 `fs_write` 完成，验证「子代理失败不拖垮主流程」。仍未实测：**运行中点 × 独立取消某一个子代理**（端点与注册表已单测，取消时机需人工在 web 端掐点验证）。
+- ~~前端尚无工作区文件浏览~~ ✅ 已落地（2026-09-17：`GET /chat/conversations/:id/files[/content]` + 顶栏「资源」面板，与长期记忆管理合并为一个抽屉）；
+- ~~长期记忆前端没有管理界面~~ ✅ 已落地（2026-09-17：「资源」面板内增删查；记忆已按 owner 隔离注入系统提示）。
 
 ## 9. 架构清理（2026-09-17，查缺补漏 + 去冗余）
 
@@ -160,7 +162,7 @@ chatStream
 6. **用户中断（点"停止"）上下文丢失**：abort 后不落库，界面上已显示的一轮在服务端上下文里不存在 → 中断时仍把这一轮写回 `conversation.context`；
 7. **直连模式提示不存在的工具**：稳定前缀里的 `fs_write/fs_read` 守则只在工具模式注入；
 8. **图片惰性清理几乎永不触发**：`store.size % 16 !== 0` 的取模节流（删除会改变条目数）→ 改为按时间间隔（10 分钟）节流；
-9. `runningStreams: Map<string, number>` 的 value 从未读取 → 改 `Set<string>`。
+9. `runningStreams: Map<string, number>` 的 value 从未读取 → 改 `Set<string>`。（该结构随后被异步任务底座整体取代：今天运行态的唯一真相是 `src/chat-tasks.ts` 的任务注册表 `running: Map<convId, ChatTask>` + `isTaskRunning()`；全仓已无 `runningStreams`。）
 
 **补齐的缺口**：长期记忆补 HTTP 端点（原注释声称"接口可查看/增删"但无实现）——`GET/POST /chat/memory`、`DELETE /chat/memory/:id`、`DELETE /chat/memory`。
 

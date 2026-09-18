@@ -16,6 +16,8 @@ export interface SkillMeta {
   description: string;
   /** 相对 skills 根目录的目录名（read_skill 的入参）。 */
   dir: string;
+  /** 可见角色（frontmatter `roles: movie, generic` 逗号分隔）；缺省 = 所有角色可见。 */
+  roles?: string[];
 }
 
 interface Cache {
@@ -40,8 +42,17 @@ function parseFrontmatter(raw: string): Record<string, string> {
   return out;
 }
 
-/** 列出可用 skills（带短缓存，避免每次请求都扫盘）。 */
-function listSkills(): SkillMeta[] {
+/** 列出可用 skills（带短缓存，避免每次请求都扫盘）。传 `role` 时按角色过滤（缺省 roles = 全角色可见）。 */
+export function listSkillMetas(role?: string | null): SkillMeta[] {
+  const all = listAllSkillMetas();
+  const r = String(role || "").trim();
+  if (!r || r === "generic") {
+    return all.filter((s) => !s.roles?.length || s.roles.includes("generic"));
+  }
+  return all.filter((s) => !s.roles?.length || s.roles.includes(r));
+}
+
+function listAllSkillMetas(): SkillMeta[] {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.skills;
   const skills: SkillMeta[] = [];
   try {
@@ -55,6 +66,7 @@ function listSkills(): SkillMeta[] {
           name: meta.name || entry.name,
           description: meta.description || "",
           dir: entry.name,
+          ...(meta.roles ? { roles: meta.roles.split(/[,，]/).map((x) => x.trim()).filter(Boolean) } : {}),
         });
       }
     }
@@ -78,13 +90,36 @@ export function readSkill(dir: string): string | null {
   }
 }
 
-/** 渲染进系统提示的索引段；没有 skills 时返回空串。 */
-export function renderSkillIndex(): string {
-  const skills = listSkills();
+/** 渲染进系统提示的索引段（按角色过滤）；没有 skills 时返回空串。 */
+export function renderSkillIndex(role?: string | null): string {
+  const skills = listSkillMetas(role);
   if (!skills.length) return "";
   const lines = skills.map((skill) => `- ${skill.dir}${skill.description ? `：${skill.description}` : ""}`);
   return [
     "以下是可以按需加载的技能（skills）。任务命中时调用 read_skill 工具取全文，再按其中步骤执行：",
     ...lines,
   ].join("\n");
+}
+
+/**
+ * 渲染用户为本对话主动勾选的技能全文（输入框「技能」面板勾选语义）。
+ * 注入系统提示的**动态后缀**（而非稳定前缀）：勾选是低频但非零变化的对话级设置，
+ * 放动态段避免破坏 prompt cache 命中。已勾选的技能不再依赖 read_skill 按需加载。
+ */
+export function renderEnabledSkills(dirs: string[] | null | undefined): string {
+  if (!dirs?.length) return "";
+  const blocks: string[] = [];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    if (typeof dir !== "string" || !dir || seen.has(dir)) continue;
+    seen.add(dir);
+    const content = readSkill(dir);
+    if (content == null) continue; // 目录已删除等：跳过，不编造
+    blocks.push(`<skill name="${dir}">\n${content}\n</skill>`);
+  }
+  if (!blocks.length) return "";
+  return [
+    "以下是用户为本对话指定的技能全文，与本轮任务相关时**优先按其中步骤执行**：",
+    ...blocks,
+  ].join("\n\n");
 }

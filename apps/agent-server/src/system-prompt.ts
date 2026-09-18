@@ -4,7 +4,9 @@
 //   动态段 = 长期记忆 / 历史摘要 / 回复语言 —— 变化频率低但非零，放后面避免破坏前缀缓存。
 import type { TodoItem } from "@bx/shared";
 import { renderMemory } from "./memory.js";
-import { renderSkillIndex } from "./skills.js";
+import { renderEnabledSkills, renderSkillIndex } from "./skills.js";
+import { UNTRUSTED_CONTENT_RULE } from "./untrusted.js";
+import { getRole } from "./roles.js";
 
 /**
  * 稳定前缀：改这里会影响缓存命中（改一次 = 全量缓存失效一次），保持精炼且通用，
@@ -21,10 +23,20 @@ const BASE_PROMPT = [
 ].join("\n");
 
 /**
- * 工具模式专属守则：只在真的注入了工具时才说。
+ * 工具模式专属守则（含写操作许可纪律，P0-8）：只在真的注入了工具时才说。
  * 直连模式（无工具）下提到具体工具名，会让模型去调用并不存在的工具。
+ * 注：许可语义只属于确认卡——用户的口头同意、模型在散文里征求许可都不构成执行依据。
  */
-const TOOLING_RULES = "5. 需要把中间结果留给后续使用时，用 fs_write 存入工作区，之后用 fs_read 取回。";
+const TOOLING_RULES = [
+  "5. 需要把中间结果留给后续使用时，用 fs_write 存入工作区，之后用 fs_read 取回。",
+  "6. 禁止用自然语言征求写操作的许可（如「要我直接执行吗？」）。要执行就直接调用工具，系统会弹出确认卡由用户批准。",
+  "7. 区分「问参数」与「求许可」：为补全必填参数而追问是允许的；把「要不要执行这个操作」当成问题抛给用户是禁止的。",
+  "8. 用户的口头同意不构成许可；执行许可只通过系统确认卡产生。",
+  "9. 不要提议调用工具清单里没有的工具，也不要凭「这类产品通常有」编造工具名；不确定某个工具是否存在时，先检索确认。",
+  "10. 回复中不要出现工具名；描述你做了什么即可。",
+  "",
+  UNTRUSTED_CONTENT_RULE,
+].join("\n");
 
 /** 子代理系统提示：上下文隔离，只拿任务描述与最小工具集，回传摘要（对齐 Deep Agents Subagents）。 */
 export const SUBAGENT_PROMPT = [
@@ -33,6 +45,8 @@ export const SUBAGENT_PROMPT = [
   "1. 只依据工具返回的真实数据；查不到就如实说明。",
   "2. 过程中的中间结果不要复述，只保留得出结论所需的最小信息。",
   "3. 最终回复就是交给主代理的唯一交接物：给出结论与关键数字，控制在 400 字以内，不要贴原始数据。",
+  "",
+  UNTRUSTED_CONTENT_RULE,
 ].join("\n");
 
 /**
@@ -140,10 +154,16 @@ export interface SystemPromptInput {
   summary?: string | null;
   /** 是否注入长期记忆（子代理不注入，避免把主上下文带进隔离上下文）。 */
   withMemory?: boolean;
+  /** 设备 owner（长期记忆按它过滤）。 */
+  ownerKey?: string;
   /** 工具通道现状（仅在工具模式注入）。 */
   tooling?: ToolingStatus | null;
   /** 跨轮持久化的任务计划（write_todos 全量替换），每轮重注入保持进度可见。 */
   todos?: TodoItem[] | null;
+  /** 用户为本对话勾选的技能（skills 目录名）→ 全文注入动态后缀（对话级设置，见「技能」面板）。 */
+  enabledSkills?: string[] | null;
+  /** Agent 角色（领域适配指南模式 B）：决定稳定前缀的人设与 skill 索引可见性。缺省 = generic。 */
+  role?: string | null;
 }
 
 const LOCALE_DIRECTIVES: Record<string, string> = {
@@ -165,14 +185,18 @@ export interface SystemPrompt {
 }
 
 export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
-  const stableParts = [BASE_PROMPT, input.tooling ? TOOLING_RULES : "", renderSkillIndex()].filter(
+  // 角色：人设与 skill 索引都随角色变化 → 两者都在**稳定前缀**里（同角色跨轮 cache 命中不变；
+  // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
+  const role = getRole(input.role);
+  const stableParts = [role.basePrompt || BASE_PROMPT, input.tooling ? TOOLING_RULES : "", renderSkillIndex(role.id)].filter(
     (part) => part && part.trim(),
   );
   const dynamicParts = [
     input.tooling ? renderToolingStatus(input.tooling) : "",
-    input.withMemory === false ? "" : renderMemory(),
+    input.withMemory === false ? "" : renderMemory(input.ownerKey),
     input.summary ? `以下是该对话更早部分的摘要：\n${input.summary}` : "",
     renderTodos(input.todos || []),
+    renderEnabledSkills(input.enabledSkills),
     languageDirective(input.locale),
   ].filter((part) => part && part.trim());
   return {

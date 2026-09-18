@@ -17,6 +17,14 @@ export function getApiErrorToken(error: unknown): LocalizedToken | undefined {
   return error instanceof ApiError ? error.token : undefined;
 }
 
+/** 错误码读取的唯一入口：判定分支只比字符串，绝不拿 token 对象去比。
+ *  `ApiError.code` 构造时已用 `token.code` 兜底（见 ApiError 构造），这里再兼容任意自带 `code` 的错误对象。 */
+export function getApiErrorCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && code.trim()) return code.trim();
+  return getApiErrorToken(error)?.code;
+}
+
 function normalizeToken(data: unknown, fallbackCode?: string): LocalizedToken | undefined {
   const raw = (data && typeof data === "object" ? data : {}) as Partial<LocalizedToken>;
   const code = typeof raw.code === "string" && raw.code.trim() ? raw.code.trim() : fallbackCode;
@@ -64,6 +72,8 @@ export async function fetchModels(): Promise<ModelInfo[]> {
   return data.models || [];
 }
 
+// 注：观影助手原有的「个性化推荐面板」已整体移除（前端 UI + 这里的客户端 API 层）。
+// 服务端的 `/agent/chat/movie/*` 端点与 movie 模块仍在（供 Agent 自身与工具使用）。
 export interface UploadResult {
   id: string;
   name: string;
@@ -81,7 +91,7 @@ export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
 /** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
 export async function streamChat(
   text: string,
-  opts: { conversationId?: string; model?: string; images?: string[] },
+  opts: { conversationId?: string; model?: string; images?: string[]; agentId?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ) {
@@ -157,20 +167,30 @@ export interface ConversationDto {
   // ---- 对话级设置（每个对话独立；空 = 用服务端/设备默认）----
   model?: string;
   mcpServers?: string[];
+  /** 该对话用户勾选的技能（skills 目录名）；空 = 全部走按需加载。 */
+  skillsEnabled?: string[];
   locale?: string;
   pendingQueue?: PendingMessage[];
   /** 置顶时间戳；null / 缺省 = 未置顶。置顶项固定排在列表最上（新的置顶在上）。 */
   pinnedAt?: number | null;
   /** 手动顺序（「手动排序」模式下生效）；未排过的项没有该字段。 */
   sortOrder?: number;
+  /** 归档标记；归档对话默认不在列表显示，需显式 includeArchived。 */
+  archived?: boolean;
+  /** 免打扰：静默该对话的后台完成提醒（不弹提示，不影响消息落库与状态点）。 */
+  muted?: boolean;
 }
 
-export async function fetchConversations(): Promise<ConversationDto[]> {
-  const data = (await jsonFetch("/agent/chat/conversations")) as { conversations: ConversationDto[] };
+export async function fetchConversations(includeArchived = false, agentId?: string): Promise<ConversationDto[]> {
+  const params = new URLSearchParams();
+  if (includeArchived) params.set("includeArchived", "1");
+  if (agentId) params.set("agentId", agentId);
+  const qs = params.toString() ? `?${params.toString()}` : "";
+  const data = (await jsonFetch(`/agent/chat/conversations${qs}`)) as { conversations: ConversationDto[] };
   return data.conversations || [];
 }
 
-export async function createConversation(payload: { id?: string; title?: string }) {
+export async function createConversation(payload: { id?: string; title?: string; agentId?: string }) {
   const data = (await jsonFetch("/agent/chat/conversations", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -185,6 +205,26 @@ export async function saveConversationMessages(id: string, messages: StoredMessa
   });
 }
 
+/** 复制对话（Duplicate）：返回新对话 DTO。 */
+export async function duplicateConversation(id: string): Promise<ConversationDto> {
+  const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/duplicate`, {
+    method: "POST",
+  })) as { conversation: ConversationDto };
+  return data.conversation;
+}
+
+/** 导出对话下载链接（MD / JSON）；直接用浏览器下载。 */
+export function conversationExportUrl(id: string, format: "md" | "json"): string {
+  return `/agent/chat/conversations/${encodeURIComponent(id)}/export.${format}`;
+}
+
+/** 独立取消某一个运行中的子代理（不影响主代理）。 */
+export async function cancelSubagent(conversationId: string, subagentId: string) {
+  return jsonFetch(`/agent/chat/subagent/${encodeURIComponent(conversationId)}/${encodeURIComponent(subagentId)}/cancel`, {
+    method: "POST",
+  });
+}
+
 export async function deleteConversation(id: string) {
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
@@ -193,7 +233,6 @@ export async function clearConversation(id: string) {
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/clear`, { method: "POST" });
 }
 
-/** 取单个对话全量文档（含 context；切换对话时载入用）。 */
 /** 更新对话级设置（只传要改的字段；服务端未提供的字段保持不变）。 */
 export async function patchConversation(
   id: string,
@@ -201,9 +240,14 @@ export async function patchConversation(
     title?: string;
     model?: string;
     mcpServers?: string[];
+    skillsEnabled?: string[];
     locale?: string;
     pendingQueue?: PendingMessage[];
     pinnedAt?: number | null;
+    /** 归档开关：true = 收进归档区（侧栏默认不显示，需打开「显示归档」）。 */
+    archived?: boolean;
+    /** 免打扰：静默该对话的「后台任务完成」提醒。 */
+    muted?: boolean;
   },
 ): Promise<ConversationDto> {
   const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, {
@@ -231,6 +275,8 @@ export interface ChatPreferences {
   theme: "" | "light" | "dark";
   locale: string;
   convSortMode: ConvSortMode;
+  /** 侧栏「显示归档」开关（归档对话默认收起，打开后拉进列表）。 */
+  showArchived: boolean;
   /** 非 0 = 客户端已完成过偏好同步（据此跳过旧 localStorage 的一次性迁移）。 */
   migratedAt: number;
 }
@@ -241,6 +287,7 @@ function toPreferences(data: Partial<ChatPreferences>): ChatPreferences {
     theme: data.theme || "",
     locale: data.locale || "",
     convSortMode: data.convSortMode === "manual" ? "manual" : "recent",
+    showArchived: data.showArchived === true,
     migratedAt: data.migratedAt || 0,
   };
 }
@@ -254,6 +301,7 @@ export async function saveChatPreferences(patch: {
   theme?: "light" | "dark";
   locale?: string;
   convSortMode?: ConvSortMode;
+  showArchived?: boolean;
 }): Promise<ChatPreferences> {
   const data = (await jsonFetch("/agent/chat/preferences", {
     method: "PUT",
@@ -284,6 +332,8 @@ export interface McpServerStatus {
   transport: string;
   enabled: boolean;
   connected: boolean;
+  /** 新建对话/任务默认勾选（服务端配置 defaultEnabled）。 */
+  defaultEnabled?: boolean;
   /** 连接过程进行中（尚未列完工具）。 */
   connecting?: boolean;
   error?: string;
@@ -347,9 +397,117 @@ export async function setChatMcpServers(
   return { available: data.available || [], enabled: data.enabled || [] };
 }
 
-export async function confirmToolCall(callId: string, confirmed: boolean) {
+// ---- 技能（Skills）：对话级勾选，与 MCP 启用集同构 ----
+export interface SkillMeta {
+  /** 展示名（SKILL.md frontmatter name，缺省为目录名）。 */
+  name: string;
+  description: string;
+  /** skills 目录名（勾选集存的值 / read_skill 的入参）。 */
+  dir: string;
+}
+
+export async function fetchChatSkills(
+  conversationId?: string,
+): Promise<{ available: SkillMeta[]; enabled: string[] }> {
+  const query = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
+  const data = (await jsonFetch(`/agent/chat/skills${query}`)) as {
+    available: SkillMeta[];
+    enabled: string[];
+  };
+  return { available: data.available || [], enabled: data.enabled || [] };
+}
+
+export async function setChatSkills(
+  enabled: string[],
+  conversationId?: string,
+): Promise<{ available: SkillMeta[]; enabled: string[] }> {
+  const data = (await jsonFetch("/agent/chat/skills", {
+    method: "PUT",
+    body: JSON.stringify({ enabled, ...(conversationId ? { conversationId } : {}) }),
+  })) as { available: SkillMeta[]; enabled: string[] };
+  return { available: data.available || [], enabled: data.enabled || [] };
+}
+
+/** 应答确认：必须携带服务端签发的一次性票据；grantRead=true 时附带会话级只读授权。 */
+export async function confirmToolCall(ticket: string, confirmed: boolean, opts: { grantRead?: boolean } = {}) {
   return jsonFetch("/agent/chat/confirm", {
     method: "POST",
-    body: JSON.stringify({ callId, confirmed }),
+    body: JSON.stringify({ ticket, confirmed, ...(opts.grantRead ? { grantRead: true } : {}) }),
   });
+}
+
+/** 显式取消某对话的后台任务（执行与推送解耦后，「停止」不再等于断开连接）。 */
+export async function cancelChatTask(conversationId: string): Promise<{ ok: boolean; running: boolean }> {
+  return jsonFetch("/agent/chat/cancel", {
+    method: "POST",
+    body: JSON.stringify({ conversationId }),
+  });
+}
+
+export interface ChatTaskStatus {
+  conversationId: string;
+  running: boolean;
+  task?: { id: string; startedAt: number; elapsedMs: number; live: boolean };
+  last?: { id: string; status: string; startedAt: number; settledAt: number; durationMs: number; outcomePersisted: boolean };
+}
+
+/** 查询某对话的任务状态（断线后判断「后台还在跑吗」）。 */
+export async function fetchChatTaskStatus(conversationId: string): Promise<ChatTaskStatus> {
+  return jsonFetch(`/agent/chat/task/status?conversationId=${encodeURIComponent(conversationId)}`);
+}
+
+/** 便捷判定：该对话是否还有后台任务在跑（网络错误时按 false 处理）。 */
+export async function isChatTaskRunning(conversationId: string): Promise<boolean> {
+  try {
+    return (await fetchChatTaskStatus(conversationId)).running;
+  } catch {
+    return false;
+  }
+}
+
+// ---- 长期记忆（按 owner 隔离）----
+
+export interface MemoryItemDto {
+  id: string;
+  text: string;
+  createdAt: number;
+}
+
+export async function fetchMemory(): Promise<MemoryItemDto[]> {
+  const data = (await jsonFetch("/agent/chat/memory")) as { memory: MemoryItemDto[] };
+  return data.memory || [];
+}
+
+export async function addMemoryItem(text: string): Promise<MemoryItemDto | null> {
+  const data = (await jsonFetch("/agent/chat/memory", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  })) as { memory: MemoryItemDto | null };
+  return data.memory;
+}
+
+export async function removeMemoryItem(id: string): Promise<boolean> {
+  const data = (await jsonFetch(`/agent/chat/memory/${encodeURIComponent(id)}`, { method: "DELETE" })) as { ok: boolean };
+  return Boolean(data.ok);
+}
+
+// ---- 对话工作区（虚拟文件系统，只读 UI）----
+
+export interface WorkspaceFile {
+  path: string;
+  bytes: number;
+}
+
+export async function fetchWorkspaceFiles(conversationId: string): Promise<WorkspaceFile[]> {
+  const data = (await jsonFetch(
+    `/agent/chat/conversations/${encodeURIComponent(conversationId)}/files`,
+  )) as { files: WorkspaceFile[] };
+  return data.files || [];
+}
+
+export async function readWorkspaceFile(conversationId: string, path: string): Promise<string> {
+  const data = (await jsonFetch(
+    `/agent/chat/conversations/${encodeURIComponent(conversationId)}/files/content?path=${encodeURIComponent(path)}`,
+  )) as { content: string };
+  return data.content || "";
 }

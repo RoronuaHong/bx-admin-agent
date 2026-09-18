@@ -124,6 +124,19 @@ textarea {
   color: inherit;
 }
 
+/* 删除撤销条入场动画：撤销条本体在 ChatPage.vue 里以 ::global 命中，
+   keyframes 必须放全局（scoped 里的 keyframes 会被改名导致引用落空）。 */
+@keyframes undo-toast-in {
+  from {
+    opacity: 0;
+    top: 8px;
+  }
+  to {
+    opacity: 1;
+    top: 20px;
+  }
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,

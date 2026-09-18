@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { config, type ModelEntry } from "./config.js";
 
 // 统一模型调用层：三种协议适配（anthropic / openai / ollama），均返回纯文本。
@@ -542,7 +543,8 @@ async function callOpenAi(
   const toolCalls: ToolCall[] = [...pendingTools.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([index, call]) => ({
-      id: call.id || `call_${index}`,
+      // 兜底 id 不可猜（原来是 call_<index>）：callId 会参与确认流程关联，可预测 id 有被冒用的空间。
+      id: call.id || `call_${randomUUID()}`,
       name: call.name,
       argsJson: call.args || "{}",
     }))

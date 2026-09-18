@@ -14,6 +14,9 @@ export interface TodoItem {
   status: "pending" | "in_progress" | "completed" | "cancelled";
 }
 
+/** 工具风险级别（副作用强弱；数据外发是另一正交轴，后续再扩展）。 */
+export type RiskLevel = "read" | "write" | "destructive";
+
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
@@ -23,9 +26,45 @@ export type ChatEvent =
   | { type: "model"; id: string; label: string }
   | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
   | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
-  | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
+  | {
+      type: "confirmation_required";
+      /** 工具调用 id（UI 关联步骤用，不再用于批准）。 */
+      id: string;
+      /** 服务端签发的一次性确认票据（批准必须用它，与请求会话绑定）。 */
+      ticket: string;
+      name: string;
+      server?: string;
+      args?: string;
+      /** 生效风险级别（read 不弹卡；write/destructive 弹卡）。 */
+      level?: RiskLevel;
+      reason?: string;
+      /** 关键参数摘要（截断 + 敏感键脱敏），让用户知情批准。 */
+      argSummary?: Array<{ key: string; value: string }>;
+      /** 是否可提供「本对话只读授权」勾选（仅未声明级别的外部服务器工具）。 */
+      canGrantRead?: boolean;
+      /** 票据有效期（毫秒）：超时未应答按拒绝处理（fail-closed），前端据此提示时限。 */
+      expiresInMs?: number;
+    }
   | { type: "confirmation_response"; id: string; confirmed: boolean }
   | { type: "todos"; todos: TodoItem[] }
+  | {
+      /** 子代理（task）启动：独立事件维度，旧前端忽略未知 type 即可向后兼容。 */
+      type: "subagent_start";
+      /** 子代理运行 id（跨事件唯一，前端独立取消用）。 */
+      id: string;
+      /** 父代理发起的 task 工具调用 id（UI 关联步骤用）。 */
+      parentId: string;
+      description: string;
+    }
+  | { type: "subagent_delta"; id: string; text: string }
+  | {
+      type: "subagent_end";
+      id: string;
+      ok: boolean;
+      /** 终态：正常完成 / 被独立取消 / 执行出错。 */
+      status: "done" | "cancelled" | "error";
+      text: string;
+    }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
   | {
       /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */

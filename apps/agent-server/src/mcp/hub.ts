@@ -1,7 +1,8 @@
 // MCP Hub（客户端侧）：连接外部 MCP 服务器、发现工具、执行工具调用。
 // 1. 每个 server 一个长连接，全局复用（连接单飞 + 空闲回收）；会话只决定「启用哪些」，不重复建连；
 // 2. 工具以 mcp__<serverId>__<tool> 命名空间注入模型，避免多 server 重名冲突；
-// 3. 工具注解（readOnlyHint / destructiveHint）参与「是否需要用户确认」的判定；
+// 3. 注解/配置只提供事实（readOnlyHint / destructiveHint / requireConfirm / toolRisks），
+//    「是否需要确认」的判定统一在 src/risk.ts（本文件只暴露 describeMcpTool）；
 // 4. 连接失败不抛错对外，只记录 error，由状态接口暴露给前端。
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -26,6 +27,8 @@ export interface ServerStatus {
   transport: string;
   enabled: boolean;
   connected: boolean;
+  /** 新建对话/任务默认勾选（配置 defaultEnabled，前端预选用）。 */
+  defaultEnabled?: boolean;
   /** 连接过程进行中（尚未列完工具）。 */
   connecting?: boolean;
   error?: string;
@@ -73,14 +76,9 @@ const RECONNECT_COOLDOWN_MS = Number(process.env.MCP_RECONNECT_COOLDOWN_MS || 30
 const IDLE_TIMEOUT_MS = Number(process.env.MCP_IDLE_TIMEOUT_MS || 30 * 60_000);
 const IDLE_SWEEP_MS = Number(process.env.MCP_IDLE_SWEEP_MS || 5 * 60_000);
 /**
- * 无注解工具的默认口径：不确认（沿用既有行为）。
- * 置 MCP_CONFIRM_STRICT=on 则按规范口径把「未声明」视为破坏性（destructiveHint 缺省 true）→ 要确认。
- * 实时读环境变量：改口径不必重启（对齐「无注解工具口径」这种随时可能调的开关）。
+ * 实时读环境变量的旧口径（MCP_CONFIRM_STRICT）已废弃：保守语义（未声明 = 需确认）
+ * 已成为 risk.ts 的默认行为，无需开关。
  */
-function confirmStrictDefault(): boolean {
-  return (process.env.MCP_CONFIRM_STRICT || "off").toLowerCase() === "on";
-}
-
 function timeoutOf(cfg: McpServerConfig): number {
   return cfg.timeoutMs && cfg.timeoutMs > 0 ? cfg.timeoutMs : DEFAULT_TIMEOUT_MS;
 }
@@ -114,8 +112,11 @@ async function refreshTools(conn: Conn): Promise<void> {
   const used = new Set<string>();
   try {
     const res = await conn.client.listTools(undefined, { timeout: timeoutOf(conn.cfg) });
+    // 工具白名单：声明后只注入列出的原始工具名（未声明 = 全部），用于收窄多领域 server 的暴露面。
+    const allow = conn.cfg.tools?.length ? new Set(conn.cfg.tools) : null;
     // 按工具名排序：工具清单是注入模型的 system 前缀的一部分，顺序稳定才谈得上 prompt 缓存命中。
     conn.tools = (res.tools || [])
+      .filter((t) => !allow || allow.has(t.name))
       .map((t) => ({
         name: encodeToolName(conn.cfg.id, t.name, used),
         serverId: conn.cfg.id,
@@ -236,6 +237,7 @@ function statusOf(cfg: McpServerConfig, conn: Conn | null): ServerStatus {
     enabled: cfg.enabled !== false,
     // 连接过程未完（工具清单还没列完）不算「已连接」：否则前端显示「已连接 · 0 工具」，误导排查。
     connected: Boolean(conn && !conn.error && !connecting),
+    ...(cfg.defaultEnabled ? { defaultEnabled: true } : {}),
     ...(connecting ? { connecting: true } : {}),
     ...(conn?.error ? { error: conn.error } : {}),
     ...(conn?.toolsError ? { toolsError: conn.toolsError } : {}),
@@ -321,38 +323,26 @@ function findTool(namespacedName: string): { conn: Conn; info: McpToolInfo } | n
   return null;
 }
 
-/**
- * 是否需要在调用前让用户二次确认（对齐 MCP 工具注解语义）：
- * 1. 服务器级 `requireConfirm` 显式配置优先（该服务器全部工具都确认）；
- * 2. `readOnlyHint: true` → 只读，不确认；
- * 3. `destructiveHint` 显式取值 → 按它判定（true 确认 / false 不确认）；
- * 4. 无注解（未知）→ 默认**不确认**（沿用既有行为）；`MCP_CONFIRM_STRICT=on` 时改为确认
- *    （对齐规范里 destructiveHint 缺省为 true 的保守口径）。
- */
-export function toolNeedsConfirm(namespacedName: string): boolean {
-  const found = findTool(namespacedName);
-  if (!found) return false;
-  if (found.conn.cfg.requireConfirm) return true;
-  const hints = found.info.annotations || {};
-  if (hints.readOnlyHint === true) return false;
-  if (hints.destructiveHint === true) return true;
-  if (hints.destructiveHint === false) return false;
-  return confirmStrictDefault();
+/** 风险分级所需的服务器事实（不做判定；判定统一在 src/risk.ts）。 */
+export interface McpToolFacts {
+  serverId: string;
+  requireConfirm?: boolean;
+  /** 工具级风险覆盖（服务器配置 toolRisks，键为裸工具名或命名空间名）。 */
+  toolRisks?: Record<string, "read" | "write" | "destructive">;
+  /** MCP 工具注解（server 的自我声明）。 */
+  annotations?: Record<string, unknown>;
 }
 
-/** 需要确认的原因（确认卡文案用，让用户知道自己在批准什么）。 */
-export function confirmReasonOf(namespacedName: string): string | null {
+/** 按命名空间工具名取回判定所需事实；查不到返回 null（调用方按「未知」保守处理）。 */
+export function describeMcpTool(namespacedName: string): McpToolFacts | null {
   const found = findTool(namespacedName);
   if (!found) return null;
-  if (found.conn.cfg.requireConfirm) {
-    return `服务器「${found.conn.cfg.label || found.conn.cfg.id}」配置为默认需确认`;
-  }
-  const hints = found.info.annotations || {};
-  if (hints.destructiveHint === true) return "该工具声明为破坏性操作（destructiveHint）";
-  if (hints.readOnlyHint !== true && !("destructiveHint" in hints) && confirmStrictDefault()) {
-    return "该工具未声明操作类型，按保守口径需确认";
-  }
-  return null;
+  return {
+    serverId: found.conn.cfg.id,
+    ...(found.conn.cfg.requireConfirm !== undefined ? { requireConfirm: found.conn.cfg.requireConfirm } : {}),
+    ...(found.conn.cfg.toolRisks ? { toolRisks: found.conn.cfg.toolRisks } : {}),
+    ...(found.info.annotations ? { annotations: found.info.annotations } : {}),
+  };
 }
 
 export interface McpCallResult {

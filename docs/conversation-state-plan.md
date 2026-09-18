@@ -127,10 +127,24 @@ interface ConversationDoc {
 
   // ---- 候选（取决于 §11.2 的决策）----
   pendingQueue?: Array<{ text: string; images?: string[]; at: number }>;  // 忙碌期间的待发消息
+
+  // ---- 后续增补（本设计之后按需求陆续加入，均为对话级、后端持久化）----
+  todos?: TodoItem[];             // 任务规划（write_todos 全量替换，跨轮持久化）
+  skillsEnabled?: string[];       // 用户勾选的技能 → 全文注入系统提示动态后缀
+  pinnedAt?: number | null;       // 置顶时间戳；null = 未置顶
+  sortOrder?: number;             // 手动排序（「手动排序」模式下生效）
+  archived?: boolean;             // 归档（默认列表不显示，需 includeArchived）
+  muted?: boolean;                // 免打扰：静默该对话的后台完成提醒
+  readGrants?: string[];          // 会话级只读授权（写闸门 P0-3）
+  ownerKey?: string;              // 设备 owner 标注（轻量归属隔离，方案 A）
 }
 ```
 
-> `summary*` 三个字段在 `src/conversations.ts` 里**已存在但从未被调用**（死代码），本设计正是它们的落地场景。
+> 整理类字段（`title` / `pinnedAt` / `archived` / `muted` / `readGrants` / `skillsEnabled`）属于
+> `ACTIVITY_NEUTRAL_KEYS`：**改动它们不刷新 `updatedAt`**，否则在「按最近活动排序」下会把该对话顶到列表最前，
+> 与用户预期相反（已由 `scripts/_mute-check.mjs` 断言锁定）。
+
+> `summary*` 三个字段（`summary` / `summaryAt` / `summaryCovered`，`src/conversations.ts:81-85`）原为「已存在但从未被调用」的预留字段，**现已落地**（2026-09-18 对齐）：上下文压缩真的发生时由 `chat.ts` 写回（`setConversationSummary`，`conversations.ts:293`），水位线单调前移，下一轮在此基础上增量扩展。
 
 ### 5.2 `session`（cookie 级，`src/session.ts`）
 
@@ -171,7 +185,7 @@ interface Session {
 | 方法 + 路径 | 说明 |
 |---|---|
 | `GET /chat/conversations/:id` | 全量文档（含 `context`/`summary`/设置），供切对话时载入 |
-| `PATCH /chat/conversations/:id` | 更新设置：`{ title?, model?, mcpServers?, locale? }`；MCP 变更时服务端联动连接 |
+| `PATCH /chat/conversations/:id` | 更新设置：`{ title?, model?, mcpServers?, skillsEnabled?, locale?, pendingQueue?, pinnedAt?, archived?, muted?, readGrants? }`；MCP 变更时服务端联动连接。全部经归属守卫（他人/不存在统一 404） |
 | `GET /chat/preferences` | `{ activeConversationId, theme }`（设备态） |
 | `PUT /chat/preferences` | 更新设备态（切换对话时上报 `activeConversationId`、主题切换时上报 `theme`） |
 | `POST /chat/conversations/:id/context/clear` | 清空该对话上下文（替代现在的全局 `/chat/context/clear`） |
@@ -285,7 +299,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 | **P1+P2 统一实施** | 服务端：`conversation.context` 读写 + 设置字段 + 对话级锁/409 + MCP 引用计数改造 + session 瘦身 + 迁移；前端：`states: Map<convId, ConvState>` + 去全局锁 + 设置后端化 + 三处 localStorage 移除与迁移 + 侧栏状态点 | ① 直连脚本：两个 `conversationId` 并行请求，上下文互不污染；同 `conversationId` 并发返回 409；② 浏览器：3 个对话同时流式且互不中断；切卡不掉线；改 A 的模型/MCP/语言，B 不受影响；③ 刷新后设置与上下文保持；④ `_bi-tools-check.mjs` / `tsc` / `vite build` 全绿 |
 | **P3 待讨论项落地** | 若采纳 §11.2 的 B/C：`pendingQueue` 持久化 + 队列 UI（Pending(N)/上移/下移/编辑/删除/立即发送）+ 出队策略 | 忙碌时发消息进队列不丢；turn 收束后按序自动发；「立即发送」= abort + 出队 |
 | **P4 收尾** | 文档同步（`mcp-guide.md` / `agent-infrastructure.md` 对照表）、回归清单、旧字段标注 deprecated | 文档与代码一致 |
-| **P5（可选）** | 断线续跑（后台任务化 + run 状态持久化） | 发起后立刻断网/关页面，重连可见完整结果 |
+| **P5（可选）** | 断线续跑（后台任务化 + run 状态持久化）——✅ 已于 2026-09-17 随异步任务底座落地（`src/chat-tasks.ts` + `/chat/cancel`、`/chat/task/status`、`/chat/task/events`；断开后任务照跑、结果回投进对话消息快照） | 发起后立刻断网/关页面，重连可见完整结果 |
 
 **回归清单（每期都跑）**：NDJSON 流式正常、确认卡出现并可点、`usage` 数值合理、图片提示、MCP 面板选择、8 个 BI 工具全绿、`tsc --noEmit` + `vite build`。
 
@@ -346,16 +360,22 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 | 能力 | 落点 |
 |---|---|
 | 对话级上下文 `context` + 原子追加 | `conversations.ts`（`$push` + `$inc: contextSeq`） |
-| 对话级设置 `model`/`mcpServers`/`locale`/`pendingQueue` | `conversation` 文档 + `PATCH /chat/conversations/:id`（`app.ts:309`） |
-| 同对话并发 409 | `runningStreams`（`app.ts:43`）→ `CONVERSATION_BUSY`（`app.ts:208`） |
-| 列表回传 `running` | `app.ts:255`（**前端未消费**：`ConversationDto` 无该字段，`api.ts:170`） |
-| 设备态后端化 | `GET/PUT /chat/preferences`（`app.ts:337/348`）；`session.preferences`（`session.ts:24-29`） |
-| `session` 瘦身 | `messages`/`mcpServers` 标 `@deprecated`，仅迁移路径读取（`session.ts:38-41`） |
-| 上下文三层压缩（窗口→无损裁剪→LLM 摘要） | `history.ts`（`buildContext`） |
+| 对话级设置 `model`/`mcpServers`/`locale`/`pendingQueue` | `conversation` 文档 + `PATCH /chat/conversations/:id`（`app.ts:735`） |
+| 同对话并发 409 | 异步任务注册表 `chat-tasks.ts`（`isTaskRunning` / `startTask`）→ `CONVERSATION_BUSY`（`app.ts:532`） |
+| 列表回传 `running` | `app.ts:664`（列表）/ `app.ts:731`（单条）；**前端已消费**：`ConversationDto.running?`（`api.ts:165`）→ `ChatPage.convStatus()` 侧栏状态点 + 排队徽标 |
+| 设备态后端化 | `GET/PUT /chat/preferences`（`app.ts:854/859`）；`session.preferences`（接口 `session.ts:27-47`，字段 `session.ts:65`） |
+| `session` 瘦身 | `messages`/`mcpServers` 标 `@deprecated`，仅迁移路径读取（`session.ts:56-59`） |
+| 上下文三层压缩（窗口→无损裁剪→LLM 摘要） | `history.ts`（`assembleContext`，`history.ts:103`；真发生压缩时才回写 `conversation.summary` / `summaryCovered`） |
 | 跨轮**轻量工具句柄**（只留"查过什么"，不留正文） | `ToolHandle` + `ChatTurn.handles`（`session.ts:8-22`） |
 | 长期记忆（显式写入、可查可删、注入 system） | `memory.ts` |
-| 上下文用量透明 | `usage` 事件：`turns/dropped/toolResultsCleared/budget/window` |
+| 上下文用量透明 | `usage` 事件（字段定义 `packages/shared/src/index.ts:69-102`）：`tokens` / `budget` / `window` / `turns` / `dropped` / `summarized` / `toolResultsCleared` / `toolResultsOffloaded` / `rounds` / `toolCalls` / `modelRetries` / `modelFallbacks` / `toolFusions` / `pseudoCallRetries` / `costTokens` |
 | 新对话默认不选 MCP | 前端按对话带 `conversationId` 读取 + `POST /chat/conversations` 即时置为活跃 |
+
+> **锚点对齐（2026-09-18）**：上表行号按当前代码刷新过一遍，其中四条不只是行号漂移：
+> ①「同对话并发 409」的判据从旧的 `runningStreams` 迁到异步任务注册表 `chat-tasks.ts`（执行与推送解耦后，该注册表是运行态的唯一真相，`app.ts` 只做 `isTaskRunning()` 判定与 409 出口）；
+> ②`running` 前端**已经消费**（`ChatPage.convStatus()`：待确认 > 出错 > 生成中 ∪ 服务端 `running`，另加排队徽标），不再是「前端未消费字段」；
+> ③上下文组装入口改名为 `assembleContext`（原 `buildContext`）；
+> ④`usage` 事件字段已扩展（新增 `summarized` / `toolResultsOffloaded` / `rounds` / `toolCalls` / `modelRetries` / `modelFallbacks` / `toolFusions` / `pseudoCallRetries` / `costTokens`）。
 
 **前端半场 + P3 队列：已于 2026-09-17 落地**（实现与实测证据）：
 

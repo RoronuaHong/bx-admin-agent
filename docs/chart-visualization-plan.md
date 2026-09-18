@@ -1,8 +1,7 @@
 # 图表可视化接入方案（AntV）
 
-> 版本：v1（2026-09-17）
-> **状态：挂账（评估与实测已完成，未实施）**——本轮只做方案定性与可行性实测，代码不动。
-> 定位：回答「对话里能不能出图、用 AntV 行不行、怎么落地」；实施时按本文第 6/7 节开工。
+> 版本：v2（2026-09-17，路线 1 已实施并端到端验证，见 §10）
+> **状态：路线 1（官方出图服务 + requireConfirm 显式化数据外发）已上线**；自托管（路线 2）与前端本地渲染（路线 3）仍挂账。
 > 相关：`docs/mcp-guide.md`（MCP 接入权威实现）、`docs/deep-agents-plan.md` §5 D5（代码执行沙箱）、`apps/agent-server/scripts/metabase-mcp.mjs`（现有 BI MCP）。
 
 ---
@@ -136,9 +135,35 @@ web 引入 `@antv/g2`（统计图）＋ `@antv/g6`（结构/关系/树图，G2 �
 
 ## 9. 待办（下次开工从这里继续）
 
-- [ ] **决策**：数据合规口径——走官方服务（快）还是自托管（稳）
-- [ ] 路线 1 最小验证：`MCP_BUILTIN_SERVERS` 加 `chart` 条目 → 重启 agent-server-dev → 端到端出一张饼图
-- [ ] 写 `skills/chart-visualization/SKILL.md`（见 §6.2 三条约束）
-- [ ] （若自托管）部署 `@antv/gpt-vis-ssr` 并配 `VIS_REQUEST_SERVER`，验证数据不出内网
+- [x] **决策**：先走路线 1（官方服务），用 `requireConfirm: true` 把数据外发显式化为每次确认卡；内网敏感数据规模化使用前再评估自托管
+- [x] 路线 1 最小验证：`MCP_BUILTIN_SERVERS` 加 `chart` 条目 → 重启 → 端到端出图（见 §10）
+- [x] 写 `skills/chart-visualization/SKILL.md`（§6.2 三条约束：先取数再出图不编造 / 聚合序列 ≤50 点 / `![](url)` 贴图 + 数据摘要）
+- [ ] （生产加固）自托管 `@antv/gpt-vis-ssr` 并配 `VIS_REQUEST_SERVER`，验证数据不出内网——BI 含真实业务数据，规模化使用前建议完成
 - [ ] （若需交互）路线 3：`chart` 事件 + `render_chart` 工具 + 前端 g2/g6 组件
-- [ ] 运维提醒：改 `.env` 后需重启后端进程方可生效
+
+---
+
+## 10. 实施记录（路线 1，2026-09-17）
+
+**改动**：
+1. `.env` `MCP_BUILTIN_SERVERS` 追加 `chart` 服务器：`npx -y @antv/mcp-server-chart`，`requireConfirm: true`（数据外发显式确认），`DISABLED_TOOLS` 禁用 3 个地理图 + 词云/水波/小提琴（27 → 21 个工具位），`timeoutMs: 120000`；
+2. 新增 `skills/chart-visualization/SKILL.md`（模型按需加载的出图守则）；
+3. 验证脚本 `scripts/_chart-e2e.mjs`（真实服务端到端：自动应答确认票据 → 断言图表调用成功 + 回复含 Markdown 图片 + 图片 URL 可达）。
+
+**端到端实测（默认模型 kimi28 + BI + chart）**：
+```
+[tool_call] read_skill          → 命中「图表可视化」skill，加载出图守则
+[tool_call] mcp__bi__list_databases
+[tool_result] ok=true
+[tool_call] mcp__bi__get_database_schema
+[tool_result] ok=true（totalTables: 47）
+[tool_call] mcp__chart__generate_column_chart
+[confirm] 票据批准 -> 200        ← 数据外发确认卡（write-op-safety P0-4 票据机制）
+[tool_result] ok=true → 图片 URL
+回复含 Markdown 图片：true；图片可达：200 image/jpeg
+E2E PASS
+```
+
+**与安全闸门的联动**：chart 未声明风险级别 + 服务器级 `requireConfirm` → 每次出图弹确认卡（含脱敏参数摘要 = 将送去渲染的数据），既是写操作确认也是数据外发确认——方案 §5.9 的"歪打正着"在有 requireConfirm 配置下成为确定性保障。
+
+**遗留**：生产规模化前评估自托管（§9 第 4 条）；确认卡目前不区分「数据外发」徽标（`RiskLevel` 的 egress 轴，方案 §5.9 下一轮）。

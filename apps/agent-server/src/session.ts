@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { DATA_DIR, atomicWriteJson } from "./store-util.js";
 import { config } from "./config.js";
 
 /** 工具调用的轻量句柄：跨轮只保留「查过什么」，不保留结果正文（正文由本轮预算管理并可被清理）。 */
@@ -36,6 +36,10 @@ export interface SessionPreferences {
    */
   convSortMode?: ConvSortMode;
   /**
+   * 侧栏「显示归档」开关：归档对话默认收起来，打开后拉进列表（设备级偏好，刷新后保持）。
+   */
+  showArchived?: boolean;
+  /**
    * 客户端完成过一次偏好同步的时间戳。
    * 前端据此判断「旧的 3 个 localStorage 键是否已迁移」，避免换设备/清缓存后重复迁移。
    */
@@ -53,8 +57,10 @@ export interface Session {
   messages: ChatTurn[];
   /** @deprecated MCP 启用集已按对话持久化（`conversation.mcpServers`），仅在迁移路径读取。 */
   mcpServers: string[];
-  /** 上次打开的对话 id（原前端 localStorage）。 */
+  /** 上次打开的对话 id（原前端 localStorage）。generic 角色用这个槽。 */
   activeConversationId?: string;
+  /** 多 Agent 分槽（领域适配指南第 9 章）：按 agentId 记各角色的活跃对话，generic 不进这张表。 */
+  activeByAgent?: Record<string, string>;
   /** 设备级 UI 偏好（主题等）。 */
   preferences?: SessionPreferences;
 }
@@ -63,8 +69,7 @@ export interface Session {
 export const SESSION_COOKIE = "bx_agent_sid";
 
 // 文件持久化会话存储：进程重启后按 cookie 恢复历史上下文。
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SESSION_FILE = resolve(__dirname, "..", ".data", "sessions.json");
+const SESSION_FILE = resolve(DATA_DIR, "sessions.json");
 
 const sessions = new Map<string, Session>();
 
@@ -88,17 +93,12 @@ function loadFromDisk() {
 
 let writeChain: Promise<void> = Promise.resolve();
 function persist() {
-  // 串行化写入，避免并发写导致文件损坏；写入临时文件再 rename 保证原子性。
+  // 串行化写入，避免并发写导致文件损坏；atomicWriteJson 内部做临时文件 + rename 原子写。
   writeChain = writeChain.then(
     () =>
       new Promise<void>((resolvePromise) => {
         try {
-          mkdirSync(dirname(SESSION_FILE), { recursive: true });
-          const tmp = `${SESSION_FILE}.tmp`;
-          writeFileSync(tmp, JSON.stringify([...sessions.values()]), "utf-8");
-          renameSync(tmp, SESSION_FILE);
-        } catch {
-          // 持久化失败不影响内存中会话可用性。
+          atomicWriteJson(SESSION_FILE, [...sessions.values()], { pretty: false, logLabel: "session" });
         } finally {
           resolvePromise();
         }

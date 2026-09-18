@@ -2,6 +2,10 @@
 // 起一个本地 mock 的 OpenAI 流式服务，通过导出的 chatStream 驱动真实 runLoop 整轮循环，
 // 证明「主代理委派 task 子代理 → 子代理调内置工具 → 收敛」这条 Deep Agent 主链路真的能跑通。
 // 子代理的 tools 不含 task（chat.ts 剥离），mock 服务据此区分主/子代理返回不同脚本。
+//
+// 同时钉住「子代理默认只读」这条安全闸门（chat.ts 的 allowWrite:false + 非 read 直接拒绝）：
+// 子代理第一步就尝试 fs_write（BUILTIN_RISK 里是 write 级）→ 必被拒绝、不落盘；
+// 工作区文件改由**主代理**自己写（内置工作区写免确认，见 risk.ts verdictNeedsConfirm）。
 import { test, expect, beforeAll, afterAll } from "vitest";
 import http from "node:http";
 
@@ -50,18 +54,21 @@ function sse(lines: string[]): string {
 }
 
 function sseMainTask(): string {
-  mainN++;
   return sse([toolCallChunk([{ id: "call_task_1", name: "task", args: { description: "作为子代理：把『项目状态』小结写入工作区 results/summary.md" } }])]);
+}
+/** 主代理自己写工作区：内置工作区写免确认（无外部副作用），这才是能落盘的那一步。 */
+function sseMainFs(): string {
+  return sse([toolCallChunk([{ id: "call_fs_main", name: "fs_write", args: { path: "results/summary.md", content: "主代理产出：子代理汇报完毕，结论已落盘。" } }])]);
 }
 function sseMainFinal(): string {
   return sse([textChunk("主代理汇总：子代理已完成数据查询，结论见工作区 results/summary.md。")]);
 }
+/** 子代理第一步就写：应被只读闸门拒绝（不得落盘）。 */
 function sseSubFs(): string {
-  subN++;
   return sse([toolCallChunk([{ id: "call_fs_1", name: "fs_write", args: { path: "results/summary.md", content: "子代理产出：项目状态正常。" } }])]);
 }
 function sseSubFinal(): string {
-  return sse([textChunk("子代理结论：已写入 results/summary.md。")]);
+  return sse([textChunk("子代理结论：写入被拒（子代理只读），已直接汇报。")]);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -71,7 +78,17 @@ const server = http.createServer(async (req, res) => {
     const body = JSON.parse(buf) as { tools?: Array<{ function?: { name?: string } }> };
     const isMain = (body.tools || []).some((t) => t.function?.name === "task");
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const payload = isMain ? (mainN === 0 ? sseMainTask() : sseMainFinal()) : subN === 0 ? sseSubFs() : sseSubFinal();
+    // 主：① 委派子代理 → ② 自己写工作区 → ③ 收尾；子：① 尝试写（应被拒）→ ② 收尾。
+    const step = isMain ? mainN++ : subN++;
+    const payload = isMain
+      ? step === 0
+        ? sseMainTask()
+        : step === 1
+          ? sseMainFs()
+          : sseMainFinal()
+      : step === 0
+        ? sseSubFs()
+        : sseSubFinal();
     res.end(payload);
   } else {
     res.writeHead(404);
@@ -101,7 +118,7 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
   (conv as { mcpServers: string[]; model: string }).mcpServers = ["mock"];
   (conv as { model: string }).model = "mock";
 
-  const seen = { model: false, task: false, subagentRan: false, workspaceWritten: false, finalText: false, done: false };
+  const seen = { model: false, task: false, subagentRan: false, mainWrote: false, finalText: false, done: false };
   for await (const ev of chatStream("verify-deep", "请完成一个多步任务", {}, undefined)) {
     const t = ev.type;
     if (t === "model") seen.model = true;
@@ -111,19 +128,23 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
     } else if (t === "tool_result") {
       const e = ev as { name: string; ok: boolean };
       if (e.name === "task" && e.ok) seen.subagentRan = true;
+      // 主代理的 fs_write 是**顶层**工具结果（子代理内部的工具事件不转发到主流，只转发 text/subagent_*）。
+      if (e.name === "fs_write" && e.ok) seen.mainWrote = true;
     } else if (t === "text") seen.finalText = true;
     else if (t === "done") seen.done = true;
   }
 
-  // 子代理内部调 fs_write 会写入工作区；读回该文件即可证明「子代理 → 内置工具」链路真实执行。
+  // 工作区内容分两种来源：主代理写的（能落盘）vs 子代理写的（被只读闸门拒绝）。
+  // 用内容区分，一次同时钉住「内置工具真的执行了」与「子代理写不进去」。
   const file = fsRead("verify-deep", "results/summary.md");
-  if ("content" in file && file.content.includes("子代理产出")) seen.workspaceWritten = true;
+  const content = "content" in file ? file.content : "";
   fsRemoveConversation("verify-deep");
 
   expect(seen.model, "应进入模型调用").toBe(true);
   expect(seen.task, "主代理应委派 task 子代理").toBe(true);
   expect(seen.subagentRan, "子代理应独立执行并返回").toBe(true);
-  expect(seen.workspaceWritten, "子代理内部应调用内置工具 fs_write 落地工作区").toBe(true);
+  expect(seen.mainWrote, "主代理的内置工具 fs_write 应真实执行并落盘").toBe(true);
+  expect(content.includes("子代理产出"), "子代理的写操作应被只读闸门拒绝（P0-5），不得落盘").toBe(false);
   expect(seen.finalText, "主代理应收敛出最终文本").toBe(true);
   expect(seen.done, "事件流应正常收束 done").toBe(true);
 }, 25000);

@@ -10,12 +10,13 @@
 
 ## 1. 能力概览
 
-- 聊天页顶部「MCP」按钮是一个**多选抽屉**：从已配置的服务器里勾选要连到当前会话的（可多选、可随时取消），勾上即连、模型即可用其工具；一个都不勾就是纯直连。
+- 入口是**输入框左下角「＋」工具菜单**（与「技能」合并；菜单项：添加文件 / 技能 / 连接器）。点「连接器」在菜单右侧飞出面板（搜索框 + 列表 + 底部操作），从已配置的服务器里勾选要连到当前对话的（可多选、可随时取消），勾上即连、模型即可用其工具；一个都不勾就是纯直连。
 - 服务器清单由部署侧提供（`.env` 的 `MCP_BUILTIN_SERVERS` 或 `.data/mcp-servers.json`），前端只做选择，不含「添加 / 删除」。
 - 支持的传输：`stdio`（子进程）与 `Streamable HTTP`（远程）。
 - 工具以 `mcp__<serverId>__<tool>` 命名空间注入模型，多源工具不重名冲突。
+- **内置工具**（勾选 MCP 才注入；直连模式零工具）：`fs_write / fs_read / fs_edit / fs_ls`（对话工作区）、`write_todos`（任务计划）、`task`（委派子代理）、`read_skill`（技能全文）、`search_tools`（按需加载检索）、**`search_knowledge` / `knowledge_sources`（本地知识库检索，见 `docs/agent-infrastructure.md` §7）**。全部在 `BUILTIN_RISK` 登记级别，启动时 `assertBuiltinRiskCoverage()` 断言无漏登记。
 - 写操作护栏：`requireConfirm` 的服务器，每次调用前弹出确认卡，用户允许才执行；超时按拒绝处理。
-- 会话级启用集：按匿名 cookie 识别的会话保存「勾选了哪些」，切换会话互不影响。
+- **对话级启用集**：勾选结果持久化在该对话文档（GET/PUT `/chat/mcp/servers` 带 `conversationId`；旧实现的「会话级」已迁移），切换对话互不影响；技能启用集同构（`GET/PUT /chat/skills`）。
 - 连接失败只记录状态、不影响聊天主流程；未连接/连接失败的服务器在工具循环里静默跳过。
 
 成熟度：对照 `docs/agent-infrastructure.md` 的路线图，本项目处于 **M1（工具闭环）已达成**。
@@ -51,16 +52,18 @@
 
 | 文件 | 职责 |
 |---|---|
-| `src/mcp/config.ts` | 服务器配置持久化（`.data/mcp-servers.json`）；`loadServers / getServer / upsertServer / deleteServer / validateServerInput / toPublic`（凭据脱敏为键名）。 |
-| `src/mcp/hub.ts` | 连接管理：`connect / disconnect / disconnectAll / listStatuses / reload / collectToolsDetailed / collectTools / callMcpTool / toolNeedsConfirm`。每个 server 全局一条长连接（多服务器**并行**接入），工具命名空间编码，缺席服务器带原因上报。 |
-| `src/confirm.ts` | 写操作二次确认通道：`waitForConfirmation(callId)` 挂起，`answerConfirmation(callId, confirmed)` 由前端应答解挂；超时按拒绝。 |
-| `src/chat.ts` | 聊天引擎：`chatStream`（无工具→直连单次；有工具→`runWithTools`）；`streamCall` 边收增量边 yield；护栏常量。 |
-| `src/models.ts` | 模型适配：OpenAI / Anthropic / Ollama；恢复 function calling（工具定义 + 流式 `tool_calls` 增量解析，按 index 拼接）。 |
+| `src/mcp/config.ts` | 服务器配置持久化（`.data/mcp-servers.json`）；`loadServers / getServer / upsertServer / deleteServer / validateServerInput / toPublic`（凭据脱敏为键名）；`toolRisks` 工具级风险覆盖。 |
+| `src/mcp/hub.ts` | 连接管理：`connect / disconnect / disconnectAll / listStatuses / reload / collectToolsDetailed / collectTools / callMcpTool / describeMcpTool`。每个 server 全局一条长连接（多服务器**并行**接入），工具命名空间编码，缺席服务器带原因上报。 |
+| `src/risk.ts` | **工具风险分级（单一真相）**：`resolveToolRisk`（工具级 toolRisks → 内置登记表 → 服务器级 requireConfirm → 注解 → 未知兜底 → 会话只读授权）+ `verdictNeedsConfirm`；默认 fail-closed（未声明/查不到按 `MCP_UNKNOWN_TOOLS` 处理，默认弹确认卡）。 |
+| `src/confirm.ts` | 写操作二次确认通道（一次性票据）：`requestConfirmation` 签发 `cfm_<uuid>` 票据并与 (sessionId, conversationId) 绑定，`answerConfirmation(ticket, sessionId, confirmed)` 校验归属后解挂；票据一次性；超时按拒绝。 |
+| `src/audit.ts` | 安全审计留痕：append-only JSONL（`.data/audit/audit-YYYYMM.jsonl`），记录 allowed / confirmed / denied / timeout / grant_read / subagent_refused / ownership_mismatch；参数只存脱敏摘要 + sha256。 |
+| `src/chat.ts` | 聊天引擎：`chatStream`（无工具→直连单次；有工具→`runWithTools`）；闸门接线（子代理默认只读 / deny 拒绝 / 票据确认 / 审计）；`streamCall` 边收增量边 yield；护栏常量。 |
+| `src/models.ts` | 模型适配：OpenAI / Anthropic / Ollama；恢复 function calling（工具定义 + 流式 `tool_calls` 增量解析，按 index 拼接）；工具调用兜底 id 不可猜（`call_<uuid>`）。 |
 | `src/session.ts` | 匿名会话：cookie `bx_agent_sid`、启用集 `mcpServers`、引用计数的落盘。 |
-| `src/app.ts` | 端点装配：`/mcp/servers*`、`/chat/mcp/servers`、`/chat/confirm`、`/chat/stream` 等。 |
-| `packages/shared/src/index.ts` | `ChatEvent` 类型（含 `tool_call / tool_result / confirmation_required / confirmation_response`）。 |
-| `apps/web/src/api.ts` | 前端接口封装 + `ChatEvent` 镜像类型。 |
-| `apps/web/src/pages/ChatPage.vue` | MCP 抽屉、工具步骤气泡、确认卡。 |
+| `src/app.ts` | 端点装配：`/mcp/servers*`、`/chat/mcp/servers`、`/chat/confirm`（票据 + 会话归属校验 + 只读授权）、`/chat/stream` 等。 |
+| `packages/shared/src/index.ts` | `ChatEvent` 类型（含 `tool_call / tool_result / confirmation_required（ticket/level/argSummary/canGrantRead）/ confirmation_response`）。 |
+| `apps/web/src/api.ts` | 前端接口封装 + `ChatEvent` 镜像类型；`confirmToolCall(ticket, confirmed, { grantRead })`。 |
+| `apps/web/src/pages/ChatPage.vue` | MCP 抽屉、工具步骤气泡、确认卡（**纯展示**：级别徽标 + 参数摘要表 + 只读授权勾选；无任何自动批准逻辑）。 |
 
 ---
 
@@ -84,7 +87,9 @@
 | `url` | string | http：端点 URL。 |
 | `headers` | Record<string,string> | http：请求头（**不回显**）。 |
 | `timeoutMs` | number | 连接 / 调用超时（正数；默认 60_000）。 |
-| `requireConfirm` | boolean | 该服务器工具调用前是否需用户确认。 |
+| `requireConfirm` | boolean | 该服务器的**全部**工具调用都需用户二次确认。 |
+| `toolRisks` | object | 工具级风险覆盖（`{ "tool": "read" \| "write" \| "destructive" }`），优先级高于 `requireConfirm` 与注解（判定见 `src/risk.ts`）。 |
+| `tools` | string[] | 工具白名单（**server 上的原始工具名**，非命名空间名）：声明后只把列出的工具注入模型，其余忽略；未声明 = 全部注入。用于「一个 server 提供多领域工具、但某角色只需其中一部分」——收窄暴露面、减少无关 schema（`src/mcp/hub.ts` `refreshTools` 过滤）。 |
 
 `upsertServer` 的「合并」语义：保存时未传 `env` / `headers` 视为「保持原值」，避免编辑表单时清空已有凭据；前端凭据框为空即不覆盖。
 
@@ -100,10 +105,13 @@
 | `POST /mcp/servers` | 新增或更新服务器（按 `id` upsert） | `Partial<McpServerConfig>` | `{ server: McpServerPublic }` / 400（校验失败） |
 | `DELETE /mcp/servers/:id` | 删除配置并断开连接，从所有会话启用集摘除 | — | `{ ok: true }` / 404 |
 | `POST /mcp/servers/:id/reload` | 重连并重列工具（配置变更后刷新） | — | `{ status: ServerStatus }` / 404 |
-| `GET /chat/mcp/servers` | 当前会话可用服务器（含连接状态）+ 已启用 id | — | `{ available: ServerStatus[]; enabled: string[] }`；首次访问回写会话 cookie |
-| `PUT /chat/mcp/servers` | 保存勾选结果，触发对应连接/断开（异步） | `{ enabled: string[] }` | `{ enabled: string[]; available: ServerStatus[] }` |
-| `POST /chat/confirm` | 写操作确认回调 | `{ callId: string; confirmed: boolean }` | `{ ok: boolean; confirmed: boolean }` |
-| `POST /chat/stream` | 一轮对话（HTTP Streamable，NDJSON 分块） | `{ text; model?; images? }` | `application/x-ndjson`（每行一条 `ChatEvent` JSON） |
+| `GET /chat/mcp/servers` | 可用服务器（含连接状态）+ **该对话**已启用 id | `?conversationId=` | `{ conversationId; available: ServerStatus[]; enabled: string[] }` |
+| `PUT /chat/mcp/servers` | 保存勾选结果到**该对话**，触发对应连接/断开（异步） | `{ conversationId; enabled: string[] }` | `{ conversationId; enabled: string[]; available: ServerStatus[] }` |
+| `GET /chat/skills` | 技能目录索引 + 该对话勾选的技能 | `?conversationId=` | `{ conversationId; available: SkillMeta[]; enabled: string[] }` |
+| `PUT /chat/skills` | 保存该对话勾选的技能（勾选 = 全文注入系统提示动态后缀） | `{ conversationId; enabled: string[] }` | `{ conversationId; enabled: string[] }` |
+| `POST /chat/confirm` | 写操作确认回调（**用一次性票据**，不用 callId） | `{ ticket; confirmed: boolean; grantRead?: boolean }` | `{ ok: boolean; confirmed: boolean }` / 403（票据与会话不匹配，记 `ownership_mismatch` 审计） |
+| `POST /chat/stream` | 一轮对话（HTTP Streamable，NDJSON 分块） | `{ text; model?; images?; conversationId? }` | `application/x-ndjson`（每行一条 `ChatEvent` JSON） |
+| `POST /chat/subagent/:conversationId/:subagentId/cancel` | **独立取消**某一个运行中的子代理（不影响主代理继续运行） | — | `{ ok: true; cancelled: boolean }`（未命中运行中实例 → `cancelled:false`）/ 404（对话不存在或不属于当前设备） |
 
 `ServerStatus`：`{ id, label, transport, enabled, connected, connecting?, error?, toolsError?, tools, toolNames }`（`connecting` = 连接过程未完（工具清单还没列完），此时 `connected=false`；`toolsError` = 连接正常但 `listTools` 失败，与「服务器本来没有工具」区分）。
 
@@ -127,12 +135,18 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
 | { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
 | { type: "confirmation_response"; id: string; confirmed: boolean }
+// 子代理（task 委派）独立事件维度：异步产出，旧前端忽略未知 type 即向后兼容。
+| { type: "subagent_start"; id: string; parentId: string; description: string }
+| { type: "subagent_delta"; id: string; text: string }
+| { type: "subagent_end"; id: string; ok: boolean; status: "done"|"cancelled"|"error"; text: string }
 | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
 | { type: "usage"; tokens: number; budget: number; window: number; turns: number; dropped: number; toolResultsCleared: number }  // 上下文用量（透明度）
 | { type: "done" }
 ```
 
 事件顺序（工具循环内一轮）：`text_delta* → tool_call → (confirmation_required → confirmation_response)? → tool_result → … → 下一轮 text_delta* … → text → usage → done`。
+
+**子代理事件**：模型调用 `task` 时，服务端为每个子代理产出 `subagent_start → subagent_delta* → subagent_end`（`subagent_start.id` 为子代理运行 id，供**独立取消**使用；`parentId` 是发起委派的 `task` 工具调用 id，用于 UI 关联步骤）。子代理执行期间主代理阻塞等待交接摘要，但事件逐片转发，前端可见实时进度；交接摘要仍经 `tool_result` 回灌模型上下文。
 
 **上下文预算**：以 token 计并由模型窗口推导 —— 历史预算 = `(CONTEXT_WINDOW − MODEL_MAX_OUTPUT_TOKENS − 工具 schema − MCP_TOOL_RESULT_BUDGET) × CONTEXT_SAFETY_RATIO`；跨轮裁剪后保证首条为 `user`（部分 provider 要求）。本轮工具结果超 `MCP_TOOL_RESULT_BUDGET` 时从最旧的开始清理并替换为占位文本，但保留最近 `MCP_TOOL_RESULT_KEEP` 组与 `MCP_TOOL_RESULT_PROTECT` 白名单。跨轮只保留工具**轻量句柄**（工具名 + 参数摘要 + 结果规模），不保留结果正文。窗口由 `MODEL_<ID>_CONTEXT_WINDOW` / `MODEL_CONTEXT_WINDOW` 配置。
 
@@ -193,37 +207,43 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 
 ---
 
-## 7. 写操作确认流程（requireConfirm + 工具注解）
+## 7. 写操作确认流程（risk.ts 风险分级 + 一次性票据）
 
-**确认门判定顺序**（`toolNeedsConfirm`，对齐 MCP 工具注解语义）：
+**确认门判定顺序**（`src/risk.ts` `resolveToolRisk`，对齐 MCP 工具注解语义，**fail-closed**）：
 
-1. 服务器级 `requireConfirm: true` → 该服务器**全部**工具都确认（显式配置优先，向后兼容）；
-2. `annotations.readOnlyHint === true` → 只读，不确认；
-3. `annotations.destructiveHint` 显式取值 → 按它判定（`true` 确认 / `false` 不确认）；
-4. 无注解（未知）→ 默认**不确认**（沿用既有行为）；`MCP_CONFIRM_STRICT=on` 时改为确认（规范里 `destructiveHint` 缺省为 true 的保守口径）。
+1. 工具级显式覆盖（服务器配置 `toolRisks[tool]`）→ 按配置；
+2. 内置工具登记表（`builtins.ts` 的 `BUILTIN_RISK`；启动时 `assertBuiltinRiskCoverage()` 断言无漏登记）→ 按登记；
+3. 服务器级 `requireConfirm: true` → `destructive`（全部工具确认）；
+4. 注解 `readOnlyHint: true` → `read`，不确认；
+5. 注解 `destructiveHint: true` → `destructive`，确认；
+6. 注解两者均显式 `false` → `write`，确认；
+7. 未命中（含**查不到 / 未连接**）→ 按 `MCP_UNKNOWN_TOOLS`：`confirm`（默认，弹卡）| `deny`（直接拒绝）| `allow`（按只读放行）；
+8. 会话级只读授权（确认卡勾选写入 `conversation.readGrants`）：仅对「未声明级别」且同服务器的工具降为 `read`。
 
-> 注解只是 server 的**自我声明**（hints），不是安全保证；工具注解在 `listTools` 时采集（`McpToolInfo.annotations`）。
-> 确认卡会带上原因（`confirmation_required.reason`，如「该工具声明为破坏性操作」），让用户知道自己在批准什么。
+确认口径：**只有「外部副作用」且级别非 read 才弹卡**；内置工作区写（`fs_write` 等，无外部副作用）免确认；`run_native_query` 这类「效果取决于传入文本」的工具按工具级配置定级（destructive = 永远弹卡，不看 SQL 内容）。判定只在服务端做，前端**零自动批准**。
 
 流程：
 
 1. 判定为需确认的调用，模型返回 `tool_calls`。
-2. `runLoop` 对该调用先 yield `confirmation_required`（含 `reason`），随后 `await waitForConfirmation(call.id)` 挂起。
-3. 前端收到事件 → 在气泡内渲染确认卡（工具名 + 原因 + 参数预览）→ 用户点「允许 / 拒绝」→ `POST /chat/confirm { callId, confirmed }`。
-4. `answerConfirmation` 解挂，`confirmation_response` 回推前端；允许则执行 `callMcpTool`，拒绝/超时则把「已取消/已拒绝」作为工具结果回灌模型，让模型自行调整。
-5. 确认请求本身零副作用；超时（默认 120s）按拒绝处理。
+2. `runLoop` 调 `requestConfirmation({ sessionId, conversationId, callId, tool, serverId })` 签发**一次性票据** `cfm_<uuid>`（与请求会话绑定），随后 yield `confirmation_required`（带 `ticket / level / reason / argSummary（脱敏参数摘要）/ canGrantRead`），挂起等待。
+3. 前端收到事件 → 渲染确认卡（工具名 + 服务器 + 级别徽标 + 原因 + 参数摘要表）→ 用户点「允许 / 拒绝」（可选勾选「本对话内按只读处理」）→ `POST /chat/confirm { ticket, confirmed, grantRead? }`。
+4. `answerConfirmation(ticket, sessionId, confirmed)`：ticket 不存在/已失效 → 拒绝；**sessionId 与当前请求会话不匹配 → 403 且记审计（ownership_mismatch）**；匹配则解挂，`confirmation_response` 回推前端；允许则执行，拒绝/超时把结果回灌模型。
+5. 确认请求本身零副作用；超时（默认 120s）按拒绝处理；票据一次性（应答即删，伪造/重放无效）。
+6. 每次闸门决策写审计（`src/audit.ts`）：allowed（仅外部只读）/ confirmed / denied / timeout / grant_read / subagent_refused / ownership_mismatch，参数只存脱敏摘要 + sha256。
+
+子代理默认**只读**（`SUBAGENT_ALLOW_WRITE` 仅作预留，当前忽略并告警）：子代理内非只读操作在闸门处**立即拒绝**并回喂明确错误（不进入确认流程，避免确认事件被子代理消费循环丢弃后静默挂起到超时）。
 
 ---
 
 ## 8. 会话与连接生命周期
 
 - 会话：匿名 cookie `bx_agent_sid`（UUID 校验防伪造），TTL 由 `config.sessionTtlMs` 决定；停用会话的启用集一并清除。
-- 启用集：每个会话保存 `mcpServers: string[]`（勾选的 id）。空数组 = 纯直连。
+- 启用集：**每个对话文档**保存 `mcpServers: string[]`（勾选的 id）。空数组 = 纯直连。技能启用集同理存 `conversation.skillsEnabled`。
 - 连接复用：hub 内 `conns` 以 serverId 为键，全局一条长连接；**多服务器并行接入**（串行会让等待时间随服务器数量线性增长）。
 - 连接单飞（single-flight）：连接过程的 promise 记在 `pendingConns`，并发/过早的 `connect` 复用同一次连接 —— 否则第二个调用会拿到「工具清单还没列完」的半成品，被误判成「服务器未暴露任何工具」。连接期间 `ServerStatus.connecting=true` 且 `connected=false`（前端显示「连接中」），工具清单列完才转「已连接」。
 - 失败处理：连接失败 / 工具清单失败分别记入该连接的 `error` / `toolsError`，并**如实上报给模型**（见 §6「工具通道现状」）；连接失败后进入 30s 冷却窗口（`MCP_RECONNECT_COOLDOWN_MS`），窗口内复用失败状态、不再重复等待超时，前端「重连」不受冷却限制。连接失败时立即关闭传输，避免留下孤儿 stdio 子进程。
 - 可观测：每轮工具模式对话打一行 `[chat:tools] mcp=<注入数> builtin=<内置数> ready=<id(工具数)> unavailable=<id(原因)> dropped=<被裁服务器>` —— 排查「模型说没有这个能力」时先看这行。
-- 连接/断开策略（`PUT /chat/mcp/servers`）：新勾选的立即 `connect`（异步，不阻塞响应）；取消勾选的，若**没有其它会话**仍引用，才 `disconnect`（引用计数）。
+- 连接/断开策略（`PUT /chat/mcp/servers`）：新勾选的立即 `connect`（异步，不阻塞响应）；取消勾选的，只有当**没有任何对话**仍引用（`listEnabledMcpServers()` 跨对话统计）才 `disconnect`（引用计数）。
 - 空闲回收：`startIdleSweeper()`（`src/index.ts` 启动）每 `MCP_IDLE_SWEEP_MS`（默认 5 分钟）扫一次，超过 `MCP_IDLE_TIMEOUT_MS`（默认 30 分钟）没被使用的连接直接断开（stdio 子进程不常驻），下次用到时自动重连。**在途调用（`busy>0`）与正在连接的连接不动**；阈值配 0 = 关闭回收。
 - 进程退出：`disconnectAll()` 断开全部。
 - 状态可见：`listStatuses()` 不主动建连（仅上报配置），连接状态由勾选后的 `connect` 真实反映（`connected / connecting / error / toolsError`）；前端勾选后 1.5s 轮询一次拿到真实状态。
@@ -232,9 +252,10 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 
 ## 9. 前端使用
 
-- 顶部「MCP」按钮（模型下拉旁）：点开抽屉会先刷新一次状态，列出可用服务器及状态点（已连接绿 / 未连接灰 / 失败红），文字区分「已连接 / 连接中 / 失败 / 未连接」并显示工具数；`error`（连不上）与 `toolsError`（连上了但列不出工具）都直接展示原文。
-- **面板只做选择**：勾选即连、取消即断；每行可展开只读工具清单、重连；顶部「全部取消」清回纯直连。服务器清单由部署侧提供（见 §10），前端不再提供「添加 / 删除」。
-- 对话中：助手气泡内展示工具步骤（命名空间工具名 + 服务器 + 状态 + 结果折叠）；需确认的工具弹出确认卡（工具名 + **确认原因** + 参数预览），允许/拒绝即时生效。
+- **输入框左下角「＋」工具菜单**（2026-09-17 起，原顶栏「MCP」按钮已迁至此并与技能入口合并；对齐 ima 等主流产品）：菜单项为 添加文件 / 技能 / 连接器；点（或悬停）「技能」「连接器」在菜单**右侧飞出面板**——顶部搜索框 + 图标·名称·描述列表 + 底部操作，选中行右侧打勾，列表按名称/描述/标识本地过滤；打开菜单即预取两份列表。Esc 收起。
+- **面板只做选择**：勾选即连、取消即断；每行可展开只读工具清单、重连；底部「取消全部已选连接器」清回纯直连。服务器清单由部署侧提供（见 §10），前端不提供「添加 / 删除」。
+- **技能面板**（与连接器面板同构）：`available` 来自服务端 skills 目录索引，`enabled` 按对话持久化（`conversation.skillsEnabled`）。勾选 = 用户明确「本对话要用这个技能」→ 全文注入系统提示**动态后缀**（稳定前缀不动，prompt cache 不受影响）；不勾 ≠ 禁用（模型仍可按索引 + `read_skill` 自主加载）。
+- 对话中：助手气泡内展示工具步骤（命名空间工具名 + 服务器 + 状态 + 结果折叠）；需确认的工具弹出确认卡（工具名 + **确认原因** + 参数预览 + 可选「本对话只读授权」勾选），允许/拒绝即时生效；推理区还展示任务计划、子代理实时进度与知识库检索来源。
 - 关键前端函数（`apps/web/src/api.ts`）：`fetchChatMcpServers / setChatMcpServers / reloadMcpServer / confirmToolCall`，`streamChat`（NDJSON 逐行解析）。
 
 ---
@@ -304,11 +325,24 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 **已固化**：`node --import tsx scripts/_mcp-multi-server-check.mjs`（55 项断言，自带 mock stdio server，用 `MCP_BUILTIN_SERVERS` 注入、不碰真实的 `.mcp-servers.json`）。覆盖：多服务器聚合与顺序确定性、缺席服务器上报（5 类原因）、工具数超限回报、工具通道现状注入、取消信号透传、失败冷却、并行连接、连接单飞、确认门注解矩阵、按需加载（阈值 + 检索排序 + 提示）、子代理服务器白名单、空闲回收、同轮去重签名（key 顺序无关）、跨轮 Doom Loop 熔断（连续同指纹触发 / 指纹变化重置 / 空轮不计入）。
 
+**安全闸门（P0）已固化**：`node --import tsx scripts/_risk-gate-check.mjs`（15 项断言，纯函数不依赖真实 MCP / 模型）。覆盖：内置工具登记表（fs_write 免确认 / task 只读）、未知工具 fail-closed（confirm / deny / allow 三口径）、会话级只读授权降级（含未连接服务器）、票据会话绑定（错会话拒绝且一次性）、参数摘要脱敏（敏感键 ••• / 截断 / 上限 8 项）、审计落盘回读。
+
+**2026-09-17 新增回归**（均为零外部依赖，可直接跑）：
+
+| 脚本 | 项数 | 覆盖 |
+|---|---|---|
+| `scripts/_async-subagent-check.mjs` | 6 | 子代理注册表独立取消（跨会话/未知 id 不命中）、`POST /chat/subagent/:conversationId/:subagentId/cancel` 404/未命中/级联 |
+| `scripts/_rag-check.mjs` | 23 | 知识库：解析分发 / 二进制拒绝 / 切片 / 混合检索与来源 / embedding 降级 / 指纹增量 / 索引按 mtime 重载 / 工具接线 / 真实语料命中 |
+| `scripts/_untrusted-check.mjs` | 12 | 注入防护：nonce 定界 / 伪造闭合与伪造开标签中和 / 不可见控制符清洗不误伤 / 规则只在工具模式注入 |
+| `scripts/_mute-check.mjs` | 7 | 免打扰：持久化 / 列表可见 / 回落 / **不刷新 updatedAt** / 归属守卫 / 非法类型不写脏值 |
+
+活路径（需真实模型，用 `scripts/run-*.ps1` 后台跑）：`_rag-e2e.mjs`（知识库问答 + 子代理并行委派事件流）、`_rag-inject-e2e.mjs`（注入探针实战）。
+
 ---
 
 ## 12. 关联文档
 
 - `docs/mcp-connect-plan.md`：设计稿（含交互原型、验收标准、实施步骤）。
-- `docs/chart-visualization-plan.md`：图表可视化接入方案（AntV Chart MCP，**挂账待实施**）——含 27 个出图工具实测、官方服务 vs 自托管两条路线、数据合规口径待决策。
+- `docs/chart-visualization-plan.md`：图表可视化接入方案（AntV Chart MCP，**路线 1 已实施**：官方出图服务 + `requireConfirm` 数据外发确认；自托管/前端渲染挂账）。
 - `docs/agent-infrastructure.md`：通用 Agent 基建指南，第 3/4/5/14 章对应当前实现与缺口。
 - 历史参考实现（已瘦身的登录/权限/审计/RAG/异步任务等）：`.data/trash-20260916/code/`，按需按新契约裁剪恢复。

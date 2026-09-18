@@ -4,10 +4,11 @@
 //           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
-import type { ChatEvent } from "@bx/shared";
+import type { ChatEvent, RiskLevel } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
-import { waitForConfirmation } from "./confirm.js";
+import { requestConfirmation } from "./confirm.js";
+import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
 import { offloadToolResult } from "./fs-store.js";
 import {
@@ -20,15 +21,11 @@ import {
   type ToolSpec,
   type Turn,
 } from "./models.js";
-import {
-  callMcpTool,
-  collectToolsDetailed,
-  confirmReasonOf,
-  toolNeedsConfirm,
-  type McpToolInfo,
-} from "./mcp/hub.js";
+import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
+import { resolveToolRisk, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
+import { wrapUntrusted } from "./untrusted.js";
 import { getUploadImage } from "./uploads.js";
 import { assembleContext } from "./history.js";
 
@@ -68,6 +65,41 @@ const TOOL_FAILURE_LIMIT = Math.max(1, Number(process.env.MCP_TOOL_FAILURE_LIMIT
 const SUBAGENT_MAX_ROUNDS = Number(process.env.SUBAGENT_MAX_ROUNDS || 10);
 const SUBAGENT_RESULT_CHARS = Number(process.env.SUBAGENT_RESULT_CHARS || 4000);
 const SUBAGENT_MAX_PARALLEL = Number(process.env.SUBAGENT_MAX_PARALLEL || 3);
+
+// 子代理运行注册表（Async subagents）：用于「独立取消某一个正在运行的子代理」，
+// 而不影响主代理继续运行。key = 子代理运行 id（subagent_start 事件里的 id）。
+interface SubagentHandle {
+  id: string;
+  conversationId: string;
+  description: string;
+  controller: AbortController;
+  status: "running" | "done" | "cancelled" | "error";
+}
+const subagentRegistry = new Map<string, SubagentHandle>();
+let subagentSeq = 0;
+function nextSubagentId(conversationId: string): string {
+  subagentSeq += 1;
+  return `sa_${conversationId}_${subagentSeq}`;
+}
+
+/** 独立取消某一个运行中的子代理（不影响主代理）。返回是否命中了运行中实例。 */
+export function cancelSubagent(conversationId: string, id: string): boolean {
+  const handle = subagentRegistry.get(id);
+  if (!handle || handle.conversationId !== conversationId || handle.status !== "running") return false;
+  handle.status = "cancelled";
+  handle.controller.abort();
+  return true;
+}
+
+/** 主代理整体取消时，级联取消本会话下所有运行中的子代理。 */
+export function cancelSubagentsOfConversation(conversationId: string): void {
+  for (const handle of subagentRegistry.values()) {
+    if (handle.conversationId === conversationId && handle.status === "running") {
+      handle.status = "cancelled";
+      handle.controller.abort();
+    }
+  }
+}
 
 // 工具按需加载（对齐 Claude Code 的 ToolSearch：工具定义占用超过窗口一定比例时改为「按需检索加载」）。
 const TOOL_SEARCH_MODE = (process.env.TOOL_SEARCH_MODE || "auto").toLowerCase(); // auto | on | off
@@ -126,6 +158,25 @@ export function looksLikePseudoToolCall(text: string, toolNames: ReadonlySet<str
 function handleSummary(content: string): string {
   const lines = content ? content.split("\n").length : 0;
   return `${lines} 行 / ${content.length} 字符`;
+}
+
+// 确认卡参数摘要（P0-6）：键名命中敏感词的值脱敏，值截断。
+const SENSITIVE_KEY_RE = /token|secret|password|key|authorization|cookie/i;
+const ARG_SUMMARY_MAX_ITEMS = 8;
+const ARG_SUMMARY_VALUE_CHARS = 200;
+
+/** 关键参数摘要：取入参顶层键，值 JSON 化后截断；敏感键只显示占位符（凭据不外泄）。 */
+export function summarizeArgsForConfirm(argsJson: string): Array<{ key: string; value: string }> {
+  const args = safeJsonParse(argsJson);
+  if (!args || typeof args !== "object" || Array.isArray(args)) return [];
+  return Object.entries(args as Record<string, unknown>)
+    .slice(0, ARG_SUMMARY_MAX_ITEMS)
+    .map(([key, value]) => {
+      let text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+      if (text.length > ARG_SUMMARY_VALUE_CHARS) text = `${text.slice(0, ARG_SUMMARY_VALUE_CHARS)}…`;
+      if (SENSITIVE_KEY_RE.test(key)) text = "•••";
+      return { key, value: text };
+    });
 }
 
 /**
@@ -417,7 +468,17 @@ interface LoopContext {
   signal?: AbortSignal;
   /** 主代理 = true（可用 task 委派）；子代理 = false（防递归）。 */
   allowTask: boolean;
+  /** 主代理 = true；子代理 = false（默认只读：非只读操作立即拒绝，不进入确认流程）。 */
+  allowWrite: boolean;
+  /** 会话级只读授权（conversation.readGrants）：仅对「未声明级别」的同服务器工具降级为只读。 */
+  grantServers: ReadonlySet<string>;
+  /** 发起请求的会话 id：确认票据与它绑定（跨会话应答会被拒绝）。 */
+  sessionId?: string;
+  /** 发起请求的设备 owner：用于按用户隔离的本地状态（如观影画像），不暴露给模型。 */
+  ownerKey?: string;
   maxRounds: number;
+  /** 知识库命名空间（按角色隔离）：默认 "generic"，由当前会话角色决定。 */
+  namespace: string;
 }
 
 interface LoopOutcome {
@@ -573,10 +634,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         for (const item of batch) {
           yield { type: "tool_call", id: item.id, name: "task", server: BUILTIN_SERVER, args: item.argsJson };
         }
-        const results = await runSubagentBatch(batch, ctx);
+        const results: SubagentResult[] = new Array(batch.length);
+        const batchGen = runSubagentBatch(batch, ctx, results);
+        // 逐片转发子代理的 subagent_start / subagent_delta / subagent_end 独立事件。
+        for await (const ev of batchGen) yield ev;
         for (const result of results) {
           yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: result.text };
-          conversation.push({ role: "tool", toolCallId: result.id, name: "task", content: result.text });
+          // 子代理回传同样是不可信数据（它自己读的也都是外部内容）：定界后回灌。
+          const wrappedTask = wrapUntrusted(result.text, { kind: "subagent_summary", source: "task" });
+          conversation.push({ role: "tool", toolCallId: result.id, name: "task", content: wrappedTask.text });
           roundExecuted.push(toolCallSignature("task", result.args));
           handles.push({
             name: "task",
@@ -668,18 +734,72 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       let content: string;
       let rawText: string;
       let ok = true;
-      if (toolNeedsConfirm(call.name)) {
-        // 先登记等待器再下发确认事件：避免调用方在 waiter 注册前应答导致永久挂起（竞态）。
-        const pendingConfirm = waitForConfirmation(call.id);
-        const reason = confirmReasonOf(call.name);
+      // ── 写操作安全闸门（src/risk.ts 单一真相）─────────────────────────────
+      const verdict = resolveToolRisk(call.name, ctx.grantServers);
+      const auditBase = {
+        conversationId: ctx.conversationId,
+        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+        tool: call.name,
+        ...(verdict.serverId ? { server: verdict.serverId } : {}),
+        level: verdict.level,
+        unknown: verdict.unknown,
+        reason: verdict.reason,
+        argsDigest: argsDigestOf(call.argsJson),
+      };
+      // 子代理默认只读（P0-5）：非只读操作立即拒绝——不登记等待器、不发确认事件（否则确认事件
+      // 被子代理消费循环丢弃，调用会静默挂到超时），模型拿到明确错误可自行调整。
+      if (!ctx.allowWrite && verdict.level !== "read") {
+        ok = false;
+        rawText = `该操作（${verdict.level}）不能委派给子代理执行：请在主对话里直接发起，届时会弹出确认卡。`;
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理禁止写操作）" });
+        appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
+        continue;
+      }
+      // 未声明工具按 MCP_UNKNOWN_TOOLS=deny 的口径直接拒绝。
+      if (verdict.deny) {
+        ok = false;
+        rawText = `工具 ${call.name} 未声明操作级别，按当前安全口径拒绝执行；如确需使用，请在服务器配置中显式声明该工具的风险级别。`;
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未知工具被拒绝）" });
+        appendAudit({ kind: "gate", decision: "denied", ...auditBase });
+        continue;
+      }
+      if (verdictNeedsConfirm(verdict)) {
+        // 先登记等待器（拿到票据）再下发确认事件：避免调用方在 waiter 注册前应答导致永久挂起（竞态）。
+        const pending = requestConfirmation({
+          sessionId: ctx.sessionId || "",
+          conversationId: ctx.conversationId,
+          callId: call.id,
+          tool: call.name,
+          ...(verdict.serverId ? { serverId: verdict.serverId } : {}),
+        });
+        const argSummary = summarizeArgsForConfirm(call.argsJson);
+        // 只读授权勾选：仅「未声明级别」的外部服务器工具可提供（写/破坏性永不适用）。
+        const canGrantRead = Boolean(verdict.unknown && verdict.serverId && ctx.allowWrite);
         yield {
           type: "confirmation_required",
           id: call.id,
+          ticket: pending.ticket,
           name: call.name,
+          ...(verdict.serverId ? { server: verdict.serverId } : {}),
           args: call.argsJson,
-          ...(reason ? { reason } : {}),
+          level: verdict.level as RiskLevel,
+          reason: verdict.reason,
+          ...(argSummary.length ? { argSummary } : {}),
+          ...(canGrantRead ? { canGrantRead: true } : {}),
+          expiresInMs: pending.timeoutMs,
         };
-        const answer = await pendingConfirm;
+        const answer = await pending.wait;
+        appendAudit({
+          kind: "gate",
+          decision: answer.confirmed ? "confirmed" : answer.timedOut ? "timeout" : "denied",
+          ...auditBase,
+          ticket: pending.ticket,
+          ...(argSummary.length ? { argsSummary: argSummary } : {}),
+        });
         yield { type: "confirmation_response", id: call.id, confirmed: answer.confirmed };
         if (!answer.confirmed) {
           ok = false;
@@ -689,12 +809,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未确认）" });
           continue;
         }
+      } else if (verdict.external) {
+        // 只读放行也留痕（仅外部工具；工作区工具不记，避免噪音）。
+        appendAudit({ kind: "gate", decision: "allowed", ...auditBase });
       }
 
       // 内置工具优先（fs_* / write_todos / read_skill）；其余走 MCP 通道。
       executedSigs.add(sig);
       roundExecuted.push(sig);
-      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId);
+      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
       // executed=false 表示并未真正执行（如按需加载模式下未检索的工具）——不计入失败熔断。
       let executed = true;
       if (builtin) {
@@ -719,7 +842,18 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       content = truncateResult(rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
-      conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content });
+      // 注入防护：外部内容回灌模型前包成带 nonce 与来源的不可信数据块（指令与数据分离）。
+      // 展示给用户的事件流仍是原文（UI 不受影响），只有模型看到的上下文被定界。
+      const wrapped = wrapUntrusted(content, {
+        kind: "tool_result",
+        source: serverOf.get(call.name) || call.name,
+      });
+      if (wrapped.collisions || wrapped.stripped) {
+        console.log(
+          `[chat:guard] 工具 ${call.name} 返回内容已加固：中和伪造定界 ${wrapped.collisions} 处、剥离不可见控制符 ${wrapped.stripped} 个`,
+        );
+      }
+      conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: wrapped.text });
       // 句柄记录的是「原文规模」而非回灌后正文，便于下一轮按需重取。
       handles.push({
         name: call.name,
@@ -790,7 +924,20 @@ export function resolveSubagentTools(
  * 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄到指定服务器）+
  * 只回摘要（单一交接）。取消级联：沿用主代理的 abort signal。
  */
-async function runSubagent(call: ToolCall, ctx: LoopContext): Promise<SubagentResult> {
+/**
+ * 子代理（Deep Agents 的 task 工具，通用型，Async subagents）：
+ * 独立上下文（只看任务描述）+ 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄）+
+ * 只回摘要（单一交接）。取消级联：沿用主代理的 abort signal；同时注册到 subagentRegistry，
+ * 支持「独立取消某一个子代理」而不影响主代理继续运行。
+ *
+ * 以 async generator 形式产出 `subagent_start / subagent_delta / subagent_end` 独立事件维度，
+ * 主循环把它们逐片转发给前端（旧前端忽略未知 type 即向后兼容）；最终 return 子代理交接结果。
+ */
+async function* runSubagent(
+  call: ToolCall,
+  ctx: LoopContext,
+  parentId: string,
+): AsyncGenerator<ChatEvent, SubagentResult> {
   const args = safeJsonParse(call.argsJson);
   const description = String(args.description || args.task || "").trim();
   if (!description) {
@@ -808,6 +955,34 @@ async function runSubagent(call: ToolCall, ctx: LoopContext): Promise<SubagentRe
   const subBuiltins = builtinToolSpecs({ toolSearch: ctx.toolSearch }).filter(
     (spec) => spec.name !== "task" && spec.name !== "write_todos",
   );
+
+  const subagentId = nextSubagentId(ctx.conversationId);
+  const controller = new AbortController();
+  const handle: SubagentHandle = {
+    id: subagentId,
+    conversationId: ctx.conversationId,
+    description,
+    controller,
+    status: "running",
+  };
+  subagentRegistry.set(subagentId, handle);
+  // 级联：主代理整体取消 → 子代理也中止。
+  const onParentAbort = (): void => {
+    if (handle.status === "running") {
+      handle.status = "cancelled";
+      controller.abort();
+    }
+  };
+  const detachParent = (): void => {
+    if (ctx.signal) ctx.signal.removeEventListener("abort", onParentAbort);
+  };
+  if (ctx.signal) {
+    if (ctx.signal.aborted) onParentAbort();
+    else ctx.signal.addEventListener("abort", onParentAbort, { once: true });
+  }
+
+  yield { type: "subagent_start", id: subagentId, parentId, description };
+
   const subCtx: LoopContext = {
     ...ctx,
     images: [],
@@ -818,40 +993,100 @@ async function runSubagent(call: ToolCall, ctx: LoopContext): Promise<SubagentRe
     loadedTools: new Set<string>(),
     system: { stable: SUBAGENT_PROMPT, dynamic: "" },
     allowTask: false,
+    // 子代理默认只读（写操作安全闸门 P0-5）：非只读操作在闸门处立即拒绝。
+    // SUBAGENT_ALLOW_WRITE=on 仅作预留（确认事件转发未实现，放开会导致挂起到超时），不改变本值。
+    allowWrite: false,
     maxRounds: SUBAGENT_MAX_ROUNDS,
+    namespace: ctx.namespace,
+    ownerKey: ctx.ownerKey,
+    signal: controller.signal,
   };
-  const gen = runLoop(subCtx, [{ role: "user", content: description }]);
-  let next = await gen.next();
+
   let toolCalls = 0;
-  while (!next.done) {
-    if (next.value.type === "tool_call") toolCalls += 1;
-    next = await gen.next();
+  let outcome: LoopOutcome | null = null;
+  try {
+    const gen = runLoop(subCtx, [{ role: "user", content: description }]);
+    let next = await gen.next();
+    while (!next.done) {
+      const ev = next.value;
+      if (ev.type === "text_delta" || ev.type === "text") {
+        yield { type: "subagent_delta", id: subagentId, text: ev.text };
+      } else if (ev.type === "tool_call") {
+        toolCalls += 1;
+      }
+      next = await gen.next();
+    }
+    outcome = next.value;
+  } catch (err) {
+    detachParent();
+    const cancelled = controller.signal.aborted || ctx.signal?.aborted;
+    const status = cancelled ? "cancelled" : "error";
+    handle.status = status;
+    const text = cancelled ? "子代理已被取消。" : `子代理执行出错：${String((err as Error)?.message || err)}`;
+    yield { type: "subagent_end", id: subagentId, ok: false, status, text };
+    subagentRegistry.delete(subagentId);
+    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
   }
-  const outcome = next.value;
-  if (outcome.failure) {
-    return { id: call.id, args: call.argsJson, ok: false, text: `子代理执行失败：${outcome.failure}`, toolCalls };
+
+  detachParent();
+  handle.status = outcome!.failure ? "error" : "done";
+  if (outcome!.failure) {
+    const text = `子代理执行失败：${outcome!.failure}`;
+    yield { type: "subagent_end", id: subagentId, ok: false, status: "error", text };
+    subagentRegistry.delete(subagentId);
+    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
   }
-  const summary = outcome.text.trim() || "（子代理未返回内容）";
+  const summary = outcome!.text.trim() || "（子代理未返回内容）";
   const clipped =
     summary.length > SUBAGENT_RESULT_CHARS
       ? `${summary.slice(0, SUBAGENT_RESULT_CHARS)}\n…（已截断；如需完整数据，让子代理先用 fs_write 落盘，再用 fs_read 读取）`
       : summary;
+  yield { type: "subagent_end", id: subagentId, ok: true, status: "done", text: clipped };
+  subagentRegistry.delete(subagentId);
   return { id: call.id, args: call.argsJson, ok: true, text: clipped, toolCalls };
 }
 
-/** 一批子代理并行执行（并发上限 SUBAGENT_MAX_PARALLEL），结果按调用顺序返回。 */
-async function runSubagentBatch(batch: ToolCall[], ctx: LoopContext): Promise<SubagentResult[]> {
-  const results: SubagentResult[] = new Array(batch.length);
+/**
+ * 一批子代理并行执行（并发上限 SUBAGENT_MAX_PARALLEL）。
+ * 以 async generator 形式把各子代理的 `subagent_*` 事件逐片转发；`results` 按调用顺序回填交接结果，
+ * 供主循环转成 `tool_result` 回灌模型上下文。
+ */
+async function* runSubagentBatch(
+  batch: ToolCall[],
+  ctx: LoopContext,
+  results: SubagentResult[],
+): AsyncGenerator<ChatEvent> {
+  const queue: ChatEvent[] = [];
   let cursor = 0;
-  const worker = async (): Promise<void> => {
-    while (cursor < batch.length) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await runSubagent(batch[index]!, ctx);
+  let settled = 0;
+  const runOne = async (index: number): Promise<void> => {
+    const call = batch[index]!;
+    const gen = runSubagent(call, ctx, call.id);
+    let n = await gen.next();
+    while (!n.done) {
+      queue.push(n.value);
+      n = await gen.next();
     }
+    results[index] = n.value;
+    settled += 1;
   };
-  await Promise.all(Array.from({ length: Math.min(SUBAGENT_MAX_PARALLEL, batch.length) }, () => worker()));
-  return results;
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < Math.min(SUBAGENT_MAX_PARALLEL, batch.length); i++) {
+    workers.push(
+      (async () => {
+        let idx: number;
+        while ((idx = cursor++) < batch.length) await runOne(idx);
+      })(),
+    );
+  }
+  void Promise.all(workers).catch(() => undefined);
+  while (settled < batch.length || queue.length) {
+    if (queue.length) {
+      yield queue.shift() as ChatEvent;
+    } else {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+  }
 }
 
 /**
@@ -863,7 +1098,7 @@ async function runSubagentBatch(batch: ToolCall[], ctx: LoopContext): Promise<Su
 export async function* chatStream(
   conversationId: string,
   userText: string,
-  opts: { model?: string; images?: string[] } = {},
+  opts: { model?: string; images?: string[]; sessionId?: string; ownerKey?: string } = {},
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
   const conversation = await getConversation(conversationId);
@@ -982,6 +1217,9 @@ export async function* chatStream(
       summary: assembled.summary || null,
       tooling,
       todos: conversation?.todos,
+      enabledSkills: conversation?.skillsEnabled,
+      role: conversation?.agentId,
+      ownerKey: opts.ownerKey,
     });
     // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
     const images = opts.images?.length && m.vision === "direct" ? imagesOf(opts.images) : [];
@@ -1003,7 +1241,12 @@ export async function* chatStream(
               system,
               signal,
               allowTask: true,
+              allowWrite: true,
+              grantServers: new Set(conversation?.readGrants || []),
+              sessionId: opts.sessionId,
               maxRounds: MAX_TOOL_ROUNDS,
+              namespace: conversation?.agentId || "generic",
+              ownerKey: opts.ownerKey,
             },
             turns,
           )

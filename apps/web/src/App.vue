@@ -24,7 +24,9 @@ watch(
   <a class="skip-link" href="#app-main">{{ tx("跳到主要内容", "Skip to content", "Pular para o conteudo", "मुख्य सामग्री पर जाएं") }}</a>
   <div ref="routeFocus" class="route-focus-anchor" tabindex="-1"></div>
   <div id="app-main">
-    <RouterView />
+    <!-- 按 path 强制重挂载：/chat 与 /movie 复用同一 ChatPage 组件，直接改 URL 时靠 key 让 setup 重跑、
+         使 agentId prop 重新求值；普通同路由导航（无 path 变化）不受影响。 -->
+    <RouterView :key="$route.path" />
   </div>
 </template>
 

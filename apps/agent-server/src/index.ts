@@ -1,9 +1,18 @@
 import "./load-env.js";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
+import { assertBuiltinRiskCoverage } from "./builtins.js";
 import { config, defaultModel, listModels } from "./config.js";
 import { listEnabledMcpServers } from "./conversations.js";
 import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
+
+// 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
+assertBuiltinRiskCoverage();
+if ((process.env.SUBAGENT_ALLOW_WRITE || "off").toLowerCase() === "on") {
+  console.warn(
+    "[安全] SUBAGENT_ALLOW_WRITE=on 已被忽略：子代理确认事件转发尚未实现，放开会让写操作静默挂起到超时。子代理保持只读。",
+  );
+}
 
 const app = createApp();
 

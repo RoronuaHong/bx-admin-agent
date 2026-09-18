@@ -7,6 +7,8 @@
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 import type { TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
+import { defaultMcpServers } from "./mcp/config.js";
+import { getRole } from "./roles.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -42,6 +44,8 @@ interface ConversationDoc {
   model?: string;
   /** 该对话启用的 MCP server id。 */
   mcpServers?: string[];
+  /** 该对话用户主动勾选的技能（skills 目录名）；勾选 = 全文注入系统提示，未勾选保持按需加载。 */
+  skillsEnabled?: string[];
   /** 该对话的界面语言，同时决定回复语言；空 = 客户端默认。 */
   locale?: string;
   /** 忙碌期间排队的待发消息。 */
@@ -52,6 +56,22 @@ interface ConversationDoc {
   pinnedAt?: number | null;
   /** 手动顺序（「手动排序」模式下生效）；按下标 × `ORDER_STEP` 分配，便于中间插入。 */
   sortOrder?: number;
+  /** 归档：true = 收进归档区（默认列表不显示，需显式 includeArchived）。 */
+  archived?: boolean;
+  /**
+   * 免打扰：true = 该对话的后台完成提醒静默（不弹提示）。
+   * 只影响「提醒」，不影响消息落库与侧栏状态点 —— 多会话并行时用来避免被打断。
+   */
+  muted?: boolean;
+  /** 会话级只读授权：该对话内，把这些 MCP 服务器上「未声明级别」的工具按只读处理（写操作安全闸门 P0-3）。 */
+  readGrants?: string[];
+  /** 设备 owner 标注（轻量归属隔离，方案 A）：创建该对话的设备标识；缺省 = 遗留数据（对所有人可见）。 */
+  ownerKey?: string;
+  /**
+   * Agent 角色（领域适配指南模式 B）：generic = 通用助手，movie = 观影助手…
+   * 决定系统提示人设 / skill 索引可见性；缺省 = generic（旧对话向后兼容）。
+   */
+  agentId?: string;
 
   // ---- 模型上下文（thread）----
   /** 发往模型的对话历史（含工具轻量句柄），是上下文的唯一真相。 */
@@ -138,14 +158,38 @@ function dedupeDocs(list: ConversationDoc[]): ConversationDoc[] {
 }
 
 // ---- CRUD ----
-export async function listConversations(): Promise<ConversationDoc[]> {
+/**
+ * 归属过滤（轻量 owner 标注）：只看「自己创建的 + 无主遗留」。
+ * 遗留数据（没有 ownerKey）保持全员可见，避免升级时把既有对话孤儿化；新建对话一律带 owner。
+ */
+function visibleTo(docs: ConversationDoc[], ownerKey?: string): ConversationDoc[] {
+  if (!ownerKey) return docs;
+  return docs.filter((doc) => !doc.ownerKey || doc.ownerKey === ownerKey);
+}
+
+export async function listConversations(
+  ownerKey?: string,
+  includeArchived = false,
+  /** 按 Agent 角色过滤（缺省/未传 = 不过滤，兼容旧调用方）。 */
+  agentId?: string,
+): Promise<ConversationDoc[]> {
   const coll = await getColl();
+  const stripContext = (doc: ConversationDoc): ConversationDoc => {
+    const { context, ...rest } = doc;
+    return rest as ConversationDoc;
+  };
   // 列表不返回 context（体积大）：切对话时用 GET /chat/conversations/:id 单独取。
-  if (!coll) {
-    return dedupeDocs([...memory.values()].map(({ context, ...rest }) => rest as ConversationDoc));
-  }
-  const docs = await coll.find({}, { projection: { context: 0 } }).sort({ updatedAt: -1 }).toArray();
-  return dedupeDocs(docs.map(({ _id, ...rest }) => rest as ConversationDoc));
+  const all = visibleTo(
+    !coll
+      ? dedupeDocs([...memory.values()].map(stripContext))
+      : dedupeDocs((await coll.find({}, { projection: { context: 0 } }).sort({ updatedAt: -1 }).toArray()).map(({ _id, ...rest }) => rest as ConversationDoc)),
+    ownerKey,
+  );
+  const byArchive = includeArchived ? all : all.filter((doc) => !doc.archived);
+  if (!agentId) return byArchive;
+  // 多 Agent 分槽：generic 页看不到 movie 对话，反之亦然（缺省 agentId 的旧数据归 generic）。
+  const wanted = agentId === "generic" ? "generic" : agentId;
+  return byArchive.filter((doc) => (doc.agentId || "generic") === wanted);
 }
 
 export async function getConversation(id: string): Promise<ConversationDoc | null> {
@@ -157,14 +201,28 @@ export async function getConversation(id: string): Promise<ConversationDoc | nul
   return rest as ConversationDoc;
 }
 
-export async function createConversation(input: { id: string; title: string }): Promise<ConversationDoc> {
+export async function createConversation(input: {
+  id: string;
+  title: string;
+  ownerKey?: string;
+  /** Agent 角色（缺省 generic）；决定人设 / skill 可见性 / 默认 MCP 勾选。 */
+  agentId?: string;
+  /** 显式指定 MCP 启用集（缺省 = 角色默认）。 */
+  mcpServers?: string[];
+}): Promise<ConversationDoc> {
   const now = Date.now();
+  // MCP 默认勾选：显式传入 > 角色默认 > 配置了 defaultEnabled 的服务器。
+  const mcp = input.mcpServers || getRole(input.agentId).defaultMcpServers || defaultMcpServers();
+  // 新对话默认勾选配置了 defaultEnabled 的 MCP 服务器（已有对话不受影响）。
   const doc: ConversationDoc = {
     id: input.id,
     title: input.title || "新对话",
     messages: [],
+    mcpServers: mcp,
     createdAt: now,
     updatedAt: now,
+    ...(input.agentId ? { agentId: input.agentId } : {}),
+    ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
   };
   const coll = await getColl();
   if (!coll) {
@@ -179,7 +237,15 @@ export async function createConversation(input: { id: string; title: string }): 
   }
   await coll.updateMany(
     { id: input.id },
-    { $set: { title: input.title || "新对话", updatedAt: now }, $setOnInsert: { createdAt: now } },
+    {
+      $set: { title: input.title || "新对话", updatedAt: now },
+      $setOnInsert: {
+        createdAt: now,
+        mcpServers: doc.mcpServers,
+        ...(input.agentId ? { agentId: input.agentId } : {}),
+        ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
+      },
+    },
     { upsert: true },
   );
   const saved = await getConversation(input.id);
@@ -282,17 +348,24 @@ export interface ConversationPatch {
   title?: string;
   model?: string;
   mcpServers?: string[];
+  skillsEnabled?: string[];
   locale?: string;
   pendingQueue?: PendingMessage[];
   /** 置顶时间戳；null = 取消置顶。 */
   pinnedAt?: number | null;
+  /** 归档开关。 */
+  archived?: boolean;
+  /** 免打扰开关（静默该对话的后台完成提醒）。 */
+  muted?: boolean;
+  /** 会话级只读授权（服务器 id 白名单）。 */
+  readGrants?: string[];
 }
 
 /**
  * 只改变「列表怎么组织」、不代表对话有新活动的字段：
  * 改它们不应刷新 `updatedAt`，否则在「按最近活动排序」下会把该对话弹到列表最前（与用户预期不符）。
  */
-const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt"]);
+const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled"]);
 
 /**
  * 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。
@@ -301,7 +374,7 @@ const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt"]);
  */
 export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
   const set: Record<string, unknown> = {};
-  for (const key of ["title", "model", "mcpServers", "locale", "pendingQueue", "pinnedAt"] as const) {
+  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
   if (!Object.keys(set).length) return getConversation(id);
@@ -345,6 +418,21 @@ export async function listEnabledMcpServers(): Promise<Set<string>> {
   const used = new Set<string>();
   for (const doc of docs) for (const id of doc.mcpServers || []) used.add(id);
   return used;
+}
+
+/**
+ * 会话级只读授权：把 serverId 加入该对话的 readGrants（确认卡勾选「按只读处理」时调用）。
+ * $addToSet 原子去重；文档不存在则忽略（确认应答已校验票据归属，此处无需再建）。
+ */
+export async function addConversationReadGrant(id: string, serverId: string): Promise<void> {
+  if (!id || !serverId) return;
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (doc) doc.readGrants = [...new Set([...(doc.readGrants || []), serverId])];
+    return;
+  }
+  await coll.updateMany({ id }, { $addToSet: { readGrants: serverId } });
 }
 
 /** 从所有对话的启用集里摘除某 MCP server（配置被删除时调用，避免留下悬空引用）。 */
@@ -392,6 +480,17 @@ export async function appendContext(id: string, turns: ChatTurn[]): Promise<void
   );
 }
 
+/**
+ * 归属判定（轻量 owner 标注，方案 A）：ownerKey 缺省 = 遗留数据（人人可见）；
+ * 有标注则必须精确匹配。不存在的对话返回 false（HTTP 层统一 404，不泄漏存在性）。
+ */
+export async function conversationOwnedBy(id: string, ownerKey?: string): Promise<boolean> {
+  if (!id) return false;
+  const doc = await getConversation(id);
+  if (!doc) return false;
+  return !doc.ownerKey || (Boolean(ownerKey) && doc.ownerKey === ownerKey);
+}
+
 /** 清空该对话的上下文与摘要（不影响 UI 消息快照 messages）。 */
 export async function clearContext(id: string): Promise<void> {
   const coll = await getColl();
@@ -419,19 +518,40 @@ export async function clearContext(id: string): Promise<void> {
  * - 都没有 → 创建「默认对话」，并把旧 session.messages / mcpServers **拷贝**迁移进去
  *   （源字段保留一个版本以支持回退，不再写入）。
  */
-export async function resolveConversation(session: Session, conversationId?: string): Promise<string> {
+export async function resolveConversation(
+  session: Session,
+  conversationId?: string,
+  ownerKey?: string,
+  /** Agent 角色：无显式对话时按角色取活跃槽（多 Agent 页面不互相顶掉）。 */
+  agentId?: string,
+): Promise<string> {
   if (conversationId) {
     if (!(await getConversation(conversationId))) {
-      await createConversation({ id: conversationId, title: "新对话" });
+      await createConversation({ id: conversationId, title: "新对话", ...(agentId ? { agentId } : {}), ...(ownerKey ? { ownerKey } : {}) });
     }
     return conversationId;
   }
-  if (session.activeConversationId && (await getConversation(session.activeConversationId))) {
-    return session.activeConversationId;
+  // 按角色取活跃对话：generic 走旧字段（向后兼容），其余角色走分槽映射。
+  const activeForAgent = agentId && agentId !== "generic" ? session.activeByAgent?.[agentId] : session.activeConversationId;
+  if (activeForAgent && (await getConversation(activeForAgent))) {
+    return activeForAgent;
   }
   const legacyTurns = (session.messages || []).filter((m) => m.text);
   const id = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await createConversation({ id, title: legacyTurns[0] ? legacyTurns[0].text.slice(0, 24) : "新对话" });
+  await createConversation({
+    id,
+    title: legacyTurns[0] ? legacyTurns[0].text.slice(0, 24) : "新对话",
+    ...(agentId ? { agentId } : {}),
+    ...(ownerKey ? { ownerKey } : {}),
+  });
+  // 创建后立即占住该角色的活跃槽：否则在 stream 之外的端点（如 mcp/servers PUT）里
+  // 每次无 id 解析都会再造一个新对话（generic 旧路径同款问题的同款修法）。
+  if (agentId && agentId !== "generic") {
+    session.activeByAgent = session.activeByAgent || {};
+    session.activeByAgent[agentId] = id;
+  } else {
+    session.activeConversationId = id;
+  }
   if (legacyTurns.length || (session.mcpServers || []).length) {
     await appendContext(
       id,
@@ -448,7 +568,75 @@ export async function resolveConversation(session: Session, conversationId?: str
       `[conversations] 迁移旧会话：上下文 ${legacyTurns.length} 条 / MCP ${(session.mcpServers || []).length} 个 → ${id}`,
     );
   }
-  session.activeConversationId = id;
+  // 活跃槽已在上方按角色写好（generic → activeConversationId；其余 → activeByAgent）。
   touchSession(session);
   return id;
+}
+
+/** 取含模型上下文（context）的完整对话（导出用）；不存在返回 null。 */
+export async function getFullConversation(id: string): Promise<ConversationDoc | null> {
+  const coll = await getColl();
+  if (!coll) return memory.get(id) || null;
+  const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
+  if (!doc) return null;
+  const { _id, ...rest } = doc;
+  return rest as ConversationDoc;
+}
+
+/**
+ * 复制对话（Duplicate）：深拷贝消息 / 任务规划 / 模型上下文 / 设置，生成新对话。
+ * 标题加「 副本」后缀；归自己所有、不归档、不置顶、不继承手动顺序（回到默认序）。
+ */
+export async function duplicateConversation(id: string, ownerKey?: string): Promise<ConversationDoc | null> {
+  const src = await getFullConversation(id);
+  if (!src) return null;
+  // 归属校验：无主遗留可复制（与可见性同口径），有主须匹配。
+  if (src.ownerKey && src.ownerKey !== ownerKey) return null;
+  const newId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  const clone = JSON.parse(JSON.stringify(src)) as ConversationDoc;
+  const doc: ConversationDoc = {
+    ...clone,
+    _id: undefined,
+    id: newId,
+    title: `${src.title || "对话"} 副本`,
+    createdAt: now,
+    updatedAt: now,
+    archived: false,
+    pinnedAt: null,
+    sortOrder: undefined,
+    ...(ownerKey ? { ownerKey } : {}),
+  };
+  const coll = await getColl();
+  if (!coll) {
+    memory.set(newId, doc);
+    return doc;
+  }
+  await coll.insertOne(doc as ConversationDoc & { _id?: ObjectId });
+  return getConversation(newId);
+}
+
+/** 渲染对话为 Markdown（导出用）。 */
+export function renderConversationMarkdown(doc: ConversationDoc): string {
+  const lines: string[] = [];
+  lines.push(`# ${doc.title || "对话"}`);
+  lines.push("");
+  lines.push(`- 导出时间：${new Date().toISOString()}`);
+  lines.push(`- 对话 ID：${doc.id}`);
+  const created = doc.createdAt ? new Date(doc.createdAt).toLocaleString() : "未知";
+  lines.push(`- 创建时间：${created}`);
+  lines.push("");
+  const messages = doc.messages || [];
+  for (const msg of messages) {
+    const who = msg.role === "user" ? "用户" : "助手";
+    lines.push(`## ${who}`);
+    lines.push("");
+    lines.push(msg.text || "");
+    if (msg.steps?.length) {
+      lines.push("");
+      lines.push(`> 工具：${msg.steps.map((s) => `${s.name}(${s.status})`).join("、")}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
 }

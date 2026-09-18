@@ -6,8 +6,46 @@ import { fsEdit, fsList, fsRead, fsWrite } from "./fs-store.js";
 import { setConversationTodos } from "./conversations.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
+import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
+import { addHistory, setFeedback } from "./movie/profile.js";
 
 export const BUILTIN_SERVER = "builtin";
+
+/**
+ * 内置工具风险登记表（写操作安全闸门 P0-1）：内置工具不在 MCP 注册表里，
+ * 必须显式登记级别，否则 risk.ts 会按「未知」兜底处理（fail-closed）。
+ * scope = workspace 的工具只写「本对话工作区」，无外部副作用（免确认依据）。
+ */
+export const BUILTIN_RISK: Record<
+  string,
+  { level: "read" | "write" | "destructive"; scope: "workspace" | "external"; reason: string }
+> = {
+  fs_read: { level: "read", scope: "workspace", reason: "读取本对话工作区文件" },
+  fs_ls: { level: "read", scope: "workspace", reason: "列出本对话工作区文件" },
+  read_skill: { level: "read", scope: "workspace", reason: "读取技能说明" },
+  search_tools: { level: "read", scope: "workspace", reason: "检索工具清单" },
+  search_knowledge: { level: "read", scope: "workspace", reason: "检索本地知识库（只读）" },
+  knowledge_sources: { level: "read", scope: "workspace", reason: "列出知识库已入库来源" },
+  fs_write: { level: "write", scope: "workspace", reason: "写入本对话工作区文件（无外部副作用）" },
+  fs_edit: { level: "write", scope: "workspace", reason: "编辑本对话工作区文件（无外部副作用）" },
+  write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
+  task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
+  record_watched_movies: {
+    level: "write",
+    scope: "workspace",
+    reason: "把用户表达过的观影偏好写入本地画像（无外部副作用）",
+  },
+};
+
+/** 启动断言：内置工具漏登记级别时直接抛错（在启动即暴露，而不是运行时静默放行）。 */
+export function assertBuiltinRiskCoverage(): void {
+  const missing = builtinToolSpecs({ toolSearch: true })
+    .map((item) => item.name)
+    .filter((name) => !BUILTIN_RISK[name]);
+  if (missing.length) {
+    throw new Error(`内置工具缺少风险登记（BUILTIN_RISK）：${missing.join("、")}`);
+  }
+}
 
 /** 单个内置工具的执行结果；`todos` 存在时由 chat 循环负责持久化并发 todos 事件。 */
 export interface BuiltinOutcome {
@@ -136,6 +174,53 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         required: ["name"],
       },
     ),
+    spec(
+      "search_knowledge",
+      "检索本地知识库（已入库的企业文档：制度/流程/规范等）。" +
+        "当用户问的是文档里才有的内容（制度、流程、规范、标准）时用它取原文片段，" +
+        "并在回答里注明来源（返回结果的 source/title），不要凭记忆编造。" +
+        "检索为空说明知识库没这份资料，如实说没有，不要用通用知识代替。",
+      {
+        type: "object",
+        properties: {
+          query: jsonType("string", "检索问题或关键词（写完整问题比单词效果好）"),
+          topK: jsonType("number", "返回条数（默认 5）"),
+        },
+        required: ["query"],
+      },
+    ),
+    spec("knowledge_sources", "列出知识库已入库的来源与切片数（判断某类资料有没有入库时用）。", {
+      type: "object",
+      properties: {},
+    }),
+    spec(
+      "record_watched_movies",
+      "记录用户**看过 / 喜欢 / 不喜欢**的影片，写入本地观影画像（持久保存，供后续口味相关回答参考）。" +
+        "当用户在对话里明确提到自己看过、喜欢或不喜欢某部片时调用；" +
+        "每部片至少给 title，若已通过搜索工具拿到影片 id 就一并给出（id 更准确）。" +
+        "只记录用户明确表达过的观影经历或偏好，不要凭猜测调用。",
+      {
+        type: "object",
+        properties: {
+          movies: {
+            type: "array",
+            description: "影片列表，每条至少含 title",
+            items: {
+              type: "object",
+              properties: {
+                id: jsonType("string", "影片 id（可先用搜索工具查到，优先提供）"),
+                title: jsonType("string", "片名（必填）"),
+                year: jsonType("number", "年份（可选）"),
+                rating: jsonType("number", "用户给出的评分（可选）"),
+                verdict: jsonType("string", "用户态度：like / dislike（可选；用户没表态就不要填）"),
+              },
+              required: ["title"],
+            },
+          },
+        },
+        required: ["movies"],
+      },
+    ),
     // 仅按需加载模式注入：工具 schema 已全量载入时，检索没有意义，白占一个工具位。
     ...(opts.toolSearch ? [TOOL_SEARCH_SPEC] : []),
   ];
@@ -164,12 +249,15 @@ function normalizeTodos(raw: unknown): { todos: TodoItem[] } | { error: string }
 
 /**
  * 执行内置工具；不是内置工具返回 null（交回 MCP 通道）。
- * `conversationId` 用于工作区隔离与 todos 落库。
+ * `conversationId` 用于工作区隔离与 todos 落库；
+ * `namespace` 用于知识库按角色隔离（默认 "generic"，由调用方按当前角色传入，不暴露给模型）。
  */
 export async function execBuiltin(
   name: string,
   argsJson: string,
   conversationId: string,
+  namespace = "generic",
+  ownerKey?: string,
 ): Promise<BuiltinOutcome | null> {
   const args = safeJsonParse(argsJson);
   switch (name) {
@@ -201,6 +289,27 @@ export async function execBuiltin(
       if (!content) return { ok: false, text: `技能不存在：${str(args, "name")}` };
       return { ok: true, text: content };
     }
+    case "search_knowledge": {
+      const query = str(args, "query").trim();
+      if (!query) return { ok: false, text: "search_knowledge 需要 query" };
+      const topK = Math.min(Math.max(Number(args.topK) || 5, 1), 20);
+      const hits = await ragSearch(query, topK, namespace);
+      if (!hits.length) return { ok: true, text: "（知识库中没有匹配内容）" };
+      return {
+        ok: true,
+        text: hits
+          .map((h, i) => `[${i + 1}] ${h.title}（来源：${h.source}，相关度 ${h.score}）\n${h.text}`)
+          .join("\n\n"),
+      };
+    }
+    case "knowledge_sources": {
+      const sources = ragSources(namespace);
+      if (!sources.length) return { ok: true, text: "（知识库为空：先用 build-rag-index 入库）" };
+      return {
+        ok: true,
+        text: sources.map((s) => `${s.source}（${s.title}，${s.chunks} 切片）`).join("\n"),
+      };
+    }
     case "write_todos": {
       const result = normalizeTodos(args.todos);
       if ("error" in result) return { ok: false, text: `计划写入失败：${result.error}` };
@@ -210,6 +319,48 @@ export async function execBuiltin(
         ok: true,
         text: `计划已更新：共 ${result.todos.length} 步，已完成 ${done}。`,
         todos: result.todos,
+      };
+    }
+    case "record_watched_movies": {
+      if (!ownerKey) return { ok: false, text: "无法记录观影偏好：缺少用户标识" };
+      const raw = Array.isArray(args.movies) ? args.movies : [];
+      // 显式标注元素类型：否则 spread 条件对象会把 verdict 拓宽成 string，调用 setFeedback 时类型不匹配。
+      const items: Array<{ id: string; title: string; year?: number; rating?: number; verdict?: "like" | "dislike" }> = raw
+        .map((entry) => {
+          const rec = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+          const title = String(rec.title || "").trim();
+          // 先归一为 string 再收窄：rec 是 Record<string, unknown>，字面量比较无法收窄索引签名。
+          const rawVerdict = String(rec.verdict || "");
+          const verdict: "like" | "dislike" | undefined =
+            rawVerdict === "like" || rawVerdict === "dislike" ? rawVerdict : undefined;
+          return {
+            // id 缺失时用片名兜底：保证历史仍能记录（代价是可能与 id 形态的同一部片重复，去重口径由画像层负责）。
+            id: String(rec.id || "").trim() || title,
+            title,
+            ...(Number(rec.year) ? { year: Number(rec.year) } : {}),
+            ...(Number(rec.rating) ? { rating: Number(rec.rating) } : {}),
+            ...(verdict ? { verdict } : {}),
+          };
+        })
+        .filter((item) => item.title);
+      if (!items.length) return { ok: false, text: "record_watched_movies 至少需要一条含 title 的记录" };
+      await addHistory(
+        ownerKey,
+        items.map((item) => ({
+          id: item.id,
+          title: item.title,
+          ...(item.year ? { year: item.year } : {}),
+          ...(item.rating ? { rating: item.rating } : {}),
+          source: "chat" as const,
+        })),
+      );
+      const withVerdict = items.filter((item) => item.verdict);
+      for (const item of withVerdict) {
+        await setFeedback(ownerKey, { id: item.id, title: item.title, verdict: item.verdict! });
+      }
+      return {
+        ok: true,
+        text: `已记录 ${items.length} 部影片${withVerdict.length ? `（其中 ${withVerdict.length} 部带偏好态度）` : ""}，后续推荐会参考。`,
       };
     }
     default:

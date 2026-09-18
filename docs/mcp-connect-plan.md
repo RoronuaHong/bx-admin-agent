@@ -27,6 +27,8 @@
 
 前端（`apps/web/src`）：只有 `pages/ChatPage.vue`（会话侧栏 + 流式气泡 + 模型下拉 + 图片上传 + markdown），`api.ts` 的 `ChatEvent` 只有 `text/text_delta/model/error/done`。
 
+> 快照时效（2026-09-18 核）：本节是当时的现状记录。今天前端已不止 `ChatPage.vue`——`pages/MoviePage.vue`（`/movie` 观影助手独立页）、`pages/PortalPage.vue`（`/` 门户）、`components/`（ModelSelect / ThemeToggle / UiLocaleSelect），`ChatEvent` 也已扩展（tool_call / tool_result / confirmation_* / todos / subagent_* / usage / task_running …）。
+
 共享类型（`packages/shared/src/index.ts`）：`LocalizedToken / ApiErrorPayload / ChatEvent`。
 
 > 旧实现可参考备份：`.data/trash-20260916/code/apps-agent-server-src/mcp/*.ts`（需按新契约裁剪，旧的含登录/权限/索引等已删逻辑）。

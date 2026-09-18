@@ -37,7 +37,14 @@ function applyTheme(next: ThemeName) {
   if (meta) meta.setAttribute("content", next === "dark" ? "#0c0c0b" : "#f3f3f0");
 }
 
-export function provideTheme() {
+export interface ThemeApi {
+  theme: Ref<ThemeName>;
+  toggle: () => void;
+  adopt: (value: string) => void;
+}
+
+/** 建一套主题状态（provide 与兜底单例共用同一实现，避免两份行为漂移）。 */
+function createThemeApi(): { api: ThemeApi; init: () => void } {
   const theme = ref<ThemeName>(systemTheme());
 
   /**
@@ -62,13 +69,30 @@ export function provideTheme() {
     }
   }
 
-  onMounted(() => applyTheme(theme.value));
-  provide(themeKey, { theme, toggle, adopt });
-  return { theme, toggle, adopt };
+  return { api: { theme, toggle, adopt }, init: () => applyTheme(theme.value) };
 }
 
-export function useTheme() {
-  const api = inject(themeKey);
-  if (!api) throw new Error("Theme is not provided");
+/**
+ * 兜底主题状态：正常路径永远走 provide/inject；只有注入链断裂时才用到这里。
+ * 典型场景是开发期 HMR 重新求值本模块（`themeKey` 变成新的 Symbol，已挂载组件注入失败）——
+ * 过去这种情况会直接抛错、把**整页**打成白屏；主题不是关键路径，退化即可（切换照常生效）。
+ */
+let fallbackApi: ThemeApi | null = null;
+
+export function provideTheme(): ThemeApi {
+  const { api, init } = createThemeApi();
+  onMounted(init);
+  provide(themeKey, api);
   return api;
+}
+
+export function useTheme(): ThemeApi {
+  const injected = inject(themeKey, null);
+  if (injected) return injected;
+  if (!fallbackApi) {
+    const created = createThemeApi();
+    fallbackApi = created.api;
+    created.init();
+  }
+  return fallbackApi;
 }

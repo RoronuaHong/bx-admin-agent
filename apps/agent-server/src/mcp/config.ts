@@ -1,8 +1,8 @@
 // MCP 服务器配置持久化（全局一份列表；会话只存「启用的 id 集合」）。
 // 凭据（env / headers）只落本机 .data/mcp-servers.json，对外接口一律只返回键名。
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { DATA_DIR, atomicWriteJson } from "../store-util.js";
 
 export type McpTransport = "stdio" | "http";
 
@@ -23,6 +23,23 @@ export interface McpServerConfig {
   timeoutMs?: number;
   /** 该服务器的**全部**工具调用都需用户二次确认 */
   requireConfirm?: boolean;
+  /** 工具级风险覆盖（键 = 裸工具名或命名空间名，`*` = 本服务器全部未单独声明的工具；优先级高于 requireConfirm 与注解，见 src/risk.ts）。 */
+  toolRisks?: Record<string, "read" | "write" | "destructive">;
+  /**
+   * 工具白名单（server 上的**原始**工具名，非命名空间名）：声明后只把列出的工具注入模型，其余忽略。
+   * 用于「一个 server 提供多个领域的工具、但某个角色只需要其中一部分」——收窄暴露面、减少无关 schema。
+   * 未声明 = 全部注入（向后兼容）。
+   */
+  tools?: string[];
+  /** 新建对话默认勾选该服务器（仅影响新建，已有对话的启用集不受影响）。 */
+  defaultEnabled?: boolean;
+}
+
+/** 新建对话应默认启用的服务器 id 集（defaultEnabled 且未停用）。 */
+export function defaultMcpServers(): string[] {
+  return loadServers()
+    .filter((s) => s.defaultEnabled === true && s.enabled !== false)
+    .map((s) => s.id);
 }
 
 /** 对外输出的服务器信息：凭据只保留键名，绝不回传值。 */
@@ -31,8 +48,7 @@ export interface McpServerPublic extends Omit<McpServerConfig, "env" | "headers"
   headerKeys: string[];
 }
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = resolve(__dirname, "..", "..", ".data", "mcp-servers.json");
+const CONFIG_PATH = resolve(DATA_DIR, "mcp-servers.json");
 const ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const TRANSPORTS: McpTransport[] = ["stdio", "http"];
 
@@ -49,6 +65,12 @@ export function validateServerInput(input: Partial<McpServerConfig>): string | n
   if (input.transport === "http" && !String(input.url || "").trim()) return "http 传输必须提供 url";
   if (input.transport && !TRANSPORTS.includes(input.transport)) return "transport 非法（stdio | http）";
   if (input.timeoutMs !== undefined && !(Number(input.timeoutMs) > 0)) return "timeoutMs 必须为正数";
+  if (
+    input.tools !== undefined &&
+    (!Array.isArray(input.tools) || input.tools.some((t) => typeof t !== "string" || !t.trim()))
+  ) {
+    return "tools 必须是工具名（非空字符串）数组";
+  }
   return null;
 }
 
@@ -104,14 +126,7 @@ export function loadServers(): McpServerConfig[] {
 
 function persist(list: McpServerConfig[]): void {
   fileCache = list;
-  try {
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    const tmp = `${CONFIG_PATH}.tmp`;
-    writeFileSync(tmp, JSON.stringify(list, null, 2), "utf-8");
-    renameSync(tmp, CONFIG_PATH);
-  } catch (err) {
-    console.warn(`[mcp:config] 写入失败：${String((err as Error)?.message || err)}`);
-  }
+  atomicWriteJson(CONFIG_PATH, list, { logLabel: "mcp:config" });
 }
 
 export function getServer(id: string): McpServerConfig | null {
