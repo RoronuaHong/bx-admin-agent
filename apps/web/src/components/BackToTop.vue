@@ -8,7 +8,6 @@
 //   点击后把焦点移到主标题（页面需给标题加 tabindex="-1"），避免焦点停留在马上就消失的按钮上。
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { getUiLocale } from "../ui-locale";
-import { smoothScrollTo } from "../smooth-scroll";
 
 const props = withDefaults(
   defineProps<{
@@ -97,11 +96,12 @@ function onScroll() {
 
 function toTop() {
   const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-  // 始终平滑滚回顶部：用户要的是「滑动」的过渡反馈（reduced-motion 下 smoothScrollTo 内部会瞬移）。
-  // 注意：本项目对话容器上原生 scrollTo({behavior:'smooth'}) 被静默忽略，故用自定义 rAF 缓动。
-  const scroller = findScroller() ?? (document.scrollingElement as HTMLElement | null);
-  if (scroller) smoothScrollTo(scroller, 0, { duration: reduceMotion ? 0 : 460 });
-  window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" }); // 文档级滚动布局兜底（无平滑则无害空操作）
+  // 始终平滑滚回顶部：用户要的是「滑动」的过渡反馈，长距离也用 smooth（reduced-motion 下瞬移）。
+  // 用原生 scrollTo({behavior})——本项目 .mc-scroll 上原生 smooth 实测可用；只在 scrollTo 上显式传
+  // behavior，不会让流式跟底用的 scrollTop= 赋值也被动画化（那会滞后留缝）。
+  const behavior: ScrollBehavior = reduceMotion ? "auto" : "smooth";
+  findScroller()?.scrollTo({ top: 0, behavior });
+  window.scrollTo({ top: 0, behavior }); // 文档级滚动布局兜底（body 滚动时是无害空操作）
   // 焦点管理：页面用 tabindex="-1" 显式标了可聚焦的元素（标题 / 滚动区）时，把焦点交给它，
   // 避免焦点留在一个马上就 display:none 的按钮上（那会掉到 body，键盘用户丢失位置）。
   let target: HTMLElement | null = null;

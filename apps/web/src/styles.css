@@ -203,5 +203,7 @@ a,
   *::after {
     animation: none !important;
     transition: none !important;
+    /* 减少动态效果：滚动也瞬移，不平滑（对齐 WCAG 2.3.3，避免 vestibular 敏感用户眩晕）。 */
+    scroll-behavior: auto !important;
   }
 }

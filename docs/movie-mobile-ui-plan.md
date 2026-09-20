@@ -122,3 +122,33 @@
 - 服务端数据核对：`agentId=movie` 会话恰好 1 条（无空会话孤儿），消息持久化正确。
 - 构建：`vite build` 通过（75 modules，exit 0）；`read_lints` 三个文件均无新增错误。
 - `/chat` 未受影响：`ChatPage.vue` 恢复原状（`isMovieMode` 全仓库 0 处残留）；运行时核对侧栏、两个 nav tab、汉堡、`#chat-model`、工具菜单、输入提示、缩放手柄均在。
+
+## 滚动过渡（2026-09-20）
+
+观影对话可滚高度常达数百~上千像素，「返回顶部」与发送/进入对话后的「跳到底部」都应给用户平滑的「滑动」反馈，而非瞬移。
+
+### 问题 / 修复
+
+| 项 | 说明 |
+|---|---|
+| 问题 | 长对话（>2 屏）点「返回顶部」直接瞬移，没有滑动过渡；用户明确期望平滑回顶。 |
+| 影响 | 瞬移突兀，与页面其它过渡（按钮 hover / 入场动画）节奏不一致。 |
+| 误判（已纠正） | 一度怀疑原生 `scrollTo({behavior:'smooth'})` 在 `.mc-scroll` 上被静默忽略，为此写了自定义 rAF 缓动工具 `smooth-scroll.ts`；后实测原生 smooth 在该容器**可用**，自写 rAF 属过度实现（且初版未做重复调用取消，二次点击会与上一段动画互相打架）。**已删除该工具**。 |
+| 根因 | 原 `toTop()` 用 `behavior: distance > 2*viewport ? "auto" : "smooth"`——长距离被强制瞬移，正是用户看到的「不滑」。 |
+| 修复 | `toTop()` 始终 `scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" })`（去掉距离阈值）；`scrollToBottom(force)` 显式回底同样走 `scrollTo({ behavior: "smooth" })`。流式跟底（`force=false`）保留即时 `scrollTop = scrollHeight`。 |
+| 关键约束 | 实测在 `scroll-behavior: smooth` 下**`scrollTop=` 属性赋值也会被动画化**（`early=9, late=3840, target=4000`）。因此**不能**给 `.mc-scroll` 加全局 `scroll-behavior: smooth`（否则流式跟底会滞后留缝），只能在「点对点 `scrollTo`」上显式传 `behavior`。 |
+| 无障碍 | reduced-motion 下 `behavior: "auto"` 瞬移；并在全局 `@media (prefers-reduced-motion: reduce)` 补 `scroll-behavior: auto` 兜底（对齐 WCAG 2.3.3）。 |
+
+### 最佳实践依据
+
+1. **平滑滚动优先用原生 API**：`Element.scrollTo({behavior:"smooth"})` / CSS `scroll-behavior` 即可，MDN 明确其为 CSSOM 触发的滚动行为、2022 起广泛支持；自写 rAF 仅在需要自定义时长/缓动且原生不可用时才是必要兜底（MDN / web.dev）。
+2. **尊重 `prefers-reduced-motion`**：vestibular 敏感用户会被滚动动画诱发眩晕，reduced-motion 下必须瞬移（WCAG 2.3.3 Animation from Interactions 的精神；web.dev `prefers-reduced-motion`）。
+3. **流式跟底即时贴合**：聊天类页面的「贴底」用 `scrollTop=` 即时赋值，避免平滑动画期间内容增长导致留缝——通用做法。
+
+### 验证（2026-09-20，浏览器实测）
+
+- 根因 3 实例：同浏览器内普通 div / `.mc-scroll` / 给容器加 `scroll-behavior:smooth` 后，原生 `scrollTo({behavior:"smooth"})` 均 `before→after: 0`，证明原生 smooth 可用（此前「no-op」是测试假象）。
+- `scrollTop=` 在 smooth 下会被动画化（`early=9, late=3840`），印证**不能**给容器全局开 smooth、只能在 `scrollTo` 上点对点传 `behavior`。
+- 点击「返回顶部」：容器从 ~3900px 渐进滑动到 0（中途采样确认是动画而非瞬移）；reduced-motion 下直接到 0。
+- 发送消息 / 进入对话：`scrollToBottom(true)` 平滑滚到底；流式跟底保持即时贴合、无留缝。
+- Lint：涉及文件 0 新增错误；HMR 正常。

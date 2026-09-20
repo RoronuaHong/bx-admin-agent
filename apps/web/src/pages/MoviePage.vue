@@ -4,7 +4,6 @@ import BackToTop from "../components/BackToTop.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { renderChatMarkdown } from "../chat-richtext";
-import { smoothScrollTo } from "../smooth-scroll";
 import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { agentText, findAgent } from "../agents";
 import { localizeToken } from "../localize";
@@ -143,9 +142,17 @@ function scrollToBottom(force = false) {
     // 执行时再按实时几何复核（阈值放宽到 240px：单片增量一般长不了这么多，超出只可能是用户上滚）。
     // 只靠标记有个窗口：密集增量下滚动事件还没来得及把标记置假，排队中的回底会把用户刚滚上去的位置盖掉。
     if (!force && !nearBottom(el, 240)) return;
-    if (force) followBottom = true;
-    // 显式回底（进入/新建对话、发送）走自定义缓动平滑滚动给「滑动」过渡；流式跟底（force=false）保持即时贴合，避免平滑动画期间内容增长留缝。
-    smoothScrollTo(el, el.scrollHeight);
+    if (force) {
+      followBottom = true;
+      // 显式回底（进入/新建对话、发送）才走原生平滑滚动给「滑动」过渡；reduced-motion 下瞬移（WCAG 2.3.3）。
+      const reduceMotion =
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+      el.scrollTo({ top: el.scrollHeight, behavior: reduceMotion ? "auto" : "smooth" });
+      return;
+    }
+    // 流式跟底（每个增量都会走到这里）必须即时贴合：这里用 scrollTop 赋值而不是 scrollTo/smooth——
+    // 后者会为每片增量重启动画，内容还在增长而动画在追赶，结果永远差一截（底部留缝、跟不上）。
+    el.scrollTop = el.scrollHeight;
   });
 }
 
@@ -474,8 +481,9 @@ onBeforeUnmount(() => {
                    模型不出推理（非思考模型）时退回三点输入指示，标题只说「正在生成」，不谎称在思考。 -->
               <details v-if="b.streaming" class="mc-think" open>
                 <summary class="mc-think__head">
-                  {{ thinkingLabel(b) }}
+                  <span class="sr-only">{{ thinkingLabel(b) }}</span>
                   <span v-if="!hasThinking(b)" class="mc-typing" aria-hidden="true"><span></span><span></span><span></span></span>
+                  <span v-else>{{ thinkingLabel(b) }}</span>
                 </summary>
                 <pre v-if="hasThinking(b)" class="mc-think__body">{{ b.thinking }}</pre>
               </details>
@@ -1107,6 +1115,19 @@ html[data-theme="dark"] .mc-think__head {
 
 html[data-theme="dark"] .mc-think__body {
   color: #a9b6c8;
+}
+
+/* 屏幕阅读器专用：视觉隐藏，仅供无障碍播报。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* 三点弹跳指示：标题行内联显示，单行不占第二行。 */
