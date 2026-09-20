@@ -155,6 +155,8 @@ export interface StoredMessage {
    * 必须持久化，否则刷新后推理面板里的思考过程丢失。
    */
   thinking?: string;
+  /** 累计思考耗时（毫秒）：推理面板标题展示用（对齐 ChatGPT「Thought for Ns」）。 */
+  thinkMs?: number;
   /** 工具调用步骤摘要（推理面板展示用）。 */
   steps?: unknown[];
   /** 任务规划（write_todos 产出，推理面板展示用）。 */

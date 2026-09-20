@@ -10,6 +10,7 @@ import {
   type ComponentPublicInstance,
 } from "vue";
 import { useRouter } from "vue-router";
+import BackToTop from "../components/BackToTop.vue";
 import ModelSelect from "../components/ModelSelect.vue";
 import ToolsSearch from "../components/ToolsSearch.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
@@ -570,6 +571,9 @@ interface Bubble {
     ticket: string;
     question: string;
     options: Array<{ label: string; description?: string }>;
+    /** 模型声明的「缺的是哪个决策点」与「为什么它会影响答案」（可选；未声明时不显示）。 */
+    missingField?: string;
+    whyItMatters?: string;
     expiresInMs?: number;
   } | null;
   /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
@@ -595,6 +599,8 @@ interface Bubble {
   }>;
   /** 扩展思考（thinking 增量拼接，支持思考的模型才有；仅作展示，不回灌模型上下文）。 */
   thinking?: string;
+  /** 累计思考耗时（毫秒）：各思考段相加，工具执行/回灌的间隙不计；展示用（对齐 ChatGPT「Thought for Ns」）。 */
+  thinkMs?: number;
 }
 
 /**
@@ -752,7 +758,12 @@ const confirmDialog = ref<{
   onConfirm: () => void;
 } | null>(null);
 const confirmDialogEl = ref<HTMLElement | null>(null);
-const confirmCancelBtn = ref<HTMLElement | null>(null);
+/**
+ * 弹窗主操作按钮（删除 / 关闭）的引用：打开时焦点落这里，回车即执行。
+ * 对齐 antd `Modal.confirm` 的 `autoFocusButton: "ok"` 默认值——弹窗本身已是二次确认，
+ * 再让键盘用户多按一次 Tab 才能回车确认，等于把「回车」变成了「取消」。
+ */
+const confirmPrimaryBtn = ref<HTMLElement | null>(null);
 let confirmReturnFocus: HTMLElement | null = null;
 
 function askDeleteConversation(conv: ConversationDto) {
@@ -832,13 +843,13 @@ function trapConfirmFocus(e: KeyboardEvent) {
   }
 }
 
-// 打开时锁背景滚动；关闭时恢复。焦点移到「取消」按钮（安全默认项，回车不会误删）。
+// 打开时锁背景滚动；关闭时恢复。焦点移到主操作按钮（回车即确认，Esc / 点遮罩取消）。
 watch(
   confirmDialog,
   (val) => {
     if (val) {
       document.body.style.overflow = "hidden";
-      nextTick(() => confirmCancelBtn.value?.focus());
+      nextTick(() => confirmPrimaryBtn.value?.focus());
     } else {
       document.body.style.overflow = "";
     }
@@ -1101,14 +1112,34 @@ function queueScrollIfCurrent(convId: string) {
   if (currentId.value === convId) queueScroll();
 }
 
-function queueScroll() {
+/**
+ * 跟底开关（stick-to-bottom）：流式增量只在「当前已贴近底部」（48px 容差）时才自动跟随。
+ * 没有它，用户在生成中上滚阅读历史会被下一片增量拉回底部——「回到顶部」也就形同虚设。
+ * 判定挂在滚动容器的 scroll 事件上（程序滚动同样触发），滚回底部附近即自动恢复跟随。
+ */
+let followBottom = true;
+function nearBottom(el: HTMLElement, gap = 48): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < gap;
+}
+function onThreadScroll() {
+  const el = threadEl.value;
+  if (el) followBottom = nearBottom(el);
+}
+
+function queueScroll(force = false) {
+  if (!force && !followBottom) return;
   if (scrollQueued) return;
   scrollQueued = true;
   requestAnimationFrame(() => {
     scrollQueued = false;
     void nextTick(() => {
       const el = threadEl.value;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      // 执行时再按实时几何复核（阈值放宽到 240px：单片增量一般长不了这么多，超出只可能是用户上滚）。
+      // 只靠标记有个窗口：rAF+nextTick 双重延迟下，密集增量可能先于 scroll 事件把用户刚上滚的位置盖掉。
+      if (!force && !nearBottom(el, 240)) return;
+      if (force) followBottom = true;
+      el.scrollTop = el.scrollHeight;
     });
   });
 }
@@ -1162,30 +1193,61 @@ function hasThinking(b: Bubble): boolean {
   return !!b.thinking && b.thinking.trim().length > 0;
 }
 
-// 意图识别：取思考流首行作为「理解意图」展示（对齐 ReAct 规划首步）。
-// 优先识别显式「意图：/Intent:」前缀；模型未用前缀时，兜底取首句（需是简短自然句，
-// 避免把代码块/列表行误判为意图）。这样任何 reasoning 模型都能稳定出意图卡，不依赖严格格式。
+// 意图识别：只认模型显式写的「意图：/Intent:」前缀。
+// 不做「取首句」兜底——推理流首行经常是半截话（如「用户只输入了"123"，没有明确的请求或问题。这可能是：」），
+// 截断后放进高亮卡里像坏数据，也是推理面板观感差的主要来源之一（ChatGPT/Claude 都不做这种二次高亮）。
 const INTENT_RE = /^(意图|Intent)\s*[:：]\s*(.+)$/i;
-// 标题/列表/代码/大括号/尖括号首行，或括号内的编号行（如「(1) 步骤」），不算意图。
-const FILLER_RE = /^[#\-*`{<>]|^\(\d+[.、]\s/;
 
 function intentOf(b: Bubble): string | undefined {
-  const t = b.thinking;
-  if (!t) return undefined;
-  const firstLine = t.split("\n", 1)[0].trim();
-  if (!firstLine) return undefined;
+  const firstLine = (b.thinking || "").split("\n", 1)[0].trim();
   const m = firstLine.match(INTENT_RE);
-  if (m) return m[2].trim();
-  if (firstLine.length <= 120 && !FILLER_RE.test(firstLine)) return firstLine;
-  return undefined;
+  return m ? m[2].trim() : undefined;
 }
 
-// 去掉首行意图（作为意图卡展示）后的思考流，避免重复；无意图时不剥离。
+// 去掉首行意图（作为意图行展示）后的思考流，避免重复；无意图时不剥离。
 function thinkingDisplay(b: Bubble): string {
   if (!intentOf(b)) return b.thinking || "";
   const t = b.thinking || "";
   const nl = t.indexOf("\n");
   return nl >= 0 ? t.slice(nl + 1).replace(/^\s*\n/, "") : "";
+}
+
+// ---- 思考耗时（对齐 ChatGPT「Thought for Ns」的口径）----
+// 各思考段分别计时后累加：工具执行 / 结果回灌的间隙不算思考；
+// 计时起点放模块级 Map（气泡 id → 该段首个思考增量时刻），不进响应式状态。
+const thinkStarts = new Map<number, number>();
+
+function thinkPhaseStart(id: number) {
+  if (!thinkStarts.has(id)) thinkStarts.set(id, Date.now());
+}
+
+/** 结束当前思考段并累加进气泡：正文到达 / 收束 / 出错时都要调，否则该段时长丢失。 */
+function thinkPhaseEnd(reply: Bubble) {
+  const start = thinkStarts.get(reply.id);
+  if (!start) return;
+  thinkStarts.delete(reply.id);
+  reply.thinkMs = (reply.thinkMs || 0) + (Date.now() - start);
+}
+
+/** 展示用耗时（如「8 秒」）；累计不足 0.8s 不显示，避免短轮次凑热闹。 */
+function thinkLabel(b: Bubble): string {
+  if (!b.thinkMs || b.thinkMs < 800) return "";
+  const s = Math.round(b.thinkMs / 1000);
+  return tx(`${s} 秒`, `${s}s`, `${s}s`, `${s} सेकंड`);
+}
+
+// 思考流跟底：面板限高内滚，不跟底就只能盯着开头（推理增量很密，rAF 合并避免每片都触发布局）。
+let thinkStickQueued = false;
+function stickThinkingToBottom() {
+  if (thinkStickQueued) return;
+  thinkStickQueued = true;
+  requestAnimationFrame(() => {
+    thinkStickQueued = false;
+    // 取最后一个思考区：正在流式的通常就是最新一条助手气泡。
+    const bodies = threadEl.value?.querySelectorAll<HTMLElement>(".reasoning__thinking");
+    const last = bodies?.length ? bodies[bodies.length - 1] : null;
+    if (last) last.scrollTop = last.scrollHeight;
+  });
 }
 
 function reasoningTitle(b: Bubble): string {
@@ -1221,6 +1283,7 @@ function toStored(list: Bubble[]): StoredMessage[] {
       images: b.images,
       // 推理面板相关字段一并落库：刷新后从后端快照恢复，思考过程 / 工具步骤 / 任务规划不丢。
       ...(b.thinking ? { thinking: b.thinking } : {}),
+      ...(b.thinkMs ? { thinkMs: b.thinkMs } : {}),
       ...(b.steps?.length ? { steps: b.steps } : {}),
       ...(b.todos?.length ? { todos: b.todos } : {}),
     }));
@@ -1265,6 +1328,7 @@ function selectConversation(conv: ConversationDto) {
       images: m.images,
       // 推理面板相关字段恢复（与 toStored 对称）：思考过程 / 工具步骤 / 任务规划。
       ...(m.thinking ? { thinking: m.thinking } : {}),
+      ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
       ...(Array.isArray(m.steps) && m.steps.length ? { steps: m.steps as ToolStep[] } : {}),
       ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
     }));
@@ -1280,7 +1344,7 @@ function selectConversation(conv: ConversationDto) {
   void loadMcp(conv.id);
   // 技能面板：可用列表全局，启用集按对话。
   void loadSkills(conv.id);
-  queueScroll();
+  queueScroll(true); // 切对话是用户动作：无条件回底，并重置跟底状态
 }
 
 async function newConversation() {
@@ -1995,6 +2059,7 @@ async function send() {
   if (!convId) return;
   const text = state.input.trim();
   if (!text && !state.pendingImages.length) return;
+  followBottom = true; // 用户发送：无条件回底（新一轮回复从底部开始展示）
   if (state.sending) {
     // 排队语义：同一对话在生成时，新消息进待发队列（服务端 409 是并发标签页的兜底）。
     await enqueueMessage(convId, text, state.pendingImages.map((i) => i.id));
@@ -2061,14 +2126,18 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
       (event) => {
         if (event.type === "text_delta") {
           reply.text += event.text;
+          thinkPhaseEnd(reply);
           queueScrollIfCurrent(convId);
         } else if (event.type === "text") {
           reply.text = event.text;
+          thinkPhaseEnd(reply);
         } else if (event.type === "thinking_delta") {
           // 扩展思考增量：拼接进 reasoning 面板，实时展示模型规划过程，取代「正在规划」占位。
           reply.thinking = (reply.thinking || "") + event.text;
+          thinkPhaseStart(reply.id);
           openReasoning.add(reply.id);
           queueScrollIfCurrent(convId);
+          stickThinkingToBottom();
         } else if (event.type === "model") {
           state.activeModelLabel = event.label;
         } else if (event.type === "tool_call") {
@@ -2115,6 +2184,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
             ticket: event.ticket,
             question: event.question,
             options: event.options,
+            ...(event.missingField ? { missingField: event.missingField } : {}),
+            ...(event.whyItMatters ? { whyItMatters: event.whyItMatters } : {}),
             expiresInMs: event.expiresInMs,
           };
           queueScrollIfCurrent(convId);
@@ -2166,6 +2237,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
         } else if (event.type === "done") {
           // 收束时清理模型回声式重复（只改内存展示，不改落库文本）。
           reply.text = dedupeRepeats(reply.text);
+          thinkPhaseEnd(reply);
           reply.streaming = false;
           openReasoning.delete(reply.id);
           // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
@@ -2204,6 +2276,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
       }
     }
     reply.streaming = false;
+    // 异常退出（停止/断连/报错）也要把开着的思考段关掉，耗时才不会丢。
+    thinkPhaseEnd(reply);
   } finally {
     state.sending = false;
     state.controller = null;
@@ -2360,6 +2434,20 @@ async function answerToolConfirm(bubble: Bubble, confirmed: boolean) {
 }
 
 /**
+ * 澄清卡的自由文本补充（对齐「问题卡必须提供自由文本回退」的通行做法）：
+ * 选项之外还能补充说明，避免用户只能点一个都不贴切的选项——点兜底项却不补充，模型拿到的是零信息。
+ * 按气泡 id 暂存草稿。
+ */
+const clarifyDraft = ref<Record<number, string>>({});
+
+async function submitClarifyFreeform(bubble: Bubble) {
+  const text = (clarifyDraft.value[bubble.id] || "").trim();
+  if (!text) return;
+  clarifyDraft.value = { ...clarifyDraft.value, [bubble.id]: "" };
+  await answerClarification(bubble, text);
+}
+
+/**
  * 应答结构化澄清：选中某个选项即把选项值回传；不带值 = 跳过（模型按自己的理解继续）。
  * 与确认卡共用票据通道（一次性 + 会话绑定），失效处理口径一致。
  */
@@ -2367,6 +2455,8 @@ async function answerClarification(bubble: Bubble, value?: string) {
   const ask = bubble.clarification;
   if (!ask) return;
   bubble.clarification = null;
+  // 清掉自由文本草稿：避免同气泡稍后再出现澄清卡时带回上一轮的旧输入。
+  delete clarifyDraft.value[bubble.id];
   const step = (bubble.steps || []).find((s) => s.id === ask.id);
   if (step) {
     step.status = "ok";
@@ -3457,10 +3547,11 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="modal__foot">
-            <button type="button" class="ghost-btn" ref="confirmCancelBtn" @click="closeConfirm">
+            <button type="button" class="ghost-btn" @click="closeConfirm">
               {{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}
             </button>
             <button
+              ref="confirmPrimaryBtn"
               type="button"
               class="ghost-btn"
               :class="{ 'ghost-btn-danger': confirmDialog.danger }"
@@ -3798,7 +3889,8 @@ onBeforeUnmount(() => {
 
       <div v-if="settingsError" class="warn-line header-warn" role="status">{{ settingsError }}</div>
 
-      <div ref="threadEl" class="thread">
+      <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
+      <div ref="threadEl" class="thread" tabindex="-1" @scroll="onThreadScroll">
         <div v-if="!current.bubbles.length" class="empty">
           {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
         </div>
@@ -3810,21 +3902,26 @@ onBeforeUnmount(() => {
               class="reasoning"
               :class="{ open: openReasoning.has(b.id) }"
             >
-              <button class="reasoning__head" type="button" @click="toggleReasoning(b.id)">
-                <span class="reasoning__icon" aria-hidden="true"><span class="reasoning__caret"></span></span>
+              <button
+                class="reasoning__head"
+                type="button"
+                :aria-expanded="openReasoning.has(b.id)"
+                @click="toggleReasoning(b.id)"
+              >
+                <span class="reasoning__caret" aria-hidden="true"></span>
                 <span class="reasoning__title">{{ reasoningTitle(b) }}</span>
-                <span v-if="b.streaming && hasRunningStep(b)" class="reasoning__spinner" aria-hidden="true"></span>
+                <span v-if="thinkLabel(b)" class="reasoning__time">{{ thinkLabel(b) }}</span>
+                <span v-if="b.streaming" class="reasoning__spinner" aria-hidden="true"></span>
               </button>
               <div v-show="openReasoning.has(b.id)" class="reasoning__body">
-                <!-- 意图识别卡：模型首行「意图：…」结构化高亮，区别于后续裸思考流（对齐 ReAct 规划首步）。 -->
-                <div v-if="intentOf(b)" class="intent-card">
-                  <span class="intent-card__label">{{ tx("理解意图", "Intent", "Intenção", "इरादा") }}</span>
-                  <span class="intent-card__text">{{ intentOf(b) }}</span>
+                <!-- 意图行：仅当模型显式声明「意图：」才渲染；无框弱标签，替代原高亮卡
+                     （原「取首句」兜底经常截出半截话，且与思考流首行重复）。 -->
+                <div v-if="intentOf(b)" class="intent-line">
+                  <span class="intent-line__label">{{ tx("意图", "Intent", "Intenção", "इरादा") }}</span>
+                  <span class="intent-line__text">{{ intentOf(b) }}</span>
                 </div>
-                <!-- 扩展思考流：实时展示模型规划过程，取代静默的「正在规划」占位（已剥离首行意图标记）。 -->
-                <div v-if="thinkingDisplay(b)" class="reasoning__thinking-wrap">
-                  <pre class="reasoning__thinking">{{ thinkingDisplay(b) }}</pre>
-                </div>
+                <!-- 扩展思考流：实时展示模型规划过程（已剥离显式意图行）；正文同族无衬线、限高内滚 + 流式跟底。 -->
+                <pre v-if="thinkingDisplay(b)" class="reasoning__thinking">{{ thinkingDisplay(b) }}</pre>
                 <!-- 规划阶段但尚无思考流（模型不支持 thinking）：给一个「正在规划」状态，避免静默加载像卡死；
                      一旦正文开始流式（b.text 已非空）即隐藏，转为「回答中」，不再误导地停在规划态。 -->
                 <div
@@ -3947,6 +4044,14 @@ onBeforeUnmount(() => {
               <div class="confirm-text">
                 {{ tx("需要你确认一下", "Need your input", "Preciso de uma confirmação", "आपकी पुष्टि आवश्यक") }}：{{ b.clarification.question }}
               </div>
+              <div v-if="b.clarification.missingField || b.clarification.whyItMatters" class="clarify-why">
+                <span v-if="b.clarification.missingField" class="clarify-why__field">
+                  {{ tx("待定项", "Open point", "Ponto em aberto", "खुला बिंदु") }}：{{ b.clarification.missingField }}
+                </span>
+                <span v-if="b.clarification.whyItMatters" class="clarify-why__text">
+                  {{ b.clarification.whyItMatters }}
+                </span>
+              </div>
               <div class="clarify-options">
                 <button
                   v-for="opt in b.clarification.options"
@@ -3957,6 +4062,24 @@ onBeforeUnmount(() => {
                 >
                   <span class="clarify-label">{{ opt.label }}</span>
                   <span v-if="opt.description" class="clarify-desc">{{ opt.description }}</span>
+                </button>
+              </div>
+              <!-- 自由文本回退：选项都不贴切时可直接补充说明（点选项不补充 = 模型拿到零信息）。 -->
+              <div class="clarify-free">
+                <input
+                  v-model="clarifyDraft[b.id]"
+                  type="text"
+                  class="clarify-free__input"
+                  :placeholder="tx('以上都不是？直接补充说明', 'None of these? Add your own answer', 'Nenhuma delas? Escreva a sua', 'इनमें से कोई नहीं? अपना उत्तर लिखें')"
+                  @keydown.enter.prevent="submitClarifyFreeform(b)"
+                />
+                <button
+                  type="button"
+                  class="clarify-free__send"
+                  :disabled="!(clarifyDraft[b.id] || '').trim()"
+                  @click="submitClarifyFreeform(b)"
+                >
+                  {{ tx("发送", "Send", "Enviar", "भेजें") }}
                 </button>
               </div>
               <div v-if="confirmExpiryText(b.clarification.expiresInMs)" class="confirm-expiry">
@@ -4005,6 +4128,12 @@ onBeforeUnmount(() => {
           </div>
           </div>
         </div>
+        <!-- 回到顶部：挂在对话滚动容器内（滚动容器由组件自动识别），长对话翻久了可一键回顶；
+             avoid-selector 让按钮抬到底部输入区上方，不压住输入框与发送键。
+             threshold 用 120（约一个气泡高）：对话区可滚高度常常只有一两百像素（几轮对话），
+             沿用页面级的 240 会几乎不出现。 -->
+        <BackToTop :threshold="120" avoid-selector=".composer" focus-target=".thread" />
+
       </div>
 
       <footer class="composer">
@@ -7084,6 +7213,62 @@ button.step-head:disabled {
   word-break: break-word;
 }
 
+/* 澄清契约字段：写明「待定的是哪一项、为什么它会影响答案」，让这一问的必要性可见。 */
+.clarify-why {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.clarify-why__field {
+  font-weight: 600;
+}
+
+.clarify-why__text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 自由文本回退：选项都不贴切时可直接补充说明。 */
+.clarify-free {
+  display: flex;
+  gap: 6px;
+}
+
+.clarify-free__input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.clarify-free__input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--stop) 45%, var(--line));
+}
+
+.clarify-free__send {
+  padding: 6px 10px;
+  font-size: 13px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.clarify-free__send:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .thread {
   flex: 1;
   overflow-y: auto;
@@ -7409,67 +7594,41 @@ button.step-head:disabled {
   text-decoration-color: color-mix(in srgb, var(--muted) 55%, transparent);
 }
 
-/* 推理过程（任务计划 + 工具步骤）折叠：生成中展开、收束后折叠，避免长过程刷屏。 */
+/* 推理过程（思考流 + 工具步骤 + 任务计划）内联披露：
+   对齐 ChatGPT「Thought for Ns」/ Claude「Thought process」的形态——不再套卡片边框
+   （气泡本身已是容器，此前的「盒中盒再套盒」是观感差的主因）；头部收成一行弱化文字，
+   展开内容用 2px 左轨缩进表达「这是过程、不是结论」。 */
 .reasoning {
   margin: 0 0 10px;
-  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
-  /* 左侧强调轨：把「系统/agent 过程块」与正文气泡区分开（对齐 Claude 推理块）。
-     用 3px 整值——2.5px 在圆角处会出现毛边。 */
-  border-left: 3px solid color-mix(in srgb, var(--accent) 62%, var(--line));
-  border-radius: 10px;
-  /* 实色表面：原来 50% 半透明 fill-soft 叠在气泡上，会随底色漂成不定值的脏灰。 */
-  background: var(--panel);
-  overflow: hidden;
-  transition: box-shadow 0.2s var(--ease);
-}
-
-/* 展开时给一层极浅的抬升：过程区与正文的边界更清楚（力度对齐 antd 卡片的克制程度）。 */
-.reasoning.open {
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
 .reasoning__head {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 9px 12px;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px 3px 2px;
+  margin-left: -2px;
   border: none;
   background: transparent;
-  color: color-mix(in srgb, var(--ink) 82%, var(--panel));
+  border-radius: 6px;
+  color: var(--muted);
   font: inherit;
   font-size: 12.5px;
   font-weight: 500;
-  letter-spacing: -0.005em;
   line-height: 18px;
   cursor: pointer;
   text-align: left;
-  transition: color 0.2s var(--ease), background-color 0.2s var(--ease);
+  transition: color 0.15s var(--ease), background-color 0.15s var(--ease);
 }
 
 .reasoning__head:hover {
   color: var(--ink);
-  background: color-mix(in srgb, var(--ink) 4%, transparent);
-}
-
-/* 展开后表头与内容之间拉一条分隔线（antd Collapse 的做法），省掉一层底色也足够清楚。 */
-.reasoning.open .reasoning__head {
-  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
-}
-
-/* 图标芯片：承载 chevron，给面板一点「卡片」质感（对齐 Notion/Claude 的披露控件）。 */
-.reasoning__icon {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: color-mix(in srgb, var(--accent) 78%, var(--ink));
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
 .reasoning__caret {
+  flex: none;
   width: 6px;
   height: 6px;
   border-right: 1.5px solid currentColor;
@@ -7483,11 +7642,18 @@ button.step-head:disabled {
 }
 
 .reasoning__title {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 思考耗时：弱化小字 + 等宽数字（ChatGPT「Thought for Ns」的口径），不给面板添第二種颜色。 */
+.reasoning__time {
+  flex: none;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--muted) 85%, transparent);
 }
 
 /* 进行中指示：环形转圈。轨道只给 20% 的抓色——整圈同亮度会显得笨重（antd Spin 的处理）。 */
@@ -7505,8 +7671,12 @@ button.step-head:disabled {
   to { transform: rotate(360deg); }
 }
 
+/* 展开内容：2px 左轨 + 缩进（Claude 推理块的做法）——表达「过程」语义，
+   又不像卡片那样把思考流框成第二个气泡。 */
 .reasoning__body {
-  padding: 10px 12px 12px;
+  margin: 4px 0 0;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--line) 85%, transparent);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -7538,56 +7708,41 @@ button.step-head:disabled {
   100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 
-/* 扩展思考流：等宽、弱对比、可滚动，区分于正式正文；收束后随面板折叠（不刷屏）。 */
-.reasoning__thinking-wrap {
-  margin: 0;
-}
-
-/* 意图识别卡：把模型首行「意图：…」高亮成结构化块，区别于后续裸思考流（对齐 ReAct 规划首步）。
-   不再加左侧色条——外层过程块已有强调轨，再套一条会变成「线中套线」。 */
-.intent-card {
+/* 意图行：仅当模型显式声明「意图：」才渲染；无框、弱标签 + 正文色。
+   替代原「理解意图」高亮卡——它与思考流首行重复、且「取首句」兜底常截出半截话。 */
+.intent-line {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin: 0;
-  padding: 8px 10px;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
-  border-radius: 8px;
 }
 
-.intent-card__label {
+.intent-line__label {
   flex: none;
   font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
-  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: color-mix(in srgb, var(--accent) 72%, var(--muted));
 }
 
-.intent-card__text {
-  font-size: 12.5px;
+.intent-line__text {
+  font-size: 12.8px;
   color: var(--ink-2);
-  line-height: 1.55;
+  line-height: 1.6;
 }
 
+/* 思考流：与正文同族的无衬线——中文没有像样的等宽族，mono 回退参差是「难看」的另一主因
+   （ChatGPT/Claude 的思考文本都用正文字体）；只弱一档对比、不再套灰底描边的小盒子。 */
 .reasoning__thinking {
   margin: 0;
-  max-height: 260px;
+  max-height: 280px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  /* 原来写的是 var(--mono, …)：本仓 token 名是 --font-mono，--mono 不存在，
-     等于一直在吃系统字体 fallback（与代码块/步骤名的字体不一致）。 */
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.65;
+  font-family: inherit;
+  font-size: 12.8px;
+  line-height: 1.62;
   /* 思考流是「过程」而非结论：比正文/步骤名弱一档，但仍保证可读（不用 --muted 那样虚）。 */
-  color: color-mix(in srgb, var(--ink) 74%, var(--panel));
-  background: var(--surface-2);
-  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
-  border-radius: 8px;
-  padding: 10px 12px;
+  color: color-mix(in srgb, var(--ink) 72%, var(--panel));
 }
 
 .reasoning__body .todos,

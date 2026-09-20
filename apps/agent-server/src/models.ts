@@ -81,6 +81,14 @@ export interface CallOptions {
   tools?: ToolSpec[];
   toolChoice?: "auto" | "none" | "required";
   /**
+   * 关闭该次调用的「扩展思考」（OpenAI 兼容通道专用）。
+   * 用于**内部辅助调用**（如数据需求分诊、受约束兜底话术）——它们只要一个词或一两句话，思考纯属浪费延迟。
+   * 实测（跑 `scripts/_model-thinking-probe.mjs` 可复现，TokenHub kimi 系端点）：只有 `thinking:{type:"disabled"}`
+   * 被端点接受且思考归零（769ms vs 基线 1363ms），`enable_thinking` / `chat_template_kwargs` 会被忽略。
+   * 默认不传该字段：不把可能被陌生网关拒绝的参数塞给所有调用；调用方按需显式开启，失败路径本身有兜底。
+   */
+  disableThinking?: boolean;
+  /**
    * 系统提示的两段式形态（Deep Agents 的 prompt caching 思路）：
    * `stable` 跨轮不变（角色守则 + skills 索引）→ anthropic 加 cache_control 标记缓存；
    * `dynamic` 低频变化（记忆 / 摘要 / 语言）。OpenAI 兼容通道的隐式前缀缓存无需标记。
@@ -554,6 +562,8 @@ async function callOpenAi(
       messages,
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
+      // 内部辅助调用按需关思考（见 CallOptions.disableThinking 的实测记录）。
+      ...(opts.disableThinking ? { thinking: { type: "disabled" } } : {}),
     };
     if (functionTools.length) {
       body.tools = functionTools;

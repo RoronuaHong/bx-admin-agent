@@ -13,6 +13,7 @@ export type AuditDecision =
   | "timeout" // 确认等待超时（按拒绝）
   | "grant_read" // 会话级只读授权写入
   | "subagent_refused" // 子代理尝试非只读操作被立即拒绝
+  | "clarify_deferred" // 待澄清期间被冻结暂缓的非只读调用（未执行、未产生副作用）
   | "ownership_mismatch"; // 确认应答与当前会话不匹配
 
 export interface AuditEvent {

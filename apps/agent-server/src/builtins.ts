@@ -65,8 +65,15 @@ export interface BuiltinOutcome {
   /**
    * 结构化澄清请求：由 chat 循环负责下发事件、挂起等待用户应答，并把结果回灌模型
    * （工具层无法自行等待，否则事件发不出去）。
+   * `missingField` / `whyItMatters` 为可选的「澄清契约」字段（对齐业界 typed pause 做法）：
+   * 强制模型点名缺的是哪个决策、为什么它会影响答案，压掉「能多给点背景吗」这类无指向追问。
    */
-  clarification?: { question: string; options: ClarifyOption[] };
+  clarification?: {
+    question: string;
+    options: ClarifyOption[];
+    missingField?: string;
+    whyItMatters?: string;
+  };
 }
 
 const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
@@ -77,6 +84,8 @@ const MAX_CLARIFY_OPTIONS = 6;
 const MAX_CLARIFY_QUESTION = 300;
 const MAX_CLARIFY_LABEL = 80;
 const MAX_CLARIFY_DESC = 200;
+const MAX_CLARIFY_FIELD = 60;
+const MAX_CLARIFY_WHY = 200;
 
 function spec(name: string, description: string, parameters: Record<string, unknown>): ToolSpec {
   return { name, description, parameters };
@@ -223,21 +232,25 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "request_clarification",
-      "就当前需求向用户提问，让用户从你给的选项里选一个（目标/词义不明确时用，不要硬猜后直接取数）。" +
-        "给出多个互斥且覆盖主要可能的选项（至少 2 个）；用户选定后你会收到其选择并据此继续。" +
-        "不要把「要不要执行某个操作」当问题抛给用户（执行许可走系统确认卡）。",
+      // 「何时该问」的判据只在系统提示第 6 条（单一真相），这里只写「怎么问」的行为约定。
+      "就当前需求向用户提问，让用户从你给的选项里选一个。一次只问一个能改变你下一步动作的关键决策。" +
+        "给出 2 个以上互斥且覆盖主要可能的选项；若某个选项需要用户补充具体内容，就在它的 description 里写明这一点。" +
+        "不要问你自己能查到的事实（先检索）；也不要把「要不要执行某个操作」当问题抛给用户（执行许可走系统确认卡）。" +
+        "用户选定后你会收到其选择并据此继续（只回传选项标题，因此每个选项都要能独立表达清楚意思）。",
       {
         type: "object",
         properties: {
           question: jsonType("string", "要问的问题（一句话，说明为什么需要澄清）"),
+          missing_field: jsonType("string", "缺的是哪个决策点（如「问的是谁 / 哪个范围 / 哪种口径」），界面与日志展示用"),
+          why_it_matters: jsonType("string", "为什么它会影响你的答案或下一步动作（一句话）"),
           options: {
             type: "array",
             description: "选项（至少 2 个，互斥且覆盖主要可能；多余部分服务端会截断）",
             items: {
               type: "object",
               properties: {
-                label: jsonType("string", "选项标题（短，用户点选的就是它）"),
-                description: jsonType("string", "该选项的含义说明（可选）"),
+                label: jsonType("string", "选项标题（短，用户点选的就是它；需能独立表达清楚含义）"),
+                description: jsonType("string", "该选项的含义说明；需要用户补充内容的选项要在这里写明"),
               },
               required: ["label"],
             },
@@ -375,7 +388,7 @@ function normalizeTodos(raw: unknown): { todos: TodoItem[] } | { error: string }
 /** 归一化 request_clarification 入参；非法返回错误文本。 */
 function normalizeClarification(
   raw: Record<string, unknown>,
-): { clarification: { question: string; options: ClarifyOption[] } } | { error: string } {
+): { clarification: NonNullable<BuiltinOutcome["clarification"]> } | { error: string } {
   const question = String(raw.question || "").trim().slice(0, MAX_CLARIFY_QUESTION);
   if (!question) return { error: "request_clarification 需要 question" };
   if (!Array.isArray(raw.options) || raw.options.length < 2) {
@@ -390,7 +403,17 @@ function normalizeClarification(
     options.push({ label, ...(description ? { description } : {}) });
   }
   if (options.length < 2) return { error: "options 至少需要 2 个带 label 的有效选项" };
-  return { clarification: { question, options } };
+  // 澄清契约字段可选：缺失不算错误（弱模型漏填时不该把整次澄清判失败）。
+  const missingField = String(raw.missing_field || "").trim().slice(0, MAX_CLARIFY_FIELD);
+  const whyItMatters = String(raw.why_it_matters || "").trim().slice(0, MAX_CLARIFY_WHY);
+  return {
+    clarification: {
+      question,
+      options,
+      ...(missingField ? { missingField } : {}),
+      ...(whyItMatters ? { whyItMatters } : {}),
+    },
+  };
 }
 
 /**

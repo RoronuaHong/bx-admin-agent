@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import BackToTop from "../components/BackToTop.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { agentText, findAgent, listAgents } from "../agents";
 import { saveChatPreferences } from "../api";
@@ -59,7 +60,8 @@ function onLocaleChange(next: UiLocale) {
     </header>
 
     <main class="portal__main">
-      <h1 class="portal__title">{{ tx("选择一个助手开始", "Pick an assistant", "Escolha um assistente", "एक सहायक चुनें") }}</h1>
+      <!-- tabindex="-1"：给「返回顶部」点击后的焦点落点（读屏念出页面标题），不进入 Tab 序列。 -->
+      <h1 id="portal-title" class="portal__title" tabindex="-1">{{ tx("选择一个助手开始", "Pick an assistant", "Escolha um assistente", "एक सहायक चुनें") }}</h1>
       <p class="portal__sub">
         {{ tx("每个助手有各自的人设、技能与工具，会话互相独立。", "Each assistant has its own persona, skills and tools; conversations are independent.", "Cada assistente tem persona, habilidades e ferramentas próprias; conversas independentes.", "प्रत्येक सहायक की अपनी persona, skills और tools हैं; बातचीत स्वतंत्र है।") }}
       </p>
@@ -111,6 +113,9 @@ function onLocaleChange(next: UiLocale) {
       </div>
       <p v-else class="portal__empty">{{ tx("没有匹配的助手", "No matching assistants", "Nenhum assistente correspondente", "कोई मेल खाने वाला सहायक नहीं") }}</p>
     </main>
+
+    <!-- 返回顶部：滚动超过一屏 1/3 才出现；点击后平滑回顶并把焦点交给下面的标题（tabindex="-1"）。 -->
+    <BackToTop focus-target="#portal-title" />
   </div>
 </template>
 

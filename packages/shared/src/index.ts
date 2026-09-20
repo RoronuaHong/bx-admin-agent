@@ -64,6 +64,10 @@ export type ChatEvent =
       ticket: string;
       question: string;
       options: ClarifyOption[];
+      /** 缺的是哪个决策点（由模型声明，界面与日志展示用；未声明时不显示）。 */
+      missingField?: string;
+      /** 为什么它会影响答案或下一步动作（由模型声明，一句话）。 */
+      whyItMatters?: string;
       expiresInMs?: number;
     }
   | { type: "clarification_response"; id: string; answer?: string }

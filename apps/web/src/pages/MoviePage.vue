@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { computed, reactive, ref, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import BackToTop from "../components/BackToTop.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
+import ModelSelect from "../components/ModelSelect.vue";
 import { renderChatMarkdown } from "../chat-richtext";
 import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { agentText, findAgent } from "../agents";
 import { localizeToken } from "../localize";
 import {
   streamChat,
+  fetchModels,
   fetchConversations,
   fetchChatPreferences,
   createConversation,
@@ -17,6 +20,8 @@ import {
   clearConversationContext,
   getApiErrorToken,
   getApiErrorCode,
+  MODEL_AUTO_ID,
+  type ModelInfo,
 } from "../api";
 
 /**
@@ -54,6 +59,8 @@ interface Bubble {
   images?: Array<{ id: string; name: string }>;
   streaming?: boolean;
   error?: string;
+  /** 扩展思考（thinking 增量拼接）：仅作展示，不回灌模型上下文。 */
+  thinking?: string;
 }
 
 const bubbles = ref<Bubble[]>([]);
@@ -65,22 +72,47 @@ let seq = 0;
 let convId = "";
 let controller: AbortController | null = null;
 
+// ---- 模型选择（与 /chat 同源的「自动」逻辑）----
+// 模型列表来自服务端 /agent/models；空选 = 自动模式（运行时挑可用模型）。
+const models = ref<ModelInfo[]>([]);
+const modelId = ref<string>(MODEL_AUTO_ID);
+/** 当前生效模型（auto 已解析为具体模型）的展示名：服务端回传 model 事件时刷新。 */
+const activeModelLabel = ref("");
+const lastGoodModelId = ref<string>("");
+const failedModelIds = ref<Set<string>>(new Set());
+/**
+ * 「自动」模式解析：把 auto（或空/失效值）落到具体模型。
+ * 优先用「上次成功用过的模型」，否则按列表顺序挑第一个「近期未失败」的——
+ * 实现「哪个能用用哪个」：失败过的模型会被跳过，直到全部失败才重置黑名单重新探测。
+ */
+function resolveModel(value: string): string {
+  const ids = models.value.map((m) => m.id);
+  const usable = (id: string | undefined) => !!id && ids.includes(id) && !failedModelIds.value.has(id);
+  if (value && value !== MODEL_AUTO_ID && usable(value)) return value;
+  if (usable(lastGoodModelId.value)) return lastGoodModelId.value;
+  const next = ids.find((id) => !failedModelIds.value.has(id));
+  if (next) return next;
+  failedModelIds.value.clear();
+  return ids[0] ?? "";
+}
+const resolvedModelId = computed(() => resolveModel(modelId.value));
+
 /** 「清空对话」确认弹窗：清空不可撤销，用弹窗显式确认，避免「点错一下就没了」。 */
 const showClearModal = ref(false);
-/** 弹窗内「取消」按钮：打开时焦点落在这里——键盘用户的默认落点应该是安全操作。 */
-const clearCancelRef = ref<HTMLButtonElement | null>(null);
+/** 弹窗内「清空」按钮：打开时焦点落在这里——回车即执行，弹窗本身就是二次确认。 */
+const clearPrimaryRef = ref<HTMLButtonElement | null>(null);
 /** 触发弹窗的「清空对话」按钮：关闭后焦点还给它，否则焦点掉回 body、Tab 会从页首重来。 */
 const clearTriggerRef = ref<HTMLButtonElement | null>(null);
 
 /**
- * 打开：锁住背景滚动 + 焦点进入「取消」（默认落点是安全项，回车不会误清）；
+ * 打开：锁住背景滚动 + 焦点进入「清空」（与 `/chat` 的删除确认弹窗同一约定：回车=确认、Esc=取消）；
  * 关闭：解锁 + 焦点归还触发按钮。
  * 只做视觉不动焦点的话，键盘用户按 Tab 会逛到弹窗背后的页面上。
  */
 watch(showClearModal, async (open) => {
   document.body.style.overflow = open ? "hidden" : "";
   await nextTick();
-  if (open) clearCancelRef.value?.focus();
+  if (open) clearPrimaryRef.value?.focus();
   else clearTriggerRef.value?.focus();
 });
 
@@ -89,10 +121,64 @@ function isBusyError(err: unknown): boolean {
   return getApiErrorCode(err) === "CONVERSATION_BUSY";
 }
 
-function scrollToBottom() {
+/**
+ * 跟底开关（stick-to-bottom）：流式增量只在「当前已贴近底部」（48px 容差）时才自动跟随。
+ * 没有它，用户在生成中上滚阅读历史会被下一片增量拉回底部——「回到顶部」也就形同虚设。
+ * 判定挂在滚动容器的 scroll 事件上（程序滚动同样触发），滚回底部附近即自动恢复跟随。
+ */
+let followBottom = true;
+function nearBottom(el: HTMLElement, gap = 48): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < gap;
+}
+function onScroll() {
+  const el = scroller.value;
+  if (el) followBottom = nearBottom(el);
+}
+
+function scrollToBottom(force = false) {
+  if (!force && !followBottom) return;
   nextTick(() => {
     const el = scroller.value;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    // 执行时再按实时几何复核（阈值放宽到 240px：单片增量一般长不了这么多，超出只可能是用户上滚）。
+    // 只靠标记有个窗口：密集增量下滚动事件还没来得及把标记置假，排队中的回底会把用户刚滚上去的位置盖掉。
+    if (!force && !nearBottom(el, 240)) return;
+    if (force) followBottom = true;
+    el.scrollTop = el.scrollHeight;
+  });
+}
+
+/** 是否有真实思考内容：流式片段常只推来空白，直接判 thinking 会渲染出空面板。 */
+function hasThinking(b: Bubble): boolean {
+  return !!b.thinking && b.thinking.trim().length > 0;
+}
+
+/**
+ * 思考面板标题：有推理流时按「思考中 / 思考过程」区分进行态与完成态；
+ * 模型不出推理（非思考模型）时只说「正在生成」，不谎称在思考。
+ */
+function thinkingLabel(b: Bubble): string {
+  if (!hasThinking(b)) {
+    return tx("正在生成…", "Generating…", "Gerando…", "उत्तर बन रहा है…");
+  }
+  return b.streaming
+    ? tx("思考中…", "Thinking…", "Pensando…", "सोच रहा है…")
+    : tx("思考过程", "Thinking process", "Processo de pensamento", "सोच की प्रक्रिया");
+}
+
+/**
+ * 把思考面板滚到最新一行：面板限高内滚，不跟底的话用户只能盯着开头，
+ * 「实时过程」就退化成静态文本（思考增量很密，用 rAF 合并避免每片都触发布局）。
+ */
+let thinkStickQueued = false;
+function stickThinkingToBottom() {
+  if (thinkStickQueued) return;
+  thinkStickQueued = true;
+  requestAnimationFrame(() => {
+    thinkStickQueued = false;
+    const bodies = scroller.value?.querySelectorAll<HTMLElement>(".mc-think__body");
+    const last = bodies?.length ? bodies[bodies.length - 1] : null;
+    if (last) last.scrollTop = last.scrollHeight;
   });
 }
 
@@ -122,7 +208,7 @@ async function ensureConversation() {
     convId = conv.id;
     bubbles.value = [];
   }
-  scrollToBottom();
+  scrollToBottom(true); // 进入/新建对话是用户动作：无条件回底并重置跟底状态
 }
 
 async function persist() {
@@ -150,21 +236,36 @@ async function send() {
   input.value = "";
   autoGrow();
   const userBubble: Bubble = { id: ++seq, role: "user", text };
-  const reply: Bubble = { id: ++seq, role: "assistant", text: "", streaming: true };
+  // 必须用 reactive 包装：若 push 原始对象、之后又用原引用改属性，Vue 3 不会触发重渲染
+  // （表现：思考流与正文都不逐步显示，一直停在三点加载，直到收尾才整段蹦出来——用户感知就是「很慢」）。
+  const reply = reactive<Bubble>({ id: ++seq, role: "assistant", text: "", streaming: true });
   bubbles.value.push(userBubble, reply);
   sending.value = true;
-  scrollToBottom();
+  scrollToBottom(true); // 用户发送：无条件回底（新回复从底部开始展示）
   controller = new AbortController();
+  // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
+  const chosenModel = resolveModel(modelId.value);
+  activeModelLabel.value = models.value.find((m) => m.id === chosenModel)?.label || "";
   try {
     await streamChat(
       text,
-      { conversationId: convId, agentId: AGENT_ID },
+      // conversationId 显式带上 + agentId 供服务端按角色分流；model 走自动解析（auto = 不传则服务端按候选链兜底）。
+      { conversationId: convId, model: chosenModel || undefined, agentId: AGENT_ID },
       (event) => {
         if (event.type === "text_delta") {
           reply.text += event.text;
           scrollToBottom();
+        } else if (event.type === "thinking_delta") {
+          // 扩展思考增量：模型在正文之前先产出推理流（实测首个思考增量 +8.8s、首个正文 +27.2s），
+          // 此前这类事件被整段丢弃，用户只能看「三点加载」黑盒空转几十秒。仅作展示，不回灌上下文。
+          reply.thinking = (reply.thinking || "") + event.text;
+          scrollToBottom();
+          stickThinkingToBottom();
         } else if (event.type === "text") {
           reply.text = event.text;
+        } else if (event.type === "model") {
+          // 服务端实际选用的模型（含候选链自动切换）：刷新当前模型标签，用户可感知已切到备用模型。
+          activeModelLabel.value = event.label;
         } else if (event.type === "error") {
           // 第三参数是兜底 code 而非文案：token 自带 defaultMessage，直接本地化即可。
           reply.error = localizeToken(uiLocale.value, event.error);
@@ -203,6 +304,13 @@ async function send() {
     reply.streaming = false;
     sending.value = false;
     controller = null;
+    // 自动模式：本轮成功则记下来实际用到的具体模型（下次优先复用），失败则记入黑名单（下次跳过）。
+    // 仅「真正出错」计入——用户主动停止 / 对话繁忙 都不算模型不可用。
+    if (reply.error) failedModelIds.value.add(chosenModel);
+    else {
+      failedModelIds.value.delete(chosenModel);
+      if (!reply.error) lastGoodModelId.value = chosenModel;
+    }
     await persist();
     scrollToBottom();
   }
@@ -268,6 +376,12 @@ function autoGrow() {
 
 onMounted(async () => {
   window.addEventListener("keydown", onClearModalKeydown);
+  // 模型列表与对话恢复并行加载：列表不阻塞会话恢复（两者互不依赖）。
+  void fetchModels()
+    .then((list) => {
+      models.value = list || [];
+    })
+    .catch(() => undefined);
   await ensureConversation().catch(() => {});
 });
 
@@ -285,6 +399,8 @@ onBeforeUnmount(() => {
       <div class="mc-top-inner">
         <span class="mc-title">{{ AGENT_LABEL }}</span>
         <div class="mc-actions">
+          <!-- 模型选择：默认「自动」(AUTO)，由服务端候选链 + 前端失败黑名单共同选可用模型；与 /chat 同源。 -->
+          <ModelSelect v-model="modelId" :models="models" />
           <!-- 清空对话：与主题/语言控件同排同高；点击弹出确认框，确认后才真正清空。
                生成中禁用——清完还会被在途的流写回，先停止再清更符合直觉。 -->
           <button
@@ -322,7 +438,8 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div ref="scroller" class="mc-scroll">
+    <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
+    <div ref="scroller" class="mc-scroll" tabindex="-1" @scroll="onScroll">
       <div class="mc-inner">
         <!-- 空态：没有对话时给一张渐变欢迎卡，避免整页只剩一片空白。 -->
         <div v-if="!bubbles.length" class="mc-welcome">
@@ -350,16 +467,27 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="b.role === 'user'" class="mc-plain">{{ b.text }}</div>
             <template v-else>
+              <!-- 思考过程只在「等待期间」显示：推理流先于正文到达（实测首个思考增量 +8.8s），
+                   这段黑盒时间用它交代模型在干什么；正文/收束一旦出现就整块收掉，
+                   最终答案才是主角（助手类页面的约定；/chat 的推理面板不受此影响）。
+                   模型不出推理（非思考模型）时退回三点输入指示，标题只说「正在生成」，不谎称在思考。 -->
+              <details v-if="b.streaming" class="mc-think" open>
+                <summary class="mc-think__head">
+                  {{ thinkingLabel(b) }}
+                  <span v-if="!hasThinking(b)" class="mc-typing" aria-hidden="true"><span></span><span></span><span></span></span>
+                </summary>
+                <pre v-if="hasThinking(b)" class="mc-think__body">{{ b.thinking }}</pre>
+              </details>
               <div v-if="b.text" class="mc-md" v-html="renderChatMarkdown(b.text, uiLocale)"></div>
-              <!-- 正在生成且尚无文本时，显示三点输入指示。 -->
-              <div v-else-if="b.streaming && !b.error" class="mc-typing">
-                <span></span><span></span><span></span>
-              </div>
             </template>
             <div v-if="b.error" class="mc-error">{{ b.error }}</div>
           </div>
         </div>
       </div>
+
+      <!-- 回到顶部：挂在对话滚动容器内（滚动容器由组件自动识别）；avoid-selector 抬到输入区上方不压输入框，
+           threshold 用一个气泡高——观影对话可滚高度常常只有一两百像素。 -->
+      <BackToTop :threshold="120" avoid-selector=".mc-composer" focus-target=".mc-scroll" />
     </div>
 
     <form class="mc-composer" @submit.prevent="send">
@@ -446,8 +574,8 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="mc-modal__foot">
-            <button ref="clearCancelRef" type="button" class="mc-btn-ghost" @click="closeClearModal">{{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}</button>
-            <button type="button" class="mc-btn-danger" @click="confirmClear">{{ tx("清空", "Clear", "Limpar", "खाली करें") }}</button>
+            <button type="button" class="mc-btn-ghost" @click="closeClearModal">{{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}</button>
+            <button ref="clearPrimaryRef" type="button" class="mc-btn-danger" @click="confirmClear">{{ tx("清空", "Clear", "Limpar", "खाली करें") }}</button>
           </div>
         </div>
       </div>
@@ -914,11 +1042,78 @@ html[data-theme="dark"] .mc-welcome__hint {
   white-space: pre-wrap;
 }
 
+/* 思考过程面板：与正文明确区分（弱对比 + 等宽 + 限高内滚），避免和最终答案抢注意力。
+   折叠头一行常驻，流式时自动展开，收束后自动收起（用户手动展开的状态不会被增量重渲染重置）。 */
+.mc-think {
+  margin: 0 0 8px;
+  border: 1px solid rgba(125, 137, 160, 0.3);
+  border-radius: 8px;
+  background: rgba(125, 137, 160, 0.07);
+  font-size: 12.5px;
+}
+
+html[data-theme="dark"] .mc-think {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.mc-think__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  cursor: pointer;
+  color: #55637a;
+  font-size: 12.5px;
+  list-style: none;
+  user-select: none;
+}
+
+/* 去掉浏览器默认三角，改用自绘 caret（默认态右向、展开态下向，位置稳定不跳动）。 */
+.mc-think__head::-webkit-details-marker {
+  display: none;
+}
+
+.mc-think__head::before {
+  content: "▸";
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+.mc-think[open] > .mc-think__head::before {
+  content: "▾";
+}
+
+html[data-theme="dark"] .mc-think__head {
+  color: #a9b6c8;
+}
+
+/* 生成中：标题后内联三点弹跳（ChatGPT 风格的输入指示），与正文明确区分、单行不占第二行。 */
+.mc-think__body {
+  margin: 0;
+  padding: 0 9px 8px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #55637a;
+  /* 与 /chat 的推理面板同一结论：思考是自然语言过程，用正文同族无衬线
+     （中文没有像样的等宽族，mono 回退参差反而难看）。 */
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.62;
+}
+
+html[data-theme="dark"] .mc-think__body {
+  color: #a9b6c8;
+}
+
+/* 三点弹跳指示：标题行内联显示，单行不占第二行。 */
 .mc-typing {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 2px;
+  gap: 5px;
+  padding: 0 0 0 4px;
 }
 
 /* 单色弹跳三点：去掉渐变，更接近 iMessage / ChatGPT 的轻量输入指示。 */

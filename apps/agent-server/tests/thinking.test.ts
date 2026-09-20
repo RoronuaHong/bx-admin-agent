@@ -189,6 +189,24 @@ describe("thinking 事件流（callAgent 透传 + 解析正确性）", () => {
     expect(res.text).toBe("Offline answer.");
   });
 
+  it("内部辅助调用可关思考（thinking:{type:'disabled'}）；默认不带该字段", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        bodies.push(init?.body ? JSON.parse(init.body) : null);
+        return sse(openaiPlainSse.split("\n"));
+      }),
+    );
+    const model = makeModel("openai", "probe-thinking-flag", "probe-thinking-flag");
+
+    await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, { disableThinking: true });
+    expect((bodies[0] as { thinking?: unknown }).thinking).toEqual({ type: "disabled" });
+
+    await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, {});
+    expect((bodies[1] as { thinking?: unknown }).thinking).toBeUndefined();
+  });
+
   it("openai o 系列：delta.reasoning 转发、不泄漏进正文", async () => {
     const fetchMock = vi.fn(async () => sse(openaiReasoningSse.split("\n")));
     vi.stubGlobal("fetch", fetchMock);

@@ -92,13 +92,12 @@ const ROLES: Record<string, AgentRole> = {
     // 服务端不做语义正则）；纠正用尽仍无数据则改用「受约束的诚实兜底」（禁止任何事实性断言），
     // 绝不展示可能编造的内容。通用角色不开启。
     enforceGrounding: true,
-    // 观影助手默认模型 = kimi26（kimi-k2.6，TokenHub）：与全局默认同一款，钉住是为了「首页默认模型被改掉时，
-    // 观影助手仍用已验证能遵守工具纪律的模型」。选它的理由：遵循「必须先调观影工具」指令、返回 TMDb 真实数据、
-    // 查不到如实说「没查到」，不凭记忆编造；该端点不支持 tool_choice=required（见上），工具调用纪律靠人设 + 接地护栏保证。
-    // 用户仍可在 UI 手动切其它模型；切到弱模型时 unavailable 护栏与伪调用检测仍是兜底。
-    // 注意：id 必须存在于 MODEL_PROVIDERS（.env）——钉住的模型被下线/改名后会静默回落到全局默认模型，
-    // 服务端会用 [chat:model] 日志如实告警，排查「页面用的模型和这里写的不一致」先看那条日志。
-    defaultModel: "kimi26",
+    // 默认模型：不钉死（2026-09-20 用户要求模型走 auto）——跟随服务端默认（MODEL_PROVIDERS 首位），
+    // 且首选模型失败（含额度耗尽 / 参数错误等确定性失败）时由 chat.ts 的候选链自动切到下一个可用模型。
+    // 原钉 kimi26 的理由（遵循「必须先调观影工具」、不凭记忆编造）由人设第 1/2/3 条 + enforceGrounding 承担；
+    // 该端点不支持 tool_choice=required（见上），工具调用纪律本就不靠钉模型保证。
+    // 若某天确需钉回：加一行 defaultModel: "<id>"（id 必须存在于 MODEL_PROVIDERS，否则服务端打
+    // [chat:model] 告警并回落全局默认）。
   },
   support: {
     id: "support",

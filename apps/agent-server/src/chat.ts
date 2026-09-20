@@ -4,7 +4,7 @@
 //           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
-import type { ChatEvent, RiskLevel, TodoItem } from "@bx/shared";
+import type { ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
@@ -233,7 +233,7 @@ async function probeNeedsExternalData(model: ModelEntry, question: string, signa
       [],
       signal,
       undefined,
-      { systemParts: { stable: DATA_NEED_SYSTEM, dynamic: "" } },
+      { systemParts: { stable: DATA_NEED_SYSTEM, dynamic: "" }, disableThinking: true },
     );
     return parseDataNeed(result.text);
   } catch (err) {
@@ -255,7 +255,7 @@ async function honestFallbackWith(
       [],
       signal,
       undefined,
-      { systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" } },
+      { systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" }, disableThinking: true },
     );
     return result.text.trim() || null;
   } catch (err) {
@@ -269,9 +269,18 @@ function truncateArgs(raw: string): string {
   return text.length > HANDLE_ARGS_CHARS ? `${text.slice(0, HANDLE_ARGS_CHARS)}…` : text;
 }
 
-/** 判定模型调用错误是否瞬态（可重试）：限流/5xx/超时/中断/网络抖动。4xx 等永久错误返回 false。 */
+/**
+ * 判定模型调用错误是否「瞬态」（同一模型重试有意义）：限流 / 5xx / 超时 / 中断 / 网络抖动。
+ * 额度类（402 / 401008 / 额度不足）与参数 / 鉴权类（400 / 401 / invalid_request）是确定性失败：
+ * 同模型重试只会得到同一结果，应直接交给候选链切下一个模型。
+ * 注意必须先做确定性排除再跑正向匹配——上游错误 JSON 里顺带的词（如 "source":"gateway"）
+ * 会把 402 误判成瞬态，让每个死模型都白打满重试次数（实测 kimi26 额度耗尽即如此）。
+ */
 function isTransientModelError(msg: string | null): boolean {
   if (!msg) return false;
+  if (/(?:model http )?40[012]\b|401008|额度不足|额度已耗尽|permission_error|invalid_request_error|unauthorized/i.test(msg)) {
+    return false;
+  }
   return /(?:429|503|5\d\d|timeout|timed?\s*out|abort|rate\s*limit|freeusagelimit|econn|fetch failed|network|socket|模型服务暂时不可用|gateway)/i.test(
     msg,
   );
@@ -303,6 +312,30 @@ export function looksLikePseudoToolCall(text: string, toolNames: ReadonlySet<str
 function handleSummary(content: string): string {
   const lines = content ? content.split("\n").length : 0;
   return `${lines} 行 / ${content.length} 字符`;
+}
+
+/**
+ * 澄清回执（对齐「答案必须绑定回被问的那一项」的通行做法）：
+ * 用户点选 = 回传值恰好等于某个选项标题；自由文本 = 回传值不等于任何选项标题；跳过/超时 = 显式说明。
+ * 三种口径分开表述，避免出现「用户已澄清：X」而 X 其实只是模型自己给的兜底选项——那对模型是零信息，
+ * 它只会卡住（实测：用户点了「其他…」之后模型直接空回复）。
+ * 判定只做字符串相等（协议层），不解读语义、不含任何词表。
+ */
+export function buildClarifyAck(
+  answer: { confirmed: boolean; timedOut: boolean; value?: string },
+  options: ClarifyOption[],
+): string {
+  if (answer.timedOut) return "等待澄清超时：请按最合理的理解继续，并在回复里说明你的假设。";
+  // 非确认（拒绝）与空值统一按「跳过」处理：拒绝时不应把任何值当作用户的选择。
+  if (!answer.confirmed || !answer.value) return "用户跳过了澄清：请按最合理的理解继续，并在回复里说明你的假设。";
+  const picked = options.find((opt) => opt.label === answer.value);
+  if (!picked) return `用户补充说明：${answer.value}。据此继续。`;
+  const note = picked.description ? `（该选项说明：${picked.description}）` : "";
+  return (
+    `用户选择了选项「${picked.label}」${note}。据此继续；` +
+    "如果这条选择仍不足以确定你要的信息（例如它只是一个没有指明具体内容的兜底项），" +
+    "请就最关键的一点再具体追问一次，不要凭空假设。"
+  );
 }
 
 // 确认卡参数摘要（P0-6）：键名命中敏感词的值脱敏，值截断。
@@ -996,6 +1029,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     const calls = outcome.toolCalls;
     let index = 0;
 
+    /**
+     * 本轮是否请求了结构化澄清：包含时，冻结本轮其余**非只读**调用
+     * （对齐澄清的通行做法：问题未答前不得产生会锁定方向的副作用，只读探查仍放行）。
+     * 判据只看风险级别，与参数内容、模型措辞无关。
+     */
+    const clarifyRequestedThisRound = calls.some((item) => item.name === "request_clarification");
+
     /** 审计基础字段（串行 / 并发两条路径共用，保证留痕口径一致）。 */
     const auditBaseOf = (c: ToolCall, v: ReturnType<typeof resolveToolRisk>) => ({
       conversationId: ctx.conversationId,
@@ -1288,6 +1328,20 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         appendAudit({ kind: "gate", decision: "denied", ...auditBase });
         continue;
       }
+      // 待澄清期间冻结非只读调用（问题未答前不得产生会锁定方向的副作用；只读探查照常放行）。
+      // 被冻结的调用不算失败（不计入失败熔断），模型收到回答后如需再做可重新调用。
+      if (clarifyRequestedThisRound && verdict.level !== "read") {
+        ok = false;
+        rawText =
+          `本轮你请求了澄清，在用户回答之前该操作（${verdict.level}）已暂缓、未执行；` +
+          "拿到用户的回答后，如果仍需要做这件事，请重新调用。";
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "已暂缓（等待澄清）" });
+        // 闸门决策留痕：与其他 gate 口径一致，便于审计追溯「pending 期间拦下了哪些写操作」。
+        appendAudit({ kind: "gate", decision: "clarify_deferred", ...auditBase });
+        continue;
+      }
       if (verdictNeedsConfirm(verdict)) {
         // 先登记等待器（拿到票据）再下发确认事件：避免调用方在 waiter 注册前应答导致永久挂起（竞态）。
         const pending = requestConfirmation({
@@ -1359,6 +1413,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             ticket: pending.ticket,
             question: builtin.clarification.question,
             options: builtin.clarification.options,
+            ...(builtin.clarification.missingField ? { missingField: builtin.clarification.missingField } : {}),
+            ...(builtin.clarification.whyItMatters ? { whyItMatters: builtin.clarification.whyItMatters } : {}),
             expiresInMs: pending.timeoutMs,
           };
           const answer = await pending.wait;
@@ -1367,12 +1423,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             id: call.id,
             ...(answer.value ? { answer: answer.value } : {}),
           };
-          ok = true;
-          rawText = answer.value
-            ? `用户已澄清：${answer.value}。据此继续。`
-            : answer.timedOut
-              ? "等待澄清超时：请按最合理的理解继续，或在回复里说明还需要什么信息。"
-              : "用户跳过了澄清：请按最合理的理解继续，并在回复里说明你的假设。";
+          // 回执按「点选 / 自由文本 / 跳过 / 超时」分口径构造（见 buildClarifyAck）；
+          // ok 已由 builtin.ok（澄清成功必为 true）给出，无需重复赋值。
+          rawText = buildClarifyAck(answer, builtin.clarification.options);
         }
       } else if (ctx.toolSearch && specOfTool.has(call.name) && !ctx.loadedTools.has(call.name)) {
         // 按需加载模式：没检索加载过的工具不给调用（模型是照着索引里的名字猜的，参数说明它没见过）。
@@ -1507,8 +1560,11 @@ async function* runSubagent(
     return { id: call.id, args: call.argsJson, ok: false, text: resolved.error, toolCalls: 0 };
   }
   const subTools = resolved.tools;
+  // 子代理不得向用户提问（排除 request_clarification）：用户决策权归父任务（对齐 Deep Agents
+  // 「子代理只能回传候选」）——子代理的澄清要么到不了用户（挂到超时），要么绕过父代理的决策上下文。
   const subBuiltins = builtinToolSpecs({ toolSearch: ctx.toolSearch }).filter(
-    (spec) => spec.name !== "task" && spec.name !== "write_todos",
+    (spec) =>
+      spec.name !== "task" && spec.name !== "write_todos" && spec.name !== "request_clarification",
   );
 
   const subagentId = nextSubagentId(ctx.conversationId);
@@ -1859,14 +1915,22 @@ export async function* chatStream(
     groundingVerifications = loop.groundingVerifications || 0;
     ungrounded = loop.ungrounded || false;
     costTokens = loop.spentTokens || 0;
-    if (!outcome.failure) break;
+    if (!outcome.failure) {
+      // 成功必须清掉前序候选残留的 failure：否则第一个模型的 402 会阴魂不散地
+      // 给成功结果拼上「⚠️ 生成中断」尾巴（实测 kimi26 402 → 后续候选成功仍带中断提示）。
+      failure = null;
+      break;
+    }
     failure = outcome.failure;
-    if (!isTransientModelError(failure)) break; // 永久错误不切模型
+    // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
+    // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
+    // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，
+    // 实测 kimi26 额度耗尽 → 切到 kimi27hs 报 400 → 链直接断，后面 10 个注册模型根本没试）。
     // 安全护栏：已执行过工具调用（可能含写操作 / 用户已确认的调用）时不再换模型重跑，
     // 避免重复副作用；此时直接按失败收束（下方会保留已生成的中间结果）。
     if (toolCalls > 0) break;
     modelFallbacks += 1;
-    console.log(`[chat:fallback] model ${m.label} failed (${failure}); trying next candidate`);
+    console.log(`[chat:fallback] model ${m.label} failed (${failure.slice(0, 200)}); trying next candidate`);
   }
 
   const usage: ChatEvent = {
