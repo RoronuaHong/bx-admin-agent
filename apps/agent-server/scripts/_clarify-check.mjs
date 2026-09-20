@@ -34,6 +34,24 @@ await check("合法入参返回 clarification（由 chat 循环去挂起）", as
   assert.equal(out.clarification.options[1].description, "说明");
 });
 
+await check("澄清契约字段（缺哪个决策点 / 为什么影响答案）带出，且缺省不算错", async () => {
+  const withContract = await call({
+    question: "哪个范围？",
+    missing_field: "统计范围",
+    why_it_matters: "不同范围会得到完全不同的结论。",
+    options: [{ label: "A" }, { label: "B" }],
+  });
+  assert.equal(withContract.ok, true, withContract?.text);
+  assert.equal(withContract.clarification.missingField, "统计范围");
+  assert.equal(withContract.clarification.whyItMatters, "不同范围会得到完全不同的结论。");
+
+  // 弱模型漏填契约字段时不该把整次澄清判失败（可选字段）。
+  const withoutContract = await call({ question: "哪个范围？", options: [{ label: "A" }, { label: "B" }] });
+  assert.equal(withoutContract.ok, true);
+  assert.equal(withoutContract.clarification.missingField, undefined);
+  assert.equal(withoutContract.clarification.whyItMatters, undefined);
+});
+
 await check("缺 question 被拒", async () => {
   const out = await call({ options: [{ label: "A" }, { label: "B" }] });
   assert.equal(out.ok, false);

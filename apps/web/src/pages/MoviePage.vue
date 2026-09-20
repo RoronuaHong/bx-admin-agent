@@ -3,8 +3,8 @@ import { computed, reactive, ref, watch, onMounted, onBeforeUnmount, nextTick } 
 import BackToTop from "../components/BackToTop.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
-import ModelSelect from "../components/ModelSelect.vue";
 import { renderChatMarkdown } from "../chat-richtext";
+import { smoothScrollTo } from "../smooth-scroll";
 import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { agentText, findAgent } from "../agents";
 import { localizeToken } from "../localize";
@@ -144,7 +144,8 @@ function scrollToBottom(force = false) {
     // 只靠标记有个窗口：密集增量下滚动事件还没来得及把标记置假，排队中的回底会把用户刚滚上去的位置盖掉。
     if (!force && !nearBottom(el, 240)) return;
     if (force) followBottom = true;
-    el.scrollTop = el.scrollHeight;
+    // 显式回底（进入/新建对话、发送）走自定义缓动平滑滚动给「滑动」过渡；流式跟底（force=false）保持即时贴合，避免平滑动画期间内容增长留缝。
+    smoothScrollTo(el, el.scrollHeight);
   });
 }
 
@@ -399,8 +400,8 @@ onBeforeUnmount(() => {
       <div class="mc-top-inner">
         <span class="mc-title">{{ AGENT_LABEL }}</span>
         <div class="mc-actions">
-          <!-- 模型选择：默认「自动」(AUTO)，由服务端候选链 + 前端失败黑名单共同选可用模型；与 /chat 同源。 -->
-          <ModelSelect v-model="modelId" :models="models" />
+          <!-- 观影助手页面不展示模型选择器：模型仍走「自动」逻辑（send() 内 resolveModel 自动选可用模型），
+               仅隐藏 UI 控件，避免把内部模型切换暴露给终端用户。 -->
           <!-- 清空对话：与主题/语言控件同排同高；点击弹出确认框，确认后才真正清空。
                生成中禁用——清完还会被在途的流写回，先停止再清更符合直觉。 -->
           <button

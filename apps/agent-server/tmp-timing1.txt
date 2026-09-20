@@ -1,9 +1,0 @@
-[+0.0s] POST /chat/stream → HTTP 200
-[+0.0s] model
-[+0.0s] model
-[+14.8s] text
-[+14.8s] usage  {"type":"usage","tokens":5,"budget":74152,"window":128000,"turns":0,"dropped":0,"summarized":false,"toolResultsCleared":0,"toolResultsOffloaded":0,"rounds":2,"t
-[+14.8s] done
-
-首个思考增量：+1.0s｜首个正文增量：+14.8s｜结束：+14.8s
-最终回复：好的，休息愉快，有需要随时叫我。

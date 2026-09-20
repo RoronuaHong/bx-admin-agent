@@ -464,6 +464,34 @@ export function isReasoningReplayRejected(detail: string): boolean {
   return /(missing|required|absent|not\s+found|expect|need|invalid|empty)/i.test(text);
 }
 
+/**
+ * 关思考（disableThinking）同样受端点兼容性制约：部分端点（如 kimi27hs）只接受 thinking:{type:"enabled"}，
+ * 收 disabled 会 400（"invalid thinking: only type=enabled is allowed"）。按端点运行时学习：首跳被拒 → 记住不支持
+ * → 之后内部辅助调用省略 thinking 字段（模型按默认开启），避免每次白打 400 拖垮接地护栏的兜底路径。
+ */
+const disableThinkingUnsupportedEndpoints = new Set<string>();
+
+/** 该模型端点是否仍可尝试关闭思考（false = 已实测被拒，辅助调用省略 thinking 字段）。 */
+export function disableThinkingSupported(model: ModelEntry): boolean {
+  return !disableThinkingUnsupportedEndpoints.has(openAiEndpointKeyOf(model));
+}
+
+/** 记录「该端点不支持关闭思考」（进程内记忆；首跳报错由调用方传入）。 */
+function markDisableThinkingUnsupported(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (disableThinkingUnsupportedEndpoints.has(key)) return;
+  disableThinkingUnsupportedEndpoints.add(key);
+  console.warn(
+    `[models] 端点不支持关闭思考（模型 ${model.id}）：内部辅助调用改为省略 thinking 字段，由模型按默认处理`,
+  );
+}
+
+/** 判定一次失败是否属于「端点拒绝 disabled 思考」。只认 thinking 相关的通用报错措辞，不绑定厂商。 */
+function isThinkingDisabledRejected(detail: string): boolean {
+  const text = String(detail || "");
+  return /invalid thinking|only type=enabled is allowed|type=disabled|thinking.*(not.*allowed|invalid|unsupported)/i.test(text);
+}
+
 /** 转成 OpenAI 消息：assistant 带 tool_calls，工具结果用 role:tool 回灌。 */
 function toOpenAiMessages(
   model: ModelEntry,
@@ -562,8 +590,9 @@ async function callOpenAi(
       messages,
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
-      // 内部辅助调用按需关思考（见 CallOptions.disableThinking 的实测记录）。
-      ...(opts.disableThinking ? { thinking: { type: "disabled" } } : {}),
+      // 内部辅助调用按需关思考（见 CallOptions.disableThinking 的实测记录）；
+      // 该端点实测不支持 disabled 时省略字段（运行时学习，见 markDisableThinkingUnsupported）。
+      ...(opts.disableThinking && disableThinkingSupported(model) ? { thinking: { type: "disabled" } } : {}),
     };
     if (functionTools.length) {
       body.tools = functionTools;
@@ -590,6 +619,13 @@ async function callOpenAi(
     if (!alreadyReplaying && isReasoningReplayRejected(detail)) {
       markReasoningReplayRequired(model);
       response = await postOnce(true);
+      detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+    }
+    // 学习型自愈：端点拒绝 disabled 思考（如 kimi27hs 只接受 enabled）→ 记住并去掉 thinking 字段重发一次，
+    // 否则每次辅助调用都白打 400，连带拖垮接地护栏的兜底路径（问候/超范围提问被回成「没取到数据」）。
+    if (opts.disableThinking && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
+      markDisableThinkingUnsupported(model);
+      response = await postOnce(alreadyReplaying);
       detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
     }
   }
