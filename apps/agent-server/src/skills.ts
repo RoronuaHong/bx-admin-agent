@@ -11,6 +11,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const SKILLS_DIR = resolve(__dirname, "..", "skills");
 const SKILL_FILE = "SKILL.md";
 
+/**
+ * 勾选注入的技能全文总字符上限（动态段必须有硬上限）。
+ * 用户可勾选多个技能，全文累加（单个 SKILL.md 动辄数千字）会挤占历史与工具结果预算；
+ * 超出后不再注入后续技能，并在末尾注明（不静默丢内容）。
+ */
+const ENABLED_SKILLS_INJECT_CHARS = Number(process.env.SKILLS_INJECT_CHARS || 12_000);
+
 export interface SkillMeta {
   name: string;
   description: string;
@@ -110,16 +117,28 @@ export function renderEnabledSkills(dirs: string[] | null | undefined): string {
   if (!dirs?.length) return "";
   const blocks: string[] = [];
   const seen = new Set<string>();
+  let used = 0;
+  let skipped = 0;
   for (const dir of dirs) {
     if (typeof dir !== "string" || !dir || seen.has(dir)) continue;
     seen.add(dir);
     const content = readSkill(dir);
     if (content == null) continue; // 目录已删除等：跳过，不编造
-    blocks.push(`<skill name="${dir}">\n${content}\n</skill>`);
+    const block = `<skill name="${dir}">\n${content}\n</skill>`;
+    if (used + block.length > ENABLED_SKILLS_INJECT_CHARS) {
+      skipped += 1;
+      continue;
+    }
+    used += block.length;
+    blocks.push(block);
   }
   if (!blocks.length) return "";
+  const tail = skipped > 0 ? `\n…（另有 ${skipped} 个技能因超出注入上限未注入，必要时用 read_skill 按需读取）` : "";
   return [
     "以下是用户为本对话指定的技能全文，与本轮任务相关时**优先按其中步骤执行**：",
     ...blocks,
-  ].join("\n\n");
+    tail,
+  ]
+    .filter((part) => part)
+    .join("\n\n");
 }

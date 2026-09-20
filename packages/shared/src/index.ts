@@ -17,6 +17,12 @@ export interface TodoItem {
 /** 工具风险级别（副作用强弱；数据外发是另一正交轴，后续再扩展）。 */
 export type RiskLevel = "read" | "write" | "destructive";
 
+/** 结构化澄清的一个选项（工具 request_clarification 的产物）。 */
+export interface ClarifyOption {
+  label: string;
+  description?: string;
+}
+
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
@@ -50,6 +56,17 @@ export type ChatEvent =
       expiresInMs?: number;
     }
   | { type: "confirmation_response"; id: string; confirmed: boolean }
+  | {
+      /** 结构化澄清（工具 request_clarification）：把「散文追问」升级为带选项的选项卡。 */
+      type: "clarification_required";
+      id: string;
+      /** 与确认卡同源的一次性票据（会话绑定、超时按「跳过」处理）。 */
+      ticket: string;
+      question: string;
+      options: ClarifyOption[];
+      expiresInMs?: number;
+    }
+  | { type: "clarification_response"; id: string; answer?: string }
   | { type: "todos"; todos: TodoItem[] }
   | {
       /** 子代理（task）启动：独立事件维度，旧前端忽略未知 type 即可向后兼容。 */

@@ -76,8 +76,16 @@ const server = http.createServer(async (req, res) => {
     let buf = "";
     for await (const c of req) buf += c;
     const body = JSON.parse(buf) as { tools?: Array<{ function?: { name?: string } }> };
-    const isMain = (body.tools || []).some((t) => t.function?.name === "task");
+    const tools = body.tools || [];
+    const isMain = tools.some((t) => t.function?.name === "task");
+    // Chain-of-Verification 的事后核验调用不携带工具（只送回证据与答案让模型判定），
+    // 若当成「子代理」会误返回 fs_write 工具调用、在无工具上下文里空转。识别为「无工具」即直接回空断言 JSON。
+    const isVerify = tools.length === 0;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (isVerify) {
+      res.end(sse([textChunk('{"unsupported":[]}')]));
+      return;
+    }
     // 主：① 委派子代理 → ② 自己写工作区 → ③ 收尾；子：① 尝试写（应被拒）→ ② 收尾。
     const step = isMain ? mainN++ : subN++;
     const payload = isMain
@@ -100,12 +108,15 @@ let chatStream: (typeof import("../src/chat.js"))["chatStream"];
 let createConversation: (typeof import("../src/conversations.js"))["createConversation"];
 let fsRead: (typeof import("../src/fs-store.js"))["fsRead"];
 let fsRemoveConversation: (typeof import("../src/fs-store.js"))["fsRemoveConversation"];
+// 端到端里没有真人点确认卡：自动放行主代理的写操作确认，否则确认 waiter 永不 resolve → 挂到超时。
+let answerConfirmation: (typeof import("../src/confirm.js"))["answerConfirmation"];
 
 beforeAll(async () => {
   await new Promise<void>((resolve) => server.listen(PORT, "127.0.0.1", resolve));
   ({ chatStream } = await import("../src/chat.js"));
   ({ createConversation } = await import("../src/conversations.js"));
   ({ fsRead, fsRemoveConversation } = await import("../src/fs-store.js"));
+  ({ answerConfirmation } = await import("../src/confirm.js"));
 });
 
 afterAll(() => {
@@ -118,8 +129,14 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
   (conv as { mcpServers: string[]; model: string }).mcpServers = ["mock"];
   (conv as { model: string }).model = "mock";
 
+  const SESSION = "verify-session";
   const seen = { model: false, task: false, subagentRan: false, mainWrote: false, finalText: false, done: false };
-  for await (const ev of chatStream("verify-deep", "请完成一个多步任务", {}, undefined)) {
+  for await (const ev of chatStream("verify-deep", "请完成一个多步任务", { sessionId: SESSION }, undefined)) {
+    // 端到端没有真人点确认卡：自动放行主代理的写操作确认，避免 waiter 挂到超时（子代理写仍被只读闸门拒绝）。
+    if (ev.type === "confirmation_required") {
+      answerConfirmation((ev as { ticket: string }).ticket, SESSION, true);
+      continue;
+    }
     const t = ev.type;
     if (t === "model") seen.model = true;
     else if (t === "tool_call") {

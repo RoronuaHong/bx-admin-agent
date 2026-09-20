@@ -1,4 +1,7 @@
 // 原生 SQL 只读判定（服务端单一真相，fail-closed）。
+// ⚠️ MCP 适配器侧另有一份同口径实现（scripts/metabase-mcp.mjs 的 isReadOnlySql），
+// 属刻意纵深防御（适配器粗筛 + 服务端硬拒）。本文件是权威口径——改动白名单/黑名单/危险构造时，
+// 必须同步修改 mjs 侧，否则会出现「适配器放行、服务端拒绝」或反之的口径漂移。
 // 首词白名单。
 const LEADING_KEYWORDS = ["select", "with", "show", "describe", "desc", "explain"];
 

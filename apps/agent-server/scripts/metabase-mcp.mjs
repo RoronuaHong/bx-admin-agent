@@ -78,7 +78,12 @@ const RO_DENY_PATTERNS = [/into\s+(out|dump)file/, /load_file\s*\(/, /pg_read_fi
 function stripSqlComments(s) {
   return s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n\r]*/g, " ");
 }
-/** 是否可安全放行的单条只读查询（脱引号/注释后判定，避免字面量/注释里的关键字被误判）。 */
+/**
+ * 是否可安全放行的单条只读查询（脱引号/注释后判定，避免字面量/注释里的关键字被误判）。
+ * ⚠️ 口径一致性：服务端另有**权威判定** `src/sql-readonly.ts` 的 `isReadOnlySql`（经 src/risk.ts
+ * 在工具抵达 MCP 之前再拦一道）。两处是刻意的纵深防御（适配器粗筛 + 服务端硬拒），
+ * 但口径必须一致——修改本函数的白名单/黑名单/多语句规则时，必须同步修改 `src/sql-readonly.ts`。
+ */
 function isReadOnlySql(raw) {
   const sql = stripSqlComments(String(raw ?? ""))
     .replace(/'[^']*'/g, "''")

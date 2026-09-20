@@ -21,6 +21,8 @@ export interface AuditEvent {
   decision: AuditDecision;
   conversationId?: string;
   sessionId?: string;
+  /** 设备 owner 标注；缺省 = 遗留事件（对所有人可见，与对话口径一致）。 */
+  ownerKey?: string;
   tool: string;
   server?: string;
   level?: string;
@@ -67,6 +69,8 @@ export interface AuditFilter {
   decision?: AuditDecision;
   tool?: string;
   limit?: number;
+  /** 归属过滤：命中该 owner 的事件 + 无主遗留事件（与对话/记忆同一口径）。 */
+  ownerKey?: string;
 }
 
 function dayToTs(day: string, endOfDay: boolean): number {
@@ -107,6 +111,8 @@ export function listAuditEvents(filter: AuditFilter = {}): AuditEvent[] {
           if (to && event.at > to) continue;
           if (filter.decision && event.decision !== filter.decision) continue;
           if (filter.tool && event.tool !== filter.tool) continue;
+          // 归属隔离：只返回本 owner 的事件与无主遗留事件（HTTP 侧最小权限；全局视角走 CLI）。
+          if (filter.ownerKey && event.ownerKey && event.ownerKey !== filter.ownerKey) continue;
           events.push(event);
           if (events.length >= limit) return events;
         } catch {

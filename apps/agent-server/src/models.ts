@@ -534,22 +534,27 @@ async function callOpenAi(
   // 已确认不支持的网关直接跳过注入，省掉「先失败再降级」的额外往返。
   const webSearchWanted = !!opts.webSearch && !webSearchUnsupportedHosts.has(base);
   let response = await attempt(webSearchWanted);
+  // 失败详情只读一次：Response body 是单次消费流，第二次 .text() 只能拿到空串，
+  // 会把网关的真实报错吞成一句「model http 400: 」（排查时完全看不到原因）。
+  let failureDetail = "";
   if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).slice(0, 500);
+    failureDetail = (await response.text().catch(() => "")).slice(0, 500);
     const webSearchBroke =
       webSearchWanted &&
       (response.status === 400 ||
-        /web.?search|unsupported.?tool|unknown parameter|tool_choice|invalid.*tool/i.test(detail));
+        /web.?search|unsupported.?tool|unknown parameter|tool_choice|invalid.*tool/i.test(failureDetail));
     if (webSearchBroke) {
       webSearchUnsupportedHosts.add(base);
       console.warn(
-        `[models] 网关不支持联网搜索工具（${response.status}），自动降级为不带搜索重试（后续该网关将直接跳过联网搜索）：${detail}`,
+        `[models] 网关不支持联网搜索工具（${response.status}），自动降级为不带搜索重试（后续该网关将直接跳过联网搜索）：${failureDetail}`,
       );
       response = await attempt(false);
+      // 换了新响应对象：详情留空，由下面那处按需重新读取这次响应的 body。
+      failureDetail = "";
     }
   }
   if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).slice(0, 500);
+    const detail = failureDetail || (await response.text().catch(() => "")).slice(0, 500);
     if (/401006|"code"\s*:\s*402|402/.test(detail) || response.status === 402) {
       throw new Error(
         `model http ${response.status}: 模型服务未开通或额度不足（${model.name}）。` +

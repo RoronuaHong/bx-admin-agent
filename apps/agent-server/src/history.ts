@@ -18,8 +18,12 @@ const TABLE_MAX_LINES = 12;
 /** 摘要生成的输入上限（字符）：更早的部分已被逐条裁剪，正常到不了这里。 */
 const COMPACT_INPUT_CHARS = 24_000;
 
+/** 摘要软目标（写进提示词）与硬上限（服务端截断）：提示词要求会被弱模型忽略，硬护栏才保证预算。 */
+const SUMMARY_TARGET_CHARS = 600;
+const SUMMARY_MAX_CHARS = Number(process.env.HISTORY_SUMMARY_CHARS || 1200);
+
 const SUMMARIZE_PROMPT =
-  "把以下对话压缩成一份摘要，供后续对话作为背景使用。必须保留：\n" +
+  `把以下对话压缩成一份摘要，供后续对话作为背景使用（${SUMMARY_TARGET_CHARS} 字以内）。必须保留：\n` +
   "1) 用户的目标与约束；2) 已确认的结论与关键数字；3) 执行过的工具调用（工具名 + 关键参数）；4) 未完成事项。\n" +
   "不要评论、不要输出标题以外的客套话，直接输出摘要正文。\n\n对话内容：\n";
 
@@ -146,7 +150,9 @@ export async function assembleContext(input: AssembleInput): Promise<AssembleRes
     const prompt = summary ? `已有摘要：\n${summary}\n\n新增对话：\n${body}` : body;
     const next = await input.compact(SUMMARIZE_PROMPT + prompt).catch(() => "");
     if (!next || !next.trim()) return false;
-    summary = next.trim();
+    let next2 = next.trim();
+    if (next2.length > SUMMARY_MAX_CHARS) next2 = `${next2.slice(0, SUMMARY_MAX_CHARS)}…（摘要已截断）`;
+    summary = next2;
     covered += absorb.length;
     compacted = true;
     return true;

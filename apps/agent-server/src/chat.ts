@@ -4,10 +4,10 @@
 //           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
-import type { ChatEvent, RiskLevel } from "@bx/shared";
+import type { ChatEvent, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
-import { requestConfirmation } from "./confirm.js";
+import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
 import { offloadToolResult } from "./fs-store.js";
@@ -73,6 +73,41 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
+/**
+ * 从 `start` 起收集一段**连续的**可并发调用（纯函数，便于单测）。
+ * 遇到「已执行过 / 批内重复 / 已熔断 / 不可并发」任一项即停止，长度受 `max` 限制。
+ * 连续段的语义：不重排模型给出的顺序，也不跳过中间某个调用去凑批。
+ */
+export function planConcurrentBatch<T extends { name: string; argsJson: string }>(
+  calls: readonly T[],
+  opts: {
+    start: number;
+    max: number;
+    signature: (name: string, argsJson: string) => string;
+    isExecuted: (sig: string) => boolean;
+    isFused: (name: string) => boolean;
+    canRun: (name: string, argsJson: string) => boolean;
+  },
+): Array<{ call: T; sig: string }> {
+  const out: Array<{ call: T; sig: string }> = [];
+  const seen = new Set<string>();
+  for (let j = opts.start; j < calls.length && out.length < opts.max; j += 1) {
+    const c = calls[j]!;
+    const sig = opts.signature(c.name, c.argsJson);
+    if (opts.isExecuted(sig) || seen.has(sig)) break;
+    if (opts.isFused(c.name)) break;
+    if (!opts.canRun(c.name, c.argsJson)) break;
+    seen.add(sig);
+    out.push({ call: c, sig });
+  }
+  return out;
+}
+
+/**
+ * 单轮里可并发执行的调用上限（G1）：模型一轮返回多个独立只读调用时并发发出，
+ * 省掉 N×RTT。上限避免一次打爆上游；需要确认的写操作与交互式调用永不进并发批。
+ */
+const MAX_CONCURRENT_CALLS = Math.max(1, Number(process.env.MCP_CONCURRENT_CALLS || 4));
 // 接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：仅对声明 enforceGrounding 的角色生效。
 // GROUNDING_MAX_RETRIES = 允许的纠正次数（作废文本 + 回灌提示让模型补取数据）；用尽后改用确定性拒答。
 const GROUNDING_GUARD = (process.env.GROUNDING_GUARD || "on").toLowerCase() !== "off";
@@ -466,8 +501,8 @@ export async function* streamCall(
   // 角色级首轮强制工具调用：当前尚无工具结果（turns 里没有 role==="tool"）且角色开启 forceToolCall 时，
   // 把 tool_choice 设为 required，逼模型先调工具、杜绝凭记忆编造；一旦有工具结果即恢复 auto（模型可正常收尾）。
   // 仅当确有工具 schema 时才设（无工具的直连路径保持原 auto/none 语义，不产生 required+空工具的非法请求）。
-  // 注意：required(any) 与「扩展思考(thinking)」在多数端点互斥（Anthropic 文档明示；kimi 等开 thinking 的模型亦拒绝）。
-  // 若首轮 required 被端点以「与 thinking 不兼容」拒绝，自动降级 auto 重试一次（model 仍靠强提示走工具），不让强制开关把对话打断。
+  // 注意：required(any) 与「扩展思考(thinking)」在多数端点互斥（Anthropic 文档明示），且部分网关根本不接受该取值。
+  // 首轮 required 被端点拒绝时自动降级 auto 重试一次（model 仍靠强提示走工具），不让强制开关把对话直接打断。
   const hasToolResult = turns.some((t) => t.role === "tool");
   const forceApplied = !!forceToolCall && !hasToolResult;
   let toolChoice: "required" | "auto" = forceApplied ? "required" : "auto";
@@ -532,9 +567,21 @@ export async function* streamCall(
   };
 
   yield* invokeAndDrain();
-  // 首轮强制 required 因「与 thinking 不兼容」被端点拒绝：降级 auto 重试一次（仍靠强提示让模型走工具）。
-  if (forceApplied && failure && /tool_choice.*(required|any).*(incompatible|thinking|not support|unsupported)/i.test(failure)) {
-    console.log("[chat:tool-choice] required 与 thinking 不兼容，降级 auto 重试");
+  // 首轮强制 required 被端点拒绝 → 降级 auto 重试一次（仍靠强提示让模型走工具）。
+  // 触发面不止「与 thinking 不兼容」：部分网关对 tool_choice=required 直接回 4xx 且不点名字段
+  // （例如只回「请求不合法」的通用客户端错误），因此把「任何 4xx 客户端拒绝」都算作端点不接受强制通道。
+  // 排除鉴权 / 额度 / 限流类永久错误：那些重试也只会拿到同一个错误，白打一次还拖慢失败反馈。
+  const permanentFailure = /402|401006|额度|未开通|余额|无权限|限流|rate.?limit|too many requests/i.test(
+    failure || "",
+  );
+  const forcedToolRejected =
+    forceApplied &&
+    !!failure &&
+    !permanentFailure &&
+    (/model http 4\d\d/i.test(failure) ||
+      /tool_choice.*(required|any).*(incompatible|thinking|not support|unsupported|invalid)/i.test(failure));
+  if (forcedToolRejected) {
+    console.log(`[chat:tool-choice] required 被端点拒绝，降级 auto 重试一次：${failure!.slice(0, 200)}`);
     failure = null;
     toolChoice = "auto";
     // 复位消费循环状态：第一次（失败的 required）的 .finally 已把 settled 置 true、wake 置 null，
@@ -811,6 +858,56 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 逐个处理；**连续的** task 委派合并成一批并行执行（对齐 Deep Agents：单轮多个 task 并行）。
     const calls = outcome.toolCalls;
     let index = 0;
+
+    /** 审计基础字段（串行 / 并发两条路径共用，保证留痕口径一致）。 */
+    const auditBaseOf = (c: ToolCall, v: ReturnType<typeof resolveToolRisk>) => ({
+      conversationId: ctx.conversationId,
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+      ...(ctx.ownerKey ? { ownerKey: ctx.ownerKey } : {}),
+      tool: c.name,
+      ...(v.serverId ? { server: v.serverId } : {}),
+      level: v.level,
+      unknown: v.unknown,
+      reason: v.reason,
+      argsDigest: argsDigestOf(c.argsJson),
+    });
+
+    /**
+     * 能否进并发批（G1）：只读 + 免确认 + 非交互。
+     * task 委派自带并行批、工具检索会改工具清单、澄清要挂起等用户——都不进并发批；
+     * 写操作 / 需确认 / 被拒的调用一律串行（避免同时弹多张确认卡）。
+     */
+    const concurrentOk = (name: string, v: ReturnType<typeof resolveToolRisk>) =>
+      v.level === "read" &&
+      !v.deny &&
+      !verdictNeedsConfirm(v) &&
+      name !== "task" &&
+      name !== TOOL_SEARCH_NAME &&
+      name !== "request_clarification";
+
+    /** 单个调用的执行体（不 yield，供并发批复用；事件与回灌由调用方按原始顺序处理）。 */
+    const executeOne = async (
+      c: ToolCall,
+    ): Promise<{ ok: boolean; rawText: string; executed: boolean; todos?: TodoItem[] }> => {
+      const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
+      if (builtin) {
+        return {
+          ok: builtin.ok,
+          rawText: builtin.text,
+          executed: true,
+          ...(builtin.todos ? { todos: builtin.todos } : {}),
+        };
+      }
+      if (ctx.toolSearch && specOfTool.has(c.name) && !ctx.loadedTools.has(c.name)) {
+        return {
+          ok: false,
+          executed: false,
+          rawText: `工具 ${c.name} 尚未加载：请先调用 ${TOOL_SEARCH_NAME} 检索它（关键词可用工具名），加载后再调用。`,
+        };
+      }
+      const result = await callMcpTool(c.name, safeJsonParse(c.argsJson), ctx.signal);
+      return { ok: !result.isError, rawText: result.text, executed: true };
+    };
     while (index < calls.length) {
       const call = calls[index]!;
       // 同轮去重：本轮已执行过的相同调用（name + 规范化参数）不再重复执行，仍回灌结果保持模型上下文对齐。
@@ -944,6 +1041,77 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         });
         continue;
       }
+      // ── 并发批（G1）：连续的「只读 + 免确认」调用一起发出，省掉 N×RTT ──
+      // 顺序纪律：事件与上下文回灌仍按模型给出的原始顺序，保证可复现与 prompt cache 稳定。
+      if (concurrentOk(call.name, resolveToolRisk(call.name, ctx.grantServers, safeJsonParse(call.argsJson)))) {
+        const planned = planConcurrentBatch(calls, {
+          start: index,
+          max: MAX_CONCURRENT_CALLS,
+          signature: toolCallSignature,
+          isExecuted: (s) => TOOL_DEDUP_SAME_ROUND && executedSigs.has(s),
+          isFused: (name) => (failedTools.get(name) || 0) >= TOOL_FAILURE_LIMIT,
+          canRun: (name, argsJson) => concurrentOk(name, resolveToolRisk(name, ctx.grantServers, safeJsonParse(argsJson))),
+        });
+        const batch = planned.map((item) => ({
+          ...item,
+          verdict: resolveToolRisk(item.call.name, ctx.grantServers, safeJsonParse(item.call.argsJson)),
+        }));
+        // 只有 1 个就走原路径（零行为变化），≥2 个才真的并发。
+        if (batch.length > 1) {
+          for (const item of batch) {
+            index += 1;
+            toolCallCount += 1;
+            yield {
+              type: "tool_call",
+              id: item.call.id,
+              name: item.call.name,
+              server: serverOf.get(item.call.name),
+              args: item.call.argsJson,
+            };
+          }
+          for (const item of batch) {
+            executedSigs.add(item.sig);
+            roundExecuted.push(item.sig);
+            // 只读放行也留痕（仅外部工具；工作区工具不记，避免噪音）。
+            if (item.verdict.external) {
+              appendAudit({ kind: "gate", decision: "allowed", ...auditBaseOf(item.call, item.verdict) });
+            }
+          }
+          const outcomes = await Promise.all(batch.map((item) => executeOne(item.call)));
+          for (let k = 0; k < batch.length; k += 1) {
+            const item = batch[k]!;
+            const out = outcomes[k]!;
+            // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
+            if (out.executed) {
+              if (out.ok) failedTools.delete(item.call.name);
+              else failedTools.set(item.call.name, (failedTools.get(item.call.name) || 0) + 1);
+            }
+            if (out.executed && out.ok && isGroundingEvidenceTool(item.call.name)) {
+              groundingEvidence += 1;
+              pushEvidence(out.rawText, item.call.name);
+            }
+            if (out.todos) yield { type: "todos", todos: out.todos };
+            const outContent = truncateResult(out.rawText);
+            yield { type: "tool_result", id: item.call.id, name: item.call.name, ok: out.ok, text: outContent };
+            const wrappedOut = wrapUntrusted(outContent, {
+              kind: "tool_result",
+              source: serverOf.get(item.call.name) || item.call.name,
+            });
+            conversation.push({
+              role: "tool",
+              toolCallId: item.call.id,
+              name: item.call.name,
+              content: wrappedOut.text,
+            });
+            handles.push({
+              name: item.call.name,
+              args: truncateArgs(item.call.argsJson),
+              summary: out.ok ? handleSummary(out.rawText) : "执行失败",
+            });
+          }
+          continue;
+        }
+      }
       index += 1;
       toolCallCount += 1;
       yield {
@@ -959,16 +1127,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       let ok = true;
       // ── 写操作安全闸门（src/risk.ts 单一真相）─────────────────────────────
       const verdict = resolveToolRisk(call.name, ctx.grantServers, safeJsonParse(call.argsJson));
-      const auditBase = {
-        conversationId: ctx.conversationId,
-        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-        tool: call.name,
-        ...(verdict.serverId ? { server: verdict.serverId } : {}),
-        level: verdict.level,
-        unknown: verdict.unknown,
-        reason: verdict.reason,
-        argsDigest: argsDigestOf(call.argsJson),
-      };
+      const auditBase = auditBaseOf(call, verdict);
       // 子代理默认只读（P0-5）：非只读操作立即拒绝——不登记等待器、不发确认事件（否则确认事件
       // 被子代理消费循环丢弃，调用会静默挂到超时），模型拿到明确错误可自行调整。
       if (!ctx.allowWrite && verdict.level !== "read") {
@@ -1050,6 +1209,34 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         rawText = builtin.text;
         // 任务规划即时可见（事件流），同时已持久化到 conversation.todos。
         if (builtin.todos) yield { type: "todos", todos: builtin.todos };
+        // 结构化澄清：工具层不能自己挂起（事件发不出去），由循环下发事件并等待用户选择。
+        if (builtin.clarification) {
+          const pending = requestClarification({
+            sessionId: ctx.sessionId || "",
+            conversationId: ctx.conversationId,
+            callId: call.id,
+          });
+          yield {
+            type: "clarification_required",
+            id: call.id,
+            ticket: pending.ticket,
+            question: builtin.clarification.question,
+            options: builtin.clarification.options,
+            expiresInMs: pending.timeoutMs,
+          };
+          const answer = await pending.wait;
+          yield {
+            type: "clarification_response",
+            id: call.id,
+            ...(answer.value ? { answer: answer.value } : {}),
+          };
+          ok = true;
+          rawText = answer.value
+            ? `用户已澄清：${answer.value}。据此继续。`
+            : answer.timedOut
+              ? "等待澄清超时：请按最合理的理解继续，或在回复里说明还需要什么信息。"
+              : "用户跳过了澄清：请按最合理的理解继续，并在回复里说明你的假设。";
+        }
       } else if (ctx.toolSearch && specOfTool.has(call.name) && !ctx.loadedTools.has(call.name)) {
         // 按需加载模式：没检索加载过的工具不给调用（模型是照着索引里的名字猜的，参数说明它没见过）。
         ok = false;
@@ -1342,11 +1529,16 @@ export async function* chatStream(
   const conversation = await getConversation(conversationId);
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
   const roleDefaultModel = conversation?.agentId ? getRole(conversation.agentId).defaultModel : undefined;
+  const roleModel = roleDefaultModel ? getModel(roleDefaultModel) : undefined;
+  // 角色钉住的模型已从 MODEL_PROVIDERS 移除（下线 / 改 id）时如实告警一次：否则会静默回落到全局默认，
+  // 表现为「页面用的模型和配置里写的不是同一个」，排查时只能靠翻 .env 猜。
+  if (roleDefaultModel && !roleModel) {
+    console.warn(
+      `[chat:model] 角色 ${conversation?.agentId} 的默认模型 ${roleDefaultModel} 未在 MODEL_PROVIDERS 中配置，回落到服务端默认模型`,
+    );
+  }
   const model =
-    getModel(opts.model) ||
-    getModel(conversation?.model) ||
-    (roleDefaultModel ? getModel(roleDefaultModel) : undefined) ||
-    defaultModel();
+    getModel(opts.model) || getModel(conversation?.model) || roleModel || defaultModel();
   if (!model) {
     yield {
       type: "error",

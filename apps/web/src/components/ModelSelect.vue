@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { MODEL_AUTO_ID, type ModelInfo } from "../api";
 import { getUiLocale } from "../ui-locale";
+import { matchesFuzzy, loadPinyin, pinyinReady } from "../pinyin";
 import { useSelectPanel } from "../composables/useSelectPanel";
 
 const props = defineProps<{
@@ -67,13 +68,13 @@ function groupKeyOf(model: ModelInfo): string {
 
 /** 按来源分组 + 关键词过滤（分组标题始终保留，与 antd 分组选择器一致）。 */
 const groups = computed<SelectGroup[]>(() => {
+  // 读 pinyinReady 建立依赖：字典异步就绪后重算，启用拼音匹配（未就绪时仅原文匹配）。
+  void pinyinReady.value;
   const keyword = query.value.trim().toLowerCase();
   const buckets = new Map<string, SelectOption[]>();
   for (const model of props.models) {
-    if (keyword) {
-      const haystack = `${model.label} ${model.id}`.toLowerCase();
-      if (!haystack.includes(keyword)) continue;
-    }
+    // 与工具飞出面板一致：原文子串 + 拼音（首字母/全拼/缩写）。
+    if (keyword && !matchesFuzzy([model.label, model.id], keyword)) continue;
     const key = groupKeyOf(model);
     const option: SelectOption = { id: model.id, label: model.label, tags: tagsOf(model) };
     const list = buckets.get(key);
@@ -102,6 +103,7 @@ const currentTags = computed(() => (currentModel.value ? tagsOf(currentModel.val
 async function openPanel() {
   if (open.value || !props.models.length) return;
   openPanelBase();
+  loadPinyin();
   query.value = "";
   const currentIndex = indexOfId(props.modelValue);
   activeIndex.value = currentIndex >= 0 ? currentIndex : 0;

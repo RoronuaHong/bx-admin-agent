@@ -440,11 +440,23 @@ export async function setChatSkills(
   return { available: data.available || [], enabled: data.enabled || [] };
 }
 
-/** 应答确认：必须携带服务端签发的一次性票据；grantRead=true 时附带会话级只读授权。 */
-export async function confirmToolCall(ticket: string, confirmed: boolean, opts: { grantRead?: boolean } = {}) {
+/**
+ * 应答确认 / 澄清：必须携带服务端签发的一次性票据；grantRead=true 时附带会话级只读授权。
+ * 澄清（request_clarification）用同一通道回传用户选中的选项值 `value`。
+ */
+export async function confirmToolCall(
+  ticket: string,
+  confirmed: boolean,
+  opts: { grantRead?: boolean; value?: string } = {},
+) {
   return jsonFetch("/agent/chat/confirm", {
     method: "POST",
-    body: JSON.stringify({ ticket, confirmed, ...(opts.grantRead ? { grantRead: true } : {}) }),
+    body: JSON.stringify({
+      ticket,
+      confirmed,
+      ...(opts.grantRead ? { grantRead: true } : {}),
+      ...(opts.value ? { value: opts.value } : {}),
+    }),
   });
 }
 

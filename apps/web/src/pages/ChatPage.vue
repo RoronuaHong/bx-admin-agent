@@ -11,9 +11,11 @@ import {
 } from "vue";
 import { useRouter } from "vue-router";
 import ModelSelect from "../components/ModelSelect.vue";
+import ToolsSearch from "../components/ToolsSearch.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { renderChatMarkdown } from "../chat-richtext";
+import { matchesFuzzyScoped, matchesFuzzy, loadPinyin, pinyinReady } from "../pinyin";
 import { getUiLocale, detectDefaultLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { localizeToken } from "../localize";
 import { AGENTS, agentText, type AgentEntry } from "../agents";
@@ -559,6 +561,17 @@ interface Bubble {
     /** 票据有效期（服务端下发）：超时按拒绝处理，前端据此提示并自动作废卡片。 */
     expiresInMs?: number;
   } | null;
+  /**
+   * 结构化澄清（工具 request_clarification）：把模型的「散文追问」变成可点选的选项卡，
+   * 复用确认通道回传用户选中的选项值。
+   */
+  clarification?: {
+    id: string;
+    ticket: string;
+    question: string;
+    options: Array<{ label: string; description?: string }>;
+    expiresInMs?: number;
+  } | null;
   /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
   usage?: {
     tokens: number;
@@ -649,6 +662,20 @@ function blankState(): ConvState {
 const threadEl = ref<HTMLElement | null>(null);
 const models = ref<ModelInfo[]>([]);
 const conversations = ref<ConversationDto[]>([]);
+
+// 侧栏会话搜索（原文 + 拼音，按标题过滤）。搜索态下隐藏分组分隔线、禁用拖拽（见模板）。
+const convQuery = ref("");
+const conversationsFiltered = computed(() => {
+  // 读 pinyinReady 建立依赖：字典异步就绪后重算，启用拼音。
+  void pinyinReady.value;
+  const q = convQuery.value.trim().toLowerCase();
+  if (!q) return conversations.value;
+  return conversations.value.filter((c) => matchesFuzzy([c.title], q));
+});
+function onConvSearchInput() {
+  // 首次输入才拉起拼音字典（首屏不背这体积）。
+  loadPinyin();
+}
 /**
  * Agent 角色（领域适配指南模式 B）：路由以 props 注入（/chat=generic，/movie=观影助手…）。
  * 同一页面组件服务所有 Agent —— 会话列表 / 新建 / 流式请求都带上 agentId，服务端按角色
@@ -1837,7 +1864,7 @@ async function clearCurrent() {
 /** 侧栏状态点：待确认 > 出错 > 生成中（服务端 running 或本地发送中）。 */
 function convStatus(conv: ConversationDto): "" | "running" | "pending" | "error" {
   const state = states.get(conv.id);
-  if (state?.bubbles.some((b) => b.pending)) return "pending";
+  if (state?.bubbles.some((b) => b.pending || b.clarification)) return "pending";
   if (state?.error) return "error";
   if (state?.sending || conv.running) return "running";
   return "";
@@ -1980,6 +2007,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
     streaming: true,
     steps: [],
     pending: null,
+    clarification: null,
     subagents: [],
   });
   state.bubbles.push(reply);
@@ -2051,6 +2079,18 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           queueScrollIfCurrent(convId);
         } else if (event.type === "confirmation_response") {
           reply.pending = null;
+        } else if (event.type === "clarification_required") {
+          // 结构化澄清：选项由模型给出，用户点选后把选项值回传（与确认卡同通道、同票据机制）。
+          reply.clarification = {
+            id: event.id,
+            ticket: event.ticket,
+            question: event.question,
+            options: event.options,
+            expiresInMs: event.expiresInMs,
+          };
+          queueScrollIfCurrent(convId);
+        } else if (event.type === "clarification_response") {
+          reply.clarification = null;
         } else if (event.type === "error") {
           const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
           reply.error = message;
@@ -2291,6 +2331,39 @@ async function answerToolConfirm(bubble: Bubble, confirmed: boolean) {
 }
 
 /**
+ * 应答结构化澄清：选中某个选项即把选项值回传；不带值 = 跳过（模型按自己的理解继续）。
+ * 与确认卡共用票据通道（一次性 + 会话绑定），失效处理口径一致。
+ */
+async function answerClarification(bubble: Bubble, value?: string) {
+  const ask = bubble.clarification;
+  if (!ask) return;
+  bubble.clarification = null;
+  const step = (bubble.steps || []).find((s) => s.id === ask.id);
+  if (step) {
+    step.status = "ok";
+    step.result = value || tx("已跳过澄清", "Clarification skipped", "Esclarecimento ignorado", "स्पष्टीकरण छोड़ दिया");
+  }
+  await confirmToolCall(ask.ticket, true, { ...(value ? { value } : {}) }).catch((err) => {
+    if (step) {
+      step.status = "error";
+      step.result = tx(
+        "澄清已失效（超时或已处理），请重新发起",
+        "Clarification expired (timed out or already handled) — please retry",
+        "Esclarecimento expirado (tempo esgotado ou já tratado) — tente novamente",
+        "स्पष्टीकरण समाप्त हो गया (समय समाप्त या पहले ही संसाधित) — फिर से प्रयास करें",
+      );
+    }
+    showSettingsError(
+      localizeToken(
+        uiLocale.value,
+        getApiErrorToken(err),
+        (err as Error)?.message || tx("澄清应答失败", "Failed to answer clarification", "Falha ao responder", "उत्तर देने में विफल"),
+      ),
+    );
+  });
+}
+
+/**
  * 确认票据到点自动作废（与服务端 fail-closed 一致，正常路径由服务端回执清卡）：
  * 兜底「流已断开 / 已切走对话导致回执丢失」时卡片一直挂着，用户点一个注定失败的按钮。
  */
@@ -2349,12 +2422,25 @@ async function loadMcp(convId = currentId.value) {
   if (state) state.settings.mcpEnabled = data.enabled;
 }
 
-/** 打开连接器飞出面板（互斥：同时只开一个飞出）。 */
-function toggleMcpPanel() {
-  mcpOpen.value = !mcpOpen.value;
+/**
+ * 打开连接器飞出面板（互斥：同时只开一个飞出）。
+ * @param focusSearch 是否把焦点放进搜索框：点击打开要（可直接打字），悬停打开不要
+ *   （否则鼠标扫过菜单就把焦点从消息输入框抢走）。
+ */
+function openMcpPanel(focusSearch = true) {
+  // 已展开则保持：仅确保互斥，不重置搜索框/焦点/重新拉取（hover 重复进入不应清空用户输入）。
+  if (mcpOpen.value) {
+    skillOpen.value = false;
+    expertOpen.value = false;
+    return;
+  }
+  mcpOpen.value = true;
   skillOpen.value = false;
   expertOpen.value = false;
-  if (mcpOpen.value) void loadMcp();
+  mcpQuery.value = "";
+  searchAutofocus.value = focusSearch;
+  loadPinyin();
+  void loadMcp();
 }
 
 /** 勾选/取消某个 MCP 服务器（乐观更新 + 失败回滚）。 */
@@ -2462,12 +2548,22 @@ async function loadSkills(convId = currentId.value) {
   state.settings.skillsEnabled = data.enabled;
 }
 
-/** 打开技能飞出面板（互斥：同时只开一个飞出）。 */
-function toggleSkillPanel() {
-  skillOpen.value = !skillOpen.value;
+/** 打开技能飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
+function openSkillPanel(focusSearch = true) {
+  // 已展开则保持：仅确保互斥，不重置搜索框/焦点/重新拉取（hover 重复进入不应清空用户输入）。
+  if (skillOpen.value) {
+    mcpOpen.value = false;
+    expertOpen.value = false;
+    return;
+  }
+  skillOpen.value = true;
   mcpOpen.value = false;
   expertOpen.value = false;
-  if (skillOpen.value) void loadSkills();
+  // 每次从关闭→打开都从空关键词开始，避免残留上次搜索词导致列表看着「少了几项」。
+  skillQuery.value = "";
+  searchAutofocus.value = focusSearch;
+  loadPinyin();
+  void loadSkills();
 }
 
 /** 勾选/取消某个技能（乐观更新 + 失败回滚；语义：勾选 = 全文注入系统提示，不勾 = 按需加载）。 */
@@ -2525,19 +2621,23 @@ const toolsMenuOpen = ref(false);
 const toolsRoot = ref<HTMLElement | null>(null);
 const skillQuery = ref("");
 const mcpQuery = ref("");
+/** 本次打开飞出面板是否把焦点放进搜索框（点击 = true，悬停 = false）。 */
+const searchAutofocus = ref(true);
 
 const skillFiltered = computed(() => {
   const q = skillQuery.value.trim().toLowerCase();
+  // 读 pinyinReady 建立依赖：字典异步就绪后触发重算，启用拼音匹配。
+  void pinyinReady.value;
   if (!q) return skillAvailable.value;
-  return skillAvailable.value.filter(
-    (s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q) || s.dir.toLowerCase().includes(q),
-  );
+  // 单字母关键词只匹配可见名称；目录名与描述归「长字段」，避免任意字母命中一堆英文标识。
+  return skillAvailable.value.filter((s) => matchesFuzzyScoped([s.name], [s.dir, s.description], q));
 });
 
 const mcpFiltered = computed(() => {
   const q = mcpQuery.value.trim().toLowerCase();
+  void pinyinReady.value;
   if (!q) return mcpAvailable.value;
-  return mcpAvailable.value.filter((s) => s.label.toLowerCase().includes(q) || s.id.toLowerCase().includes(q));
+  return mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
 });
 
 function toggleToolsMenu() {
@@ -2546,6 +2646,8 @@ function toggleToolsMenu() {
     // 打开菜单就预取两份列表：飞出面板秒开无等待。
     void loadSkills();
     void loadMcp();
+    // 后台拉起拼音字典，之后打开任一搜索面板都能用拼音（首屏不背这体积）。
+    loadPinyin();
   } else {
     skillOpen.value = false;
     mcpOpen.value = false;
@@ -2553,7 +2655,6 @@ function toggleToolsMenu() {
   }
 }
 
-/** 悬停菜单项即展开右侧飞出面板（与点击等价，不重复关闭已展开的面板）。 */
 /** 连接器一行描述：transport · 工具数 (+ 首个错误)，同时用于悬浮全文。 */
 function mcpDescText(s: McpServerStatus): string {
   const parts = [`${s.transport} · ${s.tools} ${tx("工具", "tools", "ferramentas", "टूल")}`];
@@ -2569,10 +2670,38 @@ const expertAgents: AgentEntry[] = AGENTS.filter((a) => a.id !== "movie" && a.id
 // 当前选中的专家（无 = 通用，对齐 CodeBuddy：chip 存在即已选专家，无 chip 即通用）。
 const currentExpert = computed(() => expertAgents.find((a) => a.id === AGENT_ID));
 
-function toggleExpertPanel() {
-  expertOpen.value = !expertOpen.value;
+const expertQuery = ref("");
+/**
+ * 专家搜索：单字符关键词只匹配「当前界面语言的名称」（否则英文名/长描述里的字母会让任意
+ * 字母都命中，如输入 a 命中「Support assistant」）；≥2 个字符才扩展到 id、四语名称与描述。
+ */
+const expertFiltered = computed(() => {
+  const q = expertQuery.value.trim().toLowerCase();
+  void pinyinReady.value;
+  if (!q) return expertAgents;
+  return expertAgents.filter((a) =>
+    matchesFuzzyScoped(
+      [agentText(a.label, uiLocale.value)],
+      [a.id, ...Object.values(a.label), ...Object.values(a.description)],
+      q,
+    ),
+  );
+});
+
+/** 打开专家飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
+function openExpertPanel(focusSearch = true) {
+  // 已展开则保持：仅确保互斥，不重置搜索框/焦点（hover 重复进入不应清空用户输入）。
+  if (expertOpen.value) {
+    skillOpen.value = false;
+    mcpOpen.value = false;
+    return;
+  }
+  expertOpen.value = true;
   skillOpen.value = false;
   mcpOpen.value = false;
+  expertQuery.value = "";
+  searchAutofocus.value = focusSearch;
+  loadPinyin();
 }
 
 // 收起所有工具面板（专家/技能/连接器/主菜单），切换专家或取消选中前调用。
@@ -2594,11 +2723,12 @@ function onClearExpert() {
   router.push("/chat");
 }
 
+/** 悬停菜单项即展开右侧飞出面板（与点击等价，但不抢焦点）。 */
 function hoverFlyout(which: "skills" | "mcp" | "expert") {
   if (!toolsMenuOpen.value) return;
-  if (which === "skills" && !skillOpen.value) toggleSkillPanel();
-  if (which === "mcp" && !mcpOpen.value) toggleMcpPanel();
-  if (which === "expert" && !expertOpen.value) toggleExpertPanel();
+  if (which === "skills") openSkillPanel(false);
+  if (which === "mcp") openMcpPanel(false);
+  if (which === "expert") openExpertPanel(false);
 }
 
 /** Esc 收起工具菜单/飞出面板（键盘可达，不拦截输入框内容）。 */
@@ -2987,17 +3117,31 @@ onBeforeUnmount(() => {
       <button class="new-chat" type="button" @click="newConversation">
         + {{ tx("新对话", "New chat", "Nova conversa", "नई चैट") }}
       </button>
+      <div class="conv-search" role="search">
+        <svg class="conv-search__icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="m20 20-3.2-3.2"></path>
+        </svg>
+        <input
+          v-model="convQuery"
+          class="conv-search__input"
+          type="text"
+          :placeholder="tx('搜索对话', 'Search chats', 'Buscar conversas', 'चैट खोजें')"
+          :aria-label="tx('搜索对话', 'Search chats', 'Buscar conversas', 'चैट खोजें')"
+          @input="onConvSearchInput"
+        />
+      </div>
       <label class="conv-archived-toggle" :title="tx('显示已归档的对话', 'Show archived chats', 'Mostrar conversas arquivadas', 'आर्काइव की चैट दिखाएं')">
         <input type="checkbox" v-model="showArchived" @change="reloadConversations" />
         {{ tx("显示归档", "Archived", "Arquivadas", "आर्काइव") }}
       </label>
       <div ref="convListEl" class="conv-list">
-        <template v-for="(conv, i) in conversations" :key="conv.id">
-          <div v-if="pinnedCount > 0 && i === pinnedCount" class="conv-divider" role="separator">
+        <template v-for="(conv, i) in conversationsFiltered" :key="conv.id">
+          <div v-if="!convQuery.trim() && pinnedCount > 0 && i === pinnedCount" class="conv-divider" role="separator">
             {{ tx("置顶", "Pinned", "Fixadas", "पिन किए गए") }}
           </div>
           <!-- 归档区固定在列表末尾（由 convRank 保证），勾选「显示归档」后才有内容。 -->
-          <div v-if="archivedCount > 0 && i === firstArchivedIndex" class="conv-divider" role="separator">
+          <div v-if="!convQuery.trim() && archivedCount > 0 && i === firstArchivedIndex" class="conv-divider" role="separator">
             {{ tx("归档", "Archived", "Arquivadas", "आर्काइव") }}
           </div>
           <div
@@ -3015,7 +3159,7 @@ onBeforeUnmount(() => {
             tabindex="0"
             :aria-current="conv.id === currentId ? 'true' : undefined"
             aria-haspopup="menu"
-            :draggable="renaming.id !== conv.id && !conv.archived"
+            :draggable="renaming.id !== conv.id && !conv.archived && !convQuery.trim()"
             @click="selectConversation(conv)"
             @contextmenu.prevent="openCtxMenu($event, conv)"
             @keydown="onConvKeydown($event, conv)"
@@ -3070,6 +3214,9 @@ onBeforeUnmount(() => {
           </div>
         </template>
       </div>
+      <p v-if="convQuery.trim() && !conversationsFiltered.length" class="conv-empty">
+        {{ tx("没有匹配的对话", "No matching chats", "Nenhuma conversa correspondente", "कोई मेल खाने वाली चैट नहीं") }}
+      </p>
       <button
         class="ghost-btn"
         :class="{ 'ghost-btn-danger': clearArmedFor === currentId }"
@@ -3571,7 +3718,7 @@ onBeforeUnmount(() => {
                 <button class="mcp-mini" type="button" :disabled="memoryBusy || !memoryText.trim()" @click="addMemoryEntry">＋</button>
               </div>
               <div class="res-list">
-                <div v-if="!memoryItems.length" class="mcp-empty">
+                <div v-if="!memoryItems.length" class="empty-hint">
                   {{ tx("还没有长期记忆", "No long-term memory yet", "Aún no hay memoria", "अभी कोई मेमोरी नहीं") }}
                 </div>
                 <div v-for="m in memoryItems" :key="m.id" class="res-row">
@@ -3587,8 +3734,8 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <div class="res-list">
-                <div v-if="wsLoading" class="mcp-empty">{{ tx("加载中…", "Loading…", "Cargando…", "लोड हो रहा है…") }}</div>
-                <div v-else-if="!wsFiles.length" class="mcp-empty">
+                <div v-if="wsLoading" class="empty-hint">{{ tx("加载中…", "Loading…", "Cargando…", "लोड हो रहा है…") }}</div>
+                <div v-else-if="!wsFiles.length" class="empty-hint">
                   {{ tx("工作区为空（对话里可用 fs_write 保存文件）", "Workspace is empty (use fs_write in chat to save files)", "El espacio está vacío (usa fs_write)", "वर्कस्पेस खाली है (fs_write का उपयोग करें)") }}
                 </div>
                 <button
@@ -3742,6 +3889,31 @@ onBeforeUnmount(() => {
                 </button>
                 <button type="button" class="mcp-link" @click="answerToolConfirm(b, false)">
                   {{ tx("拒绝", "Deny", "Recusar", "अस्वीकार करें") }}
+                </button>
+              </div>
+            </div>
+            <div v-if="b.clarification" class="confirm-card">
+              <div class="confirm-text">
+                {{ tx("需要你确认一下", "Need your input", "Preciso de uma confirmação", "आपकी पुष्टि आवश्यक") }}：{{ b.clarification.question }}
+              </div>
+              <div class="clarify-options">
+                <button
+                  v-for="opt in b.clarification.options"
+                  :key="opt.label"
+                  type="button"
+                  class="clarify-opt"
+                  @click="answerClarification(b, opt.label)"
+                >
+                  <span class="clarify-label">{{ opt.label }}</span>
+                  <span v-if="opt.description" class="clarify-desc">{{ opt.description }}</span>
+                </button>
+              </div>
+              <div v-if="confirmExpiryText(b.clarification.expiresInMs)" class="confirm-expiry">
+                {{ confirmExpiryText(b.clarification.expiresInMs) }}
+              </div>
+              <div class="confirm-ops">
+                <button type="button" class="mcp-link" @click="answerClarification(b)">
+                  {{ tx("跳过，按你的理解继续", "Skip and use your best guess", "Pular e usar seu melhor palpite", "छोड़ें, अपनी समझ से आगे बढ़ें") }}
                 </button>
               </div>
             </div>
@@ -3907,7 +4079,7 @@ onBeforeUnmount(() => {
                   v-if="currentExpert"
                   type="button"
                   class="expert-chip"
-                  :title="tx('取消选中专家，回到通用助手', 'Deselect expert, back to general assistant', 'Desmarcar especialista, voltar ao assistente geral', 'विशेषज्ञ चयन रद्द करें, सामान्य सहायक पर वापस')"
+                  :title="tx('取消选中助手，回到通用助手', 'Deselect assistant, back to general assistant', 'Desmarcar assistente, voltar ao assistente geral', 'सहायक चयन रद्द करें, सामान्य सहायक पर वापस')"
                   @click="onClearExpert"
                 >
                   <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -3921,7 +4093,7 @@ onBeforeUnmount(() => {
                     class="tools-menu__row"
                     type="button"
                     role="menuitem"
-                    @click="fileInput?.click(); toolsMenuOpen = false"
+                    @click="fileInput?.click(); closeToolsPanels()"
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <rect x="3" y="4.5" width="18" height="15" rx="2.5" />
@@ -3935,7 +4107,7 @@ onBeforeUnmount(() => {
                     type="button"
                     role="menuitem"
                     :aria-expanded="skillOpen"
-                    @click="toggleSkillPanel"
+                    @click="openSkillPanel()"
                     @mouseenter="hoverFlyout('skills')"
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -3950,7 +4122,7 @@ onBeforeUnmount(() => {
                     type="button"
                     role="menuitem"
                     :aria-expanded="mcpOpen"
-                    @click="toggleMcpPanel"
+                    @click="openMcpPanel()"
                     @mouseenter="hoverFlyout('mcp')"
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -3965,34 +4137,24 @@ onBeforeUnmount(() => {
                     type="button"
                     role="menuitem"
                     :aria-expanded="expertOpen"
-                    @click="toggleExpertPanel"
+                    @click="openExpertPanel()"
                     @mouseenter="hoverFlyout('expert')"
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <circle cx="12" cy="8" r="3.4" />
                       <path d="M5.5 20a6.5 6.5 0 0 1 13 0" />
                     </svg>
-                    <span>{{ tx("专家", "Expert", "Especialista", "विशेषज्ञ") }}</span>
+                    <span>{{ tx("助手", "Assistant", "Assistente", "सहायक") }}</span>
                     <span v-if="currentExpert" class="tools-badge">1</span>
                     <span class="tools-menu__chev">›</span>
                   </button>
                 </div>
 
                 <div v-if="skillOpen" class="tools-flyout" role="dialog" :aria-label="tx('技能', 'Skills', 'Habilidades', 'स्किल')">
-                  <div class="tools-flyout__search">
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
-                      <circle cx="11" cy="11" r="6.5" />
-                      <path d="m20 20-4.2-4.2" />
-                    </svg>
-                    <input
-                      v-model="skillQuery"
-                      type="text"
-                      :placeholder="tx('搜索技能', 'Search skills', 'Buscar habilidades', 'स्किल खोजें')"
-                    />
-                  </div>
+                  <ToolsSearch v-model="skillQuery" :placeholder="tx('搜索技能', 'Search skills', 'Buscar habilidades', 'स्किल खोजें')" :autofocus="searchAutofocus" />
 
                   <div class="tools-list">
-                    <div v-if="!skillFiltered.length" class="mcp-empty">
+                    <div v-if="!skillFiltered.length" class="empty-hint">
                       {{
                         skillAvailable.length
                           ? tx("没有匹配的技能", "No matching skills", "Nenhuma habilidade correspondente", "कोई मेल खाता स्किल नहीं")
@@ -4020,7 +4182,7 @@ onBeforeUnmount(() => {
                   </div>
 
                   <div class="tools-flyout__foot">
-                    <p class="skill-hint">
+                    <p class="flyout-hint">
                       {{
                         tx(
                           "勾选的技能全文会注入本对话的系统提示；未勾选的技能模型仍可按需加载。",
@@ -4043,20 +4205,10 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div v-if="mcpOpen" class="tools-flyout" role="dialog" :aria-label="tx('MCP 连接', 'MCP connections', 'Conexões MCP', 'MCP कनेक्शन')">
-                  <div class="tools-flyout__search">
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
-                      <circle cx="11" cy="11" r="6.5" />
-                      <path d="m20 20-4.2-4.2" />
-                    </svg>
-                    <input
-                      v-model="mcpQuery"
-                      type="text"
-                      :placeholder="tx('搜索连接器', 'Search connectors', 'Buscar conectores', 'कनेक्टर खोजें')"
-                    />
-                  </div>
+                  <ToolsSearch v-model="mcpQuery" :placeholder="tx('搜索连接器', 'Search connectors', 'Buscar conectores', 'कनेक्टर खोजें')" :autofocus="searchAutofocus" />
 
                   <div class="tools-list">
-                    <div v-if="!mcpFiltered.length" class="mcp-empty">
+                    <div v-if="!mcpFiltered.length" class="empty-hint">
                       {{
                         mcpAvailable.length
                           ? tx("没有匹配的连接器", "No matching connectors", "Nenhum conector correspondente", "कोई मेल खाता कनेक्टर नहीं")
@@ -4127,10 +4279,15 @@ onBeforeUnmount(() => {
                   <div v-if="mcpError" class="mcp-error">{{ mcpError }}</div>
                 </div>
 
-                <div v-if="expertOpen" class="tools-flyout" role="dialog" :aria-label="tx('专家', 'Expert', 'Especialista', 'विशेषज्ञ')">
+                <div v-if="expertOpen" class="tools-flyout" role="dialog" :aria-label="tx('助手', 'Assistant', 'Assistente', 'सहायक')">
+                  <ToolsSearch v-model="expertQuery" :placeholder="tx('搜索助手', 'Search assistants', 'Buscar assistentes', 'सहायक खोजें')" :autofocus="searchAutofocus" />
+
                   <div class="tools-list">
+                    <div v-if="!expertFiltered.length" class="empty-hint">
+                      {{ tx("没有匹配的助手", "No matching assistants", "Nenhum assistente correspondente", "कोई मेल खाता सहायक नहीं") }}
+                    </div>
                     <button
-                      v-for="a in expertAgents"
+                      v-for="a in expertFiltered"
                       :key="a.id"
                       type="button"
                       class="tools-item"
@@ -4148,10 +4305,10 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                   <div class="tools-flyout__foot">
-                    <p class="skill-hint">
+                    <p class="flyout-hint">
                       {{
                         tx(
-                          "切换专家会跳转到对应角色页面，会话按角色隔离。",
+                          "切换助手会跳转到对应角色页面，会话按角色隔离。",
                           "Switching expert jumps to that role's page; conversations are isolated per role.",
                           "Trocar especialista vai para a página daquele papel; conversas isoladas por papel.",
                           "विशेषज्ञ बदलने से उस भूमिका के पृष्ठ पर जाता है; वार्तालाप भूमिका के अनुसार अलग रहते हैं।",
@@ -5867,47 +6024,7 @@ onBeforeUnmount(() => {
   }
 }
 
-.tools-flyout__search {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  margin-bottom: 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--panel) 88%, var(--ink) 4%);
-  color: var(--muted);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-/* 聚焦指示放到外层容器上：内层 input 是透明无边框的，若把聚焦环画在它身上
-   会糊在边框盒子里变成一圈黑线。容器整体聚焦才像正常的输入框聚焦。 */
-.tools-flyout__search:focus-within {
-  border-color: color-mix(in srgb, var(--ink) 32%, var(--line));
-  box-shadow: var(--ring);
-}
-
-.tools-flyout__search input {
-  flex: 1;
-  min-width: 0;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--ink);
-  font: inherit;
-  font-size: 13px;
-}
-
-.tools-flyout__search input:focus,
-.tools-flyout__search input:focus-visible {
-  outline: none;
-  border: none;
-  box-shadow: none;
-}
-
-.tools-flyout__search input::placeholder {
-  color: var(--muted);
-}
+/* 搜索框样式随组件走（本文件是 scoped，子选择器到不了子组件内部元素），见 ToolsSearch.vue。 */
 
 .tools-list {
   display: flex;
@@ -6055,7 +6172,7 @@ onBeforeUnmount(() => {
   gap: 2px;
 }
 
-.tools-flyout__foot .skill-hint {
+.tools-flyout__foot .flyout-hint {
   margin-top: 8px;
 }
 
@@ -6097,8 +6214,8 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
-/* 技能面板底部的语义说明 */
-.skill-hint {
+/* 飞出面板底部的语义说明（技能 / 专家共用，原名 skill-hint 语义过窄）。 */
+.flyout-hint {
   margin: 8px 2px 0;
   padding-top: 8px;
   border-top: 1px solid var(--line);
@@ -6115,7 +6232,8 @@ onBeforeUnmount(() => {
   overflow-y: auto;
 }
 
-.mcp-empty {
+/* 通用空态占位：飞出面板（技能/连接器/专家）与资源面板（记忆/工作区）共用。 */
+.empty-hint {
   padding: 14px 4px;
   color: var(--muted);
   font-size: 12px;
@@ -6526,6 +6644,49 @@ onBeforeUnmount(() => {
   accent-color: var(--accent, #4f7cff);
 }
 
+.conv-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 10px 2px;
+  padding: 0 10px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.conv-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent, #4f7cff) 55%, var(--line));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #4f7cff) 16%, transparent);
+}
+
+.conv-search__icon {
+  flex: none;
+}
+
+.conv-search__input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+}
+
+.conv-search__input::placeholder {
+  color: var(--muted);
+}
+
+.conv-empty {
+  margin: 14px 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 /* ---- 资源面板（长期记忆 + 工作区文件）---- */
 .res-panel {
   width: min(420px, calc(100vw - 32px));
@@ -6697,6 +6858,43 @@ onBeforeUnmount(() => {
 .confirm-expiry {
   font-size: 12px;
   color: var(--muted);
+}
+
+/* 结构化澄清卡（request_clarification）：复用确认卡容器，选项做成可点选按钮。 */
+.clarify-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.clarify-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.clarify-opt:hover {
+  border-color: color-mix(in srgb, var(--stop) 45%, var(--line));
+  background: color-mix(in srgb, var(--stop) 8%, transparent);
+}
+
+.clarify-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.clarify-desc {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .thread {

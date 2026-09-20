@@ -30,7 +30,7 @@ const GENERIC_FALLBACKS: Record<string, LocalizedTextStrict> = {
   },
 };
 
-// 仅收录当前服务端会产生的错误码；未收录时回退到服务端 defaultMessage。
+// 仅收录当前服务端会产生的「文案固定」错误码；未收录（含有意不收录的）时回退到服务端 defaultMessage。
 const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
   MODEL_UNAVAILABLE: {
     zh: "没有可用模型，请先在服务端配置 MODEL_PROVIDERS。",
@@ -38,7 +38,8 @@ const TOKEN_TEXT: Record<string, LocalizedTextStrict> = {
     pt: "Nenhum modelo disponivel. Configure MODEL_PROVIDERS no servidor.",
     hi: "कोई मॉडल उपलब्ध नहीं है। सर्वर पर MODEL_PROVIDERS कॉन्फ़िगर करें।",
   },
-  MODEL_ERROR: GENERIC_FALLBACKS.GENERIC_UNKNOWN_ERROR,
+  // MODEL_ERROR 刻意不收录：这类失败的原因千差万别（额度/限流/参数被网关拒绝…），
+  // 统一盖成「操作失败」会把唯一可排查的信息吞掉——留给下面按服务端 defaultMessage 原样展示。
   CHAT_EMPTY_INPUT: {
     zh: "请输入内容。",
     en: "Please enter a message.",

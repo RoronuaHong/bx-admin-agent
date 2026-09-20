@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { agentText, findAgent, listAgents } from "../agents";
 import { saveChatPreferences } from "../api";
 import { getUiLocale, type UiLocale } from "../ui-locale";
+import { matchesFuzzyScoped, loadPinyin, pinyinReady } from "../pinyin";
 
 // 门户：Agent 卡片列表（领域适配指南 §8.3「枢纽型」推荐起步）。
 // 角色清单来自前端镜像的 agents 配置；角色判断与分流只在后端，这里只做展示与跳转。
@@ -14,6 +15,26 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 // 门户对齐 CodeBuddy 专家中心：默认助手（generic）单独呈现，专家网格只列真·专家。
 const defaultAgent = findAgent("generic");
 const experts = computed(() => listAgents().filter((a) => a.id !== "generic"));
+
+// 专家网格搜索（与工具飞出面板一致：原文 + 拼音，且单字母只匹配名称，避免误命中）。
+const expertQuery = ref("");
+const expertsFiltered = computed(() => {
+  // 读 pinyinReady 建立依赖：字典异步就绪后重算，启用拼音。
+  void pinyinReady.value;
+  const q = expertQuery.value.trim().toLowerCase();
+  if (!q) return experts.value;
+  return experts.value.filter((a) =>
+    matchesFuzzyScoped(
+      [agentText(a.label, locale.value)],
+      [a.id, ...Object.values(a.label), ...Object.values(a.description)],
+      q,
+    ),
+  );
+});
+function onExpertSearchInput() {
+  // 首次输入才拉起拼音字典（首屏不背这体积）。
+  loadPinyin();
+}
 
 // 标签页标题跟随界面语言（index.html 里的中文只是首屏兜底）。
 watch(
@@ -57,10 +78,24 @@ function onLocaleChange(next: UiLocale) {
         <span class="agent-card__go" aria-hidden="true">→</span>
       </RouterLink>
 
-      <h2 class="portal__section">{{ tx("专家", "Expert", "Especialista", "विशेषज्ञ") }}</h2>
-      <div class="portal__grid">
+      <h2 class="portal__section">{{ tx("助手", "Assistant", "Assistente", "सहायक") }}</h2>
+      <div class="portal__search" role="search">
+        <svg class="portal__search-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="m20 20-3.2-3.2"></path>
+        </svg>
+        <input
+          v-model="expertQuery"
+          class="portal__search-input"
+          type="text"
+          :placeholder="tx('搜索助手', 'Search assistants', 'Buscar assistentes', 'सहायक खोजें')"
+          :aria-label="tx('搜索助手', 'Search assistants', 'Buscar assistentes', 'सहायक खोजें')"
+          @input="onExpertSearchInput"
+        />
+      </div>
+      <div v-if="expertsFiltered.length" class="portal__grid">
         <RouterLink
-          v-for="agent in experts"
+          v-for="agent in expertsFiltered"
           :key="agent.id"
           class="agent-card"
           :class="{ movie: agent.id === 'movie' }"
@@ -74,6 +109,7 @@ function onLocaleChange(next: UiLocale) {
           <span class="agent-card__go" aria-hidden="true">→</span>
         </RouterLink>
       </div>
+      <p v-else class="portal__empty">{{ tx("没有匹配的助手", "No matching assistants", "Nenhum assistente correspondente", "कोई मेल खाने वाला सहायक नहीं") }}</p>
     </main>
   </div>
 </template>
@@ -131,6 +167,49 @@ function onLocaleChange(next: UiLocale) {
   margin: 18px 0 0;
   font-size: 15px;
   font-weight: 700;
+}
+
+.portal__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0 12px;
+  height: var(--ctrl-h, 40px);
+  border: 1px solid var(--line, #dfe3ee);
+  border-radius: 12px;
+  background: var(--panel, #fff);
+  color: var(--muted, #66708a);
+}
+
+.portal__search:focus-within {
+  border-color: color-mix(in srgb, #4f7cff 55%, var(--line, #dfe3ee));
+  box-shadow: 0 0 0 3px color-mix(in srgb, #4f7cff 16%, transparent);
+}
+
+.portal__search-icon {
+  flex: none;
+}
+
+.portal__search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--ink, #1c2333);
+  font: inherit;
+  font-size: 14px;
+}
+
+.portal__search-input::placeholder {
+  color: var(--muted, #66708a);
+}
+
+.portal__empty {
+  margin: 14px 0 0;
+  color: var(--muted, #66708a);
+  font-size: 13px;
 }
 
 .agent-card--default {

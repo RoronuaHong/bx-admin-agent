@@ -47,19 +47,174 @@ export function fsWrite(conversationId: string, path: string, content: string): 
   }
 }
 
-export function fsRead(conversationId: string, path: string): { content: string } | { error: string } {
+/**
+ * 读文件；支持按**行**分页（对齐参考实现的 read_file offset/limit）：
+ * offset 从 0 起，limit 为最多返回行数；不传即整读（向后兼容）。
+ * 分页时回报总行数与实际区间，便于模型决定是否需要继续翻。
+ */
+export function fsRead(
+  conversationId: string,
+  path: string,
+  opts: { offset?: number; limit?: number } = {},
+): { content: string; totalLines?: number } | { error: string } {
   const target = safePath(conversationId, path);
   if (!target) return { error: "非法路径" };
   try {
     if (!existsSync(target) || !statSync(target).isFile()) return { error: `文件不存在：${path}` };
-    const content = readFileSync(target, "utf-8");
+    let content = readFileSync(target, "utf-8");
     if (content.length > MAX_FILE_BYTES) {
-      return { content: `${content.slice(0, MAX_FILE_BYTES)}\n…（文件过大，仅返回前 ${MAX_FILE_BYTES} 字符）` };
+      content = `${content.slice(0, MAX_FILE_BYTES)}\n…（文件过大，仅返回前 ${MAX_FILE_BYTES} 字符）`;
     }
-    return { content };
+    const hasPaging = opts.offset != null || opts.limit != null;
+    if (!hasPaging) return { content };
+    const lines = content.split("\n");
+    const offset = Math.max(0, Math.floor(Number(opts.offset) || 0));
+    const limit = Math.max(1, Math.floor(Number(opts.limit) || lines.length));
+    const slice = lines.slice(offset, offset + limit);
+    const shown = slice.length
+      ? `\n\n…（共 ${lines.length} 行，本次返回第 ${offset + 1}–${offset + slice.length} 行；继续读请传 offset=${
+          offset + slice.length
+        }）`
+      : `\n\n…（共 ${lines.length} 行，offset=${offset} 已超出范围）`;
+    return { content: slice.join("\n") + shown, totalLines: lines.length };
   } catch (err) {
     return { error: String((err as Error)?.message || err) };
   }
+}
+
+/** 需要转义的正则元字符（逐字符处理，避免正则字面量嵌套）。 */
+const REGEX_META = new Set([".", "*", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);
+
+/**
+ * glob 模式 → 正则；非法（空 / 含 `..` / 绝对路径 / 盘符）返回 null。
+ * 支持单星（不跨目录）、问号，以及双星递归（双星后带斜杠表示任意层级前缀）。
+ */
+function globToRegex(pattern: string): RegExp | null {
+  const trimmed = String(pattern || "").trim();
+  // 绝对路径 / 盘符在「去掉前导斜杠」之前判定：否则 /etc/x 会被规范化成相对模式而静默通过（反馈不清晰）。
+  if (!trimmed || trimmed.includes("..") || trimmed.includes("\\") || /^[a-zA-Z]:/.test(trimmed) || trimmed.startsWith("/")) {
+    return null;
+  }
+  const raw = trimmed.replace(/^\/+/, "");
+  let out = "";
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]!;
+    if (ch === "*") {
+      if (raw[i + 1] === "*") {
+        i += 1;
+        if (raw[i + 1] === "/") {
+          out += "(?:.*/)?"; // **/ 匹配任意层级前缀（含零层）
+          i += 1;
+        } else {
+          out += ".*";
+        }
+      } else {
+        out += "[^/]*"; // 单层：不跨目录
+      }
+    } else if (ch === "?") {
+      out += "[^/]";
+    } else {
+      out += REGEX_META.has(ch) ? `\\${ch}` : ch;
+    }
+  }
+  try {
+    return new RegExp(`^${out}$`);
+  } catch {
+    return null;
+  }
+}
+
+/** glob 匹配（限工作区内）。返回相对路径列表（已排序）与命中总数。 */
+export function fsGlob(
+  conversationId: string,
+  pattern: string,
+  limit = 200,
+): { files: Array<{ path: string; bytes: number }>; total: number } | { error: string } {
+  const re = globToRegex(pattern);
+  if (!re) return { error: "非法匹配模式（只允许工作区内的相对路径模式，不支持 .. 与绝对路径）" };
+  const matched = fsList(conversationId).filter((file) => re.test(file.path));
+  return { files: matched.slice(0, Math.max(1, limit)), total: matched.length };
+}
+
+export interface GrepHit {
+  path: string;
+  line: number;
+  text: string;
+}
+
+/** 单行回显上限：命中行可能极长，截断避免把上下文撑爆。 */
+const GREP_LINE_CHARS = 200;
+
+/**
+ * 内容检索（限工作区内）。三种模式：
+ * - files：只回命中文件名（默认 200 个封顶）
+ * - content：回 `路径:行号:命中行`
+ * - count：只回每个文件的命中数
+ * 正则来自模型，长度与命中数都设上限（防误伤与失控）；二进制文件（含 \0）跳过。
+ */
+export function fsGrep(
+  conversationId: string,
+  pattern: string,
+  opts: { mode?: "files" | "content" | "count"; glob?: string; maxMatches?: number } = {},
+):
+  | { files: string[]; hits: GrepHit[]; counts: Array<{ path: string; count: number }>; truncated: boolean }
+  | { error: string } {
+  const raw = String(pattern || "");
+  if (!raw.trim()) return { error: "缺少检索模式" };
+  if (raw.length > 200) return { error: "检索模式过长（上限 200 字符）" };
+  let re: RegExp;
+  try {
+    re = new RegExp(raw);
+  } catch {
+    return { error: "检索模式不是合法正则" };
+  }
+  const mode = opts.mode === "files" || opts.mode === "count" ? opts.mode : "content";
+  const maxMatches = Math.max(1, Math.min(2000, Math.floor(Number(opts.maxMatches) || 200)));
+  let candidates = fsList(conversationId);
+  if (opts.glob) {
+    const gre = globToRegex(opts.glob);
+    if (!gre) return { error: "非法 glob 过滤条件" };
+    candidates = candidates.filter((file) => gre.test(file.path));
+  }
+  const files: string[] = [];
+  const hits: GrepHit[] = [];
+  const counts: Array<{ path: string; count: number }> = [];
+  let truncated = false;
+  for (const file of candidates) {
+    const target = safePath(conversationId, file.path);
+    if (!target) continue;
+    let text: string;
+    try {
+      text = readFileSync(target, "utf-8");
+    } catch {
+      continue;
+    }
+    if (text.includes("\0")) continue; // 二进制跳过
+    let count = 0;
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]!;
+      if (!re.test(line)) continue;
+      count += 1;
+      if (mode === "content") {
+        if (hits.length >= maxMatches) {
+          truncated = true;
+          break;
+        }
+        hits.push({
+          path: file.path,
+          line: i + 1,
+          text: line.length > GREP_LINE_CHARS ? `${line.slice(0, GREP_LINE_CHARS)}…` : line,
+        });
+      }
+    }
+    if (count > 0) {
+      files.push(file.path);
+      if (mode === "count") counts.push({ path: file.path, count });
+    }
+    if (truncated) break;
+  }
+  return { files, hits, counts, truncated };
 }
 
 /** 精确替换（对齐 Deep Agents 的 edit_file：old_string 必须唯一命中）。 */

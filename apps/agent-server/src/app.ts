@@ -16,7 +16,7 @@ import {
 import { ensureSession, SESSION_COOKIE, touchSession, type Session } from "./session.js";
 import { resolveOwner } from "./owner.js";
 import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
-import { appendAudit } from "./audit.js";
+import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -314,6 +314,21 @@ export function createApp() {
     return c.json(summarizeCost({ ownerKey: c.get("owner"), days }));
   });
 
+  // ---- 安全审计留痕查询（写操作安全闸门 P0-7 的读侧）：只写不查等于半个能力 ----
+  // 最小权限：HTTP 侧只返回本 owner 的事件与无主遗留事件，全局视角走 CLI 直读 JSONL。
+  app.get("/chat/audit", (c) => {
+    const decision = (c.req.query("decision") || "").trim();
+    const events = listAuditEvents({
+      ownerKey: c.get("owner"),
+      limit: Number(c.req.query("limit")) || 100,
+      ...(c.req.query("fromDay") ? { fromDay: c.req.query("fromDay") } : {}),
+      ...(c.req.query("toDay") ? { toDay: c.req.query("toDay") } : {}),
+      ...(c.req.query("tool") ? { tool: c.req.query("tool") } : {}),
+      ...(decision ? { decision: decision as AuditDecision } : {}),
+    });
+    return c.json({ events });
+  });
+
   // ---- 定时任务（§8：调度器复用对话任务底座；结果回投让用户回来就能看到）----
   app.get("/chat/schedules", async (c) => {
     const conversationId = c.req.query("conversationId") || undefined;
@@ -462,12 +477,19 @@ export function createApp() {
 
   // ---- 工具调用二次确认回调（一次性票据 + 会话归属校验，写操作安全闸门 P0-4）----
   app.post("/chat/confirm", async (c) => {
-    const body = await readJson<{ ticket?: string; callId?: string; confirmed?: boolean; grantRead?: boolean }>(c);
+    const body = await readJson<{
+      ticket?: string;
+      callId?: string;
+      confirmed?: boolean;
+      grantRead?: boolean;
+      /** 澄清类票据带回的选项值（结构化澄清 request_clarification）。 */
+      value?: string;
+    }>(c);
     // ticket 为主；callId 仅作旧前端兼容，但同样必须通过会话归属校验。
     const ticket = body.ticket || body.callId;
     if (!ticket) return errorJson(c, 400, "CHAT_CONFIRM_MISSING_TICKET", "缺少 ticket");
     const session = c.get("session") as Session;
-    const res = answerConfirmation(ticket, session.id, body.confirmed === true);
+    const res = answerConfirmation(ticket, session.id, body.confirmed === true, body.value);
     if (!res.ok) {
       appendAudit({
         kind: "gate",
@@ -850,9 +872,13 @@ export function createApp() {
     const id = c.req.param("id");
     if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const path = c.req.query("path") || "";
-    const result = fsRead(id, path);
+    // 大文件按行分页（与 fs_read 工具的 offset/limit 同语义：offset 从 0 起）。
+    const offset = c.req.query("offset");
+    const limit = c.req.query("limit");
+    const paging = offset != null || limit != null ? { offset: Number(offset) || 0, limit: Number(limit) || 0 } : {};
+    const result = fsRead(id, path, paging);
     if ("error" in result) return errorJson(c, 404, "WORKSPACE_FILE_NOT_FOUND", result.error);
-    return c.json({ path, content: result.content });
+    return c.json({ path, content: result.content, ...(result.totalLines ? { totalLines: result.totalLines } : {}) });
   });
 
   // ---- 设备级偏好（原前端 localStorage：主题 / 客户端默认语言 / 上次打开的对话 / 会话排序模式）----

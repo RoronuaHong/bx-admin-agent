@@ -17,6 +17,12 @@ export interface MemoryItem {
 const STORE_PATH = resolve(DATA_DIR, "memory.json");
 const MAX_ITEMS = Number(process.env.MEMORY_MAX_ITEMS || 50);
 const MAX_TEXT_LEN = Number(process.env.MEMORY_MAX_TEXT_LEN || 500);
+/**
+ * 注入系统提示的记忆总字符上限（动态段必须有硬上限）。
+ * 条数上限（MAX_ITEMS）管不住单条长度累加：50 × 500 字足以把动态段撑到 25k 字，
+ * 挤掉历史与工具结果的预算。故按「总字符」再收一道，且优先保留**最近**的记忆。
+ */
+const INJECT_CHARS = Number(process.env.MEMORY_INJECT_CHARS || 2000);
 
 let cache: MemoryItem[] | null = null;
 
@@ -94,6 +100,16 @@ export function clearMemory(ownerKey?: string): void {
 export function renderMemory(ownerKey?: string): string {
   const items = listMemory(ownerKey);
   if (!items.length) return "";
-  const lines = items.map((item) => `- ${item.text}`).join("\n");
-  return `以下是用户长期保留的记忆（跨会话生效，未确认的简单采纳，冲突时以当前对话为准）：\n${lines}`;
+  // 倒序累积（最新优先）后回正：超上限时丢的是最旧的记忆，且尾部注明省略条数（不静默丢数据）。
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const line = `- ${items[i]!.text}`;
+    if (used + line.length > INJECT_CHARS) break;
+    kept.unshift(line);
+    used += line.length;
+  }
+  const omitted = items.length - kept.length;
+  const tail = omitted > 0 ? `\n…（另有 ${omitted} 条较早记忆未注入，超出注入上限）` : "";
+  return `以下是用户长期保留的记忆（跨会话生效，未确认的简单采纳，冲突时以当前对话为准）：\n${kept.join("\n")}${tail}`;
 }

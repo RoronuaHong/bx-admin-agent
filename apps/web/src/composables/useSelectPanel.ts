@@ -2,7 +2,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 /**
  * 下拉选择面板的公共行为（开合 / 键盘上下移动 / 回车选择 / 点击外部关闭 / 失焦收回）。
- * ModelSelect 与 ExpertSelect 共用，避免在各自组件里重复这一套交互逻辑。
+ * 目前仅 ModelSelect 使用（专家切换走 ChatPage 的 toggleExpertPanel，未独立成组件）。
  *
  * 组件自身只负责「选项从哪来、选中后干什么」：
  * - `flatOptions`：扁平选项列表（含当前选中项），用于键盘边界与高亮定位。
