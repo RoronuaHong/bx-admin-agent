@@ -28,18 +28,22 @@ import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStat
 import { getRole } from "./roles.js";
 import { enforceRoleIdentity } from "./role-guard.js";
 import {
+  buildGroundedFallbackSystem,
   buildVerifyHint,
   buildVerifyPrompt,
   consensusUnsupported,
+  DATA_NEED_SYSTEM,
   decideGrounding,
   GROUNDING_HINT,
   isGroundingEvidenceTool,
+  parseDataNeed,
   parseUnsupportedClaims,
   shouldRunVerification,
   UNGROUNDED_REPLY,
   VERIFY_SYSTEM,
 } from "./grounding.js";
 import { wrapUntrusted } from "./untrusted.js";
+import { webSearchStatus } from "./web-search.js";
 import { getUploadImage } from "./uploads.js";
 import { assembleContext } from "./history.js";
 
@@ -206,6 +210,58 @@ async function verifyAnswerWith(
     { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" } },
   );
   return parseUnsupportedClaims(result.text);
+}
+
+/**
+ * 零证据收束的「受约束诚实兜底」：同一个模型、无工具、非流式，按 `buildGroundedFallbackSystem` 的严格口径
+ * 写最后一段回复（只能说明职责边界 / 如实说没取到 / 请用户补充，严禁任何事实性断言）。
+ *
+ * 为什么需要它：确定性兜底文案（`UNGROUNDED_REPLY`）没有语义，无法区分「本轮本就不需要数据」与
+ * 「需要数据但没取到」，于是打招呼、超出职责范围的提问也会被回成一句「没有取得任何数据源返回的数据」。
+ * 返回 `null` = 兜底调用不可用（异常 / 空文本），由调用方回落到确定性文案——绝不因此展示未接地内容。
+ */
+/**
+ * 「本轮是否需要外部数据」的轻判定调用（无工具、极短提示，通常几百毫秒级）。
+ * 只在**零证据收束**时使用（见 runLoop 的 grounding 分支），用来决定是「补取数据再答」（重试重提示）
+ * 还是「本就不需要数据 → 直接受约束兜底」（轻提示）。判定不可用（异常 / 解析不出）返回 null = 按 DATA 处理。
+ */
+async function probeNeedsExternalData(model: ModelEntry, question: string, signal?: AbortSignal): Promise<"data" | "no_data" | null> {
+  try {
+    const result = await callAgent(
+      model,
+      [{ role: "user", content: question.trim() || "（本轮没有可识别的文本输入）" }],
+      [],
+      signal,
+      undefined,
+      { systemParts: { stable: DATA_NEED_SYSTEM, dynamic: "" } },
+    );
+    return parseDataNeed(result.text);
+  } catch (err) {
+    console.warn(`[chat:grounding] 数据需求分诊调用失败，按 DATA 处理：${String((err as Error)?.message || err)}`);
+    return null;
+  }
+}
+
+async function honestFallbackWith(
+  model: ModelEntry,
+  question: string,
+  roleLabel: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  try {
+    const result = await callAgent(
+      model,
+      [{ role: "user", content: question.trim() || "（用户本轮没有可识别的文本输入）" }],
+      [],
+      signal,
+      undefined,
+      { systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" } },
+    );
+    return result.text.trim() || null;
+  } catch (err) {
+    console.warn(`[chat:grounding] 诚实兜底调用失败，改用确定性兜底文案：${String((err as Error)?.message || err)}`);
+    return null;
+  }
 }
 
 function truncateArgs(raw: string): string {
@@ -471,6 +527,43 @@ interface CallOutcome {
   text: string;
   toolCalls: ToolCall[];
   failure: string | null;
+  /** 本轮思考流原文：端点要求回灌思考时（models.ts 的 reasoningReplayRequired）需随 assistant 轮一起回灌，
+   *  否则多轮工具循环会被网关判为「缺 reasoning_content」而断掉。 */
+  reasoning: string;
+}
+
+/**
+ * 已确认「不接受强制工具通道」（`tool_choice: "required"` / 指定函数）的端点。
+ *
+ * 为什么需要：强制通道是可选项，不是通用能力——Anthropic 官方文档明示部分模型对 any/tool 直接返回 400，
+ * 且强制时会预填 assistant 消息（模型无法先给自然语言开场，问候这类轮次因此失去正常回话的机会）。
+ * 本仓实测 TokenHub 的 OpenAI 兼容端点（kimi-k2.7-code）对 required 与「指定函数」均回
+ * `400 invalid_request_error / 400001 rejected by an internal MaaS component`，只有 auto / none 可用；
+ * 对照实验见 `scripts/_model-toolchoice-probe.mjs`（可复跑，改模型/改网关时先跑它）。
+ *
+ * 结论：被拒一次就记住，后续不再发 required；否则**每一轮首调**都要白打一次 400（延迟翻倍 + 日志噪音），
+ * 而下面的降级分支本来就会改走 auto 重试。key 含端点地址：换模型 / 换网关重新探测，不把 A 的结论套到 B。
+ */
+const forcedToolChoiceUnsupported = new Set<string>();
+
+function modelEndpointKey(model: ModelEntry): string {
+  return `${model.id}@${String(model.baseUrl || "")}`;
+}
+
+/** 该模型端点是否仍可尝试强制工具通道（false = 已实测被拒，直接走 auto）。 */
+export function forcedToolChoiceSupported(model: ModelEntry): boolean {
+  return !forcedToolChoiceUnsupported.has(modelEndpointKey(model));
+}
+
+/** 记录「该模型端点不接受强制工具通道」（进程内记忆，重启后重新探测一次）。 */
+export function markForcedToolChoiceUnsupported(model: ModelEntry): void {
+  const key = modelEndpointKey(model);
+  if (forcedToolChoiceUnsupported.has(key)) return;
+  forcedToolChoiceUnsupported.add(key);
+  console.warn(
+    `[chat:tool-choice] 端点不接受强制工具通道（模型 ${model.id}）：反编造由提示词纪律 + 接地护栏承担，` +
+      "该端点不再尝试 tool_choice=required",
+  );
 }
 
 /** 一次模型调用：边收增量边 yield text_delta / thinking_delta，结束时返回全文与工具调用。 */
@@ -484,8 +577,6 @@ export async function* streamCall(
   /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）：仅当存在且当前尚无工具结果时，
    *  把 tool_choice 设为 required 逼模型先调工具；拿到结果后（或角色未开启）走 auto。不传 = auto。 */
   forceToolCall?: boolean,
-  /** 原生联网搜索（选项 A）：通用 Agent 开箱即带的实时检索能力；由调用方按角色/开关决定是否启用。 */
-  webSearch?: boolean,
 ): AsyncGenerator<ChatEvent, CallOutcome> {
   // 单一有序队列：文本与思考增量按到达顺序入队（同一 read 内也保持先后），消费循环严格 FIFO
   // 下发，避免「优先取文本」导致整段 SSE 一次性送达时思考被排到正文之后。
@@ -494,6 +585,8 @@ export async function* streamCall(
   let failure: string | null = null;
   let wake: (() => void) | null = null;
   let toolCalls: ToolCall[] = [];
+  // 思考流原文（按到达顺序累积）：既用于回传本轮的 assistant 轮（端点要求时回灌），也用于「空回合」判定。
+  let reasoning = "";
   // 是否收到过文本增量回调：用于区分「流式通道（文本增量已逐片推进 pending）」与
   // 「非流式通道（ollama / 不支持 SSE 的网关，onDelta 永不触发）」。
   let streamed = false;
@@ -501,10 +594,11 @@ export async function* streamCall(
   // 角色级首轮强制工具调用：当前尚无工具结果（turns 里没有 role==="tool"）且角色开启 forceToolCall 时，
   // 把 tool_choice 设为 required，逼模型先调工具、杜绝凭记忆编造；一旦有工具结果即恢复 auto（模型可正常收尾）。
   // 仅当确有工具 schema 时才设（无工具的直连路径保持原 auto/none 语义，不产生 required+空工具的非法请求）。
-  // 注意：required(any) 与「扩展思考(thinking)」在多数端点互斥（Anthropic 文档明示），且部分网关根本不接受该取值。
-  // 首轮 required 被端点拒绝时自动降级 auto 重试一次（model 仍靠强提示走工具），不让强制开关把对话直接打断。
+  // 注意：required(any) 与「扩展思考(thinking)」在多数端点互斥，且部分端点根本不接受该取值（会直接 4xx）。
+  // 首次被端点拒绝时自动降级 auto 重试一次（模型仍靠强提示走工具），并把该模型记入「不支持强制通道」——
+  // 否则每一轮首调都要白打一次 400（延迟翻倍 + 日志噪音）。判定与记忆见本模块的 forcedToolChoiceSupported。
   const hasToolResult = turns.some((t) => t.role === "tool");
-  const forceApplied = !!forceToolCall && !hasToolResult;
+  const forceApplied = !!forceToolCall && !hasToolResult && forcedToolChoiceSupported(model);
   let toolChoice: "required" | "auto" = forceApplied ? "required" : "auto";
   let text = "";
 
@@ -520,11 +614,12 @@ export async function* streamCall(
         wake?.();
       },
       tools.length
-        ? { tools, toolChoice, systemParts: system, webSearch }
-        : { systemParts: system, webSearch },
+        ? { tools, toolChoice, systemParts: system }
+        : { systemParts: system },
       (tchunk) => {
         // 注意：thinking 通道不应置 streamed——streamed 只表示「文本增量已通过流式通道到达」，
         // 用于决定是否走非流式文本兜底。否则非流式模型一旦返回 thinking，会误把最终正文丢弃。
+        reasoning += tchunk;
         pending.push({ kind: "thinking", text: tchunk });
         wake?.();
       },
@@ -581,6 +676,8 @@ export async function* streamCall(
     (/model http 4\d\d/i.test(failure) ||
       /tool_choice.*(required|any).*(incompatible|thinking|not support|unsupported|invalid)/i.test(failure));
   if (forcedToolRejected) {
+    // 记住「该端点不接受强制通道」：下一次调用起直接用 auto，不再为同一个 400 付费（本进程内有效）。
+    markForcedToolChoiceUnsupported(model);
     console.log(`[chat:tool-choice] required 被端点拒绝，降级 auto 重试一次：${failure!.slice(0, 200)}`);
     failure = null;
     toolChoice = "auto";
@@ -590,7 +687,7 @@ export async function* streamCall(
     wake = null;
     yield* invokeAndDrain();
   }
-  return { text, toolCalls, failure };
+  return { text, toolCalls, failure, reasoning };
 }
 
 /** 工具循环的运行上下文：主代理与子代理共用同一个循环，差别在工具集 / 系统提示 / 轮次上限。 */
@@ -627,8 +724,6 @@ interface LoopContext {
   /** 角色级接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：本轮无任何外部数据时不允许收束。
    *  不填 = 不参与本护栏，通用角色行为不变。 */
   enforceGrounding?: boolean;
-  /** 原生联网搜索（选项 A）：通用 Agent 开箱即带的实时检索能力；默认开，可由 .env AGENT_WEB_SEARCH=0 关闭。 */
-  webSearch: boolean;
 }
 
 interface LoopOutcome {
@@ -739,7 +834,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
     // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
     while (true) {
-      const gen = streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system, ctx.forceToolCall, ctx.webSearch);
+      const gen = streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system, ctx.forceToolCall);
       let step = await gen.next();
       while (!step.done) {
         const ev = step.value as ChatEvent;
@@ -751,7 +846,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         step = await gen.next();
       }
       outcome = step.value as CallOutcome;
-      if (!outcome.failure) break;
+      if (!outcome.failure) {
+        // 空回合（既无正文、也无工具调用、连思考都没有）不是「模型表示没有内容」，而是上游抖动：
+        // 共享/免费端点上很常见。直接收束会让用户看到空白气泡（同一次提问重发往往就有内容），
+        // 故走同一份瞬时重试预算重试；重试用尽才接受空结果（后续还有伪调用/接地等分支兜底）。
+        const emptyRound = !outcome.text.trim() && !outcome.toolCalls.length && !outcome.reasoning.trim();
+        if (emptyRound && callAttempt < MODEL_CALL_RETRIES) {
+          callAttempt += 1;
+          modelRetries += 1;
+          console.log(`[chat:retry] 模型返回空回合，重试 ${callAttempt}/${MODEL_CALL_RETRIES}`);
+          continue;
+        }
+        break;
+      }
       if (callAttempt < MODEL_CALL_RETRIES && isTransientModelError(outcome.failure)) {
         callAttempt += 1;
         modelRetries += 1;
@@ -779,8 +886,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       // 运行时校验：接地护栏（防「零数据凭记忆作答」）。声明 enforceGrounding 的角色在一条数据都没
-      // 拿到时不允许以正文结论收束——先作废该段文本 + 回灌纠正提示补取数据，纠正用尽仍无数据则
-      // 标记 ungrounded，由调用方改用确定性拒答（绝不展示可能编造的内容）。
+      // 拿到时不允许以正文结论收束——先作废该段文本 + 回灌纠正提示（两条路径都写明），纠正用尽仍无数据
+      // 则标记 ungrounded，并改用「受约束的诚实兜底」收束（绝不展示可能编造的内容）。
       const grounding = decideGrounding({
         enforceGrounding: ctx.enforceGrounding,
         enabled: GROUNDING_GUARD,
@@ -788,7 +895,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         retries: groundingRetries,
         maxRetries: GROUNDING_MAX_RETRIES,
       });
-      if (grounding === "retry") {
+      // 零证据收束先做一次**轻分诊**（无工具、极短提示）：这轮到底需不需要外部数据？
+      //   NO_DATA（问候/闲聊/问身份/超范围提问）→ 直接走受约束诚实兜底，省掉一整轮「重提示重试」。
+      //     实测一次问候的耗时几乎全在这里：重提示每轮 4-10s，而轻提示 <1s（15s → ~5s）。
+      //   DATA / 判定失败 → 维持原路（作废 + 回灌纠正提示再跑一轮），反编造的自愈路径完全不变。
+      const noDataTurn = grounding === "retry" && (await probeNeedsExternalData(ctx.model, userQuestion, ctx.signal)) === "no_data";
+      if (grounding === "retry" && !noDataTurn) {
         groundingRetries += 1;
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         conversation.push({ role: "assistant", content: outcome.text });
@@ -796,9 +908,26 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         console.log("[chat:grounding] 未取得任何工具数据即作答，已作废并回灌纠正提示");
         continue;
       }
-      if (grounding === "block") {
+      if (noDataTurn) {
+        console.log("[chat:grounding] 分诊判定本轮不需要外部数据：跳过重试，直接走受约束的诚实兜底");
+      }
+      if (grounding === "block" || noDataTurn) {
         ungrounded = true;
-        console.log("[chat:grounding] 纠正后仍未取得工具数据，改用确定性拒答");
+        // 丢弃本轮未接地的正文（不上屏），改为一次「受约束的诚实兜底」（禁止任何事实性断言）：
+        // 不能直接回固定话术——固定话术无法区分「本轮本来就不需要数据」（问候/闲聊/超范围提问）与
+        // 「需要数据但没取到」，会把「没有取得任何数据源返回的数据」当成结论告诉用户（与事实不符）。
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        const honest = await honestFallbackWith(ctx.model, userQuestion, getRole(ctx.namespace).label, ctx.signal);
+        const finalHonest = honest || UNGROUNDED_REPLY;
+        console.log(
+          `[chat:grounding] ${noDataTurn ? "零数据且不需要外部数据" : "纠正后仍未取得工具数据"}，` +
+            `改走受约束的诚实兜底${honest ? "" : "（调用不可用，回落确定性文案）"}`,
+        );
+        spentTokens += estimateTokens(finalHonest);
+        text += finalHonest;
+        synthesisText = finalHonest;
+        yield { type: "text_delta", text: finalHonest };
+        break;
       }
       // 运行时校验：事后核验（Chain-of-Verification 最小版）。零证据的情况已由上面拦截；这里覆盖
       // 「拿到部分数据后仍有超出证据的断言」——发现即作废并回灌纠正（可重新取数或删掉无支持内容）。
@@ -853,7 +982,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     executedSigs.clear();
     roundExecuted = [];
 
-    conversation.push({ role: "assistant", content: outcome.text, toolCalls: outcome.toolCalls });
+    // 工具调用轮：把本轮思考一并带上（`reasoning`）——思考类模型在工具循环里要求 assistant 工具调用消息
+    // 携带 reasoning_content，缺了会被网关判为非法请求（详见 models.ts 的 reasoningReplayRequired）。
+    // 是否真的下发该字段由端点能力决定（models.ts 按端点学习），这里只保证「有原文就不会丢」。
+    conversation.push({
+      role: "assistant",
+      content: outcome.text,
+      toolCalls: outcome.toolCalls,
+      ...(outcome.reasoning.trim() ? { reasoning: outcome.reasoning } : {}),
+    });
 
     // 逐个处理；**连续的** task 委派合并成一批并行执行（对齐 Deep Agents：单轮多个 task 并行）。
     const calls = outcome.toolCalls;
@@ -1578,6 +1715,8 @@ export async function* chatStream(
   const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
   const labels = new Map<string, string>();
   for (const server of [...collected.ready, ...collected.unavailable]) labels.set(server.id, server.label);
+  // 联网检索通道状态：一次算好，既进系统提示（诚实上报），也进下面的通道日志。
+  const webChannel = webSearchStatus();
   // 工具通道现状 → 进系统提示动态段：让模型知道「哪些域这次真的能查、哪些缺席、为什么缺席」。
   const tooling: ToolingStatus | null = toolMode
     ? {
@@ -1588,6 +1727,8 @@ export async function* chatStream(
         unavailable: collected.unavailable,
         dropped: toolSearch ? [] : selection.droppedServers.map((id) => labels.get(id) || id),
         limit: MCP_MAX_TOOLS,
+        // 联网检索通道：可用性进系统提示，让模型在「不可用」时如实说明而不是凭记忆作答。
+        web: webChannel,
         ...(toolSearch
           ? {
               deferred: true,
@@ -1604,7 +1745,8 @@ export async function* chatStream(
         `mcp=${specs.length - builtinSpecs.length}/${collected.tools.length} builtin=${builtinSpecs.length} ` +
         `ready=${collected.ready.map((item) => `${item.id}(${item.tools})`).join(",") || "-"} ` +
         `unavailable=${collected.unavailable.map((item) => `${item.id}(${item.reason})`).join("|") || "-"} ` +
-        `dropped=${toolSearch ? "-" : selection.droppedServers.join(",") || "-"}`,
+        `dropped=${toolSearch ? "-" : selection.droppedServers.join(",") || "-"} ` +
+        `web=${webChannel.available ? webChannel.provider : "off"}`,
     );
   }
   // 预算先算：窗口 − 输出预留 − 工具 schema − 本轮工具结果预算（工具定义也是纯开销）。
@@ -1674,9 +1816,6 @@ export async function* chatStream(
     yield { type: "model", id: m.id, label: m.label };
     usedWindow = m.contextWindow;
 
-    // 原生联网搜索（选项 A）：默认开箱即有，对齐 CodeBuddy/Cursor/千问；AGENT_WEB_SEARCH=0 可整体关闭。
-    const webSearchEnabled = (process.env.AGENT_WEB_SEARCH ?? "1") !== "0";
-
     let outcome: LoopOutcome | CallOutcome;
     if (toolMode) {
       outcome = yield* runLoop(
@@ -1698,14 +1837,13 @@ export async function* chatStream(
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
           enforceGrounding: roleEnforceGrounding,
-          webSearch: webSearchEnabled,
           ownerKey: opts.ownerKey,
         },
         turns,
       );
     } else {
-      // 直连路径：默认带上原生联网搜索；callOpenAi 内部会在网关不支持时自动降级为不带搜索重试。
-      outcome = yield* streamCall(m, turns, images, [], signal, system, undefined, webSearchEnabled);
+      // 直连路径：零工具语义（无 function tool → 无联网检索）；联网能力经内置工具提供，只在工具模式可用。
+      outcome = yield* streamCall(m, turns, images, [], signal, system);
     }
     text = outcome.text;
     const loop = outcome as LoopOutcome;
@@ -1783,11 +1921,12 @@ export async function* chatStream(
 
   // 角色身份护栏：兜底纠正模型把自身错认为底层大模型的自报（如「我是 Kimi」），
   // 确定性改写短自报句，长回答交提示词层处理（详见 src/role-guard.ts）。
-  // 接地护栏兜底：纠正用尽仍未取得任何工具数据的角色，改用确定性拒答——宁如实说取不到，
-  // 也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
-  const finalText = ungrounded
-    ? UNGROUNDED_REPLY
-    : enforceRoleIdentity(text.trim(), getRole(conversation?.agentId).label);
+  // 接地护栏兜底：纠正用尽仍未取得任何工具数据的角色，正文已被换成「受约束的诚实兜底」文本
+  // （只允许说明职责边界 / 如实说没取到 / 请用户补充，禁止事实性断言）；该文本缺失时才回落确定性文案。
+  // 宁如实说取不到，也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
+  const roleLabelFinal = getRole(conversation?.agentId).label;
+  const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
+  const finalText = ungrounded ? guarded || UNGROUNDED_REPLY : guarded;
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },

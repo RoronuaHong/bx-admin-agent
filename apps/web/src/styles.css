@@ -25,6 +25,23 @@
   --ctrl-h: 34px;
   --ring: 0 0 0 3px color-mix(in srgb, var(--ink) 13%, transparent);
   --ease: cubic-bezier(0.2, 0.8, 0.28, 1);
+  /* 二级文字（正文/步骤名用色，antd 的 text-88% 档位按暖底调校）；
+     比 --muted 更实，用来把「内容」与「元信息」拉开层级。 */
+  --ink-2: #3d3d38;
+  /* 语义状态色：**只用于状态**（点/药丸/图标），不做大块底色——
+     覆盖整块会把暖纸底压成脏灰。色相沿用 antd/vben 的语义映射（进行中/成功/失败），
+     暖底不适合直接搬 #1677ff，故「进行中」用品牌金 --accent。 */
+  --success: #2f9e63;
+  /* 嵌套表面（实色，不再层层 color-mix 叠加：多层混合会互相污染成不可控的灰） */
+  --surface-2: #f7f6f2;
+  --surface-3: #f1efe9;
+  /* 低透明度状态底（随主题自动取当前 --accent/--success/--danger 的色调） */
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --success-soft: color-mix(in srgb, var(--success) 13%, transparent);
+  --danger-soft: color-mix(in srgb, var(--danger) 11%, transparent);
+  /* 时间轴竖轨：与发丝边框（--line）分开控制——深色下边框要极轻，但连接线太暗就「断成几个点」，
+     所以两个主题各给一档（深色用更亮的 #3a3a35，浅色沿用 --line 的灰）。 */
+  --rail: #dbdbd4;
   color-scheme: light;
 }
 
@@ -43,6 +60,15 @@ html[data-theme="dark"] {
   /* 停止生成按钮语义色（暖杏金）：深色下柔和醒目 */
   --stop: #f2b386;
   --shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+  /* 二级文字：深色下提亮，避免与背景对比不足 */
+  --ink-2: #dcdcd4;
+  /* 语义状态色（深色下提亮，保证在深底上的辨识度） */
+  --success: #4fae76;
+  /* 嵌套表面：深色下比卡片更亮 = 抬升，与浅色的「内凹」方向相反，符合各自习惯 */
+  --surface-2: #171716;
+  --surface-3: #1d1d1b;
+  /* 时间轴竖轨：深色下提亮一档，否则连接线在深底上几乎看不见（步骤被读成互不相关的孤点）。 */
+  --rail: #3a3a35;
   color-scheme: dark;
 }
 

@@ -3,7 +3,10 @@
 // 设计口径见 src/grounding.ts 头注释。
 import { test, expect } from "vitest";
 import {
+  buildGroundedFallbackSystem,
   buildVerifyHint,
+  DATA_NEED_SYSTEM,
+  parseDataNeed,
   buildVerifyPrompt,
   consensusUnsupported,
   decideGrounding,
@@ -55,9 +58,57 @@ test("[D] isGroundingEvidenceTool：外部数据工具算证据，记账/工作�
   expect(isGroundingEvidenceTool("")).toBe(false);
 });
 
-test("[E] 兜底文案非空（提示走函数通道补数据；拒答不编造）", () => {
+test("[E] 纠正提示是两支口径：需要数据的取数、本就不需要数据的如实直答（且不得声称数据源故障）", () => {
   expect(GROUNDING_HINT.trim().length).toBeGreaterThan(0);
+  // 取数路径仍要写明（否则弱模型会直接放弃取数）。
+  expect(GROUNDING_HINT).toContain("函数调用");
+  // 非取数路径必须存在：问候/闲聊/超范围提问不该被逼着"为了凑证据去调无关工具"。
+  expect(GROUNDING_HINT).toContain("不需要外部数据");
+  // 两条路径共同的红线：不得编造。
+  expect(GROUNDING_HINT).toContain("编造");
+  // 回归锚点：本轮根本没发起取数时，不许让模型声称数据源故障（这正是「问候被回成数据源故障」的根因）。
+  expect(GROUNDING_HINT).toContain("不要声称数据源故障");
+  // 回归锚点：纠正提示不许被复述进正文（实测出现过「我选②改写回答…」被当答案开头）。
+  expect(GROUNDING_HINT).toContain("不要复述");
+  expect(VERIFY_HINT_TAIL).toContain("不要复述");
+});
+
+test("[E2] 确定性兜底文案：如实说没取到，但不把责任推给用户去改设置", () => {
   expect(UNGROUNDED_REPLY.trim().length).toBeGreaterThan(0);
+  // 回归锚点：旧文案让用户「在对话设置里确认数据源已连接」——对「本轮本来不需要数据」的轮次是误导。
+  expect(UNGROUNDED_REPLY).not.toContain("数据源已连接");
+  expect(UNGROUNDED_REPLY).not.toContain("对话设置");
+});
+
+test("[J] 数据需求分诊：NO_DATA 必须先判（含 DATA 子串），识别不出返回 null（调用方按 DATA 保守处理）", () => {
+  expect(parseDataNeed("DATA")).toBe("data");
+  expect(parseDataNeed("NO_DATA")).toBe("no_data");
+  expect(parseDataNeed("no_data\n")).toBe("no_data");
+  expect(parseDataNeed("NO-DATA")).toBe("no_data");
+  expect(parseDataNeed("NO DATA")).toBe("no_data");
+  expect(parseDataNeed("结论：NO_DATA")).toBe("no_data");
+  expect(parseDataNeed("我认为是 DATA")).toBe("data");
+  expect(parseDataNeed("hmm")).toBeNull();
+  expect(parseDataNeed("")).toBeNull();
+  // 分诊提示的契约：只输出两个词之一；拿不准时选 DATA（保守方向 = 宁可多跑一轮重试）
+  expect(DATA_NEED_SYSTEM).toContain("DATA");
+  expect(DATA_NEED_SYSTEM).toContain("NO_DATA");
+  expect(DATA_NEED_SYSTEM).toContain("无法确定时输出 DATA");
+});
+
+test("[E3] 受约束的诚实兜底提示：带角色名、禁止外部事实断言、允许自报身份、禁止提及内部机制", () => {
+  const system = buildGroundedFallbackSystem("观影助手");
+  expect(system).toContain("观影助手");
+  // 零编造的硬约束：明确禁止外部事实性内容 + 禁止提及工具/数据源等内部机制。
+  expect(system).toContain("外部");
+  expect(system).toContain("数据源");
+  expect(system).toContain("不要提及");
+  // 回归锚点：身份自我介绍必须被允许——否则「你是谁」会被兜底成「身份问题我暂无法回答」（实测踩过）。
+  expect(system).toContain("角色身份");
+  expect(system).toContain("不要回避身份问题");
+  // 长度约束存在（兜底话术不该变成第二段长回答）。
+  expect(system).toContain("80 字");
+  expect(buildGroundedFallbackSystem("客服助手")).toContain("客服助手");
 });
 
 test("[F] 角色接线：movie 开启接地护栏，通用角色不参与", () => {

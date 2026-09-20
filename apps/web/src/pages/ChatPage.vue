@@ -1121,6 +1121,35 @@ function toggleReasoning(id: number) {
   else openReasoning.add(id);
 }
 
+/**
+ * 单步结果的展开态（键 = 气泡 id + 步骤 id）。
+ * 结果默认收起：一次工具循环常有 3-8 步，全部铺开会把气泡撑得很长；收起时用一行摘要交代
+ * 「这步拿到了什么」，要看全文再点开（对齐 antd Collapse 的「默认收起 + 摘要」）。
+ */
+const openSteps = reactive(new Set<string>());
+
+function stepKey(b: Bubble, step: ToolStep): string {
+  return `${b.id}::${step.id}`;
+}
+
+function toggleStep(b: Bubble, step: ToolStep) {
+  if (!step.result) return;
+  const key = stepKey(b, step);
+  if (openSteps.has(key)) openSteps.delete(key);
+  else openSteps.add(key);
+}
+
+/** 收起时的摘要：取结果首个非空行并截断（只作提示，全文点开看）。 */
+function stepSummary(step: ToolStep): string {
+  const line = (step.result || "")
+    .split("\n")
+    .map((item) => item.trim())
+    .find((item) => item.length > 0);
+  if (!line) return "";
+  // 抓正文的步骤结果首行是 markdown 标题（`# 标题`）：摘要里去掉标记，省得像乱码。
+  return line.replace(/^#{1,6}\s*/, "").slice(0, 90);
+}
+
 function hasRunningStep(b: Bubble): boolean {
   return !!b.steps?.some((s) => s.status === "running");
 }
@@ -3826,14 +3855,36 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <div v-if="b.steps?.length" class="steps">
-                  <div v-for="step in b.steps" :key="step.id" class="step">
-                    <div class="step-head">
+                  <div
+                    v-for="step in b.steps"
+                    :key="step.id"
+                    class="step"
+                    :class="[stepClass(step.status), { expanded: openSteps.has(stepKey(b, step)) }]"
+                  >
+                    <!-- 有结果的步骤整行可点开（原生 button：键盘可达、禁用态即「纯静态行」）。 -->
+                    <button
+                      class="step-head"
+                      type="button"
+                      :disabled="!step.result"
+                      :aria-expanded="step.result ? openSteps.has(stepKey(b, step)) : null"
+                      :aria-controls="step.result ? `step-result-${step.id}` : null"
+                      @click="toggleStep(b, step)"
+                    >
                       <span class="mcp-dot" :class="stepClass(step.status)"></span>
                       <span class="step-name">{{ step.name }}</span>
                       <span v-if="step.server" class="step-server">{{ step.server }}</span>
+                      <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">
+                        {{ stepSummary(step) }}
+                      </span>
                       <span class="step-status">{{ stepStatusText(step.status) }}</span>
-                    </div>
-                    <pre v-if="step.result" class="step-result">{{ step.result }}</pre>
+                      <span v-if="step.result" class="step-caret" aria-hidden="true"></span>
+                    </button>
+                    <pre
+                      v-if="step.result"
+                      v-show="openSteps.has(stepKey(b, step))"
+                      :id="`step-result-${step.id}`"
+                      class="step-result"
+                    >{{ step.result }}</pre>
                   </div>
                 </div>
                 <div v-if="b.subagents?.length" class="subagents">
@@ -6359,29 +6410,29 @@ onBeforeUnmount(() => {
   height: 7px;
   flex: none;
   border-radius: 50%;
-  background: var(--muted);
-  opacity: 0.55;
+  /* 用带 alpha 的颜色而不是 opacity：避免与父级透明度叠加出不可控的灰。 */
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
 }
 
+/* 状态语义（对齐 antd 的 success/error/processing）：
+   ok = 绿、err = 红、running = 品牌金 + 呼吸光环（比「忽明忽暗闪烁」更稳，久看不刺眼）。 */
 .mcp-dot.ok {
-  background: color-mix(in srgb, #2f9e63 85%, var(--ink));
-  opacity: 1;
+  background: var(--success);
 }
 
 .mcp-dot.err {
   background: var(--danger);
-  opacity: 1;
 }
 
 .mcp-dot.running {
-  background: var(--stop);
-  opacity: 1;
-  animation: mcp-pulse 1.1s infinite ease-in-out;
+  background: var(--accent);
+  animation: mcp-pulse 1.4s var(--ease) infinite;
 }
 
 @keyframes mcp-pulse {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 1; }
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
+  70% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 
 .mcp-row__ops {
@@ -6476,55 +6527,165 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
-/* ---- 气泡里的工具步骤与确认卡 ---- */
+/* ---- 气泡里的工具步骤与确认卡 ----
+   步骤采用「时间轴」形态（节点 + 竖轨，对齐 antd Timeline / vben 的执行记录）：
+   比「每个步骤各套一个灰盒子」更轻、层次更清、多步连排也不糊成一片。 */
 .steps {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-bottom: 8px;
+  gap: 2px;
+  margin-bottom: 0;
+}
+
+/* 竖轨只在 ≥2 步时出现（单步没有「连接」语义，画线反而多余）。 */
+.steps:has(.step + .step)::before {
+  content: "";
+  position: absolute;
+  left: 4.5px;
+  top: 15px;
+  bottom: 15px;
+  width: 1px;
+  background: var(--rail);
 }
 
 .step {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--fill-soft) 60%, transparent);
-  padding: 6px 8px;
+  position: relative;
+  padding: 5px 0 6px 18px;
+  border-radius: 6px;
 }
 
+/* 步骤行头：有结果时整行可点开（对齐 antd Collapse：默认收起、收起时给一行摘要、点开看全文）。
+   无结果的步骤同一结构但 disabled —— 一半的样式与键盘可达性都走原生 button，不用 div 模拟。 */
 .step-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 8px;
+  margin: 0 -6px;
+  padding: 0 6px;
+  min-height: 20px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  border-radius: 6px;
+  transition: background-color 0.2s var(--ease);
+}
+
+button.step-head {
+  cursor: pointer;
+}
+
+button.step-head:not(:disabled):hover {
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+
+button.step-head:disabled {
+  cursor: default;
+}
+
+/* 时间轴节点：绝对定位落在竖轨上（中心 4.5px = 轨道位置）。
+   注意不要给 .step-head 加 position —— 它一旦成为定位祖先，节点就会跟着行头跑偏。 */
+.step-head .mcp-dot {
+  position: absolute;
+  left: 0;
+  top: 10px;
+  width: 9px;
+  height: 9px;
 }
 
 .step-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 46%;
   font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.step-server,
-.step-status {
+/* 收起时的摘要行：不点开也能知道这步拿到了什么（取结果首行，超长省略）。 */
+.step-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* 展开指示：收起指向右、展开指向下（与外层推理面板同一个语汇）。 */
+.step-caret {
   flex: none;
+  width: 6px;
+  height: 6px;
+  border-right: 1.4px solid color-mix(in srgb, var(--muted) 85%, transparent);
+  border-bottom: 1.4px solid color-mix(in srgb, var(--muted) 85%, transparent);
+  transform: rotate(-45deg);
+  transition: transform 0.2s var(--ease);
+}
+
+.step.expanded .step-caret {
+  transform: rotate(45deg);
+}
+
+/* 来源服务器：antd Tag 形态（发丝边框 + 低饱和底 + 小字号），
+   与右侧状态药丸明确区分——原来两者同为灰色小字，扫读时完全分不开。 */
+.step-server {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--fill-soft) 65%, transparent);
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 16px;
 }
 
 .step-status {
+  flex: none;
   margin-left: auto;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 17px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+/* 状态药丸配色：只上语义色，不染整块（状态值由模板给的 stepClass 落到 .step 上）。 */
+.step.running .step-status {
+  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
+  background: var(--accent-soft);
+}
+
+.step.ok .step-status {
+  color: color-mix(in srgb, var(--success) 72%, var(--ink));
+  background: var(--success-soft);
+}
+
+.step.err .step-status {
+  color: color-mix(in srgb, var(--danger) 78%, var(--ink));
+  background: var(--danger-soft);
 }
 
 .step-result {
   margin: 6px 0 0;
-  max-height: 160px;
+  max-height: 200px;
   overflow: auto;
-  background: color-mix(in srgb, var(--panel) 70%, transparent);
-  border-radius: 6px;
-  padding: 6px 8px;
+  background: var(--surface-2);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 8px;
+  padding: 8px 10px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: color-mix(in srgb, var(--ink) 80%, var(--panel));
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -6534,39 +6695,64 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 8px;
 }
 
 .subagents__head {
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
 .subagent {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--fill-soft) 60%, transparent);
-  padding: 6px 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 8px;
+  background: var(--surface-2);
 }
 
 .subagent__head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 8px;
+  font-size: 12.5px;
 }
 
 .subagent__desc {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* 状态药丸与步骤共用同一套语义配色，保证「过程面板」里所有状态读起来是一套语言。 */
 .subagent__status {
-  color: var(--muted);
   flex: none;
   margin-left: auto;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 17px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+.subagent.running .subagent__status {
+  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
+  background: var(--accent-soft);
+}
+
+.subagent.done .subagent__status {
+  color: color-mix(in srgb, var(--success) 72%, var(--ink));
+  background: var(--success-soft);
+}
+
+.subagent.error .subagent__status {
+  color: color-mix(in srgb, var(--danger) 78%, var(--ink));
+  background: var(--danger-soft);
 }
 
 .subagent__cancel {
@@ -6591,15 +6777,16 @@ onBeforeUnmount(() => {
 }
 
 .subagent__text {
-  margin: 6px 0 0;
-  max-height: 160px;
+  margin: 8px 0 0;
+  max-height: 200px;
   overflow: auto;
-  background: color-mix(in srgb, var(--panel) 70%, transparent);
-  border-radius: 6px;
-  padding: 6px 8px;
+  background: var(--surface-3);
+  border: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  border-radius: 8px;
+  padding: 8px 10px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 11.5px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -7172,40 +7359,44 @@ onBeforeUnmount(() => {
 
 /* 任务计划（write_todos）：状态标记不只靠颜色（✓/•/○/× 字形 + 文案删除线）。 */
 .todos {
-  margin-bottom: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 12.5px;
 }
 
 .todos__head {
-  margin-bottom: 5px;
-  color: var(--muted);
+  margin-bottom: 6px;
+  font-size: 10.5px;
   font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .todos__item {
   display: flex;
-  align-items: baseline;
-  gap: 7px;
-  padding: 2px 0;
-  line-height: 1.5;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  line-height: 1.55;
+  color: var(--ink-2);
 }
 
 .todos__mark {
   flex: none;
   width: 14px;
   text-align: center;
-  color: var(--muted);
+  color: color-mix(in srgb, var(--muted) 70%, transparent);
 }
 
 .todos__mark.completed {
-  color: color-mix(in srgb, #2f9e63 85%, var(--ink));
+  color: var(--success);
 }
 
 .todos__mark.in_progress {
-  color: var(--stop);
+  color: var(--accent);
 }
 
 .todos__mark.cancelled {
@@ -7215,41 +7406,55 @@ onBeforeUnmount(() => {
 .todos__text.done {
   color: var(--muted);
   text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--muted) 55%, transparent);
 }
 
 /* 推理过程（任务计划 + 工具步骤）折叠：生成中展开、收束后折叠，避免长过程刷屏。 */
 .reasoning {
-  margin-bottom: 8px;
-  border: 1px solid var(--line);
-  /* 左侧强调轨：把「系统/agent 过程块」与正文气泡区分开（对齐 Claude 推理块）。 */
-  border-left: 2.5px solid color-mix(in srgb, var(--accent) 55%, var(--line));
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--fill-soft) 50%, transparent);
+  margin: 0 0 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
+  /* 左侧强调轨：把「系统/agent 过程块」与正文气泡区分开（对齐 Claude 推理块）。
+     用 3px 整值——2.5px 在圆角处会出现毛边。 */
+  border-left: 3px solid color-mix(in srgb, var(--accent) 62%, var(--line));
+  border-radius: 10px;
+  /* 实色表面：原来 50% 半透明 fill-soft 叠在气泡上，会随底色漂成不定值的脏灰。 */
+  background: var(--panel);
   overflow: hidden;
+  transition: box-shadow 0.2s var(--ease);
+}
+
+/* 展开时给一层极浅的抬升：过程区与正文的边界更清楚（力度对齐 antd 卡片的克制程度）。 */
+.reasoning.open {
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
 .reasoning__head {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   width: 100%;
   padding: 9px 12px;
   border: none;
   background: transparent;
-  color: var(--muted);
+  color: color-mix(in srgb, var(--ink) 82%, var(--panel));
   font: inherit;
   font-size: 12.5px;
   font-weight: 500;
-  line-height: 1.2;
+  letter-spacing: -0.005em;
+  line-height: 18px;
   cursor: pointer;
   text-align: left;
-  border-radius: var(--radius-sm);
-  transition: color 0.15s ease, background 0.15s ease;
+  transition: color 0.2s var(--ease), background-color 0.2s var(--ease);
 }
 
 .reasoning__head:hover {
   color: var(--ink);
   background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+
+/* 展开后表头与内容之间拉一条分隔线（antd Collapse 的做法），省掉一层底色也足够清楚。 */
+.reasoning.open .reasoning__head {
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 
 /* 图标芯片：承载 chevron，给面板一点「卡片」质感（对齐 Notion/Claude 的披露控件）。 */
@@ -7260,17 +7465,17 @@ onBeforeUnmount(() => {
   width: 18px;
   height: 18px;
   border-radius: 6px;
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  background: var(--accent-soft);
   color: color-mix(in srgb, var(--accent) 78%, var(--ink));
 }
 
 .reasoning__caret {
-  width: 7px;
-  height: 7px;
-  border-right: 1.6px solid currentColor;
-  border-bottom: 1.6px solid currentColor;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
   transform: rotate(45deg);
-  transition: transform 0.18s var(--ease);
+  transition: transform 0.2s var(--ease);
 }
 
 .reasoning:not(.open) .reasoning__caret {
@@ -7285,14 +7490,15 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+/* 进行中指示：环形转圈。轨道只给 20% 的抓色——整圈同亮度会显得笨重（antd Spin 的处理）。 */
 .reasoning__spinner {
   flex: none;
-  width: 12px;
-  height: 12px;
-  border: 1.6px solid color-mix(in srgb, var(--ink) 20%, transparent);
+  width: 13px;
+  height: 13px;
+  border: 1.6px solid color-mix(in srgb, var(--accent) 22%, transparent);
   border-top-color: var(--accent);
   border-radius: 50%;
-  animation: reason-spin 0.7s linear infinite;
+  animation: reason-spin 0.8s linear infinite;
 }
 
 @keyframes reason-spin {
@@ -7300,10 +7506,10 @@ onBeforeUnmount(() => {
 }
 
 .reasoning__body {
-  padding: 2px 12px 12px;
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
 }
 
 /* 规划/思考阶段的状态行：比纯圆点更明确地传达「agent 正在规划」，缓解静默加载的卡顿感。 */
@@ -7311,7 +7517,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 2px;
+  padding: 2px 0;
   font-size: 12.5px;
   color: var(--muted);
 }
@@ -7323,7 +7529,7 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
-  animation: reason-pulse 1.5s ease-out infinite;
+  animation: reason-pulse 1.6s var(--ease) infinite;
 }
 
 @keyframes reason-pulse {
@@ -7334,51 +7540,54 @@ onBeforeUnmount(() => {
 
 /* 扩展思考流：等宽、弱对比、可滚动，区分于正式正文；收束后随面板折叠（不刷屏）。 */
 .reasoning__thinking-wrap {
-  margin: 2px 0 6px;
+  margin: 0;
 }
 
-/* 意图识别卡：把模型首行「意图：…」高亮成结构化块，区别于后续裸思考流（对齐 ReAct 规划首步）。 */
+/* 意图识别卡：把模型首行「意图：…」高亮成结构化块，区别于后续裸思考流（对齐 ReAct 规划首步）。
+   不再加左侧色条——外层过程块已有强调轨，再套一条会变成「线中套线」。 */
 .intent-card {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  margin: 2px 0 6px;
-  padding: 7px 10px;
-  background: color-mix(in srgb, var(--accent) 10%, var(--panel) 60%);
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line));
-  border-left: 2.5px solid var(--accent);
-  border-radius: var(--radius-sm);
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 8px;
 }
 
 .intent-card__label {
   flex: none;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.04em;
-  color: color-mix(in srgb, var(--accent) 80%, var(--ink));
+  letter-spacing: 0.06em;
+  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
   text-transform: uppercase;
 }
 
 .intent-card__text {
   font-size: 12.5px;
-  color: var(--ink);
-  line-height: 1.5;
+  color: var(--ink-2);
+  line-height: 1.55;
 }
 
 .reasoning__thinking {
   margin: 0;
-  max-height: 240px;
+  max-height: 260px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: var(--mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  /* 原来写的是 var(--mono, …)：本仓 token 名是 --font-mono，--mono 不存在，
+     等于一直在吃系统字体 fallback（与代码块/步骤名的字体不一致）。 */
+  font-family: var(--font-mono);
   font-size: 12px;
-  line-height: 1.6;
-  color: color-mix(in srgb, var(--muted) 92%, var(--ink) 8%);
-  background: color-mix(in srgb, var(--panel) 60%, var(--ink) 4%);
-  border: 1px solid color-mix(in srgb, var(--line) 70%, var(--ink) 10%);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  line-height: 1.65;
+  /* 思考流是「过程」而非结论：比正文/步骤名弱一档，但仍保证可读（不用 --muted 那样虚）。 */
+  color: color-mix(in srgb, var(--ink) 74%, var(--panel));
+  background: var(--surface-2);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 8px;
+  padding: 10px 12px;
 }
 
 .reasoning__body .todos,

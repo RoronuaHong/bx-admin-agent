@@ -255,14 +255,14 @@ chatStream
 | grep | deepagents 八件套 | ❌ 缺失 | 新增 `fs_grep`（工作区内容正则，files/content/count 三模式） | P0 |
 | task（子代理） | deepagents 八件套 | `task` ✅（通用型，隔离 + 最小工具集 + 并行≤3 + 可独立取消 + 独立事件） | 补**专用型** `bi-explorer` | P1 |
 | execute*（沙箱 shell） | deepagents 八件套（需 SandboxBackend） | ❌ 缺失 | 新增 `execute`（沙箱约束 + opt-in） | P2 |
-| web_search | Deep Agent SDK | ❌ 缺失 | 新增 `web_search`（provider 可配） | P2 |
+| web_search | Deep Agent SDK | ✅（2026-09-20，provider 可配：searxng / tavily / serper / brave） | 保持 | — |
 | http_request | Deep Agent SDK | ❌ 缺失 | 新增 `http_request`（主机白名单 + 确认） | P1 |
-| fetch_url | Deep Agent SDK | ❌ 缺失 | 新增 `fetch_url`（正文转 Markdown + 不可信定界） | P2 |
+| fetch_url | Deep Agent SDK | ✅（2026-09-20，正文转纯文本 + 不可信定界 + 私网阻断） | 保持 | — |
 | Search files & folders（含语义） | Cursor | `fs_ls`（无模式/无语义） | 由 `fs_glob` + `fs_grep` 覆盖；语义搜索挂账 | P1 |
 | Read files（图片） | Cursor | ⚠️ 用户上传图片**已有通路**（`uploads.ts` png/jpeg/webp + `VISION=direct` 视觉模型）；但 `fs_read` 仅 utf-8 文本，**读不了工作区里的图片文件** | `fs_read` 增加图片分支（交视觉模型） | P2 |
 | Edit files | Cursor | `fs_edit` ✅ | 保持 | — |
 | Run shell commands | Cursor | ❌ 缺失 | 同 `execute` | P2 |
-| Web | Cursor | ❌ 缺失 | 同 `web_search` / `fetch_url` | P2 |
+| Web | Cursor | ✅（2026-09-20，`web_search` + `fetch_url`） | 保持 | — |
 | Fetch rules | Cursor | `read_skill` + `skills/` ✅ | 保持 | — |
 | Browser | Cursor | ❌ 缺失 | 新增 `browser`（opt-in） | P2 |
 | Image generation | Cursor | ❌ 缺失 | 新增 `image_gen`（opt-in） | P2 |
@@ -293,9 +293,12 @@ chatStream
 **C. 网络能力（P1/P2）**
 
 - `http_request`：`{method, url, headers?, body?}`——**主机白名单**（env `TOOL_HTTP_ALLOW_HOSTS`）+ 默认走确认门 + 响应体大小上限。
-- `web_search`：`{query, count?}`——provider 可配（env `WEB_SEARCH_*`）；**未配 key 时按 `ToolingStatus` 诚实上报"未配置"**，不静默失败。
-- `fetch_url`：`{url}`——抓取正文转 Markdown；结果**必须**经 `untrusted.ts` `wrapUntrusted` 定界（外部内容 = 不可信数据）。
-- **验收**：白名单外主机拒绝；未配 key 时诚实上报；抓取/搜索结果确被 `wrapUntrusted` 包裹。
+- `web_search`：`{query, count?}`——**已于 2026-09-20 落地**（`src/web-search.ts` + `builtins.ts` 注册）。provider 可配（env `WEB_SEARCH_PROVIDER`：`searxng`（自建元搜索，免密钥，需 `WEB_SEARCH_BASE_URL`）/ `tavily` / `serper` / `brave`）；**未配置时不注册该工具**，并由系统提示的「工具通道现状」如实告知模型「联网检索不可用」，模型据此说明而不是凭记忆编造。
+- `fetch_url`：`{url}`——**已于 2026-09-20 落地**：抓取正文转纯文本（去标签/实体解码/按行压平，单页 512KB、正文 6000 字上限并如实标注截断）；只允许公网 http/https，**本机 / 私网 / 链路本地（含云元数据地址段）/ 保留地址一律拒绝**（基础 SSRF 防护）。
+- 结果定界：两个工具的结果都走主循环统一的 `untrusted.ts` `wrapUntrusted`（`kind="tool_result"`），外部内容只作数据、不构成指令。
+- **请求级联网搜索已移除**：Chat Completions 协议没有服务端内置搜索工具（`web_search_preview` 属 Responses API），此前把它塞进 `tools` 的「选项 A」会被网关直接 400（实测 TokenHub：`tools[36].type is invalid or missing`）并被静默降级。现由普通 function tool 提供联网能力，**不再有"每次进程启动白打一次 400"的损耗**。
+- 本地检索服务（开发环境）：`docker run -d --name searxng --restart unless-stopped -p 8888:8080 -v <repo>/apps/agent-server/.data/searxng:/etc/searxng:rw searxng/searxng:latest`；`.data/searxng/settings.yml` 需在 `search.formats` 打开 `json`（否则 JSON API 返回 403）。
+- **验收**：未配置时诚实上报且不注册工具；私网/非 http 地址被拒；检索与抓取实测可用（`scripts/_web-search-check.mjs`、`scripts/_web-search-e2e.mjs`）。
 
 **D. 沙箱与多模态（P2，opt-in）**
 
@@ -339,9 +342,9 @@ chatStream
 
 - **P0（先做）**：`fs_glob`、`fs_grep`、`fs_read` offset/limit、`request_clarification`（结构化多选）→ **四项均已于 2026-09-20 落地，见 §11.8**。
 - **P1**：工作区快照（Checkpoints）、`http_request`、`bi-explorer` 专用子代理、Search files（由 glob/grep 覆盖）、`save_memory` / `recall_memory`。
-- **P2**：`execute`（**需先有沙箱后端**）、`browser`、`image_gen`、`web_search`、`fetch_url`、Read files（`fs_read` 图片分支）、`read_todos`、语义搜索、可插拔 Backend（架构项，最后做）。
+- **P2**：`execute`（**需先有沙箱后端**）、`browser`、`image_gen`、Read files（`fs_read` 图片分支）、`read_todos`、语义搜索、可插拔 Backend（架构项，最后做）。~~`web_search` / `fetch_url`~~ → **已于 2026-09-20 落地（见 §11.3 C）**。
 
-**回归清单**：`tsc --noEmit` ✓、`vite build` ✓、`scripts/_risk-gate-check.mjs`、`scripts/_deep-agents-check.mjs`、`scripts/_async-subagent-check.mjs`；新增 `scripts/_builtin-tools-parity-check.mjs`（新工具注册 + 风险登记 + 默认关闭断言）。
+**回归清单**：`tsc --noEmit` ✓、`vite build` ✓、`scripts/_risk-gate-check.mjs`、`scripts/_deep-agents-check.mjs`、`scripts/_async-subagent-check.mjs`、`scripts/_web-search-check.mjs`（联网 provider + 未配置降级 + SSRF 边界）、`scripts/_web-search-e2e.mjs`（真实模型调用联网工具）；`scripts/_builtin-tools-parity-check.mjs`（新工具注册 + 风险登记 + 默认关闭断言）。
 
 ### 11.5 与 §10 结论的关系
 
@@ -515,6 +518,7 @@ chatStream
 
 **模型驱动项 — 14 PASS / 1 SKIP（2026-09-20 换用支持 tool-calling 的模型后复跑）：**
 - 模型切换：TokenHub `kimi-k2.7-code`（`.env` 的 `MODEL_PROVIDERS=kimi27,hyvision`，默认 `kimi27`）；下掉 402 未开通的 `minimaxm27`。网关侧直观证据：非流式 1.7s / 流式首字节 0.9s / 带 tools 返回 `finish_reason=tool_calls`。
+  - **2026-09-20 晚更新**：`kimi-k2.7-code` 免费额度耗尽（401008），按用户指定改为 **`kimi26`（kimi-k2.6）单模型**（`MODEL_PROVIDERS=kimi26`），旧模型条目（kimi27 / kimi3 / glm53 / hyvision）已按要求从 `.env` 移除；`roles.ts` 的 movie 角色默认模型同步改为 `kimi26`。实测：启动日志 `models=[kimi26:openai/kimi-k2.6]`、非流式/流式/带 tools 均 200 且出 `tool_calls`；`_web-search-e2e` PASS 3/0、`_role-check` 7/7、`_probe_stream` 正常出正文。
 - 转 PASS 项：`fs_write`/`fs_glob`/`fs_grep` 被模型主动调用、文件真实落盘（`notes/a.md`+`notes/b.md`）、`files/content` 分页、结构化澄清应答（流内自动应答 200 + `clarification_response` 回传）、主循环并发批（2 call / 2 result）。
 - 唯一 SKIP：某次运行模型未主动发起 `clarification_required`（模型行为随机性，如实标记，不伪装通过）。
 - 脚本加固 `scripts/_deep-agent-instance-check.mjs`：逐项即时输出、`waitForHealthy` 抗 pm2 重建窗口、流读取超时容错、流内自动应答（模拟前端确认/澄清），可用 `AGENT_MODEL=<id>` 指定模型一键复跑。

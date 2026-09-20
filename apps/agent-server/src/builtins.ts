@@ -9,6 +9,7 @@ import { readSkill } from "./skills.js";
 import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
 import { addMemory, listMemory } from "./memory.js";
 import { addHistory, setFeedback } from "./movie/profile.js";
+import { fetchPage, readWebSearchConfig, webSearch } from "./web-search.js";
 
 export const BUILTIN_SERVER = "builtin";
 
@@ -33,6 +34,8 @@ export const BUILTIN_RISK: Record<
   search_tools: { level: "read", scope: "workspace", reason: "检索工具清单" },
   search_knowledge: { level: "read", scope: "workspace", reason: "检索本地知识库（只读）" },
   knowledge_sources: { level: "read", scope: "workspace", reason: "列出知识库已入库来源" },
+  web_search: { level: "read", scope: "workspace", reason: "联网检索公开网页（只读，无外部副作用）" },
+  fetch_url: { level: "read", scope: "workspace", reason: "抓取公网网页正文（只读，无外部副作用）" },
   fs_write: { level: "write", scope: "external", reason: "写入本对话工作区文件（需用户确认）" },
   fs_edit: { level: "write", scope: "external", reason: "编辑本对话工作区文件（需用户确认）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
@@ -105,6 +108,9 @@ const TOOL_SEARCH_SPEC: ToolSpec = {
 };
 
 export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[] {
+  // 联网检索工具只在真的配好了检索服务时注入：不可用的工具不注册（否则模型会去调一个必然失败的
+  // 工具，并把「调用了但没结果」误当成「网上没有这个信息」）。可用性由系统提示的通道现状如实告知。
+  const webEnabled = readWebSearchConfig() !== null;
   return [
     spec(
       "fs_write",
@@ -309,6 +315,37 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         required: ["movies"],
       },
     ),
+    // 联网检索：问实时信息 / 站外资料时先检索，再按需抓正文。
+    ...(webEnabled
+      ? [
+          spec(
+            "web_search",
+            "在公开互联网上检索信息（新闻、官网、博客、文档等），返回若干条结果的标题、链接与摘要。" +
+              "当用户问的是你知识之外、需要最新或站外信息的内容时调用它；不要凭记忆编造这类内容。" +
+              "需要某条结果的正文时，再用 fetch_url 打开它的链接。",
+            {
+              type: "object",
+              properties: {
+                query: jsonType("string", "检索关键词（写成完整问题或精确短语效果更好）"),
+                count: jsonType("number", "最多返回多少条（默认由服务端配置决定）"),
+              },
+              required: ["query"],
+            },
+          ),
+          spec(
+            "fetch_url",
+            "抓取某个公开网页并转成纯文本，用于读取上一步检索结果里链接的正文。" +
+              "只支持公网 http/https 地址（本机与内网地址会被拒绝）。正文过长会被截断。",
+            {
+              type: "object",
+              properties: {
+                url: jsonType("string", "要抓取的完整链接（http/https）"),
+              },
+              required: ["url"],
+            },
+          ),
+        ]
+      : []),
     // 仅按需加载模式注入：工具 schema 已全量载入时，检索没有意义，白占一个工具位。
     ...(opts.toolSearch ? [TOOL_SEARCH_SPEC] : []),
   ];
@@ -475,6 +512,32 @@ export async function execBuiltin(
         ok: true,
         text: sources.map((s) => `${s.source}（${s.title}，${s.chunks} 切片）`).join("\n"),
       };
+    }
+    case "web_search": {
+      const query = str(args, "query").trim();
+      if (!query) return { ok: false, text: "web_search 需要 query" };
+      const outcome = await webSearch(query, Number(args.count) || undefined);
+      if (!outcome.ok) return { ok: false, text: outcome.error };
+      if (!outcome.hits.length) return { ok: true, text: "（没有检索到相关结果，可换关键词或如实说明未找到）" };
+      const body = outcome.hits
+        .map((hit, i) => {
+          const meta = [hit.source, hit.publishedAt].filter(Boolean).join(" · ");
+          return `[${i + 1}] ${hit.title}\n${hit.url}${meta ? `\n${meta}` : ""}\n${hit.snippet}`;
+        })
+        .join("\n\n");
+      return {
+        ok: true,
+        text: `检索到 ${outcome.hits.length} 条结果（来源：${outcome.provider}）：\n\n${body}`,
+      };
+    }
+    case "fetch_url": {
+      const url = str(args, "url").trim();
+      if (!url) return { ok: false, text: "fetch_url 需要 url" };
+      const page = await fetchPage(url);
+      if (!page.ok) return { ok: false, text: page.error };
+      const head = [page.title ? `# ${page.title}` : "", page.url].filter(Boolean).join("\n");
+      const tail = page.truncated ? "\n…（正文过长已截断，可换更具体的链接）" : "";
+      return { ok: true, text: `${head}\n\n${page.text}${tail}` };
     }
     case "write_todos": {
       const result = normalizeTodos(args.todos);

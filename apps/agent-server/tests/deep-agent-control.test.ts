@@ -2,7 +2,14 @@
 // 验证「路线 B」deep agent 的决策大脑：子代理工具收窄、同轮去重签名、跨轮 Doom Loop 熔断、工具数上限截断。
 // 阈值 MCP_MAX_TOOLS=3 在 vitest.config.ts 的 test.env 中固定。
 import { test, expect } from "vitest";
-import { resolveSubagentTools, toolCallSignature, LoopGuard, selectMcpToolSpecs } from "../src/chat.js";
+import {
+  forcedToolChoiceSupported,
+  markForcedToolChoiceUnsupported,
+  resolveSubagentTools,
+  toolCallSignature,
+  LoopGuard,
+  selectMcpToolSpecs,
+} from "../src/chat.js";
 
 type FakeTool = { serverId: string; name: string; description?: string; inputSchema?: unknown };
 
@@ -70,4 +77,22 @@ test("[D] selectMcpToolSpecs（工具数上限截断）", () => {
   const r = selectMcpToolSpecs(many as never);
   expect(r.specs.length).toBe(3);
   expect(r.droppedServers.length).toBe(3);
+});
+
+test("[E] 强制工具通道端点记忆：被拒一次后不再尝试 required（未受影响/换端点仍可尝试）", () => {
+  const model = { id: "probe-a", baseUrl: "https://gateway-a.example/v1" } as never;
+  const other = { id: "probe-b", baseUrl: "https://gateway-b.example/v1" } as never;
+  const sameIdOtherHost = { id: "probe-a", baseUrl: "https://gateway-c.example/v1" } as never;
+
+  // 默认（未探测）→ 可尝试
+  expect(forcedToolChoiceSupported(model)).toBe(true);
+  markForcedToolChoiceUnsupported(model);
+  // 同模型同端点 → 不再尝试（避免每轮首调白打一次 400）
+  expect(forcedToolChoiceSupported(model)).toBe(false);
+  // 其它模型 / 同 id 但换了端点 → 各自重新探测，不把 A 的结论套到 B
+  expect(forcedToolChoiceSupported(other)).toBe(true);
+  expect(forcedToolChoiceSupported(sameIdOtherHost)).toBe(true);
+  // 幂等：重复标记不报错、状态不变
+  markForcedToolChoiceUnsupported(model);
+  expect(forcedToolChoiceSupported(model)).toBe(false);
 });

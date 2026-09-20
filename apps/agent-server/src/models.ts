@@ -36,6 +36,9 @@ export interface ModelTurn {
   content: string;
   /** assistant 消息携带的工具调用（上一轮模型产出，需回灌给模型保持上下文）。 */
   toolCalls?: ToolCall[];
+  /** 该轮模型产出的思考流（reasoning / reasoning_content）。默认只作展示；仅当端点被记为「要求回灌思考」
+   *  （见 reasoningReplayRequired）时，才作为 assistant 消息的 reasoning_content 一并回传，保持多轮语义完整。 */
+  reasoning?: string;
 }
 
 /** 工具执行结果消息（OpenAI 的 role:tool / anthropic 的 tool_result）。 */
@@ -70,13 +73,13 @@ export interface ToolCall {
 export interface AgentResult {
   text: string;
   toolCalls: ToolCall[];
+  /** 本轮思考流原文（无思考的模型为空串）。调用方负责决定是否随 assistant 轮回灌（见 ModelTurn.reasoning）。 */
+  reasoning?: string;
 }
 
 export interface CallOptions {
   tools?: ToolSpec[];
   toolChoice?: "auto" | "none" | "required";
-  /** 原生联网搜索（选项 A）：对齐通用 Agent「开箱即有联网搜索」的标配；按 host 自适应各家声明方式。 */
-  webSearch?: boolean;
   /**
    * 系统提示的两段式形态（Deep Agents 的 prompt caching 思路）：
    * `stable` 跨轮不变（角色守则 + skills 索引）→ anthropic 加 cache_control 标记缓存；
@@ -409,11 +412,57 @@ async function callAnthropic(
   return { text, toolCalls };
 }
 
+/**
+ * 「回灌 assistant 工具调用消息时必须带 reasoning_content」的端点集合（进程内学习，重启后重学一次）。
+ *
+ * 问题（通用，非某家独有）：思考类模型在**多轮工具循环**里，常要求把上一轮的思考作为 `reasoning_content`
+ * 随 assistant 消息一起回灌；缺字段就直接 400，表现为「工具明明取到了数据，最终回复却空白」。
+ * 实测原文形如 `thinking is enabled but reasoning_content is missing in assistant tool call message`
+ * （DeepSeek / Qwen / Kimi 等 OpenAI 兼容网关的 thinking 模式都有同类校验，措辞各异）。
+ *
+ * 为什么不「一律带上」：各网关对未知字段的容忍度不同，给不需要它的端点塞这个字段有被 400 的风险
+ * （同当年 `web_search_preview` 的教训）。所以按端点学习：首跳缺字段被拒 → 记住 → 同一轮内按新口径重发一次
+ * → 之后该端点一直按新口径组装消息。学习信号来自网关自己的报错，不写死任何厂商名或固定话术。
+ */
+const reasoningReplayRequiredEndpoints = new Set<string>();
+
+function openAiEndpointKeyOf(model: ModelEntry): string {
+  return `${model.id}@${String(model.baseUrl || "")}`;
+}
+
+/** 该模型端点是否已被记为「要求回灌思考」（true 时 assistant 工具调用消息会带 reasoning_content）。 */
+export function reasoningReplayRequired(model: ModelEntry): boolean {
+  return reasoningReplayRequiredEndpoints.has(openAiEndpointKeyOf(model));
+}
+
+/** 记录「该端点要求回灌思考」（进程内记忆；首跳报错由调用方传入）。 */
+export function markReasoningReplayRequired(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (reasoningReplayRequiredEndpoints.has(key)) return;
+  reasoningReplayRequiredEndpoints.add(key);
+  console.warn(
+    `[models] 端点要求 assistant 工具调用消息回灌 reasoning_content（模型 ${model.id}）：` +
+      "已按该口径重发，且该端点后续都按此口径组装消息",
+  );
+}
+
+/**
+ * 判定一次失败是否属于「assistant 工具调用消息缺思考内容」。
+ * 只认协议级字段名（reasoning_content）+ 通用缺失类措辞，不绑定任何厂商名或整句报错——换网关也适用。
+ */
+export function isReasoningReplayRejected(detail: string): boolean {
+  const text = String(detail || "");
+  if (!/reasoning[_\s-]?content/i.test(text)) return false;
+  return /(missing|required|absent|not\s+found|expect|need|invalid|empty)/i.test(text);
+}
+
 /** 转成 OpenAI 消息：assistant 带 tool_calls，工具结果用 role:tool 回灌。 */
 function toOpenAiMessages(
   model: ModelEntry,
   turns: Turn[],
   images: OptionImage[],
+  /** 是否给带工具调用的 assistant 消息补 `reasoning_content`（端点要求时开，见 reasoningReplayRequired）。 */
+  withReasoningReplay = false,
 ): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (let i = 0; i < turns.length; i++) {
@@ -432,6 +481,8 @@ function toOpenAiMessages(
           type: "function",
           function: { name: call.name, arguments: call.argsJson },
         })),
+        // 端点要求时回灌上一轮思考：有原文就用原文（多轮语义完整），网关只校验「字段在不在」，故缺了给空串。
+        ...(withReasoningReplay ? { reasoning_content: turn.reasoning || "" } : {}),
       });
       continue;
     }
@@ -462,12 +513,6 @@ function parseModelPenalty(raw: string | undefined): number | null {
   return Number.isFinite(v) && v !== 0 ? v : null;
 }
 
-/**
- * 已知不支持 OpenAI 原生联网搜索（web_search_preview）的网关（按 baseUrl 记录）。
- * 首次遇到 400 后记住，后续调用直接不带搜索，避免每次白费一次往返与延迟（日志也不再刷屏）。
- */
-const webSearchUnsupportedHosts = new Set<string>();
-
 async function callOpenAi(
   model: ModelEntry,
   turns: Turn[],
@@ -479,25 +524,28 @@ async function callOpenAi(
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
   const system = systemPrompt(opts);
-  const messages: Array<Record<string, unknown>> = [
-    ...(system ? [{ role: "system", content: system }] : []),
-    ...toOpenAiMessages(model, turns, images),
-  ];
   const freqPenalty = parseModelPenalty(process.env.MODEL_FREQUENCY_PENALTY);
   const presPenalty = parseModelPenalty(process.env.MODEL_PRESENCE_PENALTY);
-  // 原生联网搜索（选项 A）：对齐 CodeBuddy/Cursor/千问「开箱即有联网搜索」的通用 Agent 标配。
-  // 按 host 自适应各家声明方式；未支持的网关在 .env 设 AGENT_WEB_SEARCH=0 即可整体关闭。
-  // 若网关不支持该工具声明（如部分私有部署对 web_search_preview 返回 400），自动降级为「不带搜索」
-  // 重试一次——保证联网搜索是「尽力增强」而非「可能把整个调用打挂」（工具模式与直连模式共用）。
-  const functionToolsBase: Array<Record<string, unknown>> = hasTools(opts)
+  // 只声明 function tool：Chat Completions 协议里没有服务端内置的联网搜索工具
+  // （`web_search_preview` 属于 Responses API，塞进 tools 会被网关判为非法参数直接 400）。
+  // 联网能力因此以普通内置工具（web_search / fetch_url）提供，见 src/web-search.ts。
+  const functionTools: Array<Record<string, unknown>> = hasTools(opts)
     ? (opts.tools || []).map((tool) => ({
         type: "function",
         function: { name: tool.name, description: tool.description, parameters: tool.parameters },
       }))
     : [];
 
-  const attempt = async (webSearchOn: boolean): Promise<Response> => {
-    const functionTools = [...functionToolsBase];
+  /**
+   * 组装并按当前口径发一次请求。抽成函数是为了「学习型自愈」能原样重发：
+   * `withReasoningReplay` 打开时，带工具调用的 assistant 消息会补 `reasoning_content`（见上方
+   * reasoningReplayRequired 的说明）。除该字段外，两次请求的一切都相同。
+   */
+  const postOnce = (withReasoningReplay: boolean): Promise<Response> => {
+    const messages: Array<Record<string, unknown>> = [
+      ...(system ? [{ role: "system", content: system }] : []),
+      ...toOpenAiMessages(model, turns, images, withReasoningReplay),
+    ];
     const body: Record<string, unknown> = {
       model: model.name,
       max_tokens: config.maxOutputTokens,
@@ -507,16 +555,6 @@ async function callOpenAi(
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
     };
-    if (webSearchOn) {
-      const host = (model.baseUrl || "").replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
-      if (host.includes("dashscope") || host.includes("aliyun")) {
-        // 通义/千问：请求级联网开关（独立参数，不与 tools 数组冲突）。
-        body.enable_search = true;
-      } else {
-        // OpenAI 及兼容网关（DeepSeek / Qwen / Kimi 等走 OpenAI 协议）：声明 web_search_preview。
-        functionTools.push({ type: "web_search_preview", search_context_size: "medium" });
-      }
-    }
     if (functionTools.length) {
       body.tools = functionTools;
       body.tool_choice = opts.toolChoice || "auto";
@@ -531,30 +569,21 @@ async function callOpenAi(
     );
   };
 
-  // 已确认不支持的网关直接跳过注入，省掉「先失败再降级」的额外往返。
-  const webSearchWanted = !!opts.webSearch && !webSearchUnsupportedHosts.has(base);
-  let response = await attempt(webSearchWanted);
+  const alreadyReplaying = reasoningReplayRequired(model);
+  let response = await postOnce(alreadyReplaying);
   // 失败详情只读一次：Response body 是单次消费流，第二次 .text() 只能拿到空串，
   // 会把网关的真实报错吞成一句「model http 400: 」（排查时完全看不到原因）。
-  let failureDetail = "";
+  let detail = "";
   if (!response.ok) {
-    failureDetail = (await response.text().catch(() => "")).slice(0, 500);
-    const webSearchBroke =
-      webSearchWanted &&
-      (response.status === 400 ||
-        /web.?search|unsupported.?tool|unknown parameter|tool_choice|invalid.*tool/i.test(failureDetail));
-    if (webSearchBroke) {
-      webSearchUnsupportedHosts.add(base);
-      console.warn(
-        `[models] 网关不支持联网搜索工具（${response.status}），自动降级为不带搜索重试（后续该网关将直接跳过联网搜索）：${failureDetail}`,
-      );
-      response = await attempt(false);
-      // 换了新响应对象：详情留空，由下面那处按需重新读取这次响应的 body。
-      failureDetail = "";
+    detail = (await response.text().catch(() => "")).slice(0, 500);
+    // 学习型自愈（通用，不认厂商）：端点抱怨 assistant 工具调用消息缺 reasoning_content → 记住并补上重发一次。
+    if (!alreadyReplaying && isReasoningReplayRejected(detail)) {
+      markReasoningReplayRequired(model);
+      response = await postOnce(true);
+      detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
     }
   }
   if (!response.ok) {
-    const detail = failureDetail || (await response.text().catch(() => "")).slice(0, 500);
     if (/401006|"code"\s*:\s*402|402/.test(detail) || response.status === 402) {
       throw new Error(
         `model http ${response.status}: 模型服务未开通或额度不足（${model.name}）。` +
@@ -573,6 +602,8 @@ async function callOpenAi(
   const decoder = new TextDecoder();
   let buffer = "";
   let text = "";
+  // 思考流累积（除转发展示外还要回传：端点要求时需随 assistant 消息回灌，见 reasoningReplayRequired）。
+  let reasoningText = "";
   // 流式工具调用是分片增量（index/id/name/arguments 分别到达），按 index 累积拼接。
   const pendingTools = new Map<number, { id: string; name: string; args: string }>();
   let finished = false;
@@ -616,7 +647,10 @@ async function callOpenAi(
       // 推理模型在正式回答前下发思考流：OpenAI 官方 o 系列用 delta.reasoning，
       // DeepSeek / Qwen / Kimi 等兼容网关用 delta.reasoning_content；非推理模型两者皆无，自然忽略。
       const reasoning = delta?.reasoning ?? delta?.reasoning_content;
-      if (reasoning) onThinking?.(reasoning);
+      if (reasoning) {
+        reasoningText += reasoning;
+        onThinking?.(reasoning);
+      }
       for (const part of delta?.tool_calls || []) {
         const index = typeof part.index === "number" ? part.index : 0;
         const current = pendingTools.get(index) || { id: "", name: "", args: "" };
@@ -637,7 +671,7 @@ async function callOpenAi(
       argsJson: call.args || "{}",
     }))
     .filter((call) => Boolean(call.name));
-  return { text: text.trim(), toolCalls };
+  return { text: text.trim(), toolCalls, ...(reasoningText ? { reasoning: reasoningText } : {}) };
 }
 
 async function callOllama(

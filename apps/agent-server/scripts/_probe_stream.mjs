@@ -12,7 +12,8 @@ async function main() {
   const res = await fetch(`${BASE}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
-    body: JSON.stringify({ text: "你好，用一句话介绍自己", model: "hyvision" }),
+    // 不指定 model：走服务端默认（MODEL_PROVIDERS 第一个），换模型后本探针不用改。
+    body: JSON.stringify({ text: "你好，用一句话介绍自己" }),
   });
   console.log("status:", res.status, res.statusText);
   const text = await res.text();

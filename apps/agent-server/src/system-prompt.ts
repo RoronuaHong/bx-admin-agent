@@ -61,6 +61,9 @@ const TOOLING_RULES = [
   // 数量不在此写死：下限由工具的 schema 与服务端校验（`builtins.ts` 的 normalizeClarification）保证，
   // 写死「2–6」会在调常量后与代码漂移（MAX_CLARIFY_OPTIONS 就是真相）。
   "6. 请求的目标或关键用词有歧义、无法唯一确定含义时，用 request_clarification 给出若干互斥选项让用户选，再继续执行；不要把不确定的理解硬当成结论去取数或作答。已能唯一确定时不要提问。",
+  // 事实核验纪律：防止「训练记忆里的具体细节被当成已核实的事实说出来」——实测踩过：手边有检索工具却整轮
+  // 零工具调用，用确定语气给出未经核实的具体细节（且是用户没问的追加内容）。语义判定交模型，服务端不写词表。
+  "7. 涉及可核实的具体事实（时间、地点、数字、身份与亲属关系、事件细节、作品信息等）时：手边有检索/查询工具就先用它核实再作答；核实不到就明说「这是依据我记忆中的信息、可能不准确」，不要用确定语气断言。用户没有问到的具体细节不要顺手补上——这类细节最容易记错。",
   "",
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
@@ -99,6 +102,8 @@ export interface ToolingStatus {
   searchToolName?: string;
   /** 工具索引（仅名称，按服务器分组）。 */
   catalog?: Array<{ id: string; label: string; tools: string[] }>;
+  /** 联网检索通道：可用性必须如实上报，否则模型会把「没有联网能力」当成「网上查不到」。 */
+  web?: { available: boolean; provider?: string; reason?: string } | null;
 }
 
 /** 工具索引（仅名称）最多列多少个：几千个工具时，索引本身也不能变成新的负担。 */
@@ -145,6 +150,15 @@ function renderToolingStatus(status: ToolingStatus): string {
         .map((server) => `${server.label}（${server.reason}）`)
         .join("、")}。这些能力域本次拿不到数据：用户问到时直接说明暂不能回答（可建议在对话设置里重连或稍后重试），` +
         "不要用记忆、训练知识或其它域的数据去推断或补全该域的内容。",
+    );
+  }
+  if (status.web) {
+    lines.push(
+      status.web.available
+        ? `- 联网检索可用（${status.web.provider}）：用户问实时信息或站外资料时用联网检索工具取真实来源，不要凭记忆作答；` +
+            "取到结果后注明来源链接。"
+        : `- 联网检索不可用（${status.web.reason || "未配置"}）：用户问实时或站外信息时如实说明当前无法联网，` +
+            "不要用记忆或猜测代替。",
     );
   }
   if (status.dropped.length) {

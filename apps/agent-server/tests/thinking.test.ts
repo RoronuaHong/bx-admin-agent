@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callAgent } from "../src/models.js";
+import { callAgent, isReasoningReplayRejected, markReasoningReplayRequired, reasoningReplayRequired } from "../src/models.js";
 import { streamCall } from "../src/chat.js";
 import { config } from "../src/config.js";
 import type { ModelEntry } from "../src/config.js";
 
-function makeModel(provider: ModelEntry["provider"], name: string): ModelEntry {
+function makeModel(provider: ModelEntry["provider"], name: string, id = "test"): ModelEntry {
   return {
-    id: "test",
+    id,
     label: name,
     provider,
     name,
@@ -228,6 +228,106 @@ describe("thinking 事件流（callAgent 透传 + 解析正确性）", () => {
 
     expect(thinkingCalls).not.toHaveBeenCalled();
     expect(res.text).toBe("Hi there");
+  });
+});
+
+// ---- 思考回灌（通用修复：思考类模型的工具循环要求 assistant 工具调用消息带 reasoning_content）----
+
+/** 网关的抱怨原文（实测形态）：只看协议字段名 + 缺失类措辞，不绑定厂商。 */
+const REASONING_REPLAY_COMPLAINT = JSON.stringify({
+  error: {
+    type: "invalid_request_error",
+    code: 400,
+    message: "thinking is enabled but reasoning_content is missing in assistant tool call message",
+  },
+});
+
+/** 一个「上一轮发起过工具调用」的最小会话（第二轮回灌时的形态）。 */
+const toolCallTurns = (): Parameters<typeof callAgent>[1] => [
+  { role: "user", content: "hi" },
+  { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "probe_echo", argsJson: "{}" }] },
+  { role: "tool", toolCallId: "c1", name: "probe_echo", content: "ok" },
+];
+
+const assistantMessageOf = (body: unknown): Record<string, unknown> => {
+  const messages = (body as { messages?: Array<Record<string, unknown>> })?.messages || [];
+  return messages.find((m) => m.role === "assistant") || {};
+};
+
+describe("思考回灌（reasoning_content）：能力学习 + 自愈重发", () => {
+  it("recognizer 只认协议字段 + 缺失类措辞（不误伤普通报错）", () => {
+    expect(isReasoningReplayRejected(REASONING_REPLAY_COMPLAINT)).toBe(true);
+    expect(isReasoningReplayRejected('thinking is enabled but reasoning_content is required')).toBe(true);
+    expect(isReasoningReplayRejected("model http 400: invalid api key")).toBe(false);
+    expect(isReasoningReplayRejected("reasoning_content too long")).toBe(false);
+    expect(isReasoningReplayRejected("")).toBe(false);
+  });
+
+  it("chat 协议返回的思考原文会被带出（不再只作展示而丢弃）", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse(openaiReasoningSse.split("\n"))));
+    const res = await callAgent(makeModel("openai", "o3-mini"), [{ role: "user", content: "hi" }], [], undefined, undefined, {}, () => {});
+    expect(res.reasoning).toBe("I am reasoning");
+    expect(res.text).toBe("Hello");
+  });
+
+  it("未学到的端点：不塞未知字段；学到后：带 reasoning_content（有原文用原文，没有给空串）", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        bodies.push(init?.body ? JSON.parse(init.body) : null);
+        return sse(openaiPlainSse.split("\n"));
+      }),
+    );
+
+    const plain = makeModel("openai", "probe-plain", "probe-plain");
+    await callAgent(plain, toolCallTurns(), [], undefined, undefined, {});
+    expect(assistantMessageOf(bodies[0]).reasoning_content).toBeUndefined();
+
+    // 学到能力（模拟首跳被拒后的记录）→ 有思考原文时回灌原文
+    const withReasoning = makeModel("openai", "probe-with-reasoning", "probe-with-reasoning");
+    markReasoningReplayRequired(withReasoning);
+    const turns = toolCallTurns();
+    (turns[1] as { reasoning?: string }).reasoning = "I thought about it";
+    await callAgent(withReasoning, turns, [], undefined, undefined, {});
+    expect(assistantMessageOf(bodies[1]).reasoning_content).toBe("I thought about it");
+
+    // 学到能力但没有思考原文（该轮模型没产出思考）→ 给空串满足校验（网关只看字段在不在）
+    const noReasoning = makeModel("openai", "probe-no-reasoning", "probe-no-reasoning");
+    markReasoningReplayRequired(noReasoning);
+    await callAgent(noReasoning, toolCallTurns(), [], undefined, undefined, {});
+    expect(assistantMessageOf(bodies[2]).reasoning_content).toBe("");
+  });
+
+  it("首跳被拒 → 同一轮内补字段重发一次，之后该端点不再白打 400", async () => {
+    const bodies: unknown[] = [];
+    // 行为化 mock（按网关语义）：assistant 工具调用消息没带 reasoning_content 就拒绝，带了才放行。
+    // 这样断言的是「客户端是否满足网关要求」，而不是脆弱的调用次数。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        const body = init?.body ? JSON.parse(init.body) : null;
+        bodies.push(body);
+        const assistant = assistantMessageOf(body);
+        return assistant.tool_calls && assistant.reasoning_content === undefined
+          ? new Response(REASONING_REPLAY_COMPLAINT, { status: 400 })
+          : sse(openaiPlainSse.split("\n"));
+      }),
+    );
+
+    const model = makeModel("openai", "probe-learn", "probe-learn");
+    const res = await callAgent(model, toolCallTurns(), [], undefined, undefined, {});
+
+    expect(bodies).toHaveLength(2); // 自愈只重发一次（首跳被拒 + 补字段重发）
+    expect(res.text).toBe("Hi there"); // 重发结果正常返回，不把 400 抛给上层
+    expect(assistantMessageOf(bodies[1]).reasoning_content).toBe("");
+    expect(reasoningReplayRequired(model)).toBe(true); // 能力已记住
+
+    // 第二次调用：能力已记住 → 直接按新口径组装，一次请求即通过（不再白打 400）
+    bodies.length = 0;
+    await callAgent(model, toolCallTurns(), [], undefined, undefined, {});
+    expect(bodies).toHaveLength(1);
+    expect(assistantMessageOf(bodies[0]).reasoning_content).toBe("");
   });
 });
 
