@@ -8,6 +8,8 @@
   --fill: #ffffff;
   --fill-soft: #eeece8;
   --danger: #8f2b22;
+  /* 品牌强调色（暖金，对齐纸感主题；替代此前缺失 --accent 时回落的冷蓝 #4f7cff） */
+  --accent: #b9882f;
   /* 停止生成按钮语义色（赤陶橙）：更通透温暖，与纸感主题协调 */
   --stop: #c25c2c;
   --shadow: 0 20px 50px rgba(20, 20, 19, 0.07);
@@ -36,6 +38,8 @@ html[data-theme="dark"] {
   --fill: #191917;
   --fill-soft: #20201e;
   --danger: #e07a70;
+  /* 品牌强调色（深 theme 下提亮为柔金，保证与背景的对比） */
+  --accent: #e3bd75;
   /* 停止生成按钮语义色（暖杏金）：深色下柔和醒目 */
   --stop: #f2b386;
   --shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
@@ -124,16 +128,31 @@ textarea {
   color: inherit;
 }
 
-/* 删除撤销条入场动画：撤销条本体在 ChatPage.vue 里以 ::global 命中，
-   keyframes 必须放全局（scoped 里的 keyframes 会被改名导致引用落空）。 */
+/* 撤销条 / 完成提醒的入场动画：本体在 ChatPage.vue，keyframes 必须放全局
+   （scoped 里的 keyframes 会被改名，引用会落空）。 */
+
+/* 撤销条：靠 translateX(-50%) 居中，所以动画必须带上这个位移，否则入场瞬间偏右半个身位。
+   只动 transform/opacity，不动 top —— top 是 calc(100% + 12px)，被动画覆盖会闪一下再跳回。 */
 @keyframes undo-toast-in {
   from {
     opacity: 0;
-    top: 8px;
+    transform: translate(-50%, -6px);
   }
   to {
     opacity: 1;
-    top: 20px;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* 完成提醒：固定在右下角，不需要水平位移。 */
+@keyframes done-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 

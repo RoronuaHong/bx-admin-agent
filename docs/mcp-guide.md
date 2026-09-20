@@ -148,7 +148,7 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 
 **子代理事件**：模型调用 `task` 时，服务端为每个子代理产出 `subagent_start → subagent_delta* → subagent_end`（`subagent_start.id` 为子代理运行 id，供**独立取消**使用；`parentId` 是发起委派的 `task` 工具调用 id，用于 UI 关联步骤）。子代理执行期间主代理阻塞等待交接摘要，但事件逐片转发，前端可见实时进度；交接摘要仍经 `tool_result` 回灌模型上下文。
 
-**上下文预算**：以 token 计并由模型窗口推导 —— 历史预算 = `(CONTEXT_WINDOW − MODEL_MAX_OUTPUT_TOKENS − 工具 schema − MCP_TOOL_RESULT_BUDGET) × CONTEXT_SAFETY_RATIO`；跨轮裁剪后保证首条为 `user`（部分 provider 要求）。本轮工具结果超 `MCP_TOOL_RESULT_BUDGET` 时从最旧的开始清理并替换为占位文本，但保留最近 `MCP_TOOL_RESULT_KEEP` 组与 `MCP_TOOL_RESULT_PROTECT` 白名单。跨轮只保留工具**轻量句柄**（工具名 + 参数摘要 + 结果规模），不保留结果正文。窗口由 `MODEL_<ID>_CONTEXT_WINDOW` / `MODEL_CONTEXT_WINDOW` 配置。
+**上下文预算**：以 token 计并由模型窗口推导 —— 历史预算 = `(CONTEXT_WINDOW − MODEL_MAX_OUTPUT_TOKENS − 工具 schema − MCP_TOOL_RESULT_BUDGET) × CONTEXT_SAFETY_RATIO`；跨轮裁剪后保证首条为 `user`（部分 provider 要求）。本轮工具结果超 `MCP_TOOL_RESULT_BUDGET` 时从最旧的开始清理并替换为占位文本，但保留最近 `MCP_TOOL_RESULT_KEEP` 组与 `MCP_TOOL_RESULT_PROTECT` 白名单（**支持 `*` 通配**，如 `mcp__movie__*` 保护整台 MCP 服务器的工具结果不被卸载，适合「多轮同主题检索」场景，避免早期结果被卸载后模型失忆）。跨轮只保留工具**轻量句柄**（工具名 + 参数摘要 + 结果规模），不保留结果正文。窗口由 `MODEL_<ID>_CONTEXT_WINDOW` / `MODEL_CONTEXT_WINDOW` 配置。
 
 ---
 
@@ -290,26 +290,75 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 ### 内置 BI 服务器（Metabase）的工具清单
 
-`scripts/metabase-mcp.mjs` 把实例 REST API 暴露为 8 个只读工具。接口形状按**实例自带**的 `GET /api/docs/openapi.json` 核对（当前实例 v0.62.x）：
+`scripts/metabase-mcp.mjs` 把实例 REST API 暴露为 9 个工具，其中除 `run_native_query`（执行任意 SQL）外全部只读并声明 MCP 标准注解 `readOnlyHint`——**声明事实而非放行**：服务端风险判定（`src/risk.ts`）仍以 `toolRisks` 优先。接口形状按**实例自带**的 `GET /api/docs/openapi.json` 核对（当前实例 v0.62.x）：
 
 | 工具 | 对应接口 | 说明 |
 |---|---|---|
 | `list_databases` | `GET /api/database` | 数据库 id / name / engine / timezone |
-| `get_database_schema` | `GET /api/database/:id/metadata` | 默认只列表（`skip_fields=true`，可用 `search` 过滤）；给 `table` 才取该表字段 |
+| `get_database_schema` | `GET /api/database/:id/metadata` | 默认只列表（`skip_fields=true`，可用 `search` 过滤）；给 `table` 才取该表字段——**字段统一带描述 / 语义类型 / 外键指向 / 去重值个数（fingerprint）** |
+| `get_field_values` | `GET /api/field/:id/values` → 退回 `POST /api/dataset` | **字段取值分布**（去重值 + 出现次数）：写过滤条件前先确认合法取值与空值语义。**不传 `sample`** 优先用实例缓存的取值列表（最快，无计数）；**传了 `sample`** 就走带出现次数的统计路径（默认扫前 200000 行，传 0 = 全表精确），返回标注 `approximate` / `scanLimit`，不把样本计数冒充精确值 |
 | `run_native_query` | `POST /api/dataset` | 原生 SQL，按 `limit` 截断；未完成时如实报错 |
 | `search` | `GET /api/search` | 关键词找表 / 提问 / 仪表盘（写 SQL 前先定位数据） |
 | `list_cards` / `get_card` | `GET /api/card[/:id]` | 已保存提问，详情含 MBQL 定义 |
 | `list_dashboards` / `get_dashboard` | `GET /api/dashboard[/:id]` | 仪表盘与其中卡片 |
 
-**三个已踩过的坑（按文档修正）**：
+**七个已踩过的坑（按文档修正）**：
 
 1. 仪表盘详情的卡片数组字段是 **`dashcards`**；`ordered_cards` 自 v0.5x 起已移除，读错会**永远返回空卡片**。
 2. 表结构默认用 **`skip_fields=true`** 只取表清单；否则一次会拉回全部表（本例 47 张）的所有字段，必被工具结果长度上限截断。
 3. `POST /api/dataset` 返回 **202**（`res.ok` 仍为真），必须判 `status` 与 `data.cols` 是否存在，不能假定一定有结果。
+4. **元数据默认会「丢证据」**：`/database/:id/metadata` 里的表/字段描述、`semantic_type`、`fk_target_field_id`（外键指向）、`fingerprint`（去重值个数、NULL 占比）本来都在返回体里，适配器早期只映射了 `name/base_type/semantic_type`，表清单模式甚至只给 `fieldCount`。后果是模型只能靠字段名猜语义——典型误判：把**真实存在的空串/默认值当成脏数据顺手排除**，或凭命名猜主键、猜表关系。**这是适配器的映射取舍，不是元数据本身缺失**，取舍一经修正即可消除（见下方「陌生库取证」）。
+5. **取值域不能裸跑全表分组**：超大表上的 `GROUP BY` 会直接把调用拖到超时（实测某明细表在未加取样前，探针连续两次被空闲超时掐断）。故兜底查询默认带取样上限，并在返回里如实标注 `approximate`；要精确统计显式传 `sample=0`。
+6. **指纹统计可能过时**：同一列的 `fingerprint` 报 `distinctValues = 1`，而真实取值是 4 个（实测）。所以 fingerprint 只是**线索**，不能当结论——取值域必须真的去取，这正是 `get_field_values` 存在的理由。
+7. **大整数会失真**：超过 `2^53` 的 ID 经 JSON 往返后可能被压成科学计数法（实测某表主键返回 `9.23494677158002E+15`，已非原值）。要精确的主键/ID 就在 SQL 里显式转成字符串再取，不要依赖默认的数字解析。
+
+### 对齐最佳实践的四处加固（2026-09-19）
+
+在补齐取证能力之后，又按通用最佳实践做了一轮加固（都不是本域特有问题，换任何 MCP server 同样成立）：
+
+| 加固项 | 做法 | 依据 |
+|---|---|---|
+| **外部调用必须有界** | 每次请求带 `AbortSignal.timeout`（**默认 30s**，与 `docs/text2sql-text2api-plan.md` 的 P1-2 一致；`BI_TIMEOUT_MS` 可调），超时 fail-closed 并返回可操作提示 | 挂住的查询会占死整条 stdio 连接，表现为「模型卡住」且零诊断信息；有超时才有可诊断的失败。**局限**：客户端 abort 只是「不再等」，DB 上那条 SQL 仍在跑——防的是会话被拖死，不是数据库被拖死 |
+| **子进程日志不再黑洞** | 适配器每次调用打到 stderr（工具名 / 耗时 / 成败）；hub 把 stdio 子进程的 stderr 转发为 `[mcp:<id>] …` | stdio 下 stdout 被协议帧占用，stderr 是唯一日志出口。本 SDK（1.30.0）**没有** `onstderr` 回调，只能监听 `transport.stderr` 流——不接出来等于日志全丢 |
+| **注解补全** | 只读工具同时声明 `readOnlyHint` + `idempotentHint` | MCP 注解：幂等声明让客户端 / 网关能安全地失败重试 |
+| **数据源侧纵深防御** | 执行前拒绝多语句（含 `;`）与空 SQL | 最小权限 + 纵深防御；**单条** SQL 是读是写仍由 `src/risk.ts` 用 `src/sql-readonly.ts` 判定后决定是否弹卡，这里只堵「一次塞多条」这个没有正当用途的口子 |
+| **优先复用已验证口径** | `run_native_query` 描述提示先用 `list_cards` / `get_card` / `search` 找现成查询 | Text-to-SQL 通用经验：复用已验证 SQL 比现场重新生成可靠得多 |
+
+> 运维提示：适配器代码改动 → `POST /mcp/servers/:id/reload` 即可；但 **`src/mcp/hub.ts` 这类服务端改动必须重启进程**（reload 不重载服务端代码）。
+
+### 陌生库取证：一次误判的复盘（通用规律 vs 缺陷）
+
+背景：同一个取数任务，另一套系统一次答对、本系统答错（把某枚举字段的空串当脏数据排掉，并多关联了一张维表）。当事自述的 4 条归因逐条判定如下——**凡能靠一次最小查询证明的事实，都不该记在「模型能力 / 环境差异」账上**：
+
+| 自述归因 | 判定 | 说明 |
+|---|---|---|
+| 领域先验不足（不熟悉该库的业务约定） | 半通用 | 先验差异真实存在，但属于**信息差**：字段语义本可从「取值域 + 元数据描述」发现，不是只能猜 |
+| Schema 解读策略保守（少 JOIN 更稳） | 通用 | 少假设确实更稳；但应升级为可判定的动作：先单表口径、再关联口径，不一致就查差异 |
+| MCP 边探查边答、上下文 / 工具链受限 | 部分成立 | 探查成本是真实约束；但「没有持久化记忆」不实（长期记忆、会话持久化、历史摘要都在），缺的是**取证工具与结论沉淀** |
+| 下次先问用户「空串有没有特殊含义、哪个是业务主键」 | 归因对、方案错 | 这两问都能自证（取值分布 / `count(*)` vs `count(distinct …)` / 外键元数据）；把可自证的验证外包给用户＝转移验证责任 |
+
+由此固化的三处修复（都是可复现的工程动作，不是「下次更谨慎」）：
+
+1. **补元数据映射**（见上文「七个坑」第 4 条）：描述 / 语义类型 / 外键指向 / 去重值个数一并回灌，模型不必靠字段名猜。
+2. **新增 `get_field_values` 取值域工具**：一次调用即可看到真实取值及出现次数，空串与 NULL 被显式标注——「像脏数据」这种主观判断变成可见事实。不传 `sample` 优先用实例缓存（最快，无计数）；传了即走带计数的统计路径。
+3. **技能 `schema-probe`（陌生库探查）**：固化「先找存量口径 → 取值域取证 → 单表口径优先 → 主键用去重数验证 → 结论写清口径」的通用流程；口径类技能 `metric-caliber-check` 已交叉引用。技能内不含任何业务词，跨库通用。
+
+> 判据：取证能力（工具 + 流程）补齐后，同一类错误应能**可复现地消除**；补不上才叫环境差异。
+
+**本次仍欠（挂账；已落地的三项不计入）**：
+
+| 缺口 | 现状 | 建议方向 |
+|---|---|---|
+| **口径资产化 / 可复现性** | 当前工作区已无语义层包与金样 SQL（`src/analytics` 不复存在），同一问题每次靠现场探查 → 结果不可复现、不可回归 | 把验证过的口径固化成实例里**已保存的提问**（`list_cards` / `get_card` 就是现成读取口），或经用户确认写入长期记忆；高频口径应成为资产，而不是「这次模型运气好」 |
+| **探查结论的沉淀闭环** | 长期记忆按设计**不自动抽取**（`src/memory.ts` 明确「由用户显式写入」，避免把噪声沉淀成假事实）——所以本轮确认的字段语义，下一轮不会自带 | 补一条显式路径（模型提议 → 用户确认 → 落记忆 / 落已保存提问），而不是改成自动抽取 |
+| **结构探查的上下文成本** | `schema-probe` 技能已建议「探 schema 交给子代理」，但只写在技能里，系统提示层未强化 | 先观察实际轮次占比再决定是否加引导；当前工具输出已做裁剪（字段预览 25 个、字段描述 200 字、表描述 160 字） |
+| ~~**空串场景的真机复现**~~ | ✅ **已验证（2026-09-19）**：空串位列取值域第一项，详见 §11 实测 | — |
 
 验证脚本：
-- `node scripts/_bi-tools-check.mjs` —— 以真实 MCP 客户端逐个调用并打印输出（冒烟）。
-- `node scripts/_bi-openapi.mjs` —— 打印我们用到端点在实例 OpenAPI 里的权威签名（**升级 Metabase 后先跑它**）。
+- `node --import tsx scripts/_bi-tools-check.mjs` —— 走本仓 MCP hub 与 `.env` 配置，逐步验证：① 工具清单 9/9 与只读注解；② 新工具的风险级别（不弹卡）；③ 表清单 + `search` 过滤 + 字段名预览；④ 指定表的字段取证（描述 / 外键 / 指纹覆盖率）；⑤ 取值域两条路径；⑥ `sample` 参数生效（防「传了被忽略」）；⑦ 负向用例（非法标识符 / 不存在的表与字段均如实报错，不执行不编造）；⑧ 多语句被拒。全程只调元数据类工具，不执行 SQL。超时分支可用 `BI_TIMEOUT_MS=1` 跑一次验证（应得到「请求超时（1ms…）」的可操作提示）。
+- 升级 Metabase 后如需核对端点签名：用实例自带的 `GET /api/docs/openapi.json`（早期脚本 `_bi-openapi.mjs` 已在清理提交中移除）。
+
+> **适配器新增 / 删除工具后的生效口径（本次踩到的实操坑）**：两件事必须都做，缺一不可。① 在 `MCP_BUILTIN_SERVERS` 的 `toolRisks` 里给新工具补级别——漏了会走「未知」兜底，**每次调用都弹确认卡**；② 让改动生效：`POST /mcp/servers/:id/reload` 只重建 MCP 连接并重列工具（响应包在 `{ status }` 里），**不重读 `.env`**——所以 `toolRisks` 的变更必须**重启服务进程**（`pm2 delete` → 确认端口释放 → `pm2 start`）才会加载。本次已按此流程重启，验证得到 `tools=9` 且 `get_field_values` 定级 `read`。
 
 ---
 
@@ -335,6 +384,45 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 | `scripts/_rag-check.mjs` | 23 | 知识库：解析分发 / 二进制拒绝 / 切片 / 混合检索与来源 / embedding 降级 / 指纹增量 / 索引按 mtime 重载 / 工具接线 / 真实语料命中 |
 | `scripts/_untrusted-check.mjs` | 12 | 注入防护：nonce 定界 / 伪造闭合与伪造开标签中和 / 不可见控制符清洗不误伤 / 规则只在工具模式注入 |
 | `scripts/_mute-check.mjs` | 7 | 免打扰：持久化 / 列表可见 / 回落 / **不刷新 updatedAt** / 归属守卫 / 非法类型不写脏值 |
+
+**BI 通道自检（需真实实例与凭据，非零外部依赖）**：`node --import tsx scripts/_bi-tools-check.mjs` —— 走本仓 hub 与 `.env` 配置，断言：工具清单 9/9、8 个只读工具均已声明 `readOnlyHint`（`run_native_query` 按设计不声明）、**`get_field_values` 的服务器配置为 `read` 且执行类工具非 `read`**（走 `src/risk.ts` 真实判定）、表清单与 `include_fields` 真的回字段名（不是只给数量）、字段结构稳定（`name` / `type`）、`get_field_values` 能取到取值分布（探测顺序：字段多的表优先，最多 4 张表 × 2 字段）。只调元数据类工具，不执行 SQL。
+
+实测（2026-09-18，`id=bi` 的 ClickHouse 主库，47 张表）：
+
+```
+连接：connected=true 工具数=9
+  ok   工具清单与适配器一致：期望 9 个 / 实际 9 个
+  ok   只读工具已声明 readOnlyHint：8/8
+  ok   run_native_query 未声明只读（执行任意 SQL，交由服务端定级）
+  ok   get_field_values 已在服务器配置里定为 read：level=read source=tool-config
+  ok   run_native_query 不是 read（按配置定级）：level=destructive source=tool-config
+  ok   表清单可用：totalTables=47 matched=47
+  ok   include_fields 真的回字段名（不是只给数量）
+  ok   指定表返回字段；字段结构稳定（name/type）
+  取证信息覆盖：字段 26 / 带描述 9 / 带外键指向 2 / 带去重值个数 0
+[get_field_values] <schema>.<table>.<field> → source=group-by 取值数=20
+  ok   sample 参数已生效（scanLimit 回显 + approximate 标注）：scanLimit=5 approximate=true
+  ok   非法表名 / 不存在的表 / 不存在的字段 → 均如实报错（不执行、不编造）
+=== bi-tools PASS ===
+```
+
+两条实测结论（第 2 条是对首版结论的**修正**）：
+
+1. **取值域的两条路径都被真实实例走到过**：某次跑命中 `source=field-values`（实例缓存），另一次进入 `group-by` 兜底。所以兜底路径不是「以防万一」，必须保持随时可跑通。
+2. ~~「该实例元数据没有描述 / 外键 / 指纹」~~ **首版这条结论是错的，予以修正**：它来自**采样偏差**——早先脚本挑中的第一张表只有 1 个字段。在**字段最多的表（26 字段）**上重测得到：带描述 9 / 带外键指向 2 / 带去重值个数 0。正确口径：**描述与外键只是部分可用，fingerprint 在该库整体缺失（个别列即使有也可能过时，见 §10 坑 6）** → 取证既不能只靠注释，也不能只靠指纹，**取值域是唯一稳定可靠的一手证据**。
+
+**空串场景复现（2026-09-19）**：对某明细表的语言类字段调用 `get_field_values`（`sample=2000`，1.1s 返回），字段名已隐去：
+
+```
+{
+  "table": "<schema>.<表>", "field": "<语言类字段>", "type": "type/Text",
+  "semantic": "type/Category", "distinctValues": 1, "nullRatio": 0,
+  "source": "field-values",
+  "values": [ { "value": "" }, { "value": "xx-YY" }, { "value": "xx-YY" }, { "value": "xx-YY" } ]
+}
+```
+
+唯一一条结论（另一条「两条路径都被用到过」的结论已并入上面 §11 实测结论，不再重复）：**空串位列取值域第一项**——它和另外 3 个规范取值一样是该列的合法成员，正是当初被「当脏数据顺手排掉」的那个值。取证工具把它显式列出来之后，这类误判**不再依赖模型先验**。
 
 活路径（需真实模型，用 `scripts/run-*.ps1` 后台跑）：`_rag-e2e.mjs`（知识库问答 + 子代理并行委派事件流）、`_rag-inject-e2e.mjs`（注入探针实战）。
 

@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { computed, ref, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { renderChatMarkdown } from "../chat-richtext";
-import { getUiLocale, type UiLocale } from "../ui-locale";
+import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
+import { agentText, findAgent } from "../agents";
 import { localizeToken } from "../localize";
 import {
   streamChat,
   fetchConversations,
+  fetchChatPreferences,
   createConversation,
   saveConversationMessages,
   patchConversation,
@@ -24,11 +26,26 @@ import {
  */
 
 const AGENT_ID = "movie";
-const AGENT_LABEL = "观影助手";
 
 const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
+
+// 角色名走门户同一份四语文案：切语言时品牌名 / 欢迎卡 / 标签页标题一起变。
+const AGENT_LABEL = computed(() => {
+  const entry = findAgent(AGENT_ID);
+  return entry
+    ? agentText(entry.label, uiLocale.value)
+    : tx("观影助手", "Movie assistant", "Assistente de filmes", "फ़िल्म सहायक");
+});
+
+watch(
+  AGENT_LABEL,
+  (label) => {
+    document.title = `${label} · Agent`;
+  },
+  { immediate: true },
+);
 
 interface Bubble {
   id: number;
@@ -50,6 +67,22 @@ let controller: AbortController | null = null;
 
 /** 「清空对话」确认弹窗：清空不可撤销，用弹窗显式确认，避免「点错一下就没了」。 */
 const showClearModal = ref(false);
+/** 弹窗内「取消」按钮：打开时焦点落在这里——键盘用户的默认落点应该是安全操作。 */
+const clearCancelRef = ref<HTMLButtonElement | null>(null);
+/** 触发弹窗的「清空对话」按钮：关闭后焦点还给它，否则焦点掉回 body、Tab 会从页首重来。 */
+const clearTriggerRef = ref<HTMLButtonElement | null>(null);
+
+/**
+ * 打开：锁住背景滚动 + 焦点进入「取消」（默认落点是安全项，回车不会误清）；
+ * 关闭：解锁 + 焦点归还触发按钮。
+ * 只做视觉不动焦点的话，键盘用户按 Tab 会逛到弹窗背后的页面上。
+ */
+watch(showClearModal, async (open) => {
+  document.body.style.overflow = open ? "hidden" : "";
+  await nextTick();
+  if (open) clearCancelRef.value?.focus();
+  else clearTriggerRef.value?.focus();
+});
 
 /** 服务端并发保护（同会话已有任务在跑）：另一标签页、或刷新后后台任务尚未收束时会出现。 */
 function isBusyError(err: unknown): boolean {
@@ -64,11 +97,17 @@ function scrollToBottom() {
 }
 
 async function ensureConversation() {
+  // 语言恢复：会话显式设置优先，否则用设备默认。缺了这一步，切完语言刷新就会退回浏览器语言。
+  const prefs = await fetchChatPreferences().catch(() => null);
+  const deviceLocale = isUiLocale(prefs?.locale) ? prefs.locale : detectDefaultLocale();
+  setUiLocale(deviceLocale);
+
   const list = await fetchConversations(false, AGENT_ID);
   // 取最近更新的那条（服务端不保证顺序），空会话也复用，避免每次进入都新建空会话。
   const recent = [...list].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
   if (recent) {
     convId = recent.id;
+    if (isUiLocale(recent.locale)) setUiLocale(recent.locale);
     bubbles.value = (recent.messages || []).map((m) => ({
       id: ++seq,
       role: m.role,
@@ -183,6 +222,13 @@ function closeClearModal() {
   showClearModal.value = false;
 }
 
+/** Esc 关闭：确认弹窗的通用约定，键盘用户不必再回头找鼠标。 */
+function onClearModalKeydown(event: KeyboardEvent) {
+  if (!showClearModal.value || event.key !== "Escape") return;
+  event.preventDefault();
+  closeClearModal();
+}
+
 /**
  * 在弹窗里确认后真正执行清空：本地气泡 + 服务端两条状态一起清。
  * 只清其中一条都会「清了个假空」——服务端 messages 是 UI 快照，context 才是喂给模型的历史，
@@ -221,12 +267,15 @@ function autoGrow() {
 }
 
 onMounted(async () => {
-  document.title = `${AGENT_LABEL} · Agent`;
+  window.addEventListener("keydown", onClearModalKeydown);
   await ensureConversation().catch(() => {});
 });
 
 onBeforeUnmount(() => {
   controller?.abort();
+  window.removeEventListener("keydown", onClearModalKeydown);
+  // 弹窗还开着就卸载组件时，滚动锁会留在 body 上，整页再也滚不动。
+  document.body.style.overflow = "";
 });
 </script>
 
@@ -239,6 +288,7 @@ onBeforeUnmount(() => {
           <!-- 清空对话：与主题/语言控件同排同高；点击弹出确认框，确认后才真正清空。
                生成中禁用——清完还会被在途的流写回，先停止再清更符合直觉。 -->
           <button
+            ref="clearTriggerRef"
             type="button"
             class="mc-clear"
             :disabled="sending || !bubbles.length"
@@ -300,12 +350,10 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="b.role === 'user'" class="mc-plain">{{ b.text }}</div>
             <template v-else>
-              <div v-if="b.text" class="mc-md" v-html="renderChatMarkdown(b.text)"></div>
-              <!-- 流式正文尾部闪烁光标：传达「还有更多」，比独立「生成中」行更接近最佳实践。 -->
-              <span v-if="b.streaming && b.text" class="mc-cursor" aria-hidden="true"></span>
+              <div v-if="b.text" class="mc-md" v-html="renderChatMarkdown(b.text, uiLocale)"></div>
+              <!-- 正在生成且尚无文本时，显示三点输入指示。 -->
               <div v-else-if="b.streaming && !b.error" class="mc-typing">
                 <span></span><span></span><span></span>
-                <span class="mc-typing__label">{{ tx("正在思考…", "Thinking…", "Pensando…", "सोच रहा है…") }}</span>
               </div>
             </template>
             <div v-if="b.error" class="mc-error">{{ b.error }}</div>
@@ -375,14 +423,30 @@ onBeforeUnmount(() => {
           aria-modal="true"
           :aria-label="tx('清空当前对话', 'Clear current chat', 'Limpar conversa atual', 'वर्तमान चैट खाली करें')"
         >
-          <div class="mc-modal__head">
-            <span class="mc-modal__title">{{ tx("清空当前对话", "Clear current chat", "Limpar conversa atual", "वर्तमान चैट खाली करें") }}</span>
-          </div>
           <div class="mc-modal__body">
-            <p>{{ tx("此操作不可恢复，将清空当前对话的全部消息与上下文。确定要清空吗？", "This can't be undone — all messages and context in this chat will be cleared. Continue?", "Esta ação é irreversível — todas as mensagens e o contexto desta conversa serão apagados. Continuar?", "यह क्रिया अपरिवर्तनीय है — इस चैट का सारा संदेश और संदर्भ मिट जाएगा। जारी रखें?") }}</p>
+            <span class="mc-modal__icon" aria-hidden="true">
+              <svg
+                viewBox="0 0 24 24"
+                width="22"
+                height="22"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.9"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <circle cx="12" cy="12" r="9.25" />
+                <path d="M12 7.6v5.4" />
+                <path d="M12 16.4h.01" />
+              </svg>
+            </span>
+            <div class="mc-modal__content">
+              <div class="mc-modal__title">{{ tx("清空当前对话", "Clear current chat", "Limpar conversa atual", "वर्तमान चैट खाली करें") }}</div>
+              <p class="mc-modal__desc">{{ tx("此操作不可恢复，将清空当前对话的全部消息与上下文。确定要清空吗？", "This can't be undone — all messages and context in this chat will be cleared. Continue?", "Esta ação é irreversível — todas as mensagens e o contexto desta conversa serão apagados. Continuar?", "यह क्रिया अपरिवर्तनीय है — इस चैट का सारा संदेश और संदर्भ मिट जाएगा। जारी रखें?") }}</p>
+            </div>
           </div>
           <div class="mc-modal__foot">
-            <button type="button" class="mc-btn-ghost" @click="closeClearModal">{{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}</button>
+            <button ref="clearCancelRef" type="button" class="mc-btn-ghost" @click="closeClearModal">{{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}</button>
             <button type="button" class="mc-btn-danger" @click="confirmClear">{{ tx("清空", "Clear", "Limpar", "खाली करें") }}</button>
           </div>
         </div>
@@ -535,42 +599,73 @@ html[data-theme="dark"] .mc-title {
   backdrop-filter: blur(2px);
 }
 
+/* 清空确认弹窗：对齐 antd / Vben 的 confirm 风格——图标居左、标题+描述成块、底部右对齐按钮，去掉重分隔线。 */
 .mc-modal {
   width: 100%;
-  max-width: 420px;
+  max-width: 416px;
   background: var(--panel);
   color: var(--ink);
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 10px;
   box-shadow: var(--shadow);
-  display: flex;
-  flex-direction: column;
+  overflow: hidden;
 }
 
-.mc-modal__head {
-  padding: 16px 18px;
-  border-bottom: 1px solid var(--line);
+/* 主体：图标 + 文本块横向排列，对齐 antd confirm 的图标左置布局。 */
+.mc-modal__body {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 24px;
+}
+
+/* 警示图标：淡危险色圆底 + 危险色描边图标，antd 确认框的标准视觉。
+   用淡底而非实心块——实心红点的视觉重量会压过标题，小尺寸下也容易糊成一团。 */
+.mc-modal__icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+/* 深色下 12% 的红几乎看不见，提到 22% 才读得出「淡色底」的层次。 */
+html[data-theme="dark"] .mc-modal__icon {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
+/* 文本块下移 5px：让标题的光学中线与 32px 图标对齐，而不是与图标顶边齐平。 */
+.mc-modal__content {
+  flex: 1;
+  min-width: 0;
+  margin-top: 5px;
 }
 
 .mc-modal__title {
   font-family: var(--font-display);
   font-size: 16px;
   font-weight: 600;
+  line-height: 1.4;
+  color: var(--ink);
 }
 
-.mc-modal__body {
-  padding: 16px 18px;
+.mc-modal__desc {
+  margin: 6px 0 0;
   font-size: 14px;
   line-height: 1.6;
   color: var(--muted);
 }
 
+/* 底部：右对齐、无顶边框，靠留白与主体分隔（antd confirm 风格）。 */
 .mc-modal__foot {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  padding: 14px 18px;
-  border-top: 1px solid var(--line);
+  gap: 12px;
+  padding: 0 24px 24px;
 }
 
 .mc-btn-ghost {
@@ -578,6 +673,7 @@ html[data-theme="dark"] .mc-title {
   background: transparent;
   color: var(--muted);
   border-radius: var(--radius);
+  min-width: 80px;
   padding: 8px 16px;
   font-size: 14px;
   cursor: pointer;
@@ -600,6 +696,7 @@ html[data-theme="dark"] .mc-title {
   background: var(--danger);
   color: #fff;
   border-radius: var(--radius);
+  min-width: 80px;
   padding: 8px 16px;
   font-size: 14px;
   cursor: pointer;
@@ -612,6 +709,48 @@ html[data-theme="dark"] .mc-title {
 
 .mc-btn-danger:active {
   transform: scale(0.97);
+}
+
+/* 深色下 --danger 是提亮过的浅红，给白字只有 ~2.9:1（不达 AA），而且浅红当底色也不像「危险」。
+   压成深砖红后白字约 6:1，既守住可读性，也保住红色语义。 */
+html[data-theme="dark"] .mc-btn-danger {
+  background: color-mix(in srgb, var(--danger) 50%, #5c1a12);
+  color: #fff;
+  border-color: color-mix(in srgb, var(--danger) 60%, #5c1a12);
+}
+
+html[data-theme="dark"] .mc-btn-danger:hover {
+  background: color-mix(in srgb, var(--danger) 64%, #5c1a12);
+}
+
+/* 入场动效：遮罩淡入 + 卡片轻微上浮。 */
+.mc-modal-mask {
+  animation: mc-mask-in 0.15s ease;
+}
+
+.mc-modal {
+  animation: mc-modal-in 0.18s var(--ease);
+}
+
+@keyframes mc-mask-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes mc-modal-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 窄屏：按钮纵向铺满，主操作在上，避免误触。 */
+@media (max-width: 420px) {
+  .mc-modal__foot {
+    flex-direction: column-reverse;
+  }
+  .mc-btn-ghost,
+  .mc-btn-danger {
+    width: 100%;
+  }
 }
 
 .mc-clear__icon {
@@ -778,35 +917,30 @@ html[data-theme="dark"] .mc-welcome__hint {
 .mc-typing {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 2px;
+  gap: 6px;
+  padding: 3px 2px;
 }
 
-.mc-typing__label {
-  margin-left: 4px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
+/* 单色弹跳三点：去掉渐变，更接近 iMessage / ChatGPT 的轻量输入指示。 */
 .mc-typing span {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #7cb3f7, #f5a462);
-  animation: mc-blink 1.2s infinite ease-in-out;
+  background: var(--accent, #4f7cff);
+  animation: mc-bounce 1.3s infinite ease-in-out;
 }
 
 .mc-typing span:nth-child(2) {
-  animation-delay: 0.2s;
+  animation-delay: 0.18s;
 }
 
 .mc-typing span:nth-child(3) {
-  animation-delay: 0.4s;
+  animation-delay: 0.36s;
 }
 
-@keyframes mc-blink {
-  0%, 80%, 100% { opacity: 0.3; }
-  40% { opacity: 1; }
+@keyframes mc-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.45; }
+  30% { transform: translateY(-4px); opacity: 1; }
 }
 
 .mc-error {
@@ -817,23 +951,6 @@ html[data-theme="dark"] .mc-welcome__hint {
 
 html[data-theme="dark"] .mc-error {
   color: #fca5a5;
-}
-
-/* 流式正文尾部的闪烁光标：块级文本后内联显示，传达「还有更多内容在生成」。 */
-.mc-cursor {
-  display: inline-block;
-  width: 7px;
-  height: 1.05em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  border-radius: 1px;
-  background: linear-gradient(135deg, #7cb3f7, #f5a462);
-  animation: mc-cursor-blink 1s steps(1, end) infinite;
-}
-
-@keyframes mc-cursor-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
 }
 
 .mc-imgs {

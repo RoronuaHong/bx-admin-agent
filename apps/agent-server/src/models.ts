@@ -75,6 +75,8 @@ export interface AgentResult {
 export interface CallOptions {
   tools?: ToolSpec[];
   toolChoice?: "auto" | "none" | "required";
+  /** 原生联网搜索（选项 A）：对齐通用 Agent「开箱即有联网搜索」的标配；按 host 自适应各家声明方式。 */
+  webSearch?: boolean;
   /**
    * 系统提示的两段式形态（Deep Agents 的 prompt caching 思路）：
    * `stable` 跨轮不变（角色守则 + skills 索引）→ anthropic 加 cache_control 标记缓存；
@@ -90,15 +92,34 @@ export async function callAgent(
   signal?: AbortSignal,
   onDelta?: (chunk: string) => void,
   opts: CallOptions = {},
+  /** 扩展思考增量回调：仅在支持 thinking 的模型（Claude 3.7+/4、o 系列）且有思考输出时触发。 */
+  onThinking?: (chunk: string) => void,
 ): Promise<AgentResult> {
   switch (model.provider) {
     case "anthropic":
-      return callAnthropic(model, turns, images, signal, onDelta, opts);
+      return callAnthropic(model, turns, images, signal, onDelta, opts, onThinking);
     case "openai":
-      return callOpenAi(model, turns, images, signal, onDelta, opts);
+      return callOpenAi(model, turns, images, signal, onDelta, opts, onThinking);
     default:
       return { text: await callOllama(model, turns, images, signal, opts), toolCalls: [] };
   }
+}
+
+/**
+ * 是否对该 anthropic 模型开启扩展思考（extended thinking）：
+ * - 仅对已知支持思考的模型族启用，避免不支持的网关收到 thinking 参数直接 400。
+ * - 环境变量 ANTHROPIC_THINKING 可强制开（"1"/"true"）或关（"0"/"false"）。
+ * 开启时返回的 budget_tokens 必须小于 max_tokens（模型硬性约束），这里取一半并夹在 [1024, max-1]。
+ */
+function anthropicThinkingBudget(model: ModelEntry): number | null {
+  const env = process.env.ANTHROPIC_THINKING;
+  if (env === "0" || env === "false") return null;
+  const name = model.name.toLowerCase();
+  const supports = /claude-(3-7-sonnet|opus-4|sonnet-4|3-7|4[.\-])/.test(name);
+  const forced = env === "1" || env === "true";
+  if (!supports && !forced) return null;
+  const budget = Math.floor(config.maxOutputTokens / 2);
+  return budget >= 1024 && budget < config.maxOutputTokens ? budget : null;
 }
 
 function hasTools(opts: CallOptions): boolean {
@@ -230,15 +251,19 @@ async function callAnthropic(
   signal: AbortSignal | undefined,
   onDelta: ((chunk: string) => void) | undefined,
   opts: CallOptions = {},
+  onThinking?: ((chunk: string) => void) | undefined,
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
   const messages = toAnthropicMessages(model, turns, images);
   const system = anthropicSystem(opts);
+  // 扩展思考：开启后模型先产出 thinking 块再产出正文；thinking 块不计入最终回复正文。
+  const budget = anthropicThinkingBudget(model);
   const body: Record<string, unknown> = {
     model: model.name,
     max_tokens: config.maxOutputTokens,
     // 流式：边生成边回包，避免网关对慢模型整包超时（不支持时按非流式降级解析）。
     stream: true,
+    ...(budget ? { thinking: { type: "enabled", budget_tokens: budget } } : {}),
     ...(system ? { system } : {}),
     messages,
     ...(hasTools(opts)
@@ -280,6 +305,12 @@ async function callAnthropic(
       throw new Error(`model http ${response.status}: ${detail}`);
     }
     const blocks = bodyResult?.content || [];
+    // 非流式降级：若网关回包含 thinking 块，整段回传给前端做「思考过程」展示。
+    const thinkingText = blocks
+      .filter((block) => block.type === "thinking")
+      .map((block) => (block as { thinking?: string }).thinking || "")
+      .join("");
+    if (thinkingText) onThinking?.(thinkingText);
     return {
       text: blocks
         .filter((block) => block.type === "text")
@@ -330,7 +361,7 @@ async function callAnthropic(
       let event: {
         type?: string;
         index?: number;
-        delta?: { type?: string; text?: string; partial_json?: string; stop_reason?: string };
+        delta?: { type?: string; text?: string; thinking?: string; partial_json?: string; stop_reason?: string };
         content_block?: { type?: string; id?: string; name?: string };
       };
       try {
@@ -352,6 +383,9 @@ async function callAnthropic(
         if (event.delta?.type === "text_delta" && event.delta.text) {
           text += event.delta.text;
           onDelta?.(event.delta.text);
+        } else if (event.delta?.type === "thinking_delta" && event.delta.thinking) {
+          // 扩展思考增量：回传前端做实时「思考过程」展示（不计入最终正文）。
+          onThinking?.(event.delta.thinking);
         } else if (event.delta?.type === "input_json_delta" && event.delta.partial_json) {
           const current = pendingTools.get(index) || { id: "", name: "", args: "" };
           current.args += event.delta.partial_json;
@@ -428,6 +462,12 @@ function parseModelPenalty(raw: string | undefined): number | null {
   return Number.isFinite(v) && v !== 0 ? v : null;
 }
 
+/**
+ * 已知不支持 OpenAI 原生联网搜索（web_search_preview）的网关（按 baseUrl 记录）。
+ * 首次遇到 400 后记住，后续调用直接不带搜索，避免每次白费一次往返与延迟（日志也不再刷屏）。
+ */
+const webSearchUnsupportedHosts = new Set<string>();
+
 async function callOpenAi(
   model: ModelEntry,
   turns: Turn[],
@@ -435,6 +475,7 @@ async function callOpenAi(
   signal?: AbortSignal,
   onDelta?: (chunk: string) => void,
   opts: CallOptions = {},
+  onThinking?: ((chunk: string) => void) | undefined,
 ): Promise<AgentResult> {
   const base = model.baseUrl.replace(/\/+$/, "");
   const system = systemPrompt(opts);
@@ -444,35 +485,69 @@ async function callOpenAi(
   ];
   const freqPenalty = parseModelPenalty(process.env.MODEL_FREQUENCY_PENALTY);
   const presPenalty = parseModelPenalty(process.env.MODEL_PRESENCE_PENALTY);
-  const body: Record<string, unknown> = {
-    model: model.name,
-    max_tokens: config.maxOutputTokens,
-    // 流式：边生成边回包，避免网关对慢模型整包超时。
-    stream: true,
-    messages,
-    ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
-    ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
-    ...(hasTools(opts)
-      ? {
-          tools: (opts.tools || []).map((tool) => ({
-            type: "function",
-            function: { name: tool.name, description: tool.description, parameters: tool.parameters },
-          })),
-          tool_choice: opts.toolChoice || "auto",
-        }
-      : {}),
+  // 原生联网搜索（选项 A）：对齐 CodeBuddy/Cursor/千问「开箱即有联网搜索」的通用 Agent 标配。
+  // 按 host 自适应各家声明方式；未支持的网关在 .env 设 AGENT_WEB_SEARCH=0 即可整体关闭。
+  // 若网关不支持该工具声明（如部分私有部署对 web_search_preview 返回 400），自动降级为「不带搜索」
+  // 重试一次——保证联网搜索是「尽力增强」而非「可能把整个调用打挂」（工具模式与直连模式共用）。
+  const functionToolsBase: Array<Record<string, unknown>> = hasTools(opts)
+    ? (opts.tools || []).map((tool) => ({
+        type: "function",
+        function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+      }))
+    : [];
+
+  const attempt = async (webSearchOn: boolean): Promise<Response> => {
+    const functionTools = [...functionToolsBase];
+    const body: Record<string, unknown> = {
+      model: model.name,
+      max_tokens: config.maxOutputTokens,
+      // 流式：边生成边回包，避免网关对慢模型整包超时。
+      stream: true,
+      messages,
+      ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
+      ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
+    };
+    if (webSearchOn) {
+      const host = (model.baseUrl || "").replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
+      if (host.includes("dashscope") || host.includes("aliyun")) {
+        // 通义/千问：请求级联网开关（独立参数，不与 tools 数组冲突）。
+        body.enable_search = true;
+      } else {
+        // OpenAI 及兼容网关（DeepSeek / Qwen / Kimi 等走 OpenAI 协议）：声明 web_search_preview。
+        functionTools.push({ type: "web_search_preview", search_context_size: "medium" });
+      }
+    }
+    if (functionTools.length) {
+      body.tools = functionTools;
+      body.tool_choice = opts.toolChoice || "auto";
+    }
+    return fetchWithKeyRotation(model, (key) =>
+      fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify(body),
+        signal: timeoutSignalOf(model, signal),
+      }),
+    );
   };
-  const response = await fetchWithKeyRotation(model, (key) =>
-    fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify(body),
-      signal: timeoutSignalOf(model, signal),
-    }),
-  );
+
+  // 已确认不支持的网关直接跳过注入，省掉「先失败再降级」的额外往返。
+  const webSearchWanted = !!opts.webSearch && !webSearchUnsupportedHosts.has(base);
+  let response = await attempt(webSearchWanted);
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => "")).slice(0, 500);
+    const webSearchBroke =
+      webSearchWanted &&
+      (response.status === 400 ||
+        /web.?search|unsupported.?tool|unknown parameter|tool_choice|invalid.*tool/i.test(detail));
+    if (webSearchBroke) {
+      webSearchUnsupportedHosts.add(base);
+      console.warn(
+        `[models] 网关不支持联网搜索工具（${response.status}），自动降级为不带搜索重试（后续该网关将直接跳过联网搜索）：${detail}`,
+      );
+      response = await attempt(false);
+    }
+  }
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).slice(0, 500);
     if (/401006|"code"\s*:\s*402|402/.test(detail) || response.status === 402) {
@@ -514,6 +589,10 @@ async function callOpenAi(
         choices?: Array<{
           delta?: {
             content?: string | null;
+            reasoning?: string | null;
+            // OpenAI 官方 o 系列用 delta.reasoning；但 DeepSeek / Qwen / Kimi 等 OpenAI 兼容
+            // 网关把思考流放在 delta.reasoning_content，漏读会导致思考过程被静默丢弃。
+            reasoning_content?: string | null;
             tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
           };
         }>;
@@ -529,6 +608,10 @@ async function callOpenAi(
         text += content;
         onDelta?.(content);
       }
+      // 推理模型在正式回答前下发思考流：OpenAI 官方 o 系列用 delta.reasoning，
+      // DeepSeek / Qwen / Kimi 等兼容网关用 delta.reasoning_content；非推理模型两者皆无，自然忽略。
+      const reasoning = delta?.reasoning ?? delta?.reasoning_content;
+      if (reasoning) onThinking?.(reasoning);
       for (const part of delta?.tool_calls || []) {
         const index = typeof part.index === "number" ? part.index : 0;
         const current = pendingTools.get(index) || { id: "", name: "", args: "" };

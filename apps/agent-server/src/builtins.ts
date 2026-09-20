@@ -14,7 +14,8 @@ export const BUILTIN_SERVER = "builtin";
 /**
  * 内置工具风险登记表（写操作安全闸门 P0-1）：内置工具不在 MCP 注册表里，
  * 必须显式登记级别，否则 risk.ts 会按「未知」兜底处理（fail-closed）。
- * scope = workspace 的工具只写「本对话工作区」，无外部副作用（免确认依据）。
+ * scope = workspace 的工具只写「本对话工作区」，无外部副作用（免确认依据）；
+ * 例外：fs_write / fs_edit 直接变更用户可见的工作区文件，scope 标 external 以走确认流程。
  */
 export const BUILTIN_RISK: Record<
   string,
@@ -26,8 +27,8 @@ export const BUILTIN_RISK: Record<
   search_tools: { level: "read", scope: "workspace", reason: "检索工具清单" },
   search_knowledge: { level: "read", scope: "workspace", reason: "检索本地知识库（只读）" },
   knowledge_sources: { level: "read", scope: "workspace", reason: "列出知识库已入库来源" },
-  fs_write: { level: "write", scope: "workspace", reason: "写入本对话工作区文件（无外部副作用）" },
-  fs_edit: { level: "write", scope: "workspace", reason: "编辑本对话工作区文件（无外部副作用）" },
+  fs_write: { level: "write", scope: "external", reason: "写入本对话工作区文件（需用户确认）" },
+  fs_edit: { level: "write", scope: "external", reason: "编辑本对话工作区文件（需用户确认）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
   record_watched_movies: {

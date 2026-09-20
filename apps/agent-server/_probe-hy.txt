@@ -1,0 +1,17 @@
+[probe] 对话 conv_1789873427788_xsvu4u，MCP=["movie"]
+[probe] 提问：10部恐怖搞笑电影，高分，不同国家
+
+[probe] stream HTTP 200
+  model: Hy3-视觉
+  model: Hy3-视觉
+  !! error: {"type":"error","error":{"code":"MODEL_ERROR","defaultMessage":"model http 400: "},"message":"model http 400: "}
+  usage: {"type":"usage","tokens":16,"budget":75069,"window":128000,"turns":0,"dropped":0,"summarized":false,"toolResultsCleared":0,"toolResultsOffloaded":0,"rounds":1,"toolCalls":0,"modelRetries":0,"modelFallbacks":0,"toolFusions":0,"pseudoCallRetries":0,"groundingRetries":0,"groundingVerifications":0,"ungrounded":false,"costTokens":0}
+
+[probe] 事件统计: {"model":2,"error":1,"usage":1,"done":1}
+[probe] tool 调用(0): 
+[probe] text_delta 累计字符=0
+[probe] 最终 text 事件字符=0
+[probe] 耗时=0.6s
+
+----最终回复(前 1200 字符)----
+

@@ -90,7 +90,6 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  min-width: 132px;
   height: var(--ctrl-h);
   padding: 0 11px 0 12px;
   border: 1px solid var(--line);
@@ -98,7 +97,6 @@ onBeforeUnmount(() => {
   background: var(--panel);
   color: var(--muted);
   cursor: pointer;
-  overflow: hidden;
   transition:
     color 0.15s ease,
     background 0.15s ease,
@@ -120,10 +118,6 @@ onBeforeUnmount(() => {
 }
 
 .locale-value {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink);
   font-size: 13px;
@@ -219,9 +213,6 @@ onBeforeUnmount(() => {
 }
 
 .locale-option__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -232,7 +223,6 @@ onBeforeUnmount(() => {
 
 @media (max-width: 720px) {
   .locale-select {
-    min-width: 128px;
     padding: 0 10px;
     gap: 7px;
   }
@@ -241,9 +231,11 @@ onBeforeUnmount(() => {
     font-size: 12px;
   }
 
+  /* 保持右缘对齐向左展开：控件通常靠在右侧，改成 left:0 会让菜单向右溢出视口被裁切。 */
   .locale-menu-wrap {
-    right: auto;
-    left: 0;
+    right: 0;
+    left: auto;
+    max-width: calc(100vw - 24px);
   }
 }
 </style>

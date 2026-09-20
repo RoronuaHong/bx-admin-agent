@@ -149,8 +149,17 @@ async function openConnection(cfg: McpServerConfig): Promise<Conn | null> {
     busy: 0,
   };
   conns.set(cfg.id, conn);
+  const transport = buildTransport(cfg);
+  // stdio 子进程的 stderr 是 MCP server 唯一的日志通道（stdout 被协议帧占用）：不接出来就是日志黑洞，
+  // 适配器侧的超时/报错在服务端日志里完全看不到。这里转发并加前缀、截断，避免刷屏。
+  if (transport instanceof StdioClientTransport) {
+    transport.stderr?.on("data", (chunk: Buffer | string) => {
+      const line = String(chunk).trim();
+      if (line) console.log(`[mcp:${cfg.id}] ${line.slice(0, 2000)}`);
+    });
+  }
   try {
-    await client.connect(buildTransport(cfg), { timeout: timeoutOf(cfg) });
+    await client.connect(transport, { timeout: timeoutOf(cfg) });
     await refreshTools(conn);
     console.log(
       conn.toolsError
@@ -329,6 +338,8 @@ export interface McpToolFacts {
   requireConfirm?: boolean;
   /** 工具级风险覆盖（服务器配置 toolRisks，键为裸工具名或命名空间名）。 */
   toolRisks?: Record<string, "read" | "write" | "destructive">;
+  /** 原生 SQL 工具白名单（服务端只读判定后可免确认）。 */
+  readOnlySqlTools?: string[];
   /** MCP 工具注解（server 的自我声明）。 */
   annotations?: Record<string, unknown>;
 }
@@ -341,6 +352,7 @@ export function describeMcpTool(namespacedName: string): McpToolFacts | null {
     serverId: found.conn.cfg.id,
     ...(found.conn.cfg.requireConfirm !== undefined ? { requireConfirm: found.conn.cfg.requireConfirm } : {}),
     ...(found.conn.cfg.toolRisks ? { toolRisks: found.conn.cfg.toolRisks } : {}),
+    ...(found.conn.cfg.readOnlySqlTools ? { readOnlySqlTools: found.conn.cfg.readOnlySqlTools } : {}),
     ...(found.info.annotations ? { annotations: found.info.annotations } : {}),
   };
 }

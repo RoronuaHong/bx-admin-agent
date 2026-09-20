@@ -51,7 +51,7 @@ await check("系统提示按角色：movie 用观影人设 + 只见自己的技�
   const movie = systemPrompt.buildSystemPrompt({ role: "movie" });
   const generic = systemPrompt.buildSystemPrompt({ role: "generic" });
   assert.ok(movie.stable.includes("观影助手"), "movie 稳定前缀应为观影人设");
-  assert.ok(generic.stable.includes("数据分析助手"), "generic 稳定前缀应保持原样");
+  assert.ok(generic.stable.includes("通用 AI 助手"), "generic 稳定前缀应为通用人设");
   // movie 技能只出现在 movie 前缀；generic 前缀不得出现（防止击穿通用 cache）。
   const movieIdx = skills.renderSkillIndex("movie");
   const genericIdx = skills.renderSkillIndex("generic");

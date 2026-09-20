@@ -38,7 +38,7 @@ list_dashboards · list_databases · run_native_query · search
 
 ### 1.2 但性质相同、真实存在的危险工具就在清单里
 
-`run_native_query`（`scripts/metabase-mcp.mjs` L128-163）：
+`run_native_query`（`scripts/metabase-mcp.mjs` 的同名工具；**行号会随文件改动漂移，请以工具名为准**，2026-09-19 已移除不再准确的 L128-163 行号引用）：
 
 ```js
 name: "run_native_query",
@@ -306,13 +306,13 @@ export function assertBuiltinRiskCoverage(): void;   // 漏登记即抛错
 {"id":"bi","label":"BI","transport":"stdio","command":"node","args":["scripts/metabase-mcp.mjs"],
  "requireConfirm":true,"timeoutMs":180000,
  "toolRisks":{
-   "get_card":"read","get_dashboard":"read","get_database_schema":"read",
+   "get_card":"read","get_dashboard":"read","get_database_schema":"read","get_field_values":"read",
    "list_cards":"read","list_dashboards":"read","list_databases":"read","search":"read",
    "run_native_query":"destructive"
  }}
 ```
 
-效果：7 个只读工具 → `read` → **不弹卡**（与今天"弹了但被自动批准"的净体验一致，**无回归**）；`run_native_query` → `destructive` → **永远弹卡**（这正是要收紧的那一处）。
+效果：8 个只读工具 → `read` → **不弹卡**（与今天"弹了但被自动批准"的净体验一致，**无回归**）；`run_native_query` → `destructive` → **永远弹卡**（这正是要收紧的那一处）。
 
 ② **会话级只读授权**（针对未声明工具，例如将来的 `yapi`）：
 
@@ -495,7 +495,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 - [ ] `run_native_query` **无论 SQL 长什么样**都必须弹确认卡（含 SELECT 开头的情况）
 - [ ] 参数含 `PRAGMA` / `SELECT ... INTO OUTFILE` / `EXPLAIN ANALYZE` 的调用不再被自动批准
 - [ ] 前端 grep 不到 `isReadOnlyQuery` 与自动批准路径
-- [ ] `bi` 的 7 个只读工具**不弹卡**（无体验回归）；`run_native_query` 弹卡
+- [ ] `bi` 的 8 个只读工具**不弹卡**（无体验回归）；`run_native_query` 弹卡
 - [ ] 未声明注解 / 查不到的工具：默认弹确认卡（`MCP_UNKNOWN_TOOLS=deny` 时直接拒绝）
 - [ ] 伪造 / 跨会话复用 ticket 无法批准（`/chat/confirm` 返回 403 且记审计）
 - [ ] 子代理碰到写操作：**立即**返回明确错误（不再等 120s）
@@ -511,7 +511,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 
 | 风险 | 应对 |
 |---|---|
-| 删掉自动批准后 BI 查数变烦 | 由 P0-3 的 `toolRisks` 承接（7 个只读工具免卡）；**两者必须同批**，否则会明显回归 |
+| 删掉自动批准后 BI 查数变烦 | 由 P0-3 的 `toolRisks` 承接（8 个只读工具免卡）；**两者必须同批**，否则会明显回归 |
 | `readGrants` 被人为放宽导致漏确认 | 授权只对 `unknown` 生效，且**写/破坏性永不适用**；授权动作本身进审计 |
 | 票据机制改动导致前端旧代码批准失败 | `/chat/confirm` 同时接受 `ticket` 与旧 `callId`，但都强制会话校验；确认卡与 api 层同批更新 |
 | 门禁变严导致正常流程被拦 | `MCP_UNKNOWN_TOOLS=allow` 可临时降级（会记审计），但不建议常态开启 |
@@ -521,6 +521,9 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 ---
 
 ## 8. 参考
+
+- 本文只覆盖「写操作确认闸门」这一个风险轴。`run_native_query`（text2sql）的**只读边界、超时、语义层**以及 `yapi`（text2api）的工具设计对齐，见 `text2sql-text2api-plan.md`。
+- 注意：本文 §9 实施的 `isReadOnlySql` 降级属于**体验优化层**，不是安全边界；真正的边界由数据库只读角色提供。
 
 - MCP 规范 · Tool Annotations（`readOnlyHint` / `destructiveHint` / `idempotentHint`；缺省保守口径）
 - `docs/mcp-guide.md`（本仓库 MCP 契约）
@@ -545,7 +548,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 | P0-4 | `src/confirm.ts`（重写） | `requestConfirmation` 签发 `cfm_<uuid>` 一次性票据，绑定 (sessionId, conversationId)；`answerConfirmation(ticket, sessionId, confirmed)` 归属校验；应答即删（伪造/重放无效） |
 | P0-4 | `src/models.ts` | 工具调用兜底 id `call_<randomUUID>`（消除可预测性） |
 | P0-4 | `src/app.ts` | `/chat/confirm` 接受 `ticket`（`callId` 兼容但同样过归属校验）；不匹配 → 403 + `ownership_mismatch` 审计；`grantRead=true` → `$addToSet` 写 `conversation.readGrants` + `grant_read` 审计 |
-| P0-3 | `.env` | `bi` 配置 `toolRisks`（7 个只读工具 read + `run_native_query` destructive）；`MCP_CONFIRM_STRICT` 标注废弃 |
+| P0-3 | `.env` | `bi` 配置 `toolRisks`（8 个只读工具 read + `run_native_query` destructive）；`MCP_CONFIRM_STRICT` 标注废弃 |
 | P0-3 | `src/conversations.ts` | `ConversationDoc.readGrants` + `ConversationPatch.readGrants`（ACTIVITY_NEUTRAL）+ `addConversationReadGrant`（$addToSet 原子） |
 | P0-6 | `packages/shared/src/index.ts` | `confirmation_required` 事件扩 `ticket / server / level / argSummary / canGrantRead`；导出 `RiskLevel` |
 | P0-6 | `apps/web/src/api.ts` | `confirmToolCall(ticket, confirmed, { grantRead })` |
@@ -613,7 +616,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 | 用户自加的第三方 MCP 上未声明级别的工具 | `MCP_UNKNOWN_TOOLS` 默认 `confirm`（fail-closed） |
 | 声明 `destructiveHint` 或服务器 `requireConfirm: true` 的工具 | risk.ts 第 3、5 条 |
 
-免确认：全部内置工具（workspace 无外部副作用）、`bi` 的 7 个只读、`yapi` 全部（本轮新增）、`chart` 的 `"*": "read"`、`movie` 白名单；子代理内的非只读**直接拒绝**（不弹卡）。
+免确认：全部内置工具（workspace 无外部副作用）、`bi` 的 8 个只读（2026-09-19 起含新增的 `get_field_values`）、`yapi` 全部（本轮新增）、`chart` 的 `"*": "read"`、`movie` 白名单；子代理内的非只读**直接拒绝**（不弹卡）。
 
 **验证**：`_risk-gate-check.mjs` **16/16 PASS**（新增「票据签发同时回传有效期」一条）；真实连接实测 `mcp__yapi__call_api` → `level=read / source=annotation / needsConfirm=false`；`tsc --noEmit` 无新增错误（当时残留 1 个预存在的 `builtins.ts:355` 类型错误，与本次改动无关）。**（2026-09-18 复核：该残留错误已不存在——`tsc --noEmit` 在 `apps/agent-server` 干净通过、exit 0。）**
 

@@ -31,6 +31,12 @@ export interface RunTrace {
   costTokens?: number;
   modelRetries?: number;
   modelFallbacks?: number;
+  /** 接地护栏纠正次数（零数据作答被拦截并回灌提示的次数）：评测 G7 与劣化排查的信号。 */
+  groundingRetries?: number;
+  /** 事后核验次数（收束前对「回答 vs 本轮证据」做断言级核对）。 */
+  groundingVerifications?: number;
+  /** 纠正用尽仍未取得工具数据、以确定性拒答收束（>0 说明本轮模型有编造倾向）。 */
+  ungrounded?: boolean;
   error?: string;
   /** 代码版本（git sha / RELEASE env）：评测基线与排障按版本对比的必要条件。 */
   release?: string;

@@ -21,6 +21,13 @@ export interface StoredMessage {
   images?: Array<{ id: string; name: string }>;
   /** 该助手消息用到的工具步骤摘要（便于历史还原"它做了什么"）。 */
   steps?: Array<{ name: string; status: string }>;
+  /**
+   * 扩展思考（reasoning）文本：支持思考的模型才有，仅作展示、不回灌模型上下文。
+   * 必须持久化，否则刷新后推理面板的思考过程丢失（前端 toStored 会一并带上）。
+   */
+  thinking?: string;
+  /** 任务规划（write_todos 产出，推理面板展示用；前端一并落库）。 */
+  todos?: TodoItem[];
 }
 
 /** 忙碌期间排队的待发消息（按对话持久化，先进先出）。 */
@@ -632,6 +639,12 @@ export function renderConversationMarkdown(doc: ConversationDoc): string {
     lines.push(`## ${who}`);
     lines.push("");
     lines.push(msg.text || "");
+    if (msg.thinking) {
+      lines.push("");
+      lines.push("> 思考过程：");
+      lines.push("");
+      lines.push(msg.thinking);
+    }
     if (msg.steps?.length) {
       lines.push("");
       lines.push(`> 工具：${msg.steps.map((s) => `${s.name}(${s.status})`).join("、")}`);

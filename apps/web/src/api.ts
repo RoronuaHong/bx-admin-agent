@@ -67,6 +67,9 @@ export interface ModelInfo {
   vision: "direct" | "ocr" | "none";
 }
 
+/** 模型选择器的「自动」模式：运行时挑一个可用模型（哪个能用用哪个）。 */
+export const MODEL_AUTO_ID = "auto";
+
 export async function fetchModels(): Promise<ModelInfo[]> {
   const data = (await jsonFetch("/agent/models")) as { models: ModelInfo[] };
   return data.models || [];
@@ -147,6 +150,15 @@ export interface StoredMessage {
   role: "user" | "assistant";
   text: string;
   images?: { id: string; name: string }[];
+  /**
+   * 扩展思考（reasoning）文本：支持思考的模型才有，仅作展示、不回灌模型上下文。
+   * 必须持久化，否则刷新后推理面板里的思考过程丢失。
+   */
+  thinking?: string;
+  /** 工具调用步骤摘要（推理面板展示用）。 */
+  steps?: unknown[];
+  /** 任务规划（write_todos 产出，推理面板展示用）。 */
+  todos?: unknown[];
 }
 
 /** 排队中的待发消息（后端持久化，`conversation.pendingQueue`）。 */

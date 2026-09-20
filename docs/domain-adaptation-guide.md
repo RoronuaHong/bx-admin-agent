@@ -22,7 +22,7 @@
 
 | 关注点 | 真实位置 | 现状 |
 |---|---|---|
-| 角色定义（稳定前缀） | `apps/agent-server/src/system-prompt.ts` 的 `BASE_PROMPT` + `buildSystemPrompt()` | 🟡 当前硬编码为「数据分析助手」，是 prompt caching 命中对象 |
+| 角色定义（稳定前缀） | `apps/agent-server/src/system-prompt.ts` 的 `SAFETY_GUARDRAIL` + `BASE_PROMPT`/`buildSystemPrompt()` + `src/roles.ts` 的 `MOVIE_BASE_PROMPT` | 🟢 全局安全护栏 + 按角色人设/技能/MCP；安全策略见 `docs/movie-safety-policy.md` |
 | 能力插件 | `apps/agent-server/skills/<name>/SKILL.md` | ✅ 已有机制（`metric-caliber-check` 为样例），frontmatter 只载 `name/description`，模型命中后加载全文 |
 | 工具接入 | 两路来源：`.data/mcp-servers.json`（可写，用户增删改）+ `.env` 的 `MCP_BUILTIN_SERVERS`（随环境、不落盘，可带 `defaultEnabled`）；连接 `src/mcp/hub.ts` | ✅ 配置驱动、命名空间隔离、`mcp__<server>__<tool>`、连接失败不阻断主流程 |
 | 内置工具（引擎自带） | `src/builtins.ts`：`fs_*` / `write_todos` / `task`（子代理）/ `read_skill` / `search_tools` / **`search_knowledge`+`knowledge_sources`（知识库）** | ✅ 2026-09-17 增补后两项 —— 观影助手可把**影评/影片资料/运营文档**入本地库直接检索，无需为它单造工具 |
@@ -42,7 +42,7 @@
 
 同一份引擎代码，跑两个部署，各自一份配置：
 
-- **部署 A（通用）**：`BASE_PROMPT`=数据分析助手 + 通用 `skills/` + 通用 MCP。
+- **部署 A（通用）**：`BASE_PROMPT`=通用 AI 助手 + 通用 `skills/` + 通用 MCP。
 - **部署 B（观影）**：`BASE_PROMPT`=观影助手 + `skills/观影助手/` + 观影 MCP（如 TMDB / 豆瓣 / 猫眼）。
 
 本质是**部署配置的区别，不是运行时状态机**。两者共享引擎、互不影响。换一份 `BASE_PROMPT` 即切角色。
@@ -73,6 +73,7 @@
 - 新建 `apps/agent-server/skills/观影助手/SKILL.md`：`frontmatter(name/description)` + 流程 + 输出格式。
 - 可按场景拆多个 skill：选片推荐、影评写作、排片查询、对比分析。
 - 模型命中 `description` 后自动加载全文，无需改引擎。
+- 通用型技能（如 `schema-probe` 陌生库探查、`metric-caliber-check` 指标口径核对、`chart-visualization` 图表可视化）**不写 `roles:` 即对所有角色可见**；只有领域专属技能才用 `roles: movie` 收窄（`renderSkillIndex(role)` 已按角色过滤）。判断标准：流程里是否出现具体业务词——有业务词就该收窄，没有就保持通用。
 
 ### M1 工具接入（MCP 配置）
 - 在 `mcp-servers.json` 加观影数据源（TMDB / 豆瓣 / 猫眼）。
@@ -81,6 +82,7 @@
 ### M2 可信（复用 infra 第 10–11 章）
 - Trace + 评测门禁：观影金样集（如「推荐一部诺兰的科幻片」应命中推荐 skill 并调用观影 MCP）。
 - 防短路：门禁检查「是否调用了期望 skill / 工具」，而非只比对最终文本（避免模型直答骗过门禁）。
+- 数据类领域额外建议：把验证过的口径固化为**已保存的查询 / 金样 SQL**，别每次靠现场探查——否则同一问题不可复现、不可回归（判据与做法见 `docs/mcp-guide.md` §10「陌生库取证」的挂账表）。
 
 ### M3 写操作闸门（如观影助手有写意图：加入片单 / 标记看过）
 - 复用 `requireConfirm` 二次确认；确认超时 = 拒绝，且确认请求本身零副作用。
@@ -114,7 +116,7 @@
 3. 需要同引擎多角色时，升级到 **模式 B**（加 `role` 参数）。
 4. 越域风险真实存在时，再补 **模式 C** 的按 role 护栏。
 
-**当前进度（2026-09-17）：M0/M1 已落地，门户已上线** —— 已交付：①门户页 `/`（Agent 卡片 → `/chat`、`/movie`）；②`src/roles.ts` 角色注册表（generic + movie，人设 / 角色默认 MCP）；③`renderSkillIndex(role)` 按角色过滤（skill frontmatter `roles:`）+ 观影示例 skill `skills/movie/`；④会话按 `agentId` 分槽（`conversation.agentId` + `session.activeByAgent`，列表按角色过滤，旧数据归 generic）；⑤观影数据源为 **TMDb**（`.env` 的 `MCP_BUILTIN_SERVERS` 里 movie 项：公共托管 MCP + `tools` 白名单放行全部 21 个只读工具（电影 + 剧集 + 榜单/多源评分等）；2026-09-18 由豆瓣换源，原自编示例数据源与豆瓣管线已删除）。端到端：`_movie-e2e.mjs` PASS（2026-09-18）——「推荐一部科幻片」→ `mcp__movie__movies_search` / `movies_details` → 按 TMDb 真实数据作答（中文标题/简介/评分），工具不可用时如实说明不编造；回归 `_role-check.mjs` 7/7（角色表 / 分槽 / 未知角色 400 / 技能过滤 / 活跃槽不互顶）。**（2026-09-18 复核：KB 按角色隔离 #4 落地后重跑 `_role-check.mjs` 7/7、`_movie-e2e.mjs` PASS，示例观影链路未被破坏。）** #5 身份 / #6 真实片源为**暂缓项**（当前仅单端 Web、且暂无真实片源凭证，示例数据源已可端到端验证角色链路；二者待多端接入 / 真实片源接入时再补，期间代码不引用不存在的资源）。剩余前置：
+**当前进度（2026-09-17）：M0/M1 已落地，门户已上线** —— 已交付：①门户页 `/`（Agent 卡片 → `/chat`、`/movie`）；②`src/roles.ts` 角色注册表（generic + movie，人设 / 角色默认 MCP）；③`renderSkillIndex(role)` 按角色过滤（skill frontmatter `roles:`）+ 观影示例 skill `skills/movie/`；④会话按 `agentId` 分槽（`conversation.agentId` + `session.activeByAgent`，列表按角色过滤，旧数据归 generic）；⑤观影数据源为 **TMDb**（`.env` 的 `MCP_BUILTIN_SERVERS` 里 movie 项：公共托管 MCP + `tools` 白名单放行全部 21 个只读工具（电影 + 剧集 + 榜单/多源评分等）；2026-09-18 由豆瓣换源，原自编示例数据源与豆瓣管线已删除）；⑥前端 `agents.ts` 镜像清单 + `PortalPage.vue` 门户 Agent 卡片 + `ChatPage` 输入框工具菜单「专家」项（**2026-09-20 更新：原 `ChatPage` 顶栏 `ExpertSelect.vue` 专家选择器改为输入框「+」工具菜单项，列出除观影助手、通用助手外的其他专家**；观影助手属独立项目走 `/movie`；`agents.ts` 仍为门户卡片与专家面板的展示数据源）——前端零角色判断，分流只在后端 `roles.ts`。端到端：`_movie-e2e.mjs` PASS（2026-09-18）——「推荐一部科幻片」→ `mcp__movie__movies_search` / `movies_details` → 按 TMDb 真实数据作答（中文标题/简介/评分），工具不可用时如实说明不编造；回归 `_role-check.mjs` 7/7（角色表 / 分槽 / 未知角色 400 / 技能过滤 / 活跃槽不互顶）。**（2026-09-18 复核：KB 按角色隔离 #4 落地后重跑 `_role-check.mjs` 7/7、`_movie-e2e.mjs` PASS，示例观影链路未被破坏。）** #5 身份 / #6 真实片源为**暂缓项**（当前仅单端 Web、且暂无真实片源凭证，示例数据源已可端到端验证角色链路；二者待多端接入 / 真实片源接入时再补，期间代码不引用不存在的资源）。剩余前置：
 
 | # | 前置项 | 出处 | 状态 |
 |---|---|---|---|
@@ -213,19 +215,25 @@ routes: [
 - **门户 Agent 页面（`PortalPage.vue`）**：应用根路由 `/` 的落地页，作为所有 Agent 的统一入口/枢纽。
 - **观影助手页面（`MoviePage.vue`；2026-09-18 复核改名，早期设计叫 `MovieChatPage.vue`）**：独立路由 `/movie`，通过 `agentId="movie"` 让后端走第 2 章「模式 B」（同一引擎、按角色选 prompt/skills/MCP），无需另起部署。
 
-### 8.3 门户 Agent 页面设计
+### 8.3 门户 Agent 页面设计（✅ 已落地，2026-09-19）
 
-两种常见形态，按产品取舍：
+两种形态：原本的「顶栏专家选择器」于 **2026-09-20 改为「输入框工具菜单（`+`）里的「专家」项」**——二级面板列出**除观影助手外的其他专家**（观影助手属独立项目、走 `/movie`），选中即 `router.push(agent.path)` 跳对应角色页；门户 `PortalPage.vue` 仍是跨 Agent 的主入口：
 
-- **枢纽型（推荐起步）**：门户展示 Agent 卡片列表（通用助手、观影助手…），每张卡含名称/简介/图标与「开始对话」→ 跳对应路由。结构清晰、易扩展新 Agent。
-- **内嵌型**：门户本身就是默认通用 Agent，顶栏带 Agent 切换器，一键跳到观影助手等。适合 Agent 数量少、希望首屏即可聊的场景。
+- **枢纽型（门户 `/`，`PortalPage.vue`）**：根路由展示 Agent 卡片列表（通用助手、观影助手、客服助手…），每张卡含图标 / 名称 / 简介（四语）与「开始对话」→ 跳对应路由（`agent.path`）。结构清晰、易扩展新 Agent。
+- **内嵌型（输入框工具菜单「专家」项，`ChatPage.vue` 的 `tools-menu` / `tools-flyout`）**：`ChatPage` 输入框左侧「+」工具菜单新增「专家」行，点开二级面板列出**除观影助手、通用助手外的其他专家**（观影助手属独立项目 `/movie`、通用助手是默认形态，两者都不进专家列表）；选中即 `router.push(agent.path)` 跳到该角色的路由。**切专家 = 跳路由**，会话按 `agentId` 分槽互不串台（不做单页内人设热切换）。组件 `ExpertSelect.vue` 保留在仓内但当前未被引用（入口改为内联实现）。**（2026-09-20 由顶栏选择器改为工具菜单项。）**
 
-移动端衔接（对接第 7 章）：Agent 切换用**底部导航栏（bottom nav）**而非侧栏 `display:none`；门户卡片在窄屏纵向堆叠。
+**术语对齐（= CodeBuddy/WorkBuddy「专家」）**：本项目的「专家」即 CodeBuddy **专家中心**（左侧栏「专家」）里的**专家（Agent 型）**——每位专家有独立人设、方法论与工具链，召唤后把通用助手切换为该领域角色（"召唤谁就像请到那个岗位的资深从业者"）。注意 CodeBuddy **没有名为「专家模式」的独立 mode**（其模式是 Ask / Craft / Plan / Agent）；「专家」是专家中心里的一类**领域角色 / Agent**，属 Agent 能力的领域化封装。对照之下：通用助手（`generic`）是**默认 / 未切换**形态、**不算专家**（对应专家中心未切换时的通用视角），观影助手、客服助手等才是真正的专家（这也正是上一轮把 `generic` 移出「专家」菜单的依据）。三层关系与 CodeBuddy 一致——`Skill（技能）= 工具能力` → `专家（Agent 型）= 能力 + 经验（封装了技能与领域人设的独立 Agent）` → `专家团（Team 型）= 多专家 + 协作流程`（本项目暂未实现专家团，门户 / 工具菜单的「专家」目前只列单 Agent 型专家）。`PortalPage` 即「专家中心」式的浏览 / 召唤入口，`ChatPage`「+」菜单的「专家」项即「切换专业角色」；专家 `id` 语义化、全局唯一，对应 CodeBuddy 专家的「专家标识」。
+
+**前端镜像清单（`apps/web/src/agents.ts`）**：角色展示信息（`id` / `path` / `label` / `description` / `icon`，文案四语 `zh`/`en`/`pt-BR`/`hi`）的**唯一前端真相源**，与服务端 `src/roles.ts` 一一对应（`id` 必须两端一致）。新增 Agent：服务端 `roles.ts` 加角色 → 前端 `agents.ts` 加一条镜像（`id` 相同）。**前端不允许自行实现角色判断**，只做展示与路由跳转（角色分流只在后端，呼应第 2 章模式 B 与第 12 章「端只是壳」）。
+
+移动端衔接（对接第 7 章）：门户卡片在窄屏纵向堆叠；跨 Agent 切换统一走门户（`.brand__home`（⌂）回门户），与侧栏离屏抽屉并存；`ChatPage` 输入框「+」工具菜单的「专家」项在窄屏同样可达。
 
 ### 8.4 新页面实现最佳实践
 
 - **抽离共享聊天组件，禁止复制整页**：`ChatPage.vue` 实测 **≈98KB**（99,774 字节 / 3,400+ 行；线程/流式/工具步骤/确认卡/输入区，2026-09-18 已增至约 230KB）。应把聊天内核抽成可复用 `ChatView.vue`（或 `useChat` composable），`ChatPage` 与 `MovieChatPage` 都挂载 `<ChatView :agentId="..." />`，仅传 `role` 差异，避免逻辑分叉与回归风险。**（2026-09-18 实际落地：未抽 `ChatView`——`/movie` 走独立 `MoviePage.vue`，只复用底层能力（`api.ts` 流式/会话接口、markdown/表格渲染、`UiLocaleSelect`/`ThemeToggle`），不复制页面级结构；本建议保留为「若要复用**页面级**布局」时的参考。）**
 - **页面只负责"配置角色"，不改引擎**：新页面把 `agentId`/`role` 透传给后端 `buildSystemPrompt({ role })`（第 2 章模式 B）；后端按角色选 `prompt / skills / MCP`。若后端暂不支持 `role` 参数，前端页面也应只设"角色标识"，由后端补齐，而不是在前端硬编码角色逻辑。
+
+> **（2026-09-19 实际落地）**：`router.ts` 直接挂载 `ChatPage` / `MoviePage`（**未用路由 props 注入 `agentId`**），各页组件内部写死自己的 `agentId`（`ChatPage`=`generic`、`MoviePage`=`movie`），再随每个会话级请求（`/chat/stream` 的 `agentId` 字段）上行，由服务端 `getRole(agentId)` 分流；不要误以为 `agentId` 经路由 props 传入。前端 `agents.ts` 镜像只描述「展示与跳哪」，角色真相只在 `roles.ts`。
 - **会话按 agentId 隔离（关键）**：当前后端会话是「每 cookie 单线条」（见 infra 第 9 章 ❌）。多个 Agent 页面若共享同一会话，切换 Agent 会串上下文。须在会话 key 里带上 `agentId`（如 `sessionKey = cookie + agentId`），或在侧栏/门户里按 Agent 分组会话列表。把"按 Agent 隔离"作为验收项。
 - **资源懒加载**：路由用 `() => import(...)` 动态加载，门户首屏不加载观影页重量逻辑。
 
@@ -235,6 +243,8 @@ routes: [
 - `/movie` 与 `/chat` 行为独立：观影页只命中观影 skill/MCP，通用页行为不变（回归金样全绿）。
 - 两个 Agent 的会话互不串台（按 agentId 隔离）。
 - 移动端 Agent 切换走底部导航，可达且单手可操作。**（2026-09-18 实际落地：未采用底部导航**——改为「门户枢纽 + 侧栏回门户」：入口是 `PortalPage.vue` 的 Agent 卡片，`ChatPage.vue:2692` 的 `.brand__home`（⌂）回门户；移动端侧栏是离屏抽屉 + 汉堡入口。）
+- 输入框工具菜单「专家」项（`ChatPage.vue`）：列出**除观影助手、通用助手外的其他专家**、键盘可达（Tab / Enter / Esc，焦点可见）、当前项高亮；选中跳对应路由且会话按 agentId 分槽、不串台。**（2026-09-20 由顶栏选择器改为工具菜单项，复用同一份 `agents.ts` 镜像数据源；观影助手、通用助手不在此列表。）**
+- 前端 `agents.ts` 镜像与服务端 `roles.ts` 的 `id` 一一对应；新增 Agent 两端同步、前端不重复角色逻辑。
 
 ### 8.6 反模式补充
 
@@ -244,6 +254,49 @@ routes: [
 | 多 Agent 共享同一会话 | 切 Agent 串上下文、答案错乱 | 会话 key 带 `agentId` 隔离 |
 | 门户只做跳转、无状态/无入口 | 用户迷路 | 门户作为枢纽，含 Agent 卡片/切换器 |
 | 移动端 Agent 切换藏在 `display:none` 侧栏 | 窄屏找不到入口 | 底部导航栏切换 Agent（**2026-09-18 实际落地：侧栏改离屏抽屉 + 汉堡入口，Agent 切换走门户枢纽**） |
+
+### 8.7 专家中心：对齐 CodeBuddy 的优化设计（2026-09-20）
+
+> 目标：把本项目的多 Agent 门户 / 专家入口，对齐到 CodeBuddy/WorkBuddy 的「专家中心」模型（术语见 §8.3「术语对齐」）。2026-09-20 四项决策已落定并落地（见 §8.7.4），本文档同步记录最终设计。
+
+#### 8.7.1 概念映射（CodeBuddy ↔ 本项目）
+
+| CodeBuddy 概念 | 本项目对应 | 状态 |
+|---|---|---|
+| 专家中心（左侧栏「专家」入口，浏览 / 召唤专家） | `PortalPage.vue`：默认助手单独呈现 + 专家网格只列真·专家 + 「开始对话」 | ✅ 已落地（默认助手非专家卡；专家卡含图标 / 名称 / 简介四语 + 跳 `agent.path`） |
+| 专家（Agent 型）：独立人设 + 方法论 + 工具链的领域角色 | `agents.ts` 中**非 generic、非 movie** 的条目（如 `support` 客服助手）；人设由后端 `roles.ts` 提供 | ✅ 已落地；`support` 后端角色已补（见 §8.7.4-Q3） |
+| 通用助手（未切换专家时的默认形态，**非专家**） | `generic`（走 `/chat`，即 `ChatPage` 本身） | ✅ 已落地；已从「专家」菜单与门户专家网格排除，仅作默认态单独呈现 |
+| 切换专业角色 | `ChatPage`「+」工具菜单「专家」项（二级面板列专家、跳 `agent.path`） | ✅ 已落地（排除 movie + generic） |
+| 召唤专家 / 专家团 → 进入对话 | 点卡片「开始对话」/ 菜单项 → `router.push(agent.path)` | ✅ 已落地 |
+| 技能（Skill = 工具能力） | 既有 `Skills` 系统（`.codebuddy/skills/`） | ✅ 已落地 |
+| 专家标识（语义化、全局唯一，如 `frontend-expert`） | `agents.ts` 的 `id`（须与后端 `roles.ts` 一致） | ✅ 已落地 |
+| 分类（专家按分类目录组织检索） | —— | 🗺️ 本次不加（见 8.7.4-Q2） |
+| 专家团（Team 型：团长拆解、多专家并行、整合交付） | —— | 🗺️ 路线图（本次不做，见 8.7.4-Q4） |
+| 企业自建 / 内置市场、权限控制 | —— | 🗺️ 路线图（本项目为单租户前端镜像，暂不涉及） |
+
+#### 8.7.2 专家数据模型（对齐 CodeBuddy 专家字段）
+
+`apps/web/src/agents.ts` 的 `AgentEntry` 当前字段：`id` / `path` / `label`(四语) / `description`(四语) / `icon`。对照 CodeBuddy 专家（标识、显示名称、分类、描述、头像、权限），建议：
+
+- **保留**：`id`（= 专家标识，语义化、全局唯一）、`label`（= 显示名称，四语）、`description`（= 描述，四语）、`icon`（= 头像占位符）。
+- **`category`（本次不加）**：对应 CodeBuddy 的「分类」，便于门户按领域分组浏览（如「办公 / 影音 / 客服」）。Q2 决策为暂不引入——门户暂以单列专家网格呈现，不按分类分组（见 8.7.4）。
+- **人设（persona）/ 方法论 / 工具链**：**只在后端 `roles.ts`**，前端不持有（呼应「端只是壳」）。新增专家必须两端同步：`roles.ts` 加角色 → `agents.ts` 加镜像（`id` 一致）。
+
+#### 8.7.3 已实现 vs 待优化（状态）
+
+- ✅ 门户 = 专家中心形态：默认助手单独呈现，专家网格只列真·专家（卡片浏览 + 召唤）。
+- ✅ 通用助手明确不算专家，不出现在「专家」菜单与门户专家网格，仅作默认态单独呈现。
+- ✅ 专家入口在输入框「+」工具菜单，跳路由、会话按 `agentId` 分槽隔离。
+- ✅ 四语文案、键盘可达（Tab / Enter / Esc，焦点可见）、当前项高亮。
+- ✅ `support` 客服助手成为真·专家：前端路由（`/support`）+ 后端 `roles.ts` 角色（人设 / 服务守则）已补。
+- 🗺️ 路线图：专家团（Team）、分类检索、企业权限。
+
+#### 8.7.4 决策记录（2026-09-20 已决并落地）
+
+- **Q1（门户剔除 generic 卡片）**：✅ 已决——`PortalPage` 不再把 `generic` 当「专家」卡片，改为默认态单独呈现（专家网格只列 movie / support 等真专家），对齐 CodeBuddy「专家中心不列默认助手」的最佳实践。
+- **Q2（加 `category` 分类字段）**：❌ 暂不做——本次不加 `category`，门户以单列专家网格呈现，不按分类分组。
+- **Q3（客服后端角色）**：✅ 已决——在 `apps/agent-server/src/roles.ts` 加 `support` 角色（`basePrompt` 客服人设 + 服务守则），复用通用工具能力，暂无专属 MCP/技能（需订单/工单系统时再补 `defaultMcpServers` + 强制工具开关）。
+- **Q4（专家团范围）**：❌ 本次不做——专家团（Team 型）仅作路线图记录，暂不实现。
 
 ---
 
@@ -306,8 +359,8 @@ routes: [
 | 集成点 | 实测位置（2026-09-17 复核；**2026-09-18 更新**，改动处已标注） | 结论 |
 |---|---|---|
 | 请求体解析 | `app.ts` `readJson = c.req.json<T>().catch(() => ({}))` | 宽松解析、无严格 schema 校验；新增 `role`/`agentId` 字段不会被拒绝，纯加性 |
-| prompt 构建入口 | `chat.ts:1215` `buildSystemPrompt({ locale, summary, tooling, todos, enabledSkills, role, ownerKey })` | **（2026-09-18 更新：已传 `role: conversation?.agentId`，「当前不传 role」已过期）**。稳定前缀 = `role.basePrompt`（缺省回退 `BASE_PROMPT`）+ `TOOLING_RULES` + `renderSkillIndex(role.id)`（`system-prompt.ts:191`）→ 第 2 章「按 role 过滤 skill」已落地 |
-| skill 索引渲染 | `skills.ts:94` `renderSkillIndex(role?)`（**2026-09-18 更新：已支持按角色过滤**）+ `chat.ts` 注入 `enabledSkills` 到**动态**后缀 | 索引在稳定段（cache 命中对象）、勾选全文在动态段；「按角色过滤」已由 `system-prompt.ts:191` 传 `role.id` 落地，新增其它角色的 skill 不再互相击穿缓存 |
+| prompt 构建入口 | `chat.ts:1236` `buildSystemPrompt({ locale, summary, tooling, todos, enabledSkills, role, ownerKey })` | **（2026-09-18 更新：已传 `role: conversation?.agentId`，「当前不传 role」已过期）**。稳定前缀 = `SAFETY_GUARDRAIL` + `role.basePrompt`（缺省回退 `BASE_PROMPT`）+ `TOOLING_RULES` + `renderSkillIndex(role.id)`（`system-prompt.ts:210`）→ 第 2 章「按 role 过滤 skill」已落地 |
+| skill 索引渲染 | `skills.ts:94` `renderSkillIndex(role?)`（**2026-09-18 更新：已支持按角色过滤**）+ `chat.ts` 注入 `enabledSkills` 到**动态**后缀 | 索引在稳定段（cache 命中对象）、勾选全文在动态段；「按角色过滤」已由 `system-prompt.ts:210` 传 `role.id` 落地，新增其它角色的 skill 不再互相击穿缓存 |
 | 会话解析调用方 | `resolveConversation`（用于 mcp put / stream / context 等端点） | 改会话模型影响面局部；子代理走 `runLoop(subCtx)`，独立上下文、不调用它 |
 | 按**对话** MCP 启用 | `conversation.mcpServers` 真实字段，`app.ts` `PUT /chat/mcp/servers` 内 `patchConversation(conversationId, { mcpServers })` 持久化；断开按 `listEnabledMcpServers()` **跨对话**引用计数 | 观影 MCP 仅在该对话启用，不泄漏通用对话 |
 | 活跃对话向后兼容 | `session.activeConversationId` | 保留为 generic 槽；新 Agent 用 `activeConversationIdByAgent` 映射，旧对话不受影响 |
@@ -317,7 +370,7 @@ routes: [
 
 **唯一阻断项（2026-09-17）**：skill 索引全局加载（`skills.ts` 的 `listSkills()` 不过滤角色）→ 已在第 2 章标注为必需代码改动（`renderSkillIndex(role)`）。
 
-> **（2026-09-18 对齐：该阻断项已解除）** `renderSkillIndex(role?)` 已按角色过滤（`skills.ts:94`，内部走 `listSkillMetas(role)`），`system-prompt.ts:191` 传入 `role.id`；角色注册表见 `src/roles.ts`。
+> **（2026-09-18 对齐：该阻断项已解除）** `renderSkillIndex(role?)` 已按角色过滤（`skills.ts:94`，内部走 `listSkillMetas(role)`），`system-prompt.ts:210` 传入 `role.id`；角色注册表见 `src/roles.ts`。
 
 > **行号会漂移**：表中行号为复核当时值，若对不上请以符号名（`buildSystemPrompt` / `renderSkillIndex` / `resolveConversation` / `streamNdjson`）为准 —— 这些是稳定锚点。
 
@@ -403,6 +456,8 @@ routes: [
 
 **对接 role 的完整清单（不止 skill）**：第 2 章指出「按 role 过滤 skill 索引」是必需代码改动。补完本节后，需要按角色隔离的对象应扩展为四项：
 
+（2026-09-18 追加）**第五项通用能力：陌生库取证（工具 + 技能）**。BI 适配器补齐了元数据映射（描述 / 语义类型 / 外键指向 / 去重值个数）并新增取值域工具 `get_field_values`，配套通用技能 `schema-probe`（先找存量口径 → 取值域取证 → 单表口径优先 → 主键用去重数验证 → 结论写清口径）。对领域 Agent 的意义：**接入任何新数据源时，「问数据」的成本都应低于「猜语义」的成本**——这类取证能力与领域无关，换库、换 MCP、换角色都成立；实现细节与一次误判复盘（通用规律 vs 缺陷）见 `docs/mcp-guide.md` §10「陌生库取证」。
+
 | 对象 | 当前是否按 role 隔离 | 现状 |
 |---|---|---|
 | `BASE_PROMPT`（角色人设） | 否（硬编码） | 模式 A/B 的改造对象 |
@@ -415,3 +470,5 @@ routes: [
 > 一句话：**现有 Agent 不会被影响——它只是同一引擎下的一个配置变体；观影助手是另一个变体，两者可共存、可切换、可独立回滚。前端需把 ≤860px 的 `display:none` 侧栏改为抽屉；用「门户页 `/` + 观影新路由 `/movie`（复用 `ChatView`、按 agentId 隔离会话）」构成多 Agent 移动端结构；并以「会话按 agentId 分槽（旧对话向后兼容）+ 复用项目评测底座挂观影金样门禁」守住两个中风险点。全链路集成点已实测核实为安全，唯一必需代码改动是 `renderSkillIndex(role)` 按角色过滤 skill 索引（2026-09-17 复核：仍然成立；知识库语料已按 `namespace` 隔离（见第 13 章））。观影助手进 App（H5 / PC / Android / iOS）时，角色区分仍只在后端 `role` 字段，四端只是同一 API 的不同壳，契约（认证 / role / 写确认协议 / 会话隔离 / 凭据）统一；客户端对话流本就是 **HTTP Streamable / NDJSON**（非 SSE），四端可直接复用、无需传输层适配，生产只需确保反代 / CDN **不缓冲 chunked**，原生端再接系统推送即可。**
 >
 > **2026-09-18 补充**：引擎侧新增的知识库检索、子代理委派、注入防护、后台完成提醒四项能力均为通用件，观影助手可直接复用（详见第 13 章），其中「子代理并行查多片源」与「知识库承载影评/资料」能显著降低观影助手的落地成本；知识库已按 `namespace` 隔离、skill 索引已完成按 role 过滤，两者均不再是缺口。
+>
+> **2026-09-18 二次补充（陌生库取证）**：新增「元数据映射 + 取值域工具 `get_field_values` + 通用技能 `schema-probe`」这一组取证能力，接任何数据源的领域 Agent 都能直接复用。判据：**凡能靠一次最小查询证明的事实，都属于工程缺陷而不是模型运气**——把「先入为主地排除某个取值」「过度关联维表」这类错误，从「下次更谨慎」变成可复现地消除。复盘与挂账见 `docs/mcp-guide.md` §10「陌生库取证」。

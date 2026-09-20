@@ -1,18 +1,32 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { listAgents } from "../agents";
-import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
+import { computed, watch } from "vue";
+import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import { agentText, findAgent, listAgents } from "../agents";
+import { saveChatPreferences } from "../api";
+import { getUiLocale, type UiLocale } from "../ui-locale";
 
 // 门户：Agent 卡片列表（领域适配指南 §8.3「枢纽型」推荐起步）。
 // 角色清单来自前端镜像的 agents 配置；角色判断与分流只在后端，这里只做展示与跳转。
-const locale = ref<UiLocale>(isUiLocale(getUiLocale()) ? getUiLocale() : detectDefaultLocale());
-function switchLocale() {
-  const order: UiLocale[] = ["zh", "en", "pt-BR", "hi"];
-  locale.value = order[(order.indexOf(locale.value) + 1) % order.length];
-  setUiLocale(locale.value);
-}
-function tx(zh: string, en: string, pt: string, hi: string): string {
-  return { zh, en, "pt-BR": pt, hi }[locale.value];
+// 语言读共享的界面语言 ref（与 Chat/Movie 页同一份内存态），切换交给统一的 UiLocaleSelect。
+const locale = getUiLocale();
+const tx = (zh: string, en: string, pt = en, hi = en) =>
+  locale.value === "zh" ? zh : locale.value === "pt-BR" ? pt : locale.value === "hi" ? hi : en;
+// 门户对齐 CodeBuddy 专家中心：默认助手（generic）单独呈现，专家网格只列真·专家。
+const defaultAgent = findAgent("generic");
+const experts = computed(() => listAgents().filter((a) => a.id !== "generic"));
+
+// 标签页标题跟随界面语言（index.html 里的中文只是首屏兜底）。
+watch(
+  () => tx("小助手", "Assistant", "Assistente", "सहायक"),
+  (name) => {
+    document.title = name;
+  },
+  { immediate: true },
+);
+
+/** 门户没有对话上下文，语言落到设备默认（`session.preferences.locale`），进 Chat 时即生效。 */
+function onLocaleChange(next: UiLocale) {
+  void saveChatPreferences({ locale: next }).catch(() => undefined);
 }
 </script>
 
@@ -20,7 +34,7 @@ function tx(zh: string, en: string, pt: string, hi: string): string {
   <div class="portal">
     <header class="portal__head">
       <span class="portal__brand">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</span>
-      <button type="button" class="portal__locale" @click="switchLocale">{{ locale }}</button>
+      <UiLocaleSelect @change="onLocaleChange" />
     </header>
 
     <main class="portal__main">
@@ -29,9 +43,24 @@ function tx(zh: string, en: string, pt: string, hi: string): string {
         {{ tx("每个助手有各自的人设、技能与工具，会话互相独立。", "Each assistant has its own persona, skills and tools; conversations are independent.", "Cada assistente tem persona, habilidades e ferramentas próprias; conversas independentes.", "प्रत्येक सहायक की अपनी persona, skills और tools हैं; बातचीत स्वतंत्र है।") }}
       </p>
 
+      <!-- 默认助手（非专家，对应 CodeBuddy 未切换专家时的通用形态） -->
+      <RouterLink
+        v-if="defaultAgent"
+        class="agent-card agent-card--default"
+        :to="defaultAgent.path"
+      >
+        <span class="agent-card__icon" aria-hidden="true">{{ defaultAgent.icon }}</span>
+        <span class="agent-card__body">
+          <span class="agent-card__name">{{ agentText(defaultAgent.label, locale) }}</span>
+          <span class="agent-card__desc">{{ agentText(defaultAgent.description, locale) }}</span>
+        </span>
+        <span class="agent-card__go" aria-hidden="true">→</span>
+      </RouterLink>
+
+      <h2 class="portal__section">{{ tx("专家", "Expert", "Especialista", "विशेषज्ञ") }}</h2>
       <div class="portal__grid">
         <RouterLink
-          v-for="agent in listAgents()"
+          v-for="agent in experts"
           :key="agent.id"
           class="agent-card"
           :class="{ movie: agent.id === 'movie' }"
@@ -39,8 +68,8 @@ function tx(zh: string, en: string, pt: string, hi: string): string {
         >
           <span class="agent-card__icon" aria-hidden="true">{{ agent.icon }}</span>
           <span class="agent-card__body">
-            <span class="agent-card__name">{{ agent.label }}</span>
-            <span class="agent-card__desc">{{ agent.description }}</span>
+            <span class="agent-card__name">{{ agentText(agent.label, locale) }}</span>
+            <span class="agent-card__desc">{{ agentText(agent.description, locale) }}</span>
           </span>
           <span class="agent-card__go" aria-hidden="true">→</span>
         </RouterLink>
@@ -70,17 +99,6 @@ function tx(zh: string, en: string, pt: string, hi: string): string {
   font-weight: 700;
 }
 
-.portal__locale {
-  border: 1px solid var(--line, #dfe3ee);
-  background: transparent;
-  border-radius: 8px;
-  padding: 4px 10px;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  text-transform: uppercase;
-}
-
 .portal__main {
   flex: 1;
   width: min(760px, calc(100vw - 32px));
@@ -107,6 +125,17 @@ function tx(zh: string, en: string, pt: string, hi: string): string {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 14px;
+}
+
+.portal__section {
+  margin: 18px 0 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.agent-card--default {
+  border-color: color-mix(in srgb, #4f7cff 45%, var(--line, #dfe3ee));
+  background: color-mix(in srgb, #4f7cff 6%, var(--panel, #fff));
 }
 
 .agent-card {

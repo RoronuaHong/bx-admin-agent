@@ -281,8 +281,10 @@
 
 **验收**：改 prompt 后能在 CI 里看到红/绿；换模型时能给出"哪个模型在哪些用例上更好"；弱模型短路能被门禁拦下（假绿视为失败）。
 
-**本项目对照**：❌ 缺失（历史实现 `eval-core.mjs` G1–G6 门禁 + `eval-trace-gate.mjs` + eval 用例，备份在 `.data/trash-20260916/code/scripts`）。
-**补齐建议**：有 trace 之后再恢复评测（评测依赖 trace 数据），顺序上排在第 10 章之后。
+**本项目对照**：🟡 部分 — **G1–G7 门禁已落地（2026-09-20）**：`scripts/_movie-grounding-gate.mjs` 对着活服务按 movie 角色跑事实型夹具，覆盖 G1 角色路由（必须路由到 movie 工具、不泄漏非观影类工具）/ G2 期望工具（命中与问题匹配的观影工具）/ G7-A 取数 / G7-B 未触发接地兜底 / G7-C 答案中的年份可溯源到本轮工具返回 / G7-D 轮次不超预算；`tests/grounding-guard.test.ts` 覆盖两道接地护栏的决策矩阵、核验结果解析、多票裁决与角色接线（进程内零网络，11 例）；run 级 trace 新增 `groundingRetries` / `groundingVerifications` / `ungrounded` 三个劣化信号（对应上文「诚实信号」：短路与幻觉直答必须能被单独立项的门禁拦下）。
+配套运行时护栏（被门禁度量，仅对声明 `enforceGrounding` 的角色生效，设计见 `docs/movie-safety-policy.md` §3）：`src/grounding.ts` 的「零证据不得收束」+「事后断言核验（CoV 最小版）」+「多票裁决（可选，降核验器误判）」+「证据来源标注」。
+**G1–G6 旧 harness 未恢复（按「不乱加乱改」主动放弃）**：历史实现 `eval-core.mjs` G1–G6 + `eval-trace-gate.mjs` 是为**分析时代契约**写的，备份在 `.data/trash-20260916/code/scripts`；它依赖的角色/消息/ownerKey 模型与当前瘦身后的 chat-agent/roles/MCP 契约已不一致，原样恢复约 2000 行属大改且易冲突。**其意图已被新门禁 + 代码护栏更便宜地覆盖**：G1/G2（路由/期望工具）已进 G7 门禁；G3（伪调用拦截）由 `chat.ts` 运行时守卫 `looksLikePseudoToolCall` 覆盖；G4（预算/轮次）= G7-D；G5（流程收束）/ G6（短路直答拦截）= G7-A + 代码护栏。
+**补齐建议**：若后续确需「跨模型横评 + 历史基线 + CI 卡点」，应**新建**一套贴合当前契约的轻量评测（复用现有 gate 脚本与 run trace），而非复活旧 harness；评测依赖 trace 数据，顺序上排在第 10 章之后。
 
 ---
 

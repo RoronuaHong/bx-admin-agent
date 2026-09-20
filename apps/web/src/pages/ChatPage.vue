@@ -9,12 +9,14 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
+import { useRouter } from "vue-router";
 import ModelSelect from "../components/ModelSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import { renderChatMarkdown } from "../chat-richtext";
 import { getUiLocale, detectDefaultLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { localizeToken } from "../localize";
+import { AGENTS, agentText, type AgentEntry } from "../agents";
 import { readStoredTheme, useTheme } from "../theme";
 import {
   cancelChatTask,
@@ -48,6 +50,7 @@ import {
   setChatSkills,
   streamChat,
   uploadFiles,
+  MODEL_AUTO_ID,
   type ChatPreferences,
   type ConversationDto,
   type ConvSortMode,
@@ -577,6 +580,8 @@ interface Bubble {
     status: "running" | "done" | "cancelled" | "error";
     text: string;
   }>;
+  /** 扩展思考（thinking 增量拼接，支持思考的模型才有；仅作展示，不回灌模型上下文）。 */
+  thinking?: string;
 }
 
 /**
@@ -649,14 +654,34 @@ const conversations = ref<ConversationDto[]>([]);
  * 同一页面组件服务所有 Agent —— 会话列表 / 新建 / 流式请求都带上 agentId，服务端按角色
  * 选人设与 skill 索引，会话分槽互不串台。角色判断只在后端，前端只透传。
  */
+const router = useRouter();
 const agentProps = defineProps<{ agentId?: string; agentLabel?: string }>();
 const AGENT_ID = agentProps.agentId || "generic";
 const AGENT_LABEL = agentProps.agentLabel || "";
 
-// 移动端侧栏抽屉（指南 §6 阻断项 #2）：≤860px 时侧栏离屏，由汉堡按钮切换；桌面端始终可见，此状态无关。
-const sidebarOpen = ref(false);
+// 标签页标题跟随界面语言（AGENT_LABEL 由多 Agent 路由注入，缺省用通用名）。
+watch(
+  () => (AGENT_LABEL ? `${AGENT_LABEL} · Agent` : tx("小助手", "Assistant", "Assistente", "सहायक")),
+  (title) => {
+    document.title = title;
+  },
+  { immediate: true },
+);
+
+// 侧栏两套状态：移动端是带遮罩的抽屉（sidebarOpen），桌面端是常驻折叠（sidebarCollapsed）。
+// 折叠态关掉后聊天区占满整屏（对齐 ChatGPT/Claude 桌面端「收起侧栏」最佳实践），
+// 由顶栏汉堡按钮切换——即「PC 端左侧对话列表可点击展开 / 收起」。
+const MOBILE_QUERY = "(max-width: 860px)";
+const sidebarOpen = ref(false); // 移动端抽屉开关
+const sidebarCollapsed = ref(false); // 桌面端常驻折叠
+const isMobile = ref(typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches);
+const navExpanded = computed(() => (isMobile.value ? sidebarOpen.value : !sidebarCollapsed.value));
+function updateIsMobile() {
+  isMobile.value = window.matchMedia(MOBILE_QUERY).matches;
+}
 function toggleSidebar() {
-  sidebarOpen.value = !sidebarOpen.value;
+  if (isMobile.value) sidebarOpen.value = !sidebarOpen.value;
+  else sidebarCollapsed.value = !sidebarCollapsed.value;
 }
 function onSidebarEsc(e: KeyboardEvent) {
   if (e.key === "Escape") sidebarOpen.value = false;
@@ -676,10 +701,10 @@ const ctxMenuEl = ref<HTMLElement | null>(null);
 /** 触发菜单的元素（会话项 / ⋯ 按钮）：Esc 关闭后把焦点还回去（WAI-ARIA menu pattern）。 */
 let ctxTriggerEl: HTMLElement | null = null;
 /**
- * 菜单里「不可撤销操作」的二次确认态（空 = 无）：首次点击只进入待确认，再点一次才执行。
- * 这些操作没有撤销入口（清空 = 丢上下文；关闭其它 = 批量删除），菜单关闭即复位。
+ * 菜单里「清空对话」的二次确认态（空 = 无）：首次点击只进入待确认，再点一次才执行；
+ * 「关闭其它对话」改为走 confirmDialog 确认弹窗。菜单关闭即复位。
  */
-const ctxConfirm = ref<"" | "clear" | "closeOthers">("");
+const ctxConfirm = ref<"" | "clear">("");
 /** 正在内联重命名的会话（id 为空 = 无）。 */
 const renaming = ref<{ id: string; value: string }>({ id: "", value: "" });
 const renameInputEl = ref<HTMLInputElement | null>(null);
@@ -689,6 +714,114 @@ const RENAME_MAX = 100;
 const UNDO_DELETE_MS = 5000;
 const undoDelete = ref<{ conv: ConversationDto; index: number; wasCurrent: boolean } | null>(null);
 let undoDeleteTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ---- 删除确认弹窗（选项 A）----
+// 点删除先弹确认框，确定才真正走 removeConversation；撤销条仍保留作为兜底，避免「确认后反悔」无路可退。
+const confirmDialog = ref<{
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger: boolean;
+  onConfirm: () => void;
+} | null>(null);
+const confirmDialogEl = ref<HTMLElement | null>(null);
+const confirmCancelBtn = ref<HTMLElement | null>(null);
+let confirmReturnFocus: HTMLElement | null = null;
+
+function askDeleteConversation(conv: ConversationDto) {
+  confirmReturnFocus = (document.activeElement as HTMLElement) || null;
+  const fallback = tx("新对话", "New chat", "Nova conversa", "नई चैट");
+  const name = conv.title || fallback;
+  confirmDialog.value = {
+    title: tx("删除对话", "Delete chat", "Excluir conversa", "चैट हटाएं"),
+    message: tx(
+      `确定删除「${name}」吗？删除后可通过底部撤销条恢复，但正在进行的对话流会被中断。`,
+      `Delete “${name}”? You can undo from the toast, but the running stream will stop.`,
+      `Excluir “${name}”? Você pode desfazer pelo aviso, mas o fluxo em andamento será interrompido.`,
+      `“${name}” हटाएं? आप टूस्ट से पूर्ववत कर सकते हैं, परंतु चल रही स्ट्रीम रुक जाएगी।`
+    ),
+    confirmLabel: tx("删除", "Delete", "Excluir", "हटाएं"),
+    danger: true,
+    onConfirm: () => removeConversation(conv.id),
+  };
+}
+
+function askDeleteFromCtx() {
+  const id = ctxMenu.value.targetId;
+  const conv = conversations.value.find((c) => c.id === id);
+  closeCtxMenu();
+  if (conv) askDeleteConversation(conv);
+}
+
+function askCloseOthers() {
+  const keepId = ctxMenu.value.targetId;
+  const n = conversations.value.filter((c) => c.id !== keepId && !c.archived).length;
+  closeCtxMenu();
+  // 没有其它会话可关：菜单直接收起，避免弹出「关闭 0 个对话」的怪异确认。
+  if (n === 0) return;
+  confirmReturnFocus = (document.activeElement as HTMLElement) || null;
+  confirmDialog.value = {
+    title: tx("关闭其它对话", "Close other chats", "Fechar outras conversas", "अन्य चैट बंद करें"),
+    message: tx(
+      `确定关闭其它 ${n} 个对话吗？这些对话都会被删除，且无法撤销。`,
+      `Close ${n} other chat${n === 1 ? "" : "s"}? They will all be deleted and cannot be undone.`,
+      `Fechar ${n} outra${n === 1 ? "" : "s"} conversa${n === 1 ? "" : "s"}? Todas serão excluídas e não podem ser desfeitas.`,
+      `क्या ${n} अन्य चैट बंद करें? वे सभी हटा दी जाएंगी और पूर्ववत नहीं की जा सकतीं।`
+    ),
+    confirmLabel: tx("关闭", "Close", "Fechar", "बंद करें"),
+    danger: true,
+    onConfirm: () => closeOtherConversations(keepId),
+  };
+}
+
+function closeConfirm() {
+  confirmDialog.value = null;
+  // 焦点还给触发元素（取消时按钮还在；确认删除后按钮已被移除则跳过）。
+  if (confirmReturnFocus && document.body.contains(confirmReturnFocus)) {
+    confirmReturnFocus.focus();
+  }
+  confirmReturnFocus = null;
+}
+
+function confirmDialogConfirm() {
+  const fn = confirmDialog.value?.onConfirm;
+  closeConfirm();
+  fn?.();
+}
+
+function trapConfirmFocus(e: KeyboardEvent) {
+  const dlg = confirmDialogEl.value;
+  if (!dlg || e.key !== "Tab") return;
+  const focusable = dlg.querySelectorAll<HTMLElement>("button:not([disabled])");
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// 打开时锁背景滚动；关闭时恢复。焦点移到「取消」按钮（安全默认项，回车不会误删）。
+watch(
+  confirmDialog,
+  (val) => {
+    if (val) {
+      document.body.style.overflow = "hidden";
+      nextTick(() => confirmCancelBtn.value?.focus());
+    } else {
+      document.body.style.overflow = "";
+    }
+  },
+  { flush: "post" }
+);
+
+onBeforeUnmount(() => {
+  if (confirmDialog.value) document.body.style.overflow = "";
+});
 
 /**
  * 会话列表排序模式（设备级偏好，后端持久化）：
@@ -817,13 +950,32 @@ const current = computed<ConvState>(() => (currentId.value ? states.get(currentI
 /** 输入内容变化（含切换对话）时让输入框自动长高。必须放在 current 声明之后，避免 setup 期 TDZ。 */
 watch(() => current.value.input, () => autoGrow());
 
-/** 当前对话的模型选择；空 = 服务端默认，UI 兜底展示列表首个（与旧行为一致）。 */
+/** 当前对话的模型选择；空 = 自动模式（运行时挑可用模型），UI 兜底展示「自动」。 */
 const modelId = computed({
-  get: () => current.value.settings.modelId || models.value[0]?.id || "",
+  get: () => current.value.settings.modelId || MODEL_AUTO_ID,
   set: (value: string) => {
     void saveModelChoice(value);
   },
 });
+
+/**
+ * 「自动」模式解析：把 auto（或空/失效值）落到具体模型。
+ * 优先用「上次成功用过的模型」，否则按列表顺序挑第一个「近期未失败」的——
+ * 实现「哪个能用用哪个」：失败过的模型会被跳过，直到全部失败才重置黑名单重新探测。
+ */
+const lastGoodModelId = ref<string>("");
+const failedModelIds = ref<Set<string>>(new Set());
+function resolveModel(value: string): string {
+  const ids = models.value.map((m) => m.id);
+  const usable = (id: string | undefined) => !!id && ids.includes(id) && !failedModelIds.value.has(id);
+  if (value && value !== MODEL_AUTO_ID && usable(value)) return value;
+  if (usable(lastGoodModelId.value)) return lastGoodModelId.value;
+  const next = ids.find((id) => !failedModelIds.value.has(id));
+  if (next) return next;
+  // 全部失败过：清空黑名单，给一次重新探测的机会。
+  failedModelIds.value.clear();
+  return ids[0] ?? "";
+}
 
 let settingsErrorTimer: ReturnType<typeof setTimeout> | null = null;
 /** 乐观更新失败后的提示；4s 自动消失，不打扰。 */
@@ -888,9 +1040,12 @@ async function onLocaleChange(locale: UiLocale) {
   }
 }
 
+/** 实际生效的模型（auto 已解析为具体模型），用于图片能力等预判。 */
+const resolvedModelId = computed(() => resolveModel(modelId.value));
+
 /** 当前模型是否支持直读图片（由服务端 /models 的 vision 字段给出）。 */
 const modelSupportsImages = computed(
-  () => models.value.find((m) => m.id === modelId.value)?.vision === "direct",
+  () => models.value.find((m) => m.id === resolvedModelId.value)?.vision === "direct",
 );
 /** 已选图片但当前模型不支持：明确提示，避免"传了但模型看不到"的静默失效。 */
 const imagesUnsupported = computed(
@@ -943,10 +1098,52 @@ function hasRunningStep(b: Bubble): boolean {
   return !!b.steps?.some((s) => s.status === "running");
 }
 
+/**
+ * 是否真的有思考内容。流式片段常常只推来空白（换行/空格），
+ * 直接判 `b.thinking` 会把「空白的推理面板」渲染出来，所以统一按去空白后判断。
+ */
+function hasThinking(b: Bubble): boolean {
+  return !!b.thinking && b.thinking.trim().length > 0;
+}
+
+// 意图识别：取思考流首行作为「理解意图」展示（对齐 ReAct 规划首步）。
+// 优先识别显式「意图：/Intent:」前缀；模型未用前缀时，兜底取首句（需是简短自然句，
+// 避免把代码块/列表行误判为意图）。这样任何 reasoning 模型都能稳定出意图卡，不依赖严格格式。
+const INTENT_RE = /^(意图|Intent)\s*[:：]\s*(.+)$/i;
+// 标题/列表/代码/大括号/尖括号首行，或括号内的编号行（如「(1) 步骤」），不算意图。
+const FILLER_RE = /^[#\-*`{<>]|^\(\d+[.、]\s/;
+
+function intentOf(b: Bubble): string | undefined {
+  const t = b.thinking;
+  if (!t) return undefined;
+  const firstLine = t.split("\n", 1)[0].trim();
+  if (!firstLine) return undefined;
+  const m = firstLine.match(INTENT_RE);
+  if (m) return m[2].trim();
+  if (firstLine.length <= 120 && !FILLER_RE.test(firstLine)) return firstLine;
+  return undefined;
+}
+
+// 去掉首行意图（作为意图卡展示）后的思考流，避免重复；无意图时不剥离。
+function thinkingDisplay(b: Bubble): string {
+  if (!intentOf(b)) return b.thinking || "";
+  const t = b.thinking || "";
+  const nl = t.indexOf("\n");
+  return nl >= 0 ? t.slice(nl + 1).replace(/^\s*\n/, "") : "";
+}
+
 function reasoningTitle(b: Bubble): string {
   const n = b.steps?.length || 0;
   const sn = b.subagents?.length || 0;
-  // 静默规划期（流式但还没有任何步骤/子代理）：显式标「正在规划」，而非空白或通用「推理」。
+  // 思考期（流式、已收到 thinking 但还没具体步骤）：有意图识别则标「理解意图」，否则「思考中」。
+  if (b.streaming && hasThinking(b) && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
+    return intentOf(b)
+      ? tx("理解意图…", "Understanding intent…", "Entendendo a intenção…", "इरादा समझ रहा है…")
+      : tx("思考中…", "Thinking…", "Pensando…", "सोच रहा है…");
+  // 已在出正文但尚无步骤/子代理（模型未显式规划，直接作答）：标「回答中」，避免还挂着「正在规划」像卡死。
+  if (b.streaming && b.text && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
+    return tx("回答中…", "Answering…", "Respondendo…", "उत्तर दे रहा है…");
+  // 静默规划期（流式但还没有任何步骤/子代理，也没有思考流、也没出正文）：显式标「正在规划」。
   if (b.streaming && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
     return tx("正在规划…", "Planning…", "Planejando…", "योजना बना रहा है…");
   if (b.streaming && hasRunningStep(b)) return tx("推理中…", "Reasoning…", "Pensando…", "तर्क कर रहा है…");
@@ -962,7 +1159,15 @@ function reasoningTitle(b: Bubble): string {
 function toStored(list: Bubble[]): StoredMessage[] {
   return list
     .filter((b) => b.text || b.images?.length)
-    .map((b) => ({ role: b.role, text: b.text, images: b.images }));
+    .map((b) => ({
+      role: b.role,
+      text: b.text,
+      images: b.images,
+      // 推理面板相关字段一并落库：刷新后从后端快照恢复，思考过程 / 工具步骤 / 任务规划不丢。
+      ...(b.thinking ? { thinking: b.thinking } : {}),
+      ...(b.steps?.length ? { steps: b.steps } : {}),
+      ...(b.todos?.length ? { todos: b.todos } : {}),
+    }));
 }
 
 /**
@@ -1002,6 +1207,10 @@ function selectConversation(conv: ConversationDto) {
       role: m.role,
       text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
       images: m.images,
+      // 推理面板相关字段恢复（与 toStored 对称）：思考过程 / 工具步骤 / 任务规划。
+      ...(m.thinking ? { thinking: m.thinking } : {}),
+      ...(Array.isArray(m.steps) && m.steps.length ? { steps: m.steps as ToolStep[] } : {}),
+      ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
     }));
   }
   // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
@@ -1334,7 +1543,7 @@ function closeCtxMenu(restoreFocus = false) {
 }
 
 /** 首次点击「不可撤销」菜单项：进入待确认态并把焦点带到确认项（菜单保持打开，菜单项被替换后焦点会掉到 body）。 */
-async function armCtxConfirm(kind: "clear" | "closeOthers") {
+async function armCtxConfirm(kind: "clear") {
   ctxConfirm.value = kind;
   await nextTick();
   ctxMenuEl.value?.querySelector<HTMLElement>("[data-ctx-confirm]")?.focus();
@@ -1778,7 +1987,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
   openReasoning.add(reply.id);
   state.sending = true;
   state.error = "";
-  const chosenModel = state.settings.modelId || models.value[0]?.id || "";
+  const chosenModel = resolveModel(state.settings.modelId);
   state.activeModelLabel = models.value.find((m) => m.id === chosenModel)?.label || "";
   // 中断句柄存进「该对话自己的」状态：切到别的对话后按停止不会误伤这一条。
   const controller = new AbortController();
@@ -1798,6 +2007,11 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           queueScrollIfCurrent(convId);
         } else if (event.type === "text") {
           reply.text = event.text;
+        } else if (event.type === "thinking_delta") {
+          // 扩展思考增量：拼接进 reasoning 面板，实时展示模型规划过程，取代「正在规划」占位。
+          reply.thinking = (reply.thinking || "") + event.text;
+          openReasoning.add(reply.id);
+          queueScrollIfCurrent(convId);
         } else if (event.type === "model") {
           state.activeModelLabel = event.label;
         } else if (event.type === "tool_call") {
@@ -1885,6 +2099,8 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           reply.text = dedupeRepeats(reply.text);
           reply.streaming = false;
           openReasoning.delete(reply.id);
+          // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
+          if (!reply.error) lastGoodModelId.value = chosenModel;
         }
       },
       controller.signal,
@@ -1922,6 +2138,10 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
   } finally {
     state.sending = false;
     state.controller = null;
+    // auto 模式：本轮失败则把该模型记入黑名单（下次解析跳过），成功则清除其失败标记。
+    // 仅「真正出错」计入——用户主动停止 / 对话繁忙 / 后台继续 都不算模型不可用。
+    if (reply.error) failedModelIds.value.add(chosenModel);
+    else failedModelIds.value.delete(chosenModel);
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
     await persist(convId, state.bubbles);
     queueScrollIfCurrent(convId);
@@ -2133,6 +2353,7 @@ async function loadMcp(convId = currentId.value) {
 function toggleMcpPanel() {
   mcpOpen.value = !mcpOpen.value;
   skillOpen.value = false;
+  expertOpen.value = false;
   if (mcpOpen.value) void loadMcp();
 }
 
@@ -2245,6 +2466,7 @@ async function loadSkills(convId = currentId.value) {
 function toggleSkillPanel() {
   skillOpen.value = !skillOpen.value;
   mcpOpen.value = false;
+  expertOpen.value = false;
   if (skillOpen.value) void loadSkills();
 }
 
@@ -2327,6 +2549,7 @@ function toggleToolsMenu() {
   } else {
     skillOpen.value = false;
     mcpOpen.value = false;
+    expertOpen.value = false;
   }
 }
 
@@ -2339,19 +2562,53 @@ function mcpDescText(s: McpServerStatus): string {
   return parts.join(" · ");
 }
 
-function hoverFlyout(which: "skills" | "mcp") {
+const expertOpen = ref(false);
+// 专家菜单只列「有专门角色」的 Agent：观影助手属独立项目（/movie）不在此列，
+// 通用助手是默认形态也不算专家；其余专家（如客服）在此列出。
+const expertAgents: AgentEntry[] = AGENTS.filter((a) => a.id !== "movie" && a.id !== "generic");
+// 当前选中的专家（无 = 通用，对齐 CodeBuddy：chip 存在即已选专家，无 chip 即通用）。
+const currentExpert = computed(() => expertAgents.find((a) => a.id === AGENT_ID));
+
+function toggleExpertPanel() {
+  expertOpen.value = !expertOpen.value;
+  skillOpen.value = false;
+  mcpOpen.value = false;
+}
+
+// 收起所有工具面板（专家/技能/连接器/主菜单），切换专家或取消选中前调用。
+function closeToolsPanels() {
+  toolsMenuOpen.value = false;
+  expertOpen.value = false;
+  skillOpen.value = false;
+  mcpOpen.value = false;
+}
+
+function onPickExpert(agent: AgentEntry) {
+  closeToolsPanels();
+  router.push(agent.path);
+}
+
+// chip 上的 ×：取消选中专家，回到 /chat（generic）。
+function onClearExpert() {
+  closeToolsPanels();
+  router.push("/chat");
+}
+
+function hoverFlyout(which: "skills" | "mcp" | "expert") {
   if (!toolsMenuOpen.value) return;
   if (which === "skills" && !skillOpen.value) toggleSkillPanel();
   if (which === "mcp" && !mcpOpen.value) toggleMcpPanel();
+  if (which === "expert" && !expertOpen.value) toggleExpertPanel();
 }
 
 /** Esc 收起工具菜单/飞出面板（键盘可达，不拦截输入框内容）。 */
 function onEscTools(event: KeyboardEvent) {
   if (event.key !== "Escape") return;
-  if (!toolsMenuOpen.value && !mcpOpen.value && !skillOpen.value) return;
+  if (!toolsMenuOpen.value && !mcpOpen.value && !skillOpen.value && !expertOpen.value) return;
   toolsMenuOpen.value = false;
   mcpOpen.value = false;
   skillOpen.value = false;
+  expertOpen.value = false;
 }
 
 function onOutsideTools(event: MouseEvent) {
@@ -2359,6 +2616,7 @@ function onOutsideTools(event: MouseEvent) {
     toolsMenuOpen.value = false;
     mcpOpen.value = false;
     skillOpen.value = false;
+    expertOpen.value = false;
   }
 }
 
@@ -2624,10 +2882,8 @@ async function migrateLocalPrefs(prefs: ChatPreferences) {
 onMounted(async () => {
   // 移动端抽屉：Esc 关闭（桌面端无抽屉、此监听无害）。
   window.addEventListener("keydown", onSidebarEsc);
-  // 多 Agent 页面：标题带上角色名，用户能分辨自己在哪个 Agent 里。
-  if (AGENT_LABEL) document.title = `${AGENT_LABEL} · Agent`;
   models.value = await fetchModels().catch(() => []);
-  // 不在这里写 modelId：它已按对话派生（空 = 服务端默认，UI 兜底列表首个），
+  // 不在这里写 modelId：它已按对话派生（空 = 自动模式，UI 兜底展示「自动」），
   // 赋值会触发一次无意义的 PATCH。
   // 不在这里 loadMcp()：此刻还没选中对话，请求会回退到服务端的 activeConversationId（可能是别的对话）。
   // 交给下面的 selectConversation / newConversation 按对话加载。
@@ -2648,6 +2904,7 @@ onMounted(async () => {
   window.addEventListener("resize", syncTaskMcpPos);
   // 窗口缩放改变输入框换行宽度，高度需重算。
   window.addEventListener("resize", onWindowResizeGrow);
+  window.addEventListener("resize", updateIsMobile);
 
   // 设备态偏好（主题 / 默认语言 / 上次打开的对话）以后端为唯一真相；顺带跑一次性迁移。
   const prefs = await fetchChatPreferences().catch(() => null);
@@ -2684,6 +2941,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("scroll", syncTaskMcpPos, true);
   window.removeEventListener("resize", syncTaskMcpPos);
   window.removeEventListener("resize", onWindowResizeGrow);
+  window.removeEventListener("resize", updateIsMobile);
   // 离开页面时把还没到点的删除落实，避免撤销窗口内的删除被永久搁置。
   flushPendingDelete();
 });
@@ -2691,10 +2949,23 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chat" @click="closeCtxMenu()">
-    <aside class="sidebar" :class="{ open: sidebarOpen }" aria-label="会话列表">
+    <aside class="sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }" :aria-label="tx('会话列表', 'Conversations', 'Conversas', 'चैट सूची')">
       <div class="brand">
         <span class="brand__name">{{ AGENT_LABEL || tx("小助手", "Assistant", "Assistente", "सहायक") }}</span>
         <RouterLink to="/" class="brand__home" :title="tx('返回门户', 'Back to portal', 'Voltar ao portal', 'पोर्टल पर वापस')">⌂</RouterLink>
+        <button
+          v-if="!isMobile"
+          type="button"
+          class="brand__collapse"
+          :aria-label="tx('收起会话列表', 'Collapse conversations', 'Recolher conversas', 'सूची समेटें')"
+          :title="tx('收起会话列表', 'Collapse conversations', 'Recolher conversas', 'सूची समेटें')"
+          @click="toggleSidebar()"
+        >
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <line x1="9" y1="4" x2="9" y2="20" />
+          </svg>
+        </button>
       </div>
       <nav class="nav" :aria-label="tx('主导航', 'Primary', 'Navegação principal', 'मुख्य नेविगेशन')">
         <button
@@ -2791,7 +3062,7 @@ onBeforeUnmount(() => {
                 class="conv-del"
                 type="button"
                 :title="tx('删除对话', 'Delete chat', 'Excluir conversa', 'चैट हटाएं')"
-                @click.stop="removeConversation(conv.id)"
+                @click.stop="askDeleteConversation(conv)"
               >
                 ×
               </button>
@@ -2905,7 +3176,7 @@ onBeforeUnmount(() => {
           {{ tx("恢复自动排序", "Sort by recent", "Ordenar por recentes", "हाल के अनुसार क्रम") }}
         </button>
         <div class="ctx-sep" role="separator"></div>
-        <!-- 清空上下文 / 批量删除都没有撤销入口：首点进入待确认，再点才执行。 -->
+        <!-- 清空对话无撤销入口：首点进入待确认，再点才执行；关闭其它对话走下方确认弹窗。 -->
         <button
           v-if="ctxConfirm !== 'clear'"
           type="button"
@@ -2926,23 +3197,12 @@ onBeforeUnmount(() => {
           {{ tx("确认清空（不可恢复）", "Confirm clear (can't be undone)", "Confirmar limpeza (irreversível)", "खाली करने की पुष्टि (अपरिवर्तनीय)") }}
         </button>
         <button
-          v-if="ctxConfirm !== 'closeOthers'"
-          type="button"
-          class="ctx-item"
-          role="menuitem"
-          @click="armCtxConfirm('closeOthers')"
-        >
-          {{ tx("关闭其它对话", "Close other chats", "Fechar outras conversas", "अन्य चैट बंद करें") }}
-        </button>
-        <button
-          v-else
-          data-ctx-confirm
           type="button"
           class="ctx-item danger"
           role="menuitem"
-          @click="closeOtherConversations(ctxMenu.targetId)"
+          @click="askCloseOthers()"
         >
-          {{ tx("确认关闭其它对话", "Confirm closing other chats", "Confirmar fechar outras conversas", "अन्य चैट बंद करने की पुष्टि") }}
+          {{ tx("关闭其它对话", "Close other chats", "Fechar outras conversas", "अन्य चैट बंद करें") }}
         </button>
         <button type="button" class="ctx-item" role="menuitem" @click="toggleArchive(ctxMenu.targetId)">
           {{ ctxTarget?.archived ? tx("取消归档", "Unarchive", "Desarquivar", "अनआर्काइव करें") : tx("归档", "Archive", "Arquivar", "आर्काइव करें") }}
@@ -2964,17 +3224,8 @@ onBeforeUnmount(() => {
           {{ tx("导出 JSON", "Export JSON", "Exportar JSON", "JSON निर्यात") }}
         </button>
         <div class="ctx-sep" role="separator"></div>
-        <button type="button" class="ctx-item danger" role="menuitem" @click="removeConversation(ctxMenu.targetId)">
+        <button type="button" class="ctx-item danger" role="menuitem" @click="askDeleteFromCtx()">
           {{ tx("删除对话", "Delete chat", "Excluir conversa", "चैट हटाएं") }}
-        </button>
-      </div>
-    </Teleport>
-
-    <Teleport to="body">
-      <div v-if="undoDelete" class="undo-toast" role="status" aria-live="polite">
-        <span class="undo-toast__text">{{ tx("已删除对话", "Chat deleted", "Conversa excluída", "चैट हटा दी गई") }}</span>
-        <button type="button" class="undo-toast__undo" @click="undoRemoveConversation">
-          {{ tx("撤销", "Undo", "Desfazer", "पूर्ववत करें") }}
         </button>
       </div>
     </Teleport>
@@ -2996,6 +3247,53 @@ onBeforeUnmount(() => {
         >
           ×
         </button>
+      </div>
+    </Teleport>
+
+    <!-- 删除确认弹窗：点删除先弹这里，确定才真正删除（撤销条仍兜底）。 -->
+    <Teleport to="body">
+      <div v-if="confirmDialog" class="modal-mask" @click.self="closeConfirm">
+        <div
+          ref="confirmDialogEl"
+          class="modal modal--confirm"
+          role="alertdialog"
+          aria-modal="true"
+          :aria-label="confirmDialog.title"
+          tabindex="-1"
+          @keydown.esc.stop="closeConfirm"
+          @keydown.tab="trapConfirmFocus"
+        >
+          <div class="modal__body confirm-body">
+            <span
+              class="confirm-icon"
+              :class="{ 'confirm-icon--danger': confirmDialog.danger }"
+              aria-hidden="true"
+            >
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 9v4" />
+                <path d="M12 17h.01" />
+                <path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+              </svg>
+            </span>
+            <div class="confirm-text">
+              <div class="confirm-title">{{ confirmDialog.title }}</div>
+              <p class="confirm-message">{{ confirmDialog.message }}</p>
+            </div>
+          </div>
+          <div class="modal__foot">
+            <button type="button" class="ghost-btn" ref="confirmCancelBtn" @click="closeConfirm">
+              {{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}
+            </button>
+            <button
+              type="button"
+              class="ghost-btn"
+              :class="{ 'ghost-btn-danger': confirmDialog.danger }"
+              @click="confirmDialogConfirm"
+            >
+              {{ confirmDialog.confirmLabel }}
+            </button>
+          </div>
+        </div>
       </div>
     </Teleport>
 
@@ -3228,15 +3526,15 @@ onBeforeUnmount(() => {
     <main class="main">
       <header class="top">
         <button
+          v-show="!navExpanded"
           type="button"
           class="hamburger"
-          :aria-expanded="sidebarOpen"
+          :aria-expanded="navExpanded"
           :aria-label="tx('打开会话列表', 'Open conversations', 'Abrir conversas', 'चैट खोलें')"
           @click="toggleSidebar()"
         >
           <span class="hamburger__bar" aria-hidden="true"></span>
         </button>
-        <div class="brand">{{ tx("对话", "Chat", "Conversa", "चैट") }}</div>
         <div class="top-actions">
           <span
             v-if="current.activeModelLabel && current.activeModelLabel !== selectedModelLabel"
@@ -3310,31 +3608,51 @@ onBeforeUnmount(() => {
           <UiLocaleSelect @change="onLocaleChange" />
           <ThemeToggle />
         </div>
+
+        <!-- 删除撤销条：挂在头部内做绝对定位，left:50% 才是「对话区中心」而非「视口中心」。
+             之前 Teleport 到 body + position:fixed，桌面端会偏左半个侧栏宽（256/2=128px），
+             并且 top:20px 正好压住模型/语言选择器。 -->
+        <div v-if="undoDelete" class="undo-toast" role="status" aria-live="polite">
+          <span class="undo-toast__text">{{ tx("已删除对话", "Chat deleted", "Conversa excluída", "चैट हटा दी गई") }}</span>
+          <button type="button" class="undo-toast__undo" @click="undoRemoveConversation">
+            {{ tx("撤销", "Undo", "Desfazer", "पूर्ववत करें") }}
+          </button>
+        </div>
       </header>
 
       <div v-if="settingsError" class="warn-line header-warn" role="status">{{ settingsError }}</div>
 
       <div ref="threadEl" class="thread">
         <div v-if="!current.bubbles.length" class="empty">
-          {{ tx("随便问点什么吧。", "Ask anything to get started.", "Pergunte qualquer coisa para começar.", "शुरू करने के लिए कुछ भी पूछें।") }}
+          {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
         </div>
         <div v-for="b in current.bubbles" :key="b.id" class="row" :class="b.role">
           <div class="bubble-wrap">
           <div class="bubble">
             <div
-              v-if="b.todos?.length || b.steps?.length || b.subagents?.length || (b.streaming && !b.text)"
+              v-if="b.todos?.length || b.steps?.length || b.subagents?.length || hasThinking(b) || (b.streaming && !b.text)"
               class="reasoning"
               :class="{ open: openReasoning.has(b.id) }"
             >
               <button class="reasoning__head" type="button" @click="toggleReasoning(b.id)">
-                <span class="reasoning__caret" aria-hidden="true"></span>
+                <span class="reasoning__icon" aria-hidden="true"><span class="reasoning__caret"></span></span>
                 <span class="reasoning__title">{{ reasoningTitle(b) }}</span>
                 <span v-if="b.streaming && hasRunningStep(b)" class="reasoning__spinner" aria-hidden="true"></span>
               </button>
               <div v-show="openReasoning.has(b.id)" class="reasoning__body">
-                <!-- 规划/思考阶段：尚无具体步骤，先给一个「正在规划」状态，避免静默加载像卡死。 -->
+                <!-- 意图识别卡：模型首行「意图：…」结构化高亮，区别于后续裸思考流（对齐 ReAct 规划首步）。 -->
+                <div v-if="intentOf(b)" class="intent-card">
+                  <span class="intent-card__label">{{ tx("理解意图", "Intent", "Intenção", "इरादा") }}</span>
+                  <span class="intent-card__text">{{ intentOf(b) }}</span>
+                </div>
+                <!-- 扩展思考流：实时展示模型规划过程，取代静默的「正在规划」占位（已剥离首行意图标记）。 -->
+                <div v-if="thinkingDisplay(b)" class="reasoning__thinking-wrap">
+                  <pre class="reasoning__thinking">{{ thinkingDisplay(b) }}</pre>
+                </div>
+                <!-- 规划阶段但尚无思考流（模型不支持 thinking）：给一个「正在规划」状态，避免静默加载像卡死；
+                     一旦正文开始流式（b.text 已非空）即隐藏，转为「回答中」，不再误导地停在规划态。 -->
                 <div
-                  v-if="b.streaming && !b.steps?.length && !b.todos?.length && !b.subagents?.length"
+                  v-else-if="b.streaming && !b.text && !hasThinking(b) && !b.steps?.length && !b.todos?.length && !b.subagents?.length"
                   class="reasoning__planning"
                 >
                   <span class="reasoning__planning-dot" aria-hidden="true"></span>
@@ -3432,12 +3750,9 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="b.role === 'user'" class="plain">{{ b.text }}</div>
             <template v-else>
-              <div v-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b))"></div>
-              <!-- 流式正文尾部闪烁光标：传达「还有更多」，与 MoviePage 同一套语义。 -->
-              <span v-if="b.streaming && b.text" class="gen-cursor" aria-hidden="true"></span>
-              <div v-else-if="!b.error && b.streaming" class="typing">
-                <span></span><span></span><span></span>
-              </div>
+              <!-- 流式 loading 态完全交给推理面板（正在规划/思考中/步骤/子代理），
+                   答案气泡在出正文前保持空，避免与推理面板重复出现「思考中」指示。 -->
+              <div v-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b), uiLocale)"></div>
             </template>
             <div v-if="isStoppedBubble(b)" class="stopped-tag">
               <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true">
@@ -3565,8 +3880,8 @@ onBeforeUnmount(() => {
                 <button
                   type="button"
                   class="icon-btn"
-                  :class="{ on: toolsMenuOpen || mcpOpen || skillOpen }"
-                  :aria-expanded="toolsMenuOpen || mcpOpen || skillOpen"
+                  :class="{ on: toolsMenuOpen || mcpOpen || skillOpen || expertOpen }"
+                  :aria-expanded="toolsMenuOpen || mcpOpen || skillOpen || expertOpen"
                   aria-haspopup="menu"
                   :title="tx('工具', 'Tools', 'Ferramentas', 'टूल')"
                   :aria-label="tx('工具', 'Tools', 'Ferramentas', 'टूल')"
@@ -3585,6 +3900,20 @@ onBeforeUnmount(() => {
                   >
                     <path d="M12 5v14M5 12h14" />
                   </svg>
+                </button>
+
+                <!-- 已选专家 chip（对齐 CodeBuddy）：选中专家后显示在 + 旁，点 × 取消选中回通用；无 chip = 通用。 -->
+                <button
+                  v-if="currentExpert"
+                  type="button"
+                  class="expert-chip"
+                  :title="tx('取消选中专家，回到通用助手', 'Deselect expert, back to general assistant', 'Desmarcar especialista, voltar ao assistente geral', 'विशेषज्ञ चयन रद्द करें, सामान्य सहायक पर वापस')"
+                  @click="onClearExpert"
+                >
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                  <span>{{ agentText(currentExpert.label, uiLocale) }}</span>
                 </button>
 
                 <div v-if="toolsMenuOpen" class="tools-menu" role="menu">
@@ -3613,7 +3942,7 @@ onBeforeUnmount(() => {
                       <path d="M12 3l2.2 5.4L20 10l-4.4 3.6L16.8 20 12 17l-4.8 3 1.2-6.4L4 10l5.8-1.6z" />
                     </svg>
                     <span>{{ tx("技能", "Skills", "Habilidades", "स्किल") }}</span>
-                    <span v-if="current.settings.skillsEnabled.length" class="mcp-count">{{ current.settings.skillsEnabled.length }}</span>
+                    <span v-if="current.settings.skillsEnabled.length" class="tools-badge">{{ current.settings.skillsEnabled.length }}</span>
                     <span class="tools-menu__chev">›</span>
                   </button>
                   <button
@@ -3628,7 +3957,23 @@ onBeforeUnmount(() => {
                       <path d="M9 6a3 3 0 1 1 6 0v1h2.5A1.5 1.5 0 0 1 19 8.5v3a3 3 0 0 1-3 3h-1v1a3 3 0 0 1-6 0v-1H7a3 3 0 0 1-3-3v-3A1.5 1.5 0 0 1 5.5 7H9z" />
                     </svg>
                     <span>{{ tx("连接器", "Connectors", "Conectores", "कनेक्टर") }}</span>
-                    <span v-if="current.settings.mcpEnabled.length" class="mcp-count">{{ current.settings.mcpEnabled.length }}</span>
+                    <span v-if="current.settings.mcpEnabled.length" class="tools-badge">{{ current.settings.mcpEnabled.length }}</span>
+                    <span class="tools-menu__chev">›</span>
+                  </button>
+                  <button
+                    class="tools-menu__row"
+                    type="button"
+                    role="menuitem"
+                    :aria-expanded="expertOpen"
+                    @click="toggleExpertPanel"
+                    @mouseenter="hoverFlyout('expert')"
+                  >
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="8" r="3.4" />
+                      <path d="M5.5 20a6.5 6.5 0 0 1 13 0" />
+                    </svg>
+                    <span>{{ tx("专家", "Expert", "Especialista", "विशेषज्ञ") }}</span>
+                    <span v-if="currentExpert" class="tools-badge">1</span>
                     <span class="tools-menu__chev">›</span>
                   </button>
                 </div>
@@ -3781,6 +4126,40 @@ onBeforeUnmount(() => {
                   </div>
                   <div v-if="mcpError" class="mcp-error">{{ mcpError }}</div>
                 </div>
+
+                <div v-if="expertOpen" class="tools-flyout" role="dialog" :aria-label="tx('专家', 'Expert', 'Especialista', 'विशेषज्ञ')">
+                  <div class="tools-list">
+                    <button
+                      v-for="a in expertAgents"
+                      :key="a.id"
+                      type="button"
+                      class="tools-item"
+                      :class="{ on: a.id === AGENT_ID }"
+                      @click="onPickExpert(a)"
+                    >
+                      <span class="tools-item__icon" :style="iconStyle(a.id)" aria-hidden="true">{{ a.icon }}</span>
+                      <span class="tools-item__body">
+                        <span class="tools-item__name">{{ agentText(a.label, uiLocale) }}</span>
+                        <span class="tools-item__desc" :title="agentText(a.description, uiLocale)">{{ agentText(a.description, uiLocale) }}</span>
+                      </span>
+                      <svg v-if="a.id === AGENT_ID" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="m5 12.5 4.5 4.5L19 7.5" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div class="tools-flyout__foot">
+                    <p class="skill-hint">
+                      {{
+                        tx(
+                          "切换专家会跳转到对应角色页面，会话按角色隔离。",
+                          "Switching expert jumps to that role's page; conversations are isolated per role.",
+                          "Trocar especialista vai para a página daquele papel; conversas isoladas por papel.",
+                          "विशेषज्ञ बदलने से उस भूमिका के पृष्ठ पर जाता है; वार्तालाप भूमिका के अनुसार अलग रहते हैं।",
+                        )
+                      }}
+                    </p>
+                  </div>
+                </div>
               </div>
               <span class="composer-hint">{{ tx("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for a new line", "Enter envia · Shift+Enter nova linha", "भेजने के लिए Enter · नई पंक्ति के लिए Shift+Enter") }}</span>
               <button
@@ -3850,6 +4229,10 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+  /* 桌面端折叠时平滑收起（移动端媒体查询会改用 transform 过渡）。 */
+  transition:
+    flex-basis 0.2s ease,
+    width 0.2s ease;
 }
 
 .brand {
@@ -3877,6 +4260,34 @@ onBeforeUnmount(() => {
 .brand__home:hover,
 .brand__home:focus-visible {
   color: var(--ink);
+}
+
+/* 侧栏收起按钮（仅桌面端渲染）：放侧栏头部右侧，收起后由顶栏汉堡负责展开。 */
+.brand__collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.brand__collapse:hover {
+  color: var(--ink);
+  background: var(--fill-soft);
+}
+
+.brand__collapse:focus-visible {
+  box-shadow: var(--ring);
 }
 
 /* 主导航：分段控件，对话 / 定时任务 切换，为接入预留入口 */
@@ -4304,6 +4715,51 @@ onBeforeUnmount(() => {
   gap: 8px;
   padding: 14px 18px;
   border-top: 1px solid var(--line);
+}
+
+/* 删除确认弹窗：antd / Vben 风格——左侧危险图标 + 文本块，底部右对齐双按钮。 */
+.modal--confirm {
+  max-width: 420px;
+}
+
+.confirm-body {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.confirm-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  margin-top: 2px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.confirm-icon--danger {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+}
+
+.confirm-text {
+  min-width: 0;
+}
+
+.confirm-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.confirm-message {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .field {
@@ -4945,7 +5401,7 @@ onBeforeUnmount(() => {
   background: var(--panel, #fff);
   box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
   font-size: 12px;
-  animation: undo-toast-in 0.22s var(--ease, ease);
+  animation: done-toast-in 0.22s var(--ease, ease);
 }
 
 .done-toast__text {
@@ -5118,16 +5574,19 @@ onBeforeUnmount(() => {
   background: var(--line);
 }
 
-/* 删除撤销条：Teleport 到 body，scoped 样式不生效，用 :global 命中。 */
-:global(.undo-toast) {
-  position: fixed;
+/* 删除撤销条：挂在 .top 内做绝对定位，不再是 body 上的 fixed 元素，scoped 直接命中。
+   left:50% 以头部（= 对话区整宽）为参照，是「对话区居中」而非「视口居中」；
+   top:calc(100% + 12px) 恒等于头部下方，不必硬编码头部高度（窄屏头部 padding 会变）。 */
+.undo-toast {
+  position: absolute;
   left: 50%;
-  top: 20px;
+  top: calc(100% + 12px);
   transform: translateX(-50%);
-  z-index: 1100;
+  z-index: 70;
   display: flex;
   align-items: center;
   gap: 14px;
+  max-width: min(92%, 420px);
   padding: 10px 14px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -5138,7 +5597,7 @@ onBeforeUnmount(() => {
   animation: undo-toast-in 0.22s var(--ease, ease);
 }
 
-:global(.undo-toast__undo) {
+.undo-toast__undo {
   appearance: none;
   border: none;
   background: transparent;
@@ -5150,10 +5609,17 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   cursor: pointer;
   text-decoration: underline;
+  /* 文案换行时按钮不跟着被压扁。 */
+  flex: none;
 }
 
-:global(.undo-toast__undo:hover),
-:global(.undo-toast__undo:focus-visible) {
+.undo-toast__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.undo-toast__undo:hover,
+.undo-toast__undo:focus-visible {
   background: var(--fill-soft);
 }
 
@@ -5207,6 +5673,8 @@ onBeforeUnmount(() => {
   gap: 12px;
   padding: 12px 18px;
   border-bottom: 1px solid var(--line);
+  /* 撤销条的定位参照：让 top:calc(100% + Npx) 恒等于「头部下方」，不必硬编码头部高度。 */
+  position: relative;
 }
 
 .brand {
@@ -5218,6 +5686,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* 始终靠右：删掉左侧品牌字后 space-between 只剩单子元素会掉到左边，用 auto 边距兜住。 */
+  margin-left: auto;
 }
 
 .model-tag {
@@ -5232,7 +5702,7 @@ onBeforeUnmount(() => {
 }
 
 /* ---- 资源/MCP 面板共用部件 ---- */
-.mcp-count {
+.tools-badge {
   min-width: 16px;
   padding: 1px 5px;
   border-radius: var(--radius-pill);
@@ -5324,7 +5794,7 @@ onBeforeUnmount(() => {
 }
 
 /* 菜单宽度是飞出面板的水平锚点：文案过长时截断，避免撑破固定宽度 */
-.tools-menu__row > span:not(.tools-menu__chev):not(.mcp-count) {
+.tools-menu__row > span:not(.tools-menu__chev):not(.tools-badge) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5407,6 +5877,14 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--panel) 88%, var(--ink) 4%);
   color: var(--muted);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* 聚焦指示放到外层容器上：内层 input 是透明无边框的，若把聚焦环画在它身上
+   会糊在边框盒子里变成一圈黑线。容器整体聚焦才像正常的输入框聚焦。 */
+.tools-flyout__search:focus-within {
+  border-color: color-mix(in srgb, var(--ink) 32%, var(--line));
+  box-shadow: var(--ring);
 }
 
 .tools-flyout__search input {
@@ -5418,6 +5896,13 @@ onBeforeUnmount(() => {
   color: var(--ink);
   font: inherit;
   font-size: 13px;
+}
+
+.tools-flyout__search input:focus,
+.tools-flyout__search input:focus-visible {
+  outline: none;
+  border: none;
+  box-shadow: none;
 }
 
 .tools-flyout__search input::placeholder {
@@ -5487,6 +5972,34 @@ onBeforeUnmount(() => {
   color: #fff;
   font-size: 13px;
   font-weight: 600;
+}
+
+/* 已选专家 chip（对齐 CodeBuddy）：+ 旁的小胶囊，× 可取消选中回通用。 */
+.expert-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border, #d5dae2);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.expert-chip:hover {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ink) 25%, transparent);
+}
+
+.expert-chip svg {
+  color: var(--muted, #8a93a3);
+  flex: none;
 }
 
 .tools-item__body {
@@ -6257,6 +6770,12 @@ onBeforeUnmount(() => {
   word-break: break-word;
 }
 
+/* 助手消息正文容器：长无空格串（URL/JSON/代码残留）允许断词，避免横向溢出气泡。 */
+.md {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .md :deep(p),
 .md :deep(ul),
 .md :deep(ol),
@@ -6334,6 +6853,9 @@ onBeforeUnmount(() => {
   color: var(--danger);
   font-size: 13px;
   white-space: pre-wrap;
+  /* 错误串常含无空格的长 URL/JSON/HTML，必须允许断词，否则撑破气泡横向溢出。 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* 「已停止生成」徽标：虚线胶囊，弱化展示，不混入正文 */
@@ -6501,45 +7023,60 @@ onBeforeUnmount(() => {
 .reasoning {
   margin-bottom: 8px;
   border: 1px solid var(--line);
+  /* 左侧强调轨：把「系统/agent 过程块」与正文气泡区分开（对齐 Claude 推理块）。 */
+  border-left: 2.5px solid color-mix(in srgb, var(--accent) 55%, var(--line));
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--fill-soft) 55%, transparent);
+  background: color-mix(in srgb, var(--fill-soft) 50%, transparent);
   overflow: hidden;
 }
 
 .reasoning__head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   width: 100%;
-  padding: 7px 10px;
+  padding: 9px 12px;
   border: none;
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 500;
-  line-height: 1;
+  line-height: 1.2;
   cursor: pointer;
   text-align: left;
-  transition: color 0.15s ease;
+  border-radius: var(--radius-sm);
+  transition: color 0.15s ease, background 0.15s ease;
 }
 
 .reasoning__head:hover {
   color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+
+/* 图标芯片：承载 chevron，给面板一点「卡片」质感（对齐 Notion/Claude 的披露控件）。 */
+.reasoning__icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: color-mix(in srgb, var(--accent) 78%, var(--ink));
 }
 
 .reasoning__caret {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid currentColor;
-  border-bottom: 1.5px solid currentColor;
-  transform: rotate(-45deg);
-  transition: transform 0.18s ease;
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 0.18s var(--ease);
 }
 
-.reasoning.open .reasoning__caret {
-  transform: rotate(45deg);
+.reasoning:not(.open) .reasoning__caret {
+  transform: rotate(-45deg);
 }
 
 .reasoning__title {
@@ -6552,10 +7089,10 @@ onBeforeUnmount(() => {
 
 .reasoning__spinner {
   flex: none;
-  width: 11px;
-  height: 11px;
-  border: 1.5px solid color-mix(in srgb, var(--ink) 22%, transparent);
-  border-top-color: var(--stop);
+  width: 12px;
+  height: 12px;
+  border: 1.6px solid color-mix(in srgb, var(--ink) 20%, transparent);
+  border-top-color: var(--accent);
   border-radius: 50%;
   animation: reason-spin 0.7s linear infinite;
 }
@@ -6565,7 +7102,7 @@ onBeforeUnmount(() => {
 }
 
 .reasoning__body {
-  padding: 2px 10px 10px;
+  padding: 2px 12px 12px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -6575,7 +7112,7 @@ onBeforeUnmount(() => {
 .reasoning__planning {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   padding: 6px 2px;
   font-size: 12.5px;
   color: var(--muted);
@@ -6583,11 +7120,67 @@ onBeforeUnmount(() => {
 
 .reasoning__planning-dot {
   flex: none;
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #7cb3f7, #f5a462);
-  animation: blink 1.2s infinite ease-in-out;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: reason-pulse 1.5s ease-out infinite;
+}
+
+@keyframes reason-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+  70% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+
+/* 扩展思考流：等宽、弱对比、可滚动，区分于正式正文；收束后随面板折叠（不刷屏）。 */
+.reasoning__thinking-wrap {
+  margin: 2px 0 6px;
+}
+
+/* 意图识别卡：把模型首行「意图：…」高亮成结构化块，区别于后续裸思考流（对齐 ReAct 规划首步）。 */
+.intent-card {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 2px 0 6px;
+  padding: 7px 10px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel) 60%);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line));
+  border-left: 2.5px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+.intent-card__label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--accent) 80%, var(--ink));
+  text-transform: uppercase;
+}
+
+.intent-card__text {
+  font-size: 12.5px;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+.reasoning__thinking {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  color: color-mix(in srgb, var(--muted) 92%, var(--ink) 8%);
+  background: color-mix(in srgb, var(--panel) 60%, var(--ink) 4%);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, var(--ink) 10%);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
 }
 
 .reasoning__body .todos,
@@ -6670,49 +7263,6 @@ onBeforeUnmount(() => {
 /* 设置保存失败的横幅：挂在 header 下方，不挤压输入区。 */
 .header-warn {
   padding: 6px 18px 0;
-}
-
-.typing {
-  display: flex;
-  gap: 4px;
-}
-
-.typing span {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  animation: blink 1.2s infinite ease-in-out;
-}
-
-.typing span:nth-child(2) {
-  animation-delay: 0.15s;
-}
-
-.typing span:nth-child(3) {
-  animation-delay: 0.3s;
-}
-
-@keyframes blink {
-  0%, 80%, 100% { opacity: 0.25; }
-  40% { opacity: 1; }
-}
-
-/* 流式正文尾部的闪烁光标：与 MoviePage 的 mc-cursor 同一语义（块级文本后内联显示）。 */
-.gen-cursor {
-  display: inline-block;
-  width: 7px;
-  height: 1.05em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  border-radius: 1px;
-  background: var(--accent, var(--muted));
-  animation: gen-cursor-blink 1s steps(1, end) infinite;
-}
-
-@keyframes gen-cursor-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
 }
 
 .composer {
@@ -6888,6 +7438,8 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  /* 推到工具栏最右侧（左侧留给附件/提示，发送按钮固定靠右）。 */
+  margin-left: auto;
   width: 34px;
   height: 34px;
   flex: none;
@@ -6949,9 +7501,16 @@ onBeforeUnmount(() => {
   .sidebar.open {
     transform: translateX(0);
   }
+}
 
-  .hamburger {
-    display: inline-flex;
+/* 桌面端折叠态：侧栏收起、聊天区占满整屏（汉堡按钮负责重新展开）。 */
+@media (min-width: 861px) {
+  .sidebar.collapsed {
+    flex-basis: 0;
+    width: 0;
+    padding: 0;
+    border-right: none;
+    overflow: hidden;
   }
 }
 
@@ -6965,11 +7524,12 @@ onBeforeUnmount(() => {
 
 /* 汉堡按钮：桌面端隐藏，移动端显示（≤860px）。 */
 .hamburger {
-  display: none;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 38px;
   height: 38px;
+  flex: none;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--panel);
@@ -7012,11 +7572,29 @@ onBeforeUnmount(() => {
 
   .top {
     gap: 8px;
-    padding: 10px 12px;
+    /* 顶部留出刘海屏安全区，避免被状态栏遮挡。 */
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 10px;
   }
 
   .top-actions {
     gap: 6px;
+  }
+
+  /* 窄屏收掉顶栏冗余品牌字、收窄模型选择器，防止控件溢出换行。 */
+  .top .brand {
+    display: none;
+  }
+
+  .top :deep(.msel__trigger) {
+    min-width: 92px;
+    max-width: 132px;
+  }
+
+  /* 触摸目标 ≥40px（移动端最佳实践）。 */
+  .send,
+  .icon-btn {
+    width: 40px;
+    height: 40px;
   }
 }
 </style>

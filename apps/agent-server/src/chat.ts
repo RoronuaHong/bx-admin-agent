@@ -25,6 +25,20 @@ import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.j
 import { resolveToolRisk, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
+import { getRole } from "./roles.js";
+import { enforceRoleIdentity } from "./role-guard.js";
+import {
+  buildVerifyHint,
+  buildVerifyPrompt,
+  consensusUnsupported,
+  decideGrounding,
+  GROUNDING_HINT,
+  isGroundingEvidenceTool,
+  parseUnsupportedClaims,
+  shouldRunVerification,
+  UNGROUNDED_REPLY,
+  VERIFY_SYSTEM,
+} from "./grounding.js";
 import { wrapUntrusted } from "./untrusted.js";
 import { getUploadImage } from "./uploads.js";
 import { assembleContext } from "./history.js";
@@ -34,13 +48,20 @@ const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
 // 本轮工具结果预算（token）与「最近 N 组不清理」——沿用 trigger / keep 的语义。
 const TOOL_RESULT_BUDGET = Number(process.env.MCP_TOOL_RESULT_BUDGET || 12_000);
 const TOOL_RESULT_KEEP = Number(process.env.MCP_TOOL_RESULT_KEEP || 3);
-// 白名单：名单内工具的结果永不清理（逗号分隔工具名）。
-const TOOL_RESULT_PROTECTED = new Set(
-  (process.env.MCP_TOOL_RESULT_PROTECT || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean),
-);
+// 白名单：名单内工具的结果永不清理（逗号分隔；支持 * 通配，如 mcp__movie__* 保护整台 MCP 服务器的工具）。
+const TOOL_RESULT_PROTECT_PATTERNS = (process.env.MCP_TOOL_RESULT_PROTECT || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+function isToolResultProtected(name: string): boolean {
+  if (!name) return false;
+  return TOOL_RESULT_PROTECT_PATTERNS.some((pat) => {
+    if (pat === name) return true;
+    if (!pat.includes("*")) return false;
+    const re = new RegExp("^" + pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").split("*").join(".*") + "$");
+    return re.test(name);
+  });
+}
 const TOOL_RESULT_CLEARED = "…（较早的工具结果已清理以节省上下文；需要该数据请重新调用对应工具）";
 // 句柄里的参数原文上限，避免参数本身占满上下文。
 const HANDLE_ARGS_CHARS = Number(process.env.MCP_HANDLE_ARGS_CHARS || 200);
@@ -52,6 +73,19 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
+// 接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：仅对声明 enforceGrounding 的角色生效。
+// GROUNDING_MAX_RETRIES = 允许的纠正次数（作废文本 + 回灌提示让模型补取数据）；用尽后改用确定性拒答。
+const GROUNDING_GUARD = (process.env.GROUNDING_GUARD || "on").toLowerCase() !== "off";
+const GROUNDING_MAX_RETRIES = Math.max(0, Number(process.env.GROUNDING_MAX_RETRIES || 1));
+// 事后核验（Chain-of-Verification 最小版，详见 src/grounding.ts）：补齐「拿到部分数据后仍有超出证据的断言」。
+// 代价 = 每次收束多一次模型调用（不流式、不展示给用户）；GROUNDING_VERIFY=off 可关闭。
+const GROUNDING_VERIFY = (process.env.GROUNDING_VERIFY || "on").toLowerCase() !== "off";
+const GROUNDING_VERIFY_MAX = Math.max(0, Number(process.env.GROUNDING_VERIFY_MAX || 1));
+// 多票裁决次数（≤1 = 单次，默认；>1 = 跑 N 次独立核验、多数票认定无支持才作废，降低核验器自身误判）。
+// 代价随票数线性叠加（每次收束多 N 次模型调用）；属「更稳但更贵」的可选项，默认不开启。
+const GROUNDING_VERIFY_VOTES = Math.max(1, Number(process.env.GROUNDING_VERIFY_VOTES || 1));
+// 送入核验器的证据上限（字符）：证据本身也可能很长，核验不能变成新的上下文负担。
+const GROUNDING_EVIDENCE_CHARS = Math.max(1000, Number(process.env.GROUNDING_EVIDENCE_CHARS || 12_000));
 // 循环内层瞬时重试：某轮模型调用遇 SSE 断流 / 超时 / 限流等瞬态错误时重试，
 // 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
 const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
@@ -117,6 +151,26 @@ function historyBudgetTokens(model: ModelEntry, toolSchemaTokens: number): numbe
 async function summarizeWith(model: ModelEntry, prompt: string, signal?: AbortSignal): Promise<string> {
   const result = await callAgent(model, [{ role: "user", content: prompt }], [], signal);
   return result.text;
+}
+
+/**
+ * 事后核验调用（Chain-of-Verification 最小版）：同一个模型、无工具、非流式——结果只用于判定，
+ * 不展示给用户。返回无支持断言列表；`null` 表示核验不可用（解析失败），调用方按「不阻断」处理。
+ */
+async function verifyAnswerWith(
+  model: ModelEntry,
+  input: { question: string; evidence: string; answer: string },
+  signal?: AbortSignal,
+): Promise<string[] | null> {
+  const result = await callAgent(
+    model,
+    [{ role: "user", content: buildVerifyPrompt(input) }],
+    [],
+    signal,
+    undefined,
+    { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" } },
+  );
+  return parseUnsupportedClaims(result.text);
 }
 
 function truncateArgs(raw: string): string {
@@ -289,7 +343,7 @@ export function governToolResults(
   const older = toolTurns.filter(
     (turn, index) =>
       index < toolTurns.length - TOOL_RESULT_KEEP &&
-      !TOOL_RESULT_PROTECTED.has(turn.name || "") &&
+      !isToolResultProtected(turn.name || "") &&
       !isGovernedPlaceholder(turn.content),
   );
   let cleared = 0;
@@ -384,70 +438,111 @@ interface CallOutcome {
   failure: string | null;
 }
 
-/** 一次模型调用：边收增量边 yield text_delta，结束时返回全文与工具调用。 */
-async function* streamCall(
+/** 一次模型调用：边收增量边 yield text_delta / thinking_delta，结束时返回全文与工具调用。 */
+export async function* streamCall(
   model: ModelEntry,
   turns: Turn[],
   images: OptionImage[],
   tools: ToolSpec[],
   signal?: AbortSignal,
   system?: SystemPrompt,
+  /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）：仅当存在且当前尚无工具结果时，
+   *  把 tool_choice 设为 required 逼模型先调工具；拿到结果后（或角色未开启）走 auto。不传 = auto。 */
+  forceToolCall?: boolean,
+  /** 原生联网搜索（选项 A）：通用 Agent 开箱即带的实时检索能力；由调用方按角色/开关决定是否启用。 */
+  webSearch?: boolean,
 ): AsyncGenerator<ChatEvent, CallOutcome> {
-  const chunks: string[] = [];
+  // 单一有序队列：文本与思考增量按到达顺序入队（同一 read 内也保持先后），消费循环严格 FIFO
+  // 下发，避免「优先取文本」导致整段 SSE 一次性送达时思考被排到正文之后。
+  const pending: Array<{ kind: "text" | "thinking"; text: string }> = [];
   let settled = false;
   let failure: string | null = null;
   let wake: (() => void) | null = null;
   let toolCalls: ToolCall[] = [];
-  // 是否收到过增量回调：用于区分「流式通道（增量已逐片推进 chunks）」与
+  // 是否收到过文本增量回调：用于区分「流式通道（文本增量已逐片推进 pending）」与
   // 「非流式通道（ollama / 不支持 SSE 的网关，onDelta 永不触发）」。
   let streamed = false;
 
-  const running = callAgent(
-    model,
-    turns,
-    images,
-    signal,
-    (chunk) => {
-      chunks.push(chunk);
-      streamed = true;
-      wake?.();
-    },
-    tools.length
-      ? { tools, toolChoice: "auto", systemParts: system }
-      : { systemParts: system },
-  )
-    .then((result) => {
-      toolCalls = result.toolCalls || [];
-      // 非流式通道（如 ollama、不支持 SSE 的网关）没有增量回调，整包文本在这里补齐，
-      // 否则模型明明有输出，最终却拼出空回复。注意：判据用 streamed 而非 chunks.length——
-      // 流式通道的 chunks 在消费循环里会被即时 shift 清空，若按 chunks.length 判断会在
-      // 流式结束后误把整段最终文本再压入一次，导致最终回复翻倍。
-      if (result.text && !streamed) chunks.push(result.text);
-    })
-    .catch((err) => {
-      failure = String((err as Error)?.message || err);
-    })
-    .finally(() => {
-      settled = true;
-      wake?.();
-    });
-
+  // 角色级首轮强制工具调用：当前尚无工具结果（turns 里没有 role==="tool"）且角色开启 forceToolCall 时，
+  // 把 tool_choice 设为 required，逼模型先调工具、杜绝凭记忆编造；一旦有工具结果即恢复 auto（模型可正常收尾）。
+  // 仅当确有工具 schema 时才设（无工具的直连路径保持原 auto/none 语义，不产生 required+空工具的非法请求）。
+  // 注意：required(any) 与「扩展思考(thinking)」在多数端点互斥（Anthropic 文档明示；kimi 等开 thinking 的模型亦拒绝）。
+  // 若首轮 required 被端点以「与 thinking 不兼容」拒绝，自动降级 auto 重试一次（model 仍靠强提示走工具），不让强制开关把对话打断。
+  const hasToolResult = turns.some((t) => t.role === "tool");
+  const forceApplied = !!forceToolCall && !hasToolResult;
+  let toolChoice: "required" | "auto" = forceApplied ? "required" : "auto";
   let text = "";
-  while (!settled || chunks.length) {
-    if (!chunks.length) {
-      await new Promise<void>((resolve) => {
-        wake = () => {
-          wake = null;
-          resolve();
-        };
+
+  const invokeAndDrain = async function* (): AsyncGenerator<ChatEvent> {
+    const running = callAgent(
+      model,
+      turns,
+      images,
+      signal,
+      (chunk) => {
+        pending.push({ kind: "text", text: chunk });
+        streamed = true;
+        wake?.();
+      },
+      tools.length
+        ? { tools, toolChoice, systemParts: system, webSearch }
+        : { systemParts: system, webSearch },
+      (tchunk) => {
+        // 注意：thinking 通道不应置 streamed——streamed 只表示「文本增量已通过流式通道到达」，
+        // 用于决定是否走非流式文本兜底。否则非流式模型一旦返回 thinking，会误把最终正文丢弃。
+        pending.push({ kind: "thinking", text: tchunk });
+        wake?.();
+      },
+    )
+      .then((result) => {
+        toolCalls = result.toolCalls || [];
+        // 非流式通道（如 ollama、不支持 SSE 的网关）没有增量回调，整包文本在这里补齐，
+        // 否则模型明明有输出，最终却拼出空回复。注意：判据用 streamed 而非 pending.length——
+        // 流式通道的 pending 在消费循环里会被即时 shift 清空，若按 pending.length 判断会在
+        // 流式结束后误把整段最终文本再压入一次，导致最终回复翻倍。
+        if (result.text && !streamed) pending.push({ kind: "text", text: result.text });
+      })
+      .catch((err) => {
+        failure = String((err as Error)?.message || err);
+      })
+      .finally(() => {
+        settled = true;
+        wake?.();
       });
-      continue;
+
+    while (!settled || pending.length) {
+      if (!pending.length) {
+        await new Promise<void>((resolve) => {
+          wake = () => {
+            wake = null;
+            resolve();
+          };
+        });
+        continue;
+      }
+      const item = pending.shift() as { kind: "text" | "thinking"; text: string };
+      if (item.kind === "text") {
+        text += item.text;
+        yield { type: "text_delta", text: item.text };
+      } else {
+        yield { type: "thinking_delta", text: item.text };
+      }
     }
-    const chunk = chunks.shift() as string;
-    text += chunk;
-    yield { type: "text_delta", text: chunk };
+    await running;
+  };
+
+  yield* invokeAndDrain();
+  // 首轮强制 required 因「与 thinking 不兼容」被端点拒绝：降级 auto 重试一次（仍靠强提示让模型走工具）。
+  if (forceApplied && failure && /tool_choice.*(required|any).*(incompatible|thinking|not support|unsupported)/i.test(failure)) {
+    console.log("[chat:tool-choice] required 与 thinking 不兼容，降级 auto 重试");
+    failure = null;
+    toolChoice = "auto";
+    // 复位消费循环状态：第一次（失败的 required）的 .finally 已把 settled 置 true、wake 置 null，
+    // 若不复位，第二个 invokeAndDrain 的 while 循环会因 settled 早已为 true 而直接跳过，导致第二轮文本增量全部丢失（返回空回复）。
+    settled = false;
+    wake = null;
+    yield* invokeAndDrain();
   }
-  await running;
   return { text, toolCalls, failure };
 }
 
@@ -479,6 +574,14 @@ interface LoopContext {
   maxRounds: number;
   /** 知识库命名空间（按角色隔离）：默认 "generic"，由当前会话角色决定。 */
   namespace: string;
+  /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）；仅 "尚无工具结果" 的首轮生效。
+   *  不填 = auto，通用角色行为不变。子代理继承主代理值（movie 子代理同样首轮强制）。 */
+  forceToolCall?: boolean;
+  /** 角色级接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：本轮无任何外部数据时不允许收束。
+   *  不填 = 不参与本护栏，通用角色行为不变。 */
+  enforceGrounding?: boolean;
+  /** 原生联网搜索（选项 A）：通用 Agent 开箱即带的实时检索能力；默认开，可由 .env AGENT_WEB_SEARCH=0 关闭。 */
+  webSearch: boolean;
 }
 
 interface LoopOutcome {
@@ -497,6 +600,12 @@ interface LoopOutcome {
   toolFusions: number;
   /** 伪工具调用被拦截纠正的次数。 */
   pseudoCallRetries: number;
+  /** 接地护栏纠正次数（零数据作答被作废并回灌提示的次数）。 */
+  groundingRetries: number;
+  /** 事后核验（断言-证据核对）次数。 */
+  groundingVerifications: number;
+  /** 纠正后仍未取得数据、最终以确定性拒答收束（true 时调用方须丢弃模型文本）。 */
+  ungrounded: boolean;
   /** 累计发送的 prompt token 估算（成本护栏开启时统计）。 */
   spentTokens: number;
 }
@@ -516,6 +625,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const conversation: Turn[] = [...turns];
   const handles: ToolHandle[] = [];
   let text = "";
+  // 最终回答文本：只有「综合轮」（不调工具、直接收束的那一轮）的文本才作为正式答案。
+  // 中间轮（会调工具 / 被纠正重试）的文本属于过程叙述，不进入答案（详见下方流式缓冲）。
+  let synthesisText = "";
   let failure: string | null = null;
   let clearedToolResults = 0;
   let offloadedToolResults = 0;
@@ -533,6 +645,28 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let toolFusions = 0;
   let pseudoCallRetries = 0;
   let pseudoCallRetried = false;
+  // 接地护栏状态：evidence = 本轮真正执行成功且引入外部数据的工具数；未取证就收束则按 decision 处理。
+  let groundingEvidence = 0;
+  let groundingRetries = 0;
+  let ungrounded = false;
+  // 事后核验状态：累积证据原文（供核验器对齐）+ 已核验次数。
+  let groundingVerifications = 0;
+  const evidence: string[] = [];
+  let evidenceChars = 0;
+  /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
+   *  每条以「【来源 工具名】」前缀标注来源——这是「断言→具体来源」逐条归因的基础（详见 docs），
+   *  也便于核验器在口径里据此判断某断言由哪个工具返回支撑。 */
+  const pushEvidence = (raw: string, source?: string) => {
+    if (!raw || evidenceChars >= GROUNDING_EVIDENCE_CHARS) return;
+    const labeled = source ? `【来源 ${source}】\n${raw}` : raw;
+    const room = GROUNDING_EVIDENCE_CHARS - evidenceChars;
+    const piece = labeled.slice(0, room);
+    evidence.push(piece);
+    evidenceChars += piece.length;
+  };
+  // 核验与「无数据作答」都以**用户原始问题**为对照基准：取上下文里最后一条 user 消息
+  // （后续回灌的纠正提示会往 conversation 追加 user 消息，所以基准必须在这里先取好）。
+  const userQuestion = [...turns].reverse().find((turn) => turn.role === "user")?.content || "";
 
   for (let round = 0; round < ctx.maxRounds; round++) {
     // 成本护栏：轮次上限之外的第二道闸门。累计每轮实际发送的 prompt（历史 + 工具 schema）
@@ -550,10 +684,26 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     }
     let outcome: CallOutcome;
     let callAttempt = 0;
+    // 本轮正文缓冲：先把本轮的流式正文暂存，其余事件（思考 / 工具调用 / 工具结果）照常转发。
+    // 待本轮判定为「综合轮」时才把正文作为回答下发；否则（工具调用轮 / 被纠正重试轮）丢弃，
+    // 避免把「让我搜索…」这类过程叙述泄漏进用户可见的答案（对齐 Deep Agents：工具轮的内部
+    // 叙述不是答案，答案只看最后一圈综合）。
+    let roundText = "";
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
     // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
     while (true) {
-      outcome = yield* streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system);
+      const gen = streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system, ctx.forceToolCall, ctx.webSearch);
+      let step = await gen.next();
+      while (!step.done) {
+        const ev = step.value as ChatEvent;
+        if (ev.type === "text_delta") {
+          roundText += ev.text;
+        } else {
+          yield ev;
+        }
+        step = await gen.next();
+      }
+      outcome = step.value as CallOutcome;
       if (!outcome.failure) break;
       if (callAttempt < MODEL_CALL_RETRIES && isTransientModelError(outcome.failure)) {
         callAttempt += 1;
@@ -581,6 +731,74 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         console.log("[chat:pseudo-call] 检出文本形式的工具调用，已作废并回灌纠正提示");
         continue;
       }
+      // 运行时校验：接地护栏（防「零数据凭记忆作答」）。声明 enforceGrounding 的角色在一条数据都没
+      // 拿到时不允许以正文结论收束——先作废该段文本 + 回灌纠正提示补取数据，纠正用尽仍无数据则
+      // 标记 ungrounded，由调用方改用确定性拒答（绝不展示可能编造的内容）。
+      const grounding = decideGrounding({
+        enforceGrounding: ctx.enforceGrounding,
+        enabled: GROUNDING_GUARD,
+        evidenceCalls: groundingEvidence,
+        retries: groundingRetries,
+        maxRetries: GROUNDING_MAX_RETRIES,
+      });
+      if (grounding === "retry") {
+        groundingRetries += 1;
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        conversation.push({ role: "assistant", content: outcome.text });
+        conversation.push({ role: "user", content: GROUNDING_HINT });
+        console.log("[chat:grounding] 未取得任何工具数据即作答，已作废并回灌纠正提示");
+        continue;
+      }
+      if (grounding === "block") {
+        ungrounded = true;
+        console.log("[chat:grounding] 纠正后仍未取得工具数据，改用确定性拒答");
+      }
+      // 运行时校验：事后核验（Chain-of-Verification 最小版）。零证据的情况已由上面拦截；这里覆盖
+      // 「拿到部分数据后仍有超出证据的断言」——发现即作废并回灌纠正（可重新取数或删掉无支持内容）。
+      if (
+        shouldRunVerification({
+          enforceGrounding: ctx.enforceGrounding,
+          enabled: GROUNDING_VERIFY,
+          evidenceChars,
+          verifications: groundingVerifications,
+          maxVerifications: GROUNDING_VERIFY_MAX,
+        })
+      ) {
+        groundingVerifications += 1;
+        const evidenceText = evidence.join("\n");
+        const verifyInput = { question: userQuestion, evidence: evidenceText, answer: outcome.text };
+        // 多票裁决：跑 GROUNDING_VERIFY_VOTES 次独立核验，多数票认定无支持才作废（降低核验器自身误判）。
+        // 任一票不可用（解析失败 / 调用异常）→ 整体视为「未核验」，不阻断作答（不静默、也不误判）。
+        let claims: string[] | null = null;
+        let anyVerifyFail = false;
+        const runs: Array<string[] | null> = [];
+        for (let v = 0; v < GROUNDING_VERIFY_VOTES; v += 1) {
+          spentTokens += estimateTokens(buildVerifyPrompt(verifyInput));
+          try {
+            runs.push(await verifyAnswerWith(ctx.model, verifyInput, ctx.signal));
+          } catch (err) {
+            anyVerifyFail = true;
+            console.warn(`[chat:grounding] 事后核验调用失败（票 ${v + 1}），本轮跳过核验：${String((err as Error)?.message || err)}`);
+          }
+        }
+        if (!anyVerifyFail) claims = consensusUnsupported(runs);
+        if (claims && claims.length) {
+          // 断言条目来自模型（可能转述了外部内容）→ 按不可信数据处理，回灌前定界。
+          const wrapped = wrapUntrusted(claims.map((claim) => `- ${claim}`).join("\n"), {
+            kind: "verification_claims",
+            source: "grounding-verify",
+          });
+          text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+          conversation.push({ role: "assistant", content: outcome.text });
+          conversation.push({ role: "user", content: buildVerifyHint(wrapped.text) });
+          console.log(`[chat:grounding] 事后核验发现 ${claims.length} 条无支持断言，已作废并回灌纠正提示`);
+          continue;
+        }
+      }
+      // 本轮为「综合轮」（无工具调用、并通过全部纠正后收束）：只有这一轮的正文才是正式回答，
+      // 流式下发为回答正文，并记为最终答案（覆盖中间轮的过程叙述）。
+      synthesisText = outcome.text;
+      if (roundText) yield { type: "text_delta", text: roundText };
       break;
     }
 
@@ -640,6 +858,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         for await (const ev of batchGen) yield ev;
         for (const result of results) {
           yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: result.text };
+          // 子代理回传也是外部数据 → 计入接地证据（见 src/grounding.ts）。
+          if (result.ok) {
+            groundingEvidence += 1;
+            pushEvidence(result.text, "task");
+          }
           // 子代理回传同样是不可信数据（它自己读的也都是外部内容）：定界后回灌。
           const wrappedTask = wrapUntrusted(result.text, { kind: "subagent_summary", source: "task" });
           conversation.push({ role: "tool", toolCallId: result.id, name: "task", content: wrappedTask.text });
@@ -735,7 +958,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       let rawText: string;
       let ok = true;
       // ── 写操作安全闸门（src/risk.ts 单一真相）─────────────────────────────
-      const verdict = resolveToolRisk(call.name, ctx.grantServers);
+      const verdict = resolveToolRisk(call.name, ctx.grantServers, safeJsonParse(call.argsJson));
       const auditBase = {
         conversationId: ctx.conversationId,
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
@@ -757,10 +980,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
         continue;
       }
-      // 未声明工具按 MCP_UNKNOWN_TOOLS=deny 的口径直接拒绝。
+      // 未声明工具按 MCP_UNKNOWN_TOOLS=deny 的口径直接拒绝；原生 SQL 工具的非只读查询也走此处。
       if (verdict.deny) {
         ok = false;
-        rawText = `工具 ${call.name} 未声明操作级别，按当前安全口径拒绝执行；如确需使用，请在服务器配置中显式声明该工具的风险级别。`;
+        rawText = verdict.reason
+          ? `工具 ${call.name} 被安全闸门拒绝：${verdict.reason}`
+          : `工具 ${call.name} 未声明操作级别，按当前安全口径拒绝执行；如确需使用，请在服务器配置中显式声明该工具的风险级别。`;
         yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未知工具被拒绝）" });
@@ -840,6 +1065,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         if (ok) failedTools.delete(call.name);
         else failedTools.set(call.name, (failedTools.get(call.name) || 0) + 1);
       }
+      // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；
+      // 记账 / 工作区类内置工具（write_todos、fs_write 等）成功也不算证据。
+      if (executed && ok && isGroundingEvidenceTool(call.name)) {
+        groundingEvidence += 1;
+        pushEvidence(rawText, call.name);
+      }
       content = truncateResult(rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
       // 注入防护：外部内容回灌模型前包成带 nonce 与来源的不可信数据块（指令与数据分离）。
@@ -875,7 +1106,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   }
 
   return {
-    text,
+    // 只把综合轮的文本作为答案返回；没有综合轮（失败 / 熔断 / 预算耗尽）时回退到累计文本，
+    // 保证这些降级路径仍能看到已完成的部分成果。
+    text: synthesisText || text,
     failure,
     handles,
     clearedToolResults,
@@ -885,6 +1118,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     modelRetries,
     toolFusions,
     pseudoCallRetries,
+    groundingRetries,
+    groundingVerifications,
+    ungrounded,
     spentTokens,
   };
 }
@@ -919,11 +1155,6 @@ export function resolveSubagentTools(
   return { tools: filtered };
 }
 
-/**
- * 子代理（Deep Agents 的 task 工具，通用型）：独立上下文（只看任务描述）+
- * 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄到指定服务器）+
- * 只回摘要（单一交接）。取消级联：沿用主代理的 abort signal。
- */
 /**
  * 子代理（Deep Agents 的 task 工具，通用型，Async subagents）：
  * 独立上下文（只看任务描述）+ 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄）+
@@ -1037,6 +1268,13 @@ async function* runSubagent(
     return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
   }
   const summary = outcome!.text.trim() || "（子代理未返回内容）";
+  // 接地护栏：子代理纠正用尽仍无数据 → 不以「成功摘要」回传，避免把未接地内容当结论回灌主代理。
+  if (outcome!.ungrounded) {
+    const text = UNGROUNDED_REPLY;
+    yield { type: "subagent_end", id: subagentId, ok: false, status: "error", text };
+    subagentRegistry.delete(subagentId);
+    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
+  }
   const clipped =
     summary.length > SUBAGENT_RESULT_CHARS
       ? `${summary.slice(0, SUBAGENT_RESULT_CHARS)}\n…（已截断；如需完整数据，让子代理先用 fs_write 落盘，再用 fs_read 读取）`
@@ -1102,8 +1340,13 @@ export async function* chatStream(
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
   const conversation = await getConversation(conversationId);
-  // 优先级：请求显式指定 > 对话设置 > 服务端默认。
-  const model = getModel(opts.model) || getModel(conversation?.model) || defaultModel();
+  // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
+  const roleDefaultModel = conversation?.agentId ? getRole(conversation.agentId).defaultModel : undefined;
+  const model =
+    getModel(opts.model) ||
+    getModel(conversation?.model) ||
+    (roleDefaultModel ? getModel(roleDefaultModel) : undefined) ||
+    defaultModel();
   if (!model) {
     yield {
       type: "error",
@@ -1128,7 +1371,16 @@ export async function* chatStream(
   const selection = selectMcpToolSpecs(collected.tools);
   // 工具定义本身就是纯开销：超过窗口的一定比例就改成「按需检索加载」（对齐 Claude Code ToolSearch 阈值策略）。
   const eagerTokens = selection.specs.length ? estimateTokens(JSON.stringify(selection.specs)) : 0;
-  const toolSearch = toolMode && collected.tools.length > 0 && toolSearchEnabled(model, eagerTokens);
+  // 角色级开关：仅 forceEagerTools=true 的角色（如 movie）跳过 deferred、强制全量注入；
+  // 通用角色不设置该字段，完全跟随全局 TOOL_SEARCH_MODE=auto 的原有策略，逻辑不变。
+  const roleForceEagerTools = conversation?.agentId ? getRole(conversation.agentId).forceEagerTools : undefined;
+  const toolSearch = toolMode && collected.tools.length > 0 && toolSearchEnabled(model, eagerTokens) && !roleForceEagerTools;
+  // 角色级首轮强制工具调用：仅 forceToolCall=true 的角色（如 movie）首轮 tool_choice=required，逼模型先调工具；
+  // 通用角色不设置该字段 → undefined → streamCall 内恒为 auto，行为不变。
+  const roleForceToolCall = conversation?.agentId ? getRole(conversation.agentId).forceToolCall : undefined;
+  // 角色级接地护栏：仅 enforceGrounding=true 的角色（如 movie）在「零工具数据」时不许收束（见 src/grounding.ts）；
+  // 通用角色不设置该字段 → undefined → 不参与本护栏，行为不变。
+  const roleEnforceGrounding = conversation?.agentId ? getRole(conversation.agentId).enforceGrounding : undefined;
   // 内置工具（fs_* / write_todos / read_skill / task / search_tools）只在工具模式注入 —— 直连模式保持零工具语义。
   const builtinSpecs = toolMode ? builtinToolSpecs({ toolSearch }) : [];
   const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
@@ -1187,6 +1439,9 @@ export async function* chatStream(
   let modelRetries = 0;
   let toolFusions = 0;
   let pseudoCallRetries = 0;
+  let groundingRetries = 0;
+  let groundingVerifications = 0;
+  let ungrounded = false;
   let costTokens = 0;
   let modelFallbacks = 0;
 
@@ -1227,30 +1482,39 @@ export async function* chatStream(
     yield { type: "model", id: m.id, label: m.label };
     usedWindow = m.contextWindow;
 
-    const outcome: LoopOutcome | CallOutcome =
-      toolMode
-        ? yield* runLoop(
-            {
-              conversationId,
-              model: m,
-              images,
-              mcpTools: collected.tools,
-              specs,
-              toolSearch,
-              loadedTools: new Set<string>(),
-              system,
-              signal,
-              allowTask: true,
-              allowWrite: true,
-              grantServers: new Set(conversation?.readGrants || []),
-              sessionId: opts.sessionId,
-              maxRounds: MAX_TOOL_ROUNDS,
-              namespace: conversation?.agentId || "generic",
-              ownerKey: opts.ownerKey,
-            },
-            turns,
-          )
-        : yield* streamCall(m, turns, images, [], signal, system);
+    // 原生联网搜索（选项 A）：默认开箱即有，对齐 CodeBuddy/Cursor/千问；AGENT_WEB_SEARCH=0 可整体关闭。
+    const webSearchEnabled = (process.env.AGENT_WEB_SEARCH ?? "1") !== "0";
+
+    let outcome: LoopOutcome | CallOutcome;
+    if (toolMode) {
+      outcome = yield* runLoop(
+        {
+          conversationId,
+          model: m,
+          images,
+          mcpTools: collected.tools,
+          specs,
+          toolSearch,
+          loadedTools: new Set<string>(),
+          system,
+          signal,
+          allowTask: true,
+          allowWrite: true,
+          grantServers: new Set(conversation?.readGrants || []),
+          sessionId: opts.sessionId,
+          maxRounds: MAX_TOOL_ROUNDS,
+          namespace: conversation?.agentId || "generic",
+          forceToolCall: roleForceToolCall,
+          enforceGrounding: roleEnforceGrounding,
+          webSearch: webSearchEnabled,
+          ownerKey: opts.ownerKey,
+        },
+        turns,
+      );
+    } else {
+      // 直连路径：默认带上原生联网搜索；callOpenAi 内部会在网关不支持时自动降级为不带搜索重试。
+      outcome = yield* streamCall(m, turns, images, [], signal, system, undefined, webSearchEnabled);
+    }
     text = outcome.text;
     const loop = outcome as LoopOutcome;
     handles = loop.handles || [];
@@ -1261,6 +1525,9 @@ export async function* chatStream(
     modelRetries = loop.modelRetries || 0;
     toolFusions = loop.toolFusions || 0;
     pseudoCallRetries = loop.pseudoCallRetries || 0;
+    groundingRetries = loop.groundingRetries || 0;
+    groundingVerifications = loop.groundingVerifications || 0;
+    ungrounded = loop.ungrounded || false;
     costTokens = loop.spentTokens || 0;
     if (!outcome.failure) break;
     failure = outcome.failure;
@@ -1288,6 +1555,9 @@ export async function* chatStream(
     modelFallbacks,
     toolFusions,
     pseudoCallRetries,
+    groundingRetries,
+    groundingVerifications,
+    ungrounded,
     costTokens,
   };
 
@@ -1319,7 +1589,13 @@ export async function* chatStream(
     return;
   }
 
-  const finalText = text.trim();
+  // 角色身份护栏：兜底纠正模型把自身错认为底层大模型的自报（如「我是 Kimi」），
+  // 确定性改写短自报句，长回答交提示词层处理（详见 src/role-guard.ts）。
+  // 接地护栏兜底：纠正用尽仍未取得任何工具数据的角色，改用确定性拒答——宁如实说取不到，
+  // 也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
+  const finalText = ungrounded
+    ? UNGROUNDED_REPLY
+    : enforceRoleIdentity(text.trim(), getRole(conversation?.agentId).label);
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },

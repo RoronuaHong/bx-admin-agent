@@ -8,6 +8,7 @@ const risk = await import("../src/risk.js");
 const confirm = await import("../src/confirm.js");
 const audit = await import("../src/audit.js");
 const chat = await import("../src/chat.js");
+const sql = await import("../src/sql-readonly.js");
 
 let pass = 0;
 function check(name, fn) {
@@ -29,11 +30,11 @@ check("builtin fs_read = read/workspace", () => {
   assert.equal(v.source, "builtin");
   assert.equal(risk.verdictNeedsConfirm(v), false);
 });
-check("builtin fs_write = write/workspace 免确认（无外部副作用）", () => {
+check("builtin fs_write = write，需用户确认（变更工作区文件）", () => {
   const v = risk.resolveToolRisk("fs_write");
   assert.equal(v.level, "write");
-  assert.equal(v.external, false);
-  assert.equal(risk.verdictNeedsConfirm(v), false);
+  assert.equal(v.external, true);
+  assert.equal(risk.verdictNeedsConfirm(v), true);
 });
 check("builtin task = read/workspace", () => {
   const v = risk.resolveToolRisk("task");
@@ -168,6 +169,28 @@ check("审计事件落盘并可回读", () => {
   assert.ok(found);
   assert.equal(found.kind, "gate");
   assert.ok(found.argsDigest);
+});
+
+// ---- 7. 原生 SQL 只读判定 ----
+check("只读 SELECT 放行", () => {
+  assert.equal(sql.isReadOnlySql("SELECT a FROM t"), true);
+});
+
+// ---- 8. 原生 SQL 工具：非只读查询被服务端硬拒（双重保险，P1-1）----
+check("run_native_query 只读 SELECT → 不拒（降级免确认）", () => {
+  assert.equal(risk.isNativeSqlRejected(["run_native_query"], "run_native_query", { query: "SELECT 1" }), false);
+});
+check("run_native_query 写操作 DELETE → 硬拒", () => {
+  assert.equal(risk.isNativeSqlRejected(["run_native_query"], "run_native_query", { query: "DELETE FROM t" }), true);
+});
+check("run_native_query 多语句 INSERT…SELECT → 硬拒", () => {
+  assert.equal(risk.isNativeSqlRejected(["run_native_query"], "run_native_query", { query: "INSERT INTO t SELECT 1" }), true);
+});
+check("非 SQL 工具不受 SQL 判据影响", () => {
+  assert.equal(risk.isNativeSqlRejected(["run_native_query"], "get_card", { query: "DELETE FROM t" }), false);
+});
+check("SQL 字面量里的关键字不误判（SELECT 'drop table'）→ 不拒", () => {
+  assert.equal(risk.isNativeSqlRejected(["run_native_query"], "run_native_query", { query: "SELECT 'drop table' FROM t" }), false);
 });
 
 console.log(`\n${pass} checks passed${process.exitCode ? "（存在失败）" : ""}`);

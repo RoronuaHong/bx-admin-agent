@@ -4,10 +4,11 @@
 // 判定与参数内容无关、与模型措辞无关。
 import type { RiskLevel } from "@bx/shared";
 import { BUILTIN_RISK } from "./builtins.js";
-import { describeMcpTool } from "./mcp/hub.js";
+import { describeMcpTool, type McpToolFacts } from "./mcp/hub.js";
+import { isReadOnlySql } from "./sql-readonly.js";
 
 /** 判据来源，便于排障与审计。 */
-export type RiskSource = "tool-config" | "builtin" | "server-config" | "annotation" | "default" | "grant";
+export type RiskSource = "tool-config" | "builtin" | "server-config" | "annotation" | "default" | "grant" | "sql-readonly";
 
 export interface RiskVerdict {
   /** 生效级别。 */
@@ -71,7 +72,11 @@ function unknownVerdict(reason: string, serverId?: string): RiskVerdict {
  * 7. 未命中（含查不到）→ MCP_UNKNOWN_TOOLS 兜底（默认 confirm）
  * 8. unknown 且该服务器在会话级只读授权名单里 → 降为 read（仅对未声明工具生效）
  */
-export function resolveToolRisk(namespacedName: string, grantServers?: ReadonlySet<string>): RiskVerdict {
+export function resolveToolRisk(
+  namespacedName: string,
+  grantServers?: ReadonlySet<string>,
+  args?: Record<string, unknown>,
+): RiskVerdict {
   if (!namespacedName.startsWith(MCP_PREFIX)) {
     const builtin = BUILTIN_RISK[namespacedName];
     if (builtin) {
@@ -102,17 +107,35 @@ export function resolveToolRisk(namespacedName: string, grantServers?: ReadonlyS
   const toolOverride =
     described.toolRisks?.[bare] ?? described.toolRisks?.[namespacedName] ?? described.toolRisks?.["*"];
   const base = { ...(described.serverId ? { serverId: described.serverId } : {}), external: true };
+  const downgraded = readOnlySqlOk(described, bare, args) && toolOverride === "destructive";
+  // 原生 SQL 工具（readOnlySqlTools 声明的，如 bi 的 run_native_query）：本次若是非只读查询，
+  // 服务端闸门直接硬拒——双重保险：即便 MCP 适配器层被绕过/改坏，这里仍拦一道。
+  // 与服务端 src/sql-readonly.ts 口径一致（首词白名单 + 全文黑名单 + 危险构造）。
+  const sqlRejected = isNativeSqlRejected(described.readOnlySqlTools, bare, args);
 
   let verdict: RiskVerdict;
   if (toolOverride === "read" || toolOverride === "write" || toolOverride === "destructive") {
-    verdict = {
-      ...base,
-      level: toolOverride,
-      unknown: false,
-      deny: false,
-      reason: `工具级配置将该操作定为 ${toolOverride}`,
-      source: "tool-config",
-    };
+    if (sqlRejected) {
+      verdict = {
+        ...base,
+        level: "destructive",
+        unknown: false,
+        deny: true,
+        reason: `该工具（${bare}）为原生 SQL 工具，服务端判定本次为非只读查询，按只读策略拒绝执行`,
+        source: "sql-readonly",
+      };
+    } else {
+      verdict = {
+        ...base,
+        level: downgraded ? "read" : toolOverride,
+        unknown: false,
+        deny: false,
+        reason: downgraded
+          ? "该工具为原生 SQL 工具，服务端判定本次为只读查询"
+          : `工具级配置将该操作定为 ${toolOverride}`,
+        source: downgraded ? "sql-readonly" : "tool-config",
+      };
+    }
   } else if (described.requireConfirm) {
     verdict = {
       ...base,
@@ -146,7 +169,22 @@ export function resolveToolRisk(namespacedName: string, grantServers?: ReadonlyS
   return applyGrant(verdict, grantServers);
 }
 
-/** 第 8 条：unknown 且该服务器在会话级只读授权名单里 → 降为 read（写/破坏性显式声明永不适用）。 */
+function readOnlySqlOk(d: McpToolFacts, bare: string, args?: Record<string, unknown>): boolean {
+  if (!d.readOnlySqlTools?.includes(bare)) return false;
+  return isReadOnlySql(args?.query) || isReadOnlySql(args?.sql);
+}
+
+/** 原生 SQL 工具的非只读查询判定（服务端硬拒判据）。仅对 `readOnlySqlTools` 声明的工具生效；可单测。 */
+export function isNativeSqlRejected(
+  readOnlySqlTools: string[] | undefined,
+  bare: string,
+  args?: Record<string, unknown>,
+): boolean {
+  if (!readOnlySqlTools?.includes(bare)) return false;
+  return !(isReadOnlySql(args?.query) || isReadOnlySql(args?.sql));
+}
+
+/** 第 8 条：unknown 且服务器在授权名单里 → 降为 read。 */
 function applyGrant(verdict: RiskVerdict, grantServers?: ReadonlySet<string>): RiskVerdict {
   if (verdict.unknown && !verdict.deny && verdict.serverId && grantServers?.has(verdict.serverId)) {
     return { ...verdict, level: "read", reason: `${verdict.reason}；本对话已授权该服务器按只读处理`, source: "grant" };

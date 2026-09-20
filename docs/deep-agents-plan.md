@@ -1,6 +1,6 @@
 # Deep Agents 架构评估与迁移方案
 
-> 版本：v2（2026-09-17，决议已冻结 + 实施记录见 §8）
+> 版本：v3（2026-09-20，追加 §11 内置工具对标与全量补齐计划 + §11.6 查缺补漏修订）；v2（2026-09-17，决议已冻结 + 实施记录见 §8）
 > 定位：评估稿 → 实施记录。回答两个问题：① 现在的架构是不是 harness？② 要不要/能不能升级成 Deep Agents 架构，现有代码支持吗？
 > 相关：`docs/agent-infrastructure.md`、`docs/conversation-state-plan.md`（thread/并发/队列契约）。
 
@@ -29,6 +29,8 @@
 ---
 
 ## 3. 能力差距矩阵（Deep Agents 能力 × 现状）
+
+> 本表为 2026-09-17 评估时的差距快照；D1–D4 已于 §8 全部落地，当前符合性见 §10（2026-09-19 自检：六项差距闭合，harness 已达 Deep Agent 最佳实践）。
 
 | Deep Agents 能力 | 我们的现状 | 判定 |
 |---|---|---|
@@ -167,3 +169,209 @@ chatStream
 **补齐的缺口**：长期记忆补 HTTP 端点（原注释声称"接口可查看/增删"但无实现）——`GET/POST /chat/memory`、`DELETE /chat/memory/:id`、`DELETE /chat/memory`。
 
 **回归**：`tsc --noEmit` ✓、`vite build` ✓、`context-budget.test.ts` PASS=30/FAIL=0 ✓。
+
+---
+
+## 10. 最佳实践符合性自检（2026-09-19）
+
+> 对当前 `apps/agent-server/src` 实现逐条核对 Deep Agents 官方能力清单与 `docs/agent-infrastructure.md` §安全护栏。结论：**当前 harness 已符合 Deep Agent 最佳实践，无需改动**。原 §3 差距矩阵所列六项（虚拟文件系统 / todo / 子代理 / 详细系统提示+Skills / prompt caching / 子代理流式事件）经 D1–D4 全部闭合。
+
+### 10.1 能力符合矩阵（现状）
+
+| Deep Agents 能力 | 实现位置 | 状态 |
+|---|---|---|
+| 多轮工具循环 + 轮次上限 | `chat.ts` `runLoop` + `MAX_TOOL_ROUNDS=14`（:58/:1268） | ✅ |
+| 子代理委派（独立上下文 / 最小工具集 / 并行 / 可取消 / 独立事件） | `builtins.ts` `task` + `chat.ts` `runSubagent`/`runSubagentBatch` + `subagentRegistry` | ✅ |
+| 任务规划（每轮重注入，Claude Code TodoWrite 式） | `builtins.ts` `write_todos` + `system-prompt.ts` `renderTodos` | ✅ |
+| 长期记忆（按 owner 隔离、不自动脑补） | `memory.ts`（显式写入 + `renderMemory` 注入） | ✅ |
+| Prompt Cache（稳定前缀 / 动态后缀） | `system-prompt.ts` 两段式 + `models.ts`（OpenAI 隐式前缀缓存 / Anthropic `cache_control: ephemeral`） | ✅ |
+| 工具按需加载（Tool Search） | `builtins.ts` `search_tools` + 延迟注入模式（`deferred`），命中即加载 spec（:677-716） | ✅ |
+| 大结果卸载工作区 | `fs-store.ts` `governToolResults`/`offloadToolResult`，每轮治理（:291/:886） | ✅ |
+| 同轮同参数去重 | `chat.ts` `toolCallSignature`（参数排序归一）+ `executedSigs`（:355/:621） | ✅ |
+| 跨轮 Doom Loop 熔断 | `chat.ts` `LoopGuard`（连续相同指纹达 `MCP_DOOM_LOOP_MAX` 默认 3 即强制收束，空轮不计连击，:370-388/:889） | ✅ |
+| 伪调用拦截（文本模拟工具） | `chat.ts` `looksLikePseudoToolCall` + 作废回灌纠正提示（:154/:596） | ✅ |
+| 提示注入防护（结构隔离，非词表） | `untrusted.ts` `wrapUntrusted`（nonce+来源+中和伪造定界+剥离控制符）+ 覆盖全部工具结果与子代理回传（:868/:665） | ✅ |
+| 写操作确认闸门（fail-closed） | `risk.ts` + `confirm.ts`（`_risk-gate-check.mjs` 17/17 PASS，见下） | ✅ |
+| 模型 fallback 韧性（瞬态重试 / 永久不切 / 已执行工具不重跑防副作用重复） | `chat.ts` 候选链（:1286-1293） | ✅ |
+| 执行/推送解耦（断线续传 / 取消 / 结果回投） | `chat-tasks.ts` 异步任务底座 | ✅ |
+| 工具通道现状透明告知（防「拿不到 = 没有」幻觉） | `system-prompt.ts` `ToolingStatus`（就绪/缺席/裁切如实上报，:117-148） | ✅ |
+| 红线：语义 100% 交模型，零业务词写死 | `SAFETY_GUARDRAIL`/`BASE_PROMPT`/`TOOLING_RULES` 全通用；`untrusted.ts` 显式「不检测自然语言词表」 | ✅ |
+
+### 10.2 本轮核对发现的两处重构（非回归，是改善）
+
+- **Doom Loop**：从早期 Annotation 写法（`lastToolSignature`/`toolSignatureStreak`/`doomLoopExhausted`）重构为 `LoopGuard` 类 + `DOOM_LOOP_MAX_ROUNDS`（默认 3），逻辑更内聚；空轮不计连击，避免思考轮误触发熔断。
+- **同轮去重**：从仅针对 `call_api` 的 `callApiKey` 升级为通用 `toolCallSignature`（name + 排序后参数），覆盖所有工具（含子任务），避免「换工具名绕过去重」。
+
+### 10.3 红线确认（agent-infrastructure §「禁止业务词写死」）
+
+- harness 层（`system-prompt` / `chat` / `risk` / `untrusted`）**零业务词写死**：所有安全/工具守则均为跨系统通用语义；「是否该查、查哪个域」完全由模型基于工具返回的真实结果判定，服务端不做业务语义正则匹配。
+- 提示注入防护为**纯协议层**（定界 + nonce + 来源标注 + 不可见控制符剥离），不依赖任何自然语言词表拦截，对齐 OWASP LLM01。
+- 早期挂账的 `src/analytics` 中文业务正则（按天/按渠道/不要没标等写死）已随 `src/analytics` 删除而移除（复盘见 `docs/mcp-guide.md` §10 陌生库取证）；当前全仓源码已无此类写死（仅文档/注释出现业务词，属正常）。
+
+### 10.4 验证脚本（当前可复跑）
+
+- `node --import tsx scripts/_risk-gate-check.mjs` → **17/17 PASS**（写操作安全闸门纯函数断言：内置登记表 / 未知 fail-closed 三口径 / 只读授权降级 / 票据会话绑定 / 参数脱敏 / 审计落盘回读）。
+- `node --import tsx scripts/_deep-agents-check.mjs` → **9/9 PASS**（D1–D4 活链路：fs 走通 / todos 持久化 / task 委派返回摘要，§8 记录）。
+- `node --import tsx scripts/_async-subagent-check.mjs` → **6/6 PASS**（子代理独立事件维度 / 独立取消 / 级联，§8 记录）。
+
+> 结论：**无需改动代码**。若后续引入新内置工具，只需在 `BUILTIN_RISK` 登记级别（漏登启动即抛错，见 `builtins.ts` `assertBuiltinRiskCoverage`）+ 必要时在 `toolRisks` 补定级，无需改主循环。
+
+---
+
+## 11. 内置工具对标与全量补齐计划（2026-09-20）
+
+> 背景：对当前 `apps/agent-server/src/builtins.ts` 的通用内置工具，与两份业界参考逐项对标——**① Deep Agent 开源库（deepagents / `create_deep_agent`）八大内置工具 + Deep Agent SDK 扩展**；**② Cursor Agent 工具集**。用户决议：**参考清单所列缺口全部补齐**（"都要"）。本节先落文档（补齐清单 + 落点 + 风险 + 分期），代码随后按 §11.4 分期实施。
+
+### 11.0 范围与前置澄清
+
+- **本项目定位**：领域专用（后台管理 / BI 查询）Agent，非通用编码 Agent。原 `call_api` / `search_api_module` 等**业务/领域能力已外置为 MCP 服务器**（`bi` / `yapi` / `movie` / `chart`，经 `MCP_BUILTIN_SERVERS` 注入，见 `mcp/config.ts`）。**本节只针对通用 harness 内置工具**（`builtins.ts` 的 `BUILTIN_SERVER` 一组），不与领域 MCP 工具混算。
+- **现状内置清单**：`fs_write` / `fs_read` / `fs_edit` / `fs_ls` / `write_todos` / `task` / `read_skill` / `search_knowledge` / `knowledge_sources` / `record_watched_movies`，外加仅按需加载模式注入的 `search_tools`。
+- **补齐原则（不得破坏现有红线）**：
+  1. **安全边界放在工具/沙箱层**（`risk.ts` fail-closed + 确认门 `confirm.ts`），不靠 LLM 自我约束；
+  2. 高风险工具（`execute` / `browser` / `image_gen` / `http_request` 外发类）**默认关闭、opt-in**，且必须在 `BUILTIN_RISK` 登记级别（漏登 `assertBuiltinRiskCoverage` 启动即抛错）；
+  3. **零业务词写死**（`AGENT_CHARTER.md` 最高红线）——工具描述 / 错误提示 / 示例一律用 `XX` / `<模块>` / `<接口>` 占位；
+  4. 所有新增内置工具**只在工具模式（启用 MCP）注入**，直连模式保持零工具语义；
+  5. schema token 计入预算公式，超阈值走 `search_tools` 按需加载（`deferred`）。
+
+### 11.1 对标矩阵（现状 → 目标）
+
+| 参考工具 | 参考来源 | 现状 | 目标 | 优先级 |
+|---|---|---|---|---|
+| write_todos / read_todos | deepagents 八件套 | `write_todos` ✅（读靠 `renderTodos` 每轮隐式注入） | 可选补 `read_todos` 显式读取 | P2 |
+| ls | deepagents 八件套 | `fs_ls` ✅ | 保持 | — |
+| read_file | deepagents 八件套 | `fs_read` ✅（**无 offset/limit**） | 补 `{offset, limit}` 行分页 | P0 |
+| write_file | deepagents 八件套 | `fs_write` ✅ | 保持 | — |
+| edit_file | deepagents 八件套 | `fs_edit` ✅（防御性替换，`old_string` 必须唯一命中） | 保持 | — |
+| glob | deepagents 八件套 | ❌ 缺失 | 新增 `fs_glob`（工作区模式匹配） | P0 |
+| grep | deepagents 八件套 | ❌ 缺失 | 新增 `fs_grep`（工作区内容正则，files/content/count 三模式） | P0 |
+| task（子代理） | deepagents 八件套 | `task` ✅（通用型，隔离 + 最小工具集 + 并行≤3 + 可独立取消 + 独立事件） | 补**专用型** `bi-explorer` | P1 |
+| execute*（沙箱 shell） | deepagents 八件套（需 SandboxBackend） | ❌ 缺失 | 新增 `execute`（沙箱约束 + opt-in） | P2 |
+| web_search | Deep Agent SDK | ❌ 缺失 | 新增 `web_search`（provider 可配） | P2 |
+| http_request | Deep Agent SDK | ❌ 缺失 | 新增 `http_request`（主机白名单 + 确认） | P1 |
+| fetch_url | Deep Agent SDK | ❌ 缺失 | 新增 `fetch_url`（正文转 Markdown + 不可信定界） | P2 |
+| Search files & folders（含语义） | Cursor | `fs_ls`（无模式/无语义） | 由 `fs_glob` + `fs_grep` 覆盖；语义搜索挂账 | P1 |
+| Read files（图片） | Cursor | ⚠️ 用户上传图片**已有通路**（`uploads.ts` png/jpeg/webp + `VISION=direct` 视觉模型）；但 `fs_read` 仅 utf-8 文本，**读不了工作区里的图片文件** | `fs_read` 增加图片分支（交视觉模型） | P2 |
+| Edit files | Cursor | `fs_edit` ✅ | 保持 | — |
+| Run shell commands | Cursor | ❌ 缺失 | 同 `execute` | P2 |
+| Web | Cursor | ❌ 缺失 | 同 `web_search` / `fetch_url` | P2 |
+| Fetch rules | Cursor | `read_skill` + `skills/` ✅ | 保持 | — |
+| Browser | Cursor | ❌ 缺失 | 新增 `browser`（opt-in） | P2 |
+| Image generation | Cursor | ❌ 缺失 | 新增 `image_gen`（opt-in） | P2 |
+| Ask questions | Cursor | ❌（澄清工具不在内置清单，全仓源码无定义） | **先核实现状**，按需补 `request_clarification` | P0 |
+| Checkpoints | Cursor | ❌ 缺失 | 新增工作区快照 `fs_snapshot` / `fs_restore` | P1 |
+| Subagents（预置类型） | Cursor | `task` ✅ 通用型 | 补专用型（同 `bi-explorer`） | P1 |
+| Skills | Cursor | `read_skill` + skills 目录 + 勾选全量注入 ✅ | 保持 | — |
+| Memory（模型侧持久化） | deepagents Memory / 最佳实践「Persistent backend」 | ⚠️ **仅用户侧**（`memory.ts` + `GET/POST/DELETE /chat/memory`），模型**无**可调用工具（全仓 `addMemory` 调用点只有 `app.ts`） | 新增 `save_memory` / `recall_memory`（模型显式写入 + 查删） | P1 |
+| 可插拔 Backend（State / Filesystem / Persistent / Composite） | deepagents 最佳实践 | ⚠️ 仅磁盘单后端（`fs-store.ts` 硬编码 `.data/fs/`），无 Composite 路径路由（`/memories/` → 持久层） | 抽出 backend 接口 + Composite 路径路由 | P2 |
+| Sandbox backend（`execute` 前置） | deepagents（`execute` 依赖 SandboxBackend） | ❌ 无沙箱后端（D5 未做） | 先实现受限沙箱，否则不注册 `execute` | P2 |
+
+### 11.2 补齐清单（分组，含落点与验收）
+
+**A. 文件系统补全（P0/P1）**
+
+- `fs_glob`：`{pattern, path?}`——在工作区命名空间内做 glob 匹配（支持 `**/` 递归）；复用 `fs-store.ts` 现有越界校验（拒 `..` / 绝对路径 / 反斜杠）。
+- `fs_grep`：`{pattern, path?, mode: files|content|count, glob?}`——正则搜索工作区文件内容，content 模式返回 `文件:行号:命中行`。
+- `fs_read` 补 `{offset, limit}`：按行分页读取（对齐 deepagents `read_file`）；缺省整读，保持向后兼容。
+- **验收**：新增 `scripts/_builtin-fs-check.mjs`——glob / grep / 分页各 ≥3 用例 + 越界（`..`、绝对路径）拒绝。
+
+**B. 交互与体验（P0/P1）**
+
+- `request_clarification`（对齐 Cursor Ask questions）：**现状已核实**（2026-09-20）——全仓无该工具定义（`builtins.ts` 与各 MCP 适配器均无），澄清当前**完全靠纯文本反问**：`system-prompt.ts` 的 `TOOLING_RULES` 第 3 条明确「为补全必填参数而追问是允许的」，`BASE_PROMPT` 第 1 条要求先写明对请求的理解。即**「反问」能力在，但无结构化选项**（模型只能写一段问题，用户以自由文本回答）。
+  - 目标：补 `request_clarification` 工具 `{question, options[]}` + NDJSON 事件 `clarification_required` + 前端选项卡（复用确认门 `confirm.ts` 的等待/应答通道），把澄清从「散文追问」升级为「结构化多选」；纯文本追问作为无固定选项时的降级路径保留。
+- `Checkpoints`（工作区快照）：`fs_write` 前对工作区打快照（`.data/fs/<convId>/.snapshots/`），提供 `fs_snapshot` / `fs_restore` 与 HTTP 端点；对齐 Cursor「重大变更前自动快照 + 一键回滚」，独立于 Git。
+- **验收**：澄清选项可回填并驱动后续轮次；快照创建 → 改文件 → 回滚后内容与快照一致。
+
+**C. 网络能力（P1/P2）**
+
+- `http_request`：`{method, url, headers?, body?}`——**主机白名单**（env `TOOL_HTTP_ALLOW_HOSTS`）+ 默认走确认门 + 响应体大小上限。
+- `web_search`：`{query, count?}`——provider 可配（env `WEB_SEARCH_*`）；**未配 key 时按 `ToolingStatus` 诚实上报"未配置"**，不静默失败。
+- `fetch_url`：`{url}`——抓取正文转 Markdown；结果**必须**经 `untrusted.ts` `wrapUntrusted` 定界（外部内容 = 不可信数据）。
+- **验收**：白名单外主机拒绝；未配 key 时诚实上报；抓取/搜索结果确被 `wrapUntrusted` 包裹。
+
+**D. 沙箱与多模态（P2，opt-in）**
+
+- `execute`：`{command, cwd?}`——**仅当 `TOOL_SANDBOX=on` 且检测到沙箱后端才注册**（对齐参考「默认 in-memory 不开放」）；无沙箱时工具不进入模型清单。`BUILTIN_RISK` 定 `destructive` + 强制确认。
+- `browser`：导航 / 点击 / 截图 / 取文本，opt-in（`TOOL_BROWSER=on`），复用现有 playwright 依赖，默认关闭。
+- `image_gen`：`{prompt, size?}`，opt-in（需 provider key）；产物落工作区 `assets/` 并内联预览。
+- **验收**：默认关闭时工具不出现在模型清单（`budget` 不变）；开启后写/外发类操作走确认门。
+
+**E. 子代理专业化（P1）**
+
+- 新增专用子代理类型 `bi-explorer`（对齐 Cursor 预置类型 + 参考「任务专业化」）：**受限只读工具集**（BI / 知识库 / fs 读取），专用于多步 BI 探查并回传摘要；主代理保持高层协调（专治「查 N 行回灌上下文」的 context-bloat）。
+- 落点：`roles.ts` 子代理类型注册 + `chat.ts` `resolveSubagentTools` 白名单 + `task` 参数 `subagent_type`。
+- **验收**：`task(subagent_type: "bi-explorer")` 走受限工具集，写操作被拒（复用现有 `subagent_refused` 审计）。
+
+**F. 长期记忆的模型侧工具（P1）**
+
+- 现状：`memory.ts` 提供 `addMemory` / `removeMemory` / `listMemory`，但**调用点只有 `app.ts` 的 HTTP 端点**——记忆完全由用户手工维护，模型无法把「用户明确表达的稳定事实 / 偏好」自行沉淀（与参考的 Memory 能力不对齐）。
+- 目标：新增 `save_memory` `{text}`、`recall_memory` `{}`（可选 `forget_memory` `{id}`）；写入仍守「**显式写入、不自动脑补**」原则——只落用户明确表达的事实，不做推断抽取；按 `ownerKey` 隔离（复用 `owner.ts`）。
+- 落点：`builtins.ts`（注册 + `BUILTIN_RISK` 定 `write` / `scope: workspace`，无外部副作用故免确认）+ 复用 `memory.ts` 现有函数。
+- **验收**：模型调 `save_memory` 后 `GET /chat/memory` 可见，且下一轮 system 动态后缀已注入；`recall_memory` 只返回当前 owner 可见条目。
+
+**G. 可插拔 Backend（P2，架构项）**
+
+- 现状：`fs-store.ts` 把根目录硬编码为 `.data/fs/`，后端不可替换；持久层（`memory.json`）与工作区是两套独立实现，无 Composite 路径路由。
+- 目标：抽出 `FsBackend` 接口（read / write / edit / list / glob / grep）→ 先用现有磁盘实现；再评估 Composite（路径前缀路由，如 `/memories/` → 持久层、`/results/` → 工作区），为将来换 GridFS / 对象存储留口。**属架构重构、非新增工具，排最后做。**
+- **验收**：磁盘 backend 行为与现状逐字节一致（回归全绿）；Composite 路由单测通过。
+
+### 11.3 风险与护栏
+
+| 风险 | 缓解 |
+|---|---|
+| 新增工具扩大攻击面 | 一律先 `BUILTIN_RISK` 登记 + fail-closed；高风险默认 off、opt-in 才注册 |
+| `execute` / `browser` 沙箱逃逸 | 无沙箱后端不注册；网络/文件越界在**工具层**拦截（不靠 LLM 自律） |
+| 外部内容注入主代理 | `http_request` / `fetch_url` / `web_search` / `browser` 结果全部经 `wrapUntrusted` 定界 |
+| schema 膨胀挤占窗口 | 计入预算公式；超阈值走 `search_tools` 按需加载 |
+| 违反「禁止业务词写死」红线 | 新增工具描述/错误提示全部通用措辞；评审按 `AGENT_CHARTER.md` 审计口径 |
+| 模型侧记忆写入污染（把推断当事实沉淀） | 只落用户**明确表达**的事实，不做自动脑补抽取；按 `ownerKey` 隔离；写失败仅记录不阻断对话 |
+| Backend 重构引入回归 | 先抽接口、保持磁盘实现逐字节一致，回归全绿后再做 Composite 路径路由 |
+
+### 11.4 分期与验收
+
+- **P0（先做）**：`fs_glob`、`fs_grep`、`fs_read` offset/limit、`request_clarification`（结构化多选）。
+- **P1**：工作区快照（Checkpoints）、`http_request`、`bi-explorer` 专用子代理、Search files（由 glob/grep 覆盖）、`save_memory` / `recall_memory`。
+- **P2**：`execute`（**需先有沙箱后端**）、`browser`、`image_gen`、`web_search`、`fetch_url`、Read files（`fs_read` 图片分支）、`read_todos`、语义搜索、可插拔 Backend（架构项，最后做）。
+
+**回归清单**：`tsc --noEmit` ✓、`vite build` ✓、`scripts/_risk-gate-check.mjs`、`scripts/_deep-agents-check.mjs`、`scripts/_async-subagent-check.mjs`；新增 `scripts/_builtin-tools-parity-check.mjs`（新工具注册 + 风险登记 + 默认关闭断言）。
+
+### 11.5 与 §10 结论的关系
+
+§10「无需改动代码」成立的前提是**只对齐 Deep Agents 的能力层（middleware 形态）**，不含逐工具对标。按用户决议（参考清单缺口全补），本节为 §10 的**工具级增量**，不推翻其能力层结论；新增工具仍遵循 §10.4 的规则——在 `BUILTIN_RISK` 登记级别、必要时补 `toolRisks`，**不改主循环**。
+
+### 11.6 查缺补漏核对记录（2026-09-20，源码级）
+
+对 §11 结论逐条回源码核实；结果与修正如下。
+
+**① 已核实为真的结论**
+
+| 结论 | 证据（源码） |
+|---|---|
+| 内置工具就是这 11 个 | `builtins.ts` `builtinToolSpecs`（`search_tools` 条件注入）；`execBuiltin` 的 switch 分支一一对应 |
+| `fs_read` 无分页 | `fs-store.ts` `fsRead(conversationId, path)` 只有 path；超 `MAX_FILE_BYTES`(256KB) 直接截断 |
+| `fs_edit` 是防御性替换 | `fs-store.ts` `fsEdit`：命中 0 次报错、>1 次报「需要唯一」 |
+| 无 glob / grep / snapshot | `fs-store.ts` 导出仅有 `fsWrite` / `fsRead` / `fsEdit` / `fsList` / `fsRemoveConversation` / `offloadToolResult` |
+| 无 execute / browser / image_gen / web_search / http_request / fetch_url | 全仓无这些工具定义（`builtins.ts` + 各 MCP 适配器） |
+| 无结构化澄清工具 | 全仓 grep `clarif` / `ask_question` / `request_question` = **0**；澄清靠 `TOOLING_RULES` 第 3 条纯文本追问 |
+| `task` 无 `subagent_type` | `builtins.ts` 的 `task` 参数只有 `description` / `servers` |
+| 业务工具已外置为 MCP（§11.0 判断成立） | `yapi-mcp.mjs` 的 `TOOLS` 含 `call_api` / `search_apis` / `get_api_desc` / `list_projects` / `list_categories`；`bi` → `metabase-mcp.mjs` |
+| backend 不可替换 | `fs-store.ts` 顶部 `FS_ROOT = resolve(__dirname, "..", ".data", "fs")` 硬编码 |
+
+**② 本轮修正 / 新增的 4 项（原稿遗漏）**
+
+1. **模型侧 Memory 工具缺失**——`memory.ts` 的 `addMemory` / `removeMemory` / `listMemory` 调用点只有 `app.ts`（HTTP 端点），模型无法写入记忆。原 §11 未列 → 已补 §11.1 + §11.2 **F**。
+2. **可插拔 Backend / Composite 未对齐**——参考最佳实践明确列出 Backends 四态（State / Filesystem / Persistent / Composite），本项目只有磁盘单后端、无路径路由。→ 已补 §11.1 + §11.2 **G**。
+3. **`execute` 的硬前置 = 沙箱后端**——参考明确「仅当 backend 实现 SandboxBackend 才可用」；原稿只写 opt-in 开关，漏了「得先有沙箱」这个前置条件。→ 已补 §11.1 + §11.2 **D**。
+4. **图片输入其实已部分具备**——`uploads.ts`（png/jpeg/webp）+ `VISION=direct` 视觉模型已支持用户上传图片；真实缺口只是 `fs_read` 读不了工作区里的图片文件。→ 已修正 §11.1 该项，避免误计为「零基础」缺口。
+
+**③ 已对齐、无需新增的项（避免过度补齐）**
+
+| 参考最佳实践 | 本项目现状 | 判定 |
+|---|---|---|
+| Tool Result Eviction（默认 20000 token 自动落盘） | `MCP_TOOL_RESULT_BUDGET=12000` + `_KEEP=3` + `_PROTECT`；`offloadToolResult` 落盘并留 `fs_read` 指针 | ✅ 已对齐（阈值 12000 可配，差异非缺口） |
+| 工具 schema 超载 → Tool Search | `TOOL_SEARCH_MODE=auto` / `TOOL_SEARCH_RATIO=0.1` + `search_tools` | ✅ 已对齐 |
+| 写操作安全边界在工具/沙箱层 | `risk.ts` fail-closed + `confirm.ts` + `_risk-gate-check.mjs` 17/17 PASS | ✅ 已对齐（强于「trust-the-LLM」） |
+| `edit_file` 防御性替换 | `fsEdit` 唯一命中约束 | ✅ 已对齐 |
+| MCP 接外部能力 | `MCP_BUILTIN_SERVERS` + `mcp/hub.ts` 命名空间 + 注解定级 | ✅ 已对齐 |
+| Skills 渐进加载 | `skills.ts` 索引常驻 + `read_skill` 按需取全文 | ✅ 已对齐 |
+
+> 小结：原 §11 方向正确（缺 8 类工具），但**漏了 4 项**——模型侧记忆、可插拔 Backend、`execute` 的沙箱前置、图片输入已部分具备；已全部补入 §11.1 / §11.2 / §11.4。**代码仍零改动**，待确认后按 §11.4 分期实施。

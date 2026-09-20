@@ -25,6 +25,8 @@ export interface McpServerConfig {
   requireConfirm?: boolean;
   /** 工具级风险覆盖（键 = 裸工具名或命名空间名，`*` = 本服务器全部未单独声明的工具；优先级高于 requireConfirm 与注解，见 src/risk.ts）。 */
   toolRisks?: Record<string, "read" | "write" | "destructive">;
+  /** 命名「原生 SQL 工具」：这些工具若被定为 destructive，可在服务端按只读 SQL 判定降级免确认（见 src/risk.ts）。 */
+  readOnlySqlTools?: string[];
   /**
    * 工具白名单（server 上的**原始**工具名，非命名空间名）：声明后只把列出的工具注入模型，其余忽略。
    * 用于「一个 server 提供多个领域的工具、但某个角色只需要其中一部分」——收窄暴露面、减少无关 schema。

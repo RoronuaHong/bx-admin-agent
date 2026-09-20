@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { ModelInfo } from "../api";
+import { computed, nextTick, ref, watch } from "vue";
+import { MODEL_AUTO_ID, type ModelInfo } from "../api";
 import { getUiLocale } from "../ui-locale";
+import { useSelectPanel } from "../composables/useSelectPanel";
 
 const props = defineProps<{
   models: ModelInfo[];
@@ -31,14 +32,26 @@ interface SelectGroup {
   items: SelectOption[];
 }
 
-const root = ref<HTMLElement | null>(null);
-const triggerEl = ref<HTMLButtonElement | null>(null);
 const searchEl = ref<HTMLInputElement | null>(null);
-const listEl = ref<HTMLElement | null>(null);
-
-const open = ref(false);
 const query = ref("");
-const activeIndex = ref(0);
+
+const {
+  root,
+  triggerEl,
+  listEl,
+  open,
+  activeIndex,
+  indexOfId,
+  scrollActiveIntoView,
+  moveActive,
+  openPanel: openPanelBase,
+  closePanel,
+  choose: chooseBase,
+} = useSelectPanel({
+  flatOptions: () => flatOptions.value,
+  currentId: () => props.modelValue,
+  onChoose: (id) => emit("update:modelValue", id),
+});
 
 /** 能力标签：让「能不能读图」这类类型差异在列表里一眼可见。 */
 function tagsOf(model: ModelInfo): OptionTag[] {
@@ -70,31 +83,25 @@ const groups = computed<SelectGroup[]>(() => {
   return [...buckets.entries()].map(([label, items], index) => ({ label, tone: `t${index % 5}`, items }));
 });
 
-const flatOptions = computed(() => groups.value.flatMap((group) => group.items));
-const current = computed(() => props.models.find((model) => model.id === props.modelValue) || null);
-const currentSource = computed(() => (current.value ? groupKeyOf(current.value) : ""));
-const currentTags = computed(() => (current.value ? tagsOf(current.value) : []));
+const AUTO_LABELS = { zh: "自动", en: "Auto", "pt-BR": "Automático", hi: "स्वतः" } as const;
 
-function indexOfId(id: string): number {
-  return flatOptions.value.findIndex((option) => option.id === id);
-}
+const isAuto = computed(() => props.modelValue === MODEL_AUTO_ID);
+const autoLabel = computed(() => AUTO_LABELS[uiLocale.value] ?? AUTO_LABELS.en);
+const autoItem = computed<SelectOption>(() => ({ id: MODEL_AUTO_ID, label: autoLabel.value, tags: [] }));
 
-function scrollActiveIntoView() {
-  void nextTick(() => {
-    listEl.value?.querySelector<HTMLElement>(`[data-index="${activeIndex.value}"]`)?.scrollIntoView({ block: "nearest" });
-  });
-}
+const flatOptions = computed<SelectOption[]>(() => [autoItem.value, ...groups.value.flatMap((group) => group.items)]);
 
-function moveActive(delta: number) {
-  const total = flatOptions.value.length;
-  if (!total) return;
-  activeIndex.value = (activeIndex.value + delta + total) % total;
-  scrollActiveIntoView();
-}
+const currentModel = computed(() => props.models.find((model) => model.id === props.modelValue) || null);
+const currentLabel = computed(() =>
+  isAuto.value ? autoLabel.value : (currentModel.value?.label || ""),
+);
+const currentSource = computed(() => (currentModel.value ? groupKeyOf(currentModel.value) : ""));
+const currentTags = computed(() => (currentModel.value ? tagsOf(currentModel.value) : []));
 
+/** 打开时清空搜索并聚焦输入框（composable 只管开合与键盘，不感知 search 框）。 */
 async function openPanel() {
   if (open.value || !props.models.length) return;
-  open.value = true;
+  openPanelBase();
   query.value = "";
   const currentIndex = indexOfId(props.modelValue);
   activeIndex.value = currentIndex >= 0 ? currentIndex : 0;
@@ -103,20 +110,22 @@ async function openPanel() {
   scrollActiveIntoView();
 }
 
-function closePanel(refocusTrigger = false) {
-  if (!open.value) return;
-  open.value = false;
-  if (refocusTrigger) void nextTick(() => triggerEl.value?.focus());
-}
-
 function togglePanel() {
   if (open.value) closePanel();
   else void openPanel();
 }
 
+function onTriggerKeydown(event: KeyboardEvent) {
+  if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    void openPanel();
+  } else if (event.key === "Escape") {
+    closePanel();
+  }
+}
+
 function choose(id: string) {
-  emit("update:modelValue", id);
-  closePanel(true);
+  chooseBase(id);
 }
 
 function onSearchKeydown(event: KeyboardEvent) {
@@ -146,23 +155,6 @@ function onSearchKeydown(event: KeyboardEvent) {
   }
 }
 
-function onTriggerKeydown(event: KeyboardEvent) {
-  if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    void openPanel();
-  } else if (event.key === "Escape") {
-    closePanel();
-  }
-}
-
-function onPointerDown(event: MouseEvent) {
-  if (!root.value?.contains(event.target as Node)) closePanel();
-}
-
-function onWindowKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape" && open.value) closePanel(true);
-}
-
 watch(query, () => {
   activeIndex.value = 0;
   scrollActiveIntoView();
@@ -175,16 +167,6 @@ watch(
     if (!props.modelValue && list.length) emit("update:modelValue", list[0]!.id);
   },
 );
-
-onMounted(() => {
-  window.addEventListener("mousedown", onPointerDown);
-  window.addEventListener("keydown", onWindowKeydown);
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("mousedown", onPointerDown);
-  window.removeEventListener("keydown", onWindowKeydown);
-});
 </script>
 
 <template>
@@ -197,16 +179,17 @@ onBeforeUnmount(() => {
       :class="{ 'is-open': open }"
       :aria-expanded="open"
       aria-haspopup="listbox"
-      :aria-label="`${tx('模型', 'Model', 'Modelo', 'मॉडल')}${current ? ` ${current.label}` : ''}`"
-      :title="current?.label || ''"
+      :aria-label="`${tx('模型', 'Model', 'Modelo', 'मॉडल')}${currentLabel ? ` ${currentLabel}` : ''}`"
+      :title="currentLabel || ''"
       @click="togglePanel"
       @keydown="onTriggerKeydown"
     >
-      <span v-if="currentSource" class="msel__source">{{ currentSource }}</span>
+      <span v-if="isAuto" class="msel__source msel__source--auto" aria-hidden="true">AUTO</span>
+      <span v-else-if="currentSource" class="msel__source">{{ currentSource }}</span>
       <span class="msel__value">
-        {{ current?.label || tx("选择模型", "Select a model", "Selecionar um modelo", "मॉडल चुनें") }}
+        {{ currentLabel || tx("选择模型", "Select a model", "Selecionar um modelo", "मॉडल चुनें") }}
       </span>
-      <span v-if="currentTags.length" class="msel__tag is-vision">{{ currentTags[0]!.text }}</span>
+      <span v-if="!isAuto && currentTags.length" class="msel__tag is-vision">{{ currentTags[0]!.text }}</span>
       <span class="msel__caret" aria-hidden="true"></span>
     </button>
 
@@ -242,6 +225,30 @@ onBeforeUnmount(() => {
       </div>
 
       <ul id="msel-listbox" ref="listEl" class="msel__list" role="listbox" :aria-label="tx('模型', 'Model', 'Modelo', 'मॉडल')">
+        <li
+          :id="`msel-opt-${MODEL_AUTO_ID}`"
+          class="msel__option msel__option--auto"
+          role="option"
+          :aria-selected="isAuto"
+          :data-index="0"
+          :class="{ 'is-selected': isAuto, 'is-active': activeIndex === 0 }"
+          @click="choose(MODEL_AUTO_ID)"
+          @mouseenter="activeIndex = 0"
+        >
+          <span class="msel__option-text">
+            <span class="msel__option-label">
+              {{ autoLabel }}
+              <span class="msel__auto-badge" aria-hidden="true">AUTO</span>
+            </span>
+            <span class="msel__option-id msel__auto-desc">
+              {{ tx("自动选择可用模型", "Auto-pick a working model", "Selecionar automaticamente um modelo funcional", "स्वतः एक कार्यशील मॉडल चुनें") }}
+            </span>
+          </span>
+          <span class="msel__option-side">
+            <span v-if="isAuto" class="msel__check" aria-hidden="true">✓</span>
+          </span>
+        </li>
+
         <template v-for="group in groups" :key="group.label">
           <li class="msel__group" role="presentation">
             <span class="msel__group-dot" :class="group.tone" aria-hidden="true"></span>
@@ -273,7 +280,7 @@ onBeforeUnmount(() => {
             </span>
           </li>
         </template>
-        <li v-if="!flatOptions.length" class="msel__empty">
+        <li v-if="!groups.length" class="msel__empty">
           {{ tx("没有匹配的模型", "No matching model", "Nenhum modelo correspondente", "कोई मेल खाता मॉडल नहीं") }}
         </li>
       </ul>
@@ -335,6 +342,14 @@ onBeforeUnmount(() => {
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+.msel__source--auto {
+  color: color-mix(in srgb, var(--accent, #2f7d5a) 82%, var(--ink));
+  background: color-mix(in srgb, var(--accent, #2f7d5a) 12%, transparent);
+  border-radius: var(--radius-pill);
+  padding: 1px 5px;
+  letter-spacing: 0.05em;
 }
 
 .msel__value {
@@ -512,6 +527,35 @@ onBeforeUnmount(() => {
   cursor: pointer;
   font-size: 13px;
   transition: background 0.15s ease;
+}
+
+/* 「自动」置顶项：用左侧色条 + 浅底突出为推荐入口。 */
+.msel__option--auto {
+  background: color-mix(in srgb, var(--accent, #2f7d5a) 7%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent, #2f7d5a) 60%, transparent);
+}
+
+.msel__option--auto.is-active {
+  background: color-mix(in srgb, var(--accent, #2f7d5a) 13%, transparent);
+}
+
+.msel__auto-badge {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--accent, #2f7d5a) 16%, transparent);
+  color: color-mix(in srgb, var(--accent, #2f7d5a) 88%, var(--ink));
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 15px;
+}
+
+.msel__auto-desc {
+  margin-top: 1px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 /* 高亮用半透明 ink 叠加（浅色压暗、深色提亮），避免依赖固定底色在深色下失效 */

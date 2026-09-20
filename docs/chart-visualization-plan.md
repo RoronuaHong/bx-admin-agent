@@ -18,7 +18,7 @@
 
 | 能力 | 落点 | 判定 |
 |---|---|---|
-| 查数据 | `.env` 的 `MCP_BUILTIN_SERVERS` → `scripts/metabase-mcp.mjs`（`list_databases`/`get_database_schema`/`run_native_query`/`list_cards`/`list_dashboards`/`get_dashboard`/`get_card`/`search`） | ✅ 8 个**只读**工具（**没有**建卡工具） |
+| 查数据 | `.env` 的 `MCP_BUILTIN_SERVERS` → `scripts/metabase-mcp.mjs`（`list_databases` / `get_database_schema` / **`get_field_values`** / `run_native_query` / `list_cards` / `list_dashboards` / `get_dashboard` / `get_card` / `search`） | ✅ 9 个工具 = **8 个只读** + `run_native_query`（执行任意 SQL），**没有**建卡工具。2026-09-19 新增取值域工具 `get_field_values`（写过滤/分组条件前先取证），`toolRisks` 已同步标 `read` |
 | 存数据 | `src/fs-store.ts` + `fs_write/read/edit/ls`，对话级工作区 `.data/fs/<convId>/` | ✅ |
 | **对话内显示图片** | `apps/web/src/chat-richtext.ts`：DOMPurify 白名单**已含 `img`**（`src/width/height`），URI 放行 `https` 与相对路径 | ✅ **不需要改前端** |
 | 出图工具 | —— | ❌ 无 |

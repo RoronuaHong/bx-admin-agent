@@ -20,9 +20,13 @@ export type RiskLevel = "read" | "write" | "destructive";
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
+// 支持扩展思考的模型（Claude 3.7+/4、o 系列）会在回答前产出 thinking 事件：前端渲染成
+// 可折叠的「思考过程」块，取代静默规划期的「正在规划…」占位（最佳实践：实时展示推理）。
 export type ChatEvent =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "thinking_delta"; text: string }
   | { type: "model"; id: string; label: string }
   | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
   | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
@@ -97,6 +101,12 @@ export type ChatEvent =
       toolFusions?: number;
       /** 伪工具调用（把调用写成文本）被拦截并纠正的次数。 */
       pseudoCallRetries?: number;
+      /** 接地护栏纠正次数（零数据作答被作废并回灌提示补取数据的次数）。 */
+      groundingRetries?: number;
+      /** 事后核验次数（收束前对「回答 vs 本轮证据」做断言级核对的次数）。 */
+      groundingVerifications?: number;
+      /** 纠正后仍未取得任何工具数据、最终以确定性拒答收束。 */
+      ungrounded?: boolean;
       /** 循环累计发送的 prompt token 估算（成本护栏开启时统计）。 */
       costTokens?: number;
     }

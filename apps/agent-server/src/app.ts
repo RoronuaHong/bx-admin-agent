@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ApiErrorPayload, LocalizedToken } from "@bx/shared";
+import type { ApiErrorPayload, LocalizedToken, TodoItem } from "@bx/shared";
 import { cors } from "hono/cors";
 import { getCookie, setCookie } from "hono/cookie";
 import { config, listModels } from "./config.js";
@@ -110,7 +110,7 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
     ...(modelEvent ? { model: modelEvent.id } : {}),
     status,
     durationMs: (task.settledAt || Date.now()) - task.startedAt,
-    ...(usage ? { rounds: usage.rounds, toolCalls: usage.toolCalls, tokens: usage.tokens, costTokens: usage.costTokens, modelRetries: usage.modelRetries, modelFallbacks: usage.modelFallbacks } : {}),
+    ...(usage ? { rounds: usage.rounds, toolCalls: usage.toolCalls, tokens: usage.tokens, costTokens: usage.costTokens, modelRetries: usage.modelRetries, modelFallbacks: usage.modelFallbacks, groundingRetries: usage.groundingRetries, groundingVerifications: usage.groundingVerifications, ungrounded: usage.ungrounded } : {}),
     ...(errorEvent ? { error: String(errorEvent.message || errorEvent.error?.defaultMessage || "") } : {}),
     release: getRelease(),
   };
@@ -180,10 +180,27 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
       name: event.name,
       status: resultOk.get(event.id) === false ? "error" : "ok",
     }));
+  // 推理面板相关字段重建（与前端 toStored 对称）：客户端断开后由服务端代为落库，
+  // 思考过程 / 任务规划必须从事件缓冲里拼回，否则刷新后推理面板内容丢失。
+  let thinking = "";
+  let todos: TodoItem[] | undefined;
+  for (const event of task.buffer) {
+    if (event.type === "thinking_delta") thinking += event.text;
+    else if (event.type === "todos") todos = event.todos;
+  }
   const messages = [
     ...((doc?.messages || []) as StoredMessage[]),
-    { role: "user" as const, text: task.userText },
-    { role: "assistant" as const, text: finalText, ...(steps.length ? { steps } : {}) },
+    {
+      role: "user" as const,
+      text: task.userText,
+    },
+    {
+      role: "assistant" as const,
+      text: finalText,
+      ...(thinking ? { thinking } : {}),
+      ...(todos?.length ? { todos } : {}),
+      ...(steps.length ? { steps } : {}),
+    },
   ];
   await upsertMessages({ id: task.conversationId, messages });
   return true;
