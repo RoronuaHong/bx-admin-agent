@@ -12,3 +12,7 @@ coverage
 # 调试抓包产物（Chrome DevTools 导出的 request/response dump）
 *.network-request
 *.network-response
+# 根目录的调试产物（截图 / 探针输出）：此前被误提交过（_movie_test.png、_probe-*.txt 等）。
+# 只忽略**仓库根目录**的 `_*` 文件——apps/agent-server/scripts/_*.mjs 这类刻意保留的回归脚本不受影响。
+/_*.png
+/_*.txt
