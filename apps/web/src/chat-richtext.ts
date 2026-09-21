@@ -19,10 +19,50 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
 
-DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
-  if (data.attrName === "style") {
-    data.forceKeepAttr = true;
-  }
+/**
+ * 这里是渲染**模型输出**的最后一道防线：内容可能来自抓取回来的网页，不能当可信输入。
+ * 富文本里的行内排版样式要保留（折叠块、表格、Markdown 注入都依赖它），但能用来劫持页面的
+ * CSS 必须拦掉——`position:fixed + inset:0 + z-index` 就能铺一层假 UI 做钓鱼 overlay。
+ * 所以按**属性白名单**逐条过滤声明，而不是整体放行整个 style。
+ */
+const SAFE_STYLE_PROPS = new Set([
+  "color", "background", "background-color", "opacity",
+  "font", "font-family", "font-size", "font-weight", "font-style",
+  "text-align", "text-decoration", "text-indent", "line-height", "letter-spacing", "white-space",
+  "vertical-align", "word-break", "overflow-wrap", "float", "clear",
+  "width", "max-width", "height", "max-height",
+  "border", "border-color", "border-width", "border-style", "border-radius", "border-collapse",
+  "padding", "padding-left", "padding-right", "margin", "margin-left", "margin-right",
+]);
+
+/**
+ * 按白名单重写一整条 style：只保留安全声明，整条为空就干脆去掉这个属性。
+ * 注意钩子必须挂在 `afterSanitizeAttributes` 上——`uponSanitizeAttribute` 只处理「本来要被丢掉」
+ * 的属性，而 `style` 在 DOMPurify 的白名单里，改 `attrValue` 根本不会被调用（实测确认过）。
+ */
+function filterStyleDeclarations(raw: string): string {
+  return raw
+    .split(";")
+    .map((decl) => decl.trim())
+    .filter(Boolean)
+    .filter((decl) => {
+      const colon = decl.indexOf(":");
+      if (colon <= 0) return false;
+      const prop = decl.slice(0, colon).trim().toLowerCase();
+      const value = decl.slice(colon + 1).trim().toLowerCase();
+      if (!SAFE_STYLE_PROPS.has(prop)) return false;
+      // 白名单属性仍可能在值里夹带危险内容：url() / javascript: / expression() / 转义
+      return !/url\(|javascript:|expression\(|\\/.test(value);
+    })
+    .join("; ");
+}
+
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  const el = node as unknown as Element | null;
+  if (!el || typeof el.hasAttribute !== "function" || !el.hasAttribute("style")) return;
+  const kept = filterStyleDeclarations(el.getAttribute("style") || "");
+  if (kept) el.setAttribute("style", kept);
+  else el.removeAttribute("style");
 });
 
 /** 超过该行的表格默认折叠（与 history.ts 上下文表格折叠阈值一致），避免长表占满首屏。 */
@@ -62,6 +102,20 @@ function foldAgentBlocks(html: string, locale: UiLocale): string {
   const body = doc.body;
   const labels = FOLD_LABELS[locale];
 
+  // 标题层级下沉：模型在气泡里写 `#`/`##` 会被渲染成 h1/h2，与整页唯一的 <h1>（助手名）撞车，
+  // 还会出现「h1 之后直接 h3」的跳级（WCAG 1.3.1 / 2.4.6）。整页标题已是 h1，
+  // 这里把气泡内所有标题统一降一级（h1→h2 … h5→h6，h6 封顶），让文档大纲只剩一个 h1、
+  // 气泡内容从 h2 起、相对层级不丢、也不产生跳级。
+  for (const h of Array.from(body.querySelectorAll("h1, h2, h3, h4, h5, h6"))) {
+    const level = Number(h.tagName.charAt(1));
+    if (level >= 6) continue;
+    const nh = doc.createElement("h" + (level + 1));
+    if (h.className) nh.className = h.className;
+    if (h.id) nh.id = h.id;
+    while (h.firstChild) nh.appendChild(h.firstChild);
+    h.parentNode!.replaceChild(nh, h);
+  }
+
   // 1) [本轮已执行的工具] 段落 + 其后连续的列表（工具调用清单）整体收起。
   const heads = Array.from(body.querySelectorAll("p, h1, h2, h3, h4, h5, h6"));
   for (const h of heads) {
@@ -98,6 +152,12 @@ function foldAgentBlocks(html: string, locale: UiLocale): string {
     details.appendChild(w);
   }
 
+  // 表格可访问性：MarkdownIt 渲染出的 <th> 默认不带 scope，列数一多读屏只会逐格念、
+  // 分不清「这一格属于哪一列」，WCAG 1.3.1 要求表头与单元格建立关联。
+  // 表头行在 thead 的给 scope=col，tbody 内若出现行表头（th）给 scope=row。
+  body.querySelectorAll("table thead th").forEach((th) => th.setAttribute("scope", "col"));
+  body.querySelectorAll("table tbody th").forEach((th) => th.setAttribute("scope", "row"));
+
   return body.innerHTML;
 }
 
@@ -123,7 +183,7 @@ export function renderChatMarkdown(text: string, locale: UiLocale = "zh"): strin
       "div","span","details","summary",
       "a","img",
     ],
-    ALLOWED_ATTR: ["href","src","alt","title","class","style","target","rel","width","height","align","id","name","type","start","colspan","rowspan"],
+    ALLOWED_ATTR: ["href","src","alt","title","class","style","target","rel","width","height","align","id","name","type","start","colspan","rowspan","scope"],
     ALLOW_DATA_ATTR: false,
     FORCE_BODY: true,
     ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,

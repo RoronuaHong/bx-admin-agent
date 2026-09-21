@@ -241,6 +241,10 @@ function toAnthropicMessages(
       out.push({ role: "user", content });
       continue;
     }
+    // 空 assistant 轮（无正文、也无工具调用）对上游是非法消息（"... with role 'assistant' must not be empty"）。
+    // 历史上出现过这种轮次（用户在任何正文产生前点「停止」时曾回写空轮）——这里做**边界自愈**：
+    // 直接丢弃、不发给上游。否则一条脏历史会让该会话每次请求都失败，且候选链救不了（所有模型同样 400）。
+    if (turn.role === "assistant" && !String(turn.content || "").trim() && !turn.toolCalls?.length) continue;
     out.push({ role: turn.role, content: turn.content });
   }
   return out;
@@ -533,6 +537,9 @@ function toOpenAiMessages(
       out.push({ role: "user", content });
       continue;
     }
+    // 空 assistant 轮自愈（与 Anthropic 转换器同口径）：不带正文、也不带工具调用的 assistant 消息
+    // 对上游是非法参数，整条会话会每次请求都 400。丢弃它——这种轮次不含任何信息。
+    if (turn.role === "assistant" && !String(turn.content || "").trim() && !turn.toolCalls?.length) continue;
     out.push({ role: turn.role, content: turn.content });
   }
   return out;

@@ -1,7 +1,9 @@
 // 内置工具层（路线 B：在自研 harness 上补齐 Deep Agents 能力）。
 // 与 MCP 工具同台竞争：同一套 tool_calls 循环、同一套事件契约（server 标记为 "builtin"）。
-// 仅在「启用 MCP」的工具模式下注入 —— 直连模式保持零工具语义；schema token 计入预算公式。
+// 注入策略：内置工具是**本机能力**，始终注入（不依赖「勾选了哪个连接器」）；
+// 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
 import type { ClarifyOption, TodoItem } from "@bx/shared";
+import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite } from "./fs-store.js";
 import { setConversationTodos } from "./conversations.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
@@ -28,6 +30,7 @@ export const BUILTIN_RISK: Record<
   fs_glob: { level: "read", scope: "workspace", reason: "按模式匹配本对话工作区文件" },
   fs_grep: { level: "read", scope: "workspace", reason: "检索本对话工作区文件内容" },
   read_skill: { level: "read", scope: "workspace", reason: "读取技能说明" },
+  render_chart: { level: "read", scope: "workspace", reason: "前端本地渲染图表（数据不出本机，无外部副作用）" },
   request_clarification: { level: "read", scope: "workspace", reason: "向用户提问以澄清需求（无外部副作用）" },
   recall_memory: { level: "read", scope: "workspace", reason: "读取长期记忆（只读）" },
   save_memory: { level: "write", scope: "workspace", reason: "写入长期记忆（仅本对话归属，无外部副作用）" },
@@ -74,6 +77,17 @@ export interface BuiltinOutcome {
     missingField?: string;
     whyItMatters?: string;
   };
+  /**
+   * 前端本地渲染图表（方案 D / 路线 3）：工具层只透传 spec，浏览器用 AntV 本地绘制
+   * （零外链、数据不出本机，无外部副作用）。由 chat 循环负责下发 chart 事件。
+   */
+  chart?: {
+    title?: string;
+    chartType: string;
+    data: unknown;
+    encode?: Record<string, string>;
+    options?: Record<string, unknown>;
+  };
 }
 
 const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
@@ -92,6 +106,12 @@ function spec(name: string, description: string, parameters: Record<string, unkn
 }
 
 const jsonType = (type: string, description: string) => ({ type, description });
+
+/** render_chart 支持的图表族（前端据此映射到 G2 / G6）：清单在 @bx/shared，与前端分流同源。 */
+export const CHART_TYPES = new Set<string>(SHARED_CHART_TYPES);
+
+/** 图形类（走 G6 而非 G2）：同样取自共享清单，避免「后端放行、前端按统计图画」的漂移。 */
+const GRAPH_CHART_TYPES = new Set<string>(SHARED_GRAPH_CHART_TYPES);
 
 /**
  * 工具检索（按需加载模式的入口：对齐 Claude Code 的 ToolSearch 与 Anthropic「Code execution with MCP」
@@ -281,6 +301,31 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         type: "object",
         properties: { name: jsonType("string", "技能目录名（见系统提示中的技能索引）") },
         required: ["name"],
+      },
+    ),
+    spec(
+      "render_chart",
+      "在对话内本地渲染一张图表（浏览器用 AntV 绘制，零外链、数据不出本机）。" +
+        "调用前必须先通过取数工具拿到真实数据，把数据行（或图形结构）透传进来，**禁止编造数据点**。" +
+        "chartType 取值：饼图 pie / 横向柱 bar / 纵向柱 column / 折线 line / 面积 area / 散点 scatter / 雷达 radar /" +
+        "矩形树 treemap / 漏斗 funnel / 箱线 boxplot / 直方图 histogram / 瀑布 waterfall / 双轴 dual_axes /" +
+        "桑基 sankey / 思维导图 mind_map / 组织架构 org_chart / 关系网络 network。" +
+        "图形类（sankey/mind_map/org_chart/network）data 用 {nodes:[{id,label}],edges:[{source,target,label?}]}" +
+        "或层级结构 {name,children:[...]}；统计图 data 用行数组，encode 指定 x/y/color/series 字段。",
+      {
+        type: "object",
+        properties: {
+          title: jsonType("string", "图表标题（可选）"),
+          chartType: jsonType("string", "图表族：pie/bar/column/line/area/scatter/radar/treemap/funnel/boxplot/histogram/waterfall/dual_axes/sankey/mind_map/org_chart/network"),
+          data: {
+            description:
+              "真实数据：统计图为行对象数组；图形类为 {nodes,edges} 或 {name,children} 层级结构。禁止编造。",
+            type: "array",
+          },
+          encode: jsonType("object", "字段映射：{ x, y, color, size, series } 等（统计图用）"),
+          options: jsonType("object", "额外选项（轴标题、图布局等）"),
+        },
+        required: ["chartType", "data"],
       },
     ),
     spec(
@@ -514,6 +559,64 @@ export async function execBuiltin(
       const content = readSkill(str(args, "name"));
       if (!content) return { ok: false, text: `技能不存在：${str(args, "name")}` };
       return { ok: true, text: content };
+    }
+    case "render_chart": {
+      const chartType = String(args.chartType ?? args.type ?? "").trim().toLowerCase();
+      if (!CHART_TYPES.has(chartType)) {
+        return {
+          ok: false,
+          text: `不支持的图表类型：${chartType || "(空)"}。支持：${[...CHART_TYPES].join("、")}`,
+        };
+      }
+      // 模型偶尔把结构化参数当 JSON 字符串传（双重编码）：宽容解析，省掉一轮无谓重试。
+      const asJson = (v: unknown): unknown => {
+        if (typeof v !== "string") return v;
+        try {
+          return JSON.parse(v);
+        } catch {
+          return v;
+        }
+      };
+      const rawData = asJson(args.data);
+      if (GRAPH_CHART_TYPES.has(chartType)) {
+        // 图形类：接受 {nodes,...} 或层级 {name,children}。
+        // 注意数组的 typeof 也是 "object"，必须显式排除——否则 [1,2] 会一路走到前端才抛错降级成表格。
+        if (typeof rawData !== "object" || rawData === null || Array.isArray(rawData)) {
+          return {
+            ok: false,
+            text: "render_chart（图形类）需要 data 为 {nodes,edges} 或 {name,children} 结构（不能是数组）",
+          };
+        }
+        const g = rawData as Record<string, unknown>;
+        if (!Array.isArray(g.nodes) && !Array.isArray(g.children)) {
+          return {
+            ok: false,
+            text: "render_chart（图形类）的 data 需要含 nodes 数组（关系/流程）或 children 数组（层级/树）",
+          };
+        }
+      } else if (!Array.isArray(rawData)) {
+        return { ok: false, text: "render_chart（统计图）需要 data 为行对象数组（真实数据，禁止编造）" };
+      } else if (rawData.some((r) => typeof r !== "object" || r === null || Array.isArray(r))) {
+        // 纯数字数组（[1,2,3]）画不出图：G2 要靠字段名取 x/y，静默空白比明确回告更糟。
+        return {
+          ok: false,
+          text: 'render_chart（统计图）的 data 必须是「行对象」数组（如 [{"name":"A","value":1}]），纯数字数组无法确定坐标字段',
+        };
+      }
+      const MAX_ROWS = 5000;
+      const data = Array.isArray(rawData) ? rawData.slice(0, MAX_ROWS) : rawData;
+      const title = str(args, "title") || undefined;
+      const encRaw = asJson(args.encode);
+      const optRaw = asJson(args.options);
+      const encode =
+        encRaw && typeof encRaw === "object" ? (encRaw as Record<string, string>) : undefined;
+      const options =
+        optRaw && typeof optRaw === "object" ? (optRaw as Record<string, unknown>) : undefined;
+      return {
+        ok: true,
+        text: `已生成图表（${title || chartType}），将在对话内本地渲染。`,
+        chart: { title, chartType, data, encode, options },
+      };
     }
     case "search_knowledge": {
       const query = str(args, "query").trim();

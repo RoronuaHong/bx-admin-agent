@@ -181,13 +181,13 @@ watch(
       :class="{ 'is-open': open }"
       :aria-expanded="open"
       aria-haspopup="listbox"
-      :aria-label="`${tx('模型', 'Model', 'Modelo', 'मॉडल')}${currentLabel ? ` ${currentLabel}` : ''}`"
+      :aria-label="`${tx('模型', 'Model', 'Modelo', 'मॉडल')}${currentSource ? ` ${currentSource}` : ''}${currentLabel ? ` ${currentLabel}` : ''}`"
       :title="currentLabel || ''"
       @click="togglePanel"
       @keydown="onTriggerKeydown"
     >
       <span v-if="isAuto" class="msel__source msel__source--auto" aria-hidden="true">AUTO</span>
-      <span v-else-if="currentSource" class="msel__source">{{ currentSource }}</span>
+      <span v-else-if="currentSource" class="msel__source" aria-hidden="true">{{ currentSource }}</span>
       <span class="msel__value">
         {{ currentLabel || tx("选择模型", "Select a model", "Selecionar um modelo", "मॉडल चुनें") }}
       </span>

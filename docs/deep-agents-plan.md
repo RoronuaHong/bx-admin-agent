@@ -128,7 +128,9 @@ chatStream
 | D3 任务规划 | `builtins.ts(write_todos)`、`conversations.todos`、NDJSON `todos` 事件、前端计划卡 | 全量替换语义（对齐 Claude Code/deepagents）；持久化到 `conversation.todos`；前端气泡内渲染 ✓/•/○/× 状态（不只靠颜色） |
 | D4 子代理（通用型） | `builtins.ts(task)` + `chat.ts runLoop/runSubagent` | 子代理 = 同一个 `runLoop` 换独立上下文（只看 description）+ 最小工具集（无 `task`/`write_todos`）+ `SUBAGENT_PROMPT` + 回传摘要（≤4000 字，超出截断并提示先落盘）；**连续的 task 调用并行执行**（并发上限 3，worker 池）；取消级联（沿用主代理 signal）；轮次上限 `SUBAGENT_MAX_ROUNDS=10` |
 
-**工具注入规则**：内置工具（fs_* / write_todos / read_skill / task）只在**工具模式**（启用 MCP）注入，直连模式保持零工具语义（实测 `budget=86246` 不变，即 schema 为 0）。schema token 已并入预算公式。
+**工具注入规则**：内置工具（fs_* / write_todos / read_skill / task / render_chart …）**始终注入**——它们是本机能力、不含外部数据面；勾选的 MCP 服务器再额外注入其外部工具（`mcp__<server>__<tool>`）。「勾选」只表达「要接哪些外部数据源」，不再兼职当「要不要本机能力」的开关。schema token 已并入预算公式。
+
+> 2026-09-21 修正：旧实现用同一个 `toolMode`（=勾了 MCP）同时决定「是否注入内置工具」与「是否跑工具循环」，导致**没勾任何连接器的新对话零工具**——连本地出图（`render_chart`）、工作区文件都用不了。现已拆成正交两件事：`mcpEnabled`（外部数据面：是否收集外部工具 / 是否按需检索）与内置工具恒注入；「零工具直连」只在真的没有任何工具可用时成立。对齐 Cursor / Claude Code：本地能力恒可用，外部数据源按需接入。
 
 **顺带修复**：前端 `streamChat` 之前漏发 `conversationId`（一直靠服务端 activeConversationId 回退，多标签页会串）——现已显式带上（对齐 §6.1 契约）。
 
@@ -239,7 +241,7 @@ chatStream
   1. **安全边界放在工具/沙箱层**（`risk.ts` fail-closed + 确认门 `confirm.ts`），不靠 LLM 自我约束；
   2. 高风险工具（`execute` / `browser` / `image_gen` / `http_request` 外发类）**默认关闭、opt-in**，且必须在 `BUILTIN_RISK` 登记级别（漏登 `assertBuiltinRiskCoverage` 启动即抛错）；
   3. **零业务词写死**（`AGENT_CHARTER.md` 最高红线）——工具描述 / 错误提示 / 示例一律用 `XX` / `<模块>` / `<接口>` 占位；
-  4. 所有新增内置工具**只在工具模式（启用 MCP）注入**，直连模式保持零工具语义；
+  4. 内置工具**始终注入**（本机能力，与连接器勾选状态无关）；外部工具按对话勾选注入，勾选只表达「要接哪些外部数据源」；
   5. schema token 计入预算公式，超阈值走 `search_tools` 按需加载（`deferred`）。
 
 ### 11.1 对标矩阵（现状 → 目标）
@@ -528,3 +530,33 @@ chatStream
 2. **测试脚本 cookie jar 缺陷（已修）**：原实现只取第一个 `set-cookie`，把 `bx_agent_oid`（owner 标识）丢掉，导致归属隔离验证失真；已改为合并全部 `set-cookie`（sid 与 oid 都保留）。
 
 > 线上浏览器会自动管理全部 cookie，此缺陷仅存在于测试脚本，不影响真实用户。
+
+---
+
+### 11.9 第三轮核对：查缺补漏 + 去冗余（2026-09-21，源码级）
+
+> 延续 §9 / §11.6 / §11.7 的核对节奏；本轮覆盖面 = 本轮新做的两块（本地出图链路、聊天附件）。
+
+#### 11.9.1 真实缺陷（已修）
+
+| # | 缺陷 | 根因 | 处置 |
+|---|---|---|---|
+| A1 | **排队发出的消息静默丢文档附件** | `ChatPage.vue` 三处调用漏传 `docIds`：①`runTurn` 的并发兜底分支 `enqueueMessage(convId, text, imageIds)`；②`sendQueueItemNow` → `runTurn(convId, item.text, item.images)`；③`runTurn` 捕获 409 `CONVERSATION_BUSY` 后的入队分支 | 三处补 `docIds` / `item.docs`；服务端 `PendingMessage` 同步补 `docs?: string[]`（此前类型缺字段，靠 payload 原样透传侥幸没丢，属"类型说谎"） |
+| A2 | **图表渲染失败绕过降级、并留未处理拒绝** | `ChartCard.vue` 里 G2 的 `chart.render()` 是 Promise（`Runtime.render(): Promise<...>`）却未 `await`：渲染期抛错只在 Promise 里拒绝 → 既不出降级表格，又冒未处理拒绝；`forceFit()` 同类 | `await chart.render()`；`forceFit()` 用 `Promise.resolve(...).catch()` 兜住异步拒绝 |
+| A3 | **渲染失败路径泄漏半成品实例** | 接管本次渲染的 `dispose()` 发生在"本实例赋值之前"，失败分支既不销毁也不置空 | 抽 `discardMine()`：只销毁本次自建实例（不碰已被新渲染接管的 `instance`），作废与失败两条路径共用 |
+| A4 | **子代理出的图被静默丢弃** | `runSubagent` 只转发 `text_delta/text/tool_call`，`chart` 事件被吞；而 `render_chart` 就在子代理的内置工具集里 → 模型声称已出图、界面什么都没有 | 子代理事件循环转发 `chart` 事件（`runSubagentBatch` 本就原样透传，链路即通） |
+| A5 | **附件注入无总预算，可把请求顶出窗口** | `buildAttachmentContext` 只有「单附件 30000 **字符**」一道限制：中文下 30000 字符 ≈ 30000 token；且附件数不限、合计不设上限。而附件文本进的是**系统提示**，`historyBudgetTokens` 只扣「输出预留 + 工具 schema + 工具结果预算」，不含系统提示 → 多贴几份文档即可能超窗（上游 400） | 改为 **token** 计量：单附件 `ATTACH_MAX_TOKENS`（默认 8000）+ 本轮合计 `ATTACH_TOTAL_MAX_TOKENS`（默认 20000）；超限的附件按 token 截断或整体跳过，并把「跳过了哪些」如实写进注入内容（不静默丢）；新增纯函数 `truncateToTokens` + `tests/attachment-budget.test.ts` 4 例锁定（中文/英文/未超限/空与零预算） |
+
+#### 11.9.2 去冗余 / 口径统一
+
+- **图表 spec 三处各写一份 → 收敛为 `@bx/shared` 的 `ChartSpec`**：`ChatEvent` 的 chart 变体、web `api.ts` 的 `ChartSpec`、服务端 `StoredMessage.charts` 此前各自内联。其中服务端那份最危险——只认 13 种**旧图型**（含 `gauge/heatmap/graph/wordcloud`，而工具白名单根本没有这几种；缺 `column/treemap/funnel/waterfall/dual_axes/mind_map/org_chart/network`），还把图形类的 `data` 声明成数组（实际是 `{nodes,edges}`）——类型与实际形状不符，属"类型说谎"。
+- **图型白名单同源**：`CHART_TYPES` / `GRAPH_CHART_TYPES` 提到 `@bx/shared`，服务端 `render_chart` 校验与前端 G2 / G6 分流共用一份（此前前端自己抄了一份 4 项图形类清单，后端加一种新图型就会"前端按统计图画、静默降级成表格"）。
+- **上传模块清理**：删掉死代码 `EXT_MEDIA`（定义了从不使用，语义已被 `MEDIA_BY_EXT` 覆盖）；`EXT_BY_NAME` 原先手抄一遍扩展名，改为由 `MEDIA_BY_EXT` 的键派生；`IMAGE_TTL_MS` → `FILE_TTL_MS`（该模块现在同时管图片与文档附件，旧名与实际职责不符）。
+- **过期注释更正**：`builtins.ts` 顶部仍写着"仅在启用 MCP 的工具模式下注入"，与现行"内置工具恒注入、勾选只决定外部数据面"（§8 末条 toolMode 拆分）矛盾。
+
+#### 11.9.3 回归
+
+- `tsc --noEmit`（agent-server）**exit 0**；`vue-tsc --noEmit`（web）**exit 0**；
+- `vitest run`（agent-server）**11 files / 74 tests 全过**（含 `chart-render.test.ts` 的白名单自检——白名单改为共享常量后仍全绿；新增 `attachment-budget.test.ts` 4 例）。
+- `vite build`（web）**通过**（2457 modules / 5.14s）——顺带验证了 `@bx/shared` 在**运行时**被前端按值引用（`GRAPH_CHART_TYPES`）可正常打包（此前该包只被前端按类型引用）。
+- 未做：真实模型端到端（附件与出图都在浏览器侧验过，见 `docs/chart-visualization-plan.md` §11）。

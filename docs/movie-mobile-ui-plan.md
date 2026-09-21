@@ -152,3 +152,224 @@
 - 点击「返回顶部」：容器从 ~3900px 渐进滑动到 0（中途采样确认是动画而非瞬移）；reduced-motion 下直接到 0。
 - 发送消息 / 进入对话：`scrollToBottom(true)` 平滑滚到底；流式跟底保持即时贴合、无留缝。
 - Lint：涉及文件 0 新增错误；HMR 正常。
+
+## 输入与无障碍（2026-09-21，全局审计）
+
+把页面运行时逐项拆开对齐权威写法后，发现的问题与处理（"修复"列按外面 site 的推荐/规范落地）：
+
+| 子系统 | 问题 | 修复 | 依据 |
+|---|---|---|---|
+| 回车发送 | `@keydown.enter.exact.prevent`：`.exact` 只管 Shift/Ctrl 修饰键，**管不了输入法状态**——中文里回车是"把候选词上屏"，却被当成发送 | 改 `@keydown="onKeydown"`：`Enter && !shiftKey && !isComposing`，并留旧浏览器回退 `keyCode===229` | MDN `KeyboardEvent.isComposing`（UI Events）：合成会话期间（`compositionstart`→`compositionend`）的按键不应触发业务提交；同仓 `ChatPage.onKeydown` 早已这么写，MoviePage 是漏网的 |
+| 对话区语义 | `.mc-inner` 是裸 div：**无 `role="log"`、无 `aria-live`，整页也没有 `main` 地标** → 读屏用户完全不知道回复已经到了 | `.mc-inner` 加 `role="log" aria-live="polite"` + 本地化可访问名称；滚动容器 `div` → `main`（每页一个主地标，跳转链接才有落点） | MDN log role：角色隐含 `aria-live=polite`，典型用例就是聊天记录，且**必须有可访问名称** |
+| 流式播报策略 | 光加 live region 不够：一次回复几百个增量，会让读屏逐字轰炸 | 生成期间给 log 区 `aria-busy="true"`，收束回落 `false` → 等整段完成再播报一次 | MDN `aria-busy`：live region 标 busy 可让辅助技术等更新完成再暴露内容 |
+| 发言者可分辨 | 气泡没有说话人信息 | 每条气泡补视觉隐藏前缀（"我说：" / "观影助手："） | 聊天日志要能听出每条是谁说的 |
+| 思考面板标题 | summary 里 `sr-only` 标签与可见标签同时存在，有推理内容时同一句被念两遍 | `sr-only` 只在"没有可见标题"时才加 | 可见文本已在无障碍树里，再挂一份同名 sr-only 就是重复 |
+| 确认弹窗焦点 | 只做"打开聚焦 + 关闭归还"，**没有 Tab 陷阱**：实测按一次 Tab 焦点掉到 `body`、接着跑到弹窗背后 | 背景整体 `inert` + Tab/Shift+Tab 在弹窗首尾循环（保留 Esc、焦点归还） | WAI-ARIA APG 对话框线路；`inert`（Chrome 102+/Safari 15.5+/Firefox 112+）比手写背景屏蔽更彻底 |
+| 输入框名称 | 只有 placeholder（DevTools 报 issue：`A form field element should have an id or name attribute`） | 补本地化 `aria-label`，并加 `enterkeyhint="send"`（移动端键盘显示"发送"） | placeholder 不是可靠的可访问名称 |
+
+### 实测否决的改动（别为了优化而优化）
+
+- **假设"每个流式 token 都重解析 markdown 会卡"——不成立**：一条 45 秒、12 条列表的长回复实测**全程 47 次 DOM 变更、0 个长任务（≥50ms）**，Vue 的异步批处理已把增量合并进同一 tick/帧，无需再加 rAF 节流。
+- **移动端视口**：`.mc` 已是 `100dvh`，`env(safe-area-inset-*)` 已铺到 composer 与返回顶部，无需改。
+- **XSS**：`renderChatMarkdown` 经 DOMPurify 净化后才进 `v-html`，无需改。
+
+### 验证实例（2026-09-21，浏览器实测）
+
+- IME 三实例（修复前后同一脚本对照）：合成态回车 修复前 `0→1` 条用户气泡且进入 busy（误发送）；修复后行数不变、`inputKept:true`、`wentBusy:false`。普通回车 `3→4` 正常发送；Shift+Enter 不发送。
+- ARIA：`[role="log"]` 1 个、`aria-live=polite`、名称"对话记录"；空闲 `aria-busy=false`，流式期间 `true`，收束回落 `false`；`main` 地标 1 个；sr-only 说话人前缀 8 条按"我说：/观影助手："交替。
+- 弹窗：打开→背景 `inert=true`、焦点在"清空"；Tab→"取消"（修复前掉到 body）；Shift+Tab→"清空"；Esc→弹窗关闭、焦点回到"清空对话"触发按钮、`inert` 解除、`overflow` 复位。
+- 跟底：流式全程 `scrollHeight - scrollTop - clientHeight = 0`（贴合，无回归）。
+- 控制台：无 JS 报错；textarea 的 form-field issue 消失。
+
+### 踩坑记录（仅开发期）
+
+Vite 对 SFC 有自己的 transform 缓存：连续改同一文件时，最后一次模板改动可能没进 `/xxx.vue?vue&type=template` 产物——浏览器的 `ignoreCache` 管不到服务端。现象是"代码明明在磁盘上、行为却是旧的"，且控制台没有任何报错。`touch` 文件刷新 mtime 即可强制重编译。
+
+## 复审第二轮（2026-09-21）
+
+方法换成两条腿：**Lighthouse 快照做自动化权威核对** + **全仓同类排查**（一个页面修好了，其他地方未必）。
+
+| # | 问题 | 修复 | 依据 |
+|---|---|---|---|
+| 1 | `/chat` 的"长期记忆"和"澄清补充"两个行内输入框仍写着裸 `@keydown.enter.prevent`——和观影页同一个 IME 坑 | 抽 `onInlineSubmitKeydown(event, submit)`，同样跳过合成态 | 同上一轮的 `isComposing` 依据；同仓 renaming / composer 早已这么写 |
+| 2 | `<html lang>` 在 index.html 里写死 `zh-CN`，**切到英文/葡语/印地语也不变** → 读屏继续用中文语音念外文文案 | `setUiLocale` 同步 `document.documentElement.lang`（按 locale 映射到对应 BCP-47 标签） | WCAG 3.1.1 Language of Page |
+| 3 | Lighthouse 报 `label-content-name-mismatch`："清空对话"按钮可见文字是"清空对话"，可访问名称却是"清空当前对话" → **语音用户说"清空对话"点不到** | 名称改成以可见文案为主干，"为什么点不了"降级为括号补充跟在后面 | WCAG 2.5.3 Label in Name：可见文本必须包含在可访问名称里 |
+| 4 | `UiLocaleSelect` 的 `ul[role="listbox"]` 下**一个 `role="option"` 都没有** | 选项按钮补 `role="option"` + `aria-selected` | WAI-ARIA：`listbox` 的必需拥有元素是 `option`，缺了读屏数不出"第几项/共几项" |
+
+### 验证（2026-09-21，第二轮实测）
+
+- Lighthouse 快照：**Accessibility 100 / Best Practices 100**；未通过项从 4 条降到 3 条，剩下的是 `meta-description`、`robots-txt`、`llms-txt`——均属 SEO/基础设施，不是应用本身的无障碍问题，没有擅自改动。
+- 切到英文界面实测：`document.documentElement.lang` 由 `zh-CN` → `en`；"清空对话"按钮的可见文字与可访问名称在中英文下都保持一致（英文 `Clear chat` == `Clear chat`）；语言菜单 4/4 选项带 `role="option"`，`aria-selected` 恰好一项为 `true`。
+- 构建：`vite build` 通过；三个改动文件 lint 0 错误。
+
+### 已知但本轮未动的非阻塞项
+
+- ChatPage 两个行内输入框的修复**只有静态与编译验证**：资源面板在当前 UI 状态下渲染不出来（`资源` 触发按钮不在 DOM 里），没能做到浏览器实例级复核（同一模式已在观影页用实例验证过，这里只是没复现到入口）。后续若改到该面板建议补测。
+## 继续修复（2026-09-21 收尾）
+
+| 项 | 处理 | 说明 |
+|---|---|---|
+| 富文本 `style` 放行过宽 | 改成**属性白名单**过滤，不再整体放行 | 原先有个刻意的 hook 对 `style` 设 `forceKeepAttr = true`（保留模型输出的富文本样式），不能直接删——否则会破坏有意的行内排版。改为只保留配色/字体/排版类属性，`position` / `inset` / `z-index` / `transform` 这类能劫持页面的声明丢掉，值里含 `url()` / `javascript:` / `expression()` 也丢 |
+| 跳转链接目标不是可聚焦元素 | `#app-main` 加 `tabindex="-1"` | WebAIM / WCAG 惯例：跳转目标必须能真的接住焦点，否则点了只改 hash |
+
+### 踩坑：DOMPurify 钩子的触发条件
+
+第一版把过滤写在 `uponSanitizeAttribute` 上，**实测完全没生效**：因为这个钩子只处理"本来要被删掉"的属性，而 `style` 就在 DOMPurify 的 `ALLOWED_ATTR` 里。必须改挂 `afterSanitizeAttributes`，在净化完成后直接改写属性值（为空就 `removeAttribute`）。
+
+### 验证（4 条实例 + 1 条焦点实例）
+
+| 输入 style | 输出 |
+|---|---|
+| `position:fixed;inset:0;z-index:99999;background:#fff;color:#000` | 只剩 `background:#fff; color:#000`（overlay 钓鱼能力被卸掉） |
+| `color:red;font-weight:700` | 保留 |
+| `background:url(javascript:alert(1));width:100px` | `url()` 值丢弃，留 `width:100px` |
+| 表格单元格 `text-align:right;position:fixed;top:0` | 留 `text-align:right` |
+
+同时复测：`<script>` 删除、`onerror` 删除、链接保留 `target="_blank" rel="noopener noreferrer"`、表格正常渲染。
+
+跳转链接：直接 focus `#app-main` 成功（`activeElement.id === "app-main"`），再按 Tab 落在主内容里第一个控件 `mc-clear`——确实是"跳过导航进入主内容"。
+（附带的观察：点击跳链时因为 hash 变化会触发路由监听，焦点先被 App.vue 的 `route-focus-anchor` 接走；它排在 `#app-main` 前面，下一个 Tab 同样进入主内容，故不额外处理。）
+
+### Lighthouse 复审
+
+- Accessibility **100**、Best Practices **100**（未回退）；SEO **60 → 80**（补了 meta description）。
+- 仍剩 2 项：`robots-txt`、`llms-txt`——都是站点基础设施层面的东西，不在应用代码里改。
+
+### 仍未做实例验证的一项
+
+`/chat` 两个行内输入框（长期记忆 / 澄清补充）的 IME 修复只有静态与编译验证：资源面板在当前 UI 状态下渲染不出来（`资源` 触发按钮不在 DOM 里），入口没复现到。同一模式已在观影页用实例验证过。
+
+## 第四轮：交互细节（2026-09-21）
+
+| 项 | 问题 | 修复 |
+|---|---|---|
+| 发送 ⇄ 停止按钮互换导致**焦点丢失** | 两个页面都是 `v-if` 互换：点了「发送」后原按钮从 DOM 消失，焦点掉到 `body`，键盘用户按 Tab 得从页首重新走一遍 | 切换完成后把焦点扶到"此刻该按的控件"：生成中 → 停止按钮，收束后 → 输入框。**只在焦点确实无主（`activeElement === body`）时才接管**，避免抢走用户此刻在别处的焦点 |
+| 整页**一个标题都没有** | 读屏用户没法用"按标题跳转"定位，跳转链接落进来后也没有标题可念 | 顶栏标题 `span.mc-title` → `h1.mc-title`（补 `margin: 0` 抵消 h1 默认外边距） |
+
+### 验证实例
+
+- 焦点链路（观影页）：聚焦"发送"→点击 → 焦点落在 `mc-send--stop`；再点"停止"→ 焦点回到 `mc-input`。修复前两处都是 `body`。
+- 不抢焦点（观影页）：在输入框里按 Enter 发送，生成期间焦点保持在 `mc-input`，没有被强行挪到停止按钮。
+- 同一 bug 在 `/chat` 复修同样通过：点击发送 → 焦点到 `send stop`；点停止 → 回到 `.input`。
+- 标题：`h1` 出现且只有 1 个；顶栏 59px 高度不变、标题仍在顶栏内（改 h1 没破坏布局）。
+- 一并查过且确认没问题的：所有可见点击目标均 ≥24×24（WCAG 2.5.8）；各控件都有 `focus-visible` 焦点指示。
+- Lighthouse 复审：Accessibility **100** / Best Practices **100**，失败项仍只剩 `robots-txt`、`llms-txt`（站点基础设施，不在应用代码里改）。
+
+## 第五轮：硬核实测 + 对比度（2026-09-21）
+
+这一轮不新开大改，而是**把前几轮"声称已修"的关键项用实例坐实**，并补齐 Lighthouse 算不准的一类：真实对比度。
+
+### 实测确认（之前只声称过，本轮用实例验证成立）
+
+| 项 | 实测结果 |
+|---|---|
+| 确认弹窗焦点陷阱 | 打开 → 焦点落在"清空"按钮、`pageRoot` 变 `inert`、弹窗自身**未被 inert**；Tab 在首尾按钮间循环；Esc 关闭并焦点归还"清空"、关闭后 `inert` 撤销。完整跑通 |
+| 弹窗为何没被自己的 `inert` 误伤 | 关键在 `<Teleport to="body">`：弹窗渲染到 `body` 层级，不在 `pageRoot` 子树内，`pageRoot.inert=true` 只会禁掉背景。最初怀疑过"弹窗被自己 inert 掉"，实测排除 |
+| `<form>` 不会整页刷新 | composer 是 `<form @submit.prevent="send">`，发送按钮 `type="submit"` 不会触发浏览器原生提交导致跳转 |
+| `prefers-reduced-motion` | 全局 `@media (prefers-reduced-motion: reduce)` 关动画 + `scroll-behavior:auto`；JS 平滑滚动也按 `reduceMotion` 切瞬移（WCAG 2.3.3） |
+| 控件基础项 | 输入框有 `aria-label`、发送/清空按钮名实一致、所有可见点击目标 ≥24×24、各控件 `focus-visible` 齐全 |
+
+### 新发现并修复：渐变标题橙端对比度不达标
+
+- Lighthouse 的对比度检查对**渐变文字 / 半透明背景**经常漏判，所以这一轮在浏览器里**直接算真实 WCAG 对比度**。
+- 标题 17px 粗体属「大字」，AA 要求 ≥3:1。渐变蓝→橘里：蓝端 `#2f6fed` 在浅底 4.25:1（达标），**橙端 `#ef8a3c` 只有 2.35:1（挂）**。
+- 压深橙停靠色 `#ef8a3c → #d2691e`，复测橙端 **3.4:1** ✓；蓝端未动。
+- 顺带核过：placeholder 4.61:1、清空按钮 4.86:1、发送按钮都过 AA（placeholder 仅压线，暂不调整以免改观感）。
+
+### 收尾
+
+构建通过、lint 0 错误；Lighthouse 复审 Accessibility **100** / Best Practices **100**，失败项仍只剩 `robots-txt`、`llms-txt`（站点基础设施，不在应用代码里改）。
+
+## 第六轮：对比度收口 + 表格表头 + 语言下拉键盘（2026-09-21）
+
+这一轮把上轮对比度审计里**漏掉的同款渐变 bug**、以及两个通用的渲染层可访问性缺口补齐。
+
+### 1. 欢迎卡标题同款渐变橙端（漏网）
+
+- 上轮只修了 `.mc-title`（h1）的橙端 `#ef8a3c → #d2691e`，但**空态欢迎卡标题 `.mc-welcome__title` 用了完全相同的渐变停靠色** `#ef8a3c`，同样 2.35:1 挂 AA（20px 粗体属大字）。
+- 一并压到 `#d2691e`，与 h1 保持一致。
+
+### 2. Markdown 渲染表格缺 `scope`（WCAG 1.3.1，全局影响 `/movie` + `/chat`）
+
+- `MarkdownIt` 渲染出的 `<th>` **默认不带 `scope`**，列数一多读屏只会逐格念、分不清「这一格属于哪一列」。
+- 在 `chat-richtext.ts` 的 `foldAgentBlocks` 里补：表头行 `thead th` → `scope="col"`，`tbody` 内若出现行表头 `th` → `scope="row"`。
+- 同时把 `"scope"` 加进 `DOMPurify` 的 `ALLOWED_ATTR`，否则会被净化器剥掉。
+- 浏览器内动态 `import` 渲染器喂一张 2×2 表验证：输出已含 `<th scope="col">电影</th>` 等 ✓。
+
+### 3. 语言下拉升级为 APG listbox（键盘可达）
+
+- 原实现：按钮 + `role="listbox"` + 选项，但**选项用 `<button role="option">`**、无方向键导航、打开后焦点不进菜单——只能靠 Tab 硬走，不是真正的 listbox。
+- 重写为合规 APG listbox：
+  - `role="option"` 直接落在 `<li>` 上（去掉内嵌 button）；
+  - **roving tabindex**：仅当前选中项 `tabindex=0`，其余 `-1`；
+  - 触发器方向键/回车/空格打开并把焦点送进菜单；
+  - 菜单内 `ArrowUp/Down`、`Home/End` 移动、`Enter/Space` 选中、`Esc` 关闭并归还焦点、`Tab` 正常离场。
+- 浏览器实测：方向键打开 → 焦点落在 "English✓"；roving tabindex 为 `["-1","0","-1","-1"]`；↓ 移到 "Português (Brasil)"；回车选中、菜单关闭、**焦点归还触发器** ✓。
+
+### 4. 全量对比度复核（浏览器实算，light + dark）
+
+- 写了遍历所有文字叶节点、按「有效背景」算 WCAG 对比度的脚本（修掉了 `rgba(0,0,0,0)` 被当成纯黑导致渐变底元素全部误报的 bug）。
+- **浅色 0 失败、深色 0 失败**（实心底文字；渐变底的气泡/标题由手算确认达标：用户气泡 `#123a66` 在浅蓝渐变上 ≈8.6:1、助手气泡 `--ink` 在白底极高、标题橙端 3.4:1）。
+- 注意：首轮那次 `4.21:1` 的「清空按钮」是误报（同透明黑 bug），真实值 4.86:1 过 AA。
+
+### 5. 并行核对 ChatPage 本轮改动
+
+`ChatPage.vue` 本轮 +33 行，与观影页对齐：补 `stopBtnRef` + `sending` 焦点交接 watch（生成中→停止、收束后→输入框）、以及 `onInlineSubmitKeydown`（IME 合成态跳过，替换内存/澄清输入框的 `@keydown.enter.prevent`）。经核对均正确、无回归。
+
+### 收尾
+
+Lighthouse（移动端）Accessibility **100** / Best Practices **100**；构建通过、lint 0 错误。失败项仍只剩 `robots-txt`、`llms-txt`（站点基础设施）。
+
+## 第七轮：标题层级 + 高对比模式（2026-09-21）
+
+这一轮查结构语义与环境适配两处。
+
+### 1. 气泡内 Markdown 标题层级下沉（WCAG 1.3.1 / 2.4.6，影响 /movie + /chat）
+
+- 整页唯一的 `<h1>` 是助手名（`.mc-title`），但模型在气泡里写的 `#`/`##` 经 MarkdownIt 渲染成 `<h1>`/`<h2>`，会与页面 h1 撞车、并出现「h1 之后直接 h3」的跳级，破坏文档大纲。
+- 在 `chat-richtext.ts` 的 `foldAgentBlocks` 开头加一道标题下沉：所有 `h1→h2 … h5→h6`，`h6` 封顶。结果：整页只剩一个 h1、气泡内容从 h2 起、相对层级不丢、不产生跳级。
+- 浏览器内动态渲染 `# Top / ## Section / ### Sub / #### Deep / ##### Deeper / ###### Deepest` 验证：输出变为 `[h2,h3,h4,h5,h6,h6]`，`hasH1=false` ✓。
+
+### 2. Windows 高对比模式（forced-colors）焦点/边界兜底
+
+- 系统在高对比模式下会强制重映射颜色，半透明/阴影类焦点环被抹掉，控件边界可能消失。
+- 在 `styles.css` 末尾加 `@media (forced-colors: active)` 块：为发送/清空/输入框/主题/语言控件/弹窗/危险按钮补 `outline: 2px solid Highlight`（focus-visible 时），并为这些控件补 `border: 1px solid ButtonBorder`。
+- 仅在该模式下生效，正常渲染零影响；同时顺带加固了 App.vue 里那份全局跳转链接的焦点环。
+
+### 3. 跳转链接：发现已有全局一份，回退冗余改动
+
+- 自查时发现 `App.vue` 早已有一份全局跳转链接（`href="#app-main"`，路由容器 `id="app-main"` tabindex=-1）。
+- 本轮一度在 MoviePage 里又加了一份（`#mc-main`）——会形成 Tab 序列里连续两个跳转链接、相互冗余。已回退 MoviePage 的跳转链接与 `#mc-main` id，保留全局唯一一份（Lighthouse 的 bypass 审计也本就靠它 + `<main>` 地标通过）。
+
+### 收尾
+
+Lighthouse（移动端）Accessibility **100** / Best Practices **100**；构建通过、lint 0 错误。失败项仍只剩 `robots-txt`、`llms-txt`（站点基础设施）。
+
+## 第八轮：把可访问性审计对齐到 /chat（2026-09-21）
+
+`/movie` 修到 100 后，按同一套审计对 `/chat` 跑 Lighthouse，发现它原本 **Accessibility 96**（其余失败项 `robots-txt`/`llms-txt` 与 `/movie` 同属站点基建，不计入 a11y）。实测定位并修复 4 项真实缺陷：
+
+### 1. 对比度不达标（`color-contrast`，4 处）
+
+根因：亮色主题 `--muted: #707068` 在浅底 `#eeece8` 上只有 4.23:1（需 ≥4.5）；`reasoning__time` 还额外 `color-mix(--muted 85%, transparent)` 更浅（3.41）；`composer-hint` 是 `--muted` 再叠 `opacity: 0.75`（合成后 `#94948e`，3.04）。
+
+- `apps/web/src/styles.css` 亮色主题 `--muted: #707068 → #686868`（仅亮色主题，深色主题 `--muted` 不变）：`nav-seg`/`stopped-tag` 在 `#eeece8` 上 4.23 → 约 4.73，全站 muted 文字一并受益。
+- `ChatPage.vue` `reasoning__time`：去掉 `color-mix(85%, transparent)`，改实色 `var(--muted)` → 在 `#f4f4f1` 上约 5.07。
+- `ChatPage.vue` `composer-hint`：去掉 `opacity: 0.75`，改实色 `var(--muted)` → 在 `#ffffff` 上约 5.57。
+
+### 2. 无障碍名称与可见文字不匹配（`label-content-name-mismatch`）
+
+`button#chat-model` 可见文字为 `TokenHub` + `Kimi-K2.7-HS`，但 `aria-label="模型 Kimi-K2.7-HS"` 漏了可见的 `TokenHub`，触发 mismatch。
+
+- `components/ModelSelect.vue`：`aria-label` 补上来源徽标（`${currentSource ? ' ' + currentSource : ''}`）；来源徽标 `msel__source` 加 `aria-hidden="true"`（读屏只经 aria-label 念一次，不重复）。
+- 实测 `aria-label` 变为 `模型 TokenHub Kimi-K2.7-HS`，可见文字全部包含在内。
+
+### 3. 整页缺 `<h1>`（与 `/movie` 对齐）
+
+`/chat` 顶栏标题原为 `span.brand__name`，整页 `<h1>` 数量为 0（观影页那轮已把 `.mc-title` 升为 `h1`）。
+
+- `ChatPage.vue`：`span.brand__name → h1.brand__name`，CSS 补 `margin: 0` 抵消 h1 默认外边距（布局不变）。
+
+### 收尾
+
+`/chat` Lighthouse（移动端）Accessibility **100** / Best Practices **100**；`pageH1Count = 1`（`brand__name:小助手`）；模型按钮无障碍名称已含来源。构建通过、lint 0 错误。失败项仍只剩 `robots-txt`、`llms-txt`（站点基础设施）。两页（/movie、/chat）a11y 审计现已对齐至 100。

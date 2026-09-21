@@ -3,7 +3,8 @@ import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { assertBuiltinRiskCoverage } from "./builtins.js";
 import { config, defaultModel, listModels } from "./config.js";
-import { listEnabledMcpServers } from "./conversations.js";
+import { listEnabledMcpServers, pruneUnknownMcpServers } from "./conversations.js";
+import { loadServers } from "./mcp/config.js";
 import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
 
 // 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
@@ -31,6 +32,12 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   }
   // 周期回收空闲 MCP 连接（stdio 子进程不常驻），下次用到时自动重连。
   startIdleSweeper();
+  // 启动维护：把「配置里已不存在」的 MCP id 从各对话启用集里摘掉。
+  // 服务器的增减多来自 .env（只在启动时读），除了 DELETE 端点没有别的清理点；
+  // 放在这里而不是 GET 里，见 conversations.ts 的 pruneUnknownMcpServers 注释（安全方法语义）。
+  void pruneUnknownMcpServers(loadServers().map((s) => s.id)).then((n) => {
+    if (n) console.log(`[mcp] 启动维护：${n} 个对话的启用集里含已移除的服务器，已摘除`);
+  });
   // 任意对话启用了的 MCP 服务器：启动后自动重连，否则面板会一直显示"未连接"，与勾选状态矛盾。
   void listEnabledMcpServers().then((ids) => {
     for (const id of ids) void connect(id);

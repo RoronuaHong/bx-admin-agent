@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 
 const emit = defineEmits<{ change: [UiLocale] }>();
@@ -9,6 +9,9 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 const root = ref<HTMLElement | null>(null);
 const open = ref(false);
+const triggerRef = ref<HTMLButtonElement | null>(null);
+const optionEls = ref<HTMLLIElement[]>([]);
+const currentIndex = ref(0);
 
 const options = computed(() => [
   { value: "zh" as UiLocale, label: "中文" },
@@ -19,15 +22,62 @@ const options = computed(() => [
 
 const currentOption = computed(() => options.value.find((item) => item.value === uiLocale.value) || options.value[0]);
 
+function syncIndex() {
+  const idx = options.value.findIndex((o) => o.value === uiLocale.value);
+  currentIndex.value = idx >= 0 ? idx : 0;
+}
+
 function toggleOpen() {
   open.value = !open.value;
+}
+
+function closeMenu(returnFocus: boolean) {
+  open.value = false;
+  if (returnFocus) triggerRef.value?.focus();
+}
+
+/** 函数式 ref：把每个选项的 <li> 收集进数组，供方向键在它们之间移动焦点。 */
+function assignOptRef(i: number, el: any) {
+  if (el) optionEls.value[i] = el as HTMLLIElement;
+}
+
+function focusOption(idx: number) {
+  const els = optionEls.value;
+  if (!els.length) return;
+  currentIndex.value = (idx + els.length) % els.length;
+  els[currentIndex.value]?.focus();
 }
 
 function choose(value: UiLocale) {
   setUiLocale(value);
   // 持久化交给父组件：语言是对话级设置，需要连同 conversationId 一起落库。
   emit("change", value);
-  open.value = false;
+  closeMenu(true);
+}
+
+// 触发器键盘：方向键 / 回车 / 空格打开并把焦点送进菜单（APG listbox 约定）。
+function onTriggerKeydown(e: KeyboardEvent) {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    if (!open.value) {
+      syncIndex();
+      open.value = true;
+    }
+  }
+}
+
+// 菜单键盘：方向键在选项间移动（roving tabindex），Home/End 跳首尾，回车/空格选中，Esc 关闭并归还焦点。
+function onMenuKeydown(e: KeyboardEvent) {
+  switch (e.key) {
+    case "ArrowDown": e.preventDefault(); focusOption(currentIndex.value + 1); break;
+    case "ArrowUp": e.preventDefault(); focusOption(currentIndex.value - 1); break;
+    case "Home": e.preventDefault(); focusOption(0); break;
+    case "End": e.preventDefault(); focusOption(options.value.length - 1); break;
+    case "Enter":
+    case " ": e.preventDefault(); choose(options.value[currentIndex.value].value); break;
+    case "Escape": e.preventDefault(); closeMenu(true); break;
+    case "Tab": closeMenu(false); break;
+  }
 }
 
 function onPointerDown(e: MouseEvent) {
@@ -35,7 +85,7 @@ function onPointerDown(e: MouseEvent) {
 }
 
 function onWindowKeydown(e: KeyboardEvent) {
-  if (e.key === "Escape") open.value = false;
+  if (e.key === "Escape" && open.value) closeMenu(true);
 }
 
 onMounted(() => {
@@ -47,33 +97,54 @@ onBeforeUnmount(() => {
   window.removeEventListener("mousedown", onPointerDown);
   window.removeEventListener("keydown", onWindowKeydown);
 });
+
+// 打开后把焦点送到「当前选中项」：键盘用户不必先 Tab 一遍才落到菜单里。
+watch(open, (o) => {
+  if (o) {
+    syncIndex();
+    nextTick(() => focusOption(currentIndex.value));
+  }
+});
 </script>
 
 <template>
   <div ref="root" class="locale-box">
     <button
+      ref="triggerRef"
       type="button"
       class="locale-select"
       :aria-expanded="open"
       aria-haspopup="listbox"
       @click="toggleOpen"
+      @keydown="onTriggerKeydown"
     >
       <span class="sr-only">{{ tx("界面语言", "UI language", "Idioma da interface", "इंटरफ़ेस भाषा") }}</span>
       <span class="locale-value">{{ currentOption?.label }}</span>
       <span class="locale-caret" aria-hidden="true"></span>
     </button>
     <div v-if="open" class="locale-menu-wrap">
-      <ul class="locale-menu" role="listbox" :aria-label="tx('界面语言', 'UI language', 'Idioma da interface', 'इंटरफ़ेस भाषा')">
-        <li v-for="item in options" :key="item.value">
-          <button
-            type="button"
-            class="locale-option"
-            :class="{ active: item.value === uiLocale }"
-            @click="choose(item.value)"
-          >
-            <span class="locale-option__label">{{ item.label }}</span>
-            <span v-if="item.value === uiLocale" class="locale-option__check" aria-hidden="true">✓</span>
-          </button>
+      <ul
+        class="locale-menu"
+        role="listbox"
+        :aria-label="tx('界面语言', 'UI language', 'Idioma da interface', 'इंटरफ़ेस भाषा')"
+        @keydown="onMenuKeydown"
+      >
+        <!-- role="option" 直接上 <li>：listbox 的必需子元素是 option，读屏才能报「第几项 / 共几项」。
+             roving tabindex：仅当前项可 Tab 进入，方向键在选项间移动（APG listbox 约定）；
+             当前选中项用 aria-selected 标出。 -->
+        <li
+          v-for="(item, i) in options"
+          :key="item.value"
+          :ref="(el) => assignOptRef(i, el)"
+          class="locale-option"
+          role="option"
+          :aria-selected="item.value === uiLocale"
+          :tabindex="i === currentIndex ? 0 : -1"
+          :class="{ active: item.value === uiLocale }"
+          @click="choose(item.value)"
+        >
+          <span class="locale-option__label">{{ item.label }}</span>
+          <span v-if="item.value === uiLocale" class="locale-option__check" aria-hidden="true">✓</span>
         </li>
       </ul>
     </div>

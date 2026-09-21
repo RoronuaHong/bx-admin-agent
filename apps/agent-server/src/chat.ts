@@ -1,7 +1,8 @@
 // 聊天引擎（自研 agent harness，路线 B 补齐 Deep Agents 能力）。
-// 未勾选 MCP：一次模型调用 + 流式输出（直连语义，零工具）。
-// 勾选 MCP：MCP 工具 + 内置工具（fs_* / write_todos / read_skill / task）注入模型，
-//           按「模型出 tool_calls → 执行 → 结果回灌 → 再调用」循环，直到结论或轮次上限。
+// 工具注入：内置工具（fs_* / write_todos / read_skill / task / render_chart …）**始终注入**——
+//           它们是本机能力、不含外部数据面；勾选的 MCP 服务器再额外注入其外部工具。
+//           「勾选」只表达「要接哪些外部数据源」，不再兼职当「要不要本机能力」的开关。
+//           模型出 tool_calls → 执行 → 结果回灌 → 再调用，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
 import type { ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
@@ -44,7 +45,8 @@ import {
 } from "./grounding.js";
 import { wrapUntrusted } from "./untrusted.js";
 import { webSearchStatus } from "./web-search.js";
-import { getUploadImage } from "./uploads.js";
+import { getUploadImage, getUploadFile } from "./uploads.js";
+import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
@@ -495,6 +497,90 @@ function imagesOf(ids: string[] | undefined): OptionImage[] {
   return out;
 }
 
+/**
+ * 单附件注入上限（token）。按 **token** 而非字符计：估算器把 CJK 记作 ~1 token/字，
+ * 旧的 30000 字符上限对中文文档等于 30000 token —— 一份文档就能吃掉整个窗口的余量。
+ */
+const ATTACH_MAX_TOKENS = Math.max(500, Number(process.env.ATTACH_MAX_TOKENS || 8000));
+/**
+ * 本轮所有附件的**合计**上限（token）。
+ * 附件文本拼进系统提示，而系统提示不参与历史预算（`historyBudgetTokens` 只扣输出预留 / 工具 schema /
+ * 工具结果预算），所以这一路必须自带闸门——否则「多贴几份文档」会直接把请求顶出模型窗口。
+ */
+const ATTACH_TOTAL_MAX_TOKENS = Math.max(1000, Number(process.env.ATTACH_TOTAL_MAX_TOKENS || 20000));
+
+/** 按 token 预算截断文本（估算器：CJK ≈ 1 字/token，其余 ≈ 4 字符/token）。导出供单测覆盖。 */
+export function truncateToTokens(text: string, maxTokens: number): { text: string; truncated: boolean } {
+  if (!text || estimateTokens(text) <= maxTokens) return { text, truncated: false };
+  const chars = Array.from(text);
+  const tokensPerChar = estimateTokens(text) / chars.length;
+  const keep = Math.max(1, Math.floor(maxTokens / tokensPerChar));
+  let slice = chars.slice(0, keep).join("");
+  // 估算本身有误差：切片后仍超预算就按比例再收，保证「不越界」优先于「切得刚好」。
+  while (slice.length > 1 && estimateTokens(slice) > maxTokens) {
+    slice = Array.from(slice)
+      .slice(0, Math.floor(slice.length * 0.9))
+      .join("");
+  }
+  return { text: slice, truncated: true };
+}
+
+/**
+ * 把用户本轮在聊天里附加的文档（PDF / Word / Excel / md / txt / csv）解析为文本，
+ * 作为临时上下文注入系统提示，让模型直接据此作答（对齐 CodeBuddy「贴文档即读」）。
+ * 解析失败的附件不中断对话，仅附一行提示让模型知道它不可用；
+ * 超出预算的附件按 token 截断或整体跳过，并把「跳过了哪些」如实写进注入内容（不静默丢）。
+ */
+async function buildAttachmentContext(ids: string[] | undefined): Promise<string> {
+  if (!ids?.length) return "";
+  const blocks: string[] = [];
+  const skipped: string[] = [];
+  let usedTokens = 0;
+  for (const id of ids) {
+    const f = getUploadFile(id);
+    if (!f) {
+      blocks.push(`（附件 ${id} 已过期或不存在，已跳过）`);
+      continue;
+    }
+    let parsed: Awaited<ReturnType<typeof parseFile>>;
+    try {
+      parsed = await parseFile(f.path);
+    } catch (e) {
+      blocks.push(`（附件《${f.name}》读取失败：${String((e as Error)?.message || e)}，已跳过）`);
+      continue;
+    }
+    if ("error" in parsed) {
+      blocks.push(`（附件《${f.name}》解析失败：${parsed.error}，已跳过）`);
+      continue;
+    }
+    const remaining = ATTACH_TOTAL_MAX_TOKENS - usedTokens;
+    if (remaining <= 0) {
+      skipped.push(f.name);
+      continue;
+    }
+    // 实际可用的额度 = min(单附件上限, 合计剩余额度)：剩余额度不足时按剩余截断。
+    const cap = Math.min(ATTACH_MAX_TOKENS, remaining);
+    const capped = truncateToTokens(parsed.text, cap);
+    usedTokens += estimateTokens(capped.text);
+    blocks.push(
+      `### 附件《${f.name}》\n${capped.text}` +
+        (capped.truncated
+          ? `\n…（附件过长，已截断到约 ${cap} token；原文共 ${parsed.text.length} 字符）`
+          : ""),
+    );
+  }
+  if (skipped.length) {
+    blocks.push(
+      `（本轮附件合计超出注入预算，以下附件未提供内容：${skipped.join("、")}。如需按其作答，请单独提问或先精简附件。）`,
+    );
+  }
+  if (!blocks.length) return "";
+  return (
+    "【用户本次在对话中附加的文档（请优先依据这些内容作答，不要编造；与本地知识库冲突时以附件为准）】\n" +
+    blocks.join("\n\n")
+  );
+}
+
 /** 截断工具结果；尽量切在行边界，避免把 TSV / JSON 的某一行从中间劈开。 */
 function truncateResult(text: string): string {
   if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
@@ -767,6 +853,8 @@ interface LoopOutcome {
   offloadedToolResults: number;
   /** 执行的工具调用次数（子代理回传规模摘要用）。 */
   toolCallCount: number;
+  /** 真正执行过、且级别非只读（写/删/未知保守）的调用次数：调用方据此判断能否换模型重跑。 */
+  sideEffects: number;
   /** 工具循环实际使用的轮次（模型调用次数）。 */
   rounds: number;
   /** 模型调用瞬时失败重试次数。 */
@@ -807,6 +895,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let clearedToolResults = 0;
   let offloadedToolResults = 0;
   let toolCallCount = 0;
+  // 副作用计数（写/删/未知保守）：与「工具调用次数」分开——只读调用重跑无副作用，不该阻止换模型。
+  let sideEffects = 0;
   // 循环护栏：同轮去重集合（每轮重置）+ 跨轮 Doom Loop 检测器。
   const executedSigs = new Set<string>();
   let roundExecuted: string[] = [];
@@ -1065,7 +1155,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     /** 单个调用的执行体（不 yield，供并发批复用；事件与回灌由调用方按原始顺序处理）。 */
     const executeOne = async (
       c: ToolCall,
-    ): Promise<{ ok: boolean; rawText: string; executed: boolean; todos?: TodoItem[] }> => {
+    ): Promise<{
+      ok: boolean;
+      rawText: string;
+      executed: boolean;
+      todos?: TodoItem[];
+      chart?: { title?: string; chartType: string; data: unknown; encode?: Record<string, string>; options?: Record<string, unknown> };
+    }> => {
       const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
       if (builtin) {
         return {
@@ -1073,6 +1169,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           rawText: builtin.text,
           executed: true,
           ...(builtin.todos ? { todos: builtin.todos } : {}),
+          ...(builtin.chart ? { chart: builtin.chart } : {}),
         };
       }
       if (ctx.toolSearch && specOfTool.has(c.name) && !ctx.loadedTools.has(c.name)) {
@@ -1258,6 +1355,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           for (let k = 0; k < batch.length; k += 1) {
             const item = batch[k]!;
             const out = outcomes[k]!;
+            // 副作用计数（与单调用路径同口径，见其注释）。
+            if (out.executed && item.verdict.level !== "read") sideEffects += 1;
             // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
             if (out.executed) {
               if (out.ok) failedTools.delete(item.call.name);
@@ -1268,6 +1367,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               pushEvidence(out.rawText, item.call.name);
             }
             if (out.todos) yield { type: "todos", todos: out.todos };
+            if (out.chart)
+              yield {
+                type: "chart",
+                title: out.chart.title,
+                chartType: out.chart.chartType,
+                data: out.chart.data,
+                encode: out.chart.encode,
+                options: out.chart.options,
+              };
             const outContent = truncateResult(out.rawText);
             yield { type: "tool_result", id: item.call.id, name: item.call.name, ok: out.ok, text: outContent };
             const wrappedOut = wrapUntrusted(outContent, {
@@ -1400,6 +1508,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         rawText = builtin.text;
         // 任务规划即时可见（事件流），同时已持久化到 conversation.todos。
         if (builtin.todos) yield { type: "todos", todos: builtin.todos };
+        if (builtin.chart)
+          yield {
+            type: "chart",
+            title: builtin.chart.title,
+            chartType: builtin.chart.chartType,
+            data: builtin.chart.data,
+            encode: builtin.chart.encode,
+            options: builtin.chart.options,
+          };
         // 结构化澄清：工具层不能自己挂起（事件发不出去），由循环下发事件并等待用户选择。
         if (builtin.clarification) {
           const pending = requestClarification({
@@ -1437,6 +1554,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ok = !result.isError;
         rawText = result.text;
       }
+      // 副作用计数：真正执行过、且级别非只读的调用。只读（read）不计——换模型重跑只读调用没有副作用，
+      // 不该被「已产生副作用就不能切候选」的护栏拦住（见 chatStream 候选循环的说明）。
+      if (executed && verdict.level !== "read") sideEffects += 1;
       // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
       if (executed) {
         if (ok) failedTools.delete(call.name);
@@ -1491,6 +1611,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     clearedToolResults,
     offloadedToolResults,
     toolCallCount,
+    sideEffects,
     rounds,
     modelRetries,
     toolFusions,
@@ -1624,6 +1745,10 @@ async function* runSubagent(
         yield { type: "subagent_delta", id: subagentId, text: ev.text };
       } else if (ev.type === "tool_call") {
         toolCalls += 1;
+      } else if (ev.type === "chart") {
+        // 子代理也会用 render_chart（它在子代理的内置工具集里）。图表 spec 只存在于事件里、
+        // 不写进子代理回传的摘要文本——不在这里转发就等于「图悄悄丢了」，而模型还会声称已出图。
+        yield ev;
       }
       next = await gen.next();
     }
@@ -1712,12 +1837,15 @@ async function* runSubagentBatch(
  * 上下文与设置全部取自该对话（thread）：`conversation.context` 是唯一真相。
  * 无 MCP 工具时走直连单次调用；有工具时走 MCP 工具循环。
  * signal 由调用方传入（app.ts 接客户端断连信号），用于中止在途模型调用。
+ * traceMeta 是 run 级追踪的旁路 sink：实际服务模型作为 first-class 字段在此落地，
+ * 不依赖受限的事件缓冲（长 run 会裁掉起始的 model 事件，见 chat-tasks.ts 缓冲上限）。
  */
 export async function* chatStream(
   conversationId: string,
   userText: string,
-  opts: { model?: string; images?: string[]; sessionId?: string; ownerKey?: string } = {},
+  opts: { model?: string; images?: string[]; attachments?: string[]; sessionId?: string; ownerKey?: string } = {},
   signal?: AbortSignal,
+  traceMeta?: { servedModel?: string },
 ): AsyncGenerator<ChatEvent> {
   const conversation = await getConversation(conversationId);
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
@@ -1742,15 +1870,20 @@ export async function* chatStream(
     return;
   }
   yield { type: "model", id: model.id, label: model.label };
+  if (traceMeta) traceMeta.servedModel = model.id;
 
   // 去重 + 排序：工具清单的确定性来自这里（顺序稳定 → system+tools 前缀稳定 → prompt 缓存命中）。
   const enabled = [...new Set((conversation?.mcpServers || []).map((id) => String(id || "").trim()))]
     .filter(Boolean)
     .sort();
-  // 「工具模式」由「是否勾选了 MCP」决定，而不是「是否成功发现到 MCP 工具」：
-  // 否则某个服务器连不上会让整个对话静默降级成直连（内置工具一并消失），且模型无从知晓原因。
-  const toolMode = enabled.length > 0;
-  const collected = toolMode
+  // 两个正交概念，不能用同一个变量同时管（旧实现把「是否注入内置工具」也压在「勾了 MCP」上，
+  // 后果是没勾任何连接器时连本机能力都消失：新对话零工具，本地出图/工作区文件全用不了）：
+  //   mcpEnabled —— 外部数据面：勾了哪些外部服务器，决定是否收集外部工具、是否走按需检索。
+  //   内置工具   —— 本机能力：fs_* / write_todos / read_skill / task / search_tools / render_chart 等，
+  //                 不含任何外部数据面，因此**始终注入**（对齐 Cursor / Claude Code：
+  //                 本地能力恒可用，外部数据源按需接入）。勾选状态只影响外部能力域，不影响本机能力。
+  const mcpEnabled = enabled.length > 0;
+  const collected = mcpEnabled
     ? await collectToolsDetailed(enabled)
     : { tools: [] as McpToolInfo[], unavailable: [], ready: [] };
   const selection = selectMcpToolSpecs(collected.tools);
@@ -1759,22 +1892,27 @@ export async function* chatStream(
   // 角色级开关：仅 forceEagerTools=true 的角色（如 movie）跳过 deferred、强制全量注入；
   // 通用角色不设置该字段，完全跟随全局 TOOL_SEARCH_MODE=auto 的原有策略，逻辑不变。
   const roleForceEagerTools = conversation?.agentId ? getRole(conversation.agentId).forceEagerTools : undefined;
-  const toolSearch = toolMode && collected.tools.length > 0 && toolSearchEnabled(model, eagerTokens) && !roleForceEagerTools;
+  const toolSearch = mcpEnabled && collected.tools.length > 0 && toolSearchEnabled(model, eagerTokens) && !roleForceEagerTools;
   // 角色级首轮强制工具调用：仅 forceToolCall=true 的角色（如 movie）首轮 tool_choice=required，逼模型先调工具；
   // 通用角色不设置该字段 → undefined → streamCall 内恒为 auto，行为不变。
   const roleForceToolCall = conversation?.agentId ? getRole(conversation.agentId).forceToolCall : undefined;
   // 角色级接地护栏：仅 enforceGrounding=true 的角色（如 movie）在「零工具数据」时不许收束（见 src/grounding.ts）；
   // 通用角色不设置该字段 → undefined → 不参与本护栏，行为不变。
   const roleEnforceGrounding = conversation?.agentId ? getRole(conversation.agentId).enforceGrounding : undefined;
-  // 内置工具（fs_* / write_todos / read_skill / task / search_tools）只在工具模式注入 —— 直连模式保持零工具语义。
-  const builtinSpecs = toolMode ? builtinToolSpecs({ toolSearch }) : [];
+  // 内置工具与本对话勾了哪些 MCP 无关，始终注入（见上方 mcpEnabled 注释）。
+  const builtinSpecs = builtinToolSpecs({ toolSearch });
   const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
+  // 只要有工具就进工具循环。内置工具恒在 → 这里恒真；保留该判断是为了让语义显式：
+  // 「零工具直连」只在真的没有任何工具可用时成立，而不是由「勾了几个连接器」间接决定。
+  const useTools = specs.length > 0;
   const labels = new Map<string, string>();
   for (const server of [...collected.ready, ...collected.unavailable]) labels.set(server.id, server.label);
   // 联网检索通道状态：一次算好，既进系统提示（诚实上报），也进下面的通道日志。
   const webChannel = webSearchStatus();
   // 工具通道现状 → 进系统提示动态段：让模型知道「哪些域这次真的能查、哪些缺席、为什么缺席」。
-  const tooling: ToolingStatus | null = toolMode
+  // 未勾任何外部服务器时也照实渲染（「MCP 工具 0 个，内置工具 N 个」），
+  // 否则模型会把「没有外部数据源」当成「那个域没有数据」。
+  const tooling: ToolingStatus | null = useTools
     ? {
         mcpToolCount: toolSearch ? 0 : selection.specs.length,
         totalMcpTools: collected.tools.length,
@@ -1794,7 +1932,7 @@ export async function* chatStream(
           : {}),
       }
     : null;
-  if (toolMode) {
+  if (useTools) {
     // 工具通道一行日志：排查「模型说没有这个能力」时，先看这里（谁缺席、为什么）。
     console.log(
       `[chat:tools] mode=${toolSearch ? "search" : "eager"} ` +
@@ -1826,6 +1964,8 @@ export async function* chatStream(
   // 运行时统计（回填 usage 事件，便于可观测与成本归因）。
   let rounds = 0;
   let toolCalls = 0;
+  // 已真正执行过的写/删类调用数（决定候选失败后能否换模型重跑，见下方候选循环）。
+  let sideEffects = 0;
   let modelRetries = 0;
   let toolFusions = 0;
   let pseudoCallRetries = 0;
@@ -1866,14 +2006,22 @@ export async function* chatStream(
       role: conversation?.agentId,
       ownerKey: opts.ownerKey,
     });
+    // 聊天里随手贴的文档：解析为文本注入系统提示（本轮临时上下文，不污染持久历史）。
+    const attachmentCtx = await buildAttachmentContext(opts.attachments);
+    // 附件文本属「本轮临时上下文」，拼进系统提示的**动态后缀**（不污染稳定前缀、不影响 prompt cache）。
+    const systemPrompt: SystemPrompt = attachmentCtx
+      ? { ...system, dynamic: `${system.dynamic}\n\n${attachmentCtx}` }
+      : system;
     // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
     const images = opts.images?.length && m.vision === "direct" ? imagesOf(opts.images) : [];
     // 重 yield model 事件：前端据此更新当前模型标签，用户可感知已切换到备用模型。
     yield { type: "model", id: m.id, label: m.label };
+    // 旁路 sink：循环内最后一次写入即实际服务模型（成功候选后 break），不受 buffer 裁剪影响。
+    if (traceMeta) traceMeta.servedModel = m.id;
     usedWindow = m.contextWindow;
 
     let outcome: LoopOutcome | CallOutcome;
-    if (toolMode) {
+    if (useTools) {
       outcome = yield* runLoop(
         {
           conversationId,
@@ -1883,7 +2031,6 @@ export async function* chatStream(
           specs,
           toolSearch,
           loadedTools: new Set<string>(),
-          system,
           signal,
           allowTask: true,
           allowWrite: true,
@@ -1894,12 +2041,15 @@ export async function* chatStream(
           forceToolCall: roleForceToolCall,
           enforceGrounding: roleEnforceGrounding,
           ownerKey: opts.ownerKey,
+          system: systemPrompt,
         },
         turns,
       );
     } else {
-      // 直连路径：零工具语义（无 function tool → 无联网检索）；联网能力经内置工具提供，只在工具模式可用。
-      outcome = yield* streamCall(m, turns, images, [], signal, system);
+      // 零工具直连路径：无 function tool → 模型无法调用任何工具、也没有联网检索
+      // （联网能力由内置工具 web_search 提供）。内置工具恒注入，故正常路径不会走到这里；
+      // 保留它是为了让「零工具」的语义有明确落点，而不是靠「没勾连接器」隐式发生。
+      outcome = yield* streamCall(m, turns, images, [], signal, systemPrompt);
     }
     text = outcome.text;
     const loop = outcome as LoopOutcome;
@@ -1908,6 +2058,7 @@ export async function* chatStream(
     offloadedToolResults = loop.offloadedToolResults || 0;
     rounds = loop.rounds || 0;
     toolCalls = loop.toolCallCount || 0;
+    sideEffects = loop.sideEffects || 0;
     modelRetries = loop.modelRetries || 0;
     toolFusions = loop.toolFusions || 0;
     pseudoCallRetries = loop.pseudoCallRetries || 0;
@@ -1926,9 +2077,12 @@ export async function* chatStream(
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
     // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，
     // 实测 kimi26 额度耗尽 → 切到 kimi27hs 报 400 → 链直接断，后面 10 个注册模型根本没试）。
-    // 安全护栏：已执行过工具调用（可能含写操作 / 用户已确认的调用）时不再换模型重跑，
-    // 避免重复副作用；此时直接按失败收束（下方会保留已生成的中间结果）。
-    if (toolCalls > 0) break;
+    // 安全护栏：**已真正执行过写/删类调用**时不再换模型重跑（避免重复副作用），直接按失败收束
+    // （下方会保留已生成的中间结果）。
+    // 只读调用不算——重跑只读工具没有副作用。原先用「有工具调用就 break」一刀切，会把
+    // 「首轮取数成功、次轮模型额度耗尽」的请求挡在原始 402 面前：实测 movie 页就是这样
+    // （调过 TMDb 只读工具后再调模型报 402，用户看到的是裸 402，而不是切换后的正常回答）。
+    if (sideEffects > 0) break;
     modelFallbacks += 1;
     console.log(`[chat:fallback] model ${m.label} failed (${failure.slice(0, 200)}); trying next candidate`);
   }
@@ -1959,6 +2113,8 @@ export async function* chatStream(
     // 用户主动中断（点「停止」/ 关页面）：这一轮已经发生了，仍要写回上下文，
     // 否则下一轮模型看不到它，而界面上用户已经看到这段内容 —— 上下文与界面不一致。
     if (signal?.aborted) {
+      // 正文为空（用户在任何正文产生前就点了「停止」）时，appendContext 会丢掉这条空的 assistant 轮：
+      // 上游对空 assistant 消息直接 400，且确定性成立 → 该会话会永久卡死。只写 user 轮即可。
       await appendContext(
         conversationId,
         [{ role: "user", text: userText }, { role: "assistant", text: text.trim() }],

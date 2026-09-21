@@ -7,6 +7,7 @@
     "dev:server": "pnpm --filter @bx/agent-server dev",
     "dev:web": "pnpm --filter @bx/web dev",
     "build": "pnpm --filter @bx/web build",
-    "test": "pnpm --filter @bx/agent-server test"
+    "test": "pnpm --filter @bx/agent-server test",
+    "type-check": "pnpm --filter @bx/web type-check && pnpm --filter @bx/agent-server exec tsc --noEmit"
   }
 }

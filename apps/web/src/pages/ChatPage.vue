@@ -15,6 +15,7 @@ import ModelSelect from "../components/ModelSelect.vue";
 import ToolsSearch from "../components/ToolsSearch.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import ChartCard from "../components/ChartCard.vue";
 import { renderChatMarkdown } from "../chat-richtext";
 import { matchesFuzzyScoped, matchesFuzzy, loadPinyin, pinyinReady } from "../pinyin";
 import { getUiLocale, detectDefaultLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
@@ -54,6 +55,7 @@ import {
   streamChat,
   uploadFiles,
   MODEL_AUTO_ID,
+  type ChartSpec,
   type ChatPreferences,
   type ConversationDto,
   type ConvSortMode,
@@ -589,6 +591,8 @@ interface Bubble {
   };
   /** 任务规划（write_todos 产出，随执行推进状态）。 */
   todos?: TodoItem[];
+  /** 前端本地渲染图表（render_chart 产出；零外链，浏览器用 AntV 绘制）。一轮可出多张，按顺序展示。 */
+  charts?: ChartSpec[];
   /** 子代理（task）实时状态：独立事件维度，随流式进度更新，仅作展示（不落库）。 */
   subagents?: Array<{
     id: string;
@@ -641,6 +645,8 @@ interface ConvState {
   /** 该对话自己的中断句柄；「停止」只作用于它，不是全局中断。 */
   controller: AbortController | null;
   pendingImages: UploadResult[];
+  /** 待发的文档附件（PDF / Word / Excel / md / txt / csv）：随消息发 attachments，由服务端解析后注入上下文。 */
+  pendingDocs: UploadResult[];
   /** 服务端实际使用的模型名（可能因回退/降级与所选不同）。 */
   activeModelLabel: string;
   /** 该对话最近一次错误（侧栏状态点用）。 */
@@ -658,6 +664,7 @@ function blankState(): ConvState {
     sending: false,
     controller: null,
     pendingImages: [],
+    pendingDocs: [],
     activeModelLabel: "",
     error: "",
     settings: { modelId: "", locale: "", mcpEnabled: [], skillsEnabled: [] },
@@ -723,6 +730,19 @@ function onSidebarEsc(e: KeyboardEvent) {
 /** 是否把已归档对话也拉进侧栏列表。 */
 const showArchived = ref(false);
 const currentId = ref("");
+/**
+ * 首屏加载中（偏好 → 会话列表 → 选中/新建 全流程完成前为 true）。
+ * 用于挡掉「先渲染空态（想聊点什么？/ 空列表 / 清空按钮误入待确认态）再被真实数据覆盖」的闪现：
+ * 加载期间不出空态，加载完再按真实数据渲染空态或内容。
+ */
+const booting = ref(true);
+/**
+ * 是否真正渲染骨架屏。故意比 booting 晚一拍：
+ * 本地/局域网首屏通常一两百毫秒就回来了，立刻出骨架会「闪一下又消失」，本身就是一种抖。
+ * 只有加载超过延迟阈值才亮骨架，快加载则静默等到真实内容直接出现，中间不闪任何中间态。
+ */
+const showSkeleton = ref(false);
+const SKELETON_DELAY_MS = 240;
 /** 会话项上下文菜单（右键触发）：视口坐标绝对定位，渲染后做边界翻转。 */
 const ctxMenu = ref<{ open: boolean; x: number; y: number; targetId: string }>({
   open: false,
@@ -880,6 +900,8 @@ const DRAG_SCROLL_EDGE = 24;
 const fileInput = ref<HTMLInputElement | null>(null);
 /** 输入框元素引用：用于按内容自动撑高（交互优化）。 */
 const inputEl = ref<HTMLTextAreaElement | null>(null);
+/** 「停止」按钮：发送后原按钮被它替换，焦点得接过来（见 current.sending 的 watch）。 */
+const stopBtnRef = ref<HTMLButtonElement | null>(null);
 
 /** 用户拖拽固定的输入框高度（null = 跟随内容自动），本地持久化。 */
 const COMPOSER_H_KEY = "bx-agent-composer-h";
@@ -987,6 +1009,22 @@ const current = computed<ConvState>(() => (currentId.value ? states.get(currentI
 
 /** 输入内容变化（含切换对话）时让输入框自动长高。必须放在 current 声明之后，避免 setup 期 TDZ。 */
 watch(() => current.value.input, () => autoGrow());
+
+/**
+ * 发送 ⇄ 停止是两个不同按钮（v-if 互换）：点了之后原来那个按钮从 DOM 里消失，焦点掉到 body，
+ * 键盘用户按 Tab 得从页首重新走一遍（观影页实测复现过同一处）。
+ * 切换后把焦点扶到「此刻该按的控件」：生成中 → 停止，收束后 → 输入框；
+ * 只在焦点无主（body）时才接管，避免抢走用户此刻在别处的焦点。
+ */
+watch(
+  () => current.value.sending,
+  async (busy) => {
+    await nextTick();
+    if (document.activeElement !== document.body) return;
+    if (busy) stopBtnRef.value?.focus();
+    else inputEl.value?.focus();
+  },
+);
 
 /** 当前对话的模型选择；空 = 自动模式（运行时挑可用模型），UI 兜底展示「自动」。 */
 const modelId = computed({
@@ -1274,9 +1312,16 @@ function reasoningTitle(b: Bubble): string {
   return tx("推理过程", "Reasoning", "Raciocínio", "तर्क प्रक्रिया");
 }
 
+/** 读取快照里的图表 spec（兼容旧的单张 chart 字段：并入 charts）。 */
+function chartsOf(m: StoredMessage): ChartSpec[] {
+  const list = Array.isArray(m.charts) ? m.charts : [];
+  return m.chart ? [...list, m.chart] : list;
+}
+
 function toStored(list: Bubble[]): StoredMessage[] {
   return list
-    .filter((b) => b.text || b.images?.length)
+    // 只出图、没有正文的气泡也必须落库：否则整条消息（连图一起）刷新后消失。
+    .filter((b) => b.text || b.images?.length || b.charts?.length)
     .map((b) => ({
       role: b.role,
       text: b.text,
@@ -1286,6 +1331,8 @@ function toStored(list: Bubble[]): StoredMessage[] {
       ...(b.thinkMs ? { thinkMs: b.thinkMs } : {}),
       ...(b.steps?.length ? { steps: b.steps } : {}),
       ...(b.todos?.length ? { todos: b.todos } : {}),
+      // 图表 spec 也要落库：图是浏览器现场画的、产物只在内存，不存就会「刷新即消失」。
+      ...(b.charts?.length ? { charts: b.charts } : {}),
     }));
 }
 
@@ -1331,6 +1378,8 @@ function selectConversation(conv: ConversationDto) {
       ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
       ...(Array.isArray(m.steps) && m.steps.length ? { steps: m.steps as ToolStep[] } : {}),
       ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
+      // 图表卡片恢复（与 toStored 对称）：刷新后由 ChartCard 按 spec 重绘。
+      ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
     }));
   }
   // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
@@ -1924,6 +1973,12 @@ async function closeOtherConversations(keepId: string) {
  */
 const clearArmedFor = ref("");
 let clearArmTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * 是否处于待确认态。必须要求已有选中对话（currentId 非空）：
+ * 首屏未选中时 currentId 与 clearArmedFor 都是空串，直接比较会被判等，
+ * 刷新瞬间按钮会错误地闪成红色「确认清空（不可恢复）」。
+ */
+const clearArmed = computed(() => !!currentId.value && clearArmedFor.value === currentId.value);
 
 /** 头部清空按钮：首点进入待确认，再点才真正清空。 */
 function onClearCurrentClick() {
@@ -1976,9 +2031,17 @@ async function pickFiles(event: Event) {
   el.value = "";
   if (!files.length) return;
   const state = current.value;
+  // 图片走 vision 通道；文档（PDF/Word/Excel/md/txt/csv）走附件通道，由服务端解析后注入上下文。
+  const imageFiles: File[] = [];
+  const docFiles: File[] = [];
+  for (const f of files) {
+    const ext = (f.name.split(".").pop() || "").toLowerCase();
+    if (f.type.startsWith("image/") || ["png", "jpg", "jpeg", "webp"].includes(ext)) imageFiles.push(f);
+    else docFiles.push(f);
+  }
   try {
-    const saved = await uploadFiles(files);
-    state.pendingImages.push(...saved);
+    if (imageFiles.length) state.pendingImages.push(...(await uploadFiles(imageFiles)));
+    if (docFiles.length) state.pendingDocs.push(...(await uploadFiles(docFiles)));
   } catch (err) {
     state.bubbles.push({
       id: ++seq,
@@ -1994,17 +2057,28 @@ function removePendingImage(id: string) {
   state.pendingImages = state.pendingImages.filter((i) => i.id !== id);
 }
 
+/** 移除一个待发文档附件。 */
+function removePendingDoc(id: string) {
+  const state = current.value;
+  state.pendingDocs = state.pendingDocs.filter((i) => i.id !== id);
+}
+
 /** 队列容量上限：超过拒绝入队，避免无限堆积。 */
 const MAX_QUEUE = 20;
 
 /** 忙时入队（排队语义）：先本地、后落库，失败回滚并提示。 */
-async function enqueueMessage(convId: string, text: string, imageIds: string[]) {
+async function enqueueMessage(convId: string, text: string, imageIds: string[], docIds: string[] = []) {
   const state = stateOf(convId);
   if (state.queue.length >= MAX_QUEUE) {
     showSettingsError(tx("排队消息已达上限，请先处理队列", "The queue is full; handle it first", "A fila está cheia; resolva-a primeiro", "कतार भरी हुई है; पहले उसे संभालें"));
     return;
   }
-  const item: PendingMessage = { text, ...(imageIds.length ? { images: imageIds } : {}), at: Date.now() };
+  const item: PendingMessage = {
+    text,
+    ...(imageIds.length ? { images: imageIds } : {}),
+    ...(docIds.length ? { docs: docIds } : {}),
+    at: Date.now(),
+  };
   const prev = state.queue;
   state.queue = [...prev, item];
   try {
@@ -2050,7 +2124,7 @@ async function drainQueue(convId: string, ok: boolean) {
   } catch {
     /* 落库失败不阻塞发送，下次同步会纠正 */
   }
-  await runTurn(convId, next.text, next.images || []);
+  await runTurn(convId, next.text, next.images || [], undefined, next.docs || []);
 }
 
 async function send() {
@@ -2058,20 +2132,34 @@ async function send() {
   const convId = currentId.value;
   if (!convId) return;
   const text = state.input.trim();
-  if (!text && !state.pendingImages.length) return;
+  if (!text && !state.pendingImages.length && !state.pendingDocs.length) return;
   followBottom = true; // 用户发送：无条件回底（新一轮回复从底部开始展示）
   if (state.sending) {
     // 排队语义：同一对话在生成时，新消息进待发队列（服务端 409 是并发标签页的兜底）。
-    await enqueueMessage(convId, text, state.pendingImages.map((i) => i.id));
+    await enqueueMessage(
+      convId,
+      text,
+      state.pendingImages.map((i) => i.id),
+      state.pendingDocs.map((i) => i.id),
+    );
     state.input = "";
     state.pendingImages = [];
+    state.pendingDocs = [];
     return;
   }
   const images = state.pendingImages.slice();
-  // 发送后清空输入框与待发图片（仅在这条「用户主动发送」路径清；出队/立即发送走各自入参，不碰当前输入）。
+  const docs = state.pendingDocs.slice();
+  // 发送后清空输入框与待发附件（仅在这条「用户主动发送」路径清；出队/立即发送走各自入参，不碰当前输入）。
   state.input = "";
   state.pendingImages = [];
-  await runTurn(convId, text, images.map((i) => i.id), images.map((i) => ({ id: i.id, name: i.name })));
+  state.pendingDocs = [];
+  await runTurn(
+    convId,
+    text,
+    images.map((i) => i.id),
+    images.map((i) => ({ id: i.id, name: i.name })),
+    docs.map((i) => i.id),
+  );
 }
 
 /**
@@ -2079,11 +2167,18 @@ async function send() {
  * 单独抽出是为了让「队列自动出队」与「立即发送」复用同一条路径；
  * 注意模型取自**该对话**的设置，而不是当前展示的对话（后台出队时二者不同）。
  */
-async function runTurn(convId: string, text: string, imageIds: string[], thumbnails?: Array<{ id: string; name: string }>) {
+async function runTurn(
+  convId: string,
+  text: string,
+  imageIds: string[],
+  thumbnails?: Array<{ id: string; name: string }>,
+  docIds: string[] = [],
+) {
   const state = stateOf(convId);
   if (state.sending) {
     // 并发兜底（例如另一标签页正在生成同对话）：入队而不是报错，消息不丢。
-    await enqueueMessage(convId, text, imageIds);
+    // 图片与文档附件都必须带上：漏传 docIds 会让「排队才发的那条」静默丢附件（正文在、文件没了）。
+    await enqueueMessage(convId, text, imageIds, docIds);
     return;
   }
   state.bubbles.push({
@@ -2122,7 +2217,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
     await streamChat(
       text,
       // conversationId 显式带上：不依赖服务端的活跃对话回退（多标签页时会串）；agentId 供服务端按角色分流。
-      { conversationId: convId, model: chosenModel || undefined, images: imageIds, agentId: AGENT_ID },
+      { conversationId: convId, model: chosenModel || undefined, images: imageIds, attachments: docIds, agentId: AGENT_ID },
       (event) => {
         if (event.type === "text_delta") {
           reply.text += event.text;
@@ -2200,6 +2295,18 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
           reply.todos = event.todos;
           openReasoning.add(reply.id);
           queueScrollIfCurrent(convId);
+        } else if (event.type === "chart") {
+          // 本地渲染图表（render_chart）：追加到当前回复气泡，由 ChartCard 用 AntV 绘制。
+          // 一轮可能出多张（如「两张图对比」），必须逐张累积——单字段会让后一张覆盖前一张。
+          reply.charts = reply.charts || [];
+          reply.charts.push({
+            title: event.title,
+            chartType: event.chartType,
+            data: event.data,
+            encode: event.encode,
+            options: event.options,
+          });
+          queueScrollIfCurrent(convId);
         } else if (event.type === "subagent_start") {
           reply.subagents = reply.subagents || [];
           reply.subagents.push({
@@ -2254,7 +2361,7 @@ async function runTurn(convId: string, text: string, imageIds: string[], thumbna
       // 服务端并发保护（如另一标签页在跑）：消息不丢，进队列等下一轮自动发。
       queued = true;
       reply.text = tx("（该对话正在生成中，此消息已加入待发队列）", "(Chat is busy; the message was queued)", "(A conversa está ocupada; a mensagem entrou na fila)", "(चैट व्यस्त है; संदेश कतार में जोड़ दिया गया)");
-      await enqueueMessage(convId, text, imageIds);
+      await enqueueMessage(convId, text, imageIds, docIds);
     } else {
       // 连接类错误（断网/刷新/代理断开）：执行与推送已解耦，后台任务可能仍在跑。
       // 查一次任务状态：还在跑 → 如实告知「后台继续，稍后刷新可见」，不要误报为生成失败。
@@ -2398,7 +2505,8 @@ async function sendQueueItemNow(index: number) {
     }
   }
   await setQueue(convId, rest);
-  await runTurn(convId, item.text, item.images || []);
+  // 队列项里的图片/文档附件要原样带回本轮（漏传 docs 会让附件静默丢失）。
+  await runTurn(convId, item.text, item.images || [], undefined, item.docs || []);
 }
 
 async function answerToolConfirm(bubble: Bubble, confirmed: boolean) {
@@ -2759,6 +2867,17 @@ const mcpFiltered = computed(() => {
   return mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
 });
 
+/**
+ * 连接器角标只数「当前列表里确实存在」的 id：服务器若被从服务端配置里移除，
+ * 对话的启用集里可能残留悬空 id，直接按数组长度算就会出现「面板里一个勾都没有、角标却显示 1」。
+ * 列表还没拉到（首次打开菜单的预取窗口）时不判定，避免角标先亮后灭。
+ */
+const enabledMcpCount = computed(() => {
+  const ids = current.value.settings.mcpEnabled;
+  if (!mcpAvailable.value.length) return ids.length;
+  return ids.filter((id) => mcpAvailable.value.some((s) => s.id === id)).length;
+});
+
 function toggleToolsMenu() {
   toolsMenuOpen.value = !toolsMenuOpen.value;
   if (toolsMenuOpen.value) {
@@ -3077,9 +3196,21 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+/**
+ * 行内输入框的回车提交同样要跳过 IME 合成态（同 renaming / composer 的处理）。
+ * 之前这两处直接写 `@keydown.enter.prevent`，中文输入法选词的那一下回车会被当成提交。
+ */
+function onInlineSubmitKeydown(event: KeyboardEvent, submit: () => unknown) {
+  if (event.key !== "Enter" || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  void submit();
+}
+
 /** 首屏要打开的对话（来自后端 preferences；迁移时可能来自旧本地键）。 */
 let initialConversationId = "";
 let activeReportTimer: ReturnType<typeof setTimeout> | null = null;
+/** 首屏骨架屏延迟计时器（见 showSkeleton）。 */
+let skeletonTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * 上报「上次打开的对话」（设备态）。
@@ -3155,6 +3286,11 @@ onMounted(async () => {
   window.addEventListener("resize", onWindowResizeGrow);
   window.addEventListener("resize", updateIsMobile);
 
+  // 骨架屏延迟亮起：只在加载超过阈值时才显示，避免快加载时骨架「闪一下又消失」。
+  skeletonTimer = setTimeout(() => {
+    if (booting.value) showSkeleton.value = true;
+  }, SKELETON_DELAY_MS);
+
   // 设备态偏好（主题 / 默认语言 / 上次打开的对话）以后端为唯一真相；顺带跑一次性迁移。
   const prefs = await fetchChatPreferences().catch(() => null);
   if (prefs) {
@@ -3171,8 +3307,18 @@ onMounted(async () => {
   // 服务端给的是一份稳定默认序；「按最近活动」模式下要忽略 sortOrder 复算一次。
   resortConversations();
   const target = list.find((c) => c.id === initialConversationId) || list[0];
-  if (target) selectConversation(target);
-  else await newConversation();
+  try {
+    if (target) selectConversation(target);
+    else await newConversation();
+  } finally {
+    // 首屏数据就位（或失败）后收尾：清计时器、关骨架/空态拦截。
+    if (skeletonTimer) {
+      clearTimeout(skeletonTimer);
+      skeletonTimer = null;
+    }
+    booting.value = false;
+    showSkeleton.value = false;
+  }
 });
 
 onBeforeUnmount(() => {
@@ -3193,14 +3339,20 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", updateIsMobile);
   // 离开页面时把还没到点的删除落实，避免撤销窗口内的删除被永久搁置。
   flushPendingDelete();
+  // 首屏未加载完就离开：清掉延迟骨架计时器，避免卸载后仍回写状态。
+  if (skeletonTimer) {
+    clearTimeout(skeletonTimer);
+    skeletonTimer = null;
+  }
 });
 </script>
 
 <template>
   <div class="chat" @click="closeCtxMenu()">
     <aside class="sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }" :aria-label="tx('会话列表', 'Conversations', 'Conversas', 'चैट सूची')">
+      <div class="sidebar__inner">
       <div class="brand">
-        <span class="brand__name">{{ AGENT_LABEL || tx("小助手", "Assistant", "Assistente", "सहायक") }}</span>
+        <h1 class="brand__name">{{ AGENT_LABEL || tx("小助手", "Assistant", "Assistente", "सहायक") }}</h1>
         <RouterLink to="/" class="brand__home" :title="tx('返回门户', 'Back to portal', 'Voltar ao portal', 'पोर्टल पर वापस')">⌂</RouterLink>
         <button
           v-if="!isMobile"
@@ -3255,6 +3407,12 @@ onBeforeUnmount(() => {
         {{ tx("显示归档", "Archived", "Arquivadas", "आर्काइव") }}
       </label>
       <div ref="convListEl" class="conv-list">
+        <!-- 首屏慢加载才亮骨架行；快加载时不闪，直接等真实条目出现。 -->
+        <template v-if="showSkeleton">
+          <div class="conv-skeleton" aria-hidden="true"></div>
+          <div class="conv-skeleton" aria-hidden="true"></div>
+          <div class="conv-skeleton" aria-hidden="true"></div>
+        </template>
         <template v-for="(conv, i) in conversationsFiltered" :key="conv.id">
           <div v-if="!convQuery.trim() && pinnedCount > 0 && i === pinnedCount" class="conv-divider" role="separator">
             {{ tx("置顶", "Pinned", "Fixadas", "पिन किए गए") }}
@@ -3338,12 +3496,12 @@ onBeforeUnmount(() => {
       </p>
       <button
         class="ghost-btn"
-        :class="{ 'ghost-btn-danger': clearArmedFor === currentId }"
+        :class="{ 'ghost-btn-danger': clearArmed }"
         type="button"
         @click="onClearCurrentClick"
       >
         {{
-          clearArmedFor === currentId
+          clearArmed
             ? tx("确认清空（不可恢复）", "Confirm clear (can't be undone)", "Confirmar limpeza (irreversível)", "खाली करने की पुष्टि (अपरिवर्तनीय)")
             : tx("清空当前对话", "Clear current chat", "Limpar conversa atual", "वर्तमान चैट खाली करें")
         }}
@@ -3406,6 +3564,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </template>
+      </div>
     </aside>
     <!-- 移动端抽屉遮罩：仅抽屉打开时渲染，点击关闭；桌面端汉堡隐藏、不会打开（指南 §6 阻断项 #2）。 -->
     <div
@@ -3833,7 +3992,7 @@ onBeforeUnmount(() => {
                   type="text"
                   :placeholder="tx('要长期记住的事实或偏好…', 'A fact or preference to remember…', 'Un hecho o preferencia para recordar…', 'याद रखने के लिए तथ्य…')"
                   maxlength="500"
-                  @keydown.enter.prevent="addMemoryEntry"
+                  @keydown="onInlineSubmitKeydown($event, addMemoryEntry)"
                 />
                 <button class="mcp-mini" type="button" :disabled="memoryBusy || !memoryText.trim()" @click="addMemoryEntry">＋</button>
               </div>
@@ -3891,11 +4050,18 @@ onBeforeUnmount(() => {
 
       <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
       <div ref="threadEl" class="thread" tabindex="-1" @scroll="onThreadScroll">
-        <div v-if="!current.bubbles.length" class="empty">
+        <!-- 首屏慢加载才亮骨架；快加载时 booting 期间留空、不闪空态，直接等真实内容出现。 -->
+        <div v-if="showSkeleton" class="boot-skeleton" aria-hidden="true">
+          <div class="boot-skeleton__row boot-skeleton__row--agent"></div>
+          <div class="boot-skeleton__row boot-skeleton__row--user"></div>
+          <div class="boot-skeleton__row boot-skeleton__row--agent boot-skeleton__row--short"></div>
+        </div>
+        <div v-else-if="!booting && !current.bubbles.length" class="empty">
           {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
         </div>
         <div v-for="b in current.bubbles" :key="b.id" class="row" :class="b.role">
-          <div class="bubble-wrap">
+          <!-- has-chart：带图表的气泡要给确定宽度（否则气泡按文字收缩，图表卡片的百分比宽度会塌成窄条）。 -->
+          <div class="bubble-wrap" :class="{ 'has-chart': !!b.charts?.length }">
           <div class="bubble">
             <div
               v-if="b.todos?.length || b.steps?.length || b.subagents?.length || hasThinking(b) || (b.streaming && !b.text)"
@@ -3963,8 +4129,8 @@ onBeforeUnmount(() => {
                       class="step-head"
                       type="button"
                       :disabled="!step.result"
-                      :aria-expanded="step.result ? openSteps.has(stepKey(b, step)) : null"
-                      :aria-controls="step.result ? `step-result-${step.id}` : null"
+                      :aria-expanded="step.result ? openSteps.has(stepKey(b, step)) : undefined"
+                      :aria-controls="step.result ? `step-result-${step.id}` : undefined"
                       @click="toggleStep(b, step)"
                     >
                       <span class="mcp-dot" :class="stepClass(step.status)"></span>
@@ -4071,7 +4237,7 @@ onBeforeUnmount(() => {
                   type="text"
                   class="clarify-free__input"
                   :placeholder="tx('以上都不是？直接补充说明', 'None of these? Add your own answer', 'Nenhuma delas? Escreva a sua', 'इनमें से कोई नहीं? अपना उत्तर लिखें')"
-                  @keydown.enter.prevent="submitClarifyFreeform(b)"
+                  @keydown="onInlineSubmitKeydown($event, () => submitClarifyFreeform(b))"
                 />
                 <button
                   type="button"
@@ -4100,6 +4266,17 @@ onBeforeUnmount(() => {
                    答案气泡在出正文前保持空，避免与推理面板重复出现「思考中」指示。 -->
               <div v-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b), uiLocale)"></div>
             </template>
+            <!-- 图表卡片（render_chart 产出）：必须挂在气泡内容层——放进可折叠的推理面板会被默认折叠态
+                 的 display:none 隐藏，容器量到 0×0、图表完全不可见。一张一个卡片，逐张渲染、不互相覆盖。 -->
+            <div v-for="(c, ci) in b.charts || []" :key="`chart-${ci}`" class="chart-card-wrap">
+              <ChartCard
+                :title="c.title"
+                :chart-type="c.chartType"
+                :data="c.data"
+                :encode="c.encode"
+                :options="c.options"
+              />
+            </div>
             <div v-if="isStoppedBubble(b)" class="stopped-tag">
               <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true">
                 <rect x="6" y="6" width="12" height="12" rx="2" />
@@ -4143,7 +4320,7 @@ onBeforeUnmount(() => {
             <span class="queue__hint">{{ tx("生成结束后按序自动发送", "Sent in order after the current reply", "Enviadas em ordem após a resposta atual", "वर्तमान उत्तर के बाद क्रम से स्वतः भेजा जाएगा") }}</span>
           </div>
           <div v-for="(item, i) in current.queue" :key="item.at" class="queue__item">
-            <span class="queue__text">{{ item.text || tx("（仅图片）", "(images only)", "(apenas imagens)", "(केवल छवियाँ)") }}</span>
+            <span class="queue__text">{{ item.text || (item.docs && item.docs.length ? `（${item.docs.length} 个附件）` : tx("（仅图片）", "(images only)", "(apenas imagens)", "(केवल छवियाँ)")) }}</span>
             <span class="queue__ops">
               <button
                 type="button"
@@ -4186,6 +4363,19 @@ onBeforeUnmount(() => {
             </button>
           </span>
         </div>
+        <div v-if="current.pendingDocs.length" class="pending">
+          <span v-for="doc in current.pendingDocs" :key="doc.id" class="chip">
+            📎 {{ doc.name }}
+            <button
+              type="button"
+              :title="tx('移除', 'Remove', 'Remover', 'हटाएं')"
+              :aria-label="tx('移除', 'Remove', 'Remover', 'हटाएं')"
+              @click="removePendingDoc(doc.id)"
+            >
+              ×
+            </button>
+          </span>
+        </div>
         <div v-if="imagesUnsupported" class="warn-line">
           {{
             tx(
@@ -4202,7 +4392,7 @@ onBeforeUnmount(() => {
             ref="fileInput"
             type="file"
             name="files"
-            accept="image/*"
+            accept="image/*,.pdf,.docx,.xlsx,.md,.txt,.csv"
             multiple
             hidden
             @change="pickFiles"
@@ -4254,19 +4444,24 @@ onBeforeUnmount(() => {
                   </svg>
                 </button>
 
-                <!-- 已选专家 chip（对齐 CodeBuddy）：选中专家后显示在 + 旁，点 × 取消选中回通用；无 chip = 通用。 -->
-                <button
+                <!-- 已选专家 chip（对齐 CodeBuddy）：选中专家后显示在 + 旁，仅点 × 取消选中回通用；无 chip = 通用。 -->
+                <div
                   v-if="currentExpert"
-                  type="button"
                   class="expert-chip"
-                  :title="tx('取消选中助手，回到通用助手', 'Deselect assistant, back to general assistant', 'Desmarcar assistente, voltar ao assistente geral', 'सहायक चयन रद्द करें, सामान्य सहायक पर वापस')"
-                  @click="onClearExpert"
                 >
-                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" />
-                  </svg>
-                  <span>{{ agentText(currentExpert.label, uiLocale) }}</span>
-                </button>
+                  <span class="expert-chip__label">{{ agentText(currentExpert.label, uiLocale) }}</span>
+                  <button
+                    type="button"
+                    class="expert-chip__close"
+                    :title="tx('取消选中助手，回到通用助手', 'Deselect assistant, back to general assistant', 'Desmarcar assistente, voltar ao assistente geral', 'सहायक चयन रद्द करें, सामान्य सहायक पर वापस')"
+                    aria-label="取消选中助手"
+                    @click.stop="onClearExpert"
+                  >
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
 
                 <div v-if="toolsMenuOpen" class="tools-menu" role="menu">
                   <button
@@ -4309,7 +4504,7 @@ onBeforeUnmount(() => {
                       <path d="M9 6a3 3 0 1 1 6 0v1h2.5A1.5 1.5 0 0 1 19 8.5v3a3 3 0 0 1-3 3h-1v1a3 3 0 0 1-6 0v-1H7a3 3 0 0 1-3-3v-3A1.5 1.5 0 0 1 5.5 7H9z" />
                     </svg>
                     <span>{{ tx("连接器", "Connectors", "Conectores", "कनेक्टर") }}</span>
-                    <span v-if="current.settings.mcpEnabled.length" class="tools-badge">{{ current.settings.mcpEnabled.length }}</span>
+                    <span v-if="enabledMcpCount" class="tools-badge">{{ enabledMcpCount }}</span>
                     <span class="tools-menu__chev">›</span>
                   </button>
                   <button
@@ -4338,7 +4533,7 @@ onBeforeUnmount(() => {
                       {{
                         skillAvailable.length
                           ? tx("没有匹配的技能", "No matching skills", "Nenhuma habilidade correspondente", "कोई मेल खाता स्किल नहीं")
-                          : tx("还没有可用的技能（服务端 skills 目录为空）", "No skills available yet", "Nenhuma habilidade disponível", "कोई स्किल उपलब्ध नहीं")
+                          : tx("没有可勾选的技能（默认技能无需勾选即已生效）", "No selectable skills (default skills are already in effect)", "Nenhuma habilidade selecionável (as padrão já estão ativas)", "कोई चयन-योग्य स्किल नहीं (डिफ़ॉल्ट स्किल पहले से लागू हैं)")
                       }}
                     </div>
                     <button
@@ -4450,7 +4645,7 @@ onBeforeUnmount(() => {
                     <button
                       class="tools-flyout__action"
                       type="button"
-                      :disabled="!current.settings.mcpEnabled.length || mcpBusy"
+                      :disabled="!enabledMcpCount || mcpBusy"
                       @click="clearMcpSelection"
                     >
                       {{ tx("取消全部已选连接器", "Deselect all connectors", "Desmarcar todos os conectores", "सभी चयन हटाएँ") }}
@@ -4501,6 +4696,7 @@ onBeforeUnmount(() => {
               <span class="composer-hint">{{ tx("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for a new line", "Enter envia · Shift+Enter nova linha", "भेजने के लिए Enter · नई पंक्ति के लिए Shift+Enter") }}</span>
               <button
                 v-if="current.sending"
+                ref="stopBtnRef"
                 class="send stop"
                 type="button"
                 :title="tx('停止', 'Stop', 'Parar', 'रोकें')"
@@ -4561,15 +4757,26 @@ onBeforeUnmount(() => {
   flex: 0 0 256px;
   border-right: 1px solid var(--line);
   background: var(--panel);
-  padding: 16px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  /* min-width:0 让折叠态真正能缩到 0（否则被内部内容最小宽度撑住，
+     文字会 reflow 闪现）；overflow:hidden 把固定宽度的 inner 裁掉而非重排。 */
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   /* 桌面端折叠时平滑收起（移动端媒体查询会改用 transform 过渡）。 */
   transition:
     flex-basis 0.2s ease,
     width 0.2s ease;
+}
+
+/* 固定宽度的内部容器：折叠时整体被外层裁切，文字不会重新换行/抖动闪现。 */
+.sidebar__inner {
+  width: 256px;
+  flex: none;
+  height: 100%;
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .brand {
@@ -4579,6 +4786,7 @@ onBeforeUnmount(() => {
 }
 
 .brand__name {
+  margin: 0;
   font-family: var(--font-display);
   font-size: 17px;
   font-weight: 600;
@@ -5610,6 +5818,20 @@ onBeforeUnmount(() => {
   min-height: 0;
 }
 
+/* 侧栏首屏骨架行（加载中占位，避免「空列表 → 条目」闪现）。 */
+.conv-skeleton {
+  height: 34px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--ink) 6%, transparent) 25%,
+    color-mix(in srgb, var(--ink) 12%, transparent) 37%,
+    color-mix(in srgb, var(--ink) 6%, transparent) 63%
+  );
+  background-size: 400% 100%;
+  animation: boot-shimmer 1.4s ease infinite, skeleton-fade 0.18s ease-out;
+}
+
 .conv-item {
   display: flex;
   align-items: center;
@@ -6193,6 +6415,12 @@ onBeforeUnmount(() => {
   .tools-flyout {
     animation: none;
   }
+
+  /* 骨架屏去掉流光动画（保留静态占位块）。 */
+  .boot-skeleton__row,
+  .conv-skeleton {
+    animation: none;
+  }
 }
 
 /* 窄屏：飞出改为在菜单上方展开，避免右侧越界 */
@@ -6277,7 +6505,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   margin-left: 6px;
-  padding: 4px 10px;
+  padding: 4px 4px 4px 10px;
   border: 1px solid var(--border, #d5dae2);
   border-radius: 999px;
   background: color-mix(in srgb, var(--ink) 5%, transparent);
@@ -6285,7 +6513,6 @@ onBeforeUnmount(() => {
   font: inherit;
   font-size: 12px;
   line-height: 1.4;
-  cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 
@@ -6294,9 +6521,30 @@ onBeforeUnmount(() => {
   border-color: color-mix(in srgb, var(--ink) 25%, transparent);
 }
 
-.expert-chip svg {
-  color: var(--muted, #8a93a3);
+.expert-chip__label {
+  cursor: default;
+  user-select: none;
+}
+
+.expert-chip__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted, #8a93a3);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.expert-chip__close:hover {
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+  color: var(--ink);
 }
 
 .tools-item__body {
@@ -7286,6 +7534,61 @@ button.step-head:disabled {
   font-size: 14px;
 }
 
+/* 对话区首屏骨架：加载期间占位，避免先闪「想聊点什么？」空态再被真实消息覆盖。 */
+.boot-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 8px 0;
+  /* 骨架是「等久了才出现」的东西，淡入比硬切更不突兀。 */
+  animation: skeleton-fade 0.18s ease-out;
+}
+
+.boot-skeleton__row {
+  height: 44px;
+  border-radius: 14px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--ink) 6%, transparent) 25%,
+    color-mix(in srgb, var(--ink) 12%, transparent) 37%,
+    color-mix(in srgb, var(--ink) 6%, transparent) 63%
+  );
+  background-size: 400% 100%;
+  animation: boot-shimmer 1.4s ease infinite;
+}
+
+.boot-skeleton__row--agent {
+  width: 62%;
+}
+
+.boot-skeleton__row--user {
+  width: 48%;
+  align-self: flex-end;
+}
+
+.boot-skeleton__row--short {
+  width: 40%;
+}
+
+@keyframes boot-shimmer {
+  from {
+    background-position: 100% 50%;
+  }
+  to {
+    background-position: 0 50%;
+  }
+}
+
+/* 骨架整体淡入（与 shimmer 并存，故用逗号并列两个动画）。 */
+@keyframes skeleton-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* 对话列：流式全宽（只留响应式内边距），超宽屏也不留大空白 */
 .row {
   display: flex;
@@ -7309,6 +7612,19 @@ button.step-head:disabled {
   align-items: flex-end;
   max-width: 100%;
   min-width: 0;
+}
+
+/* 带图表的气泡需要一个「确定宽度」：气泡默认按文字宽度收缩，而图表卡片内部是「百分比 + autoFit」，
+   父级宽度不确定时会被反向钳成窄条（实测 159px 的细长图）。
+   但也不能直接 100% 撑满对话列——那样正文行宽会被拉到 1249px（正常气泡 338px），
+   可读性崩掉、图表还孤零零靠左。这里给一个「够放图、又不拉长正文」的上限，
+   卡片一律 width:100% 跟随它（宽度决策只留这一处；保留 align-items: flex-end 让操作栏仍右对齐）。 */
+.bubble-wrap.has-chart {
+  width: min(100%, 760px);
+}
+
+.bubble-wrap.has-chart > .bubble {
+  width: 100%;
 }
 
 /* 用户气泡：着色 + 不对称圆角（右下收角指向发言方）；
@@ -7653,7 +7969,7 @@ button.step-head:disabled {
   flex: none;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
-  color: color-mix(in srgb, var(--muted) 85%, transparent);
+  color: var(--muted);
 }
 
 /* 进行中指示：环形转圈。轨道只给 20% 的抓色——整圈同亮度会显得笨重（antd Spin 的处理）。 */
@@ -7992,7 +8308,6 @@ button.step-head:disabled {
   margin-left: auto;
   font-size: 11px;
   color: var(--muted);
-  opacity: 0.75;
   user-select: none;
 }
 
@@ -8062,6 +8377,12 @@ button.step-head:disabled {
 
   .sidebar.open {
     transform: translateX(0);
+  }
+
+  /* 移动端抽屉宽度不固定，inner 改为填满抽屉宽度（桌面端固定 256px 防止折叠闪现）。 */
+  .sidebar__inner {
+    width: 100%;
+    padding: 16px 14px;
   }
 }
 

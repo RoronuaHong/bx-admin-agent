@@ -156,22 +156,29 @@ export async function parseFile(absPath: string): Promise<ParsedDoc | { error: s
   }
   const fallbackTitle = path.basename(absPath, ext);
   let text = "";
-  if (PDF_EXT.has(ext)) {
-    const res = await parsePdf(buf);
-    if ("error" in res) return res;
-    text = res.text;
-  } else if (DOCX_EXT.has(ext)) {
-    const res = await parseDocx(buf);
-    if ("error" in res) return res;
-    text = res.text;
-  } else if (XLSX_EXT.has(ext)) {
-    const res = await parseXlsx(absPath);
-    if ("error" in res) return res;
-    text = res.text;
-  } else if (HTML_EXT.has(ext)) {
-    text = stripHtml(buf.toString("utf8"));
-  } else {
-    text = buf.toString("utf8");
+  try {
+    if (PDF_EXT.has(ext)) {
+      const res = await parsePdf(buf);
+      if ("error" in res) return res;
+      text = res.text;
+    } else if (DOCX_EXT.has(ext)) {
+      const res = await parseDocx(buf);
+      if ("error" in res) return res;
+      text = res.text;
+    } else if (XLSX_EXT.has(ext)) {
+      const res = await parseXlsx(absPath);
+      if ("error" in res) return res;
+      text = res.text;
+    } else if (HTML_EXT.has(ext)) {
+      text = stripHtml(buf.toString("utf8"));
+    } else {
+      text = buf.toString("utf8");
+    }
+  } catch (err) {
+    // 解析器自身抛出的异常（坏文件结构、加密文档、依赖内部错误等）不能穿透出去：
+    // 入库脚本是**扫目录批处理**的，一个文件抛异常会中断整次入库；而本函数的契约是
+    // 「返回文本，或一条可展示的失败原因（不抛异常）」。实测踩到：一个结构损坏的 pdf 让入库直接崩。
+    return { error: `${ext.slice(1) || "文件"} 解析失败：${String((err as Error)?.message || err)}` };
   }
   if (!text.trim()) return { error: "文件内容为空" };
   return { title: titleOf(text, fallbackTitle), text };

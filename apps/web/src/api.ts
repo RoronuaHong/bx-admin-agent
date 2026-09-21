@@ -1,4 +1,4 @@
-import type { LocalizedToken, ApiErrorPayload, ChatEvent } from "@bx/shared";
+import type { LocalizedToken, ApiErrorPayload, ChatEvent, ChartSpec } from "@bx/shared";
 
 export class ApiError extends Error {
   status?: number;
@@ -94,7 +94,7 @@ export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
 /** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
 export async function streamChat(
   text: string,
-  opts: { conversationId?: string; model?: string; images?: string[]; agentId?: string },
+  opts: { conversationId?: string; model?: string; images?: string[]; attachments?: string[]; agentId?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ) {
@@ -144,6 +144,10 @@ export async function clearConversationContext(id: string) {
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/context/clear`, { method: "POST" });
 }
 
+/** 本地渲染图表的 spec（render_chart 产出；前端 ChartCard 按它绘制）。
+ *  形状定义在 @bx/shared（与 chat 事件、服务端落库快照共用一份），这里只做转出。 */
+export type { ChartSpec };
+
 // ---- 会话持久化（服务端存储）----
 export interface StoredMessage {
   id?: string | number;
@@ -161,12 +165,21 @@ export interface StoredMessage {
   steps?: unknown[];
   /** 任务规划（write_todos 产出，推理面板展示用）。 */
   todos?: unknown[];
+  /**
+   * 本地渲染图表（render_chart 产出的 spec）：图的渲染产物只存在内存里，
+   * 必须随快照落库，否则刷新/重进对话后图表卡片消失（与 thinking/steps 同理）。
+   * 一轮可出多张（如「两张图对比」），故为数组——单字段会让后一张覆盖前一张。
+   */
+  charts?: ChartSpec[];
+  /** @deprecated 旧的单张结构（历史快照）：读取时并入 charts；写入一律用 charts。 */
+  chart?: ChartSpec;
 }
 
 /** 排队中的待发消息（后端持久化，`conversation.pendingQueue`）。 */
 export interface PendingMessage {
   text: string;
   images?: string[];
+  docs?: string[];
   at: number;
 }
 

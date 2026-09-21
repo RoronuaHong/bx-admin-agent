@@ -102,14 +102,20 @@ const showClearModal = ref(false);
 const clearPrimaryRef = ref<HTMLButtonElement | null>(null);
 /** 触发弹窗的「清空对话」按钮：关闭后焦点还给它，否则焦点掉回 body、Tab 会从页首重来。 */
 const clearTriggerRef = ref<HTMLButtonElement | null>(null);
+/** 页面根容器：弹窗打开时对它加 `inert`，让背景既不进 Tab 序、也不被读屏念到。 */
+const pageRoot = ref<HTMLElement | null>(null);
+/** 弹窗本体：Tab 循环的边界。 */
+const modalRef = ref<HTMLElement | null>(null);
 
 /**
- * 打开：锁住背景滚动 + 焦点进入「清空」（与 `/chat` 的删除确认弹窗同一约定：回车=确认、Esc=取消）；
+ * 打开：锁住背景滚动 + 背景整体 `inert` + 焦点进入「清空」（与 `/chat` 的删除确认弹窗同一约定：回车=确认、Esc=取消）；
  * 关闭：解锁 + 焦点归还触发按钮。
- * 只做视觉不动焦点的话，键盘用户按 Tab 会逛到弹窗背后的页面上。
+ * `inert` 是关键一环：实测只做「打开时聚焦、关闭时归还」，按一次 Tab 焦点就掉到 body、接着跑到
+ * 弹窗背后的页面上——背景层 `inert` 后既不参与 Tab 序也不进读屏，比手写 Tab 循环更省且更彻底。
  */
 watch(showClearModal, async (open) => {
   document.body.style.overflow = open ? "hidden" : "";
+  if (pageRoot.value) pageRoot.value.inert = open;
   await nextTick();
   if (open) clearPrimaryRef.value?.focus();
   else clearTriggerRef.value?.focus();
@@ -235,6 +241,34 @@ async function onLocaleChange(locale: UiLocale) {
   await patchConversation(convId, { locale }).catch(() => {});
 }
 
+/**
+ * 只要还有一条气泡在流式生成中：给 log 区域挂 aria-busy，让读屏「等整段完成」再播报一次，
+ * 而不是每个 token 都念一遍（一次回复几百个增量会把读屏刷爆）。
+ */
+const anyStreaming = computed(() => bubbles.value.some((b) => b.streaming));
+/** log 角色的可访问名称：MDN 明确 role="log" 必须有可访问名称，否则读屏只报「日志」二字。 */
+const logLabel = computed(() =>
+  tx("对话记录", "Conversation log", "Registro da conversa", "बातचीत लॉग"),
+);
+/** 气泡的说话人前缀（视觉隐藏）：log 里每条消息都得能听出是谁说的。 */
+const meLabel = computed(() => tx("我说：", "Me: ", "Eu: ", "मैं: "));
+const agentSayLabel = computed(() => `${AGENT_LABEL.value}：`);
+
+/**
+ * 回车发送有两个必须挡掉的例外，缺一个就是 bug：
+ * - Shift+Enter 是换行，不发送；
+ * - **IME 合成态必须跳过**：中文输入法下回车是「把候选词上屏」，不是要发送，
+ *   误判会把没打完的句子直接推给模型。原生标志 `isComposing`（UI Events 规范），
+ *   并保留旧浏览器回退 `keyCode === 229`。修复前用 `@keydown.enter.exact.prevent`，
+ *   `.exact` 只管 Shift/Ctrl 组合键，管不了输入法状态——实测合成态回车会真的发出去。
+ */
+function onKeydown(event: KeyboardEvent) {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  if (event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  void send();
+}
+
 async function send() {
   const text = input.value.trim();
   if (!text || sending.value) return;
@@ -340,9 +374,29 @@ function closeClearModal() {
 
 /** Esc 关闭：确认弹窗的通用约定，键盘用户不必再回头找鼠标。 */
 function onClearModalKeydown(event: KeyboardEvent) {
-  if (!showClearModal.value || event.key !== "Escape") return;
-  event.preventDefault();
-  closeClearModal();
+  if (!showClearModal.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeClearModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  // 背景 inert 还不够：实测焦点仍会从弹窗最后一个按钮掉到 body（再按就跑到浏览器 UI 上）。
+  // 按 WAI-ARIA APG 的对话框线路，Tab / Shift+Tab 要在弹窗首尾之间循环。
+  const box = modalRef.value;
+  if (!box) return;
+  const items = [...box.querySelectorAll<HTMLElement>("button, [href], input, textarea, select, [tabindex]")].filter(
+    (el) => !el.hasAttribute("disabled") && el.tabIndex >= 0,
+  );
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (!first || !last) return;
+  const active = document.activeElement as HTMLElement | null;
+  const outside = !active || !box.contains(active);
+  if (outside || (event.shiftKey ? active === first : active === last)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
 }
 
 /**
@@ -365,14 +419,36 @@ async function clearChat() {
   ]);
 }
 
-/** 悬浮说明 / 无障碍名：把「为什么点不了」讲清楚，而不是给一个沉默的灰按钮。 */
-const clearHint = computed(() =>
+/** 按钮可见文案，同时也是可访问名称的主干——两者的内容必须一致。 */
+const clearLabel = computed(() => tx("清空对话", "Clear chat", "Limpar conversa", "चैट खाली करें"));
+/**
+ * 「为什么点不了」作括号补充跟在可见文案后面，而不是替换它：
+ * aria-label 必须**包含**可见文字（WCAG 2.5.3 Label in Name），否则语音用户说「清空对话」找不到这个按钮。
+ * Lighthouse 的 `label-content-name-mismatch` 实测抓的就是这里（可见「清空对话」 vs 名称「清空当前对话」）。
+ */
+const clearAccessibleName = computed(() =>
   sending.value
-    ? tx("生成中，请先停止", "Still generating — stop it first", "Gerando — pare antes", "उत्पन्न हो रहा है — पहले रोकें")
-    : tx("清空当前对话", "Clear current chat", "Limpar conversa atual", "वर्तमान चैट खाली करें"),
+    ? `${clearLabel.value}（${tx("生成中，请先停止", "Still generating — stop it first", "Gerando — pare antes", "उत्पन्न हो रहा है — पहले रोकें")}）`
+    : clearLabel.value,
 );
 
 const ta = ref<HTMLTextAreaElement | null>(null);
+/** 「停止」按钮：发送后原按钮被它替换，焦点得接过来（见下面 sending 的 watch）。 */
+const stopRef = ref<HTMLButtonElement | null>(null);
+
+/**
+ * 发送 ⇄ 停止是两个不同按钮（v-if 互换），点了之后原来那个按钮从 DOM 里消失，
+ * 焦点会掉到 body——实测键盘用户按 Tab 得从页首重新走一遍。
+ * 切换完成后把焦点扶到「此刻该按的控件」：生成中 → 停止，收束后 → 输入框。
+ * 只在焦点确实无主（body）时才接管，避免抢走用户此刻在别处的焦点。
+ */
+watch(sending, async (busy) => {
+  await nextTick();
+  if (document.activeElement !== document.body) return;
+  if (busy) stopRef.value?.focus();
+  else ta.value?.focus();
+});
+
 function autoGrow() {
   const el = ta.value;
   if (!el) return;
@@ -402,10 +478,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="mc">
+  <div ref="pageRoot" class="mc">
     <header class="mc-top">
       <div class="mc-top-inner">
-        <span class="mc-title">{{ AGENT_LABEL }}</span>
+        <!-- h1：整页此前一个标题都没有，读屏用户没法用「按标题跳转」快速定位，跳转链接落进来后也没有标题可念。 -->
+        <h1 class="mc-title">{{ AGENT_LABEL }}</h1>
         <div class="mc-actions">
           <!-- 观影助手页面不展示模型选择器：模型仍走「自动」逻辑（send() 内 resolveModel 自动选可用模型），
                仅隐藏 UI 控件，避免把内部模型切换暴露给终端用户。 -->
@@ -416,8 +493,8 @@ onBeforeUnmount(() => {
             type="button"
             class="mc-clear"
             :disabled="sending || !bubbles.length"
-            :title="clearHint"
-            :aria-label="clearHint"
+            :title="clearAccessibleName"
+            :aria-label="clearAccessibleName"
             @click="openClearModal"
           >
             <span class="mc-clear__icon" aria-hidden="true">
@@ -438,7 +515,7 @@ onBeforeUnmount(() => {
                 <path d="M13.5 11v5" />
               </svg>
             </span>
-            <span class="mc-clear__label">{{ tx("清空对话", "Clear chat", "Limpar conversa", "चैट खाली करें") }}</span>
+            <span class="mc-clear__label">{{ clearLabel }}</span>
           </button>
           <UiLocaleSelect @change="onLocaleChange" />
           <ThemeToggle />
@@ -446,9 +523,16 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
-    <div ref="scroller" class="mc-scroll" tabindex="-1" @scroll="onScroll">
-      <div class="mc-inner">
+    <!-- main 地标：整页主內容就是这段对话，缺了它读屏用户没法用「跳到主内容」直达。
+         tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
+    <main ref="scroller" class="mc-scroll" tabindex="-1" @scroll="onScroll">
+      <div
+        class="mc-inner"
+        role="log"
+        aria-live="polite"
+        :aria-busy="anyStreaming ? 'true' : 'false'"
+        :aria-label="logLabel"
+      >
         <!-- 空态：没有对话时给一张渐变欢迎卡，避免整页只剩一片空白。 -->
         <div v-if="!bubbles.length" class="mc-welcome">
           <div class="mc-welcome__title">{{ AGENT_LABEL }}</div>
@@ -470,6 +554,8 @@ onBeforeUnmount(() => {
           :class="b.role"
         >
           <div class="mc-bubble">
+            <!-- 读屏不知道这条是谁说的：补一个视觉隐藏的说话人前缀（聊天日志要能分辨发言者）。 -->
+            <span class="sr-only">{{ b.role === "user" ? meLabel : agentSayLabel }}</span>
             <div v-if="b.images?.length" class="mc-imgs">
               <span v-for="img in b.images" :key="img.id" class="mc-img">{{ img.name }}</span>
             </div>
@@ -481,9 +567,10 @@ onBeforeUnmount(() => {
                    模型不出推理（非思考模型）时退回三点输入指示，标题只说「正在生成」，不谎称在思考。 -->
               <details v-if="b.streaming" class="mc-think" open>
                 <summary class="mc-think__head">
-                  <span class="sr-only">{{ thinkingLabel(b) }}</span>
+                  <!-- sr-only 只在「没有可见标题」时才需要（此时标题只有三点动画，读屏得有个名字）：
+                       有可见标题时若还留一份 sr-only，同一句标题会被读屏念两遍。 -->
+                  <span :class="{ 'sr-only': !hasThinking(b) }">{{ thinkingLabel(b) }}</span>
                   <span v-if="!hasThinking(b)" class="mc-typing" aria-hidden="true"><span></span><span></span><span></span></span>
-                  <span v-else>{{ thinkingLabel(b) }}</span>
                 </summary>
                 <pre v-if="hasThinking(b)" class="mc-think__body">{{ b.thinking }}</pre>
               </details>
@@ -497,7 +584,7 @@ onBeforeUnmount(() => {
       <!-- 回到顶部：挂在对话滚动容器内（滚动容器由组件自动识别）；avoid-selector 抬到输入区上方不压输入框，
            threshold 用一个气泡高——观影对话可滚高度常常只有一两百像素。 -->
       <BackToTop :threshold="120" avoid-selector=".mc-composer" focus-target=".mc-scroll" />
-    </div>
+    </main>
 
     <form class="mc-composer" @submit.prevent="send">
       <div v-if="notice" class="mc-notice" role="status">{{ notice }}</div>
@@ -507,9 +594,11 @@ onBeforeUnmount(() => {
           v-model="input"
           class="mc-input"
           rows="1"
+          enterkeyhint="send"
+          :aria-label="tx('输入你想问的问题', 'Type your question', 'Digite sua pergunta', 'अपना प्रश्न लिखें')"
           :placeholder="tx('问问观影助手…', 'Ask the movie assistant…', 'Pergunte ao assistente…', 'फ़िल्म सहायक से पूछें…')"
           @input="autoGrow"
-          @keydown.enter.exact.prevent="send"
+          @keydown="onKeydown"
         ></textarea>
         <!-- 发送/停止统一为同一几何（47px，与输入框单行等高）：切换时不跳动；停止用语义色 + 图标，
              多语言文字放 title/aria，避免「Parar / रोकें」这类长文把按钮撑宽、挤破输入区。 -->
@@ -538,6 +627,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           v-else
+          ref="stopRef"
           type="button"
           class="mc-send mc-send--stop"
           :title="tx('停止', 'Stop', 'Parar', 'रोकें')"
@@ -555,6 +645,7 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <div v-if="showClearModal" class="mc-modal-mask" @click.self="closeClearModal">
         <div
+          ref="modalRef"
           class="mc-modal"
           role="alertdialog"
           aria-modal="true"
@@ -610,6 +701,9 @@ html[data-theme="dark"] .mc {
   background-attachment: fixed;
 }
 
+/* 跳转链接（全局一份，在 App.vue 内）：键盘用户 Tab 第一下即可跳到主内容。
+   这里只补 forced-colors 下的焦点环兜底，见 styles.css。 */
+
 .mc-top {
   flex: 0 0 auto;
   padding: 12px 16px;
@@ -642,8 +736,11 @@ html[data-theme="dark"] .mc-top {
   font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.2px;
-  /* 渐变文字：蓝 → 橘，与页面主色一致。 */
-  background: linear-gradient(92deg, #2f6fed 0%, #6aa8f5 46%, #ef8a3c 100%);
+  /* 标题改成 h1 后必须清掉默认 margin，否则会顶开顶栏的对齐。 */
+  margin: 0;
+  /* 渐变文字：蓝 → 橘，与页面主色一致。停靠色取深橘 #d2691e：浅色背景下大字 AA 需 ≥3:1，
+     原 #ef8a3c 只有 2.35:1 会挂（标题 17px 粗体属大字）。蓝端 4.25 达标，故只压橙端。 */
+  background: linear-gradient(92deg, #2f6fed 0%, #6aa8f5 46%, #d2691e 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -1024,7 +1121,8 @@ html[data-theme="dark"] .mc-welcome {
   font-size: 20px;
   font-weight: 700;
   letter-spacing: 0.3px;
-  background: linear-gradient(92deg, #2f6fed 0%, #7cb3f7 46%, #ef8a3c 100%);
+  /* 与 .mc-title 同一修复：橙端停靠色压到 #d2691e（浅底大字 AA 需 ≥3:1，原 #ef8a3c 仅 2.35:1 会挂）。 */
+  background: linear-gradient(92deg, #2f6fed 0%, #7cb3f7 46%, #d2691e 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;

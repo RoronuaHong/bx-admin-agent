@@ -40,7 +40,7 @@ import {
   type StoredMessage,
 } from "./conversations.js";
 import { chatStream, cancelSubagent, cancelSubagentsOfConversation } from "./chat.js";
-import { listSkillMetas } from "./skills.js";
+import { listSelectableSkillMetas, listSkillMetas } from "./skills.js";
 import { hasRole } from "./roles.js";
 import {
   cancelTask,
@@ -94,12 +94,16 @@ const MAX_INPUT_LEN = Math.max(1, Number(process.env.CHAT_MAX_INPUT_LEN || 8000)
 const RATE_STREAM_PER_MIN = Math.max(0, Number(process.env.RATE_LIMIT_STREAM_PER_MIN ?? 20));
 const RATE_CONCURRENT_PER_OWNER = Math.max(0, Number(process.env.RATE_LIMIT_CONCURRENT_PER_OWNER ?? 3));
 
-/** 从任务事件缓冲提取 run 级统计（usage / model / error 事件），落 run 级 trace。 */
-function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, sessionId?: string, ownerKey?: string): RunTrace {
+/** 从任务事件缓冲提取 run 级统计（usage / model / error 事件），落 run 级 trace。
+ * model：buffer 有 model 事件时优先用它；该事件在**起始**发射，长 run 会被 chat-tasks.ts 的
+ * 缓冲上限裁掉，故以 chatStream 旁路 sink 记录的 **实际服务模型**（servedModelId）兜底。
+ * 未发起过模型调用的 run（校验失败等）sink 不写入，model 如实留空——不臆造配置模型。 */
+function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, sessionId?: string, ownerKey?: string, servedModelId?: string): RunTrace {
   const reversed = [...task.buffer].reverse();
   const usage = reversed.find((event) => event.type === "usage");
   const modelEvent = reversed.find((event) => event.type === "model");
   const errorEvent = reversed.find((event) => event.type === "error");
+  const model = modelEvent?.id || servedModelId || undefined;
   return {
     runId,
     at: task.startedAt,
@@ -107,7 +111,7 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
     ...(sessionId ? { sessionId } : {}),
     ...(ownerKey ? { ownerKey } : {}),
     userText: task.userText.slice(0, 200),
-    ...(modelEvent ? { model: modelEvent.id } : {}),
+    ...(model ? { model } : {}),
     status,
     durationMs: (task.settledAt || Date.now()) - task.startedAt,
     ...(usage ? { rounds: usage.rounds, toolCalls: usage.toolCalls, tokens: usage.tokens, costTokens: usage.costTokens, modelRetries: usage.modelRetries, modelFallbacks: usage.modelFallbacks, groundingRetries: usage.groundingRetries, groundingVerifications: usage.groundingVerifications, ungrounded: usage.ungrounded } : {}),
@@ -123,13 +127,15 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
  */
 async function consumeTask(
   task: ChatTask,
-  opts: { model?: string; images?: string[]; sessionId?: string; ownerKey?: string },
+  opts: { model?: string; images?: string[]; attachments?: string[]; sessionId?: string; ownerKey?: string },
 ): Promise<void> {
   const runId = newRunId();
   let status: RunStatus = "failed";
   let outcomePersisted = false;
+  // run 级追踪旁路 sink：chatStream 在此记录实际服务模型（first-class，不依赖受限的事件缓冲）。
+  const traceMeta: { servedModel?: string } = {};
   try {
-    for await (const event of chatStream(task.conversationId, task.userText, opts, task.abort.signal)) {
+    for await (const event of chatStream(task.conversationId, task.userText, opts, task.abort.signal, traceMeta)) {
       publishTaskEvent(task, event);
     }
     // 诚实状态：生成器正常结束但产出过 error 事件（如无模型/模型失败）→ 标 failed 而非 success。
@@ -153,7 +159,11 @@ async function consumeTask(
     }
   }
   // run 级追踪（§10 最小版）：每次任务收束落一行 JSONL。
-  appendRunTrace(buildRunTrace(task, runId, status, opts.sessionId, opts.ownerKey));
+  // model 只认 chatStream 旁路 sink 的**实际服务模型**：长 run 起始 model 事件被缓冲裁剪也不受影响，
+  // 未真正发起模型调用的 run（如 0ms 校验失败）sink 为空 → model 留空，不臆造配置模型。
+  appendRunTrace(
+    buildRunTrace(task, runId, status, opts.sessionId, opts.ownerKey, traceMeta.servedModel),
+  );
   // 结果回投：仅在客户端已断开时做（订阅者在线时由前端负责 UI 消息持久化，避免双写竞态）。
   if (!task.live) {
     outcomePersisted = await persistTaskOutcome(task).catch(() => false);
@@ -408,11 +418,16 @@ export function createApp() {
     const conversationId = c.req.query("conversationId") || session.activeConversationId || "";
     const owned = conversationId ? await conversationOwnedBy(conversationId, c.get("owner")) : false;
     const doc = owned && conversationId ? await getConversation(conversationId) : null;
-    return c.json({
-      conversationId,
-      available: listStatuses(),
-      enabled: doc?.mcpServers || [],
-    });
+    const available = listStatuses();
+    const known = new Set(available.map((s) => s.id));
+    const stored = doc?.mcpServers || [];
+    // 只回报「当前配置里确实存在」的启用项：服务器被从 .env / 配置文件里移除后，
+    // 对话的启用集里会留下悬空 id（服务器早没了、id 还在），原样回报会让前端按它计数——
+    // 表现为面板里一个勾都没有、角标却显示 1。
+    // 这里**只过滤、不落库**：GET 是安全方法，写操作由启动维护（pruneUnknownMcpServers）
+    // 与写入路径（下面的 PUT、DELETE /mcp/servers/:id）负责。
+    const enabled = stored.filter((id) => known.has(id));
+    return c.json({ conversationId, available, enabled });
   });
 
   app.put("/chat/mcp/servers", async (c) => {
@@ -428,8 +443,13 @@ export function createApp() {
     }
     const doc = await getConversation(conversationId);
     const prev = new Set(doc?.mcpServers || []);
+    const available = listStatuses();
+    const known = new Set(available.map((s) => s.id));
     const next = new Set(
-      Array.isArray(body.enabled) ? body.enabled.filter((x): x is string => typeof x === "string") : [],
+      (Array.isArray(body.enabled) ? body.enabled.filter((x): x is string => typeof x === "string") : []).filter(
+        // 落盘前就挡住不存在的 id：悬空引用一旦写进对话文档，就只能靠读取时兜底（见上面的 GET）。
+        (id) => known.has(id),
+      ),
     );
     await patchConversation(conversationId, { mcpServers: [...next] });
     // 新勾选的立即建连（异步，不阻塞响应）；取消勾选的，只有当**没有任何对话**再用时才断开。
@@ -439,7 +459,7 @@ export function createApp() {
       if (next.has(id) || used.has(id)) continue;
       void disconnect(id);
     }
-    return c.json({ conversationId, enabled: [...next], available: listStatuses() });
+    return c.json({ conversationId, enabled: [...next], available });
   });
 
   // ---- 对话级技能（Skills）启用集：与 MCP 启用集同构（按对话持久化）----
@@ -451,8 +471,9 @@ export function createApp() {
     const doc = owned && conversationId ? await getConversation(conversationId) : null;
     return c.json({
       conversationId,
-      // 技能目录按对话角色过滤（观影对话只见 generic + movie 技能）。
-      available: listSkillMetas(doc?.agentId || "generic"),
+      // 面板只列**可勾选**的技能：按对话角色过滤（观影对话只见 generic + movie 技能），
+      // 并排除默认生效的技能（`default: true`，它们本来就随索引生效，不需要用户勾选）。
+      available: listSelectableSkillMetas(doc?.agentId || "generic"),
       enabled: doc?.skillsEnabled || [],
     });
   });
@@ -469,10 +490,12 @@ export function createApp() {
       return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     }
     // 只接受真实存在的技能目录名；去重。不存在的目录名直接丢弃（诚实：不落库不存在的技能）。
+    // 校验用 **全量** 清单而非面板清单：默认技能（default: true）不再出现在面板里，
+    // 但历史对话可能已经勾选过它们，此时不能因为「面板不显示」就把已有勾选判为非法。
     const known = new Set(listSkillMetas().map((s) => s.dir));
     const next = [...new Set((Array.isArray(body.enabled) ? body.enabled : []).filter((x) => typeof x === "string" && known.has(x)))];
     await patchConversation(conversationId, { skillsEnabled: next });
-    return c.json({ conversationId, enabled: next, available: listSkillMetas() });
+    return c.json({ conversationId, enabled: next, available: listSelectableSkillMetas() });
   });
 
   // ---- 工具调用二次确认回调（一次性票据 + 会话归属校验，写操作安全闸门 P0-4）----
@@ -534,7 +557,7 @@ export function createApp() {
   // 收束后结果回投进对话消息快照，重连可用 GET /chat/task/events 续传。
   app.post("/chat/stream", async (c) => {
     try {
-      const body = await readJson<{ text?: string; model?: string; images?: string[]; conversationId?: string; agentId?: string }>(c);
+      const body = await readJson<{ text?: string; model?: string; images?: string[]; attachments?: string[]; conversationId?: string; agentId?: string }>(c);
       const text = String(body.text || "").trim().slice(0, MAX_INPUT_LEN);
       if (!text) return errorJson(c, 400, "CHAT_EMPTY_INPUT", "请输入内容");
       if (body.agentId !== undefined && body.agentId !== "" && !hasRole(body.agentId)) {
@@ -585,6 +608,9 @@ export function createApp() {
       void consumeTask(task, {
         model: typeof body.model === "string" ? body.model : undefined,
         images: Array.isArray(body.images) ? body.images.filter((x): x is string => typeof x === "string") : [],
+        attachments: Array.isArray(body.attachments)
+          ? body.attachments.filter((x): x is string => typeof x === "string")
+          : [],
         sessionId: session.id,
         ownerKey: owner,
       });

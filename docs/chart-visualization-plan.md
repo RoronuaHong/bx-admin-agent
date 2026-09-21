@@ -1,7 +1,9 @@
 # 图表可视化接入方案（AntV）
 
-> 版本：v2（2026-09-17，路线 1 已实施并端到端验证，见 §10）
-> **状态：路线 1（官方出图服务 + requireConfirm 显式化数据外发）已上线**；自托管（路线 2）与前端本地渲染（路线 3）仍挂账。
+> 版本：v3（2026-09-21，路线 3 已落地并端到端验证，见 §11）
+> **状态：当前唯一出图路径是路线 3（内置工具 `render_chart` + 前端 AntV 本地渲染，零外链、数据不出本机）。**
+> 路线 1（AntV 官方出图服务）**已下线**：`chart` 服务器已从 `MCP_BUILTIN_SERVERS` 移除，§5 的配置片段仅作历史记录，**不要再启用**。
+> 自托管（路线 2）仍挂账，且已无必要（路线 3 不出网）。
 > 相关：`docs/mcp-guide.md`（MCP 接入权威实现）、`docs/deep-agents-plan.md` §5 D5（代码执行沙箱）、`apps/agent-server/scripts/metabase-mcp.mjs`（现有 BI MCP）。
 
 ---
@@ -70,7 +72,10 @@
 
 ## 5. 三条落地路线
 
-### 路线 1 · MCP + 官方服务（最快，零代码，约 10 分钟）
+### 路线 1 · MCP + 官方服务（已下线 · 仅作历史记录）
+> ⚠️ 2026-09-21 起不再使用：`chart` 服务器已从 `MCP_BUILTIN_SERVERS` 移除，出图统一走路线 3（本地渲染、零外链）。
+> 下面这段配置**不要再启用**——两条路并存时模型可能改调官方出图服务，既产生数据外发、又会弹确认卡。
+
 `.env` 的 `MCP_BUILTIN_SERVERS` 追加一条（现有两条 `bi` / `yapi` 之间用逗号连接）：
 
 ```json
@@ -138,8 +143,10 @@ web 引入 `@antv/g2`（统计图）＋ `@antv/g6`（结构/关系/树图，G2 �
 - [x] **决策**：先走路线 1（官方服务），用 `requireConfirm: true` 把数据外发显式化为每次确认卡；内网敏感数据规模化使用前再评估自托管
 - [x] 路线 1 最小验证：`MCP_BUILTIN_SERVERS` 加 `chart` 条目 → 重启 → 端到端出图（见 §10）
 - [x] 写 `skills/chart-visualization/SKILL.md`（§6.2 三条约束：先取数再出图不编造 / 聚合序列 ≤50 点 / `![](url)` 贴图 + 数据摘要）
-- [ ] （生产加固）自托管 `@antv/gpt-vis-ssr` 并配 `VIS_REQUEST_SERVER`，验证数据不出内网——BI 含真实业务数据，规模化使用前建议完成
-- [ ] （若需交互）路线 3：`chart` 事件 + `render_chart` 工具 + 前端 g2/g6 组件
+- [x] **路线 3 落地**：`chart` 事件 + `render_chart` 工具 + 前端 g2/g6 组件（2026-09-21，见 §11）
+- [x] **路线 1 下线**：`chart` 服务器从 `.env` 移除 + 清理各对话启用集里的悬空 id（2026-09-21，见 §11）
+- [ ] （生产加固）自托管 `@antv/gpt-vis-ssr`——**已无必要**：路线 3 不出网、数据不出本机，此条可视为作废
+- [x] 内置工具（含 `render_chart`）不再依赖「勾选至少一个 MCP」：已落地（2026-09-21 的 `toolMode` 拆分，见 `docs/deep-agents-plan.md` §8 末条修正）
 
 ---
 
@@ -167,3 +174,51 @@ E2E PASS
 **与安全闸门的联动**：chart 未声明风险级别 + 服务器级 `requireConfirm` → 每次出图弹确认卡（含脱敏参数摘要 = 将送去渲染的数据），既是写操作确认也是数据外发确认——方案 §5.9 的"歪打正着"在有 requireConfirm 配置下成为确定性保障。
 
 **遗留**：生产规模化前评估自托管（§9 第 4 条）；确认卡目前不区分「数据外发」徽标（`RiskLevel` 的 egress 轴，方案 §5.9 下一轮）。
+
+> 注：以上路线 1 的记录保留作历史对照。`mcp__chart__*`、图片 URL、确认卡这些产物在路线 3 下都不再出现。
+
+---
+
+## 11. 实施记录（路线 3 · 本地渲染，2026-09-21）
+
+**为什么换**：路线 1 每次出图都要把数据发往蚂蚁官方服务、图片落公有 CDN、并弹一张数据外发确认卡。路线 3 把出图搬到浏览器：数据不出本机、零外链、历史消息长期有效（图不再依赖 CDN 存活）。
+
+**改动**：
+
+1. **服务端**
+   - `src/builtins.ts` 新增内置工具 `render_chart`（`BUILTIN_RISK` 登记为 `read`：只透传 spec、不发起任何外部请求，故**不需要确认卡**）；
+   - `src/chat.ts` 主循环与子代理路径均下发 `chart` 事件（`{ chartType, data, title?, encode?, options? }`）；
+   - `packages/shared` 的 `ChatEvent` 增加 `chart` 变体；
+   - 图型清单见 `skills/chart-visualization/SKILL.md`（pie/bar/column/line/area/scatter/radar/treemap/funnel/boxplot/histogram/waterfall/dual_axes/sankey/mind_map/org_chart/network），与 `src/builtins.ts` 的 `CHART_TYPES` 白名单一致。
+2. **前端**
+   - 新增 `src/components/ChartCard.vue`：`@antv/g2`（统计图）/ `@antv/g6`（结构·关系·树图）**按需动态 import**（不出图不背这 2MB），跟随深/浅主题，渲染失败降级成原始数据表格；
+   - 聊天页在气泡内渲染卡片；`chart` spec **随消息快照落库**（`StoredMessage.chart` + `toStored`/恢复映射），刷新后由 ChartCard 按 spec 重绘；
+   - 带图表的气泡撑满对话列（`.bubble-wrap.has-chart`）：气泡默认按文字收缩，会让卡片的百分比宽度反向塌成窄条（实测 159px）。
+3. **配置下线**
+   - `.env` 的 `MCP_BUILTIN_SERVERS` 移除 `chart` 条目；`.env.example` 注明「不要再加 chart」；
+   - 悬空 id 三处防线：`GET /chat/mcp/servers` 只过滤回报（**不写库**，GET 是安全方法）、`PUT` 落盘前拦掉不存在的 id、**启动维护** `pruneUnknownMcpServers()` 扫掉存量（`.env` 改动只在启动时读，那条路径没有别的清理点）；
+   - 存量清理一次性摘掉了 73 个对话里的 `chart`（当初该服务器配置了 defaultEnabled，新建对话都会带上它）。
+
+**验证**（2026-09-21，默认模型 + BI）：
+
+```
+node scripts/_chart-e2e.mjs          ← 脚本已从路线 1 断言改写为路线 3
+[启用] ["bi"]
+[tool_call] mcp__bi__list_databases        → ok（主库）
+[tool_call] mcp__bi__get_database_schema   → ok（47 张表）
+[tool_call] render_chart
+[chart] 事件下发：type=column title=各数据库的表数量 data=1 行
+E2E PASS
+```
+
+浏览器侧另验：图表卡片渲染为 `canvas 690×300`、柱状图/图例/坐标轴正常；**整页刷新后卡片仍在**（走落库快照恢复）。
+
+**内置工具恒注入**：内置工具（含 `render_chart`）与本对话勾了哪些连接器无关，**始终注入**——2026-09-21 已把旧的 `toolMode` 耦合拆开（旧实现让「没勾任何连接器的新对话零工具」，连本地出图与工作区文件都用不了；修正记录见 `docs/deep-agents-plan.md` §8 末条）。因此**零连接器也能出图**。
+
+此时没有取数来源，图里的数据必须来自用户提供的内容或已有工具结果，**不得编造**——「先取数、不编造数据点」这条约束由 `skills/chart-visualization` 与 `skills/business-data-query` 两个技能承担。
+
+**2026-09-21 补齐（查缺补漏，详见 `docs/deep-agents-plan.md` §11.9）**：
+
+1. **spec 与图型清单收敛到 `@bx/shared`**：`ChartSpec` + `CHART_TYPES` / `GRAPH_CHART_TYPES` 一处定义，服务端工具校验（`builtins.ts` 的 `render_chart`）与前端 G2 / G6 分流（`ChartCard.vue`）共用——此前服务端落库那份内联类型只认 13 种旧图型且把图形类 `data` 写成数组，与工具白名单漂移。
+2. **子代理出的图不再丢**：`runSubagent` 此前只转发文本与 `tool_call`，`chart` 事件被吞（`render_chart` 在子代理工具集内）→ 现已转发。
+3. **前端渲染失败必降级**：G2 的 `render()` 是 Promise，原先未 `await` → 渲染期报错绕过降级表格且留下未处理拒绝；现已 `await` 并统一回收半成品实例（`discardMine()`）。

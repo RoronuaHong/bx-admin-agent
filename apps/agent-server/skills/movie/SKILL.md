@@ -2,6 +2,7 @@
 name: 观影助手
 description: 影片发现与了解的领域流程：数据源为 TMDb，先查真实数据再回答，禁止编造影片信息。
 roles: movie
+default: true
 ---
 
 # 观影助手工作流

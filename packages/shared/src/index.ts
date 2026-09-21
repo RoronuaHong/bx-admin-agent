@@ -23,6 +23,55 @@ export interface ClarifyOption {
   description?: string;
 }
 
+/**
+ * 图表族白名单：内置工具 `render_chart` 的校验依据，也是前端 G2 / G6 的分流依据。
+ * 清单放共享包是**刻意**的——服务端工具白名单与前端渲染分流必须同源，
+ * 各自维护一份的后果是「后端放行了一种新图型、前端按统计图去画」，静默降级成表格。
+ */
+export const CHART_TYPES = [
+  "pie",
+  "bar",
+  "column",
+  "line",
+  "area",
+  "scatter",
+  "radar",
+  "treemap",
+  "funnel",
+  "boxplot",
+  "histogram",
+  "waterfall",
+  "dual_axes",
+  "sankey",
+  "mind_map",
+  "org_chart",
+  "network",
+] as const;
+
+/** 图形类图表族（关系 / 层级 / 流程）：前端走 G6，其余走 G2 的统计图语法。 */
+export const GRAPH_CHART_TYPES = ["sankey", "mind_map", "org_chart", "network"] as const;
+
+/**
+ * 图表 spec（内置工具 render_chart 的产出）：服务端只透传，浏览器用 AntV 本地绘制
+ * （零外链、数据不出本机）。
+ *
+ * 这个形状**三处共用同一定义**——chat 事件（`ChatEvent` 的 chart 变体）、
+ * 落库快照（`StoredMessage.charts`）、前端组件（ChartCard / web 的 ChartSpec 类型）：
+ * 各自声明一份的结果是「落库类型与渲染类型漂移」（旧代码就出现过落库只认 13 种图型、
+ * 而工具白名单已有 17 种，且图形类的 data 被声明成数组）。
+ */
+export interface ChartSpec {
+  /** 图表族，取值见 `CHART_TYPES`（`GRAPH_CHART_TYPES` 里的走 G6，其余走 G2）。 */
+  chartType: string;
+  /** 真实数据：统计图为行对象数组，图形类为 {nodes,edges} 或 {name,children} 层级结构（来自工具取数，禁止编造）。 */
+  data: unknown;
+  title?: string;
+  /** 字段映射（x/y/color/size/series 等）。 */
+  encode?: Record<string, string>;
+  /** 额外选项（轴标题、图布局等）。 */
+  options?: Record<string, unknown>;
+}
+
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
@@ -91,6 +140,7 @@ export type ChatEvent =
       text: string;
     }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
+  | ({ type: "chart" } & ChartSpec)
   | {
       /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
       type: "usage";

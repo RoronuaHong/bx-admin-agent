@@ -5,7 +5,7 @@
 //  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
-import type { TodoItem } from "@bx/shared";
+import type { ChartSpec, TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 import { defaultMcpServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
@@ -28,12 +28,25 @@ export interface StoredMessage {
   thinking?: string;
   /** 任务规划（write_todos 产出，推理面板展示用；前端一并落库）。 */
   todos?: TodoItem[];
+  /**
+   * 本地渲染图表（render_chart 产出的 spec 数组；前端一并落库）。
+   * 图由浏览器用 AntV 现场绘制、产物只在内存里，不随快照存就会「刷新即消失」。
+   * 形状直接用 @bx/shared 的 `ChartSpec`（前端 api.ts 的 ChartSpec 也转出同一份）——
+   * 这里**不要再内联一份**：曾内联过一个只认 13 种旧图型、且把图形类 data 写成数组的旧类型，
+   * 与工具白名单（17 种）漂移，属于「类型说谎」。
+   */
+  charts?: ChartSpec[];
+  /** @deprecated 早期单图字段，已被 `charts`（数组）取代；保留仅用于兼容历史数据。 */
+  chart?: ChartSpec;
 }
 
 /** 忙碌期间排队的待发消息（按对话持久化，先进先出）。 */
 export interface PendingMessage {
   text: string;
+  /** 随消息一起发出的图片附件 id（上传接口产出）。 */
   images?: string[];
+  /** 随消息一起发出的文档附件 id（PDF/Word/Excel/md/txt/csv）：出队时一并带上，否则附件会静默丢失。 */
+  docs?: string[];
   at: number;
 }
 
@@ -454,6 +467,40 @@ export async function pullMcpServerFromAllConversations(id: string): Promise<voi
   await coll.updateMany({ mcpServers: id }, { $pull: { mcpServers: id } });
 }
 
+/**
+ * 启动维护：把所有对话启用集里「配置中已不存在」的 id 摘掉，返回被改动的对话数。
+ *
+ * 为什么需要它：服务器被删除走 `DELETE /mcp/servers/:id` 时会即时清理（见上），但服务器的增减
+ * 更常来自 `.env` 的 `MCP_BUILTIN_SERVERS`（只在进程启动时读取）——那条路径没有任何清理点，
+ * 于是对话里会留下悬空 id：面板里一个勾都没有、角标却按它计数，且模型侧完全无从知晓。
+ * 放在**启动期**而不是塞进 `GET /chat/mcp/servers`：GET 是安全方法，不该产生数据变更
+ * （RFC 9110 §9.2.1：安全方法的语义是只读；有实际数据影响的写操作不能挂在它下面，否则
+ * 预取 / 重试 / 中间件都可能无意义地触发它）。
+ */
+export async function pruneUnknownMcpServers(knownIds: string[]): Promise<number> {
+  const known = new Set(knownIds);
+  const coll = await getColl();
+  if (!coll) {
+    let changed = 0;
+    for (const doc of memory.values()) {
+      const stored = doc.mcpServers || [];
+      const kept = stored.filter((id) => known.has(id));
+      if (kept.length !== stored.length) {
+        doc.mcpServers = kept;
+        changed += 1;
+      }
+    }
+    return changed;
+  }
+  const docs = await coll
+    .find({ mcpServers: { $exists: true, $ne: [] } }, { projection: { id: 1, mcpServers: 1 } })
+    .toArray();
+  const unknown = [...new Set(docs.flatMap((d) => (d.mcpServers || []).filter((id) => !known.has(id))))];
+  if (!unknown.length) return 0;
+  const res = await coll.updateMany({ mcpServers: { $in: unknown } }, { $pull: { mcpServers: { $in: unknown } } });
+  return res.modifiedCount;
+}
+
 // ---- 对话上下文（thread）----
 
 /**
@@ -461,7 +508,14 @@ export async function pullMcpServerFromAllConversations(id: string): Promise<voi
  * （对齐 OpenAI Agents SDK MongoDBSession 的「原子序列计数器」做法）。
  */
 export async function appendContext(id: string, turns: ChatTurn[]): Promise<void> {
-  if (!turns.length) return;
+  // 单点收口：丢弃「正文为空」的 assistant 轮。
+  // 上游对空 assistant 消息直接 400（"the message ... with role 'assistant' must not be empty"），
+  // 而该错是**确定性**的——候选链逐个都会失败、重试也没用，整个会话就此永久卡死（实测踩过：
+  // 用户在任何正文产生前点「停止」时，曾回写一条空的 assistant 轮）。
+  // 挡在写入口，任何调用方都不可能再把脏轮写进上下文（序列化层另有一道自愈，见 models.ts，
+  // 用于修复已经存在的脏历史）。
+  const safe = turns.filter((turn) => turn.role !== "assistant" || String(turn.text || "").trim().length > 0);
+  if (!safe.length) return;
   const now = Date.now();
   const coll = await getColl();
   if (!coll) {
@@ -470,16 +524,16 @@ export async function appendContext(id: string, turns: ChatTurn[]): Promise<void
       doc = { id, title: "新对话", messages: [], createdAt: now, updatedAt: now };
       memory.set(id, doc);
     }
-    doc.context = [...(doc.context || []), ...turns];
-    doc.contextSeq = (doc.contextSeq || 0) + turns.length;
+    doc.context = [...(doc.context || []), ...safe];
+    doc.contextSeq = (doc.contextSeq || 0) + safe.length;
     doc.updatedAt = now;
     return;
   }
   await coll.updateOne(
     { id },
     {
-      $push: { context: { $each: turns } },
-      $inc: { contextSeq: turns.length },
+      $push: { context: { $each: safe } },
+      $inc: { contextSeq: safe.length },
       $set: { updatedAt: now },
       $setOnInsert: { title: "新对话", messages: [], createdAt: now },
     },

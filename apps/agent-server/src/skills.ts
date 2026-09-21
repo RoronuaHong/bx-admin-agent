@@ -25,6 +25,16 @@ export interface SkillMeta {
   dir: string;
   /** 可见角色（frontmatter `roles: movie, generic` 逗号分隔）；缺省 = 所有角色可见。 */
   roles?: string[];
+  /**
+   * 系统自带技能（frontmatter `default: true`）：**不在「技能」面板的勾选列表里显示**。
+   *
+   * 面板的语义是「用户为本对话额外指定、全文注入」；系统自带技能本来就随索引生效、
+   * 不需要用户勾选，列进面板只会让人误以为必须先勾一次才好用。
+   *
+   * ⚠️ 这个标记**只影响展示**：它的加载路径与其它技能完全一致（索引常驻 + 命中时 read_skill 取全文）。
+   * 想「不显示」时不要顺手把它从索引、read_skill 或 skills 目录里去掉——那是在删功能。
+   */
+  default?: boolean;
 }
 
 interface Cache {
@@ -74,6 +84,7 @@ function listAllSkillMetas(): SkillMeta[] {
           description: meta.description || "",
           dir: entry.name,
           ...(meta.roles ? { roles: meta.roles.split(/[,，]/).map((x) => x.trim()).filter(Boolean) } : {}),
+          ...(meta.default === "true" ? { default: true } : {}),
         });
       }
     }
@@ -82,6 +93,17 @@ function listAllSkillMetas(): SkillMeta[] {
   }
   cache = { at: Date.now(), skills };
   return skills;
+}
+
+/**
+ * 「技能」面板**可勾选**的技能：系统自带技能（`default: true`）不在其列。
+ *
+ * 这一层只影响**展示**：面板的语义是「用户为本对话额外指定、全文注入」，
+ * 而系统自带技能本来就随索引生效、不需要用户勾选，列出来只会让人以为必须勾一次。
+ * 注意**不要**顺手把它们从索引或加载路径里摘掉——那等于删功能。
+ */
+export function listSelectableSkillMetas(role?: string | null): SkillMeta[] {
+  return listSkillMetas(role).filter((s) => !s.default);
 }
 
 /** 读取某个 skill 的全文（路径安全：只允许一级目录名）。 */
@@ -99,6 +121,8 @@ export function readSkill(dir: string): string | null {
 
 /** 渲染进系统提示的索引段（按角色过滤）；没有 skills 时返回空串。 */
 export function renderSkillIndex(role?: string | null): string {
+  // 用**全量**清单（含 `default: true` 的系统自带技能）：隐藏只在面板那一层，
+  // 索引照旧常驻，模型命中任务时仍能 read_skill 取全文——少一个技能在这里，就等于少一项能力。
   const skills = listSkillMetas(role);
   if (!skills.length) return "";
   const lines = skills.map((skill) => `- ${skill.dir}${skill.description ? `：${skill.description}` : ""}`);
