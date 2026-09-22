@@ -5,6 +5,7 @@
 > 路线 1（AntV 官方出图服务）**已下线**：`chart` 服务器已从 `MCP_BUILTIN_SERVERS` 移除，§5 的配置片段仅作历史记录，**不要再启用**。
 > 自托管（路线 2）仍挂账，且已无必要（路线 3 不出网）。
 > 相关：`docs/mcp-guide.md`（MCP 接入权威实现）、`docs/deep-agents-plan.md` §5 D5（代码执行沙箱）、`apps/agent-server/scripts/metabase-mcp.mjs`（现有 BI MCP）。
+> **验证脚本现状（2026-09-22）**：§10 / §11 的端到端记录由 `scripts/_chart-e2e.mjs` 产出，该脚本**已随 2026-09 的调试脚本清理移除**（`apps/agent-server/scripts/` 现只留 3 个功能性脚本）；现行零依赖回归入口是 `pnpm test`（图表相关见 `tests/chart-render.test.ts` / `tests/attachment-budget.test.ts`），脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11。历史实测输出保留作追溯，但**不要照抄其中的脚本命令**。
 
 ---
 
@@ -202,7 +203,7 @@ E2E PASS
 **验证**（2026-09-21，默认模型 + BI）：
 
 ```
-node scripts/_chart-e2e.mjs          ← 脚本已从路线 1 断言改写为路线 3
+（原 `node scripts/_chart-e2e.mjs`——脚本已随 2026-09 调试脚本清理移除，以下是当时的实测输出）
 [启用] ["bi"]
 [tool_call] mcp__bi__list_databases        → ok（主库）
 [tool_call] mcp__bi__get_database_schema   → ok（47 张表）

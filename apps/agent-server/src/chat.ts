@@ -712,7 +712,8 @@ interface CallOutcome {
  * 且强制时会预填 assistant 消息（模型无法先给自然语言开场，问候这类轮次因此失去正常回话的机会）。
  * 本仓实测 TokenHub 的 OpenAI 兼容端点（kimi-k2.7-code）对 required 与「指定函数」均回
  * `400 invalid_request_error / 400001 rejected by an internal MaaS component`，只有 auto / none 可用；
- * 对照实验见 `scripts/_model-toolchoice-probe.mjs`（可复跑，改模型/改网关时先跑它）。
+ * 探测脚本 `scripts/_model-toolchoice-probe.mjs` 已随 2026-09 的调试脚本清理移除；
+ * 这条结论的回归在 `tests/deep-agent-control.test.ts`（`forcedToolChoiceSupported` 的「被拒一次就记住」）。
  *
  * 结论：被拒一次就记住，后续不再发 required；否则**每一轮首调**都要白打一次 400（延迟翻倍 + 日志噪音），
  * 而下面的降级分支本来就会改走 auto 重试。key 含端点地址：换模型 / 换网关重新探测，不把 A 的结论套到 B。

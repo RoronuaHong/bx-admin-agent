@@ -105,6 +105,33 @@ export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
   return data.files || [];
 }
 
+/** NDJSON 逐行消费（每个事件一行 JSON；非法行跳过，不打断流）。 */
+async function readNdjson(body: ReadableStream<Uint8Array>, onEvent: (event: ChatEvent) => void): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          onEvent(JSON.parse(line) as ChatEvent);
+        } catch {
+          // 单条事件非法时跳过，不中断流
+        }
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+}
+
 /** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
 export async function streamChat(
   text: string,
@@ -128,29 +155,34 @@ export async function streamChat(
       code: data.code,
     });
   }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        if (!line) continue;
-        try {
-          onEvent(JSON.parse(line) as ChatEvent);
-        } catch {
-          // 单条事件非法时跳过，不中断流
-        }
-      }
-    }
-  } finally {
-    reader.cancel().catch(() => {});
-  }
+  await readNdjson(res.body, onEvent);
+}
+
+/**
+ * 断线续传：带上次消费到的 `seq` 重新挂上后台任务的事件流（对齐 SSE 的 `Last-Event-ID` 重连语义）。
+ * 返回 true = 已接上（终态 `done` 会在事件流里给出；正文由服务端补一条 `text` 快照，
+ * 前端替换即可，不会把已显示的内容拼两遍）；返回 false = 服务端已没有可续传的任务
+ * （进程重启后注册表为空、或收束后留档已过期），调用方应如实收口而不是假装还在跑。
+ */
+export async function resumeChatTaskEvents(
+  conversationId: string,
+  fromSeq: number,
+  onEvent: (event: ChatEvent) => void,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const cursor = Math.max(0, Math.floor(fromSeq) || 0);
+  const res = await fetch(
+    withOwnerParam(`/agent/chat/task/events?conversationId=${encodeURIComponent(conversationId)}&from=${cursor}`),
+    {
+      credentials: "include",
+      // 与 ?from= 同值：既保留 SSE 习惯（服务端也认这个头），也让中间层日志一眼看出在续传。
+      headers: { "Last-Event-ID": String(cursor) },
+      signal,
+    },
+  );
+  if (!res.ok || !res.body) return false;
+  await readNdjson(res.body, onEvent);
+  return true;
 }
 
 /** 清空指定对话的服务端模型上下文（不影响 UI 消息快照）。 */
@@ -500,7 +532,8 @@ export async function cancelChatTask(conversationId: string): Promise<{ ok: bool
 export interface ChatTaskStatus {
   conversationId: string;
   running: boolean;
-  task?: { id: string; startedAt: number; elapsedMs: number; live: boolean };
+  /** `lastEventSeq` = 服务端事件序号上界（与本地游标比对可判断落后多少；排障用）。 */
+  task?: { id: string; startedAt: number; elapsedMs: number; live: boolean; lastEventSeq?: number };
   last?: { id: string; status: string; startedAt: number; settledAt: number; durationMs: number; outcomePersisted: boolean };
 }
 

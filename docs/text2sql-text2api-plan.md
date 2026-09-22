@@ -116,7 +116,7 @@
 4. 确认该账号对目标 collection 有「查看」权限，避免 `list_cards` / `search` / `get_dashboard` 静默少结果。
 5. 复制该账号的 API Key。
 6. 在 `.env` 设 `BI_READONLY_API_KEY=<该 key>`（**保留** `BI_API_KEY` 不动；回滚即清空此变量）。
-7. 重启 agent-server，运行 `node --import tsx scripts/_bi-readonly-check.mjs`，逐项核对：原生查询可用（2xx）、表数 / 卡片数 / 仪表盘数 / 搜索命中与管理员 Key 对比——出现 ✗ 即整体不可用，出现 ⚠（条数变少）即可见范围缩小，需调整 collection 权限。
+7. 重启 agent-server，逐项核对：原生查询可用（2xx）、表数 / 卡片数 / 仪表盘数 / 搜索命中与管理员 Key 对比——出现 ✗ 即整体不可用，出现 ⚠（条数变少）即可见范围缩小，需调整 collection 权限。（原验收脚本 `scripts/_bi-readonly-check.mjs` 已随 2026-09 的调试脚本清理移除，见 §12.1 注；需要时按下面「验收方式」的口径临时手写、用完即删、不提交。）
 8. 验收通过后启用；若回滚，清空 `BI_READONLY_API_KEY` 即恢复原管理员 key。
 
 **⚠️ 前置校验（账号侧配置前先确认，否则会静默劣化或整体失效）**
@@ -125,7 +125,7 @@
 2. **可见范围**：只读账号可能看不到全部 collection，导致 `list_cards` / `search` / `get_dashboard` **静默少结果**——比报错更难发现，必须逐工具对比切换前后的返回条数。
 3. 其余 7 个只读工具在只读账号下逐个验证。
 
-**验收脚本（2026-09-19 已交付）**：`scripts/_bi-readonly-check.mjs` 对比管理员 Key 与 `BI_READONLY_API_KEY` 在「原生查询可用 / 表数 / 卡片数 / 仪表盘数 / 搜索命中」上的差异——只读侧任一探针非 2xx 即 ✗（整体不可用），条数变少即 ⚠（可见范围缩小）。配置好两个 Key 后 `node --import tsx scripts/_bi-readonly-check.mjs` 即可，比「跑通就行」更可靠。
+**验收方式（2026-09-19 交付的脚本已移除；2026-09-22 核对）**：对比管理员 Key 与 `BI_READONLY_API_KEY` 在「原生查询可用 / 表数 / 卡片数 / 仪表盘数 / 搜索命中」上的差异——只读侧任一探针非 2xx 即 ✗（整体不可用），条数变少即 ⚠（可见范围缩小）。原脚本 `scripts/_bi-readonly-check.mjs` 已随调试脚本清理移除，需要时按这份清单临时手写（用完即删、不提交），比「跑通就行」更可靠。
 4. 验收标准：填 key 后**逐工具对比切换前后返回条数**，而非「跑通就行」。
 
 ### P1-2 加语句超时 —— ✅ 已落地（2026-09-19）
@@ -262,6 +262,7 @@
 ## 12. 验证记录（2026-09-19）
 
 ### 12.1 安全回归（纯函数 / 不依赖网络）
+> 注（2026-09-22）：本节引用的 `_risk-gate-check.mjs` / `_untrusted-check.mjs` / `_bi-readonly-check.mjs` / `_bi-tools-check.mjs` 均已随调试脚本清理移除；**现行回归入口是 `pnpm test`**（清单见 `docs/mcp-guide.md` §11）。以下为当时的实测记录，保留作口径参照。
 - `tsc --noEmit`：通过（exit 0，0 错误）。
 - `_risk-gate-check.mjs`：**22/22**（17 原 + 5 新增 deny 分支用例）。`isNativeSqlRejected` 抽为可单测纯函数后，新增 5 例覆盖：只读 SELECT→不拒、DELETE→硬拒、`INSERT…SELECT`→硬拒、非 SQL 工具不受影响、SQL 字面量里的 `drop` 不误判。
 - `_untrusted-check.mjs`（提示注入防护）：**12/12**。

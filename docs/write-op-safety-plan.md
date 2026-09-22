@@ -5,6 +5,7 @@
 > 起因：模型输出「SQL 我帮你写好，可视化类型你选 Pie。要我直接调用 `create_card` 建出来吗？（需要确认集合 collection_id）」——模型在散文里提议执行一个"创建"操作并口头征求许可。
 > 定位：不做工具级补丁，而是建**一条通用链路**：任何工具（内置 / MCP / 未来的）在产生外部副作用前，都必须过同一个服务端闸门。
 > 相关：`apps/agent-server/src/{risk,audit,mcp/hub,chat,confirm,builtins,app,conversations,session,index}.ts`、`src/system-prompt.ts`、`scripts/metabase-mcp.mjs`、`packages/shared/src/index.ts`、`apps/web/src/{api.ts,pages/ChatPage.vue}`
+> **验证脚本现状（2026-09-22）**：§9 各轮的「验证」里提到的 `scripts/_risk-gate-check.mjs` / `_untrusted-check.mjs` / `_rag-inject-e2e.mjs` 等**均已随 2026-09 的调试脚本清理移除**；同口径回归现由 `pnpm test`（`apps/agent-server/tests/*.test.ts`，写闸门部分见 `tests/write-gate.test.ts`）承接，脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11。下述实测结论与输出保留作追溯，但**不要再照抄其中的脚本命令**。
 
 ---
 
@@ -582,7 +583,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 
 ### 9.3 验证
 
-- `node --import tsx scripts/_risk-gate-check.mjs`：**15/15 PASS**——内置登记表（fs_write 免确认 / task 只读）、未知 fail-closed 三口径、readGrants 降级（含未连接服务器）、票据归属校验（错会话拒绝且一次性）、argSummary 脱敏（敏感键 ••• / 截断 / 上限 8）、审计落盘回读；
+- 原 `node --import tsx scripts/_risk-gate-check.mjs`（**脚本已随 2026-09 的调试脚本清理移除**；同口径回归现由 `tests/write-gate.test.ts` 承接）：**15/15 PASS**——内置登记表（fs_write 免确认 / task 只读）、未知 fail-closed 三口径、readGrants 降级（含未连接服务器）、票据归属校验（错会话拒绝且一次性）、argSummary 脱敏（敏感键 ••• / 截断 / 上限 8）、审计落盘回读；
 - `tsc --noEmit` ✓、`vite build` ✓、lint 干净；
 - 全局 grep `toolNeedsConfirm / confirmReasonOf / isReadOnlyQuery` 0 残留。
 
@@ -661,5 +662,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 **根因 2（前端，没收到终态就永久转圈）**：`streamChat` 的消费循环在「服务端进程重启 / 连接被回收 / 代理切断」时是**正常返回**的（不抛异常），而只有 `done` 事件会把 `streaming` 置 false；同时 `persist` 会把 `status: "running"` 的步骤原样落库 → 刷新后从快照读回来，推理面板继续显示「推理中…」/「子代理运行中」。两层叠加就是「卡住」的观感。
 
 - **改动**（`apps/web/src/pages/ChatPage.vue`）：①新增 `StepStatus` / `SubagentStatus` 的 `interrupted`（与「失败」「已拒绝」区分：不知道结果就如实说不知道）；②消费循环记录是否收到终态事件（`done` / 服务端 `error`），**没收到就调用 `settleInterruptedRun()`**——先查 `/chat/task/status`：任务还在跑 → 如实提示「后台继续」并守望；任务没了 → 把未完成的步骤与子代理标成 `interrupted`、清掉半路挂起的确认卡 / 澄清卡；③`toStored` 与快照恢复都过一遍 `settleStep()`：**快照里不存在「正在跑」**（库里已存的 `running` 记录刷新即被纠正）；④中断的轮次不自动出队（连接已不可靠，接着发下一条大概率也失败）。
-- **未做（挂账）**：前端仍未接 `GET /chat/task/events` 做真正的断线重连续传（服务端端点已就绪），断线后只能靠「重开对话看结果」——进程重启的场景本来也续不上。
+- **后续补齐（同日）：断线续传真的接上了**。上面的收口是「接不上时如实说」，这一轮把「先试着接上」补完——对齐 SSE `Last-Event-ID` / OpenAI Responses `sequence_number`：①服务端给每个进缓冲的事件打任务内递增 `seq`（`ChatEvent.seq`），正文增量只累加、不进缓冲，续传时用一条 `text` 快照替代（客户端替换语义 → 幂等）；②`GET /chat/task/events?from=<seq>` 只回放更新的部分，收束后任务留档 `CHAT_TASK_RETAIN_MS`（默认 5 分钟）供晚到的重连取尾部；③`streamNdjson` 每 `CHAT_STREAM_HEARTBEAT_MS`（默认 15s）发 `ping` 保活（长静默不被代理掐断）；④前端 `resumeRun()` 指数退避重试 3 次，`runTurn` 的「无终态结束」与连接类异常都先走它，失败才落到 `settleInterruptedRun()`；⑤打开对话时若服务端仍有任务在跑，`attachRunningTask()` 挂气泡从游标 0 跟随（刷新 / 换设备进来继续显示，而不是干等回投）。事件处理因此从 `runTurn` 的闭包抽成 `applyChatEvent(run, event)`——首连与续传共用同一套渲染，避免两份逻辑各自演化。
+- **验证**：`tests/task-resume.test.ts` 6 例（增量不入缓冲 / 按序打号 / 续传只剩终态 / `text` 快照替换 / 取消时正文退回累积值 / 留档过期即回收 / 留档可关闭）+ 真实服务实例验证（`POST /chat/stream` 在 1.5s 处主动断开 → 任务仍在后台跑 → 按游标续传：回放事件全部晚于游标、终态送达、正文快照补齐 160 字；收束后留档期内 `from=0` 全量回放可用）；全量 18 文件 / 112 例、`tsc --noEmit`、`vue-tsc --noEmit` 全绿。
+- **仍未做（挂账）**：跨进程的任务持久化——进程重启后内存注册表随之清空，任务**本身**不存在了，只能如实告知「本轮已中断」；要做到「重启后还能续」，需要把任务状态与事件缓冲落 Mongo（或引入跨进程队列），属独立一轮的事（届时 `seq` 游标与留档语义可直接复用，不必推倒重来）。步骤级「无进展看门狗」（长时间既无事件也无心跳即主动收口）同样未做，当前只靠轮次预算 / 模型超时 / Doom Loop 熔断兜底。
 

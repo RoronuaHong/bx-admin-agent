@@ -3,9 +3,11 @@
 // 证明「主代理委派 task 子代理 → 子代理调内置工具 → 收敛」这条 Deep Agent 主链路真的能跑通。
 // 子代理的 tools 不含 task（chat.ts 剥离），mock 服务据此区分主/子代理返回不同脚本。
 //
-// 同时钉住「子代理默认只读」这条安全闸门（chat.ts 的 allowWrite:false + 非 read 直接拒绝）：
-// 子代理第一步就尝试 fs_write（BUILTIN_RISK 里是 write 级）→ 必被拒绝、不落盘；
-// 工作区文件改由**主代理**自己写（内置工作区写免确认，见 risk.ts verdictNeedsConfirm）。
+// 同时钉住「子代理按作用域限权」（chat.ts 的 allowWrite:false + risk.ts subagentMayExecute）：
+// **免确认的工作区写可委派**（fs_write 落在对话沙箱内、路径与体积有上限）→ 子代理写出的文件真的落盘；
+// 需要用户拍板的操作（带外部副作用 / 未登记工具）仍被拒——那一面由 tests/write-gate.test.ts 的 [E] 覆盖，
+// 因为子代理内部的工具事件不转发到主流（只转发 text/subagent_*），端到端这里看不到它的 tool_result。
+// 两条写刻意落在**不同路径**：同路径会被后写覆盖，届时「文件里没有子代理产出」这种断言就会假绿。
 import { test, expect, beforeAll, afterAll } from "vitest";
 import http from "node:http";
 
@@ -63,12 +65,12 @@ function sseMainFs(): string {
 function sseMainFinal(): string {
   return sse([textChunk("主代理汇总：子代理已完成数据查询，结论见工作区 results/summary.md。")]);
 }
-/** 子代理第一步就写：应被只读闸门拒绝（不得落盘）。 */
+/** 子代理自己写工作区（免确认 → 放行）：写**另一个路径**，否则会被主代理的后写覆盖、断言失去意义。 */
 function sseSubFs(): string {
-  return sse([toolCallChunk([{ id: "call_fs_1", name: "fs_write", args: { path: "results/summary.md", content: "子代理产出：项目状态正常。" } }])]);
+  return sse([toolCallChunk([{ id: "call_fs_1", name: "fs_write", args: { path: "results/sub.md", content: "子代理产出：项目状态正常。" } }])]);
 }
 function sseSubFinal(): string {
-  return sse([textChunk("子代理结论：写入被拒（子代理只读），已直接汇报。")]);
+  return sse([textChunk("子代理结论：已把进度写入工作区 results/sub.md。")]);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -162,10 +164,12 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
     else if (t === "done") seen.done = true;
   }
 
-  // 工作区内容分两种来源：主代理写的（能落盘）vs 子代理写的（被只读闸门拒绝）。
-  // 用内容区分，一次同时钉住「内置工具真的执行了」与「子代理写不进去」。
-  const file = fsRead("verify-deep", "results/summary.md");
-  const content = "content" in file ? file.content : "";
+  // 两条写落在不同路径：主代理的（能落盘）+ 子代理的（免确认 → 也放行）。
+  // 子代理内部的工具事件不转发到主流，「它的写真的执行了」只能靠工作区文件来证。
+  const mainFile = fsRead("verify-deep", "results/summary.md");
+  const subFile = fsRead("verify-deep", "results/sub.md");
+  const mainContent = "content" in mainFile ? mainFile.content : "";
+  const subContent = "content" in subFile ? subFile.content : "";
   fsRemoveConversation("verify-deep");
 
   expect(seen.model, "应进入模型调用").toBe(true);
@@ -174,7 +178,9 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
   expect(seen.mainWrote, "主代理的内置工具 fs_write 应真实执行并落盘").toBe(true);
   // 免确认是「闸门→可见性」的取舍：写必须真的执行，且**不经过任何确认卡**（弹卡就会打断用户且带回确认疲劳）。
   expect(seen.confirmed, "工作区写免确认：端到端不应出现任何确认卡").toEqual([]);
-  expect(content.includes("子代理产出"), "子代理的写操作应被只读闸门拒绝（P0-5），不得落盘").toBe(false);
+  expect(mainContent.includes("主代理产出"), "主代理写的文件应有内容").toBe(true);
+  // 子代理按作用域限权（risk.ts subagentMayExecute）：免确认的工作区写放行 → 它写的那份必须真的在盘上。
+  expect(subContent.includes("子代理产出"), "子代理的工作区写应被放行并落盘（subagentMayExecute）").toBe(true);
   expect(seen.finalText, "主代理应收敛出最终文本").toBe(true);
   expect(seen.done, "事件流应正常收束 done").toBe(true);
 }, 25000);

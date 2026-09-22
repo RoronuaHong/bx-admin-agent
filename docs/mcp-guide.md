@@ -204,7 +204,7 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 **§6.1 循环护栏（同轮去重 + 跨轮 Doom Loop 熔断）**：agent 最典型的失效模式是「模型卡在同一组工具调用上无限循环」——既拿不到进展，又持续烧 token。`runLoop` 内置两道护栏：
 - **同轮同参数去重**：每轮维护一个已执行签名集合（工具名 + 规范化参数；参数按 key 递归排序后序列化，故 key 顺序不同但语义相同不误判）。一轮内模型重复发出的相同调用只执行一次，其余回灌一条 `tool_result`（ok=false，文案「已跳过（同轮重复）」），保持模型上下文对齐（每个 `tool_call` id 都有对应结果）。`task` 批量内的重复子任务同样去重。跨轮允许重新执行，避免误杀「重新取数」等合法重复。
 - **跨轮 Doom Loop 熔断**：每轮结束后把「本轮实际执行的调用指纹」（去重后的签名集合）交给 `LoopGuard`。同一指纹**连续**重复达到 `DOOM_LOOP_MAX_ROUNDS`（默认 3）即判定陷入无效循环，主动 `break` 并追加一段提示（建议用户调整问题 / 换更具体的检索词 / 收窄勾选的服务器）。指纹变化或空轮（无执行）会重置连击，不会误伤正常多轮任务。
-- 两道护栏都由纯函数支撑（`toolCallSignature` / `LoopGuard`），已在 `_mcp-multi-server-check.mjs` 中单测覆盖；开关见上表。
+- 两道护栏都由纯函数支撑（`toolCallSignature` / `LoopGuard`），单测在 `apps/agent-server/tests/deep-agent-control.test.ts`（原 `_mcp-multi-server-check.mjs` 已移除，见 §11）；开关见上表。
 
 ---
 
@@ -358,9 +358,8 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 | **结构探查的上下文成本** | `schema-probe` 技能已建议「探 schema 交给子代理」，但只写在技能里，系统提示层未强化 | 先观察实际轮次占比再决定是否加引导；当前工具输出已做裁剪（字段预览 25 个、字段描述 200 字、表描述 160 字） |
 | ~~**空串场景的真机复现**~~ | ✅ **已验证（2026-09-19）**：空串位列取值域第一项，详见 §11 实测 | — |
 
-验证脚本：
-- `node --import tsx scripts/_bi-tools-check.mjs` —— 走本仓 MCP hub 与 `.env` 配置，逐步验证：① 工具清单 9/9 与只读注解；② 新工具的风险级别（不弹卡）；③ 表清单 + `search` 过滤 + 字段名预览；④ 指定表的字段取证（描述 / 外键 / 指纹覆盖率）；⑤ 取值域两条路径；⑥ `sample` 参数生效（防「传了被忽略」）；⑦ 负向用例（非法标识符 / 不存在的表与字段均如实报错，不执行不编造）；⑧ 多语句被拒。全程只调元数据类工具，不执行 SQL。超时分支可用 `BI_TIMEOUT_MS=1` 跑一次验证（应得到「请求超时（1ms…）」的可操作提示）。
-- 升级 Metabase 后如需核对端点签名：用实例自带的 `GET /api/docs/openapi.json`（早期脚本 `_bi-openapi.mjs` 已在清理提交中移除）。
+验证入口：**现行可复跑的回归是 `pnpm test`**（零外部依赖，见 §11「验证状态」）。本节原先用于 BI 通道自检的 `_bi-tools-check.mjs` 已随调试脚本清理移除——需要时按 §11 的「BI 通道自检清单」临时手写脚本（用完即删，不提交）。
+- 升级 Metabase 后如需核对端点签名：用实例自带的 `GET /api/docs/openapi.json`。
 
 > **适配器新增 / 删除工具后的生效口径（本次踩到的实操坑）**：两件事必须都做，缺一不可。① 在 `MCP_BUILTIN_SERVERS` 的 `toolRisks` 里给新工具补级别——漏了会走「未知」兜底，**每次调用都弹确认卡**；② 让改动生效：`POST /mcp/servers/:id/reload` 只重建 MCP 连接并重列工具（响应包在 `{ status }` 里），**不重读 `.env`**——所以 `toolRisks` 的变更必须**重启服务进程**（`pm2 delete` → 确认端口释放 → `pm2 start`）才会加载。本次已按此流程重启，验证得到 `tools=9` 且 `get_field_values` 定级 `read`。
 
@@ -376,22 +375,23 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 建议固化脚本化冒烟（MCP 连接 / 流式 / 写确认 / 工具循环四条链路），纳入 CI（见基础设施文档第 15 章）。
 
-**已固化**：`node --import tsx scripts/_mcp-multi-server-check.mjs`（55 项断言，自带 mock stdio server，用 `MCP_BUILTIN_SERVERS` 注入、不碰真实的 `.mcp-servers.json`）。覆盖：多服务器聚合与顺序确定性、缺席服务器上报（5 类原因）、工具数超限回报、工具通道现状注入、取消信号透传、失败冷却、并行连接、连接单飞、确认门注解矩阵、按需加载（阈值 + 检索排序 + 提示）、子代理服务器白名单、空闲回收、同轮去重签名（key 顺序无关）、跨轮 Doom Loop 熔断（连续同指纹触发 / 指纹变化重置 / 空轮不计入）。
+**验证脚本现状（2026-09-22 核对）**
 
-**安全闸门（P0）已固化**：`node --import tsx scripts/_risk-gate-check.mjs`（15 项断言，纯函数不依赖真实 MCP / 模型）。覆盖：内置工具登记表（fs_write 免确认 / task 只读）、未知工具 fail-closed（confirm / deny / allow 三口径）、会话级只读授权降级（含未连接服务器）、票据会话绑定（错会话拒绝且一次性）、参数摘要脱敏（敏感键 ••• / 头尾保留 + 显式省略 / 上限 8 项）、审计落盘回读。同口径的单元回归见 `tests/write-gate.test.ts`（2026-09-22 新增：工作区写免确认、放宽不外溢、确认卡参数头尾保留）。
+- **可复跑的功能性脚本只剩 3 个**：`build-rag-index.mjs`、`metabase-mcp.mjs`、`yapi-mcp.mjs`（均在 `apps/agent-server/scripts/`）。
+- **其余验证脚本已在 2026-09 的「清理遗留调试脚本」提交中移除**（`git log --diff-filter=D --name-only -- apps/agent-server/scripts` 可查），本节不再把它们当「可跑命令」引用：`_mcp-multi-server-check.mjs`（多服务器聚合 / 缺席上报 / 确认门注解矩阵 / 按需加载 / 同轮去重 / Doom Loop）、`_risk-gate-check.mjs`（写闸门与 SQL 只读判定）、`_async-subagent-check.mjs`、`_rag-check.mjs`、`_untrusted-check.mjs`、`_mute-check.mjs`、`_bi-tools-check.mjs`、`_bi-readonly-check.mjs`、`_bi-openapi.mjs`、`_deep-agents-check.mjs`、`_builtin-fs-check.mjs`、`_clarify-check.mjs`、`_concurrent-check.mjs`、`_memory-tools-check.mjs`、`_web-search-*.mjs`、`_builtin-tools-parity-check.mjs`、`_model-toolchoice-probe.mjs`、`_model-thinking-probe.mjs`，以及 4 个 `run-{chart,inject,movie,rag}-e2e.ps1` 运行器（它们指向的 `_*-e2e.mjs` 早已不存在，且硬编码本机绝对路径）。
+- **这些断言去了哪里**：能纯函数化的部分已迁进 `apps/agent-server/tests/*.test.ts`，由 `pnpm test` 统一承接——写闸门口径 → `write-gate.test.ts`；**原生 SQL 只读硬拒（写 SQL / 危险构造 / 多语句 / 缺参）→ `sql-readonly.test.ts`（2026-09-22 新增，补上 `_risk-gate-check.mjs` 被删后这唯一没有回归的防线）**；Deep Agent 循环 / 同轮去重 / Doom Loop / 子代理工具收窄 → `deep-agent-control.test.ts`；子代理端到端（含「主代理写盘、无确认卡」）→ `deep-agent-live.test.ts`；澄清挂起与冻结 → `clarification-flow.test.ts`；接地护栏 → `grounding-guard.test.ts`；协议护栏（伪调用 / 伪出图）→ `answer-protocol-guard.test.ts` / `pseudo-chart-guard.test.ts`。**`pnpm test` 是当前唯一的零依赖回归入口**，CI 也跑它。
+- **BI 通道自检清单（需真实实例与凭据；当前无脚本，按需临时手写、用完即删、不提交）**：① 工具清单 9/9 与只读注解；② 各工具风险级别（走 `src/risk.ts` 真实判定，`get_field_values` 应为 `level=read`）；③ 表清单 + `search` 过滤 + 字段名预览；④ 指定表的字段取证（描述 / 外键 / 指纹）；⑤ 取值域两条路径（`field-values` / `group-by`）；⑥ `sample` 参数生效（`scanLimit` 回显 + `approximate` 标注）；⑦ 负向用例（非法标识符 / 不存在的表与字段均如实报错，不执行不编造）；⑧ 多语句被拒。全程只调元数据类工具，不执行 SQL；超时分支可用 `BI_TIMEOUT_MS=1`。
 
-**2026-09-17 新增回归**（均为零外部依赖，可直接跑）：
+**本次自检记录（2026-09-22，按上面清单临时手写脚本跑完即删）：PASS=18 / FAIL=0**
 
-| 脚本 | 项数 | 覆盖 |
-|---|---|---|
-| `scripts/_async-subagent-check.mjs` | 6 | 子代理注册表独立取消（跨会话/未知 id 不命中）、`POST /chat/subagent/:conversationId/:subagentId/cancel` 404/未命中/级联 |
-| `scripts/_rag-check.mjs` | 23 | 知识库：解析分发 / 二进制拒绝 / 切片 / 混合检索与来源 / embedding 降级 / 指纹增量 / 索引按 mtime 重载 / 工具接线 / 真实语料命中 |
-| `scripts/_untrusted-check.mjs` | 12 | 注入防护：nonce 定界 / 伪造闭合与伪造开标签中和 / 不可见控制符清洗不误伤 / 规则只在工具模式注入 |
-| `scripts/_mute-check.mjs` | 7 | 免打扰：持久化 / 列表可见 / 回落 / **不刷新 updatedAt** / 归属守卫 / 非法类型不写脏值 |
+- ① 工具 9/9、`readOnlyHint` 8/8、`run_native_query` 未声明只读、其描述确含新增的「一次问清、一条取全」；
+- ② `risk.ts` 真实判定：8 个只读工具 `level=read` 免确认；`run_native_query` `destructive` 需确认；只读 SQL（`SELECT 1`）经 `sql-readonly` 降级为 `read`；
+- ③ 表清单 `totalTables=53 / matched=53`（**本页历史记录里的 47 已过时**）、`search` 命中 13、指定表回字段名；
+- ④ 按 §10 口径挑「字段最多的表」取证：`film_report.film_app_verify` 18 字段、带描述 18/18、外键 0、指纹 0（与本页 §10「fingerprint 在该库整体缺失」一致）。**坑复现**：不能拿表清单第一张取证——第一张 `metabase_upload.aa` 只有 1 个字段，直接用它得到的「带描述/外键/指纹全 0」是采样偏差造成的假结论；
+- ⑤⑥ 取值域在有数据的表上正常：`elt_new_guid.channel` → `source=group-by`、10 项、前 3 为真实渠道名；`elt_watch_detail.channel` → 14 项。**比 `distinctValues=13` 多 1 项即 NULL/空串**（指纹不含空值、取值域含，与 §10 的「空值也是真实取值」同源）；`sample=5` 生效（`scanLimit=5` + `approximate=true`）；
+- ⑦⑧ 不存在的表 / 不存在的字段 / 非法标识符 / 多语句 → 全部如实拒绝，不执行、不编造。**注意**：自检刻意**没有**直接对适配器发写 SQL（避免任何执行风险）——「写 SQL 被硬拒」这条防线改由纯函数回归 `tests/sql-readonly.test.ts` 覆盖（写操作 / 危险构造 / 多语句 / 缺参 fail-closed，4 用例）。
 
-**BI 通道自检（需真实实例与凭据，非零外部依赖）**：`node --import tsx scripts/_bi-tools-check.mjs` —— 走本仓 hub 与 `.env` 配置，断言：工具清单 9/9、8 个只读工具均已声明 `readOnlyHint`（`run_native_query` 按设计不声明）、**`get_field_values` 的服务器配置为 `read` 且执行类工具非 `read`**（走 `src/risk.ts` 真实判定）、表清单与 `include_fields` 真的回字段名（不是只给数量）、字段结构稳定（`name` / `type`）、`get_field_values` 能取到取值分布（探测顺序：字段多的表优先，最多 4 张表 × 2 字段）。只调元数据类工具，不执行 SQL。
-
-实测（2026-09-18，`id=bi` 的 ClickHouse 主库，47 张表）：
+**历史记录**（2026-09-18 的 BI 通道自检输出；跑它的脚本已移除，仅保留作为口径与文案参照）——`id=bi` 的 ClickHouse 主库，47 张表：
 
 ```
 连接：connected=true 工具数=9
@@ -428,7 +428,7 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 唯一一条结论（另一条「两条路径都被用到过」的结论已并入上面 §11 实测结论，不再重复）：**空串位列取值域第一项**——它和另外 3 个规范取值一样是该列的合法成员，正是当初被「当脏数据顺手排掉」的那个值。取证工具把它显式列出来之后，这类误判**不再依赖模型先验**。
 
-活路径（需真实模型，用 `scripts/run-*.ps1` 后台跑）：`_rag-e2e.mjs`（知识库问答 + 子代理并行委派事件流）、`_rag-inject-e2e.mjs`（注入探针实战）。
+活路径（需真实模型）：原 `scripts/run-*.ps1` 运行器与 `_rag-e2e.mjs`（知识库问答 + 子代理并行委派事件流）、`_rag-inject-e2e.mjs`（注入探针实战）**均已随 2026-09 的调试脚本清理移除**——当前没有现成活链路脚本，需要时按上面的「BI 通道自检清单」同一口径临时手写（用完即删、不提交）。当时的结论仍可作口径参照：知识库问答能自主检索并标注来源；注入探针文档被当数据复述、明确拒绝执行且未产生被写文件。
 
 ---
 

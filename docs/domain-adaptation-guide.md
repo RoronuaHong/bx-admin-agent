@@ -2,6 +2,7 @@
 
 > 配套文档：`agent-infrastructure.md`（通用 Agent 基建检查表，含 M0–M4 成熟度模型与反模式）。
 > 本指南回答一件事：**如何在不破坏现有通用 Agent 的前提下，把它改造成某个垂直领域 Agent（如观影助手），且能共存/切换**。
+> **验证脚本现状（2026-09-22）**：文中（如 §10 进度段）提到的 `scripts/_role-check.mjs` / `_movie-e2e.mjs` 等验证脚本**大多已随 2026-09 的调试脚本清理移除**；现行零依赖回归入口是 `pnpm test`（`apps/agent-server/tests/*.test.ts`，角色相关见 `tests/role-guard.test.ts` / `tests/system-prompt-contract.test.ts`），脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11。实测结论保留作追溯，但**不要照抄其中的脚本命令**。
 
 ---
 

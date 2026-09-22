@@ -3,6 +3,7 @@
 > 版本：v4（2026-09-20，追加 §11 内置工具对标与全量补齐计划 + §11.6 查缺补漏修订 + §11.7 第二轮核对：去冗余 / 主循环缺口 / 回归脚本断层）；v2（2026-09-17，决议已冻结 + 实施记录见 §8）
 > 定位：评估稿 → 实施记录。回答两个问题：① 现在的架构是不是 harness？② 要不要/能不能升级成 Deep Agents 架构，现有代码支持吗？
 > 相关：`docs/agent-infrastructure.md`、`docs/conversation-state-plan.md`（thread/并发/队列契约）。
+> **验证脚本现状（2026-09-22）**：本文各轮记录（§8 / §11.x）里提到的 `scripts/_*.mjs` 验证脚本**大多已随 2026-09 的调试脚本清理移除**（`apps/agent-server/scripts/` 现只留 3 个功能性脚本）。**现行零依赖回归入口是 `pnpm test`**（`apps/agent-server/tests/*.test.ts`），脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11 与本文 §10.4；历史实测输出保留作追溯，但**不要照抄其中的脚本命令**。
 
 ---
 
@@ -210,20 +211,12 @@ chatStream
 - 提示注入防护为**纯协议层**（定界 + nonce + 来源标注 + 不可见控制符剥离），不依赖任何自然语言词表拦截，对齐 OWASP LLM01。
 - 早期挂账的 `src/analytics` 中文业务正则（按天/按渠道/不要没标等写死）已随 `src/analytics` 删除而移除（复盘见 `docs/mcp-guide.md` §10 陌生库取证）；当前全仓源码已无此类写死（仅文档/注释出现业务词，属正常）。
 
-### 10.4 验证脚本（当前可复跑）
+### 10.4 验证入口（2026-09-22 核对）
 
-> 2026-09-20 修订：原清单里的 `_deep-agents-check.mjs` / `_mcp-multi-server-check.mjs` / `_thread-check.mjs` **已不在仓库**（见 §11.7 G4）。下列为当前真实可复跑的清单。
+（脚本现状与总表见本文开头那条注——此处不再重复，只留本节原清单的替代关系）
 
-- `node --import tsx scripts/_risk-gate-check.mjs` → **22/22 PASS**（写操作安全闸门纯函数断言：内置登记表 / 未知 fail-closed 三口径 / 只读授权降级 / 票据会话绑定 / 参数脱敏 / 审计落盘回读 / SQL 只读判定）。
-- `node --import tsx scripts/_builtin-fs-check.mjs` → **22/22 PASS**（2026-09-20 新增，§11.8：fs_read 分页 / fs_glob / fs_grep / 越界拒绝 / 风险登记 / 工具接线）。
-- `node --import tsx scripts/_clarify-check.mjs` → **10/10 PASS**（2026-09-20 新增：结构化澄清入参校验 + 票据回传值 / 跳过 / 跨会话 / 一次性 / 超时）。
-- `node --import tsx scripts/_concurrent-check.mjs` → **10/10 PASS**（2026-09-20 新增：主循环并发批决策，§11.8）。
-- `node --import tsx scripts/_memory-tools-check.mjs` → **7/7 PASS**（2026-09-20 新增：模型侧长期记忆写入/读取/隔离，§11.8）。
-- `node --import tsx scripts/_async-subagent-check.mjs` → **6/6 PASS**（子代理独立事件维度 / 独立取消 / 级联，§8 记录）。
-- `node --import tsx scripts/_untrusted-check.mjs` → **12/12**（提示注入防护：nonce 定界 / 伪造闭合中和 / 控制符清洗）。
-- `node --import tsx scripts/_rag-check.mjs` → **23**（知识库：解析分发 / 切片 / 混合检索 / embedding 降级 / 增量，需先建索引）。
-- `node --import tsx scripts/_bi-tools-check.mjs`（需真实实例与凭据）：BI 通道自检。
-- **仍缺（挂账）**：真实模型驱动的端到端回归（D1–D4 活链路 / 多服务器加固轮），原由 `_deep-agents-check` 承担 —— 待补或改用现有 e2e 脚本（见 §11.7 G4）。
+- **现行唯一零依赖回归入口**：`pnpm test`（`apps/agent-server/tests/*.test.ts`）——写闸门口径 → `write-gate.test.ts`；原生 SQL 只读硬拒 → `sql-readonly.test.ts`；循环护栏 / 同轮去重 / 子代理工具收窄 → `deep-agent-control.test.ts`；子代理端到端 → `deep-agent-live.test.ts`；澄清挂起 → `clarification-flow.test.ts`；接地护栏 → `grounding-guard.test.ts`；协议护栏 → `answer-protocol-guard.test.ts` / `pseudo-chart-guard.test.ts`。
+- **仍缺（挂账）**：真实模型驱动的端到端回归（D1–D4 活链路 / 多服务器加固轮）——原由 `_deep-agents-check` 承担，现无脚本；需要时按 `docs/mcp-guide.md` §11 的清单临时手写（用完即删、不提交）。
 
 > 结论：**无需改动代码**。若后续引入新内置工具，只需在 `BUILTIN_RISK` 登记级别（漏登启动即抛错，见 `builtins.ts` `assertBuiltinRiskCoverage`）+ 必要时在 `toolRisks` 补定级，无需改主循环。
 

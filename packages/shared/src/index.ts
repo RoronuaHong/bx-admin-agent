@@ -85,7 +85,7 @@ export interface ChartSpec {
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
 // 支持扩展思考的模型（Claude 3.7+/4、o 系列）会在回答前产出 thinking 事件：前端渲染成
 // 可折叠的「思考过程」块，取代静默规划期的「正在规划…」占位（最佳实践：实时展示推理）。
-export type ChatEvent =
+type ChatEventBody =
   | { type: "text"; text: string }
   | { type: "text_delta"; text: string }
   | { type: "thinking"; text: string }
@@ -189,4 +189,25 @@ export type ChatEvent =
       /** 循环累计发送的 prompt token 估算（成本护栏开启时统计）。 */
       costTokens?: number;
     }
-  | { type: "done" };
+  | { type: "done" }
+  /**
+   * 传输层保活（长静默期的模型思考 / 长工具执行）：不占序号、不进服务端事件缓冲，
+   * 前端忽略即可——它的作用只是让代理与空闲超时看到连接还活着。
+   */
+  | { type: "ping"; t: number };
+
+/**
+ * 事件信封：断线续传的游标来源。
+ *
+ * 对齐两处业界做法：SSE 的 `id:` + 重连时的 `Last-Event-ID`，以及 OpenAI Responses 流式事件的
+ * `sequence_number`。服务端给每个**进入任务缓冲**的事件打上任务内单调递增的 `seq`，
+ * 客户端只需记住最后消费到的 `seq`，重连时带 `?from=<seq>` 就能精确续读——
+ * 既不用整段重放（整段重放会把已显示的正文再拼一遍），也不会有事件被跳过。
+ * 未进入缓冲的事件（如 `text_delta` 只累加、`ping` 只保活）不带 `seq`。
+ */
+export interface ChatEventEnvelope {
+  /** 任务内单调递增序号（同一任务内连续；跨任务不复用、不保证递增）。 */
+  seq?: number;
+}
+
+export type ChatEvent = ChatEventBody & ChatEventEnvelope;

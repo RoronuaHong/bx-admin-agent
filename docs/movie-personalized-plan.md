@@ -237,7 +237,7 @@ tags=["科幻","悬疑","烧脑","高概念"]  items=12（服务端零词表，�
 
 ### 端点与界面验证证据
 
-`scripts/_movie-api-check.mjs`（打真实服务，**26/26 PASS**）：
+`scripts/_movie-api-check.mjs`（打真实服务，**26/26 PASS**；该脚本已随 2026-09 的调试脚本清理移除，以下为当时的实测输出）：
 
 - 冷启动 200 / `needsCalibration=true` / 12 条兜底；校准搜索返回真实豆瓣结果；空关键词返回空数组。
 - 校准提交：空列表 400（`MOVIE_CALIBRATION_EMPTY`）；正常提交写入 2 条历史。
@@ -246,7 +246,7 @@ tags=["科幻","悬疑","烧脑","高概念"]  items=12（服务端零词表，�
 - **反馈立即生效**：点「不感兴趣」后，即使仍在防抖窗口内，缓存返回也必须过滤掉该片（这条是实测发现的缺陷，已修）。
 - 跨用户隔离：他人画像为空且 `needsCalibration=true`，自己的历史不受影响。
 
-`scripts/_movie-taste-check.mjs`（A2 对话累积，**PASS**）：
+`scripts/_movie-taste-check.mjs`（A2 对话累积，**PASS**；该脚本已随 2026-09 的调试脚本清理移除，以下为当时的实测输出）：
 
 - 用户口头表达观影偏好 → 模型调用 `record_watched_movies` → 画像 `history=3` + `like`/`dislike` 落库。
 - 画像有历史后推荐自动转为个性化（`needsCalibration=false`），且不含已记录看过/不喜欢的片。

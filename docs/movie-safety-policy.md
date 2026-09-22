@@ -2,7 +2,7 @@
 
 > 适用对象：`/movie` 独立角色（模式 B，引擎按 `agentId=movie` 选人设 / 技能 / MCP）。
 > 配套代码：`apps/agent-server/src/system-prompt.ts`（全局护栏）、`apps/agent-server/src/roles.ts`（`MOVIE_BASE_PROMPT` + `forceEagerTools`/`forceToolCall`/`enforceGrounding` 三个角色开关）、`apps/agent-server/src/role-guard.ts`（确定性身份护栏）、`apps/agent-server/src/grounding.ts`（反编造接地护栏，§3）。
-> 配套门禁：`apps/agent-server/scripts/_movie-grounding-gate.mjs`（G7 编造检测）、`apps/agent-server/tests/grounding-guard.test.ts`（接地决策单测）。
+> 配套门禁：`apps/agent-server/tests/grounding-guard.test.ts`（接地决策单测）与 `tests/deep-agent-live.test.ts`（子代理 / 工具链路）。原 `scripts/_movie-grounding-gate.mjs`（G7 编造检测）已随 2026-09 的调试脚本清理移除——现行回归入口是 `pnpm test`，脚本现状见 `docs/mcp-guide.md` §11。
 
 ## 1. 背景与问题
 
@@ -61,9 +61,9 @@ generic 与 movie 等所有角色都先看到这段，优先级最高、任何�
 7. **强制工具通道只是加成，不是保证**（2026-09-20 实测补记）：`forceToolCall` 发的 `tool_choice=required` 并非所有端点都支持。用 `scripts/_model-toolchoice-probe.mjs` 对照实测：TokenHub 的 OpenAI 兼容端点对 `required` 与「指定函数」**一律回 400**（`400001 invalid_request_error`），只有 `auto` / `none` 可用（hyvision 连 `none` 也回 400）。因此 `chat.ts` 的 `streamCall` 在被拒时降级 `auto` 重试**并记住该端点**（`forcedToolChoiceSupported`），后续不再发 required——否则**每一轮首调**都要白打一次 400（延迟翻倍 + 日志噪音）。既然强制通道不可靠，反编造的主体就落在①人设纪律（`movie` 人设第 1/2/3 条：需要数据的必须先取数、不需要数据的不调工具也不谎称故障、取不到如实说）与②本护栏上。
 8. **同类纪律已提升为全局条款**：`system-prompt.ts` 的 `TOOLING_RULES` 第 7 条对**所有角色**生效——涉及可核实的具体事实（时间、地点、数字、身份与亲属关系、事件细节、作品信息等）时，手边有检索/查询工具就先核实再答；核实不到就说明「依据记忆、可能不准确」，不要用确定语气断言，也不要补用户没问到的具体细节。触发场景：通用角色曾对一条事实问题**整轮零工具调用**（其推理自述「不需要使用工具」，而当时联网检索是可用的），把未经核实的具体细节当确定事实说出。
 
-**门禁**：`scripts/_movie-grounding-gate.mjs`（G7 + G1/G2）——事实型夹具下断言 G7-A 真发生过工具调用、G7-B 未触发接地兜底、G7-C 答案中的 4 位年份必须能在本轮工具返回里找到（找不到 = 编造嫌疑）、G7-D 轮次不超预算、G1 角色路由到 movie 工具且不泄漏非观影类工具、G2 命中与问题匹配的期望观影工具；观测行同时打印 `groundingRetries` / `groundingVerifications` / `ungrounded`。
-`scripts/_movie-e2e-cases.mjs` 补的是 G7 **管不到的那半边**：非数据轮次（问候 / 超范围提问）不许出现观影工具调用、且正文不得出现「数据源 / 已连接」这类内部机制话术（本次修复的回归点），同时回归事实型提问仍必须取数。
-`scripts/_model-toolchoice-probe.mjs` 探端点的 `tool_choice` 兼容性（换模型 / 换网关时先跑它）。
+**门禁**：`scripts/_movie-grounding-gate.mjs`（G7 + G1/G2；**该脚本已随 2026-09 的调试脚本清理移除**，以下为当时的门禁口径，现行回归见本文档头部说明与 `tests/grounding-guard.test.ts`）——事实型夹具下断言 G7-A 真发生过工具调用、G7-B 未触发接地兜底、G7-C 答案中的 4 位年份必须能在本轮工具返回里找到（找不到 = 编造嫌疑）、G7-D 轮次不超预算、G1 角色路由到 movie 工具且不泄漏非观影类工具、G2 命中与问题匹配的期望观影工具；观测行同时打印 `groundingRetries` / `groundingVerifications` / `ungrounded`。
+`scripts/_movie-e2e-cases.mjs`（**已随 2026-09 的调试脚本清理移除**，下同）补的是 G7 **管不到的那半边**：非数据轮次（问候 / 超范围提问）不许出现观影工具调用、且正文不得出现「数据源 / 已连接」这类内部机制话术（本次修复的回归点），同时回归事实型提问仍必须取数。
+`scripts/_model-toolchoice-probe.mjs` 探端点的 `tool_choice` 兼容性（换模型 / 换网关时先跑它；脚本已移除，该结论的现行回归见 `tests/deep-agent-control.test.ts` 的「被拒一次就记住」与 `tests/thinking.test.ts`，代码侧口径写在 `src/chat.ts` / `src/models.ts` 对应注释里）。
 `tests/grounding-guard.test.ts` 覆盖两道护栏的决策矩阵、核验结果解析、多票裁决、角色接线与新话术的回归锚点；`tests/system-prompt-contract.test.ts` 覆盖「何时该调工具 / 不该调工具 + 事实核验条款」；`tests/deep-agent-control.test.ts` 覆盖强制通道端点记忆（零网络，共 25 例）。
 
 **为什么服务端不做语义判定**：第 2/3/4 条只做结构判定（有没有成功取到过外部数据），第 5 条把语义判定交回模型（由模型当核验器）。服务端写「这句话算不算事实」的正则等于把领域知识硬编码进引擎且必然误判——违反「禁止写死业务词」红线。

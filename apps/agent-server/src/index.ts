@@ -6,6 +6,7 @@ import { config, defaultModel, listModels } from "./config.js";
 import { listEnabledMcpServers, pruneUnknownMcpServers } from "./conversations.js";
 import { loadServers } from "./mcp/config.js";
 import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
+import { startTaskRetentionSweeper } from "./chat-tasks.js";
 
 // 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
 assertBuiltinRiskCoverage();
@@ -33,6 +34,8 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   }
   // 周期回收空闲 MCP 连接（stdio 子进程不常驻），下次用到时自动重连。
   startIdleSweeper();
+  // 周期回收「已收束任务的事件留档」（断线续传的取数窗口，过期即释放内存）。
+  startTaskRetentionSweeper();
   // 启动维护：把「配置里已不存在」的 MCP id 从各对话启用集里摘掉。
   // 服务器的增减多来自 .env（只在启动时读），除了 DELETE 端点没有别的清理点；
   // 放在这里而不是 GET 里，见 conversations.ts 的 pruneUnknownMcpServers 注释（安全方法语义）。

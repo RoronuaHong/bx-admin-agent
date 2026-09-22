@@ -50,6 +50,7 @@ import {
   finalTextOf,
   followTask,
   getLastTaskSummary,
+  getRetainedTask,
   getRunningTask,
   isTaskRunning,
   publishTaskEvent,
@@ -943,25 +944,40 @@ export function createApp() {
 
   // ---- 异步任务端点（断线续传 / 显式取消 / 状态查询）----
 
-  // 断线重连续传：回放任务事件缓冲并继续跟随（客户端用同一套 NDJSON 解析逻辑消费）。
+  // 断线重连续传：从客户端游标处续读并继续跟随（客户端用同一套 NDJSON 解析逻辑消费）。
+  // 游标 = 客户端最后消费到的 `seq`：优先显式 `?from=`，也接受 SSE 习惯的 `Last-Event-ID` 头；
+  // 缺省 0 = 从头回放（刷新后重新挂上一次正在跑的 run）。正文由服务端发一条 `text` 快照补上，
+  // 客户端是替换语义 → 重复续传不会把已显示的正文再拼一遍。
   app.get("/chat/task/events", async (c) => {
     const conversationId = c.req.query("conversationId") || "";
     if (await conversationNotFoundFor(c, conversationId)) {
-      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或最近的任务");
+      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或留档期内可续传的任务");
     }
-    const task = getRunningTask(conversationId);
-    const finished = getLastTaskSummary(conversationId);
-    if (!task && !finished) {
-      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或最近的任务");
-    }
-    return streamNdjson(async (send) => {
-      if (task) {
-        for await (const event of followTask(task)) send(event);
-      } else if (finished) {
-        // 已收束：回放最近一次任务的缓冲没有留档（缓冲随任务销毁），给一个明确的终态事件。
+    const rawFrom = c.req.query("from") ?? c.req.header("last-event-id") ?? "0";
+    const parsedFrom = Number(rawFrom);
+    const from = Number.isFinite(parsedFrom) ? Math.max(0, Math.floor(parsedFrom)) : 0;
+    // 运行中优先；没有运行中的就看留档——收束后的一小段时间内仍能取到尾部终态，
+    // 断线刚好发生在收尾那一刻的重连不必「重开对话才知道结果」。
+    const task = getRunningTask(conversationId) || getRetainedTask(conversationId);
+    if (!task) {
+      const finished = getLastTaskSummary(conversationId);
+      if (!finished) {
+        return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或留档期内可续传的任务");
+      }
+      // 已收束且留档已过期（缓冲随之回收）：给一个明确的终态，不假装还能续读。
+      return streamNdjson(async (send) => {
         send({ type: "error", error: { code: "CHAT_TASK_ALREADY_SETTLED", defaultMessage: "任务已收束，结果已回投到对话记录" }, message: "任务已收束" });
         send({ type: "done" });
+      });
+    }
+    return streamNdjson(async (send) => {
+      let sawDone = false;
+      for await (const event of followTask(task, from)) {
+        if (event.type === "done") sawDone = true;
+        send(event);
       }
+      // 已收束的任务：客户端游标可能已经在末尾（没有可回放的事件）——补一个终态，别让连接悬着。
+      if (!sawDone && task.status !== "running") send({ type: "done" });
     });
   });
 
@@ -989,6 +1005,7 @@ export function createApp() {
   });
 
   // 任务状态（跑没跑、最近一次收束摘要），供前端断线后判断「后台还在跑吗」。
+  // `lastEventSeq` = 当前事件序号上界：客户端据此判断自己的游标落后多少（也便于排障）。
   app.get("/chat/task/status", async (c) => {
     const conversationId = c.req.query("conversationId") || "";
     const owned = await conversationOwnedBy(conversationId, c.get("owner"));
@@ -999,7 +1016,13 @@ export function createApp() {
       running: Boolean(task),
       ...(task
         ? {
-            task: { id: task.id, startedAt: task.startedAt, elapsedMs: Date.now() - task.startedAt, live: task.live },
+            task: {
+              id: task.id,
+              startedAt: task.startedAt,
+              elapsedMs: Date.now() - task.startedAt,
+              live: task.live,
+              lastEventSeq: task.seq,
+            },
           }
         : {}),
       ...(last ? { last } : {}),
@@ -1370,15 +1393,34 @@ export function createApp() {
   return app;
 }
 
+/**
+ * 流式响应保活间隔（毫秒，0 = 关闭）。
+ * 长静默（模型思考几十秒 / 长工具执行）期间连接上一个字节都没有，代理与空闲超时会把连接掐掉——
+ * 表现就是前端「莫名其妙断了」。周期性发一条 `ping`（传输层事件，不进任务缓冲）即可保活。
+ */
+const STREAM_HEARTBEAT_MS = Math.max(0, Number(process.env.CHAT_STREAM_HEARTBEAT_MS ?? 15_000));
+
 // HTTP Streamable 流式响应：分块传输（Transfer-Encoding: chunked）+ 每行一条 JSON（NDJSON）。
 // 不用 SSE（text/event-stream），因为 vite dev 代理会缓冲 SSE 导致事件无法实时到达前端。
-function streamNdjson(run: (send: (event: unknown) => void) => Promise<void>) {
+function streamNdjson(run: (send: (event: unknown) => void) => Promise<void>, opts: { heartbeatMs?: number } = {}) {
   const encoder = new TextEncoder();
+  const heartbeatMs = opts.heartbeatMs ?? STREAM_HEARTBEAT_MS;
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: unknown) => {
         controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
       };
+      let beat: NodeJS.Timeout | null = null;
+      if (heartbeatMs > 0) {
+        beat = setInterval(() => {
+          try {
+            send({ type: "ping", t: Date.now() });
+          } catch {
+            /* 连接已关闭：等 run 收尾统一处理 */
+          }
+        }, heartbeatMs);
+        beat.unref();
+      }
       try {
         await run(send);
       } catch (error) {
@@ -1394,6 +1436,7 @@ function streamNdjson(run: (send: (event: unknown) => void) => Promise<void>) {
           /* controller 已关闭则忽略 */
         }
       } finally {
+        if (beat) clearInterval(beat);
         try {
           controller.close();
         } catch {

@@ -56,6 +56,7 @@ import {
   patchConversation,
   reloadMcpServer,
   reorderConversations,
+  resumeChatTaskEvents,
   saveChatPreferences,
   saveConversationMessages,
   saveNotifyChannel,
@@ -84,7 +85,7 @@ import {
   type UploadResult,
   type WorkspaceFile,
 } from "../api";
-import type { TodoItem } from "@bx/shared";
+import type { ChatEvent, TodoItem } from "@bx/shared";
 
 /** 侧栏视图：对话列表 / 定时任务。为后续接入定时任务预留结构化入口（占位面板）。 */
 const view = ref<"chat" | "tasks">("chat");
@@ -1806,6 +1807,8 @@ function selectConversation(conv: ConversationDto) {
   // 技能面板：可用列表全局，启用集按对话。
   void loadSkills(conv.id);
   queueScroll(true); // 切对话是用户动作：无条件回底，并重置跟底状态
+  // 服务端还有这个对话的任务在跑（刷新 / 换设备进来）：接回事件流继续显示，而不是干等结果回投。
+  void attachRunningTask(conv.id);
 }
 
 async function newConversation() {
@@ -2583,6 +2586,196 @@ async function send() {
   );
 }
 
+/** 断线续传的重试策略：指数退避（对齐「可恢复流」的客户端自动重连），退避耗尽才如实宣告中断。 */
+const RESUME_ATTEMPTS = 3;
+const RESUME_BACKOFF_MS = 600;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 一轮运行的上下文。
+ * 原先是 `runTurn` 里的闭包变量；抽出来是为了让「断线续传」复用**同一套事件处理**——
+ * 续传不是另写一条渲染路径，而是把后续事件重新接回同一个气泡，避免两份渲染逻辑各自演化。
+ */
+interface TurnRun {
+  convId: string;
+  reply: Bubble;
+  state: ConvState;
+  /** 本轮请求的模型（auto 模式下用于失败黑名单）。 */
+  chosenModel: string;
+  /** 是否收到过终态事件（done / 服务端 error）：没收到就结束的流 = 中断，必须收口。 */
+  sawTerminal: boolean;
+  /** 已消费到的最后一个事件序号 = 续传游标（服务端据它只回放更新的部分）。 */
+  lastSeq: number;
+}
+
+/**
+ * 把一条服务端事件应用到气泡上：首连与续传共用同一条路径。
+ * `seq` 只用于记账（游标），渲染分支完全不关心它；`ping` 是保活事件，忽略即可。
+ */
+function applyChatEvent(run: TurnRun, event: ChatEvent): void {
+  if (typeof event.seq === "number" && event.seq > run.lastSeq) run.lastSeq = event.seq;
+  const { convId, reply, state } = run;
+  if (event.type === "text_delta") {
+    reply.text += event.text;
+    thinkPhaseEnd(reply);
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "text") {
+    // 替换语义：终稿全文、以及续传时服务端补发的正文快照都走这里（幂等，不会把正文拼两遍）。
+    reply.text = event.text;
+    thinkPhaseEnd(reply);
+  } else if (event.type === "thinking_delta") {
+    // 扩展思考增量：拼接进 reasoning 面板，实时展示模型规划过程，取代「正在规划」占位。
+    reply.thinking = (reply.thinking || "") + event.text;
+    thinkPhaseStart(reply.id);
+    openReasoning.add(reply.id);
+    queueScrollIfCurrent(convId);
+    stickThinkingToBottom();
+  } else if (event.type === "model") {
+    state.activeModelLabel = event.label;
+  } else if (event.type === "tool_call") {
+    reply.steps = reply.steps || [];
+    reply.steps.push({
+      id: event.id,
+      name: event.name,
+      server: event.server,
+      args: event.args,
+      status: "running",
+    });
+    openReasoning.add(reply.id);
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "tool_result") {
+    const step = (reply.steps || []).find((s) => s.id === event.id);
+    if (step) {
+      step.status = event.ok ? "ok" : "error";
+      step.result = event.text;
+    }
+    reply.pending = null;
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "confirmation_required") {
+    // 安全判定只在服务端（工具级别声明 + 策略），前端只做展示：是否弹卡、用什么级别弹卡都由事件决定。
+    reply.pending = {
+      id: event.id,
+      ticket: event.ticket,
+      name: event.name,
+      server: event.server,
+      args: event.args,
+      level: event.level,
+      reason: event.reason,
+      argSummary: event.argSummary,
+      canGrantRead: event.canGrantRead,
+      expiresInMs: event.expiresInMs,
+    };
+    scheduleConfirmExpiry(reply, event.expiresInMs);
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "confirmation_response") {
+    reply.pending = null;
+  } else if (event.type === "clarification_required") {
+    // 结构化澄清：选项由模型给出，用户点选后把选项值回传（与确认卡同通道、同票据机制）。
+    reply.clarification = {
+      id: event.id,
+      ticket: event.ticket,
+      question: event.question,
+      options: event.options,
+      ...(event.missingField ? { missingField: event.missingField } : {}),
+      ...(event.whyItMatters ? { whyItMatters: event.whyItMatters } : {}),
+      expiresInMs: event.expiresInMs,
+    };
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "clarification_response") {
+    reply.clarification = null;
+  } else if (event.type === "error") {
+    // 服务端明确宣告的终态：这条之后流再断也算「有结论」，不走中断收口。
+    run.sawTerminal = true;
+    const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
+    reply.error = message;
+    state.error = message;
+  } else if (event.type === "todos") {
+    // 任务规划（write_todos）：挂到当前回复气泡上，随执行推进状态。
+    reply.todos = event.todos;
+    openReasoning.add(reply.id);
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "chart") {
+    // 本地渲染图表（render_chart）：追加到当前回复气泡，由 ChartCard 用 AntV 绘制。
+    // 一轮可能出多张（如「两张图对比」），必须逐张累积——单字段会让后一张覆盖前一张。
+    reply.charts = reply.charts || [];
+    reply.charts.push({
+      title: event.title,
+      chartType: event.chartType,
+      data: event.data,
+      encode: event.encode,
+      options: event.options,
+    });
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "subagent_start") {
+    reply.subagents = reply.subagents || [];
+    reply.subagents.push({
+      id: event.id,
+      parentId: event.parentId,
+      description: event.description,
+      status: "running",
+      text: "",
+    });
+    // 与 tool_call / todos 同约定：结构化进度一出现就展开「推理过程」，否则子代理面板默认收看不到。
+    openReasoning.add(reply.id);
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "subagent_delta") {
+    const sa = (reply.subagents || []).find((s) => s.id === event.id);
+    if (sa) sa.text += event.text;
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "subagent_end") {
+    const sa = (reply.subagents || []).find((s) => s.id === event.id);
+    if (sa) {
+      sa.status = event.status;
+      sa.text = event.text;
+    }
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "usage") {
+    reply.usage = {
+      tokens: event.tokens,
+      budget: event.budget,
+      window: event.window,
+      turns: event.turns,
+      dropped: event.dropped,
+      summarized: event.summarized,
+      toolResultsCleared: event.toolResultsCleared,
+      toolResultsOffloaded: event.toolResultsOffloaded,
+    };
+  } else if (event.type === "done") {
+    run.sawTerminal = true;
+    // 收束时清理模型回声式重复（只改内存展示，不改落库文本）。
+    reply.text = dedupeRepeats(reply.text);
+    thinkPhaseEnd(reply);
+    reply.streaming = false;
+    openReasoning.delete(reply.id);
+    // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
+    if (!reply.error) lastGoodModelId.value = run.chosenModel;
+  }
+}
+
+/**
+ * 断线后自动续传（按游标 + 指数退避重试）。
+ * 返回 true = 已接上并跑到终态（事件走同一套 `applyChatEvent`，含最终 `done`）；
+ * 返回 false = 服务端已没有该任务（进程重启后注册表为空 / 收束后留档过期）或重试耗尽 ——
+ * 由调用方如实收口，不假装还在跑。
+ */
+async function resumeRun(run: TurnRun, signal: AbortSignal): Promise<boolean> {
+  for (let attempt = 0; attempt < RESUME_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await sleep(RESUME_BACKOFF_MS * 2 ** (attempt - 1));
+    if (signal.aborted || run.sawTerminal) break;
+    try {
+      // 服务端没有可续传的任务时返回 false（不抛错）：直接走「如实收口」分支。
+      await resumeChatTaskEvents(run.convId, run.lastSeq, (event) => applyChatEvent(run, event), signal);
+    } catch {
+      /* 连接仍不通：退避后重试 */
+    }
+    if (run.sawTerminal) return true;
+    // 事件流结束但没有终态：确认任务是否还在跑——已收束且留档过期就没必要继续重试。
+    if (!(await isChatTaskRunning(run.convId).catch(() => false))) break;
+  }
+  return run.sawTerminal;
+}
+
 /**
  * 一轮对话的主流程（模型流式 + 工具循环渲染）。
  * 单独抽出是为了让「队列自动出队」与「立即发送」复用同一条路径；
@@ -2632,159 +2825,27 @@ async function runTurn(
   state.controller = controller;
   queueScrollIfCurrent(convId);
 
+  // 本轮上下文：事件处理与续传共用同一个对象（游标 lastSeq 随事件推进）。
+  const run: TurnRun = { convId, reply, state, chosenModel, sawTerminal: false, lastSeq: 0 };
   let stopped = false;
   let queued = false;
-  /** 本轮是否收到过终态事件（done / 服务端 error）：没收到就结束的流 = 中断，必须收口。 */
-  let sawTerminal = false;
   let interrupted = false;
   try {
     await streamChat(
       text,
       // conversationId 显式带上：不依赖服务端的活跃对话回退（多标签页时会串）；agentId 供服务端按角色分流。
       { conversationId: convId, model: chosenModel || undefined, images: imageIds, attachments: docIds, agentId: AGENT_ID },
-      (event) => {
-        if (event.type === "text_delta") {
-          reply.text += event.text;
-          thinkPhaseEnd(reply);
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "text") {
-          reply.text = event.text;
-          thinkPhaseEnd(reply);
-        } else if (event.type === "thinking_delta") {
-          // 扩展思考增量：拼接进 reasoning 面板，实时展示模型规划过程，取代「正在规划」占位。
-          reply.thinking = (reply.thinking || "") + event.text;
-          thinkPhaseStart(reply.id);
-          openReasoning.add(reply.id);
-          queueScrollIfCurrent(convId);
-          stickThinkingToBottom();
-        } else if (event.type === "model") {
-          state.activeModelLabel = event.label;
-        } else if (event.type === "tool_call") {
-          reply.steps = reply.steps || [];
-          reply.steps.push({
-            id: event.id,
-            name: event.name,
-            server: event.server,
-            args: event.args,
-            status: "running",
-          });
-          openReasoning.add(reply.id);
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "tool_result") {
-          const step = (reply.steps || []).find((s) => s.id === event.id);
-          if (step) {
-            step.status = event.ok ? "ok" : "error";
-            step.result = event.text;
-          }
-          reply.pending = null;
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "confirmation_required") {
-          // 安全判定只在服务端（工具级别声明 + 策略），前端只做展示：是否弹卡、用什么级别弹卡都由事件决定。
-          reply.pending = {
-            id: event.id,
-            ticket: event.ticket,
-            name: event.name,
-            server: event.server,
-            args: event.args,
-            level: event.level,
-            reason: event.reason,
-            argSummary: event.argSummary,
-            canGrantRead: event.canGrantRead,
-            expiresInMs: event.expiresInMs,
-          };
-          scheduleConfirmExpiry(reply, event.expiresInMs);
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "confirmation_response") {
-          reply.pending = null;
-        } else if (event.type === "clarification_required") {
-          // 结构化澄清：选项由模型给出，用户点选后把选项值回传（与确认卡同通道、同票据机制）。
-          reply.clarification = {
-            id: event.id,
-            ticket: event.ticket,
-            question: event.question,
-            options: event.options,
-            ...(event.missingField ? { missingField: event.missingField } : {}),
-            ...(event.whyItMatters ? { whyItMatters: event.whyItMatters } : {}),
-            expiresInMs: event.expiresInMs,
-          };
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "clarification_response") {
-          reply.clarification = null;
-        } else if (event.type === "error") {
-          // 服务端明确宣告的终态：这条之后流再断也算「有结论」，不走中断收口。
-          sawTerminal = true;
-          const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
-          reply.error = message;
-          state.error = message;
-        } else if (event.type === "todos") {
-          // 任务规划（write_todos）：挂到当前回复气泡上，随执行推进状态。
-          reply.todos = event.todos;
-          openReasoning.add(reply.id);
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "chart") {
-          // 本地渲染图表（render_chart）：追加到当前回复气泡，由 ChartCard 用 AntV 绘制。
-          // 一轮可能出多张（如「两张图对比」），必须逐张累积——单字段会让后一张覆盖前一张。
-          reply.charts = reply.charts || [];
-          reply.charts.push({
-            title: event.title,
-            chartType: event.chartType,
-            data: event.data,
-            encode: event.encode,
-            options: event.options,
-          });
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "subagent_start") {
-          reply.subagents = reply.subagents || [];
-          reply.subagents.push({
-            id: event.id,
-            parentId: event.parentId,
-            description: event.description,
-            status: "running",
-            text: "",
-          });
-          // 与 tool_call / todos 同约定：结构化进度一出现就展开「推理过程」，否则子代理面板默认收看不到。
-          openReasoning.add(reply.id);
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "subagent_delta") {
-          const sa = (reply.subagents || []).find((s) => s.id === event.id);
-          if (sa) sa.text += event.text;
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "subagent_end") {
-          const sa = (reply.subagents || []).find((s) => s.id === event.id);
-          if (sa) {
-            sa.status = event.status;
-            sa.text = event.text;
-          }
-          queueScrollIfCurrent(convId);
-        } else if (event.type === "usage") {
-          reply.usage = {
-            tokens: event.tokens,
-            budget: event.budget,
-            window: event.window,
-            turns: event.turns,
-            dropped: event.dropped,
-            summarized: event.summarized,
-            toolResultsCleared: event.toolResultsCleared,
-            toolResultsOffloaded: event.toolResultsOffloaded,
-          };
-        } else if (event.type === "done") {
-          sawTerminal = true;
-          // 收束时清理模型回声式重复（只改内存展示，不改落库文本）。
-          reply.text = dedupeRepeats(reply.text);
-          thinkPhaseEnd(reply);
-          reply.streaming = false;
-          openReasoning.delete(reply.id);
-          // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
-          if (!reply.error) lastGoodModelId.value = chosenModel;
-        }
-      },
+      (event) => applyChatEvent(run, event),
       controller.signal,
     );
     // 流结束了却一个终态事件都没收到：连接在收尾前就断了（服务端进程重启 / 代理切断 / 连接被回收）。
-    // 此时本地还挂着「执行中」的步骤与子代理，必须如实收口——否则推理面板会永久转圈。
-    if (!sawTerminal && !stopped) {
-      interrupted = true;
-      await settleInterruptedRun(convId, reply);
+    // 先按游标自动续传（可恢复流的客户端重连 + 精确续读）；服务端确实没有这个任务时才如实收口，
+    // 否则推理面板会永久转圈。
+    if (!run.sawTerminal && !stopped) {
+      if (!(await resumeRun(run, controller.signal))) {
+        interrupted = true;
+        await settleInterruptedRun(run);
+      }
     }
   } catch (err) {
     if ((err as Error)?.name === "AbortError") {
@@ -2797,22 +2858,30 @@ async function runTurn(
       await enqueueMessage(convId, text, imageIds, docIds);
     } else {
       // 连接类错误（断网/刷新/代理断开）：执行与推送已解耦，后台任务可能仍在跑。
-      // 查一次任务状态：还在跑 → 如实告知「后台继续，稍后刷新可见」，不要误报为生成失败。
-      const backgroundRunning = await isChatTaskRunning(convId).catch(() => false);
-      if (backgroundRunning) {
-        reply.text = tx(
-          "（连接已中断，生成仍在后台继续；完成后重新打开该对话即可看到结果）",
-          "(Connection lost; generation continues in the background — reopen this conversation to see the result)",
-        );
-        watchBackgroundDone(convId);
-      } else {
-        const message = localizeToken(
-          uiLocale.value,
-          getApiErrorToken(err),
-          (err as Error)?.message || "GENERIC_UNKNOWN_ERROR",
-        );
-        reply.error = message;
-        state.error = message;
+      // 先按游标续传（与「流无终态结束」同一条路径）；真接不上再查任务状态如实告知，
+      // 绝不误报为生成失败，也不用「断开」覆盖掉已经产出的正文。
+      if (!(await resumeRun(run, controller.signal))) {
+        const backgroundRunning = await isChatTaskRunning(convId).catch(() => false);
+        if (backgroundRunning) {
+          reply.text = appendNotice(
+            reply.text,
+            tx(
+              "（连接已中断，生成仍在后台继续；完成后重新打开该对话即可看到结果）",
+              "(Connection lost; generation continues in the background — reopen this conversation to see the result)",
+              "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
+              "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
+            ),
+          );
+          watchBackgroundDone(convId);
+        } else {
+          const message = localizeToken(
+            uiLocale.value,
+            getApiErrorToken(err),
+            (err as Error)?.message || "GENERIC_UNKNOWN_ERROR",
+          );
+          reply.error = message;
+          state.error = message;
+        }
       }
     }
     reply.streaming = false;
@@ -2891,12 +2960,14 @@ function appendNotice(text: string, line: string): string {
 
 /**
  * 收口一次「没等到任何终态事件就结束」的轮次（服务端进程重启 / 连接被回收 / 代理切断都会这样）。
+ * 调用前提：**续传已经试过并失败**（`resumeRun` 返回 false）——所以这里只做如实收尾，不重试。
  * 与服务端同一原则：**不猜结果**，只问服务端这个对话的任务还在不在——
- * - 还在跑：如实说「后台继续」并守望完成（结果由服务端回投到该对话）；
- * - 不在跑：把还挂着的步骤与子代理标成中断，并给出可操作提示。
+ * - 还在跑（续传只是网络不通）：如实说「后台继续」并守望完成（结果由服务端回投到该对话）；
+ * - 不在跑（进程重启后注册表为空 / 收束后留档过期）：把还挂着的步骤与子代理标成中断，并给出可操作提示。
  * 半路挂起的确认卡一并清掉：票据大概率已随进程失效，留着只会让用户点一个注定失败的按钮。
  */
-async function settleInterruptedRun(convId: string, reply: Bubble): Promise<void> {
+async function settleInterruptedRun(run: TurnRun): Promise<void> {
+  const { convId, reply } = run;
   reply.streaming = false;
   thinkPhaseEnd(reply);
   for (const step of reply.steps || []) {
@@ -2936,6 +3007,66 @@ async function settleInterruptedRun(convId: string, reply: Bubble): Promise<void
   if (backgroundRunning) watchBackgroundDone(convId);
   openReasoning.delete(reply.id);
   queueScrollIfCurrent(convId);
+}
+
+/**
+ * 打开对话时若服务端仍有本对话的任务在跑：就地挂一个气泡跟随（游标 0 = 从头回放）。
+ * 场景是刷新 / 换标签页 / 换设备进来——之前的表现是「界面上什么都看不到，只能等结果回投」，
+ * 对齐最佳实践：重新挂上正在跑的流（客户端刷新后应接回当前 run，而不是从零等）。
+ * 已在发送或已有流式气泡时不重复挂；服务端没有可续的内容就撤掉这个只为跟随而生的气泡，
+ * 不留一条凭空的「已中断」记录给用户。
+ */
+async function attachRunningTask(convId: string): Promise<void> {
+  const state = states.get(convId);
+  if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
+  if (!(await isChatTaskRunning(convId).catch(() => false))) return;
+  // 二次确认：等待期间用户可能已经发了新消息，或别的路径已经接上了。
+  const fresh = states.get(convId);
+  if (!fresh || fresh.sending || fresh.bubbles.some((b) => b.streaming)) return;
+  const reply = reactive<Bubble>({
+    id: ++seq,
+    role: "assistant",
+    text: "",
+    streaming: true,
+    steps: [],
+    pending: null,
+    clarification: null,
+    subagents: [],
+  });
+  fresh.bubbles.push(reply);
+  openReasoning.add(reply.id);
+  const run: TurnRun = {
+    convId,
+    reply,
+    state: fresh,
+    chosenModel: resolveModel(fresh.settings.modelId),
+    sawTerminal: false,
+    lastSeq: 0,
+  };
+  const controller = new AbortController();
+  fresh.controller = controller;
+  fresh.sending = true;
+  try {
+    const attached = await resumeChatTaskEvents(convId, 0, (event) => applyChatEvent(run, event), controller.signal);
+    if (!attached) {
+      fresh.bubbles = fresh.bubbles.filter((b) => b.id !== reply.id);
+      openReasoning.delete(reply.id);
+      return;
+    }
+    // 挂上了却没跑到终态（连接又断）：与首连同一条路径——先退避续传，仍不行才如实收口。
+    if (!run.sawTerminal && !(await resumeRun(run, controller.signal))) await settleInterruptedRun(run);
+  } catch {
+    // 网络不通 / 用户按了停止：留下气泡并如实说明这一轮没能拿到终态（不假装还在跑）。
+    await settleInterruptedRun(run);
+  } finally {
+    fresh.sending = false;
+    fresh.controller = null;
+    reply.streaming = false;
+    thinkPhaseEnd(reply);
+    openReasoning.delete(reply.id);
+    await persist(convId, fresh.bubbles);
+    queueScrollIfCurrent(convId);
+  }
 }
 
 // ---- 待发队列（后端持久化；忙时入队，成功收束后自动出队）----

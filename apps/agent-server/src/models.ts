@@ -83,7 +83,8 @@ export interface CallOptions {
   /**
    * 关闭该次调用的「扩展思考」（OpenAI 兼容通道专用）。
    * 用于**内部辅助调用**（如数据需求分诊、受约束兜底话术）——它们只要一个词或一两句话，思考纯属浪费延迟。
-   * 实测（跑 `scripts/_model-thinking-probe.mjs` 可复现，TokenHub kimi 系端点）：只有 `thinking:{type:"disabled"}`
+   * 实测（探测脚本 `scripts/_model-thinking-probe.mjs` 已随调试脚本清理移除，口径回归见 `tests/thinking.test.ts`；
+   * TokenHub kimi 系端点）：只有 `thinking:{type:"disabled"}`
    * 被端点接受且思考归零（769ms vs 基线 1363ms），`enable_thinking` / `chat_template_kwargs` 会被忽略。
    * 默认不传该字段：不把可能被陌生网关拒绝的参数塞给所有调用；调用方按需显式开启，失败路径本身有兜底。
    */

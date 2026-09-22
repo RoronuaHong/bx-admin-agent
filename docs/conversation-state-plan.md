@@ -3,6 +3,7 @@
 > 版本：v2（2026-09-17，追加 §13 实施状态 / §14 前端半场实施细化；§11.2 决议已冻结）
 > 定位：**设计稿 + 实施追踪**。目标是把「对话（conversation）」升级为一等公民：每个对话独立并行，语言 / MCP / 模型 / 上下文各自独立；**所有状态的持久化一律落在后端，前端零持久化**。
 > 相关：`docs/agent-infrastructure.md` §6（记忆与上下文）/ §9（会话与数据持久化）、`docs/mcp-guide.md`（MCP 契约）。
+> **验证脚本现状（2026-09-22）**：本文提到的 `scripts/_thread-check.mjs` / `_mute-check.mjs` / `_bi-tools-check.mjs` 等验证脚本**均已随 2026-09 的调试脚本清理移除**；现行零依赖回归入口是 `pnpm test`（`apps/agent-server/tests/*.test.ts`），脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11。文中的实测结论保留作追溯，但**不要照抄其中的脚本命令**。
 
 ---
 
@@ -296,7 +297,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 | 期 | 内容 | 验收标准 |
 |---|---|---|
 | **P0（本文档）** | 设计评审 + 契约冻结 | 决策点已确认（§11.1）；§11.2 待讨论 |
-| **P1+P2 统一实施** | 服务端：`conversation.context` 读写 + 设置字段 + 对话级锁/409 + MCP 引用计数改造 + session 瘦身 + 迁移；前端：`states: Map<convId, ConvState>` + 去全局锁 + 设置后端化 + 三处 localStorage 移除与迁移 + 侧栏状态点 | ① 直连脚本：两个 `conversationId` 并行请求，上下文互不污染；同 `conversationId` 并发返回 409；② 浏览器：3 个对话同时流式且互不中断；切卡不掉线；改 A 的模型/MCP/语言，B 不受影响；③ 刷新后设置与上下文保持；④ `_bi-tools-check.mjs` / `tsc` / `vite build` 全绿 |
+| **P1+P2 统一实施** | 服务端：`conversation.context` 读写 + 设置字段 + 对话级锁/409 + MCP 引用计数改造 + session 瘦身 + 迁移；前端：`states: Map<convId, ConvState>` + 去全局锁 + 设置后端化 + 三处 localStorage 移除与迁移 + 侧栏状态点 | ① 直连脚本：两个 `conversationId` 并行请求，上下文互不污染；同 `conversationId` 并发返回 409；② 浏览器：3 个对话同时流式且互不中断；切卡不掉线；改 A 的模型/MCP/语言，B 不受影响；③ 刷新后设置与上下文保持；④ `tsc` / `vite build` 全绿（原 `_bi-tools-check.mjs` 已随 2026-09 调试脚本清理移除，现行回归入口见本文档头部口径） |
 | **P3 待讨论项落地** | 若采纳 §11.2 的 B/C：`pendingQueue` 持久化 + 队列 UI（Pending(N)/上移/下移/编辑/删除/立即发送）+ 出队策略 | 忙碌时发消息进队列不丢；turn 收束后按序自动发；「立即发送」= abort + 出队 |
 | **P4 收尾** | 文档同步（`mcp-guide.md` / `agent-infrastructure.md` 对照表）、回归清单、旧字段标注 deprecated | 文档与代码一致 |
 | **P5（可选）** | 断线续跑（后台任务化 + run 状态持久化）——✅ 已于 2026-09-17 随异步任务底座落地（`src/chat-tasks.ts` + `/chat/cancel`、`/chat/task/status`、`/chat/task/events`；断开后任务照跑、结果回投进对话消息快照） | 发起后立刻断网/关页面，重连可见完整结果 |
