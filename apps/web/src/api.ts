@@ -574,6 +574,8 @@ export type ScheduleNotifyOn = "success" | "failed";
 export interface ScheduleDto {
   id: string;
   conversationId: string;
+  /** 结果回投的对话是本任务专属（服务端创建，每个任务一个）；旧数据可能缺省。 */
+  ownConversation?: boolean;
   name?: string;
   prompt: string;
   /** 周期任务：5 段 cron（分 时 日 月 周）。与 onceAt 二选一。 */
@@ -596,7 +598,10 @@ export interface ScheduleDto {
 }
 
 export interface ScheduleInput {
-  conversationId: string;
+  /** 建任务时所在的对话（可选）：只用来沿用它的 Agent 角色；结果回投的对话由服务端另建。 */
+  conversationId?: string;
+  /** Agent 角色（/support 等非 generic 入口建任务时带上，专属对话按角色分槽）。 */
+  agentId?: string;
   prompt: string;
   name?: string;
   cron?: string;
@@ -613,12 +618,15 @@ export async function fetchSchedules(conversationId?: string): Promise<ScheduleD
   return data.schedules || [];
 }
 
-export async function createChatSchedule(payload: ScheduleInput): Promise<ScheduleDto> {
+/** 新建定时任务：服务端同时创建任务专属对话（结果只回到那里），一并返回给前端接进侧栏。 */
+export async function createChatSchedule(
+  payload: ScheduleInput,
+): Promise<{ schedule: ScheduleDto; conversation?: ConversationDto }> {
   const data = (await jsonFetch("/agent/chat/schedules", {
     method: "POST",
     body: JSON.stringify(payload),
-  })) as { schedule: ScheduleDto };
-  return data.schedule;
+  })) as { schedule: ScheduleDto; conversation?: ConversationDto };
+  return data;
 }
 
 export async function patchChatSchedule(

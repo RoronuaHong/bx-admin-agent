@@ -240,6 +240,92 @@ function pickNotifyOn(values?: ScheduleNotifyOn[]): ScheduleNotifyOn[] {
 }
 
 /**
+ * 定时任务的结果回投对话 = **每个任务独占一个**（不再绑到「建任务时正打开的那个对话」）。
+ *
+ * 为什么必须独占：周期任务的每一期结果都会落进它的对话，绑在用户自己的聊天上等于每期刷屏一次；
+ * 独占之后结果有一个稳定入口——任务卡片上的「打开对话」与 IM 推送里的 `?conv=` 都指向它。
+ */
+
+/** 任务专属对话的标题：任务名优先（侧栏里一眼认出），缺省退回任务内容的前 24 字。 */
+function scheduleConversationTitle(schedule: Pick<ChatSchedule, "name" | "prompt">): string {
+  const name = (schedule.name || "").trim();
+  if (name) return name.slice(0, 40);
+  return schedule.prompt.trim().replace(/\s+/g, " ").slice(0, 24) || "定时任务";
+}
+
+/** 建一个任务专属对话（id 生成口径与 POST /chat/conversations 一致）。 */
+async function createTaskConversation(input: {
+  ownerKey: string;
+  title: string;
+  /** 任务勾了哪些服务器就带哪些（空 = 跟随默认启用集，别写成空数组把工具能力清掉）。 */
+  mcpServers?: string[];
+  agentId?: string;
+}) {
+  return createConversation({
+    id: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    title: input.title,
+    ownerKey: input.ownerKey,
+    ...(input.agentId ? { agentId: input.agentId } : {}),
+    ...(input.mcpServers?.length ? { mcpServers: input.mcpServers } : {}),
+  });
+}
+
+/**
+ * 专属对话的 MCP 启用集：任务显式勾了就用任务的；没勾（= 运行时回落对话启用集）就继承来源对话的，
+ * 否则专属对话落到角色/全局默认（往往是空集），老任务的工具能力会被迁移悄悄砍掉。
+ */
+async function taskConversationMcpServers(schedule: ChatSchedule, sourceId?: string): Promise<string[] | undefined> {
+  if (schedule.mcpServers?.length) return schedule.mcpServers;
+  const source = sourceId ? await getConversation(sourceId) : null;
+  return source?.mcpServers;
+}
+
+/**
+ * 专属对话的存活保障：返回本次运行真正该写的对话 id。
+ * 对话被用户删掉后必须重建——否则到点运行会把结果 upsert 进一个「无主孤儿对话」（没有 owner、没有标题），
+ * 既不可见也不可整理。
+ */
+async function ensureTaskConversation(schedule: ChatSchedule): Promise<string> {
+  if (await conversationOwnedBy(schedule.conversationId, schedule.ownerKey)) return schedule.conversationId;
+  const mcp = await taskConversationMcpServers(schedule, schedule.conversationId);
+  const conv = await createTaskConversation({
+    ownerKey: schedule.ownerKey,
+    title: scheduleConversationTitle(schedule),
+    ...(mcp?.length ? { mcpServers: mcp } : {}),
+  });
+  await patchSchedule(schedule.id, schedule.ownerKey, { conversationId: conv.id, ownConversation: true });
+  console.warn(`[scheduler] ${schedule.id} 的专属对话不可用，已重建 ${conv.id}`);
+  return conv.id;
+}
+
+/**
+ * 启动维护（幂等）：把「建任务时绑在随手打开的那个对话上」的老任务迁到专属对话。
+ * 只改此后结果的去向，不动老对话里已有的内容（历史报告留在原处，可自行整理）。
+ */
+async function migrateTaskConversations(): Promise<number> {
+  const list = await listSchedules();
+  let moved = 0;
+  for (const schedule of list) {
+    if (schedule.ownConversation) continue;
+    try {
+      const source = await getConversation(schedule.conversationId);
+      const mcp = await taskConversationMcpServers(schedule, schedule.conversationId);
+      const conv = await createTaskConversation({
+        ownerKey: schedule.ownerKey,
+        title: scheduleConversationTitle(schedule),
+        ...(mcp?.length ? { mcpServers: mcp } : {}),
+        ...(source?.agentId ? { agentId: source.agentId } : {}),
+      });
+      await patchSchedule(schedule.id, schedule.ownerKey, { conversationId: conv.id, ownConversation: true });
+      moved += 1;
+    } catch (err) {
+      console.warn(`[scheduler] ${schedule.id} 迁移专属对话失败：${String((err as Error)?.message || err)}`);
+    }
+  }
+  return moved;
+}
+
+/**
  * 从任务事件缓冲里取出本轮产出的图表（render_chart 产物）。
  * 图由浏览器按 spec 现场绘制、产物只在事件流里，落库（刷新后不丢）与投递（IM 推送带数据）都从这里取。
  */
@@ -483,6 +569,7 @@ export function createApp() {
 
   app.post("/chat/schedules", async (c) => {
     const body = await readJson<{
+      /** 建任务时所在的对话（可选）：只用来沿用它的 Agent 角色，结果回投的对话由服务端另建。 */
       conversationId?: string;
       prompt?: string;
       cron?: string;
@@ -492,14 +579,12 @@ export function createApp() {
       notifyChannelIds?: string[];
       notifyOn?: ScheduleNotifyOn[];
       locale?: string;
+      /** Agent 角色（/support 这类非 generic 入口建任务时带上，专属对话按角色分槽）。 */
+      agentId?: string;
     }>(c);
-    const conversationId = String(body.conversationId || "").trim();
     const prompt = String(body.prompt || "").trim();
-    if (!conversationId || !prompt) {
-      return errorJson(c, 400, "SCHEDULE_INVALID", "conversationId / prompt 必填");
-    }
-    if (await conversationNotFoundFor(c, conversationId)) {
-      return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (!prompt) {
+      return errorJson(c, 400, "SCHEDULE_INVALID", "prompt 必填");
     }
     const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
     if (timingError) return errorJson(c, 400, "SCHEDULE_INVALID_TIME", timingError);
@@ -507,18 +592,42 @@ export function createApp() {
     if ((await countSchedulesOf(owner)) >= MAX_SCHEDULES_PER_OWNER) {
       return errorJson(c, 400, "SCHEDULE_LIMIT", `每个设备最多 ${MAX_SCHEDULES_PER_OWNER} 个定时任务`);
     }
-    const schedule = await createSchedule({
-      conversationId,
+    // 角色：显式传入优先，其次沿用来源对话的角色（旧客户端只带 conversationId 的兼容路径）。
+    const agentId = String(body.agentId || "").trim();
+    if (agentId && !hasRole(agentId)) {
+      return errorJson(c, 400, "AGENT_ROLE_UNKNOWN", `未知 Agent 角色：${agentId}`);
+    }
+    const sourceId = String(body.conversationId || "").trim();
+    const sourceAgentId =
+      agentId ||
+      (sourceId ? (await getConversation(sourceId))?.agentId : undefined) ||
+      undefined;
+    const taskMcp = knownMcpIds(body.mcpServers);
+    // 专属对话：先建对话再落任务；任务落库失败就把对话删掉，别在侧栏留一个空对话。
+    const conversation = await createTaskConversation({
       ownerKey: owner,
-      prompt,
-      ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : { cron: String(body.cron || "") }),
-      ...(body.name ? { name: body.name } : {}),
-      mcpServers: knownMcpIds(body.mcpServers),
-      notifyChannelIds: knownChannelIds(body.notifyChannelIds),
-      notifyOn: pickNotifyOn(body.notifyOn),
-      ...(body.locale ? { locale: String(body.locale) } : {}),
+      title: scheduleConversationTitle({ name: String(body.name || ""), prompt }),
+      mcpServers: taskMcp,
+      ...(sourceAgentId ? { agentId: sourceAgentId } : {}),
     });
-    return c.json({ schedule });
+    try {
+      const schedule = await createSchedule({
+        conversationId: conversation.id,
+        ownConversation: true,
+        ownerKey: owner,
+        prompt,
+        ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : { cron: String(body.cron || "") }),
+        ...(body.name ? { name: body.name } : {}),
+        mcpServers: taskMcp,
+        notifyChannelIds: knownChannelIds(body.notifyChannelIds),
+        notifyOn: pickNotifyOn(body.notifyOn),
+        ...(body.locale ? { locale: String(body.locale) } : {}),
+      });
+      return c.json({ schedule, conversation });
+    } catch (err) {
+      await deleteConversation(conversation.id).catch(() => undefined);
+      throw err;
+    }
   });
 
   app.patch("/chat/schedules/:id", async (c) => {
@@ -1212,8 +1321,11 @@ export function createApp() {
   // ---- 定时调度循环（§8）：到点即复用对话任务底座执行——
   // 定时运行没有 HTTP 订阅者 → 收束后自动「结果回投」进对话消息快照。
   startScheduleLoop(async (schedule) => {
-    if (isTaskRunning(schedule.conversationId)) return "skipped"; // 对话在跑：跳过本次，排队等待由 schedulerTick 负责
-    const task = startTask({ conversationId: schedule.conversationId, userText: schedule.prompt });
+    // 专属对话被删 → 就地重建（否则结果会 upsert 进一个无主孤儿对话）。
+    // 后续一律用这个 id：重建后本地 schedule 里的旧 id 已过期（投递链接也要跟着新对话走）。
+    const conversationId = await ensureTaskConversation(schedule);
+    if (isTaskRunning(conversationId)) return "skipped"; // 对话在跑：跳过本次，排队等待由 schedulerTick 负责
+    const task = startTask({ conversationId, userText: schedule.prompt });
     // 任务级工具清单：任务自己勾了就按任务的（独立启用集），任务没勾才回落到对话启用集
     // （见 chat.ts 的 taskServers 分支）——别按「只收窄」理解。
     // 轮次预算也放宽：没人盯着，被轮次截断就等于这一期报告没有结论。
@@ -1229,7 +1341,7 @@ export function createApp() {
     const text = finalTextOf(task).trim();
     // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
     const charts = chartsOfTask(task);
-    const status = getLastTaskSummary(schedule.conversationId)?.status;
+    const status = getLastTaskSummary(conversationId)?.status;
     const finished = status === "success" || status === "cancelled" ? status : "failed";
     // 跑完了却一句收尾文本都没有 = 这一期没产出结论（实测多为轮次预算耗尽）：
     // 记 success 会推一条「成功 ·（本次未产出内容）」的空报告，看着像一切正常，必须如实记 failed。
@@ -1239,12 +1351,20 @@ export function createApp() {
     }
     // 结果投递（钉钉 / 飞书机器人）：旁路，fire-and-forget，不拖住调度 tick、不影响任务状态。
     if (final === "success" || final === "failed") {
-      void deliverScheduleResult(schedule, final, text, charts).catch((err) =>
+      // 重建过专属对话时 schedule.conversationId 是旧值，投递链接必须用解析后的 id。
+      void deliverScheduleResult({ ...schedule, conversationId }, final, text, charts).catch((err) =>
         console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
       );
     }
     return final;
   });
+
+  // 启动维护：老任务（绑在随手打开的那个对话上）一次性迁到专属对话；幂等，只改此后结果的去向。
+  void migrateTaskConversations()
+    .then((moved) => {
+      if (moved) console.log(`[scheduler] ${moved} 个定时任务已迁移到专属对话`);
+    })
+    .catch((err) => console.warn(`[scheduler] 专属对话迁移失败：${String((err as Error)?.message || err)}`));
 
   return app;
 }

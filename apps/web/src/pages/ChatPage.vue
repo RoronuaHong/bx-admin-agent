@@ -271,7 +271,7 @@ async function toggleChannelEnabled(ch: NotifyChannelDto) {
   notifyBusy.value = true;
   try {
     const nextEnabled = !ch.enabled;
-    const saved = await saveNotifyChannel({ id: ch.id, enabled: nextEnabled });
+    const saved = await saveNotifyChannel({ id: ch.id, kind: ch.kind, enabled: nextEnabled });
     const idx = notifyChannels.value.findIndex((c) => c.id === ch.id);
     if (idx >= 0) notifyChannels.value[idx] = saved;
     // 关闭后从当前任务的勾选里摘掉，避免「停用却仍显示已开启」。
@@ -764,10 +764,6 @@ async function submitTask() {
   const prompt = taskDraft.prompt.trim();
   if (!name) return (taskError.value = tx("请填写任务名称", "Name is required", "Informe o nome da tarefa", "कृपया कार्य का नाम दर्ज करें"));
   if (!prompt) return (taskError.value = tx("请填写任务内容", "Task prompt is required", "Informe o conteúdo da tarefa", "कृपया कार्य का विवरण दर्ज करें"));
-  // 任务必须绑定一个对话：到点执行的结果回投到这里（也是它拿到上下文与工具授权的地方）。
-  const conversationId = currentId.value;
-  if (!editingTaskId.value && !conversationId)
-    return (taskError.value = tx("请先打开一个对话：任务结果会回到该对话", "Open a chat first — results are delivered there", "Abra uma conversa primeiro — os resultados vão para lá", "पहले कोई चैट खोलें — परिणाम वहीं भेजे जाएँगे"));
   const base = {
     name,
     prompt,
@@ -800,8 +796,21 @@ async function submitTask() {
       const updated = await patchChatSchedule(editingTaskId.value, { ...base, ...timing });
       tasks.value = tasks.value.map((x) => (x.id === updated.id ? updated : x));
     } else {
-      const created = await createChatSchedule({ ...base, conversationId, locale: uiLocale.value, ...timing });
-      tasks.value = [created, ...tasks.value];
+      // 结果回投的对话由服务端创建（每个任务独占一个，不再灌进当前打开的对话）；
+      // 这里只带来源对话/角色，专属对话按角色分槽。返回的对话接进侧栏列表，用户能直接找到它。
+      const created = await createChatSchedule({
+        ...base,
+        ...(currentId.value ? { conversationId: currentId.value } : {}),
+        ...(AGENT_ID !== "generic" ? { agentId: AGENT_ID } : {}),
+        locale: uiLocale.value,
+        ...timing,
+      });
+      tasks.value = [created.schedule, ...tasks.value];
+      if (created.conversation) {
+        const conv = created.conversation;
+        conversations.value = [conv, ...conversations.value.filter((c) => c.id !== conv.id)];
+        resortConversations();
+      }
     }
     closeTaskForm();
   } catch (err) {
@@ -885,6 +894,33 @@ function taskKindText(t: ScheduleDto): string {
 /** 任务绑定的对话标题（结果回投到这里）；对话已被删则如实回显 id，不假装还在。 */
 function taskConvText(t: ScheduleDto): string {
   return conversations.value.find((c) => c.id === t.conversationId)?.title || t.conversationId;
+}
+
+/** 正在编辑的任务（弹窗里展示「结果回到哪个对话」用）。 */
+const editingTask = computed(() => tasks.value.find((t) => t.id === editingTaskId.value) || null);
+
+/**
+ * 打开任务的专属对话：每期结果都落在那里。
+ * 本地列表没有它（换设备 / 刚被重建）就先刷新一次列表再选；实在没有则提示等下次运行时自动重建。
+ */
+async function openTaskConversation(t: ScheduleDto) {
+  let conv = conversations.value.find((c) => c.id === t.conversationId);
+  if (!conv) {
+    const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
+    if (list) {
+      conversations.value = list;
+      resortConversations();
+      conv = list.find((c) => c.id === t.conversationId);
+    }
+  }
+  if (!conv) {
+    showSettingsError(
+      tx("该任务的对话已不存在，下次到点运行时会自动重建", "This task's chat is gone — it will be recreated on the next run", "A conversa desta tarefa não existe — será recriada na próxima execução", "इस कार्य की चैट मौजूद नहीं है — अगली रन पर फिर बनेगी"),
+    );
+    return;
+  }
+  view.value = "chat";
+  selectConversation(conv);
 }
 
 /** 气泡里的一个工具步骤（MCP 工具调用）。 */
@@ -3944,6 +3980,19 @@ onBeforeUnmount(() => {
               <span v-if="t.lastStatus" class="task-status" :class="t.lastStatus" :title="taskRunText(t)">{{ taskStatusText(t) }}</span>
               <span class="task-next" :title="taskNextRunText(t)">{{ taskNextShort(t) }}</span>
               <div class="task-card__ops" @click.stop>
+                <!-- 结果都落在任务的专属对话里：这里直达，不用去对话列表里翻。 -->
+                <button
+                  class="task-open"
+                  type="button"
+                  :title="tx('打开对话（结果都在这里）', 'Open chat (all results land here)', 'Abrir conversa (resultados ficam aqui)', 'चैट खोलें (परिणाम यहीं हैं)')"
+                  :aria-label="tx('打开对话', 'Open chat', 'Abrir conversa', 'चैट खोलें')"
+                  @click="openTaskConversation(t)"
+                >
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M7 17 17 7" />
+                    <path d="M9 7h8v8" />
+                  </svg>
+                </button>
                 <button
                   class="task-toggle"
                   type="button"
@@ -4215,6 +4264,31 @@ onBeforeUnmount(() => {
               <span class="task-section__label">{{
                 tx("到点运行时", "At run time", "Na execução", "रन के समय")
               }}</span>
+              <!-- 结果去向：每个任务独占一个对话（服务端创建），每期结果只回到那里，不再刷进别的对话。 -->
+              <div class="field">
+                <span class="field__label">{{ tx("结果回到", "Results go to", "Resultado em", "परिणाम यहाँ") }}</span>
+                <div class="task-conv">
+                  <span class="task-conv__name">{{
+                    editingTask
+                      ? taskConvText(editingTask)
+                      : tx("保存后自动创建独立对话", "A dedicated chat is created on save", "Uma conversa dedicada é criada ao salvar", "सहेजने पर एक समर्पित चैट बनेगी")
+                  }}</span>
+                  <button
+                    v-if="editingTask"
+                    class="notify-btn"
+                    type="button"
+                    @click="openTaskConversation(editingTask)"
+                  >{{ tx("打开", "Open", "Abrir", "खोलें") }}</button>
+                </div>
+                <p class="repeat-preview">{{
+                  tx(
+                    "该对话为本任务专属：每期结果只写进这里，不会出现在其它对话里。",
+                    "This chat belongs to this task only: each run's result is written here and nowhere else.",
+                    "Esta conversa é exclusiva desta tarefa: cada resultado é escrito aqui e em nenhum outro lugar.",
+                    "यह चैट केवल इस कार्य की है: हर रन का परिणाम यहीं लिखा जाएगा।",
+                  )
+                }}</p>
+              </div>
               <!-- 结果通知：勾了通道，到点跑完推送到钉钉/飞书机器人；不勾只回投对话。 -->
               <div class="field">
                 <span class="field__label">{{ tx("执行结果通知", "Notify results", "Notificar resultados", "परिणाम सूचित करें") }}</span>
@@ -6038,6 +6112,35 @@ onBeforeUnmount(() => {
     background 0.15s ease;
 }
 
+/* 「打开对话」：与删除按钮同规格的中性入口（结果都落在任务的专属对话里）。 */
+.task-open {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.5;
+  transition:
+    opacity 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.task-open:hover,
+.task-open:focus-visible {
+  opacity: 1;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  outline: none;
+  box-shadow: var(--ring);
+}
+
 .task-del:hover,
 .task-del:focus-visible {
   opacity: 1;
@@ -6055,6 +6158,24 @@ onBeforeUnmount(() => {
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: 11px;
+}
+
+/* 「结果回到」行：对话名 + 打开按钮（专属对话是结果的唯一去向）。 */
+.task-conv {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-conv__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--ink);
 }
 
 /* 弹窗：新建定时任务 */

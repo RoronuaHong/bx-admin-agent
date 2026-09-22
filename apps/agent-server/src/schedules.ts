@@ -15,7 +15,14 @@ export type ScheduleNotifyOn = "success" | "failed";
 
 export interface ChatSchedule {
   id: string;
+  /**
+   * 结果回投的对话：默认是**任务专属**的那种（`ownConversation`）。
+   * 历史形态是「绑到建任务时正打开的那个对话」，于是每期结果都灌进用户自己的聊天里（周期任务 = 反复刷屏），
+   * 现已改为专属对话；老数据由启动维护一次性迁移（见 app.ts 的 migrateTaskConversations）。
+   */
   conversationId: string;
+  /** 该对话由本任务创建、结果只回到这里。缺省 = 老数据（待迁移）。 */
+  ownConversation?: boolean;
   ownerKey: string;
   /** 任务名（列表展示与消息标题；缺省回落到 prompt 截断）。 */
   name?: string;
@@ -131,6 +138,8 @@ function cleanName(name?: unknown): string | undefined {
 
 export async function createSchedule(input: {
   conversationId: string;
+  /** 该对话是本任务专属（由调用方创建）；缺省按「调用方自己的对话」处理。 */
+  ownConversation?: boolean;
   ownerKey: string;
   prompt: string;
   cron?: string;
@@ -146,6 +155,7 @@ export async function createSchedule(input: {
   const schedule: ChatSchedule = {
     id: `sched_${randomUUID().slice(0, 12)}`,
     conversationId: input.conversationId,
+    ...(input.ownConversation ? { ownConversation: true } : {}),
     ownerKey: input.ownerKey,
     ...(name ? { name } : {}),
     prompt: input.prompt.slice(0, MAX_PROMPT_LEN),
@@ -194,6 +204,10 @@ export interface SchedulePatch {
   mcpServers?: string[];
   notifyChannelIds?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  /** 重新绑定结果回投对话（迁移到专属对话 / 专属对话被删后重建时用）。 */
+  conversationId?: string;
+  /** 标记该对话为任务专属。 */
+  ownConversation?: boolean;
   /** 本次投递结果（调度器回写用；前端不可改）。 */
   lastDelivery?: ChatSchedule["lastDelivery"];
   /** 显式覆盖下次触发时刻（运维 / 测试用）。 */
@@ -221,6 +235,8 @@ export async function patchSchedule(
     ...(patch.mcpServers !== undefined ? { mcpServers: [...new Set(patch.mcpServers)] } : {}),
     ...(patch.notifyChannelIds !== undefined ? { notifyChannelIds: [...new Set(patch.notifyChannelIds)] } : {}),
     ...(patch.notifyOn !== undefined ? { notifyOn: [...new Set(patch.notifyOn)] } : {}),
+    ...(patch.conversationId ? { conversationId: patch.conversationId } : {}),
+    ...(patch.ownConversation !== undefined ? { ownConversation: patch.ownConversation } : {}),
     ...(patch.lastDelivery !== undefined ? { lastDelivery: patch.lastDelivery } : {}),
     ...(patch.nextRunAt !== undefined ? { nextRunAt: patch.nextRunAt } : {}),
   };
