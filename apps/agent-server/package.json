@@ -12,6 +12,7 @@
     "@bx/shared": "workspace:*",
     "@hono/node-server": "^1.19.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@zereight/mcp-gitlab": "^2.1.64",
     "croner": "^10.0.1",
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",

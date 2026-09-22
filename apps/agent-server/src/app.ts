@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ApiErrorPayload, LocalizedToken, TodoItem } from "@bx/shared";
+import type { ApiErrorPayload, ChartSpec, LocalizedToken, TodoItem } from "@bx/shared";
 import { cors } from "hono/cors";
 import { getCookie, setCookie } from "hono/cookie";
 import { config, listModels } from "./config.js";
@@ -68,8 +68,21 @@ import {
   MAX_SCHEDULES_PER_OWNER,
   patchSchedule,
   startScheduleLoop,
-  validateCron,
+  validateTiming,
+  type ChatSchedule,
+  type ScheduleNotifyOn,
 } from "./schedules.js";
+import {
+  deleteChannel,
+  getChannel,
+  loadChannels,
+  toPublic as toPublicChannel,
+  upsertChannel,
+  validateChannelInput,
+  type NotifyChannel,
+  type NotifyChannelInput,
+} from "./notify/channels.js";
+import { buildScheduleDelivery, deliverToChannels } from "./notify/deliver.js";
 import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 
 const COOKIE = SESSION_COOKIE;
@@ -93,6 +106,23 @@ const MAX_INPUT_LEN = Math.max(1, Number(process.env.CHAT_MAX_INPUT_LEN || 8000)
 // 入口限流（0 = 关闭）：每 owner 每分钟发起对话次数 + 每 owner 并发运行中的对话任务数。
 const RATE_STREAM_PER_MIN = Math.max(0, Number(process.env.RATE_LIMIT_STREAM_PER_MIN ?? 20));
 const RATE_CONCURRENT_PER_OWNER = Math.max(0, Number(process.env.RATE_LIMIT_CONCURRENT_PER_OWNER ?? 3));
+/**
+ * 定时任务（无人值守）的工具轮次预算，默认比交互式宽一倍：
+ * 监测类任务要「翻 schema → 找表 → 反复取数 → 出图 → 写结论」，14 轮常常在出结论前就被截断，
+ * 结果是一轮跑完却没有收尾文本。交互式有人盯着可以追问，无人值守只能靠预算给够。
+ */
+const SCHEDULE_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.MCP_SCHEDULE_MAX_TOOL_ROUNDS || 28));
+/**
+ * 无人值守任务的执行指引（通用流程语，不含任何业务词）。
+ * 两个坑都来自「同一个对话被反复跑」这个形态：
+ *   ① 上下文里有上一期的完整结论时，模型会直接复用旧数字、连数据源都不再查（监测任务等于没监测）；
+ *   ② 结论全靠图表承载时，IM 推送渲染不了图，推过去只剩一句「以上为完整监测结果」。
+ * 走系统提示的动态后缀注入（不进用户可见历史，也不污染稳定前缀/不影响 prompt cache）。
+ */
+const SCHEDULE_TASK_GUIDE =
+  "本次是定时任务的新一期运行，请遵守两条：\n" +
+  "1) 必须从数据源重新取数，不得沿用本对话历史轮次的结论、数字或图表数据；\n" +
+  "2) 结论要能独立阅读：正文里给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。";
 
 /** 从任务事件缓冲提取 run 级统计（usage / model / error 事件），落 run 级 trace。
  * model：buffer 有 model 事件时优先用它；该事件在**起始**发射，长 run 会被 chat-tasks.ts 的
@@ -127,7 +157,23 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
  */
 async function consumeTask(
   task: ChatTask,
-  opts: { model?: string; images?: string[]; attachments?: string[]; sessionId?: string; ownerKey?: string },
+  opts: {
+    model?: string;
+    images?: string[];
+    attachments?: string[];
+    sessionId?: string;
+    ownerKey?: string;
+    /** 任务级外部工具允许清单（与对话启用集取交集，只收窄）——保留给需要收窄语义的调用方。 */
+    mcpAllowlist?: string[];
+    /** 任务级独立启用集：任务勾了哪些就注入哪些，不与对话勾选取交集（定时任务用）。 */
+    mcpServers?: string[];
+    /** 本次运行的工具轮次预算；不填走交互式默认（无人值守的定时任务给更宽的预算）。 */
+    maxRounds?: number;
+    /** 无人值守运行：最后一轮摘掉工具，强制模型收尾写结论（不定时任务不传）。 */
+    forceWrapUp?: boolean;
+    /** 任务级附加指引：拼进系统提示动态段，不进用户可见历史（无人值守任务用）。 */
+    taskGuide?: string;
+  },
 ): Promise<void> {
   const runId = newRunId();
   let status: RunStatus = "failed";
@@ -173,6 +219,45 @@ async function consumeTask(
   if (summary) summary.outcomePersisted = outcomePersisted;
 }
 
+/**
+ * 定时任务入参里的 id 集合一律**按当前配置过滤**：
+ * 悬空引用（服务器/通道已被删）写进任务只会让到点运行静默少能力/少推送，排查时毫无线索。
+ * 只过滤、不报错——响应里回传落库后的任务，调用方一眼能看出哪些没生效。
+ */
+function knownMcpIds(ids?: string[]): string[] {
+  const known = new Set(loadServers().map((server) => server.id));
+  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
+}
+
+function knownChannelIds(ids?: string[]): string[] {
+  const known = new Set(loadChannels().map((channel) => channel.id));
+  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
+}
+
+/** 投递触发条件：只认这两个状态，其余（跳过/取消）一律不推。 */
+function pickNotifyOn(values?: ScheduleNotifyOn[]): ScheduleNotifyOn[] {
+  return [...new Set((values || []).filter((v): v is ScheduleNotifyOn => v === "success" || v === "failed"))];
+}
+
+/**
+ * 从任务事件缓冲里取出本轮产出的图表（render_chart 产物）。
+ * 图由浏览器按 spec 现场绘制、产物只在事件流里，落库（刷新后不丢）与投递（IM 推送带数据）都从这里取。
+ */
+function chartsOfTask(task: ChatTask): ChartSpec[] {
+  const charts: ChartSpec[] = [];
+  for (const event of task.buffer) {
+    if (event.type !== "chart") continue;
+    charts.push({
+      title: event.title,
+      chartType: event.chartType,
+      data: event.data,
+      encode: event.encode,
+      options: event.options,
+    });
+  }
+  return charts;
+}
+
 /** 把任务收束结果写进对话 UI 消息快照（upsertMessages 是全量替换，需先读后并）。 */
 async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   let finalText = finalTextOf(task).trim();
@@ -194,6 +279,9 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   // 思考过程 / 任务规划必须从事件缓冲里拼回，否则刷新后推理面板内容丢失。
   let thinking = "";
   let todos: TodoItem[] | undefined;
+  // 图表（render_chart 产出）：图是浏览器按 spec 现场画的，产物只在事件流里。
+  // 无人值守（没有订阅者）时必须由服务端代为落库，否则刷新/重进对话后整块图消失（与 thinking/steps 同理）。
+  const charts = chartsOfTask(task);
   for (const event of task.buffer) {
     if (event.type === "thinking_delta") thinking += event.text;
     else if (event.type === "todos") todos = event.todos;
@@ -210,10 +298,56 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
       ...(thinking ? { thinking } : {}),
       ...(todos?.length ? { todos } : {}),
       ...(steps.length ? { steps } : {}),
+      ...(charts.length ? { charts } : {}),
     },
   ];
   await upsertMessages({ id: task.conversationId, messages });
   return true;
+}
+
+/**
+ * 定时任务结果投递（钉钉 / 飞书机器人）。
+ * 旁路职责：任何失败只落 lastDelivery + 日志，**不改任务状态、不阻塞调度 tick**——
+ * 推送失败与任务本身跑成没跑成是两件事，混在一起会让状态失去诊断价值。
+ */
+async function deliverScheduleResult(
+  schedule: ChatSchedule,
+  status: "success" | "failed",
+  text: string,
+  charts: ChartSpec[] = [],
+): Promise<void> {
+  const ids = schedule.notifyChannelIds || [];
+  // 每个任务勾选自己的通知通道；空 = 该任务不推送。通道「启用」开关是全局总闸，
+  // 即便任务勾了，通道被停用也不投递。
+  if (!ids.length) return;
+  const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
+  if (!notifyOn.includes(status)) return;
+  const channels = ids
+    .map((id) => getChannel(id))
+    .filter((channel): channel is NotifyChannel => channel != null && channel.enabled !== false);
+  if (!channels.length) {
+    console.warn(`[scheduler] ${schedule.id} 的通知通道都已不存在/被停用，跳过投递`);
+    return;
+  }
+  const summary = await deliverToChannels(
+    channels,
+    buildScheduleDelivery({
+      ...(schedule.name ? { name: schedule.name } : {}),
+      prompt: schedule.prompt,
+      status,
+      text,
+      conversationId: schedule.conversationId,
+      webOrigin: config.webOrigin,
+      ownerKey: schedule.ownerKey,
+      ...(charts.length ? { charts } : {}),
+      ...(schedule.locale ? { locale: schedule.locale } : {}),
+    }),
+  );
+  if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
+  else console.log(`[scheduler] ${schedule.id} 结果已投递 ${summary.sent} 个通道`);
+  await patchSchedule(schedule.id, schedule.ownerKey, {
+    lastDelivery: { at: summary.at, ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) },
+  });
 }
 
 function token(code: string, defaultMessage?: string): LocalizedToken {
@@ -348,33 +482,70 @@ export function createApp() {
   });
 
   app.post("/chat/schedules", async (c) => {
-    const body = await readJson<{ conversationId?: string; prompt?: string; cron?: string }>(c);
+    const body = await readJson<{
+      conversationId?: string;
+      prompt?: string;
+      cron?: string;
+      onceAt?: number;
+      name?: string;
+      mcpServers?: string[];
+      notifyChannelIds?: string[];
+      notifyOn?: ScheduleNotifyOn[];
+      locale?: string;
+    }>(c);
     const conversationId = String(body.conversationId || "").trim();
     const prompt = String(body.prompt || "").trim();
-    const cron = String(body.cron || "").trim();
-    if (!conversationId || !prompt || !cron) {
-      return errorJson(c, 400, "SCHEDULE_INVALID", "conversationId / prompt / cron 必填");
+    if (!conversationId || !prompt) {
+      return errorJson(c, 400, "SCHEDULE_INVALID", "conversationId / prompt 必填");
     }
     if (await conversationNotFoundFor(c, conversationId)) {
       return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     }
-    const cronError = validateCron(cron);
-    if (cronError) return errorJson(c, 400, "SCHEDULE_INVALID_CRON", cronError);
+    const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
+    if (timingError) return errorJson(c, 400, "SCHEDULE_INVALID_TIME", timingError);
     const owner = c.get("owner");
     if ((await countSchedulesOf(owner)) >= MAX_SCHEDULES_PER_OWNER) {
       return errorJson(c, 400, "SCHEDULE_LIMIT", `每个设备最多 ${MAX_SCHEDULES_PER_OWNER} 个定时任务`);
     }
-    const schedule = await createSchedule({ conversationId, ownerKey: owner, prompt, cron });
+    const schedule = await createSchedule({
+      conversationId,
+      ownerKey: owner,
+      prompt,
+      ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : { cron: String(body.cron || "") }),
+      ...(body.name ? { name: body.name } : {}),
+      mcpServers: knownMcpIds(body.mcpServers),
+      notifyChannelIds: knownChannelIds(body.notifyChannelIds),
+      notifyOn: pickNotifyOn(body.notifyOn),
+      ...(body.locale ? { locale: String(body.locale) } : {}),
+    });
     return c.json({ schedule });
   });
 
   app.patch("/chat/schedules/:id", async (c) => {
-    const body = await readJson<{ prompt?: string; cron?: string; enabled?: boolean }>(c);
-    if (body.cron !== undefined) {
-      const cronError = validateCron(String(body.cron));
-      if (cronError) return errorJson(c, 400, "SCHEDULE_INVALID_CRON", cronError);
+    const body = await readJson<{
+      name?: string;
+      prompt?: string;
+      cron?: string;
+      onceAt?: number;
+      enabled?: boolean;
+      mcpServers?: string[];
+      notifyChannelIds?: string[];
+      notifyOn?: ScheduleNotifyOn[];
+    }>(c);
+    if (body.cron !== undefined || body.onceAt !== undefined) {
+      const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
+      if (timingError) return errorJson(c, 400, "SCHEDULE_INVALID_TIME", timingError);
     }
-    const updated = await patchSchedule(c.req.param("id"), c.get("owner"), body);
+    const updated = await patchSchedule(c.req.param("id"), c.get("owner"), {
+      ...(body.name !== undefined ? { name: body.name } : {}),
+      ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
+      ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : {}),
+      ...(body.onceAt === undefined && body.cron !== undefined ? { cron: String(body.cron) } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+      ...(body.mcpServers !== undefined ? { mcpServers: knownMcpIds(body.mcpServers) } : {}),
+      ...(body.notifyChannelIds !== undefined ? { notifyChannelIds: knownChannelIds(body.notifyChannelIds) } : {}),
+      ...(body.notifyOn !== undefined ? { notifyOn: pickNotifyOn(body.notifyOn) } : {}),
+    });
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
     return c.json({ schedule: updated });
   });
@@ -383,6 +554,35 @@ export function createApp() {
     const ok = await deleteSchedule(c.req.param("id"), c.get("owner"));
     if (!ok) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
     return c.json({ ok: true });
+  });
+
+  // ---- 结果投递通道（钉钉 / 飞书自定义机器人）----
+  // 与 MCP 服务器同一形态：全局一份注册表，任务只存「用哪些通道」；凭据（webhook/密钥）只写不回显。
+  app.get("/notify/channels", (c) => c.json({ channels: loadChannels().map(toPublicChannel) }));
+
+  app.post("/notify/channels", async (c) => {
+    const body = await readJson<NotifyChannelInput>(c);
+    const invalid = validateChannelInput(body);
+    if (invalid) return errorJson(c, 400, "NOTIFY_CHANNEL_INVALID", invalid);
+    return c.json({ channel: toPublicChannel(upsertChannel(body)) });
+  });
+
+  app.delete("/notify/channels/:id", (c) => {
+    const id = c.req.param("id");
+    if (!deleteChannel(id)) return errorJson(c, 404, "NOTIFY_CHANNEL_NOT_FOUND", "通道不存在");
+    return c.json({ ok: true });
+  });
+
+  // 测试发送：配完通道先自己发一条，别等任务到点才发现 webhook / 关键词配错。
+  // 平台拒收（关键词不匹配、签名错）在这里是**业务结果而非 HTTP 错误** → 200 + ok:false + 原因。
+  app.post("/notify/channels/:id/test", async (c) => {
+    const channel = getChannel(c.req.param("id"));
+    if (!channel) return errorJson(c, 404, "NOTIFY_CHANNEL_NOT_FOUND", "通道不存在");
+    const summary = await deliverToChannels([channel], {
+      title: `bx-agent · ${channel.label}`,
+      body: "**通道连通性测试**：收到这条消息说明 webhook（含加签 / 关键词）配置正确。\nConnectivity test: if you can read this, the webhook works.",
+    });
+    return c.json({ ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) });
   });
 
   // ---- MCP 服务器管理（全局配置；凭据只写不回显）----
@@ -1012,11 +1212,38 @@ export function createApp() {
   // ---- 定时调度循环（§8）：到点即复用对话任务底座执行——
   // 定时运行没有 HTTP 订阅者 → 收束后自动「结果回投」进对话消息快照。
   startScheduleLoop(async (schedule) => {
-    if (isTaskRunning(schedule.conversationId)) return "skipped"; // 对话在跑：跳过本次，不排队
+    if (isTaskRunning(schedule.conversationId)) return "skipped"; // 对话在跑：跳过本次，排队等待由 schedulerTick 负责
     const task = startTask({ conversationId: schedule.conversationId, userText: schedule.prompt });
-    await consumeTask(task, { ownerKey: schedule.ownerKey });
+    // 任务级工具清单：任务自己勾了就按任务的（独立启用集），任务没勾才回落到对话启用集
+    // （见 chat.ts 的 taskServers 分支）——别按「只收窄」理解。
+    // 轮次预算也放宽：没人盯着，被轮次截断就等于这一期报告没有结论。
+    // forceWrapUp 兜底：预算用到最后一轮时摘掉工具，强制它用已取到的数据收尾（不然只会留下一串过程叙述）。
+    // taskGuide：每期必须重新取数 + 正文要有可独立阅读的结论（上下文里躺着上期结论时尤其关键）。
+    await consumeTask(task, {
+      ownerKey: schedule.ownerKey,
+      mcpServers: schedule.mcpServers,
+      maxRounds: SCHEDULE_MAX_TOOL_ROUNDS,
+      forceWrapUp: true,
+      taskGuide: SCHEDULE_TASK_GUIDE,
+    });
+    const text = finalTextOf(task).trim();
+    // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
+    const charts = chartsOfTask(task);
     const status = getLastTaskSummary(schedule.conversationId)?.status;
-    return status === "success" || status === "cancelled" ? status : "failed";
+    const finished = status === "success" || status === "cancelled" ? status : "failed";
+    // 跑完了却一句收尾文本都没有 = 这一期没产出结论（实测多为轮次预算耗尽）：
+    // 记 success 会推一条「成功 ·（本次未产出内容）」的空报告，看着像一切正常，必须如实记 failed。
+    const final = finished === "success" && !text ? "failed" : finished;
+    if (finished === "success" && !text) {
+      console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽），按 failed 记账`);
+    }
+    // 结果投递（钉钉 / 飞书机器人）：旁路，fire-and-forget，不拖住调度 tick、不影响任务状态。
+    if (final === "success" || final === "failed") {
+      void deliverScheduleResult(schedule, final, text, charts).catch((err) =>
+        console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
+      );
+    }
+    return final;
   });
 
   return app;

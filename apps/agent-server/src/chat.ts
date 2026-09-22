@@ -294,6 +294,16 @@ const PSEUDO_CALL_HINT =
   "请通过函数调用（tool_calls）发起工具调用；不要在回复正文里书写调用语句（JSON / XML / 方括号等）。";
 
 /**
+ * 无人值守运行走到最后一轮的收尾提示（与工具一并摘掉）。
+ * 只摘工具不够：这类模型会把「想调工具」写成一句过程叙述就停下，仍然没有结论。
+ * 故显式要求「基于已有数据给结论」，并允许它如实说「数据不足」——两种都是结论，编造不是。
+ */
+const WRAP_UP_HINT =
+  "本轮已达到工具调用轮次上限，工具不可再用。\n" +
+  "请仅基于已经获得的数据，直接给出结论性回答；不要再描述你打算查什么。\n" +
+  "若已有数据不足以支撑结论，就如实说明已经查到什么、还缺哪一项，禁止编造数据。";
+
+/**
  * 运行时答案校验（协议级）：识别「把工具调用写成正文文本」的伪调用。
  * 判据是「调用形态 + 已知工具名」双重命中，不涉及任何业务词：
  * XML 标签、行首方括号、或 JSON 中 name 字段命中真实工具名。
@@ -835,6 +845,9 @@ interface LoopContext {
   /** 发起请求的设备 owner：用于按用户隔离的本地状态（如观影画像），不暴露给模型。 */
   ownerKey?: string;
   maxRounds: number;
+  /** 无人值守运行（定时任务）：最后一轮不再给工具，强制模型用已经取到的数据收尾写结论。
+   *  不填 = 交互式行为不变（没人在等，模型可以一路调工具到预算耗尽）。 */
+  forceWrapUp?: boolean;
   /** 知识库命名空间（按角色隔离）：默认 "generic"，由当前会话角色决定。 */
   namespace: string;
   /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）；仅 "尚无工具结果" 的首轮生效。
@@ -957,7 +970,24 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
     // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
     while (true) {
-      const gen = streamCall(ctx.model, conversation, ctx.images, specs, ctx.signal, ctx.system, ctx.forceToolCall);
+      // 无人值守的最后一轮：把工具摘掉，强制模型用已取到的数据写结论。
+      // 否则它可以一路调工具到预算耗尽——这一期报告就只剩过程叙述、没有任何结论。
+      const wrapUp = ctx.forceWrapUp === true && ctx.maxRounds > 1 && round === ctx.maxRounds - 1;
+      if (wrapUp && round > 0) {
+        console.log("[chat:wrap-up] 无人值守的最后一轮：不收工具，强制收尾出结论");
+        // 只摘工具不够：模型会把「想调工具」写成一句过程叙述就停下。显式要求收尾（同 PSEUDO_CALL_HINT 的回灌方式）。
+        conversation.push({ role: "user", content: WRAP_UP_HINT });
+      }
+      // 强制工具通道在「没有工具」时无意义（部分网关会直接 400），收尾轮必须一起关掉。
+      const gen = streamCall(
+        ctx.model,
+        conversation,
+        ctx.images,
+        wrapUp ? [] : specs,
+        ctx.signal,
+        ctx.system,
+        wrapUp ? false : ctx.forceToolCall,
+      );
       let step = await gen.next();
       while (!step.done) {
         const ev = step.value as ChatEvent;
@@ -1843,7 +1873,30 @@ async function* runSubagentBatch(
 export async function* chatStream(
   conversationId: string,
   userText: string,
-  opts: { model?: string; images?: string[]; attachments?: string[]; sessionId?: string; ownerKey?: string } = {},
+  opts: {
+    model?: string;
+    images?: string[];
+    attachments?: string[];
+    sessionId?: string;
+    ownerKey?: string;
+    /**
+     * 任务级外部工具允许清单（MCP 服务器 id）。语义是**只能收窄**：
+     * 与对话启用集取交集，绝不因为调用方传了某个 id 就放开对话里没勾的服务器。
+     * 定时任务（无人值守）用它把数据源限制到任务真正需要的那几个。
+     */
+    mcpAllowlist?: string[];
+    /**
+     * 任务级独立启用集（定时任务用）：存在时注入集就是它，
+     * 不再与对话启用集取交集——定时任务是一次独立运行，工具清单以任务自身配置为准。
+     */
+    mcpServers?: string[];
+    /** 本次运行的工具轮次预算；不填走全局默认 MCP_MAX_TOOL_ROUNDS（无人值守任务给更宽的预算）。 */
+    maxRounds?: number;
+    /** 无人值守运行（定时任务）：最后一轮摘掉工具，强制模型收尾写结论（交互式不传，行为不变）。 */
+    forceWrapUp?: boolean;
+    /** 任务级附加指引：拼进系统提示的**动态后缀**（不进用户可见历史、不污染稳定前缀）。 */
+    taskGuide?: string;
+  } = {},
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string },
 ): AsyncGenerator<ChatEvent> {
@@ -1873,9 +1926,19 @@ export async function* chatStream(
   if (traceMeta) traceMeta.servedModel = model.id;
 
   // 去重 + 排序：工具清单的确定性来自这里（顺序稳定 → system+tools 前缀稳定 → prompt 缓存命中）。
-  const enabled = [...new Set((conversation?.mcpServers || []).map((id) => String(id || "").trim()))]
-    .filter(Boolean)
-    .sort();
+  const conversationEnabled = [...new Set((conversation?.mcpServers || []).map((id) => String(id || "").trim()))].filter(
+    Boolean,
+  );
+  // 允许清单与启用集**取交集**（只收窄、不放开）：定时任务可以少带工具，但不能越过对话的授权范围。
+  const allowlist = opts.mcpAllowlist?.length
+    ? new Set(opts.mcpAllowlist.map((id) => String(id || "").trim()).filter(Boolean))
+    : null;
+  // 任务级独立启用集优先：定时任务以自身勾的为准，不受对话勾选影响（对话没勾不代表任务不能用）。
+  const taskServers = opts.mcpServers
+    ? [...new Set(opts.mcpServers.map((id) => String(id || "").trim()).filter(Boolean))].sort()
+    : null;
+  const enabled =
+    taskServers ?? (allowlist ? conversationEnabled.filter((id) => allowlist.has(id)) : conversationEnabled).sort();
   // 两个正交概念，不能用同一个变量同时管（旧实现把「是否注入内置工具」也压在「勾了 MCP」上，
   // 后果是没勾任何连接器时连本机能力都消失：新对话零工具，本地出图/工作区文件全用不了）：
   //   mcpEnabled —— 外部数据面：勾了哪些外部服务器，决定是否收集外部工具、是否走按需检索。
@@ -2008,9 +2071,13 @@ export async function* chatStream(
     });
     // 聊天里随手贴的文档：解析为文本注入系统提示（本轮临时上下文，不污染持久历史）。
     const attachmentCtx = await buildAttachmentContext(opts.attachments);
-    // 附件文本属「本轮临时上下文」，拼进系统提示的**动态后缀**（不污染稳定前缀、不影响 prompt cache）。
-    const systemPrompt: SystemPrompt = attachmentCtx
-      ? { ...system, dynamic: `${system.dynamic}\n\n${attachmentCtx}` }
+    // 附件文本与任务级指引都属「本轮临时上下文」，拼进系统提示的**动态后缀**
+    // （不污染稳定前缀、不影响 prompt cache；也都不进用户可见历史）。
+    const dynamicExtras = [attachmentCtx, opts.taskGuide].filter(
+      (part): part is string => Boolean(part && part.trim()),
+    );
+    const systemPrompt: SystemPrompt = dynamicExtras.length
+      ? { ...system, dynamic: `${system.dynamic}\n\n${dynamicExtras.join("\n\n")}` }
       : system;
     // 模型不支持直读图片时不再加载图片（避免无用 base64），由前端给出明确提示。
     const images = opts.images?.length && m.vision === "direct" ? imagesOf(opts.images) : [];
@@ -2036,7 +2103,9 @@ export async function* chatStream(
           allowWrite: true,
           grantServers: new Set(conversation?.readGrants || []),
           sessionId: opts.sessionId,
-          maxRounds: MAX_TOOL_ROUNDS,
+          // 调用方给了预算就用它（无人值守的定时任务比交互式宽），否则走全局默认。
+          maxRounds: opts.maxRounds && opts.maxRounds > 0 ? Math.floor(opts.maxRounds) : MAX_TOOL_ROUNDS,
+          ...(opts.forceWrapUp ? { forceWrapUp: true } : {}),
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
           enforceGrounding: roleEnforceGrounding,

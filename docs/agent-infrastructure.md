@@ -215,7 +215,17 @@
 
 **验收**：发起任务后立刻断网，任务仍在后台完成，重连后能看到完整结果；取消后不再产生新的模型调用与写操作；定时任务到点触发且重复执行不产生重复副作用。
 
-**本项目对照**：🟢 大部分已落地 — **异步任务底座（2026-09-17）**：`src/chat-tasks.ts`（按对话键的任务注册表 + 事件缓冲含 text_delta 合并 + AbortController）+ `src/app.ts`（`/chat/stream` 执行与推送解耦：HTTP 连接只是订阅者，断开任务照跑、结果回投进对话消息快照；`GET /chat/task/events` 断线续传回放；`POST /chat/cancel` 协作式取消；`GET /chat/task/status` 状态查询含最近一次摘要；删除对话前先取消任务防 upsert 复活）。**定时任务（2026-09-17）**：`src/schedules.ts`（croner 5 段 cron + Mongo 持久化 + 内存降级）+ `POST/GET/PATCH/DELETE /chat/schedules`（owner 守卫 + 每设备 20 个上限）；到点触发复用对话任务底座，忙时 skipped 不排队；定时运行无订阅者 → 结果自动回投。验证：`scripts/_async-task-check.mjs` 10/10、`scripts/_cost-schedule-check.mjs` 9/9。仍缺：❌ 跨进程任务队列（多实例）、❌ 进度心跳。
+**本项目对照**：🟢 大部分已落地 — **异步任务底座（2026-09-17）**：`src/chat-tasks.ts`（按对话键的任务注册表 + 事件缓冲含 text_delta 合并 + AbortController）+ `src/app.ts`（`/chat/stream` 执行与推送解耦：HTTP 连接只是订阅者，断开任务照跑、结果回投进对话消息快照；`GET /chat/task/events` 断线续传回放；`POST /chat/cancel` 协作式取消；`GET /chat/task/status` 状态查询含最近一次摘要；删除对话前先取消任务防 upsert 复活）。**定时任务（2026-09-17）**：`src/schedules.ts`（croner 5 段 cron + Mongo 持久化 + 内存降级）+ `POST/GET/PATCH/DELETE /chat/schedules`（owner 守卫 + 每设备 20 个上限）；到点触发复用对话任务底座，忙时 skipped 不排队；定时运行无订阅者 → 结果自动回投。**定时任务结果投递（2026-09-21）**：
+- **任务模型**：`src/schedules.ts` 增 `name` / `onceAt`（一次性任务：跑完自动停用并 `$unset nextRunAt`，不再按 cron 推到明年同一分钟）/ `mcpServers` / `notifyChannelIds` / `notifyOn` / `locale` / `lastDelivery`；时间参数走 `validateTiming`（cron 与 onceAt 二选一）。
+- **任务级工具允许清单只能收窄**：`chat.ts` 的 `chatStream` 增 `mcpAllowlist`，与对话启用集**取交集**——定时任务可以少带数据源，但不可能越过对话的授权范围（无人值守 Agent 的最小权限）。
+- **通道注册表**：`src/notify/channels.ts`（钉钉 / 飞书自定义机器人；webhook 与加签密钥只落 `.data/notify-channels.json`，对外只回域名 + `hasSecret`，更新时未提供的凭据保持原值；**出站域名白名单**默认 `oapi.dingtalk.com` / `open.feishu.cn` / `open.larksuite.com`，自建网关用 `NOTIFY_ALLOWED_HOSTS` 显式加白——投递目标是用户可填 URL，不限就是一个 SSRF 出口）。
+- **投递适配**：`src/notify/deliver.ts` 把平台差异全收在一处：钉钉 `markdown`（无按钮）/`actionCard`（带按钮，驼峰 `actionCard` + `btns[{title,actionURL}]`）+ 加签 `base64(HMAC-SHA256(secret, ts+"\n"+secret))` + 关键词注入 + 判 `errcode`；飞书 `interactive` 卡片 + 签名（拼接串当密钥、待签数据为空字符串）+ 判 `code`。Markdown 表格折成「列=值」（两端都不渲染真表格）、超长截断并注明。正文 = 任务名/状态/时间 + 结果；按钮 = 「打开对话」（`WEB_ORIGIN` + `?conv=<id>`，前端 `ChatPage` 已支持该查询参数）。
+- **图表数据一并投递**：IM 两端都只认文本、渲染不了图，而分析类任务的结论常常只落在 `render_chart` 的图里（只推正文 = 推一句「以上为完整监测结果」）。调度循环从任务事件缓冲取本轮图表（`chartsOfTask`），连同正文一并交给 `buildScheduleDelivery`：行对象数组按「列=值」逐行折（空值不落、超出 `MAX_CHART_ROWS` 如实注明），非表格形态（层级 / 点边结构）原样给紧凑预览、不做猜测式排版；正文总预算在表格 + 图表折完后统一收敛一次，避免叠加超出平台上限被拒收。
+- **接线与旁路**：调度循环里 `consumeTask({ mcpAllowlist })` 之后 fire-and-forget 投递；投递失败只落 `lastDelivery` + 日志，**不改任务状态**（"任务没跑成"和"消息没发出去"是两件事）。`POST /notify/channels/:id/test` 供配置后自验（平台拒收按 200 + `ok:false` + 平台原因回显，不算 HTTP 错误）。
+- **前端**：`apps/web/src/api.ts` 增 schedules / notify channels 客户端；`ChatPage.vue` 的定时任务面板**从 localStorage 脚手架改为服务端持久化**（rrule → 5 段 cron 转换、一次性任务、任务级 MCP 与通知通道多选、卡片显示绑定对话 / 上次执行 / 上次投递）。
+
+验证：`scripts/_async-task-check.mjs` 10/10、`scripts/_cost-schedule-check.mjs` 9/9；投递新增 `tests/notify-deliver.test.ts` 10/10（加签算法、载荷形状、错误码判定、关键词注入、表格折行、截断、多语状态词、白名单与「后缀包含」绕过）与 `scripts/_notify-schedule-e2e.mjs` 12/12（非白名单域名被拒 → 建通道 → 凭据不回显 → 测试发送 → 一次性任务到点真跑一轮 → 结果 `actionCard` 带任务名/状态/`?conv=` 按钮 → `lastDelivery` 回写；跑法：服务端临时带 `NOTIFY_ALLOWED_HOSTS=127.0.0.1` + 本地假机器人）。
+仍缺：❌ 跨进程任务队列（多实例）、❌ 进度心跳、❌ 投递重试与去重（当前失败只记 `lastDelivery` 不重试）、❌ 结果文件下载链接（本仓库没有 xlsx 导出能力，按钮目前只有「打开对话」）、❌ 通道配置的 owner 级权限（与 MCP 服务器同口径：全局配置，不做权限收窄）。
 
 ---
 

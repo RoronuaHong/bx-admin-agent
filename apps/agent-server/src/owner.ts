@@ -11,9 +11,25 @@ const OWNER_MAX_AGE = 60 * 60 * 24 * 365; // 1 年：设备标识要长于任何
 /** 只接受自签发形态的 id（uuid 或同类），防伪造请求把 ownerKey 塞成奇怪的东西。 */
 const OWNER_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
-/** 取（必要时签发）设备 owner 标识；签发时回写 cookie。 */
+/** 取（必要时签发）设备 owner 标识；签发时回写 cookie。
+ *  IM 通知里的「打开对话」链接带 `?owner=<ownerKey>`（钉钉/飞书 webview 不共享 cookie）。
+ *  链接是**显式意图**，优先级高于设备上已有的 cookie：否则用户早先点过一次不带 owner 的旧链接、
+ *  webview 里已经落了个随机 owner，之后所有带 owner 的链接都会被那个陈旧值压掉，点进来永远看不到目标对话。
+ */
 export function resolveOwner(c: Context): string {
   const existing = getCookie(c, OWNER_COOKIE);
+  const fromQuery = String(c.req.query("owner") || "").trim();
+  if (OWNER_RE.test(fromQuery)) {
+    if (existing !== fromQuery) {
+      setCookie(c, OWNER_COOKIE, fromQuery, {
+        httpOnly: true,
+        path: "/",
+        sameSite: "Lax",
+        maxAge: OWNER_MAX_AGE,
+      });
+    }
+    return fromQuery;
+  }
   if (existing && OWNER_RE.test(existing)) return existing;
   const owner = randomUUID();
   setCookie(c, OWNER_COOKIE, owner, {

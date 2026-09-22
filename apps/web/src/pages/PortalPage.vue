@@ -207,6 +207,16 @@ function onLocaleChange(next: UiLocale) {
   font-size: 14px;
 }
 
+/* 聚焦指示只画在外层容器上（见上面的 .portal__search:focus-within）：
+   内层 input 透明无边框，全局 input:focus-visible 的焦点环落在它身上
+   会在输入框内部糊出一圈黑框（比容器小一圈）。 */
+.portal__search-input:focus,
+.portal__search-input:focus-visible {
+  outline: none;
+  border: none;
+  box-shadow: none;
+}
+
 .portal__search-input::placeholder {
   color: var(--muted, #66708a);
 }

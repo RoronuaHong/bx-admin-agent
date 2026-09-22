@@ -50,8 +50,22 @@ async function parseJson(res: Response) {
   return data;
 }
 
+/** 从当前页面 URL 取 IM 通知链接带过来的 ownerKey，透传给 API 首包。
+ *  钉钉/飞书 webview 不共享浏览器 cookie，靠它完成一次性设备归属回写。
+ */
+function withOwnerParam(path: string): string {
+  try {
+    const owner = new URLSearchParams(window.location.search).get("owner");
+    if (!owner) return path;
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}owner=${encodeURIComponent(owner)}`;
+  } catch {
+    return path;
+  }
+}
+
 async function jsonFetch(path: string, options?: RequestInit) {
-  const res = await fetch(path, {
+  const res = await fetch(withOwnerParam(path), {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...options,
@@ -86,7 +100,7 @@ export interface UploadResult {
 export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
   const form = new FormData();
   for (const f of files) form.append("files", f);
-  const res = await fetch("/agent/chat/upload", { method: "POST", credentials: "include", body: form });
+  const res = await fetch(withOwnerParam("/agent/chat/upload"), { method: "POST", credentials: "include", body: form });
   const data = (await parseJson(res)) as { files: UploadResult[] };
   return data.files || [];
 }
@@ -98,7 +112,7 @@ export async function streamChat(
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ) {
-  const res = await fetch("/agent/chat/stream", {
+  const res = await fetch(withOwnerParam("/agent/chat/stream"), {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -549,4 +563,129 @@ export async function readWorkspaceFile(conversationId: string, path: string): P
     `/agent/chat/conversations/${encodeURIComponent(conversationId)}/files/content?path=${encodeURIComponent(path)}`,
   )) as { content: string };
   return data.content || "";
+}
+
+// ---- 定时任务（服务端持久化；到点执行，结果回投对话，可选推送到 IM 机器人）----
+
+export type ScheduleStatus = "success" | "failed" | "cancelled" | "skipped" | "error";
+/** 触发投递的状态白名单（跳过/取消一律不推）。 */
+export type ScheduleNotifyOn = "success" | "failed";
+
+export interface ScheduleDto {
+  id: string;
+  conversationId: string;
+  name?: string;
+  prompt: string;
+  /** 周期任务：5 段 cron（分 时 日 月 周）。与 onceAt 二选一。 */
+  cron?: string;
+  /** 一次性任务：目标时刻（毫秒）。跑完自动停用。 */
+  onceAt?: number;
+  /** 任务级外部工具允许清单（MCP 服务器 id）：与对话启用集取交集，只收窄不放开。 */
+  mcpServers?: string[];
+  /** 结果投递通道（全局通道注册表 id）。 */
+  notifyChannelIds?: string[];
+  notifyOn?: ScheduleNotifyOn[];
+  locale?: string;
+  lastDelivery?: { at: number; ok: boolean; sent: number; error?: string };
+  enabled: boolean;
+  createdAt: number;
+  lastRunAt?: number;
+  lastStatus?: ScheduleStatus;
+  lastNote?: string;
+  nextRunAt?: number;
+}
+
+export interface ScheduleInput {
+  conversationId: string;
+  prompt: string;
+  name?: string;
+  cron?: string;
+  onceAt?: number;
+  mcpServers?: string[];
+  notifyChannelIds?: string[];
+  notifyOn?: ScheduleNotifyOn[];
+  locale?: string;
+}
+
+export async function fetchSchedules(conversationId?: string): Promise<ScheduleDto[]> {
+  const query = conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : "";
+  const data = (await jsonFetch(`/agent/chat/schedules${query}`)) as { schedules: ScheduleDto[] };
+  return data.schedules || [];
+}
+
+export async function createChatSchedule(payload: ScheduleInput): Promise<ScheduleDto> {
+  const data = (await jsonFetch("/agent/chat/schedules", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })) as { schedule: ScheduleDto };
+  return data.schedule;
+}
+
+export async function patchChatSchedule(
+  id: string,
+  patch: Partial<Omit<ScheduleInput, "conversationId">> & { enabled?: boolean },
+): Promise<ScheduleDto> {
+  const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  })) as { schedule: ScheduleDto };
+  return data.schedule;
+}
+
+export async function deleteChatSchedule(id: string): Promise<void> {
+  await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+// ---- 结果投递通道（钉钉 / 飞书自定义机器人；凭据只写不回显）----
+
+export type NotifyChannelKind = "dingtalk" | "feishu";
+
+export interface NotifyChannelDto {
+  id: string;
+  kind: NotifyChannelKind;
+  label: string;
+  /** 只回域名：凭据（webhook 含 token）留在服务端。 */
+  host: string;
+  hasSecret: boolean;
+  keyword?: string;
+  /** 通道级启用开关（缺省 true）。关闭后所有引用它的任务都跳过投递。 */
+  enabled?: boolean;
+  createdAt: number;
+}
+
+export interface NotifyChannelInput {
+  id?: string;
+  kind: NotifyChannelKind;
+  label?: string;
+  /** 新建时必填；更新时留空 = 保持原值（前端拿不到脱敏后的原文）。 */
+  webhook?: string;
+  secret?: string;
+  keyword?: string;
+  /** 通道级启用开关（仅 upsert 透传：保存时带 id + enabled 即切换）。 */
+  enabled?: boolean;
+}
+
+export async function fetchNotifyChannels(): Promise<NotifyChannelDto[]> {
+  const data = (await jsonFetch("/agent/notify/channels")) as { channels: NotifyChannelDto[] };
+  return data.channels || [];
+}
+
+export async function saveNotifyChannel(payload: NotifyChannelInput): Promise<NotifyChannelDto> {
+  const data = (await jsonFetch("/agent/notify/channels", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })) as { channel: NotifyChannelDto };
+  return data.channel;
+}
+
+export async function deleteNotifyChannel(id: string): Promise<void> {
+  await jsonFetch(`/agent/notify/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/** 测试发送：平台拒收（关键词/签名错）返回 ok:false + 原因，不算 HTTP 错误。 */
+export async function testNotifyChannel(id: string): Promise<{ ok: boolean; error?: string }> {
+  const data = (await jsonFetch(`/agent/notify/channels/${encodeURIComponent(id)}/test`, {
+    method: "POST",
+  })) as { ok: boolean; error?: string };
+  return { ok: Boolean(data.ok), ...(data.error ? { error: data.error } : {}) };
 }

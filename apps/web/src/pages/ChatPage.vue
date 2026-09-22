@@ -12,9 +12,11 @@ import {
 import { useRouter } from "vue-router";
 import BackToTop from "../components/BackToTop.vue";
 import ModelSelect from "../components/ModelSelect.vue";
+import PromptBox from "../components/PromptBox.vue";
 import ToolsSearch from "../components/ToolsSearch.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
+import UiSelect from "../components/UiSelect.vue";
 import ChartCard from "../components/ChartCard.vue";
 import { renderChatMarkdown } from "../chat-richtext";
 import { matchesFuzzyScoped, matchesFuzzy, loadPinyin, pinyinReady } from "../pinyin";
@@ -30,7 +32,10 @@ import {
   createConversation,
   cancelSubagent as apiCancelSubagent,
   conversationExportUrl,
+  createChatSchedule,
+  deleteChatSchedule,
   deleteConversation as apiDeleteConversation,
+  deleteNotifyChannel,
   duplicateConversation,
   fetchChatMcpServers,
   fetchChatPreferences,
@@ -38,6 +43,8 @@ import {
   fetchConversations,
   fetchModels,
   fetchMemory,
+  fetchNotifyChannels,
+  fetchSchedules,
   fetchWorkspaceFiles,
   getApiErrorToken,
   getApiErrorCode,
@@ -45,14 +52,17 @@ import {
   readWorkspaceFile,
   removeMemoryItem,
   isChatTaskRunning,
+  patchChatSchedule,
   patchConversation,
   reloadMcpServer,
   reorderConversations,
   saveChatPreferences,
   saveConversationMessages,
+  saveNotifyChannel,
   setChatMcpServers,
   setChatSkills,
   streamChat,
+  testNotifyChannel,
   uploadFiles,
   MODEL_AUTO_ID,
   type ChartSpec,
@@ -62,7 +72,13 @@ import {
   type McpServerStatus,
   type MemoryItemDto,
   type ModelInfo,
+  type NotifyChannelDto,
+  type NotifyChannelKind,
   type PendingMessage,
+  type ScheduleDto,
+  type ScheduleInput,
+  type ScheduleNotifyOn,
+  type ScheduleStatus,
   type SkillMeta,
   type StoredMessage,
   type UploadResult,
@@ -74,48 +90,12 @@ import type { TodoItem } from "@bx/shared";
 const view = ref<"chat" | "tasks">("chat");
 
 /* ===========================================================================
- * 定时任务（前端脚手架）
- * 数据暂存 localStorage，结构对齐真实接口：
- *   { id, name, prompt, scheduleType: 'recurring'|'once',
- *     rrule?, scheduledAt?, mcpServers?, status: 'active'|'paused', createdAt, nextRun? }
- * 接入后端时只需把 load/save 换成 GET/POST /agent/automations。
+ * 定时任务（服务端持久化：/agent/chat/schedules，到点由服务端调度器执行）
+ * 结果两处可见：① 回投到绑定的对话（打开就能看到）；② 勾了通知通道时推送到钉钉/飞书机器人。
+ * 任务级 MCP 允许清单只能收窄对话的启用集（无人值守 Agent 的通行最小权限做法）。
  * =========================================================================== */
-interface ScheduledTask {
-  id: string;
-  name: string;
-  prompt: string;
-  scheduleType: "recurring" | "once";
-  rrule?: string;
-  scheduledAt?: string;
-  /** 任务级 MCP 允许清单：到点运行时只注入这些服务器的工具（无人值守 Agent 的通行最小权限做法）。 */
-  mcpServers?: string[];
-  status: "active" | "paused";
-  createdAt: number;
-  nextRun?: number | null;
-}
-
-const TASKS_KEY = "bx-agent-automations";
-
-function loadTasks(): ScheduledTask[] {
-  try {
-    const raw = localStorage.getItem(TASKS_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? (arr as ScheduledTask[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveTasks() {
-  try {
-    localStorage.setItem(TASKS_KEY, JSON.stringify(tasks.value));
-  } catch {
-    /* 隐私模式等写入失败时忽略 */
-  }
-}
-
-const tasks = ref<ScheduledTask[]>(loadTasks());
-
+const tasks = ref<ScheduleDto[]>([]);
+const tasksBusy = ref(false);
 const showTaskForm = ref(false);
 const taskError = ref("");
 const taskDraft = reactive({
@@ -125,7 +105,20 @@ const taskDraft = reactive({
   scheduledAt: "",
   /** 本任务允许使用的 MCP 服务器（空 = 不带任何 MCP 工具运行）。 */
   mcpServers: [] as string[],
+  /** 结果投递通道（空 = 只回投对话，不推送）。 */
+  notifyChannelIds: [] as string[],
 });
+/** 正在编辑的任务 id（空 = 新建）。 */
+const editingTaskId = ref("");
+/** 原 cron 是外部建的、界面选项表达不了：频率区只读，保存时不回传频率（不猜一个相近的覆盖掉）。 */
+const cronUnparsed = ref(false);
+/** 上面那种情况要把原表达式显示出来，否则用户不知道自己错过什么。 */
+const editingCron = ref("");
+
+/** 拉取本设备的定时任务（owner 隔离在服务端）。 */
+async function loadTasks() {
+  tasks.value = await fetchSchedules().catch(() => [] as ScheduleDto[]);
+}
 
 /** 任务表单里切换某台 MCP 服务器的勾选状态。 */
 function toggleTaskServer(id: string) {
@@ -134,12 +127,163 @@ function toggleTaskServer(id: string) {
   else taskDraft.mcpServers.push(id);
 }
 
-/** 任务卡片上的服务器标签文本（服务器列表未加载时诚实显示数量）。 */
-function taskServersText(t: ScheduledTask): string {
+/** 任务卡片「工具」事实：只列服务器标签（空则如实说这次不带工具）。 */
+function taskToolsFact(t: ScheduleDto): string {
   const ids = t.mcpServers || [];
   if (!ids.length) return tx("不使用 MCP 工具", "No MCP tools", "Sem ferramentas MCP", "कोई MCP टूल नहीं");
-  const labels = ids.map((id) => mcpAvailable.value.find((s) => s.id === id)?.label || id);
-  return tx("工具", "Tools", "Ferramentas", "टूल") + "：" + labels.join(tx("、", ", ", ", ", ", "));
+  return ids
+    .map((id) => mcpAvailable.value.find((s) => s.id === id)?.label || id)
+    .join(tx("、", ", ", ", ", ", "));
+}
+
+/** 任务表单里切换某个通知通道的勾选状态（每个任务选自己的通道）。 */
+function toggleTaskChannel(id: string) {
+  const i = taskDraft.notifyChannelIds.indexOf(id);
+  if (i >= 0) taskDraft.notifyChannelIds.splice(i, 1);
+  else taskDraft.notifyChannelIds.push(id);
+}
+
+/** 任务卡片「通知」事实：本任务勾选的通道标签 + 上次投递结果。 */
+function taskNotifyFact(t: ScheduleDto): string {
+  const ids = t.notifyChannelIds || [];
+  if (!ids.length) return "";
+  const labels = ids
+    .map((id) => notifyChannels.value.find((c) => c.id === id)?.label || id)
+    .join(tx("、", ", ", ", ", ", "));
+  if (!labels) return "";
+  const last = t.lastDelivery;
+  if (!last) return labels;
+  return `${labels} · ${
+    last.ok
+      ? tx("上次推送成功", "last push ok", "último envio ok", "पिछला भेजा गया")
+      : tx("上次推送失败", "last push failed", "último envio falhou", "पिछला भेजना विफल")
+  }`;
+}
+
+/** 最近一次执行结果的短标签（卡片右上角徽标）。 */
+const STATUS_LABEL: Record<ScheduleStatus, [string, string, string, string]> = {
+  success: ["成功", "success", "sucesso", "सफल"],
+  failed: ["失败", "failed", "falhou", "विफल"],
+  skipped: ["跳过", "skipped", "ignorado", "छोड़ा"],
+  cancelled: ["已取消", "cancelled", "cancelado", "रद्द"],
+  error: ["出错", "error", "erro", "त्रुटि"],
+};
+
+function taskStatusText(t: ScheduleDto): string {
+  const label = t.lastStatus ? STATUS_LABEL[t.lastStatus] : null;
+  return label ? tx(label[0], label[1], label[2], label[3]) : "";
+}
+
+/** 状态徽标的悬浮全文：上次执行时间 + 服务端说明（跳过原因 / 错误）。卡片上放不下这些。 */
+function taskRunText(t: ScheduleDto): string {
+  const label = taskStatusText(t);
+  if (!label) return "";
+  const at = t.lastRunAt ? ` ${new Date(t.lastRunAt).toLocaleString()}` : "";
+  const head = tx("上次执行", "Last run", "Última execução", "पिछला निष्पादन") + "：" + label + at;
+  return t.lastNote ? `${head}（${t.lastNote}）` : head;
+}
+
+// ---- 通知通道（钉钉 / 飞书自定义机器人；全局注册表，凭据只写不回显）----
+const notifyChannels = ref<NotifyChannelDto[]>([]);
+const notifyBusy = ref(false);
+/** 通道操作反馈（保存 / 测试结果）；空串 = 不显示。 */
+const notifyNote = ref("");
+const channelDraft = reactive({
+  kind: "dingtalk" as NotifyChannelKind,
+  label: "",
+  webhook: "",
+  secret: "",
+  keyword: "",
+});
+
+async function loadNotifyChannels() {
+  notifyChannels.value = await fetchNotifyChannels().catch(() => [] as NotifyChannelDto[]);
+}
+
+function channelErrorText(err: unknown, fallback: string): string {
+  return localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || fallback);
+}
+
+/** 新建通道：保存成功即勾选给当前任务（配通道的目的就是用它）。 */
+async function saveChannelDraft() {
+  const webhook = channelDraft.webhook.trim();
+  if (!webhook) {
+    notifyNote.value = tx("请填写机器人 Webhook", "Webhook is required", "Informe o webhook", "कृपया वेबहुक भरें");
+    return;
+  }
+  notifyBusy.value = true;
+  notifyNote.value = "";
+  try {
+    const saved = await saveNotifyChannel({
+      kind: channelDraft.kind,
+      label: channelDraft.label.trim(),
+      webhook,
+      ...(channelDraft.secret.trim() ? { secret: channelDraft.secret.trim() } : {}),
+      ...(channelDraft.keyword.trim() ? { keyword: channelDraft.keyword.trim() } : {}),
+    });
+    notifyChannels.value = [saved, ...notifyChannels.value.filter((c) => c.id !== saved.id)];
+    if (!taskDraft.notifyChannelIds.includes(saved.id)) taskDraft.notifyChannelIds.push(saved.id);
+    channelDraft.label = "";
+    channelDraft.webhook = "";
+    channelDraft.secret = "";
+    channelDraft.keyword = "";
+    notifyNote.value = tx("已保存，可点「测试」验证能不能收到", "Saved — use Test to verify delivery", "Salvo — use Testar para verificar", "सहेजा गया — जाँच के लिए टेस्ट दबाएँ");
+  } catch (err) {
+    notifyNote.value = channelErrorText(err, tx("保存失败", "Save failed", "Falha ao salvar", "सहेजना विफल"));
+  } finally {
+    notifyBusy.value = false;
+  }
+}
+
+/** 测试发送：平台拒收（关键词 / 签名错）会带着平台原文回显，比「保存成功」有用得多。 */
+async function testChannel(id: string) {
+  notifyBusy.value = true;
+  notifyNote.value = "";
+  try {
+    const result = await testNotifyChannel(id);
+    notifyNote.value = result.ok
+      ? tx("测试消息已发送，请查看机器人所在群", "Test message sent — check the chat", "Mensagem de teste enviada — verifique a conversa", "टेस्ट संदेश भेजा गया — चैट देखें")
+      : tx("推送失败：", "Push failed: ", "Falha ao enviar: ", "भेजना विफल: ") + (result.error || "");
+  } catch (err) {
+    notifyNote.value = channelErrorText(err, tx("测试失败", "Test failed", "Teste falhou", "टेस्ट विफल"));
+  } finally {
+    notifyBusy.value = false;
+  }
+}
+
+async function removeChannel(id: string) {
+  notifyBusy.value = true;
+  try {
+    await deleteNotifyChannel(id);
+    notifyChannels.value = notifyChannels.value.filter((c) => c.id !== id);
+    taskDraft.notifyChannelIds = taskDraft.notifyChannelIds.filter((x) => x !== id);
+    notifyNote.value = "";
+  } catch (err) {
+    notifyNote.value = channelErrorText(err, tx("删除失败", "Delete failed", "Falha ao excluir", "हटाना विफल"));
+  } finally {
+    notifyBusy.value = false;
+  }
+}
+
+/** 通道级启用开关：复用 upsert 端点（带 id + enabled）切换启用状态；关闭后所有引用它的任务都跳过投递。 */
+async function toggleChannelEnabled(ch: NotifyChannelDto) {
+  if (notifyBusy.value) return;
+  notifyBusy.value = true;
+  try {
+    const nextEnabled = !ch.enabled;
+    const saved = await saveNotifyChannel({ id: ch.id, enabled: nextEnabled });
+    const idx = notifyChannels.value.findIndex((c) => c.id === ch.id);
+    if (idx >= 0) notifyChannels.value[idx] = saved;
+    // 关闭后从当前任务的勾选里摘掉，避免「停用却仍显示已开启」。
+    if (!nextEnabled) taskDraft.notifyChannelIds = taskDraft.notifyChannelIds.filter((x) => x !== ch.id);
+    notifyNote.value = nextEnabled
+      ? tx("已启用，引用它的任务到点会推送", "Enabled — tasks referencing it will deliver", "Ativado — tarefas que o referenciam entregarão", "सक्षम — इसे संदर्भित कार्य वितरित करेंगे")
+      : tx("已停用，所有任务不再推送到该通道", "Disabled — no task will deliver to it", "Desativado — nenhuma tarefa entregará a ele", "अक्षम — कोई कार्य इसे नहीं भेजेगा");
+  } catch (err) {
+    notifyNote.value = channelErrorText(err, tx("切换失败", "Toggle failed", "Falha ao alternar", "टॉगल विफल"));
+  } finally {
+    notifyBusy.value = false;
+  }
 }
 
 // ---- 任务表单里 MCP 服务器选择（下拉框，可多选）----
@@ -155,7 +299,8 @@ function updateTaskMcpPos() {
   const r = el.getBoundingClientRect();
   taskMcpPos.top = Math.round(r.bottom + 6);
   taskMcpPos.left = Math.round(r.left);
-  taskMcpPos.width = Math.round(r.width);
+  // 触发器现在是工具条里的窄按钮，面板不能被它带窄到只剩一格：给个下限。
+  taskMcpPos.width = Math.max(280, Math.round(r.width));
 }
 
 function syncTaskMcpPos() {
@@ -218,20 +363,111 @@ function toggleWeekday(code: string) {
   else taskRepeat.byday.push(code);
 }
 
-/** 由友好选项拼出后端可用的 RRULE（BYHOUR/BYMINUTE 对齐系统支持）。 */
-function buildRrule(): string {
-  const interval = Math.min(99, Math.max(1, Math.floor(taskRepeat.interval || 1)));
-  const parts = [`FREQ=${taskRepeat.freq}`, `INTERVAL=${interval}`];
-  if (taskRepeat.freq === "WEEKLY" && taskRepeat.byday.length)
-    parts.push(`BYDAY=${WEEKDAYS.filter((w) => taskRepeat.byday.includes(w.code)).map((w) => w.code).join(",")}`);
-  if (taskRepeat.freq !== "HOURLY") {
-    const [h, m] = taskRepeat.time.split(":").map((x) => parseInt(x, 10));
-    if (!Number.isNaN(h)) {
-      parts.push(`BYHOUR=${h}`);
-      if (!Number.isNaN(m)) parts.push(`BYMINUTE=${m}`);
+/** cron 星期字段是数字（0 = 周日）。 */
+const DOW: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+/** 格式化成 datetime-local 需要的本地时间字符串（编辑一次性任务时回填）。 */
+function toLocalInput(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/**
+ * 卡片上的紧凑时间：侧栏宽度只够「9/21 16:00」这一档，完整 locale 串会被挤成三行。
+ * 非本年才带上年份（跨年任务看不出年份会误读）。
+ */
+function formatShortTime(ms: number): string {
+  const d = new Date(ms);
+  const date = `${d.getMonth() + 1}/${d.getDate()}`;
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return d.getFullYear() === new Date().getFullYear() ? `${date} ${time}` : `${d.getFullYear()}/${date} ${time}`;
+}
+
+/**
+ * 5 段 cron → 友好选项（buildCron 的逆运算，编辑时回填用）。
+ * 只认本界面能产出/能表达的那几个形态；其余（外部 API 建的复杂表达式）返回 null，
+ * 由调用方**只读展示原表达式**——「尽力猜一个相近的」会在保存时把别人的调度悄悄改掉。
+ */
+function parseCron(expr?: string): { freq: typeof taskRepeat.freq; interval: number; time: string; byday: string[] } | null {
+  const parts = String(expr || "").trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [min, hour, dom, mon, dow] = parts as [string, string, string, string, string];
+  const isNum = (s: string) => /^\d{1,2}$/.test(s);
+  const step = (s: string): number => (s === "*" ? 1 : /^\*\/(\d{1,2})$/.test(s) ? Number(s.slice(2)) : 0);
+  const hhmm = (): string | null =>
+    isNum(hour) && isNum(min) ? `${hour.padStart(2, "0")}:${min.padStart(2, "0")}` : null;
+  // 每小时：0 */n * * *
+  const hourlyStep = step(hour);
+  if (min === "0" && hourlyStep >= 1 && dom === "*" && mon === "*" && dow === "*") {
+    return { freq: "HOURLY", interval: hourlyStep, time: "09:00", byday: ["MO"] };
+  }
+  const time = hhmm();
+  if (!time) return null;
+  // 每天：m h */n * *
+  const dayStep = step(dom);
+  if (dayStep >= 1 && mon === "*" && dow === "*") {
+    return { freq: "DAILY", interval: dayStep, time, byday: ["MO"] };
+  }
+  // 每周：m h * * d1,d2
+  if (dom === "*" && mon === "*" && dow !== "*") {
+    const codes = dow.split(",");
+    const names = codes.map((code) => Object.keys(DOW).find((k) => DOW[k] === Number(code)));
+    if (codes.every(isNum) && names.every(Boolean) && names.length) {
+      return { freq: "WEEKLY", interval: 1, time, byday: names as string[] };
     }
   }
-  return parts.join(";");
+  // 每月：m h 1 */n *
+  const monthStep = step(mon);
+  if (dom === "1" && monthStep >= 1 && dow === "*") {
+    return { freq: "MONTHLY", interval: monthStep, time, byday: ["MO"] };
+  }
+  return null;
+}
+
+/**
+ * 友好选项 → 服务端 5 段 cron（分 时 日 月 周）。
+ * 只表达 cron 能**精确**表达的形态：日字段的步长是「每 N 天」（不是每 N 个月），周字段也不支持 `*​/2`。
+ * 表达不了的情况如实返回 error，不用近似值糊弄用户（宁可少一个选项，也不要到点跑错）。
+ */
+function buildCron(): { cron?: string; error?: string } {
+  const interval = Math.min(99, Math.max(1, Math.floor(taskRepeat.interval || 1)));
+  const [h, m] = taskRepeat.time.split(":").map((x) => parseInt(x, 10));
+  const hour = Number.isNaN(h) ? 9 : h;
+  const minute = Number.isNaN(m) ? 0 : m;
+  if (taskRepeat.freq === "HOURLY") {
+    return { cron: interval === 1 ? "0 * * * *" : `0 */${interval} * * *` };
+  }
+  if (taskRepeat.freq === "DAILY") {
+    return { cron: `${minute} ${hour} */${interval} * *` };
+  }
+  if (taskRepeat.freq === "WEEKLY") {
+    if (interval > 1) {
+      return {
+        error: tx(
+          "每周重复暂只支持间隔 1 周（cron 无法精确表达「每 N 周」）",
+          "Weekly repeats support interval 1 only (cron cannot express every N weeks)",
+          "Repetição semanal aceita apenas intervalo 1",
+          "साप्ताहिक दोहराव में अंतराल 1 ही समर्थित है",
+        ),
+      };
+    }
+    const days = WEEKDAYS.filter((w) => taskRepeat.byday.includes(w.code))
+      .map((w) => DOW[w.code])
+      .join(",");
+    if (!days) {
+      return {
+        error: tx(
+          "每周重复请至少选择一天",
+          "Pick at least one weekday",
+          "Selecione ao menos um dia da semana",
+          "कृपया सप्ताह का कम से कम एक दिन चुनें",
+        ),
+      };
+    }
+    return { cron: `${minute} ${hour} * * ${days}` };
+  }
+  // MONTHLY：月字段步长表达「每 N 个月」，日固定 1 号（界面没有「几号」选项，不偷偷用今天）。
+  return { cron: `${minute} ${hour} 1 */${interval} *` };
 }
 
 /** 给用户看的纯中文预览，如「每 1 天，于 09:00 执行」。 */
@@ -249,6 +485,14 @@ const repeatPreview = computed(() => {
       `${n} ${repeatUnit.value}, ${dayText || "…"} को ${taskRepeat.time} बजे`,
     );
   }
+  // 每月重复固定落在 1 号（见 buildCron 的 MONTHLY 分支）：预览必须说清楚，别让用户以为是"下个月的今天"。
+  if (taskRepeat.freq === "MONTHLY")
+    return tx(
+      `每 ${n} ${repeatUnit.value}的 1 号，${taskRepeat.time} 执行`,
+      `Day 1 of every ${n} ${repeatUnit.value} at ${taskRepeat.time}`,
+      `Dia 1 a cada ${n} ${repeatUnit.value} às ${taskRepeat.time}`,
+      `हर ${n} ${repeatUnit.value} की 1 तारीख को ${taskRepeat.time} बजे`,
+    );
   return tx(
     `每 ${n} ${repeatUnit.value}，${taskRepeat.time} 执行`,
     `Every ${n} ${repeatUnit.value} at ${taskRepeat.time}`,
@@ -451,84 +695,196 @@ function onOutsideDt(e: MouseEvent) {
   if (!inTrigger && !inPanel) dtOpen.value = false;
 }
 
-function openTaskForm() {
-  taskDraft.name = "";
-  taskDraft.prompt = "";
-  taskDraft.scheduleType = "recurring";
-  taskDraft.scheduledAt = "";
-  taskRepeat.freq = "DAILY";
-  taskRepeat.interval = 1;
-  taskRepeat.byday = ["MO"];
-  taskRepeat.time = "09:00";
-  taskDraft.mcpServers = [];
+/**
+ * 打开任务表单：不传 task = 新建（空白 + 预选默认），传 task = 编辑（按原任务回填）。
+ * 编辑时频率区由 buildCron 的逆运算 parseCron 回填；解析不了的外部表达式只读展示，不猜。
+ */
+function openTaskForm(task?: ScheduleDto) {
+  editingTaskId.value = task?.id || "";
+  editingCron.value = task?.cron || "";
+  const parsed = task ? parseCron(task.cron) : null;
+  cronUnparsed.value = Boolean(task && !task.onceAt && !parsed);
+  taskDraft.name = task?.name || "";
+  taskDraft.prompt = task?.prompt || "";
+  taskDraft.scheduleType = task?.onceAt ? "once" : "recurring";
+  taskDraft.scheduledAt = task?.onceAt ? toLocalInput(task.onceAt) : "";
+  taskDraft.mcpServers = [...(task?.mcpServers || [])];
+  taskDraft.notifyChannelIds = [...(task?.notifyChannelIds || [])];
+  taskRepeat.freq = parsed?.freq || "DAILY";
+  taskRepeat.interval = parsed?.interval || 1;
+  taskRepeat.byday = parsed?.byday.length ? [...parsed.byday] : ["MO"];
+  taskRepeat.time = parsed?.time || "09:00";
+  notifyNote.value = "";
   dtOpen.value = false;
+  taskMcpOpen.value = false;
   taskError.value = "";
   showTaskForm.value = true;
-  // 任务表单也要选 MCP：确保可用服务器列表已加载，并按服务端 defaultEnabled 预选。
+  // 任务表单也要选 MCP / 通知通道：确保两份列表都已加载；新建时按服务端 defaultEnabled 预选 MCP。
   void loadMcp().then(() => {
-    if (taskDraft.mcpServers.length) return; // 用户已手动勾选过则不覆盖
+    if (task || taskDraft.mcpServers.length) return; // 编辑态 / 已手动勾选过则不覆盖
     taskDraft.mcpServers = mcpAvailable.value.filter((s) => s.defaultEnabled).map((s) => s.id);
   });
+  void loadNotifyChannels();
 }
 
 function closeTaskForm() {
   taskMcpOpen.value = false;
   showTaskForm.value = false;
+  editingTaskId.value = "";
+  cronUnparsed.value = false;
+  editingCron.value = "";
 }
 
-/** 脚手架阶段对 recurring 给粗略估算（每日=明天此刻），真实 nextRun 由后端计算。 */
-function draftNextRun(): number | null {
-  if (taskDraft.scheduleType === "once") {
-    const t = taskDraft.scheduledAt ? new Date(taskDraft.scheduledAt).getTime() : NaN;
-    return Number.isNaN(t) ? null : t;
+/**
+ * Esc 关闭任务表单：这是最上层模态，只能靠取消/关闭按钮或 Esc 退出——**点遮罩不关闭**，
+ * 免得填了一半的定时任务被一次误点清空。
+ *
+ * 两点实现细节：
+ * - 监听用 capture 并 stopPropagation：模态开着时吃掉 Esc，不再触发侧栏抽屉 / 工具菜单的 Esc 收起。
+ * - 表单里有两个 Teleport 到 body 的浮层（日期面板、MCP 下拉），它们不在模态 DOM 内，
+ *   按层级先关浮层、再关模态（否则第一下 Esc 会直接丢掉整个表单）。
+ */
+function onTaskFormEsc(event: KeyboardEvent) {
+  if (event.key !== "Escape" || !showTaskForm.value) return;
+  event.stopPropagation();
+  if (dtOpen.value) {
+    dtOpen.value = false;
+    return;
   }
-  return Date.now() + 24 * 3600 * 1000;
+  if (taskMcpOpen.value) {
+    taskMcpOpen.value = false;
+    return;
+  }
+  closeTaskForm();
 }
 
-function createTask() {
+/** 提交表单：新建走 POST，编辑走 PATCH（同一份校验与同一份草稿）。 */
+async function submitTask() {
   const name = taskDraft.name.trim();
   const prompt = taskDraft.prompt.trim();
   if (!name) return (taskError.value = tx("请填写任务名称", "Name is required", "Informe o nome da tarefa", "कृपया कार्य का नाम दर्ज करें"));
   if (!prompt) return (taskError.value = tx("请填写任务内容", "Task prompt is required", "Informe o conteúdo da tarefa", "कृपया कार्य का विवरण दर्ज करें"));
-  if (taskDraft.scheduleType === "once" && !taskDraft.scheduledAt)
-    return (taskError.value = tx("请选择执行时间", "Pick a run time", "Escolha o horário de execução", "कृपया निष्पादन समय चुनें"));
-  if (taskDraft.scheduleType === "recurring" && taskRepeat.freq === "WEEKLY" && taskRepeat.byday.length === 0)
-    return (taskError.value = tx("每周重复请至少选择一天", "Pick at least one weekday", "Selecione ao menos um dia da semana", "कृपया सप्ताह का कम से कम एक दिन चुनें"));
-  tasks.value.unshift({
-    id: "t_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  // 任务必须绑定一个对话：到点执行的结果回投到这里（也是它拿到上下文与工具授权的地方）。
+  const conversationId = currentId.value;
+  if (!editingTaskId.value && !conversationId)
+    return (taskError.value = tx("请先打开一个对话：任务结果会回到该对话", "Open a chat first — results are delivered there", "Abra uma conversa primeiro — os resultados vão para lá", "पहले कोई चैट खोलें — परिणाम वहीं भेजे जाएँगे"));
+  const base = {
     name,
     prompt,
-    scheduleType: taskDraft.scheduleType,
-    rrule: taskDraft.scheduleType === "recurring" ? buildRrule() : undefined,
-    scheduledAt: taskDraft.scheduleType === "once" ? taskDraft.scheduledAt : undefined,
     mcpServers: taskDraft.mcpServers.slice(),
-    status: "active",
-    createdAt: Date.now(),
-    nextRun: draftNextRun(),
-  });
-  saveTasks();
-  closeTaskForm();
+    notifyChannelIds: taskDraft.notifyChannelIds.slice(),
+    // 成功与失败都推（跳过不推，因为「这次没跑」不是需要人处理的结果）。
+    notifyOn: ["success", "failed"] as ScheduleNotifyOn[],
+  };
+  // 频率：外部建的表达式（cronUnparsed）保存时不动它——界面选项表达不了它，
+  // 顺手回传一个"最接近"的值等于把别人的调度改坏（服务端仍按原表达式跑）。
+  const timing: { cron?: string; onceAt?: number } = {};
+  if (!cronUnparsed.value) {
+    if (taskDraft.scheduleType === "once") {
+      if (!taskDraft.scheduledAt)
+        return (taskError.value = tx("请选择执行时间", "Pick a run time", "Escolha o horário de execução", "कृपया निष्पादन समय चुनें"));
+      const at = new Date(taskDraft.scheduledAt).getTime();
+      if (!Number.isFinite(at))
+        return (taskError.value = tx("执行时间无效", "Invalid run time", "Horário inválido", "अमान्य समय"));
+      timing.onceAt = at;
+    } else {
+      const built = buildCron();
+      if (built.error) return (taskError.value = built.error);
+      timing.cron = built.cron;
+    }
+  }
+  tasksBusy.value = true;
+  taskError.value = "";
+  try {
+    if (editingTaskId.value) {
+      const updated = await patchChatSchedule(editingTaskId.value, { ...base, ...timing });
+      tasks.value = tasks.value.map((x) => (x.id === updated.id ? updated : x));
+    } else {
+      const created = await createChatSchedule({ ...base, conversationId, locale: uiLocale.value, ...timing });
+      tasks.value = [created, ...tasks.value];
+    }
+    closeTaskForm();
+  } catch (err) {
+    taskError.value = channelErrorText(err, tx("保存失败", "Save failed", "Falha ao salvar", "सहेजना विफल"));
+  } finally {
+    tasksBusy.value = false;
+  }
 }
 
-function toggleTask(id: string) {
+/** 暂停 / 启用：乐观改写本地，失败回滚（服务端才是真相）。 */
+async function toggleTask(id: string) {
   const t = tasks.value.find((x) => x.id === id);
   if (!t) return;
-  t.status = t.status === "active" ? "paused" : "active";
-  saveTasks();
-}
-
-function removeTask(id: string) {
-  tasks.value = tasks.value.filter((x) => x.id !== id);
-  saveTasks();
-}
-
-function taskNextRunText(t: ScheduledTask): string {
-  if (t.status !== "active") return tx("已暂停", "Paused", "Pausada", "रुका हुआ");
-  if (t.scheduleType === "once") {
-    if (!t.scheduledAt) return tx("未设置", "Unscheduled", "Sem horário", "समय निर्धारित नहीं");
-    return tx("执行于 ", "Runs at ", "Executa em ", "निष्पादन: ") + new Date(t.scheduledAt).toLocaleString();
+  const next = !t.enabled;
+  t.enabled = next;
+  try {
+    const updated = await patchChatSchedule(id, { enabled: next });
+    tasks.value = tasks.value.map((x) => (x.id === id ? updated : x));
+  } catch {
+    t.enabled = !next;
   }
-  return t.nextRun ? tx("下次 ", "Next ", "Próxima ", "अगली: ") + new Date(t.nextRun).toLocaleString() : "—";
+}
+
+async function removeTask(id: string) {
+  const prev = tasks.value;
+  tasks.value = tasks.value.filter((x) => x.id !== id);
+  try {
+    await deleteChatSchedule(id);
+  } catch {
+    tasks.value = prev;
+  }
+}
+
+function taskNextRunText(t: ScheduleDto): string {
+  if (!t.enabled) return tx("已暂停", "Paused", "Pausada", "रुका हुआ");
+  // 一次性任务跑完即停用：停在目标时刻上展示，不要显示一个不存在的「下次」。
+  if (t.onceAt) {
+    return t.lastRunAt
+      ? tx("已执行", "Ran", "Executada", "निष्पादित")
+      : tx("执行于 ", "Runs at ", "Executa em ", "निष्पादन: ") + formatShortTime(t.onceAt);
+  }
+  return t.nextRunAt ? tx("下次 ", "Next ", "Próxima ", "अगली: ") + formatShortTime(t.nextRunAt) : "—";
+}
+
+/**
+ * 一行卡片上的紧凑时间：今天的任务只显示时刻（省掉「9/21 」那截，给标题让出宽度），
+ * 其余沿用 formatShortTime 的「9/21 16:00」。完整语义（含「下次 / 执行于」前缀）在 title 里。
+ */
+function taskNextShort(t: ScheduleDto): string {
+  if (!t.enabled) return tx("已暂停", "Paused", "Pausada", "रुका हुआ");
+  if (t.onceAt) return t.lastRunAt ? tx("已执行", "Ran", "Executada", "निष्पादित") : formatShortTime(t.onceAt);
+  if (!t.nextRunAt) return "—";
+  const d = new Date(t.nextRunAt);
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}` : formatShortTime(t.nextRunAt);
+}
+
+/**
+ * 一行卡片放不下的信息全进悬浮提示：类型 + 下次 + 任务内容 + 结果回到 + 工具 + 通知。
+ * 卡面上只留标题/状态/时间，侧栏 200 来像素塞不下这些行。
+ */
+function taskCardTip(t: ScheduleDto): string {
+  const head = tx("编辑", "Edit", "Editar", "संपादित करें") + "：" + (t.name || t.prompt);
+  const lines = [head, `${taskKindText(t)} · ${taskNextRunText(t)}`];
+  if (t.name) lines.push(t.prompt);
+  lines.push(tx("结果回到", "Results to", "Resultado em", "परिणाम यहाँ") + "：" + taskConvText(t));
+  lines.push(tx("工具", "Tools", "Ferramentas", "टूल") + "：" + taskToolsFact(t));
+  const notify = taskNotifyFact(t);
+  if (notify) lines.push(tx("通知", "Notify", "Notificar", "सूचित करें") + "：" + notify);
+  return lines.filter(Boolean).join("\n");
+}
+
+/** 卡片上的周期标签：一次性 / 周期（服务端用 onceAt 与 cron 区分）。 */
+function taskKindText(t: ScheduleDto): string {
+  return t.onceAt
+    ? tx("一次性", "Once", "Única", "एक बार")
+    : tx("周期", "Recurring", "Recorrente", "आवधिक");
+}
+
+/** 任务绑定的对话标题（结果回投到这里）；对话已被删则如实回显 id，不假装还在。 */
+function taskConvText(t: ScheduleDto): string {
+  return conversations.value.find((c) => c.id === t.conversationId)?.title || t.conversationId;
 }
 
 /** 气泡里的一个工具步骤（MCP 工具调用）。 */
@@ -898,8 +1254,10 @@ const dropTarget = ref<{ id: string; after: boolean } | null>(null);
 const DRAG_SCROLL_STEP = 12;
 const DRAG_SCROLL_EDGE = 24;
 const fileInput = ref<HTMLInputElement | null>(null);
-/** 输入框元素引用：用于按内容自动撑高（交互优化）。 */
-const inputEl = ref<HTMLTextAreaElement | null>(null);
+/** 输入框组件引用（对话输入区与任务表单共用同一个 PromptBox 外壳）。 */
+const promptBoxEl = ref<InstanceType<typeof PromptBox> | null>(null);
+/** 输入框元素引用：用于按内容自动撑高（交互优化）。走组件暴露的 textarea，调用方用法不变。 */
+const inputEl = computed<HTMLTextAreaElement | null>(() => promptBoxEl.value?.el ?? null);
 /** 「停止」按钮：发送后原按钮被它替换，焦点得接过来（见 current.sending 的 watch）。 */
 const stopBtnRef = ref<HTMLButtonElement | null>(null);
 
@@ -2746,13 +3104,17 @@ async function reconnectMcp(id: string) {
 }
 
 /**
- * 行内连接状态展示：按「当前对话是否启用」感知，而不是直接透出服务端连接池状态。
- * 连接池是服务端进程级共享（其它对话建的连、空闲回收期内都活着），与当前对话的启用集无关；
+ * 行内连接状态展示：按「所在作用域是否启用」感知，而不是直接透出服务端连接池状态。
+ * 连接池是服务端进程级共享（其它对话建的连、空闲回收期内都活着），与当前作用域无关；
  * 直接透出会出现「复选框没勾却显示已连接」的自相矛盾。未启用的一律显示「未启用」，
- * 工具数仍保留展示（那是服务器能力信息，不随对话变）。
+ * 工具数仍保留展示（那是服务器能力信息，不随作用域变）。
+ * @param enabled 该行的启用集：连接器面板传当前对话的启用集，任务表单传草稿的勾选集。
  */
-function mcpRowState(s: McpServerStatus): { cls: string; text: string } {
-  if (!current.value.settings.mcpEnabled.includes(s.id)) {
+function mcpRowState(
+  s: McpServerStatus,
+  enabled: readonly string[] = current.value.settings.mcpEnabled,
+): { cls: string; text: string } {
+  if (!enabled.includes(s.id)) {
     return { cls: "idle", text: tx("未启用", "not enabled", "não ativado", "सक्षम नहीं") };
   }
   if (s.connected) return { cls: "ok", text: tx("已连接", "connected", "conectado", "कनेक्टेड") };
@@ -2760,6 +3122,23 @@ function mcpRowState(s: McpServerStatus): { cls: string; text: string } {
   if (s.error) return { cls: "err", text: tx("失败", "failed", "falhou", "विफल") };
   return { cls: "idle", text: tx("未连接", "not connected", "não conectado", "कनेक्ट नहीं") };
 }
+
+/** 任务表单一行：作用域是「这个任务勾选了哪些」（草稿集），不是当前对话的启用集。 */
+function taskRowState(s: McpServerStatus): { cls: string; text: string } {
+  return mcpRowState(s, taskDraft.mcpServers);
+}
+
+/**
+ * 工具条上那个按钮的文案：没勾显示「工具」，勾了显示「工具 · 已选标签」，
+ * 一眼能看出这个任务带哪些工具（工具条空间只够一行，超长由 CSS 省略）。
+ */
+const taskMcpTriggerText = computed(() => {
+  const base = tx("工具", "Tools", "Ferramentas", "टूल");
+  const ids = taskDraft.mcpServers;
+  if (!ids.length) return base;
+  const labels = ids.map((id) => mcpAvailable.value.find((s) => s.id === id)?.label || id);
+  return `${base} · ${labels.join(tx("、", ", ", ", ", ", "))}`;
+});
 
 // ---- 技能面板（与 MCP 面板同构：列表全局、启用集按对话持久化）----
 const skillOpen = ref(false);
@@ -3269,6 +3648,8 @@ onMounted(async () => {
   // 交给下面的 selectConversation / newConversation 按对话加载。
   window.addEventListener("mousedown", onOutsideTools);
   window.addEventListener("keydown", onEscTools);
+  // 任务表单的 Esc：capture 阶段先于上面几个 Esc 处理器，模态开着时由它独占（见 onTaskFormEsc）。
+  window.addEventListener("keydown", onTaskFormEsc, true);
   window.addEventListener("mousedown", onOutsideRes);
   window.addEventListener("mousedown", onOutsideDt);
   window.addEventListener("keydown", onCtxEscape);
@@ -3306,7 +3687,12 @@ onMounted(async () => {
   conversations.value = list;
   // 服务端给的是一份稳定默认序；「按最近活动」模式下要忽略 sortOrder 复算一次。
   resortConversations();
-  const target = list.find((c) => c.id === initialConversationId) || list[0];
+  // 定时任务列表与对话列表无关，可以并行拉（不阻塞首屏会话恢复）。
+  void loadTasks();
+  void loadNotifyChannels();
+  // IM 通知里的「打开对话」链接带 ?conv=<id>：显式指定优先于设备上次打开的对话。
+  const linkedConvId = String(router.currentRoute.value.query.conv || "").trim();
+  const target = list.find((c) => c.id === (linkedConvId || initialConversationId)) || list[0];
   try {
     if (target) selectConversation(target);
     else await newConversation();
@@ -3325,6 +3711,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onSidebarEsc);
   window.removeEventListener("mousedown", onOutsideTools);
   window.removeEventListener("keydown", onEscTools);
+  window.removeEventListener("keydown", onTaskFormEsc, true);
   window.removeEventListener("mousedown", onOutsideRes);
   window.removeEventListener("mousedown", onOutsideDt);
   window.removeEventListener("keydown", onCtxEscape);
@@ -3511,7 +3898,7 @@ onBeforeUnmount(() => {
         <div class="tasks">
           <div class="tasks-head">
             <span class="tasks-head__label">{{ tx("定时任务", "Scheduled tasks", "Tarefas agendadas", "अनुसूचित कार्य") }}</span>
-            <button v-if="tasks.length" class="primary-btn" type="button" @click="openTaskForm">
+            <button v-if="tasks.length" class="primary-btn" type="button" @click="openTaskForm()">
               + {{ tx("新建", "New", "Novo", "नया") }}
             </button>
           </div>
@@ -3532,30 +3919,38 @@ onBeforeUnmount(() => {
                 <span class="tasks-empty__chip">{{ tx("定时监控", "Monitors", "Monitoramentos", "मॉनिटर") }}</span>
                 <span class="tasks-empty__chip">{{ tx("自动报告", "Reports", "Relatórios", "रिपोर्ट") }}</span>
               </div>
-              <button class="primary-btn tasks-empty__cta" type="button" @click="openTaskForm">
+              <button class="primary-btn tasks-empty__cta" type="button" @click="openTaskForm()">
                 + {{ tx("新建定时任务", "New scheduled task", "Nova tarefa agendada", "नया अनुसूचित कार्य") }}
               </button>
             </div>
           </div>
           <div v-else class="task-list">
-            <div v-for="t in tasks" :key="t.id" class="task-card">
-              <div class="task-card__main">
-                <div class="task-card__title">{{ t.name }}</div>
-                <div class="task-card__prompt">{{ t.prompt }}</div>
-                <div class="task-card__meta">
-                  <span class="task-badge" :class="t.scheduleType">{{ t.scheduleType === 'once' ? tx('一次性', 'Once', 'Única', 'एक बार') : tx('周期', 'Recurring', 'Recorrente', 'आवधिक') }}</span>
-                  <span class="task-next">{{ taskNextRunText(t) }}</span>
-                </div>
-                <div class="task-card__srv">{{ taskServersText(t) }}</div>
-              </div>
-              <div class="task-card__ops">
+            <!-- 一行卡片：标题（省略）＋上次状态（有才显示）＋下次时间＋开关/删除。
+                 任务内容、结果回到、工具、通知这些信息一行放不下，全部收进标题的 title 悬浮提示。
+                 整行仍可点开编辑；操作按钮区 stop 掉卡片点击。 -->
+            <div
+              v-for="t in tasks"
+              :key="t.id"
+              class="task-card"
+              :class="{ paused: !t.enabled }"
+              @click="openTaskForm(t)"
+            >
+              <button
+                type="button"
+                class="task-card__title"
+                :title="taskCardTip(t)"
+                @click.stop="openTaskForm(t)"
+              >{{ t.name || t.prompt }}</button>
+              <span v-if="t.lastStatus" class="task-status" :class="t.lastStatus" :title="taskRunText(t)">{{ taskStatusText(t) }}</span>
+              <span class="task-next" :title="taskNextRunText(t)">{{ taskNextShort(t) }}</span>
+              <div class="task-card__ops" @click.stop>
                 <button
                   class="task-toggle"
                   type="button"
-                  :class="{ on: t.status === 'active' }"
+                  :class="{ on: t.enabled }"
                   role="switch"
-                  :aria-checked="t.status === 'active'"
-                  :title="t.status === 'active' ? tx('暂停', 'Pause', 'Pausar', 'रोकें') : tx('启用', 'Enable', 'Ativar', 'सक्रिय करें')"
+                  :aria-checked="t.enabled"
+                  :title="t.enabled ? tx('暂停', 'Pause', 'Pausar', 'रोकें') : tx('启用', 'Enable', 'Ativar', 'सक्रिय करें')"
                   @click="toggleTask(t.id)"
                 ><span class="task-toggle__knob"></span></button>
                 <button class="task-del" type="button" :title="tx('删除', 'Delete', 'Excluir', 'हटाएं')" @click="removeTask(t.id)">×</button>
@@ -3724,135 +4119,231 @@ onBeforeUnmount(() => {
     </Teleport>
 
     <Teleport to="body">
-      <div v-if="showTaskForm" class="modal-mask" @click.self="closeTaskForm">
-        <div class="modal" role="dialog" aria-modal="true" :aria-label="tx('新建定时任务', 'New scheduled task', 'Nova tarefa agendada', 'नया अनुसूचित कार्य')">
+      <!-- 刻意不挂 @click.self：点遮罩不关闭，只有「取消」/「×」/ Esc 能退出（见 onTaskFormEsc）。 -->
+      <div v-if="showTaskForm" class="modal-mask">
+        <div class="modal modal--task" role="dialog" aria-modal="true" :aria-label="tx('新建定时任务', 'New scheduled task', 'Nova tarefa agendada', 'नया अनुसूचित कार्य')">
           <div class="modal__head">
-            <span class="modal__title">{{ tx("新建定时任务", "New scheduled task", "Nova tarefa agendada", "नया अनुसूचित कार्य") }}</span>
+            <span class="modal__title">{{
+              editingTaskId
+                ? tx("编辑定时任务", "Edit scheduled task", "Editar tarefa agendada", "अनुसूचित कार्य संपादित करें")
+                : tx("新建定时任务", "New scheduled task", "Nova tarefa agendada", "नया अनुसूचित कार्य")
+            }}</span>
             <button class="modal__close" type="button" aria-label="Close" @click="closeTaskForm">×</button>
           </div>
           <div class="modal__body">
             <label class="field">
-              <span class="field__label">{{ tx("名称", "Name", "Nome", "नाम") }}</span>
+              <span class="field__label"
+                >{{ tx("名称", "Name", "Nome", "नाम") }}<span class="field__req" aria-hidden="true">*</span></span
+              >
               <input class="field__input" v-model="taskDraft.name" :placeholder="tx('例如：每日流量日报', 'e.g. Daily traffic report', 'Ex.: relatório diário de tráfego', 'उदा. दैनिक ट्रैफ़िक रिपोर्ट')" />
             </label>
-            <label class="field">
-              <span class="field__label">{{ tx("任务内容", "Task prompt", "Conteúdo da tarefa", "कार्य निर्देश") }}</span>
-              <textarea class="field__input field__textarea" v-model="taskDraft.prompt" rows="3" :placeholder="tx('智能体要自动执行的自然语言指令…', 'Natural-language instruction for the agent…', 'Instrução em linguagem natural para o agente executar…', 'एजेंट के लिए स्वतः निष्पादित होने वाला प्राकृतिक-भाषा निर्देश…')"></textarea>
-            </label>
             <div class="field">
-              <span class="field__label">{{ tx("MCP 工具（到点运行时可用）", "MCP tools (available at run time)", "Ferramentas MCP (disponíveis na execução)", "MCP टूल (रन के समय उपलब्ध)") }}</span>
-              <div ref="taskMcpRoot" class="mcp-select">
-                <button
-                  type="button"
-                  class="mcp-select__trigger"
-                  :class="{ open: taskMcpOpen }"
-                  :aria-expanded="taskMcpOpen"
-                  @click="toggleTaskMcp()"
-                >
-                  <span v-if="taskDraft.mcpServers.length" class="mcp-select__chips">
-                    <span v-for="id in taskDraft.mcpServers" :key="id" class="mcp-select__chip">{{
-                      mcpAvailable.find((s) => s.id === id)?.label || id
-                    }}</span>
-                  </span>
-                  <span v-else class="mcp-select__placeholder">{{
-                    tx("选择 MCP 服务器（可多选）", "Choose MCP servers (multi)", "Escolher servidores MCP (múltiplo)", "MCP सर्वर चुनें (बहु-चयन)")
-                  }}</span>
-                  <span class="mcp-select__caret" :class="{ flip: taskMcpOpen }" aria-hidden="true">▾</span>
-                </button>
-                <Teleport to="body">
-                  <div
-                    v-if="taskMcpOpen"
-                    ref="taskMcpPanel"
-                    class="mcp-select__panel"
-                    :style="{ top: taskMcpPos.top + 'px', left: taskMcpPos.left + 'px', width: taskMcpPos.width + 'px' }"
-                    role="listbox"
-                    aria-multiselectable="true"
-                  >
+              <span class="field__label"
+                >{{ tx("任务内容", "Task prompt", "Conteúdo da tarefa", "कार्य निर्देश") }}<span class="field__req" aria-hidden="true">*</span></span
+              >
+              <!-- 直接复用对话输入区那套外壳（PromptBox）；工具选择也照对话区的样子放进底部工具条，
+                   不再单独占一块字段——「要执行的指令」和「带哪些工具」本来就是同一件事的两半。 -->
+              <PromptBox
+                v-model="taskDraft.prompt"
+                :min-height="104"
+                :aria-label="tx('任务内容', 'Task prompt', 'Conteúdo da tarefa', 'कार्य निर्देश')"
+                :placeholder="tx('智能体要自动执行的自然语言指令…', 'Natural-language instruction for the agent…', 'Instrução em linguagem natural para o agente executar…', 'एजेंट के लिए स्वतः निष्पादित होने वाला प्राकृतिक-भाषा निर्देश…')"
+              >
+                <template #toolbar-left>
+                  <div ref="taskMcpRoot" class="mcp-select mcp-select--inline">
                     <button
-                      v-for="s in mcpAvailable"
-                      :key="s.id"
                       type="button"
-                      class="mcp-select__opt"
-                      :class="{ active: taskDraft.mcpServers.includes(s.id) }"
-                      role="option"
-                      :aria-selected="taskDraft.mcpServers.includes(s.id)"
-                      @click="toggleTaskServer(s.id)"
+                      class="icon-btn task-mcp-btn"
+                      :class="{ on: taskMcpOpen }"
+                      :aria-expanded="taskMcpOpen"
+                      :title="tx('工具（到点运行时可用）', 'Tools (available at run time)', 'Ferramentas (disponíveis na execução)', 'टूल (रन के समय उपलब्ध)')"
+                      @click="toggleTaskMcp()"
                     >
-                      <span class="mcp-dot" :class="s.connected ? 'ok' : 'idle'" aria-hidden="true"></span>
-                      <span class="mcp-select__opt-label">{{ s.label }}</span>
-                      <span class="mcp-select__opt-sub"
-                        >{{ s.tools }} {{ tx("工具", "tools", "ferramentas", "टूल") }}<template
-                          v-if="!s.connected"
-                          >· {{ tx("未连接", "not connected", "não conectado", "कनेक्ट नहीं") }}</template
-                        ></span
-                      >
-                      <span v-if="taskDraft.mcpServers.includes(s.id)" class="mcp-select__check" aria-hidden="true">✓</span>
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 5v14M5 12h14" />
+                      </svg>
+                      <span class="task-mcp-btn__text">{{ taskMcpTriggerText }}</span>
+                      <span class="mcp-select__caret" :class="{ flip: taskMcpOpen }" aria-hidden="true">▾</span>
                     </button>
-                    <p v-if="!mcpAvailable.length" class="mcp-select__empty">
-                      {{ tx("暂无可用 MCP 服务器", "No MCP servers available", "Nenhum servidor MCP disponível", "कोई MCP सर्वर उपलब्ध नहीं") }}
-                    </p>
+                    <Teleport to="body">
+                      <div
+                        v-if="taskMcpOpen"
+                        ref="taskMcpPanel"
+                        class="mcp-select__panel"
+                        :style="{ top: taskMcpPos.top + 'px', left: taskMcpPos.left + 'px', width: taskMcpPos.width + 'px' }"
+                        role="listbox"
+                        aria-multiselectable="true"
+                      >
+                        <button
+                          v-for="s in mcpAvailable"
+                          :key="s.id"
+                          type="button"
+                          class="mcp-select__opt"
+                          :class="{ active: taskDraft.mcpServers.includes(s.id) }"
+                          role="option"
+                          :aria-selected="taskDraft.mcpServers.includes(s.id)"
+                          @click="toggleTaskServer(s.id)"
+                        >
+                          <span class="mcp-dot" :class="taskRowState(s).cls" aria-hidden="true"></span>
+                          <span class="mcp-select__opt-label">{{ s.label }}</span>
+                          <!-- 状态按「本任务是否勾选」判定：连接池是进程级共享的，直接透出会显示「没勾却已连接」。 -->
+                          <span class="mcp-select__opt-sub"
+                            >{{ s.tools }} {{ tx("工具", "tools", "ferramentas", "टूल") }} · {{ taskRowState(s).text }}</span
+                          >
+                          <span v-if="taskDraft.mcpServers.includes(s.id)" class="mcp-select__check" aria-hidden="true">✓</span>
+                        </button>
+                        <p v-if="!mcpAvailable.length" class="mcp-select__empty">
+                          {{ tx("暂无可用 MCP 服务器", "No MCP servers available", "Nenhum servidor MCP disponível", "कोई MCP सर्वर उपलब्ध नहीं") }}
+                        </p>
+                        <!-- 原来的字段说明搬进面板：工具条上放不下这么长一句。 -->
+                        <p v-else class="mcp-select__foot">{{
+                          tx(
+                            "不勾选则不带任何 MCP 工具运行；写操作到点运行时仍按风险策略确认。",
+                            "Leave unchecked to run without MCP tools; write actions at run time still follow the risk policy.",
+                            "Deixe desmarcado para executar sem ferramentas MCP; ações de escrita na execução ainda seguem a política de risco.",
+                            "अनचेक छोड़ें तो MCP टूल के बिना चलेगा; रन के समय राइट एक्शन जोखिम नीति का पालन करेंगे।",
+                          )
+                        }}</p>
+                      </div>
+                    </Teleport>
                   </div>
-                </Teleport>
+                </template>
+              </PromptBox>
+            </div>
+            <!-- 分组：上面是「这个任务是什么」，这一组是「到点怎么跑、结果往哪送」。 -->
+            <div class="task-section">
+              <span class="task-section__label">{{
+                tx("到点运行时", "At run time", "Na execução", "रन के समय")
+              }}</span>
+              <!-- 结果通知：勾了通道，到点跑完推送到钉钉/飞书机器人；不勾只回投对话。 -->
+              <div class="field">
+                <span class="field__label">{{ tx("执行结果通知", "Notify results", "Notificar resultados", "परिणाम सूचित करें") }}</span>
+              <!-- 每个任务选自己的通知通道；通道的增删改在顶部工具条「通知」里管理。 -->
+              <div class="notify-rows">
+                <button
+                  v-for="ch in notifyChannels"
+                  :key="ch.id"
+                  type="button"
+                  class="notify-row"
+                  :class="{ active: taskDraft.notifyChannelIds.includes(ch.id), disabled: !ch.enabled }"
+                  role="switch"
+                  :aria-checked="taskDraft.notifyChannelIds.includes(ch.id)"
+                  :aria-disabled="!ch.enabled"
+                  :disabled="!ch.enabled"
+                  @click="toggleTaskChannel(ch.id)"
+                >
+                  <span class="notify-row__text">
+                    <span class="notify-row__name">{{ ch.label }}</span>
+                    <span class="notify-row__host">{{ ch.kind }} · {{ ch.host }}</span>
+                  </span>
+                  <span class="notify-row__meta">
+                    <span class="notify-row__state" :class="{ on: taskDraft.notifyChannelIds.includes(ch.id) }">{{
+                      !ch.enabled
+                        ? tx("已停用", "Disabled", "Desativado", "अक्षम")
+                        : (taskDraft.notifyChannelIds.includes(ch.id) ? tx("已开启", "On", "Ativo", "चालू") : tx("已关闭", "Off", "Desligado", "बंद"))
+                    }}</span>
+                    <span class="notify-switch" :class="{ on: taskDraft.notifyChannelIds.includes(ch.id) }" aria-hidden="true">
+                      <span class="notify-switch__knob"></span>
+                    </span>
+                  </span>
+                </button>
+                <span v-if="!notifyChannels.length" class="notify-empty">{{
+                  tx("还没有通知通道，去顶部「通知」里添加", "No channels yet — add one from Notify in the top bar", "Nenhum canal ainda — adicione no Notificar da barra superior", "अभी कोई चैनल नहीं — शीर्ष पट्टी के नोटिफ़ाई से जोड़ें")
+                }}</span>
               </div>
-              <p class="repeat-preview">{{ tx("不勾选则不带任何 MCP 工具运行；写操作到点运行时仍按风险策略确认。", "Leave unchecked to run without MCP tools; write actions at run time still follow the risk policy.", "Deixe desmarcado para executar sem ferramentas MCP; ações de escrita na execução ainda seguem a política de risco.", "अनचेक छोड़ें तो MCP टूल के बिना चलेगा; रन के समय राइट एक्शन जोखिम नीति का पालन करेंगे।") }}</p>
+              <p class="repeat-preview">{{
+                tx(
+                  "勾选的通道会在本任务到点运行结束时收到结果推送（成功与失败都推）；不勾则结果只回投到对话里。通道的增删改见下方「管理通知通道」。",
+                  "Checked channels receive this task's result on completion (success and failure); otherwise the result stays in the chat. Add or edit channels under Manage channels below.",
+                  "Os canais marcados recebem o resultado desta tarefa ao concluir (sucesso e falha); caso contrário, fica no chat. Adicione/edite canais em Gerenciar canais abaixo.",
+                  "चुने गए चैनल को इस कार्य का परिणाम मिलेगा (सफल/विफल); वरना चैट में रहेगा। चैनल नीचे 'चैनल प्रबंधित करें' से जोड़ें/बदलें।",
+                )
+              }}</p>
+              <div class="notify-manage">
+                <details class="notify-collapse" open>
+                  <summary>{{ tx("管理通知通道", "Manage channels", "Gerenciar canais", "चैनल प्रबंधित करें") }}</summary>
+                  <div class="notify-form">
+                  <!-- 自定义下拉（antd/vben 风格）：原生 select 的 option 样式无法控制，与弹窗风格割裂。 -->
+                  <UiSelect
+                    v-model="channelDraft.kind"
+                    class="notify-kind"
+                    block
+                    :options="[
+                      { value: 'dingtalk', label: 'DingTalk' },
+                      { value: 'feishu', label: 'Feishu' },
+                    ]"
+                    :aria-label="tx('通道类型', 'Channel type', 'Tipo de canal', 'चैनल प्रकार')"
+                  />
+                  <input class="field__input" v-model="channelDraft.label" :placeholder="tx('备注名（如：数据群）', 'Label (e.g. data group)', 'Nome (ex.: grupo de dados)', 'नाम (जैसे: डेटा ग्रुप)')" />
+                  <input class="field__input notify-wide" v-model="channelDraft.webhook" placeholder="Webhook URL" />
+                  <input class="field__input" v-model="channelDraft.secret" :placeholder="tx('加签密钥（可选）', 'Sign secret (optional)', 'Segredo da assinatura (opcional)', 'हस्ताक्षर सीक्रेट (वैकल्पिक)')" />
+                  <input class="field__input" v-model="channelDraft.keyword" :placeholder="tx('关键词（可选）', 'Keyword (optional)', 'Palavra-chave (opcional)', 'कीवर्ड (वैकल्पिक)')" />
+                  <button class="primary-btn" type="button" :disabled="notifyBusy" @click="saveChannelDraft">
+                    {{ tx("保存通道", "Save channel", "Salvar canal", "चैनल सहेजें") }}
+                  </button>
+                </div>
+                </details>
+                <ul v-if="notifyChannels.length" class="notify-list">
+                  <li v-for="ch in notifyChannels" :key="ch.id" class="notify-item">
+                    <button
+                      type="button"
+                      class="notify-item__switch"
+                      role="switch"
+                      :aria-checked="Boolean(ch.enabled)"
+                      :aria-label="tx('通道启用', 'Channel enabled', 'Canal ativo', 'चैनल सक्रिय')"
+                      @click="toggleChannelEnabled(ch)"
+                    >
+                      <span class="notify-switch" :class="{ on: Boolean(ch.enabled) }" aria-hidden="true">
+                        <span class="notify-switch__knob"></span>
+                      </span>
+                    </button>
+                    <span class="notify-item__text">
+                      <span class="notify-item__label">{{ ch.label }}</span>
+                      <span class="notify-item__host"
+                        >{{ ch.kind }} · {{ ch.host }}<template v-if="ch.hasSecret"> · {{ tx("已配密钥", "secret set", "com segredo", "सीक्रेट सेट") }}</template></span
+                      >
+                    </span>
+                    <button class="notify-btn" type="button" :disabled="notifyBusy" @click="testChannel(ch.id)">
+                      {{ tx("测试", "Test", "Testar", "टेस्ट") }}
+                    </button>
+                    <button class="notify-btn notify-btn--danger" type="button" :disabled="notifyBusy" :title="tx('删除通道', 'Delete channel', 'Excluir canal', 'चैनल हटाएँ')" @click="removeChannel(ch.id)">×</button>
+                  </li>
+                </ul>
+                <p v-if="notifyNote" class="notify-note">{{ notifyNote }}</p>
+              </div>
             </div>
             <div class="field">
-              <span class="field__label">{{ tx("频率", "Schedule", "Agendamento", "शेड्यूल") }}</span>
-              <div class="seg">
-                <button type="button" class="seg__btn" :class="{ active: taskDraft.scheduleType === 'recurring' }" @click="taskDraft.scheduleType = 'recurring'">{{ tx("周期", "Recurring", "Recorrente", "आवधिक") }}</button>
-                <button type="button" class="seg__btn" :class="{ active: taskDraft.scheduleType === 'once' }" @click="taskDraft.scheduleType = 'once'">{{ tx("一次性", "Once", "Única", "एक बार") }}</button>
-              </div>
-            </div>
-            <template v-if="taskDraft.scheduleType === 'recurring'">
-              <div class="field">
-                <span class="field__label">{{ tx("重复频率", "Repeat", "Repetição", "दोहराव") }}</span>
-                <div class="seg">
-                  <button
-                    v-for="f in REPEAT_FREQS"
-                    :key="f.code"
-                    type="button"
-                    class="seg__btn"
-                    :class="{ active: taskRepeat.freq === f.code }"
-                    @click="taskRepeat.freq = f.code"
-                  >{{ tx(f.zh, f.en, f.pt, f.hi) }}</button>
+              <span class="field__label">{{ tx("执行频率", "Frequency", "Frequência", "आवृत्ति") }}</span>
+              <!-- 一行内联：周期/一次性 + 「每 N 单位 于 时刻」。选择器各自紧凑，不再拆成三个带标题的字段块。 -->
+              <div class="freq-row">
+                <div class="seg seg--inline">
+                  <button type="button" class="seg__btn" :disabled="cronUnparsed" :class="{ active: taskDraft.scheduleType === 'recurring' }" @click="taskDraft.scheduleType = 'recurring'">{{ tx("周期", "Recurring", "Recorrente", "आवधिक") }}</button>
+                  <button type="button" class="seg__btn" :disabled="cronUnparsed" :class="{ active: taskDraft.scheduleType === 'once' }" @click="taskDraft.scheduleType = 'once'">{{ tx("一次性", "Once", "Única", "एक बार") }}</button>
                 </div>
-              </div>
-              <div class="field">
-                <span class="field__label">{{ tx("间隔", "Interval", "Intervalo", "अंतराल") }}</span>
-                <div class="repeat-row">
-                  <span class="repeat-text">{{ tx("每", "Every", "A cada", "हर") }}</span>
+                <template v-if="!cronUnparsed && taskDraft.scheduleType === 'recurring'">
+                  <span class="freq-text">{{ tx("每", "Every", "A cada", "हर") }}</span>
                   <input
-                    class="field__input repeat-num"
+                    class="field__input freq-num"
                     type="number"
                     min="1"
                     max="99"
+                    :aria-label="tx('间隔', 'Interval', 'Intervalo', 'अंतराल')"
                     v-model.number="taskRepeat.interval"
                   />
-                  <span class="repeat-text">{{ repeatUnit }}</span>
-                </div>
-              </div>
-              <div v-if="taskRepeat.freq === 'WEEKLY'" class="field">
-                <span class="field__label">{{ tx("选择星期", "Weekdays", "Dias da semana", "सप्ताह के दिन") }}</span>
-                <div class="repeat-row">
-                  <button
-                    v-for="w in WEEKDAYS"
-                    :key="w.code"
-                    type="button"
-                    class="wd-chip"
-                    :class="{ active: taskRepeat.byday.includes(w.code) }"
-                    @click="toggleWeekday(w.code)"
-                  >{{ tx(w.zh, w.en, w.pt, w.hi) }}</button>
-                </div>
-              </div>
-              <label v-if="taskRepeat.freq !== 'HOURLY'" class="field">
-                <span class="field__label">{{ tx("执行时刻", "Run at", "Horário", "समय") }}</span>
-                <input class="field__input" type="time" v-model="taskRepeat.time" />
-              </label>
-              <p class="repeat-preview">{{ repeatPreview }}</p>
-            </template>
-            <div v-else class="field">
-              <span class="field__label">{{ tx("执行时间", "Run at", "Data e hora", "समय") }}</span>
-              <div ref="dtRoot" class="dt">
+                  <UiSelect
+                    v-model="taskRepeat.freq"
+                    class="freq-unit"
+                    :options="REPEAT_FREQS.map((f) => ({ value: f.code, label: tx(f.unitZh, f.unitEn, f.unitPt, f.unitHi) }))"
+                    :aria-label="tx('重复频率', 'Repeat', 'Repetição', 'दोहराव')"
+                  />
+                  <template v-if="taskRepeat.freq !== 'HOURLY'">
+                    <span class="freq-text">{{ tx("于", "at", "às", "को") }}</span>
+                    <input class="field__input freq-time" type="time" v-model="taskRepeat.time" :aria-label="tx('执行时刻', 'Run at', 'Horário', 'समय')" />
+                  </template>
+                </template>
+                <!-- 显式 else-if：cronUnparsed 时两边都不渲染（那种任务只在下面展示原表达式）。 -->
+                <template v-else-if="taskDraft.scheduleType === 'once'">
+                  <div ref="dtRoot" class="dt dt--inline">
                 <button
                   type="button"
                   class="field__input dt__field"
@@ -3937,13 +4428,43 @@ onBeforeUnmount(() => {
                   </div>
                   </div>
                 </Teleport>
+                  </div>
+                </template>
+              </div>
+              <!-- 每周：星期多选单独一行（7 个圆片塞不进频率行）。 -->
+              <div v-if="!cronUnparsed && taskDraft.scheduleType === 'recurring' && taskRepeat.freq === 'WEEKLY'" class="repeat-row">
+                <button
+                  v-for="w in WEEKDAYS"
+                  :key="w.code"
+                  type="button"
+                  class="wd-chip"
+                  :class="{ active: taskRepeat.byday.includes(w.code) }"
+                  @click="toggleWeekday(w.code)"
+                >{{ tx(w.zh, w.en, w.pt, w.hi) }}</button>
+              </div>
+              <!-- 外部建的表达式：只读展示原样，不猜一个相近的覆盖它（保存时整段频率都不回传）。 -->
+              <p v-if="cronUnparsed" class="repeat-preview">
+                {{
+                  tx(
+                    "该任务用的是外部创建的高级表达式，下方选项表达不了它，本次保存不会改动频率：",
+                    "This task uses an advanced expression created outside the UI; the options below cannot express it, so saving leaves the schedule untouched:",
+                    "Esta tarefa usa uma expressão avançada criada fora da interface; salvar não altera o agendamento:",
+                    "यह कार्य UI के बाहर बनाई गई उन्नत अभिव्यक्ति का उपयोग करता है; सहेजने पर समय-सारिणी नहीं बदलेगी:",
+                  )
+                }}
+                <code class="cron-raw">{{ editingCron }}</code>
+              </p>
+              <!-- 周期任务的纯文本预览（保存的是 cron，用户看的是这句话）。 -->
+              <p v-else-if="taskDraft.scheduleType === 'recurring'" class="repeat-preview">{{ repeatPreview }}</p>
               </div>
             </div>
             <p v-if="taskError" class="field__error">{{ taskError }}</p>
           </div>
           <div class="modal__foot">
             <button class="ghost-btn" type="button" @click="closeTaskForm">{{ tx("取消", "Cancel", "Cancelar", "रद्द करें") }}</button>
-            <button class="primary-btn" type="button" @click="createTask">{{ tx("创建", "Create", "Criar", "बनाएं") }}</button>
+            <button class="primary-btn" type="button" :disabled="tasksBusy" @click="submitTask">
+              {{ editingTaskId ? tx("保存", "Save", "Salvar", "सहेजें") : tx("创建", "Create", "Criar", "बनाएं") }}
+            </button>
           </div>
         </div>
       </div>
@@ -4397,27 +4918,31 @@ onBeforeUnmount(() => {
             hidden
             @change="pickFiles"
           />
-          <div class="composer-box">
-            <div
-              class="composer-grip"
-              :title="tx('拖拽调整输入框高度，双击恢复自动', 'Drag to resize the input, double-click to reset', 'Arraste para redimensionar a entrada; duplo clique para restaurar', 'इनपुट का आकार बदलने के लिए खींचें; स्वतः बहाल करने के लिए डबल-क्लिक करें')"
-              @mousedown.prevent="startComposerResize"
-              @dblclick="resetComposerSize"
-            >
-              <span class="composer-grip__bar"></span>
-            </div>
-            <textarea
-              id="chat-input"
-              ref="inputEl"
-              v-model="current.input"
-              class="input"
-              name="message"
-              rows="1"
-              :placeholder="tx('输入消息…', 'Type a message…', 'Digite uma mensagem…', 'संदेश लिखें…')"
-              @input="autoGrow"
-              @keydown="onKeydown"
-            ></textarea>
-            <div class="composer-bar">
+          <PromptBox
+            ref="promptBoxEl"
+            v-model="current.input"
+            id="chat-input"
+            name="message"
+            rows="1"
+            :min-height="COMPOSER_BASE"
+            :max-height="COMPOSER_AUTO_MAX"
+            :pad-top="6"
+            :placeholder="tx('输入消息…', 'Type a message…', 'Digite uma mensagem…', 'संदेश लिखें…')"
+            :hint="tx('Enter 发送 · Shift+Enter 换行', 'Enter to send · Shift+Enter for a new line', 'Enter envia · Shift+Enter nova linha', 'भेजने के लिए Enter · नई पंक्ति के लिए Shift+Enter')"
+            @input="autoGrow"
+            @keydown="onKeydown"
+          >
+            <template #top>
+              <div
+                class="composer-grip"
+                :title="tx('拖拽调整输入框高度，双击恢复自动', 'Drag to resize the input, double-click to reset', 'Arraste para redimensionar a entrada; duplo clique para restaurar', 'इनपुट का आकार बदलने के लिए खींचें; स्वतः बहाल करने के लिए डबल-क्लिक करें')"
+                @mousedown.prevent="startComposerResize"
+                @dblclick="resetComposerSize"
+              >
+                <span class="composer-grip__bar"></span>
+              </div>
+            </template>
+            <template #toolbar-left>
               <div ref="toolsRoot" class="tools-menu-box">
                 <button
                   type="button"
@@ -4693,7 +5218,8 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
-              <span class="composer-hint">{{ tx("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for a new line", "Enter envia · Shift+Enter nova linha", "भेजने के लिए Enter · नई पंक्ति के लिए Shift+Enter") }}</span>
+            </template>
+            <template #toolbar-right>
               <button
                 v-if="current.sending"
                 ref="stopBtnRef"
@@ -4731,8 +5257,8 @@ onBeforeUnmount(() => {
                   <path d="m5 12 7-7 7 7" />
                 </svg>
               </button>
-            </div>
-          </div>
+            </template>
+          </PromptBox>
         </div>
       </footer>
       <transition name="fade">
@@ -5046,14 +5572,17 @@ onBeforeUnmount(() => {
   padding-right: 2px;
 }
 
+/* 整张卡可点开编辑；一行排布（标题省略 + 状态 + 下次时间 + 开关/删除），
+   任务内容等次要信息收进标题的 title 悬浮提示。 */
 .task-card {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
+  cursor: pointer;
   transition:
     border-color 0.15s ease,
     box-shadow 0.15s ease;
@@ -5064,58 +5593,377 @@ onBeforeUnmount(() => {
   box-shadow: 0 6px 16px color-mix(in srgb, var(--ink) 8%, transparent);
 }
 
-.task-card__main {
+/* 已暂停：整体降噪，但不禁用——暂停的任务仍要能点开编辑 / 删除 / 重新启用。 */
+.task-card.paused {
+  opacity: 0.6;
+}
+
+.task-card.paused:hover {
+  opacity: 1;
+}
+
+/* 标题本身是「编辑」入口（键盘可达）；鼠标点卡片任意位置等效。 */
+.task-card__title {
   flex: 1;
   min-width: 0;
-}
-
-.task-card__title {
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
   font-weight: 600;
-  font-size: 14px;
-  margin-bottom: 3px;
-}
-
-.task-card__prompt {
-  font-size: 13px;
-  color: var(--muted);
-  line-height: 1.5;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-
-.task-card__meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-/* 任务允许的 MCP 服务器（最小权限允许清单的可见化） */
-.task-card__srv {
-  margin-top: 5px;
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.task-badge {
-  padding: 1px 8px;
+.task-card__title:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* 最近一次执行结果：色彩只用于状态，不做大块底色；详细原因挂在 title 上。 */
+.task-status {
+  flex: none;
+  padding: 1px 7px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--line);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.task-status.success {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 40%, var(--line));
+  background: var(--success-soft);
+}
+
+.task-status.failed,
+.task-status.error {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  background: var(--danger-soft);
+}
+
+/* 一行卡片上的下次时间：不抢标题宽度，也不换行。 */
+.task-next {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* ---- 任务表单：结果通知（仅通道管理；逐任务勾选已移除，通知由通道启用开关控制）---- */
+
+/* antd / vben 风格开关：关=浅底灰轨，开=主题绿（与任务卡片启用色一致）。 */
+.notify-switch {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  flex: none;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 14%, transparent);
+  transition:
+    background 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.notify-switch__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 30%, transparent);
+  transition: transform 0.2s ease;
+}
+
+.notify-switch.on {
+  background: color-mix(in srgb, var(--success) 82%, transparent);
+  box-shadow: inset 0 0 0 1px transparent;
+}
+
+.notify-switch.on .notify-switch__knob {
+  transform: translateX(16px);
+}
+
+.notify-item__switch {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.notify-item__switch:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* 通道管理：外层卡片；其中「添加通道」表单可折叠，通道列表是同级、始终可见。 */
+.notify-manage {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+/* 可折叠区：标题 + 添加表单；收起时只剩标题，列表不受影响。 */
+.notify-collapse {
+  border-bottom: 1px solid var(--line);
+}
+
+.notify-collapse summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.notify-collapse summary::-webkit-details-marker {
+  display: none;
+}
+
+.notify-collapse summary::before {
+  content: "▸";
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+.notify-collapse[open] summary::before {
+  transform: rotate(90deg);
+}
+
+/* 通道勾选行：整行可点，右侧开关表示「本任务勾选了这个通道」。 */
+.notify-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notify-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.notify-row:hover {
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
+  background: var(--fill-soft);
+}
+
+.notify-row.active {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--line));
+  background: color-mix(in srgb, var(--success) 6%, var(--panel));
+}
+
+.notify-row__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.notify-row__name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notify-row__host {
+  font-size: 11.5px;
+  color: var(--muted);
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右侧：状态文字 + antd 式开关。整行是 role=switch，这里只负责排版。 */
+.notify-row__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.notify-row__state {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.notify-row__state.on {
+  color: color-mix(in srgb, var(--success) 82%, var(--ink));
   font-weight: 600;
 }
 
-.task-badge.once {
-  color: color-mix(in srgb, #d99a1f 85%, var(--ink));
-  border-color: color-mix(in srgb, #d99a1f 40%, var(--line));
-  background: color-mix(in srgb, #d99a1f 12%, transparent);
+.notify-row.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.notify-empty {
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+/* 两列对齐：类型 | 备注名，URL 整行，密钥 | 关键词，按钮右下角 */
+.notify-form {
+  display: grid;
+  grid-template-columns: minmax(96px, 120px) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px 10px;
+  padding: 12px 12px 6px;
+}
+
+/* 表单里的输入框沿用 .field__input 的边框/圆角，这里只压尺寸（弹窗内要紧凑）。 */
+.notify-form .field__input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+/* 通道类型下拉（UiSelect）：字号与同排输入框一致（高度已是 38px 同档）。 */
+.notify-form .notify-kind :deep(.uisel__trigger) {
+  font-size: 12px;
+}
+
+.notify-form .notify-wide {
+  grid-column: 1 / -1;
+}
+
+.notify-form .primary-btn {
+  grid-column: 2;
+  justify-self: end;
+  padding: 7px 14px;
+  font-size: 12px;
+}
+
+.notify-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notify-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.notify-item__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.notify-item__label {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.notify-item__host {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.notify-btn {
+  flex: none;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.notify-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ink) 30%, var(--line));
+  background: var(--fill-soft);
+}
+
+.notify-btn--danger {
+  color: var(--danger);
+}
+
+.notify-btn--danger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+}
+
+.notify-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.notify-note {
+  margin: 0;
+  padding: 0 12px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .task-card__ops {
@@ -5152,8 +6000,10 @@ onBeforeUnmount(() => {
     background 0.18s ease;
 }
 
+/* 开 = 任务在跑：用成功绿。这里原来用的是 --stop（停止生成语义色），
+   橙色开关在"启用一台定时任务"的语境里读起来像"已停止"，语义是反的。 */
 .task-toggle.on {
-  background: color-mix(in srgb, var(--stop) 80%, transparent);
+  background: color-mix(in srgb, var(--success) 78%, transparent);
   border-color: transparent;
 }
 
@@ -5166,9 +6016,14 @@ onBeforeUnmount(() => {
   box-shadow: var(--ring);
 }
 
+/* 删除按钮：默认降噪、悬停才亮（编辑入口是卡片本体与标题）。 */
 .task-del {
   width: 24px;
   height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   border: none;
   border-radius: 6px;
   background: transparent;
@@ -5188,6 +6043,18 @@ onBeforeUnmount(() => {
   opacity: 1;
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 12%, transparent);
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* 外部建的 cron 表达式：等宽字体 + 底纹，和普通说明文字区分开。 */
+.cron-raw {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--fill-soft);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
 /* 弹窗：新建定时任务 */
@@ -5205,9 +6072,10 @@ onBeforeUnmount(() => {
 
 .modal {
   width: 100%;
-  max-width: 460px;
-  max-height: 90dvh;
-  overflow: auto;
+  max-width: 640px;
+  max-height: 88dvh;
+  /* 头/底固定，只有内容区滚动 */
+  overflow: hidden;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -5217,17 +6085,20 @@ onBeforeUnmount(() => {
 }
 
 .modal__head {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 18px;
+  gap: 12px;
+  padding: 16px 24px;
   border-bottom: 1px solid var(--line);
 }
 
 .modal__title {
   font-family: var(--font-display);
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .modal__close {
@@ -5248,18 +6119,69 @@ onBeforeUnmount(() => {
 }
 
 .modal__body {
-  padding: 16px 18px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 22px 24px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 20px;
+}
+
+/* 任务表单：单列堆叠（频率、通知都收进各自一行内联控件，不需要双列）。 */
+.modal--task .modal__body > * {
+  min-width: 0;
+}
+
+.modal--task .modal__body {
+  gap: 18px;
+}
+
+/* 分组：把「到点怎么跑、结果往哪送」和上面的「任务是什么」分开，读起来是两段而不是六块。 */
+.task-section {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 18px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--fill-soft) 45%, transparent);
+}
+
+.task-section__label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+/* vben 分区标题的左侧竖条 */
+.task-section__label::before {
+  content: "";
+  width: 3px;
+  height: 13px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ink) 45%, transparent);
 }
 
 .modal__foot {
+  flex: none;
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  padding: 14px 18px;
+  gap: 10px;
+  padding: 14px 24px;
   border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+/* 底部按钮：antd 的按钮等高 + 主/次按钮等宽下限（88px），不再随文案长短忽宽忽窄。 */
+.modal__foot .ghost-btn,
+.modal__foot .primary-btn {
+  min-width: 88px;
+  height: 36px;
+  padding: 0 16px;
 }
 
 /* 删除确认弹窗：antd / Vben 风格——左侧危险图标 + 文本块，底部右对齐双按钮。 */
@@ -5307,23 +6229,33 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
+/* 表单项：标签 8px 间距 + 深色标签（antd 的 label 是 rgba(0,0,0,.88) 而非灰）。 */
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .field__label {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 500;
-  color: var(--muted);
+  color: var(--ink-2);
+}
+
+/* 必填星号（antd required mark）。 */
+.field__req {
+  margin-left: 3px;
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .field__input {
   width: 100%;
+  /* 与 antd 一致：所有控件同一高度档（38px），select / time / number 才不会参差不齐。 */
+  min-height: 38px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 9px 11px;
+  padding: 10px 12px;
   background: var(--fill);
   color: var(--ink);
   font-family: var(--font-body);
@@ -5340,10 +6272,7 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 14%, transparent);
 }
 
-.field__textarea {
-  resize: vertical;
-  min-height: 64px;
-}
+/* 卡片式输入框的样式在 components/PromptBox.vue 里（对话输入区与任务表单共用，不在这里重复一份）。 */
 
 .field__error {
   margin: 0;
@@ -5355,6 +6284,7 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 4px;
   padding: 4px;
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--fill-soft);
 }
@@ -5368,7 +6298,7 @@ onBeforeUnmount(() => {
   font: inherit;
   font-size: 13px;
   font-weight: 500;
-  padding: 7px 8px;
+  padding: 8px 10px;
   border-radius: calc(var(--radius) - 4px);
   cursor: pointer;
   transition:
@@ -5391,6 +6321,19 @@ onBeforeUnmount(() => {
   box-shadow: var(--ring);
 }
 
+/* 分段控件禁用（编辑外部建的表达式时，频率区只读） */
+.seg__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.primary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
 .repeat-row {
   display: flex;
   align-items: center;
@@ -5398,15 +6341,53 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
-.repeat-num {
-  width: 76px;
+/* 执行频率行：周期/一次性 + 「每 N 单位 于 时刻」，一行内联，窄屏自动换行。 */
+.freq-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* 行内的分段控件不撑满：按钮按内容宽度排。 */
+.seg--inline {
+  flex: none;
+}
+
+.seg--inline .seg__btn {
+  flex: none;
+  min-width: 60px;
+}
+
+.freq-text {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.freq-num {
+  width: 72px;
   flex: none;
   text-align: center;
 }
 
-.repeat-text {
-  font-size: 13px;
-  color: var(--muted);
+/* time 原生控件不吃 min-height：显式定高 + 去掉上下内边距，才能和输入框对齐。 */
+.freq-time {
+  width: auto;
+  flex: none;
+  height: 38px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* 频率下拉已是自定义组件（UiSelect）：行内收缩、不参与换行拉伸。 */
+.freq-unit {
+  width: auto;
+  flex: none;
+}
+
+.dt--inline {
+  flex: 1 1 220px;
+  min-width: 0;
 }
 
 /* 周几圆片：独立命名，避免与待发图片的 .chip（同文件后文定义）互相覆盖 */
@@ -5439,18 +6420,58 @@ onBeforeUnmount(() => {
   color: var(--panel);
 }
 
+/* 说明/预览文案：弱化成普通辅助文字，避免弹窗里连着几块灰底显得杂乱。 */
 .repeat-preview {
   margin: 0;
   font-size: 12px;
+  line-height: 1.6;
   color: var(--muted);
-  background: var(--fill-soft);
-  border-radius: var(--radius);
-  padding: 8px 11px;
+  opacity: 0.9;
+  overflow-wrap: anywhere;
 }
 
 /* MCP 服务器选择下拉框（antd Select 风格，可多选） */
 .mcp-select {
   position: relative;
+}
+
+/* 工具条里的紧凑形态：触发器不再是整行输入框，而是一个图标按钮。 */
+.mcp-select--inline {
+  flex: none;
+  min-width: 0;
+}
+
+/* 双类名提高优先级：.icon-btn 在本文件后面才定义（同权重后者胜），只用 .task-mcp-btn 会被它的 34×34 定宽压回去。 */
+.icon-btn.task-mcp-btn {
+  width: auto;
+  min-width: 34px;
+  height: 30px;
+  padding: 0 9px;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12.5px;
+}
+
+.icon-btn.task-mcp-btn.on {
+  border-color: color-mix(in srgb, var(--ink) 35%, var(--line));
+}
+
+.task-mcp-btn__text {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 面板底部说明：原来写在字段下方的那一句，工具条上放不下。 */
+.mcp-select__foot {
+  margin: 4px 0 0;
+  padding: 8px 8px 6px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
 }
 
 .mcp-select__trigger {
@@ -6373,8 +7394,8 @@ onBeforeUnmount(() => {
   left: calc(var(--tools-menu-w, 208px) + 8px);
   bottom: 0;
   z-index: 41;
-  width: 340px;
-  max-width: min(340px, calc(100vw - 48px));
+  width: 372px;
+  max-width: min(372px, calc(100vw - 48px));
   padding: 10px;
   border: 1px solid color-mix(in srgb, var(--line) 88%, var(--ink) 12%);
   border-radius: var(--radius-lg);
@@ -6425,11 +7446,11 @@ onBeforeUnmount(() => {
 
 /* 窄屏：飞出改为在菜单上方展开，避免右侧越界 */
 @media (max-width: 620px) {
-  .tools-flyout {
-    left: 0;
-    bottom: calc(100% + 8px);
-    width: min(340px, calc(100vw - 32px));
-  }
+.tools-flyout {
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: min(372px, calc(100vw - 32px));
+}
 }
 
 /* 搜索框样式随组件走（本文件是 scoped，子选择器到不了子组件内部元素），见 ToolsSearch.vue。 */
@@ -6557,6 +7578,7 @@ onBeforeUnmount(() => {
 
 .tools-item__name {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   font-size: 13px;
@@ -6749,6 +7771,8 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex: none;
+  white-space: nowrap;
   padding: 1px 8px 1px 7px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--line);
@@ -7239,6 +8263,16 @@ button.step-head:disabled {
   color: var(--ink);
   font: inherit;
   font-size: 13px;
+}
+
+/* 聚焦指示只画在外层容器上（见上面的 .conv-search:focus-within）：
+   内层 input 是透明无边框的，全局 input:focus-visible 的焦点环落在它身上
+   会在输入框内部糊出一圈黑框（比容器小一圈）。 */
+.conv-search__input:focus,
+.conv-search__input:focus-visible {
+  outline: none;
+  border: none;
+  box-shadow: none;
 }
 
 .conv-search__input::placeholder {
@@ -8201,23 +9235,11 @@ button.step-head:disabled {
   display: flex;
 }
 
-/* 卡片式输入区：聚焦时整卡描边，内部元素全部无边框 */
-.composer-box {
+/* 输入框外壳（描边/圆角/底纹/聚焦态）在 components/PromptBox.vue，这里只留对话区自己的东西。
+   注意：组件要占满这一行，得在外层给宽度（组件内是 width:100%，靠父级 .composer-row 撑开）。 */
+.composer-row > :deep(.prompt-box) {
   flex: 1;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: var(--fill);
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.2s ease;
-}
-
-.composer-box:focus-within {
-  border-color: color-mix(in srgb, var(--ink) 55%, var(--line));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 10%, transparent);
 }
 
 /* 顶部拖拽把手：上下拖调整高度，双击恢复自动 */
@@ -8243,34 +9265,7 @@ button.step-head:disabled {
   background: var(--muted);
 }
 
-.input {
-  width: 100%;
-  resize: none;
-  min-height: 74px; /* 与 COMPOSER_BASE 一致：空/少量输入时固定高度 */
-  max-height: 420px;
-  border: none;
-  padding: 6px 14px 4px;
-  background: transparent;
-  color: var(--ink);
-  font-family: var(--font-body);
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.input:focus,
-.input:focus-visible {
-  outline: none;
-  border: none;
-  box-shadow: none;
-}
-
-/* 底部工具栏：左侧附件、右侧快捷键提示 + 圆形发送按钮 */
-.composer-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px 8px;
-}
+/* textarea 与底部工具条的样式也在 PromptBox 里（min/max 高度由 COMPOSER_BASE / COMPOSER_AUTO_MAX 传入）。 */
 
 .icon-btn {
   display: inline-flex;
@@ -8304,12 +9299,12 @@ button.step-head:disabled {
   box-shadow: var(--ring);
 }
 
-.composer-hint {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--muted);
-  user-select: none;
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
+
+/* 输入框提示文案（.prompt-hint）与窄屏隐藏规则随组件走，见 components/PromptBox.vue。 */
 
 .send {
   display: inline-flex;
@@ -8446,10 +9441,6 @@ button.step-head:disabled {
 
 @media (max-width: 720px) {
   .model-tag {
-    display: none;
-  }
-
-  .composer-hint {
     display: none;
   }
 
