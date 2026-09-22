@@ -2004,6 +2004,15 @@ const archivedCount = computed(() => conversations.value.filter((c) => c.archive
 /** 第一个归档项的下标：归档区固定在列表最末（由 convRank 保证）。 */
 const firstArchivedIndex = computed(() => conversations.value.length - archivedCount.value);
 
+/** 定时任务专属对话的 id 集合：侧栏据此给这类对话加区别图标（结果只回投到这里，不混进普通对话）。 */
+const taskConvIds = computed(() => {
+  const set = new Set<string>();
+  for (const t of tasks.value) {
+    if (t.ownConversation && t.conversationId) set.add(t.conversationId);
+  }
+  return set;
+});
+
 /** 菜单当前指向的会话（模板渲染菜单项状态用）。 */
 const ctxTarget = computed(() => conversations.value.find((c) => c.id === ctxMenu.value.targetId) || null);
 
@@ -3889,6 +3898,17 @@ onBeforeUnmount(() => {
               @click.stop
             />
             <template v-else>
+              <span
+                v-if="taskConvIds.has(conv.id)"
+                class="conv-task"
+                :title="tx('定时任务专属对话：结果只回投到这里', 'Task-owned chat: results only land here', 'Conversa da tarefa: resultados só caem aqui', 'कार्य वार्तालाप: परिणाम केवल यहीं आते हैं')"
+                :aria-label="tx('定时任务专属对话', 'Task-owned chat', 'Conversa da tarefa', 'कार्य वार्तालाप')"
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7v5l3 2" />
+                </svg>
+              </span>
               <span class="conv-title">{{ conv.title || tx("新对话", "New chat", "Nova conversa", "नई चैट") }}</span>
               <span
                 v-if="conv.muted"
@@ -7072,6 +7092,16 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 定时任务专属对话标记：标题前的小时钟图标（结果只回投到这里，区别于普通对话）。 */
+.conv-task {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: color-mix(in srgb, var(--accent, #2f6df6) 80%, var(--ink));
+  opacity: 0.85;
 }
 
 /* 免打扰标记：小字提示，避免占用标题空间 */
