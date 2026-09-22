@@ -923,13 +923,19 @@ async function openTaskConversation(t: ScheduleDto) {
   selectConversation(conv);
 }
 
+/** 工具步骤状态。`interrupted` = 没等到结果（连接中断 / 服务进程重启），如实展示，不冒充「失败」。 */
+type StepStatus = "running" | "ok" | "error" | "cancelled" | "interrupted";
+
+/** 子代理状态（独立事件维度）。`interrupted` 同 StepStatus 语义。 */
+type SubagentStatus = "running" | "done" | "cancelled" | "error" | "interrupted";
+
 /** 气泡里的一个工具步骤（MCP 工具调用）。 */
 interface ToolStep {
   id: string;
   name: string;
   server?: string;
   args?: string;
-  status: "running" | "ok" | "error" | "cancelled";
+  status: StepStatus;
   result?: string;
 }
 
@@ -990,7 +996,7 @@ interface Bubble {
     id: string;
     parentId: string;
     description: string;
-    status: "running" | "done" | "cancelled" | "error";
+    status: SubagentStatus;
     text: string;
   }>;
   /** 扩展思考（thinking 增量拼接，支持思考的模型才有；仅作展示，不回灌模型上下文）。 */
@@ -1712,6 +1718,15 @@ function chartsOf(m: StoredMessage): ChartSpec[] {
   return m.chart ? [...list, m.chart] : list;
 }
 
+/**
+ * 快照的状态归一：**快照里不存在「正在跑」**。
+ * 落库与恢复都过这一遍——终态没收到的步骤（连接被切断 / 服务进程重启）若以 running 存进库，
+ * 刷新后会被当成实时状态永久转圈（用户看到的「卡住」就是这个）。宁可如实记中断，也不冒充仍在执行。
+ */
+function settleStep(step: ToolStep): ToolStep {
+  return step.status === "running" ? { ...step, status: "interrupted" } : step;
+}
+
 function toStored(list: Bubble[]): StoredMessage[] {
   return list
     // 只出图、没有正文的气泡也必须落库：否则整条消息（连图一起）刷新后消失。
@@ -1723,7 +1738,7 @@ function toStored(list: Bubble[]): StoredMessage[] {
       // 推理面板相关字段一并落库：刷新后从后端快照恢复，思考过程 / 工具步骤 / 任务规划不丢。
       ...(b.thinking ? { thinking: b.thinking } : {}),
       ...(b.thinkMs ? { thinkMs: b.thinkMs } : {}),
-      ...(b.steps?.length ? { steps: b.steps } : {}),
+      ...(b.steps?.length ? { steps: b.steps.map(settleStep) } : {}),
       ...(b.todos?.length ? { todos: b.todos } : {}),
       // 图表 spec 也要落库：图是浏览器现场画的、产物只在内存，不存就会「刷新即消失」。
       ...(b.charts?.length ? { charts: b.charts } : {}),
@@ -1770,7 +1785,10 @@ function selectConversation(conv: ConversationDto) {
       // 推理面板相关字段恢复（与 toStored 对称）：思考过程 / 工具步骤 / 任务规划。
       ...(m.thinking ? { thinking: m.thinking } : {}),
       ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
-      ...(Array.isArray(m.steps) && m.steps.length ? { steps: m.steps as ToolStep[] } : {}),
+      // 历史快照里可能存着 running（收不到终态的轮次）：读回来先归一，否则刷新即「永久转圈」。
+      ...(Array.isArray(m.steps) && m.steps.length
+        ? { steps: (m.steps as ToolStep[]).map(settleStep) }
+        : {}),
       ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
       // 图表卡片恢复（与 toStored 对称）：刷新后由 ChartCard 按 spec 重绘。
       ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
@@ -2616,6 +2634,9 @@ async function runTurn(
 
   let stopped = false;
   let queued = false;
+  /** 本轮是否收到过终态事件（done / 服务端 error）：没收到就结束的流 = 中断，必须收口。 */
+  let sawTerminal = false;
+  let interrupted = false;
   try {
     await streamChat(
       text,
@@ -2690,6 +2711,8 @@ async function runTurn(
         } else if (event.type === "clarification_response") {
           reply.clarification = null;
         } else if (event.type === "error") {
+          // 服务端明确宣告的终态：这条之后流再断也算「有结论」，不走中断收口。
+          sawTerminal = true;
           const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
           reply.error = message;
           state.error = message;
@@ -2745,6 +2768,7 @@ async function runTurn(
             toolResultsOffloaded: event.toolResultsOffloaded,
           };
         } else if (event.type === "done") {
+          sawTerminal = true;
           // 收束时清理模型回声式重复（只改内存展示，不改落库文本）。
           reply.text = dedupeRepeats(reply.text);
           thinkPhaseEnd(reply);
@@ -2756,6 +2780,12 @@ async function runTurn(
       },
       controller.signal,
     );
+    // 流结束了却一个终态事件都没收到：连接在收尾前就断了（服务端进程重启 / 代理切断 / 连接被回收）。
+    // 此时本地还挂着「执行中」的步骤与子代理，必须如实收口——否则推理面板会永久转圈。
+    if (!sawTerminal && !stopped) {
+      interrupted = true;
+      await settleInterruptedRun(convId, reply);
+    }
   } catch (err) {
     if ((err as Error)?.name === "AbortError") {
       stopped = true;
@@ -2798,8 +2828,9 @@ async function runTurn(
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
     await persist(convId, state.bubbles);
     queueScrollIfCurrent(convId);
-    // 出队决策：停止 / 出错 / 已再入队 / 仍有待确认 → 停下等用户，不自动发下一条。
-    void drainQueue(convId, !stopped && !queued && !reply.error && !reply.pending);
+    // 出队决策：停止 / 中断 / 出错 / 已再入队 / 仍有待确认 → 停下等用户，不自动发下一条
+    // （中断的轮次连接已经不可靠，接着发下一条大概率也失败，交给用户决定）。
+    void drainQueue(convId, !stopped && !interrupted && !queued && !reply.error && !reply.pending);
   }
 }
 
@@ -2851,6 +2882,60 @@ function watchBackgroundDone(convId: string) {
     showDoneToast(convId, conv.title);
   }, 5000);
   bgWatch.set(convId, timer);
+}
+
+/** 给正文追加一行提示（空正文不留前导空行）。 */
+function appendNotice(text: string, line: string): string {
+  return text ? `${text}\n\n${line}` : line;
+}
+
+/**
+ * 收口一次「没等到任何终态事件就结束」的轮次（服务端进程重启 / 连接被回收 / 代理切断都会这样）。
+ * 与服务端同一原则：**不猜结果**，只问服务端这个对话的任务还在不在——
+ * - 还在跑：如实说「后台继续」并守望完成（结果由服务端回投到该对话）；
+ * - 不在跑：把还挂着的步骤与子代理标成中断，并给出可操作提示。
+ * 半路挂起的确认卡一并清掉：票据大概率已随进程失效，留着只会让用户点一个注定失败的按钮。
+ */
+async function settleInterruptedRun(convId: string, reply: Bubble): Promise<void> {
+  reply.streaming = false;
+  thinkPhaseEnd(reply);
+  for (const step of reply.steps || []) {
+    if (step.status !== "running") continue;
+    step.status = "interrupted";
+    step.result =
+      step.result ||
+      tx(
+        "未收到执行结果（连接中断）",
+        "No result received (connection lost)",
+        "Nenhum resultado recebido (conexão perdida)",
+        "कोई परिणाम नहीं मिला (कनेक्शन टूटा)",
+      );
+  }
+  for (const sa of reply.subagents || []) {
+    if (sa.status === "running") sa.status = "interrupted";
+  }
+  reply.pending = null;
+  reply.clarification = null;
+  const backgroundRunning = await isChatTaskRunning(convId).catch(() => false);
+  reply.text = appendNotice(
+    reply.text,
+    backgroundRunning
+      ? tx(
+          "（连接已中断，生成仍在后台继续；完成后重新打开该对话即可看到结果）",
+          "(Connection lost; generation continues in the background — reopen this conversation to see the result)",
+          "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
+          "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
+        )
+      : tx(
+          "（本轮已中断：连接结束且服务端没有在跑的任务，未完成的部分请重新发起）",
+          "(This turn was interrupted — the connection ended and no task is running on the server; please retry)",
+          "(Este turno foi interrompido — a conexão terminou e não há tarefa em execução no servidor; tente novamente)",
+          "(यह चरण बाधित हुआ — कनेक्शन समाप्त और सर्वर पर कोई कार्य नहीं चल रहा; कृपया फिर से प्रयास करें)",
+        ),
+  );
+  if (backgroundRunning) watchBackgroundDone(convId);
+  openReasoning.delete(reply.id);
+  queueScrollIfCurrent(convId);
 }
 
 // ---- 待发队列（后端持久化；忙时入队，成功收束后自动出队）----
@@ -3502,17 +3587,34 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function stepClass(status: ToolStep["status"]): string {
+function stepClass(status: StepStatus): string {
   if (status === "ok") return "ok";
-  if (status === "error" || status === "cancelled") return "err";
+  if (status === "error" || status === "cancelled" || status === "interrupted") return "err";
   return "running";
 }
 
-function stepStatusText(status: ToolStep["status"]): string {
+function stepStatusText(status: StepStatus): string {
   if (status === "ok") return tx("已完成", "done", "concluído", "पूर्ण");
   if (status === "error") return tx("失败", "failed", "falhou", "विफल");
   if (status === "cancelled") return tx("已拒绝", "denied", "recusado", "अस्वीकृत");
+  // 中断 ≠ 失败：不知道结果就如实说不知道（标成失败会让人以为工具自己报错了）。
+  if (status === "interrupted") return tx("已中断", "interrupted", "interrompido", "बाधित");
   return tx("执行中", "running", "executando", "चल रहा है");
+}
+
+/** 子代理状态点：与步骤共用一套语义配色（运行中动效 / 出错红 / 其余灰）。 */
+function subagentDotClass(status: SubagentStatus): string {
+  if (status === "running") return "running";
+  if (status === "error" || status === "interrupted") return "error";
+  return "ok";
+}
+
+function subagentStatusText(status: SubagentStatus): string {
+  if (status === "running") return tx("运行中", "running", "rodando", "चल रहा");
+  if (status === "done") return tx("完成", "done", "concluído", "पूर्ण");
+  if (status === "cancelled") return tx("已取消", "cancelled", "cancelado", "रद्द");
+  if (status === "interrupted") return tx("已中断", "interrupted", "interrompido", "बाधित");
+  return tx("失败", "failed", "falhou", "विफल");
 }
 
 /** 上下文用量的一行摘要（透明度：让用户知道用了多少、丢了什么）。 */
@@ -4769,9 +4871,9 @@ onBeforeUnmount(() => {
                   <div class="subagents__head">{{ tx("子代理", "Subagents", "Subagentes", "उप-एजेंट") }}</div>
                   <div v-for="sa in b.subagents" :key="sa.id" class="subagent" :class="sa.status">
                     <div class="subagent__head">
-                      <span class="mcp-dot" :class="sa.status === 'running' ? 'running' : sa.status === 'error' ? 'error' : 'ok'"></span>
+                      <span class="mcp-dot" :class="subagentDotClass(sa.status)"></span>
                       <span class="subagent__desc">{{ sa.description }}</span>
-                      <span class="subagent__status">{{ sa.status === 'running' ? tx('运行中', 'running', 'rodando', 'चल रहा') : sa.status === 'done' ? tx('完成', 'done', 'concluído', 'पूर्ण') : sa.status === 'cancelled' ? tx('已取消', 'cancelled', 'cancelado', 'रद्द') : tx('失败', 'failed', 'falhou', 'विफल') }}</span>
+                      <span class="subagent__status">{{ subagentStatusText(sa.status) }}</span>
                       <button
                         v-if="sa.status === 'running'"
                         class="subagent__cancel"

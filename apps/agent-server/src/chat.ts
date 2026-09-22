@@ -23,7 +23,7 @@ import {
   type Turn,
 } from "./models.js";
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
-import { resolveToolRisk, verdictNeedsConfirm } from "./risk.js";
+import { resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
 import { getRole } from "./roles.js";
@@ -294,6 +294,16 @@ const PSEUDO_CALL_HINT =
   "请通过函数调用（tool_calls）发起工具调用；不要在回复正文里书写调用语句（JSON / XML / 方括号等）。";
 
 /**
+ * 伪出图被拦截后的纠正提示（回灌给模型，要求走 render_chart 通道）。
+ * 与 PSEUDO_CALL_HINT 同源——都是「把工具的产出写成了正文文本」，只是载体从调用语句换成了图片语法。
+ */
+const FAKE_CHART_HINT =
+  "上一条回复用 Markdown 图片语法占位了图表，但目标不是可访问的图片地址：浏览器只会去请求一个不存在的地址，" +
+  "用户看到的不是图、而是一个破图。该文本已作废。\n" +
+  "要出图必须调用 render_chart 工具（图表会作为对话内的卡片直接显示）；不要在正文里自己写图片链接或图片占位符。" +
+  "本轮若没有可出图的真实数据，就不出图，改为如实说明缺什么，不要编造数据。";
+
+/**
  * 无人值守运行走到最后一轮的收尾提示（与工具一并摘掉）。
  * 只摘工具不够：这类模型会把「想调工具」写成一句过程叙述就停下，仍然没有结论。
  * 故显式要求「基于已有数据给结论」，并允许它如实说「数据不足」——两种都是结论，编造不是。
@@ -318,6 +328,32 @@ export function looksLikePseudoToolCall(text: string, toolNames: ReadonlySet<str
     if (new RegExp(`"(?:name|tool|tool_name)"\\s*:\\s*"${esc}"`, "i").test(text)) return true; // {"name"/"tool":"tool_name",...}
   }
   return false;
+}
+
+/**
+ * 运行时答案校验（协议级）：识别正文里的**图片占位符**——模型用 Markdown 图片语法假装出图，
+ * 实测形态：`![近 7 天 vs 前 7 天 各来源日均环比（%）](chart)`（图根本没出，正文只留一行占位）。
+ *
+ * 判据只看目标能不能解析成图片地址（`http(s):` / `data:` / 协议相对 `//`），不涉及任何业务词：
+ * 其余形态——`(chart)`、`(url)`、空目标、相对路径——在浏览器里一律按相对 URL 去请求 → 404，
+ * 用户看到的不是「没有图」而是一个**破图图标**：比不出图更糟，它看起来像图挂了、而不是没出图。
+ *
+ * 代码块与行内代码里的图片语法是**示例**（写文档、贴代码片段时会出现），不是假装出图，先剥掉再扫。
+ * 返回命中的目标（去重）供调用方回灌点名；未命中返回空数组。
+ */
+export function unresolvableImageTargets(text: string): string[] {
+  if (!text || !text.includes("![")) return [];
+  const body = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]*`/g, "");
+  const targets = new Set<string>();
+  // Markdown 图片语法：![alt](target)。alt 可为空、可含中文与空格；target 取到右括号或空白为止。
+  const re = /!\[[^\]]*\]\(\s*([^)\s]*)/g;
+  let hit: RegExpExecArray | null;
+  while ((hit = re.exec(body))) {
+    const target = hit[1] || "";
+    if (/^(?:https?:|data:|\/\/)/i.test(target)) continue;
+    targets.add(target);
+  }
+  return [...targets];
 }
 
 /** 结果规模摘要（供跨轮句柄使用，不含正文）。 */
@@ -844,7 +880,8 @@ interface LoopContext {
   signal?: AbortSignal;
   /** 主代理 = true（可用 task 委派）；子代理 = false（防递归）。 */
   allowTask: boolean;
-  /** 主代理 = true；子代理 = false（默认只读：非只读操作立即拒绝，不进入确认流程）。 */
+  /** 主代理 = true；子代理 = false（子代理送不出确认事件 → 需要用户拍板的操作在闸门处立即拒绝，
+   *  免确认的工作区写仍可执行；判定见 risk.ts `subagentMayExecute`）。 */
   allowWrite: boolean;
   /** 会话级只读授权（conversation.readGrants）：仅对「未声明级别」的同服务器工具降级为只读。 */
   grantServers: ReadonlySet<string>;
@@ -882,7 +919,7 @@ interface LoopOutcome {
   modelRetries: number;
   /** 因连续失败被熔断跳过的工具调用次数。 */
   toolFusions: number;
-  /** 伪工具调用被拦截纠正的次数。 */
+  /** 协议护栏拦截纠正的次数（伪工具调用 / 伪出图占位符）。 */
   pseudoCallRetries: number;
   /** 接地护栏纠正次数（零数据作答被作废并回灌提示的次数）。 */
   groundingRetries: number;
@@ -925,7 +962,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   // 成本护栏：累计本轮已发送的 prompt token 估算；失败熔断：各工具连续失败计数。
   let spentTokens = 0;
   const failedTools = new Map<string, number>();
-  // 运行时统计（回填 usage 事件）：轮次 / 重试 / 熔断 / 伪调用纠正。
+  // 运行时统计（回填 usage 事件）：轮次 / 重试 / 熔断 / 协议护栏纠正（伪调用与伪出图共用一次预算）。
   let rounds = 0;
   let modelRetries = 0;
   let toolFusions = 0;
@@ -1037,14 +1074,25 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     if (!outcome.toolCalls.length) {
       // 运行时校验：模型把工具调用写成正文文本（伪调用）→ 不当作终态，
       // 作废该段文本并回灌纠正提示继续下一轮（只纠正一次，避免陷入循环）。
-      if (!pseudoCallRetried && looksLikePseudoToolCall(outcome.text, new Set(specs.map((s) => s.name)))) {
-        pseudoCallRetried = true;
-        pseudoCallRetries += 1;
-        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
-        conversation.push({ role: "assistant", content: outcome.text });
-        conversation.push({ role: "user", content: PSEUDO_CALL_HINT });
-        console.log("[chat:pseudo-call] 检出文本形式的工具调用，已作废并回灌纠正提示");
-        continue;
+      if (!pseudoCallRetried) {
+        const pseudoCall = looksLikePseudoToolCall(outcome.text, new Set(specs.map((s) => s.name)));
+        // 同类问题的另一种载体：把「出图结果」写成正文里的图片占位符。两者共用一次纠正预算——
+        // 都是「工具产出被写成了正文文本」，改掉的提示是同一条纪律（走工具通道，别自己造产物）。
+        const fakeCharts = pseudoCall ? [] : unresolvableImageTargets(outcome.text);
+        const hint = pseudoCall ? PSEUDO_CALL_HINT : fakeCharts.length ? FAKE_CHART_HINT : "";
+        if (hint) {
+          pseudoCallRetried = true;
+          pseudoCallRetries += 1;
+          text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+          conversation.push({ role: "assistant", content: outcome.text });
+          conversation.push({ role: "user", content: hint });
+          console.log(
+            pseudoCall
+              ? "[chat:pseudo-call] 检出文本形式的工具调用，已作废并回灌纠正提示"
+              : `[chat:pseudo-chart] 检出图片占位符（${fakeCharts.join(", ")}），已作废并回灌纠正提示`,
+          );
+          continue;
+        }
       }
       // 运行时校验：接地护栏（防「零数据凭记忆作答」）。声明 enforceGrounding 的角色在一条数据都没
       // 拿到时不允许以正文结论收束——先作废该段文本 + 回灌纠正提示（两条路径都写明），纠正用尽仍无数据
@@ -1451,14 +1499,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // ── 写操作安全闸门（src/risk.ts 单一真相）─────────────────────────────
       const verdict = resolveToolRisk(call.name, ctx.grantServers, safeJsonParse(call.argsJson));
       const auditBase = auditBaseOf(call, verdict);
-      // 子代理默认只读（P0-5）：非只读操作立即拒绝——不登记等待器、不发确认事件（否则确认事件
-      // 被子代理消费循环丢弃，调用会静默挂到超时），模型拿到明确错误可自行调整。
-      if (!ctx.allowWrite && verdict.level !== "read") {
+      // 子代理可执行范围按**作用域**判定（P0-5，2026-09-22 细化）：真正该挡住的是「需要用户拍板」
+      // 的操作——子代理的确认事件送不进用户可见的事件流，送不出去就只能挂到超时。
+      // 免确认的工作区写（fs_write / fs_edit：沙箱内、路径与体积有上限、可回查）与此无关，照常放行
+      // （否则「让子代理把中间结果落盘」这类本来就安全的委派会被无谓挡住）。判定见 risk.ts。
+      if (!subagentMayExecute(verdict, ctx.allowWrite)) {
         ok = false;
-        rawText = `该操作（${verdict.level}）不能委派给子代理执行：请在主对话里直接发起（需要用户确认的操作会在主对话弹确认卡）。`;
+        rawText = `该操作（${verdict.level}，带外部副作用）不能委派给子代理执行：请在主对话里直接发起（这类操作需要你确认，会在主对话弹确认卡）。`;
         yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
-        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理禁止写操作）" });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理不能做需确认的操作）" });
         appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
         continue;
       }
@@ -1764,7 +1814,8 @@ async function* runSubagent(
     loadedTools: new Set<string>(),
     system: { stable: SUBAGENT_PROMPT, dynamic: "" },
     allowTask: false,
-    // 子代理默认只读（写操作安全闸门 P0-5）：非只读操作在闸门处立即拒绝。
+    // 子代理不自己弹确认卡（写操作安全闸门 P0-5）：需要用户拍板的操作由闸门按作用域拒绝
+    // （risk.ts subagentMayExecute）——免确认的工作区写可用，外部写留给主对话。
     // SUBAGENT_ALLOW_WRITE=on 仅作预留（确认事件转发未实现，放开会导致挂起到超时），不改变本值。
     allowWrite: false,
     maxRounds: SUBAGENT_MAX_ROUNDS,

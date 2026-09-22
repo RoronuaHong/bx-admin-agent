@@ -3,11 +3,11 @@
 // 属可逆的本地动作 → 免确认（否则确认疲劳会让用户退化成橡皮图章）。
 // 同时钉住「这次放宽没有波及外部写与未知工具」——那两类仍必须逐次确认（fail-closed）。
 import { test, expect } from "vitest";
-import { resolveToolRisk, verdictNeedsConfirm } from "../src/risk.js";
+import { resolveToolRisk, subagentMayExecute, verdictNeedsConfirm, type RiskVerdict } from "../src/risk.js";
 import { summarizeArgsForConfirm } from "../src/chat.js";
 import { BUILTIN_RISK, WORKSPACE_FILE_WRITE_TOOLS } from "../src/builtins.js";
 
-test("[A] 工作区写免确认：级别仍是 write（子代理只读闸门照旧拦），但不弹确认卡", () => {
+test("[A] 工作区写免确认：级别仍是 write（沙箱内、可回查），但不弹确认卡", () => {
   for (const name of ["fs_write", "fs_edit"]) {
     const v = resolveToolRisk(name);
     expect(v.source, name).toBe("builtin");
@@ -45,6 +45,30 @@ test("[C] 审计名单与风险登记表自洽（免确认后靠可回查兜底�
   }
   expect(WORKSPACE_FILE_WRITE_TOOLS.has("fs_write")).toBe(true);
   expect(WORKSPACE_FILE_WRITE_TOOLS.has("fs_edit")).toBe(true);
+});
+
+test("[E] 子代理可执行范围按作用域判定：工作区写放行，需用户拍板的外部写拒绝", () => {
+  // 免确认的工作区写（沙箱内、可回查）→ 子代理可执行；否则「子代理把中间结果落盘」这类安全委派被无谓挡住。
+  for (const name of ["fs_write", "fs_edit"]) {
+    expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
+  }
+  // 只读照常放行。
+  for (const name of ["fs_read", "fs_ls"]) {
+    expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
+  }
+  // 需要用户确认的外部写 / 破坏性：拒绝（子代理的确认事件送不倒用户面前，只能挂到超时）。
+  const externalWrite: RiskVerdict = {
+    level: "write",
+    unknown: false,
+    deny: false,
+    reason: "外部写（测试夹具）",
+    source: "annotation",
+    external: true,
+  };
+  expect(subagentMayExecute(externalWrite, false)).toBe(false);
+  expect(subagentMayExecute({ ...externalWrite, level: "destructive" }, false)).toBe(false);
+  // 主代理（allowWrite=true，自己能弹确认卡）不受此闸门限制。
+  expect(subagentMayExecute(externalWrite, true)).toBe(true);
 });
 
 test("[D] 确认卡参数展示：长值头尾保留 + 显式省略，敏感键脱敏", () => {

@@ -58,7 +58,7 @@
 | `src/risk.ts` | **工具风险分级（单一真相）**：`resolveToolRisk`（工具级 toolRisks → 内置登记表 → 服务器级 requireConfirm → 注解 → 未知兜底 → 会话只读授权）+ `verdictNeedsConfirm`；默认 fail-closed（未声明/查不到按 `MCP_UNKNOWN_TOOLS` 处理，默认弹确认卡）。 |
 | `src/confirm.ts` | 写操作二次确认通道（一次性票据）：`requestConfirmation` 签发 `cfm_<uuid>` 票据并与 (sessionId, conversationId) 绑定，`answerConfirmation(ticket, sessionId, confirmed)` 校验归属后解挂；票据一次性；超时按拒绝。 |
 | `src/audit.ts` | 安全审计留痕：append-only JSONL（`.data/audit/audit-YYYYMM.jsonl`），记录 allowed / confirmed / denied / timeout / grant_read / subagent_refused / ownership_mismatch；参数只存脱敏摘要 + sha256。 |
-| `src/chat.ts` | 聊天引擎：`chatStream`（无工具→直连单次；有工具→`runWithTools`）；闸门接线（子代理默认只读 / deny 拒绝 / 票据确认 / 审计）；`streamCall` 边收增量边 yield；护栏常量。 |
+| `src/chat.ts` | 聊天引擎：`chatStream`（无工具→直连单次；有工具→`runWithTools`）；闸门接线（子代理按作用域限权 / deny 拒绝 / 票据确认 / 审计）；`streamCall` 边收增量边 yield；护栏常量。 |
 | `src/models.ts` | 模型适配：OpenAI / Anthropic / Ollama；恢复 function calling（工具定义 + 流式 `tool_calls` 增量解析，按 index 拼接）；工具调用兜底 id 不可猜（`call_<uuid>`）。 |
 | `src/session.ts` | 匿名会话：cookie `bx_agent_sid`、启用集 `mcpServers`、引用计数的落盘。 |
 | `src/app.ts` | 端点装配：`/mcp/servers*`、`/chat/mcp/servers`、`/chat/confirm`（票据 + 会话归属校验 + 只读授权）、`/chat/stream` 等。 |
@@ -232,7 +232,7 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 5. 确认请求本身零副作用；超时（默认 120s）按拒绝处理；票据一次性（应答即删，伪造/重放无效）。
 6. 每次闸门决策写审计（`src/audit.ts`）：allowed（仅外部只读）/ confirmed / denied / timeout / grant_read / subagent_refused / ownership_mismatch，参数只存脱敏摘要 + sha256。
 
-子代理默认**只读**（`SUBAGENT_ALLOW_WRITE` 仅作预留，当前忽略并告警）：子代理内非只读操作在闸门处**立即拒绝**并回喂明确错误（不进入确认流程，避免确认事件被子代理消费循环丢弃后静默挂起到超时）。
+子代理的可执行范围**按作用域判定**（2026-09-22 细化，`risk.ts` `subagentMayExecute`）：免确认的**工作区写**（`fs_write` / `fs_edit`——沙箱内、有路径与体积上限、可回查）放行；**需要用户确认**的外部写 / 破坏性 / 未知工具在闸门处**立即拒绝**并回喂明确错误（不进入确认流程，避免确认事件被子代理消费循环丢弃后静默挂起到超时）。`SUBAGENT_ALLOW_WRITE=on` 仍被忽略并告警（确认事件转发未实现）。理由与验证见 `docs/write-op-safety-plan.md` §9.7。
 
 ---
 

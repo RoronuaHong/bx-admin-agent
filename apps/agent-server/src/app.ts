@@ -122,7 +122,8 @@ const SCHEDULE_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.MCP_SCHEDULE_MAX
 const SCHEDULE_TASK_GUIDE =
   "本次是定时任务的新一期运行，请遵守两条：\n" +
   "1) 必须从数据源重新取数，不得沿用本对话历史轮次的结论、数字或图表数据；\n" +
-  "2) 结论要能独立阅读：正文里给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。";
+  "2) 结论要能独立阅读：正文里给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。" +
+  "图仍要用 render_chart 工具出（图在对话里看得到），但不要在正文里写图片链接或图片占位符。";
 
 /** 从任务事件缓冲提取 run 级统计（usage / model / error 事件），落 run 级 trace。
  * model：buffer 有 model 事件时优先用它；该事件在**起始**发射，长 run 会被 chat-tasks.ts 的

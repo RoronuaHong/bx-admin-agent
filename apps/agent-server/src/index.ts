@@ -11,7 +11,8 @@ import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
 assertBuiltinRiskCoverage();
 if ((process.env.SUBAGENT_ALLOW_WRITE || "off").toLowerCase() === "on") {
   console.warn(
-    "[安全] SUBAGENT_ALLOW_WRITE=on 已被忽略：子代理确认事件转发尚未实现，放开会让写操作静默挂起到超时。子代理保持只读。",
+    "[安全] SUBAGENT_ALLOW_WRITE=on 已被忽略：子代理确认事件转发尚未实现，放开会让「需要用户确认」的操作静默挂起到超时。" +
+      "子代理的可执行范围由作用域决定（工作区内的写可执行；外部写/破坏性操作在闸门处直接拒绝）。",
   );
 }
 

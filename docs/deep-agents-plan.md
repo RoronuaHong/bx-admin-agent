@@ -560,3 +560,24 @@ chatStream
 - `vitest run`（agent-server）**11 files / 74 tests 全过**（含 `chart-render.test.ts` 的白名单自检——白名单改为共享常量后仍全绿；新增 `attachment-budget.test.ts` 4 例）。
 - `vite build`（web）**通过**（2457 modules / 5.14s）——顺带验证了 `@bx/shared` 在**运行时**被前端按值引用（`GRAPH_CHART_TYPES`）可正常打包（此前该包只被前端按类型引用）。
 - 未做：真实模型端到端（附件与出图都在浏览器侧验过，见 `docs/chart-visualization-plan.md` §11）。
+
+---
+
+### 11.10 第四轮核对：伪出图（图表占位符）缺陷与护栏（2026-09-22，源码级）
+
+#### 11.10.1 真实缺陷（已修）
+
+| # | 缺陷 | 根因 | 处置 |
+|---|---|---|---|
+| A6 | **模型没出图，正文里却留了一个破图**——某期定时任务报告里出现 `![近 7 天 vs 前 7 天 各来源日均环比（%）](chart)`（该期 `steps=0`、`charts=0`，即整轮没调任何工具），浏览器把它当相对路径去请求 → 404，用户看到的是一个破图图标 | 模型把「出图」这件**工具产出**写成了正文里的图片语法——与「把工具调用写成正文文本」同族，只是载体从调用语句换成了图片语法。而 `looksLikePseudoToolCall` 只认调用语句形态（XML / 行首方括号 / JSON 的 name 字段），服务端零拦截；前端 `chat-richtext.ts` 的 `img` 白名单与 `ALLOWED_URI_REGEXP` 又放行相对路径（路线 1「贴图片链接」时代的遗留口径）→ 一路直通用户 | ①服务端 `chat.ts` 新增纯函数 `unresolvableImageTargets`：正文里的图片语法只要目标不是可解析的图片地址（无 `http(s):` / `data:` / 协议相对 `//`）即判为占位符，**作废该轮正文**并回灌 `FAKE_CHART_HINT` 要求改走 `render_chart`（与伪调用**共用一次**纠正预算——同一条纪律：产物只能由工具产生）；代码块与行内代码里的图片语法属**示例**（写文档时会用到），先剥掉再扫。②前端 `chat-richtext.ts` 渲染后处理摘掉这类 `<img>`——历史消息是最后一道防线，护栏上线前落库的坏消息也不再显示破图。③`app.ts` 的 `SCHEDULE_TASK_GUIDE` 补一句「图仍要用 `render_chart` 出，正文不要写图片链接或占位符」，堵住「图表只作补充」被读成「这期不用出图」。 |
+
+#### 11.10.2 顺带修掉的既有缺陷
+
+- **`ChartCard.vue` 两处隐式 any 让 `vue-tsc` 转红**（`data.flatMap((r) => …)` / `data.map((r) => …)`，`data` 来自 `normalizeRows` 的 `any`）——由 `3c0f011`（图表渲染优化）引入，与本次改动无关，但 `pnpm type-check` 是验收门禁，就地补 `(r: any)` 两处标注。
+
+#### 11.10.3 回归
+
+- `vitest run`（agent-server）**16 files / 102 tests 全过**，其中新增两件：`tests/answer-protocol-guard.test.ts`（5 例，纯逻辑锁定伪调用 / 图片占位符两条判据）与 `tests/pseudo-chart-guard.test.ts`（mock 模型端到端：第一轮占位符 → 护栏作废 → 第二轮改走 `render_chart` → 断言占位符未上屏、`chart` 事件产出、`usage.pseudoCallRetries=1`）。
+- `tsc --noEmit`（agent-server）**exit 0**；`vue-tsc --noEmit`（web）**exit 0**。
+- 浏览器实测（`localhost:5173`，真实会话 `conv_1790056077827_wz3fcb`）：硬刷新后 13 张图表卡片（前 4 期 `render_chart` 产物）正常重绘，**页面上 `<img>` 数量为 0**——那两行占位符不再渲染成破图。
+- 遗留：护栏只保证「不再假装出图」，不能保证「一定出图」——该期模型整轮零工具调用（数据沿用历史），属模型行为，由 `SCHEDULE_TASK_GUIDE`（必须重新取数）与角色接地护栏承担，本次未新增服务端语义判定。

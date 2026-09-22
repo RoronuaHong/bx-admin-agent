@@ -222,3 +222,10 @@ E2E PASS
 1. **spec 与图型清单收敛到 `@bx/shared`**：`ChartSpec` + `CHART_TYPES` / `GRAPH_CHART_TYPES` 一处定义，服务端工具校验（`builtins.ts` 的 `render_chart`）与前端 G2 / G6 分流（`ChartCard.vue`）共用——此前服务端落库那份内联类型只认 13 种旧图型且把图形类 `data` 写成数组，与工具白名单漂移。
 2. **子代理出的图不再丢**：`runSubagent` 此前只转发文本与 `tool_call`，`chart` 事件被吞（`render_chart` 在子代理工具集内）→ 现已转发。
 3. **前端渲染失败必降级**：G2 的 `render()` 是 Promise，原先未 `await` → 渲染期报错绕过降级表格且留下未处理拒绝；现已 `await` 并统一回收半成品实例（`discardMine()`）。
+
+**2026-09-22 补齐（伪出图护栏，详见 `docs/deep-agents-plan.md` §11.10）**：
+
+4. **「假装出图」不再直通用户**：模型没调 `render_chart`、只在正文里写 `![标题](chart)` 占位符时（图根本不存在），浏览器把 `chart` 当相对路径请求 → 404，用户看到的是**破图**而不是「没有图」。两道护栏同口径：
+   - 服务端 `chat.ts` 的 `unresolvableImageTargets`——正文里的图片语法只要目标不是可解析的图片地址（无 `http(s):` / `data:` / `//`）即判为占位符，作废该轮正文并回灌提示要求改走 `render_chart`（与伪工具调用共用一次纠正预算；代码块里的图片语法属示例，不误判）；
+   - 前端 `chat-richtext.ts` 渲染后处理摘掉这类 `<img>`——护栏上线前落库的历史消息也不会再显示破图。
+5. **`SCHEDULE_TASK_GUIDE` 补一句「图仍要用 `render_chart` 出」**：原文「图表只作补充（推送里不一定看得到图）」是讲「正文必须能独立阅读」，被模型读成了「这期不用出图」。

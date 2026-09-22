@@ -92,9 +92,10 @@ const FOLD_LABELS: Record<UiLocale, { tools: string; longTable: (rows: number) =
 };
 
 /**
- * 前端渲染后处理：把不应占据首屏的内部内容折叠起来（纯展示层，不动模型输出）。
+ * 前端渲染后处理：把不应占据首屏的内部内容折叠起来、把渲染不出来的产物摘掉（纯展示层，不动模型输出）。
  *  1) [本轮已执行的工具] 段——模型把内部工具轨迹回显进回答，而工具步骤气泡已单独展示过，这里默认收起；
- *  2) 超长数据表——明细表行数过多时默认收起，汇总/短表保持展开。
+ *  2) 超长数据表——明细表行数过多时默认收起，汇总/短表保持展开；
+ *  3) 破图占位符——图片指向不可解析的地址时摘掉（见下面 pass 3 的说明）。
  */
 function foldAgentBlocks(html: string, locale: UiLocale): string {
   if (typeof DOMParser === "undefined") return html;
@@ -150,6 +151,17 @@ function foldAgentBlocks(html: string, locale: UiLocale): string {
     w.parentNode!.insertBefore(details, w);
     details.appendChild(summary);
     details.appendChild(w);
+  }
+
+  // 3) 破图占位符摘掉：图片目标不是可解析的图片地址（模型用 `![标题](chart)` 这类占位符假装出图——
+  //    图根本没出，只是正文里留了一行 Markdown 图片语法），浏览器会按相对 URL 去请求 → 404，
+  //    留给用户的是一个破图图标：比「没有图」更糟，它看起来像图挂了而不是没出图。
+  //    这类占位符不是内容（alt 是图标题、没有图就没有意义），直接摘掉；服务端同口径护栏见
+  //    chat.ts 的 unresolvableImageTargets（渲染层是历史消息的最后一道防线）。
+  for (const img of Array.from(body.querySelectorAll("img"))) {
+    const src = (img.getAttribute("src") || "").trim();
+    if (/^(?:https?:|data:|\/\/)/i.test(src)) continue;
+    img.remove();
   }
 
   // 表格可访问性：MarkdownIt 渲染出的 <th> 默认不带 scope，列数一多读屏只会逐格念、

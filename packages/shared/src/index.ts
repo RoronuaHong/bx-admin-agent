@@ -178,7 +178,7 @@ export type ChatEvent =
       modelFallbacks?: number;
       /** 因连续失败被熔断跳过的工具调用次数。 */
       toolFusions?: number;
-      /** 伪工具调用（把调用写成文本）被拦截并纠正的次数。 */
+      /** 协议护栏拦截并纠正的次数：把工具调用写成正文文本、或用图片占位符假装出图。 */
       pseudoCallRetries?: number;
       /** 接地护栏纠正次数（零数据作答被作废并回灌提示补取数据的次数）。 */
       groundingRetries?: number;

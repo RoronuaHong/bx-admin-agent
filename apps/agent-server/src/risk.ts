@@ -202,3 +202,22 @@ export function verdictNeedsConfirm(v: RiskVerdict): boolean {
   if (!v.external) return false;
   return v.level !== "read";
 }
+
+/**
+ * 子代理能否执行该操作（P0-5，2026-09-22 按作用域细化）。
+ *
+ * 判据不是「写不写」，而是「**用户还能不能在场拍板**」：子代理的确认事件送不进用户可见的事件流
+ * （送不出去就只能挂到超时），所以只有「本来就需要用户确认」的动作才必须留给主对话。
+ * 与 `verdictNeedsConfirm` 是同一条判据的另一面：
+ * - 只读：放行；
+ * - 非只读但**无外部副作用**（`scope: workspace`，沙箱内、路径与体积有上限、可回查）：放行——
+ *   它自身免确认，不存在确认事件送不出去的问题；
+ * - 非只读且有外部副作用（需用户确认）：拒绝，交由主对话发起（那里会弹确认卡）。
+ *
+ * `allowWrite`（主代理传 true）只用于表达「调用方自己已能弹确认卡」的场景，默认口径不受影响。
+ */
+export function subagentMayExecute(v: RiskVerdict, allowWrite: boolean): boolean {
+  if (allowWrite) return true;
+  if (v.level === "read") return true;
+  return !v.external;
+}

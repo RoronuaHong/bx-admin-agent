@@ -477,7 +477,7 @@ function buildG2(chart: any, type: string, rawData: any[], encode: Record<string
     case "boxplot": {
       // G2 的箱线图吃「明细行」（每行一个数值）：模型若给的是「每行一组样本」的数组，
       // 就地展开成明细行——否则一组样本会被当成一个点，画出来是一条线。
-      const rows = data.flatMap((r) => {
+      const rows = data.flatMap((r: any) => {
         const raw = r?.[y];
         if (!Array.isArray(raw)) return [r];
         return raw.map((v) => ({ ...r, [y]: v }));
@@ -501,7 +501,7 @@ function buildG2(chart: any, type: string, rawData: any[], encode: Record<string
       // （B 段 -3 显示成 4，读数直接错），diffY 在整段同号时画不出东西——所以在前端构造累积区间，
       // 用 y/y1 双端画每段的上下界，并按增减着色。
       let acc = 0;
-      const rows = data.map((r) => {
+      const rows = data.map((r: any) => {
         const from = acc;
         acc += Number(r?.[y]) || 0;
         return { ...r, __from: from, __to: acc };

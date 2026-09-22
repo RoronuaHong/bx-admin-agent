@@ -202,7 +202,7 @@ while (!next.done) {
 |---|---|---|
 | D1 | 未声明注解 / 查不到的工具 | **默认要确认**（fail-closed，对齐 MCP 规范保守口径） |
 | D2 | "查数不烦人"怎么解 | **会话级只读授权**（服务端按工具级别判定，不看参数） |
-| D3 | 写操作能否委派给子代理 | **默认只读**：命中写/未知立即拒绝并回喂明确错误 |
+| D3 | 写操作能否委派给子代理 | **按作用域限权**（2026-09-22 细化，见 §9.7）：免确认的**工作区写**可委派；**需用户确认**的外部写 / 未知工具立即拒绝并回喂明确错误（子代理送不出确认卡） |
 | D4 | 本轮范围 | **全部 P0（P0-1..P0-8）** |
 | D5（本方案自行确定） | 内置工作区写（`fs_write`/`fs_edit`/`write_todos`） | **免确认**（`scope: workspace`，无外部副作用） |
 | D6（本方案自行确定） | `run_native_query` 的级别 | **`destructive`**，永远弹卡（不看 SQL 内容） |
@@ -364,6 +364,8 @@ return c.json({ ok: true, confirmed: body.confirmed === true });
 
 ### 5.4 P0-5 子代理默认只读
 
+> **2026-09-22 修订**：判据由「非只读」收紧为「非只读**且**有外部副作用」（`risk.ts` `subagentMayExecute`）——免确认的工作区写不再被拦，理由与验证见 §9.7。以下为原始实现记录（保留追溯）。
+
 **`src/chat.ts`**：
 - `LoopContext` 新增 `allowWrite: boolean`（主循环 `true`，子代理 `false`）
 - 闸门内（子代理 `allowWrite=false` 时）：
@@ -498,7 +500,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 - [ ] `bi` 的 8 个只读工具**不弹卡**（无体验回归）；`run_native_query` 弹卡
 - [ ] 未声明注解 / 查不到的工具：默认弹确认卡（`MCP_UNKNOWN_TOOLS=deny` 时直接拒绝）
 - [ ] 伪造 / 跨会话复用 ticket 无法批准（`/chat/confirm` 返回 403 且记审计）
-- [ ] 子代理碰到写操作：**立即**返回明确错误（不再等 120s）
+- [ ] 子代理碰到**需用户确认**的操作：**立即**返回明确错误（不再等 120s）；免确认的工作区写可正常执行（§9.7）
 - [ ] 确认卡显示 工具名 / 服务器 / 级别 / 原因 / 关键参数摘要；敏感键已脱敏
 - [ ] 会话级只读授权后：该服务器**未声明**的工具不再弹卡；`run_native_query` 仍弹卡
 - [ ] `.data/audit/` 里能看到每次决策（含 denied / timeout / ownership_mismatch / subagent_refused）
@@ -616,7 +618,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 | 用户自加的第三方 MCP 上未声明级别的工具 | `MCP_UNKNOWN_TOOLS` 默认 `confirm`（fail-closed） |
 | 声明 `destructiveHint` 或服务器 `requireConfirm: true` 的工具 | risk.ts 第 3、5 条 |
 
-免确认：全部内置工具（workspace 无外部副作用）、`bi` 的 8 个只读（2026-09-19 起含新增的 `get_field_values`）、`yapi` 全部（本轮新增）、`chart` 的 `"*": "read"`、`movie` 白名单；子代理内的非只读**直接拒绝**（不弹卡）。
+免确认：全部内置工具（workspace 无外部副作用）、`bi` 的 8 个只读（2026-09-19 起含新增的 `get_field_values`）、`yapi` 全部（本轮新增）、`chart` 的 `"*": "read"`、`movie` 白名单；子代理内**需用户确认**的操作**直接拒绝**（不弹卡），免确认的工作区写可执行（§9.7）。
 
 **验证**：`_risk-gate-check.mjs` **16/16 PASS**（新增「票据签发同时回传有效期」一条）；真实连接实测 `mcp__yapi__call_api` → `level=read / source=annotation / needsConfirm=false`；`tsc --noEmit` 无新增错误（当时残留 1 个预存在的 `builtins.ts:355` 类型错误，与本次改动无关）。**（2026-09-18 复核：该残留错误已不存在——`tsc --noEmit` 在 `apps/agent-server` 干净通过、exit 0。）**
 
@@ -628,7 +630,7 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 
 - **根因是代码漂移**：D5 与 §9.5「当前默认口径」都写着内置工作区写免确认（`scope: workspace`），但 `src/builtins.ts` 的登记表被改成 `scope: "external"`，而 `verdictNeedsConfirm` 只对 `external` 生效 → 它们被送进了确认流程。
 - **判据（confirmation-gate 通行口径）**：闸门只应留给**不可逆 / 跨出信任边界**的动作，否则确认疲劳会让用户退化成橡皮图章（对手还会主动灌爆审批队列）。工作区写发生在 `./.data/fs/<conversationId>/` 沙箱内、有路径与体积上限，且系统自身（大结果卸载 `offloadToolResult`）也在静默写同一目录——逐次确认对用户是零决策质量。同类工具的可比口径：**工作目录内**的文件编辑属于自动批准那一档，需要人工把关的是越界路径、网络请求与系统级命令。
-- **仍然生效**：`level` 保持 `write`（子代理只读闸门照旧拦、澄清挂起期照旧冻结）；外部 MCP 写、未知工具 fail-closed、非只读 SQL 硬拒全部不变。
+- **仍然生效**：`level` 保持 `write`（澄清挂起期照旧冻结；子代理闸门见 §9.7——工作区写已放行）；外部 MCP 写、未知工具 fail-closed、非只读 SQL 硬拒全部不变。
 - **补偿：免确认之后必须有痕迹**。原审计分支是 `verdict.external` 才记，工作区工具一律不记——免确认后 `fs_write` 会连一条 `allowed` 都没有（此前它有 confirm_request/denied 记录）。故新增 `builtins.ts` 的 `WORKSPACE_FILE_WRITE_TOOLS`（`fs_write` / `fs_edit`，协议级英文名）并在放行分支记一条 `gate/allowed`（只落 `argsDigest`，不落内容）；工作区**只读**工具与 `write_todos` 仍不记，避免噪音。实测：`16:58:58 kind=gate decision=allowed tool=fs_write level=write reason=写入本对话工作区文件（无外部副作用）`。
 
 **改动 2：确认卡参数展示改为「头尾保留 + 显式省略」**
@@ -645,4 +647,19 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 
 - 新增 `tests/write-gate.test.ts`（3 项）：工作区写免确认且级别仍为 `write`；**放宽不外溢**（未连接的 MCP 工具与未登记的名字仍须确认）；`argSummary` 头尾保留 + 显式省略 + 敏感键脱敏 + 8 项上限。
 - `pnpm test`：14 个测试文件 / 94 用例全绿（含 `deep-agent-live` 主代理 fs_write 真实落盘、`clarification-flow` 澄清期冻结写）。
+
+### 9.7 子代理可执行范围按作用域判定 + 中断轮次的前端收口（2026-09-22）
+
+**触发**：一次「把结果整理成表并导出成文件」的对话里，主代理把「生成文件」委派给子代理（`task`）之后，界面上的 `task` 步骤长期停在「执行中」；用户以为还在算，实际那一轮已经死了。
+
+**根因 1（服务端，能力被过度限制）**：§9.6 把工作区写改回免确认之后，「子代理默认只读」这条判据就与新口径不一致了——D3 的理由是「写操作要用户拍板，子代理弹不出确认卡」（§3.5），而工作区写**本来就不需要拍板**，被拦的理由只剩旧判据的惯性。后果是「让子代理把中间结果落盘」这类安全委派被无谓拒绝。
+
+- **改动**：新增 `risk.ts` `subagentMayExecute(verdict, allowWrite)`，判据从「是否非只读」改为「**是否非只读且有外部副作用**」——只读放行 / 工作区写放行 / 外部写与未知工具拒绝（`subagent_refused` 审计照记，给模型的错误文案同步改写：说清是「带外部副作用、需要你确认」，而不是含糊的「禁止写」）。
+- **为什么不直接转发确认事件**：子代理的确认事件进不了用户可见的事件流（消费循环只转发 `subagent_*` / `chart`），转发要靠队列 + 竞速重写消费循环，风险大于收益；而**按作用域切分**已经把子代理能安全做的那部分放开了，剩下的正是本该由用户在场拍板的动作。`SUBAGENT_ALLOW_WRITE` 仍忽略 + 告警（`src/index.ts` 文案随口径更新）。
+- **验证**：`tests/write-gate.test.ts` 新增 `[E]`（工作区写 / 只读放行；外部写与破坏性拒绝；`allowWrite=true` 不受限）；`write-gate` + `deep-agent-control` 10/10，全量 16 个测试文件全绿；`tsc --noEmit` 干净。
+
+**根因 2（前端，没收到终态就永久转圈）**：`streamChat` 的消费循环在「服务端进程重启 / 连接被回收 / 代理切断」时是**正常返回**的（不抛异常），而只有 `done` 事件会把 `streaming` 置 false；同时 `persist` 会把 `status: "running"` 的步骤原样落库 → 刷新后从快照读回来，推理面板继续显示「推理中…」/「子代理运行中」。两层叠加就是「卡住」的观感。
+
+- **改动**（`apps/web/src/pages/ChatPage.vue`）：①新增 `StepStatus` / `SubagentStatus` 的 `interrupted`（与「失败」「已拒绝」区分：不知道结果就如实说不知道）；②消费循环记录是否收到终态事件（`done` / 服务端 `error`），**没收到就调用 `settleInterruptedRun()`**——先查 `/chat/task/status`：任务还在跑 → 如实提示「后台继续」并守望；任务没了 → 把未完成的步骤与子代理标成 `interrupted`、清掉半路挂起的确认卡 / 澄清卡；③`toStored` 与快照恢复都过一遍 `settleStep()`：**快照里不存在「正在跑」**（库里已存的 `running` 记录刷新即被纠正）；④中断的轮次不自动出队（连接已不可靠，接着发下一条大概率也失败）。
+- **未做（挂账）**：前端仍未接 `GET /chat/task/events` 做真正的断线重连续传（服务端端点已就绪），断线后只能靠「重开对话看结果」——进程重启的场景本来也续不上。
 
