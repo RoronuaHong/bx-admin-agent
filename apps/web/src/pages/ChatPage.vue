@@ -8086,7 +8086,7 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   margin-bottom: 0;
 }
 
@@ -8095,16 +8095,23 @@ onBeforeUnmount(() => {
   content: "";
   position: absolute;
   left: 4.5px;
-  top: 15px;
-  bottom: 15px;
-  width: 1px;
+  top: 16px;
+  bottom: 14px;
+  width: 2px;
   background: var(--rail);
+  border-radius: 2px;
 }
 
 .step {
   position: relative;
-  padding: 5px 0 6px 18px;
-  border-radius: 6px;
+  padding: 5px 6px 6px 24px;
+  border-radius: 8px;
+  transition: background-color 0.18s var(--ease);
+}
+
+/* 展开的步骤给一层极淡底，表达「这一条正在被查看」（对齐 Claude 步骤高亮）。 */
+.step.expanded {
+  background: color-mix(in srgb, var(--ink) 3.5%, transparent);
 }
 
 /* 步骤行头：有结果时整行可点开（对齐 antd Collapse：默认收起、收起时给一行摘要、点开看全文）。
@@ -8114,8 +8121,8 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   margin: 0 -6px;
-  padding: 0 6px;
-  min-height: 20px;
+  padding: 3px 6px;
+  min-height: 24px;
   border: none;
   background: transparent;
   color: inherit;
@@ -8123,7 +8130,7 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
   text-align: left;
   border-radius: 6px;
-  transition: background-color 0.2s var(--ease);
+  transition: background-color 0.18s var(--ease);
 }
 
 button.step-head {
@@ -8131,7 +8138,7 @@ button.step-head {
 }
 
 button.step-head:not(:disabled):hover {
-  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
 button.step-head:disabled {
@@ -8142,18 +8149,31 @@ button.step-head:disabled {
    注意不要给 .step-head 加 position —— 它一旦成为定位祖先，节点就会跟着行头跑偏。 */
 .step-head .mcp-dot {
   position: absolute;
-  left: 0;
-  top: 10px;
+  left: 1px;
+  top: 11px;
   width: 9px;
   height: 9px;
+  /* 白圈把节点从竖轨上「托起」，避免和轨道线粘在一起。 */
+  box-shadow: 0 0 0 3px var(--panel);
+}
+
+/* 完成 / 失败节点加语义光环（halo），让时间轴一眼可读，不靠文字颜色。 */
+.step.ok .mcp-dot {
+  box-shadow: 0 0 0 3px var(--panel), 0 0 0 5px color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+.step.err .mcp-dot {
+  box-shadow: 0 0 0 3px var(--panel), 0 0 0 5px color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
 .step-name {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 46%;
+  /* 工具名是标识符，给足宽度但留白给右侧摘要；过长才省略。 */
+  max-width: 42%;
   font-family: var(--font-mono);
   font-size: 12px;
+  font-weight: 500;
   color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -8169,6 +8189,8 @@ button.step-head:disabled {
   white-space: nowrap;
   color: var(--muted);
   font-size: 11.5px;
+  /* 比工具名弱一档，扫读时先看到「做了什么」再看「结果是什么」。 */
+  opacity: 0.92;
 }
 
 /* 展开指示：收起指向右、展开指向下（与外层推理面板同一个语汇）。 */
@@ -8176,8 +8198,8 @@ button.step-head:disabled {
   flex: none;
   width: 6px;
   height: 6px;
-  border-right: 1.4px solid color-mix(in srgb, var(--muted) 85%, transparent);
-  border-bottom: 1.4px solid color-mix(in srgb, var(--muted) 85%, transparent);
+  border-right: 1.5px solid color-mix(in srgb, var(--muted) 80%, transparent);
+  border-bottom: 1.5px solid color-mix(in srgb, var(--muted) 80%, transparent);
   transform: rotate(-45deg);
   transition: transform 0.2s var(--ease);
 }
@@ -8190,54 +8212,56 @@ button.step-head:disabled {
    与右侧状态药丸明确区分——原来两者同为灰色小字，扫读时完全分不开。 */
 .step-server {
   flex: none;
-  padding: 0 6px;
+  padding: 1px 6px;
   border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
   border-radius: 5px;
   background: color-mix(in srgb, var(--fill-soft) 65%, transparent);
-  color: var(--muted);
-  font-size: 10.5px;
-  line-height: 16px;
+  color: color-mix(in srgb, var(--muted) 88%, var(--ink));
+  font-size: 10px;
+  line-height: 15px;
+  letter-spacing: 0.02em;
 }
 
 .step-status {
   flex: none;
   margin-left: auto;
-  padding: 0 7px;
+  padding: 0 8px;
   border-radius: 999px;
   font-size: 10.5px;
-  line-height: 17px;
+  line-height: 18px;
+  font-weight: 500;
   color: var(--muted);
   background: color-mix(in srgb, var(--ink) 6%, transparent);
 }
 
 /* 状态药丸配色：只上语义色，不染整块（状态值由模板给的 stepClass 落到 .step 上）。 */
 .step.running .step-status {
-  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
+  color: color-mix(in srgb, var(--accent) 85%, var(--ink));
   background: var(--accent-soft);
 }
 
 .step.ok .step-status {
-  color: color-mix(in srgb, var(--success) 72%, var(--ink));
+  color: color-mix(in srgb, var(--success) 78%, var(--ink));
   background: var(--success-soft);
 }
 
 .step.err .step-status {
-  color: color-mix(in srgb, var(--danger) 78%, var(--ink));
+  color: color-mix(in srgb, var(--danger) 82%, var(--ink));
   background: var(--danger-soft);
 }
 
 .step-result {
-  margin: 6px 0 0;
-  max-height: 200px;
+  margin: 8px 0 2px;
+  max-height: 220px;
   overflow: auto;
   background: var(--surface-2);
   border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
   border-radius: 8px;
-  padding: 8px 10px;
+  padding: 10px 12px;
   font-family: var(--font-mono);
   font-size: 11.5px;
-  line-height: 1.6;
-  color: color-mix(in srgb, var(--ink) 80%, var(--panel));
+  line-height: 1.55;
+  color: color-mix(in srgb, var(--ink) 82%, var(--panel));
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -8280,30 +8304,32 @@ button.step-head:disabled {
   white-space: nowrap;
 }
 
-/* 状态药丸与步骤共用同一套语义配色，保证「过程面板」里所有状态读起来是一套语言。 */
+/* 状态药丸与步骤共用同一套尺寸 + 语义配色，保证「过程面板」里所有状态读起来是一套语言。
+   尺寸/字重/对比系数都与 .step-status 逐值对齐，避免两处药丸「差一点点」。 */
 .subagent__status {
   flex: none;
   margin-left: auto;
-  padding: 0 7px;
+  padding: 0 8px;
   border-radius: 999px;
   font-size: 10.5px;
-  line-height: 17px;
+  font-weight: 500;
+  line-height: 18px;
   color: var(--muted);
   background: color-mix(in srgb, var(--ink) 6%, transparent);
 }
 
 .subagent.running .subagent__status {
-  color: color-mix(in srgb, var(--accent) 82%, var(--ink));
+  color: color-mix(in srgb, var(--accent) 85%, var(--ink));
   background: var(--accent-soft);
 }
 
 .subagent.done .subagent__status {
-  color: color-mix(in srgb, var(--success) 72%, var(--ink));
+  color: color-mix(in srgb, var(--success) 78%, var(--ink));
   background: var(--success-soft);
 }
 
 .subagent.error .subagent__status {
-  color: color-mix(in srgb, var(--danger) 78%, var(--ink));
+  color: color-mix(in srgb, var(--danger) 82%, var(--ink));
   background: var(--danger-soft);
 }
 
@@ -9172,15 +9198,22 @@ button.step-head:disabled {
   to { transform: rotate(360deg); }
 }
 
-/* 展开内容：2px 左轨 + 缩进（Claude 推理块的做法）——表达「过程」语义，
-   又不像卡片那样把思考流框成第二个气泡。 */
+/* 展开内容：过程面板——极淡底 + 发丝描边 + 圆角，把「思考流 / 工具步骤 / 任务计划 / 子代理」
+   收束成一块「过程区」，与气泡里的「结论正文」形成明确分层
+   （对齐 Cursor / Claude Code 的 agent trace：过程成组、结论直排）。 */
 .reasoning__body {
-  margin: 4px 0 0;
-  padding: 2px 0 2px 12px;
-  border-left: 2px solid color-mix(in srgb, var(--line) 85%, transparent);
+  margin: 6px 0 0;
+  padding: 10px 12px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  border-radius: 10px;
+  /* 底色只给「一丝」tint：面板内 todos / 步骤结果 / 子代理卡片是实色 --surface-2，
+     面板若压到同一档，嵌套卡片就会融进底里（浅色约 #f7f6f2、深色约 #171716，
+     两个主题下 20%+ 的 fill-soft 叠出来都正好落在这一档）。分层交给描边，
+     让「有底的卡片」始终是层级里更明显的那一层。 */
+  background: color-mix(in srgb, var(--fill-soft) 14%, transparent);
 }
 
 /* 规划/思考阶段的状态行：比纯圆点更明确地传达「agent 正在规划」，缓解静默加载的卡顿感。 */
@@ -9188,6 +9221,8 @@ button.step-head:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 状态点对齐到时间轴竖轨（轨中心 5.5px），让「规划中」与思考流 / 步骤落同一竖直栅格。 */
+  margin-left: 2.5px;
   padding: 2px 0;
   font-size: 12.5px;
   color: var(--muted);
@@ -9209,20 +9244,25 @@ button.step-head:disabled {
   100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 
-/* 意图行：仅当模型显式声明「意图：」才渲染；无框、弱标签 + 正文色。
+/* 意图行：仅当模型显式声明「意图：」才渲染；弱标签改成小药丸 + 正文色。
    替代原「理解意图」高亮卡——它与思考流首行重复、且「取首句」兜底常截出半截话。 */
 .intent-line {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   gap: 8px;
 }
 
 .intent-line__label {
   flex: none;
-  font-size: 10.5px;
+  margin-top: 2px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.08em;
-  color: color-mix(in srgb, var(--accent) 72%, var(--muted));
+  line-height: 15px;
+  color: color-mix(in srgb, var(--accent) 80%, var(--ink));
+  background: var(--accent-soft);
 }
 
 .intent-line__text {
@@ -9234,16 +9274,22 @@ button.step-head:disabled {
 /* 思考流：与正文同族的无衬线——中文没有像样的等宽族，mono 回退参差是「难看」的另一主因
    （ChatGPT/Claude 的思考文本都用正文字体）；只弱一档对比、不再套灰底描边的小盒子。 */
 .reasoning__thinking {
-  margin: 0;
+  /* 左轨与正文缩进都对齐步骤时间轴（轨 4.5px、正文 ~21.5px），
+     让「思考流 → 工具步骤」在同一竖直栅格上，读起来是一件事的两段而非两个区块。 */
+  margin: 0 0 0 4.5px;
+  padding: 1px 0 1px 15px;
   max-height: 280px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
-  font-size: 12.8px;
-  line-height: 1.62;
+  font-size: 12.5px;
+  line-height: 1.65;
   /* 思考流是「过程」而非结论：比正文/步骤名弱一档，但仍保证可读（不用 --muted 那样虚）。 */
-  color: color-mix(in srgb, var(--ink) 72%, var(--panel));
+  color: color-mix(in srgb, var(--ink) 74%, var(--panel));
+  /* 细左轨保留「这是推理过程」的纵向语义（面板内再收一层，不额外套盒子）。
+     用 --rail（而非 --line）：深色主题下连接线需要比边框更亮，否则会「断成几个点」。 */
+  border-left: 2px solid var(--rail);
 }
 
 .reasoning__body .todos,
