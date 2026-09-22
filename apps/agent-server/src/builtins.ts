@@ -311,7 +311,15 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         "矩形树 treemap / 漏斗 funnel / 箱线 boxplot / 直方图 histogram / 瀑布 waterfall / 双轴 dual_axes /" +
         "桑基 sankey / 思维导图 mind_map / 组织架构 org_chart / 关系网络 network。" +
         "图形类（sankey/mind_map/org_chart/network）data 用 {nodes:[{id,label}],edges:[{source,target,label?}]}" +
-        "或层级结构 {name,children:[...]}；统计图 data 用行数组，encode 指定 x/y/color/series 字段。",
+        "或层级结构 {name,children:[...]}；统计图 data 用行数组。" +
+        "统计图的字段映射：encode 必给 x（分类/时间字段）与 y（数值字段）；" +
+        "同一 x 上有多条序列时（多条折线、多组柱、多来源对比）必须再给分组字段——折线/面积用 encode.series，柱图/饼图用 encode.color；" +
+        "漏给分组字段会把同一 x 的多个数据点当成一条线连起来，画出一团乱线；" +
+        "分组字段与 x 相同等于没分组，不要这样给。" +
+        "标注规范：轴标题用中文写在 options.xTitle / options.yTitle（缺省时按原始字段名显示，纯英文字段名会被隐藏）；" +
+        "数值单位写在 options.unit（如 \"%\"），会拼到刻度与提示框；占比结构要堆叠时给 options.stack: true；" +
+        "双轴第二指标标题 options.y1Title；直方图分箱数 options.bins。" +
+        "数据卫生：同一序列内字段名保持一致（不要带首尾空格），时间字段升序，序列名用可读名称。",
       {
         type: "object",
         properties: {
@@ -322,8 +330,14 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
               "真实数据：统计图为行对象数组；图形类为 {nodes,edges} 或 {name,children} 层级结构。禁止编造。",
             type: "array",
           },
-          encode: jsonType("object", "字段映射：{ x, y, color, size, series } 等（统计图用）"),
-          options: jsonType("object", "额外选项（轴标题、图布局等）"),
+          encode: jsonType(
+            "object",
+            "字段映射：{ x, y, series, color, y1 }。统计图必给 x/y；多条序列再给 series（折线/面积）或 color（柱图/饼图）",
+          ),
+          options: jsonType(
+            "object",
+            '额外选项：{ xTitle, yTitle, y1Title, unit, stack, bins }（轴标题写中文，单位如 "%"）',
+          ),
         },
         required: ["chartType", "data"],
       },

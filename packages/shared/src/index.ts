@@ -48,8 +48,16 @@ export const CHART_TYPES = [
   "network",
 ] as const;
 
-/** 图形类图表族（关系 / 层级 / 流程）：前端走 G6，其余走 G2 的统计图语法。 */
+/**
+ * 关系/层级形态的图表族：`data` 是 `{nodes,edges}` 或 `{name,children}` 结构（不是行数组）。
+ * 服务端 `render_chart` 用它校验 data 形态。注意它与「用哪个渲染框架」**不是一回事**：
+ * sankey 用这种数据，但渲染走 G2（G2 有 sankey mark；G6 没有桑基布局，用 G6 画只会得到
+ * 一堆叠在同一位置的节点），所以前端分流看的是下面的 `G6_CHART_TYPES`。
+ */
 export const GRAPH_CHART_TYPES = ["sankey", "mind_map", "org_chart", "network"] as const;
+
+/** 真正走 G6 渲染的图形类（关系 / 层级 / 架构）：其余图型一律走 G2 的统计图语法。 */
+export const G6_CHART_TYPES = ["mind_map", "org_chart", "network"] as const;
 
 /**
  * 图表 spec（内置工具 render_chart 的产出）：服务端只透传，浏览器用 AntV 本地绘制
@@ -61,7 +69,7 @@ export const GRAPH_CHART_TYPES = ["sankey", "mind_map", "org_chart", "network"] 
  * 而工具白名单已有 17 种，且图形类的 data 被声明成数组）。
  */
 export interface ChartSpec {
-  /** 图表族，取值见 `CHART_TYPES`（`GRAPH_CHART_TYPES` 里的走 G6，其余走 G2）。 */
+  /** 图表族，取值见 `CHART_TYPES`（`G6_CHART_TYPES` 里的走 G6，其余走 G2）。 */
   chartType: string;
   /** 真实数据：统计图为行对象数组，图形类为 {nodes,edges} 或 {name,children} 层级结构（来自工具取数，禁止编造）。 */
   data: unknown;
