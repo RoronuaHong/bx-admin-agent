@@ -7,7 +7,7 @@
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
 import type { ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
-import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME } from "./builtins.js";
+import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
@@ -350,12 +350,16 @@ export function buildClarifyAck(
   );
 }
 
-// 确认卡参数摘要（P0-6）：键名命中敏感词的值脱敏，值截断。
+// 确认卡参数摘要（P0-6）：键名命中敏感词的值脱敏；长值**头尾保留 + 显式省略计数**（不静默截断：
+// 只留头部的摘要会把藏在尾部的内容藏起来，而确认卡的全部价值就是让用户看清「到底要执行什么」）。
 const SENSITIVE_KEY_RE = /token|secret|password|key|authorization|cookie/i;
 const ARG_SUMMARY_MAX_ITEMS = 8;
-const ARG_SUMMARY_VALUE_CHARS = 200;
+/** 单值展示总长（超出即头尾保留并标注省略量）。 */
+const ARG_SUMMARY_VALUE_CHARS = 1200;
+/** 头尾保留里头部占比（其余留给尾部）。 */
+const ARG_SUMMARY_HEAD_CHARS = 800;
 
-/** 关键参数摘要：取入参顶层键，值 JSON 化后截断；敏感键只显示占位符（凭据不外泄）。 */
+/** 关键参数摘要：取入参顶层键，值 JSON 化后按上限头尾保留；敏感键只显示占位符（凭据不外泄）。 */
 export function summarizeArgsForConfirm(argsJson: string): Array<{ key: string; value: string }> {
   const args = safeJsonParse(argsJson);
   if (!args || typeof args !== "object" || Array.isArray(args)) return [];
@@ -363,7 +367,11 @@ export function summarizeArgsForConfirm(argsJson: string): Array<{ key: string; 
     .slice(0, ARG_SUMMARY_MAX_ITEMS)
     .map(([key, value]) => {
       let text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
-      if (text.length > ARG_SUMMARY_VALUE_CHARS) text = `${text.slice(0, ARG_SUMMARY_VALUE_CHARS)}…`;
+      if (text.length > ARG_SUMMARY_VALUE_CHARS) {
+        const head = text.slice(0, ARG_SUMMARY_HEAD_CHARS);
+        const tail = text.slice(-(ARG_SUMMARY_VALUE_CHARS - ARG_SUMMARY_HEAD_CHARS));
+        text = `${head}\n…（中间省略 ${text.length - ARG_SUMMARY_VALUE_CHARS} 字符）…\n${tail}`;
+      }
       if (SENSITIVE_KEY_RE.test(key)) text = "•••";
       return { key, value: text };
     });
@@ -1447,7 +1455,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // 被子代理消费循环丢弃，调用会静默挂到超时），模型拿到明确错误可自行调整。
       if (!ctx.allowWrite && verdict.level !== "read") {
         ok = false;
-        rawText = `该操作（${verdict.level}）不能委派给子代理执行：请在主对话里直接发起，届时会弹出确认卡。`;
+        rawText = `该操作（${verdict.level}）不能委派给子代理执行：请在主对话里直接发起（需要用户确认的操作会在主对话弹确认卡）。`;
         yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理禁止写操作）" });
@@ -1522,8 +1530,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未确认）" });
           continue;
         }
-      } else if (verdict.external) {
-        // 只读放行也留痕（仅外部工具；工作区工具不记，避免噪音）。
+      } else if (verdict.external || WORKSPACE_FILE_WRITE_TOOLS.has(call.name)) {
+        // 放行留痕：外部工具（含只读）全记；工作区**文件写**也记一条——它已免确认（见 builtins.ts 登记表），
+        // 免确认之后唯一的保障是「可回查」。工作区只读工具与 write_todos 仍不记，避免噪音。
         appendAudit({ kind: "gate", decision: "allowed", ...auditBase });
       }
 

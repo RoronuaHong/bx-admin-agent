@@ -130,10 +130,21 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
   (conv as { model: string }).model = "mock";
 
   const SESSION = "verify-session";
-  const seen = { model: false, task: false, subagentRan: false, mainWrote: false, finalText: false, done: false };
+  const seen = {
+    model: false,
+    task: false,
+    subagentRan: false,
+    mainWrote: false,
+    finalText: false,
+    done: false,
+    /** 端到端出现的确认卡类型（工作区写免确认 → 这条必须为空，见下方断言）。 */
+    confirmed: [] as string[],
+  };
   for await (const ev of chatStream("verify-deep", "请完成一个多步任务", { sessionId: SESSION }, undefined)) {
-    // 端到端没有真人点确认卡：自动放行主代理的写操作确认，避免 waiter 挂到超时（子代理写仍被只读闸门拒绝）。
+    // 端到端没有真人点确认卡：万一有卡就自动放行（避免 waiter 挂到 120s 超时，让失败快速暴露）。
+    // 正常情况下不该走到这里——工作区写免确认，子代理的非只读在闸门处直接拒绝。
     if (ev.type === "confirmation_required") {
+      seen.confirmed.push((ev as { name?: string }).name || "?");
       answerConfirmation((ev as { ticket: string }).ticket, SESSION, true);
       continue;
     }
@@ -161,6 +172,8 @@ test("Deep Agent 端到端循环：主代理委派 → 子代理执行内置工�
   expect(seen.task, "主代理应委派 task 子代理").toBe(true);
   expect(seen.subagentRan, "子代理应独立执行并返回").toBe(true);
   expect(seen.mainWrote, "主代理的内置工具 fs_write 应真实执行并落盘").toBe(true);
+  // 免确认是「闸门→可见性」的取舍：写必须真的执行，且**不经过任何确认卡**（弹卡就会打断用户且带回确认疲劳）。
+  expect(seen.confirmed, "工作区写免确认：端到端不应出现任何确认卡").toEqual([]);
   expect(content.includes("子代理产出"), "子代理的写操作应被只读闸门拒绝（P0-5），不得落盘").toBe(false);
   expect(seen.finalText, "主代理应收敛出最终文本").toBe(true);
   expect(seen.done, "事件流应正常收束 done").toBe(true);

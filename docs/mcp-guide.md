@@ -378,7 +378,7 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 **已固化**：`node --import tsx scripts/_mcp-multi-server-check.mjs`（55 项断言，自带 mock stdio server，用 `MCP_BUILTIN_SERVERS` 注入、不碰真实的 `.mcp-servers.json`）。覆盖：多服务器聚合与顺序确定性、缺席服务器上报（5 类原因）、工具数超限回报、工具通道现状注入、取消信号透传、失败冷却、并行连接、连接单飞、确认门注解矩阵、按需加载（阈值 + 检索排序 + 提示）、子代理服务器白名单、空闲回收、同轮去重签名（key 顺序无关）、跨轮 Doom Loop 熔断（连续同指纹触发 / 指纹变化重置 / 空轮不计入）。
 
-**安全闸门（P0）已固化**：`node --import tsx scripts/_risk-gate-check.mjs`（15 项断言，纯函数不依赖真实 MCP / 模型）。覆盖：内置工具登记表（fs_write 免确认 / task 只读）、未知工具 fail-closed（confirm / deny / allow 三口径）、会话级只读授权降级（含未连接服务器）、票据会话绑定（错会话拒绝且一次性）、参数摘要脱敏（敏感键 ••• / 截断 / 上限 8 项）、审计落盘回读。
+**安全闸门（P0）已固化**：`node --import tsx scripts/_risk-gate-check.mjs`（15 项断言，纯函数不依赖真实 MCP / 模型）。覆盖：内置工具登记表（fs_write 免确认 / task 只读）、未知工具 fail-closed（confirm / deny / allow 三口径）、会话级只读授权降级（含未连接服务器）、票据会话绑定（错会话拒绝且一次性）、参数摘要脱敏（敏感键 ••• / 头尾保留 + 显式省略 / 上限 8 项）、审计落盘回读。同口径的单元回归见 `tests/write-gate.test.ts`（2026-09-22 新增：工作区写免确认、放宽不外溢、确认卡参数头尾保留）。
 
 **2026-09-17 新增回归**（均为零外部依赖，可直接跑）：
 

@@ -194,7 +194,9 @@ function applyGrant(verdict: RiskVerdict, grantServers?: ReadonlySet<string>): R
 
 /**
  * 该次调用是否需要用户确认（deny 由调用方先行拒绝，不走本判定）：
- * 只有**外部副作用**且级别非 read 才确认；内置工作区写（fs_write 等，无外部副作用）免确认。
+ * 只有**外部副作用**且级别非 read 才确认；内置工作区写（fs_write / fs_edit，scope=workspace）免确认。
+ * 口径依据（2026-09-22）：闸门只留给不可逆 / 跨出信任边界的动作——闸门过密会制造确认疲劳，
+ * 用户退化成橡皮图章，反而降低整体安全性；工作区写在沙箱内、有路径与体积上限，属可逆的本地动作。
  */
 export function verdictNeedsConfirm(v: RiskVerdict): boolean {
   if (!v.external) return false;

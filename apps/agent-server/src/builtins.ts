@@ -18,8 +18,13 @@ export const BUILTIN_SERVER = "builtin";
 /**
  * 内置工具风险登记表（写操作安全闸门 P0-1）：内置工具不在 MCP 注册表里，
  * 必须显式登记级别，否则 risk.ts 会按「未知」兜底处理（fail-closed）。
- * scope = workspace 的工具只写「本对话工作区」，无外部副作用（免确认依据）；
- * 例外：fs_write / fs_edit 直接变更用户可见的工作区文件，scope 标 external 以走确认流程。
+ * scope = workspace 的工具只写「本对话工作区」，无外部副作用 → 免确认（判定见 risk.ts verdictNeedsConfirm）。
+ *
+ * 工作区写（fs_write / fs_edit）为何也算 workspace（2026-09-22 修订）：
+ * 闸门只应留给**不可逆 / 跨出信任边界**的动作，否则会制造确认疲劳（用户退化成橡皮图章，
+ * 对手还会故意灌爆审批队列）；工作区写发生在 `./.data/fs/<conversationId>/` 沙箱内——
+ * 路径越界即拒、单文件与文件数有上限，且系统自身（大结果卸载 offloadToolResult）也在静默写同一目录，
+ * 逐次确认对用户是零决策质量。外部写（MCP 写工具 / 非只读 SQL）仍逐次确认、不受本修订影响。
  */
 export const BUILTIN_RISK: Record<
   string,
@@ -39,8 +44,8 @@ export const BUILTIN_RISK: Record<
   knowledge_sources: { level: "read", scope: "workspace", reason: "列出知识库已入库来源" },
   web_search: { level: "read", scope: "workspace", reason: "联网检索公开网页（只读，无外部副作用）" },
   fetch_url: { level: "read", scope: "workspace", reason: "抓取公网网页正文（只读，无外部副作用）" },
-  fs_write: { level: "write", scope: "external", reason: "写入本对话工作区文件（需用户确认）" },
-  fs_edit: { level: "write", scope: "external", reason: "编辑本对话工作区文件（需用户确认）" },
+  fs_write: { level: "write", scope: "workspace", reason: "写入本对话工作区文件（无外部副作用）" },
+  fs_edit: { level: "write", scope: "workspace", reason: "编辑本对话工作区文件（无外部副作用）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
   record_watched_movies: {
@@ -49,6 +54,13 @@ export const BUILTIN_RISK: Record<
     reason: "把用户表达过的观影偏好写入本地画像（无外部副作用）",
   },
 };
+
+/**
+ * 会变更工作区**文件**的内置工具（协议级英文名，与业务无关，同 grounding.ts 的名单风格）。
+ * 用途：这类调用已免确认（见 risk.ts verdictNeedsConfirm），免确认之后唯一的保障是「可回查」，
+ * 故 chat.ts 对它们留一条 `allowed` 审计；工作区只读工具与 write_todos 不记，避免噪音。
+ */
+export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit"]);
 
 /** 启动断言：内置工具漏登记级别时直接抛错（在启动即暴露，而不是运行时静默放行）。 */
 export function assertBuiltinRiskCoverage(): void {
@@ -143,7 +155,9 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
   return [
     spec(
       "fs_write",
-      "把内容写入当前对话的工作区文件（覆盖同名文件）。用于保存中间结果、大段数据或待办材料，之后可用 fs_read 取回。",
+      "把内容写入当前对话的工作区文件（**覆盖同名文件，旧内容不保留**）。" +
+        "用于保存中间结果、大段数据或待办材料，之后可用 fs_read 取回。" +
+        "写之前先用 fs_read 确认同名文件里有没有要保留的内容；本次回答用不到第二遍的中间过程不必落盘。",
       {
         type: "object",
         properties: {
