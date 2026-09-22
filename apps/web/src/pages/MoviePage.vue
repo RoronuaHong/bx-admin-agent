@@ -19,6 +19,7 @@ import {
   clearConversationContext,
   getApiErrorToken,
   getApiErrorCode,
+  isChatTaskRunning,
   MODEL_AUTO_ID,
   type ModelInfo,
 } from "../api";
@@ -288,6 +289,10 @@ async function send() {
   // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
   const chosenModel = resolveModel(modelId.value);
   activeModelLabel.value = models.value.find((m) => m.id === chosenModel)?.label || "";
+  /** 本轮是否收到过终态事件（done / 服务端 error）：没收到的流结束 = 连接断了，必须如实收口。 */
+  let sawTerminal = false;
+  /** 用户是否按了停止（停止不是「中断」，不该报错）。 */
+  let stopped = false;
   try {
     await streamChat(
       text,
@@ -309,9 +314,12 @@ async function send() {
           // 服务端实际选用的模型（含候选链自动切换）：刷新当前模型标签，用户可感知已切到备用模型。
           activeModelLabel.value = event.label;
         } else if (event.type === "error") {
+          // 服务端明确宣告的终态：这条之后流再断也算「有结论」。
+          sawTerminal = true;
           // 第三参数是兜底 code 而非文案：token 自带 defaultMessage，直接本地化即可。
           reply.error = localizeToken(uiLocale.value, event.error);
         } else if (event.type === "done") {
+          sawTerminal = true;
           reply.streaming = false;
         }
       },
@@ -320,6 +328,7 @@ async function send() {
   } catch (err) {
     if ((err as Error)?.name === "AbortError") {
       // 用户主动停止：不是错误，标注「已停止生成」（与 /chat 行为一致）。
+      stopped = true;
       const stoppedText = tx("（已停止生成）", "(stopped)", "(geração interrompida)", "(उत्पादन रोक दिया गया)");
       reply.text = reply.text ? `${reply.text}\n\n${stoppedText}` : stoppedText;
     } else if (isBusyError(err)) {
@@ -344,6 +353,26 @@ async function send() {
     }
   } finally {
     reply.streaming = false;
+    // 流结束却没收到终态 = 连接在收尾前断了（服务重启 / 代理切断 / 连接回收）：
+    // 与服务端同一原则——**不猜结果**，问一次任务状态后如实说清，别让气泡永远停在「正在输入」。
+    // （/chat 那边更进一步：会先按游标自动续传，见 ChatPage 的 resumeRun；本页轮次短，只做如实收口。）
+    if (!stopped && !sawTerminal) {
+      const running = await isChatTaskRunning(convId).catch(() => false);
+      const note = running
+        ? tx(
+            "（连接已中断，生成仍在后台继续；稍后重开本对话即可看到结果）",
+            "(Connection lost; generation continues in the background — reopen this chat to see the result)",
+            "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
+            "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
+          )
+        : tx(
+            "（本轮已中断：服务端任务已结束，未完成的部分请重新发起）",
+            "(This turn was interrupted — no task is running on the server; please retry)",
+            "(Este turno foi interrompido — não há tarefa em execução no servidor; tente novamente)",
+            "(यह चरण बाधित हुआ — सर्वर पर कोई कार्य नहीं चल रहा; कृपया फिर से प्रयास करें)",
+          );
+      reply.text = reply.text ? `${reply.text}\n\n${note}` : note;
+    }
     sending.value = false;
     controller = null;
     // 自动模式：本轮成功则记下来实际用到的具体模型（下次优先复用），失败则记入黑名单（下次跳过）。

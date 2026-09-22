@@ -40,6 +40,7 @@ import {
   fetchChatMcpServers,
   fetchChatPreferences,
   fetchChatSkills,
+  fetchChatTaskStatus,
   fetchConversations,
   fetchModels,
   fetchMemory,
@@ -2590,6 +2591,18 @@ async function send() {
 const RESUME_ATTEMPTS = 3;
 const RESUME_BACKOFF_MS = 600;
 
+/**
+ * 这些服务端终态码**不是**「模型不可用」：中断（服务重启）/ 无进展收口 / 已收束 / 流异常
+ * 都不该把模型记进 auto 模式的失败黑名单（否则一次服务重启就会让「自动」跳过本来好用的模型）。
+ */
+const NOT_MODEL_FAULT_CODES = new Set([
+  "CHAT_TASK_INTERRUPTED",
+  "CHAT_TASK_STALLED",
+  "CHAT_TASK_ELSEWHERE",
+  "CHAT_TASK_ALREADY_SETTLED",
+  "STREAM_ERROR",
+]);
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -2607,6 +2620,10 @@ interface TurnRun {
   sawTerminal: boolean;
   /** 已消费到的最后一个事件序号 = 续传游标（服务端据它只回放更新的部分）。 */
   lastSeq: number;
+  /** 本轮的任务 id（`POST /chat/stream` 的响应头给出）：续传时带回去，确认接的还是**同一轮**。 */
+  taskId?: string;
+  /** 服务端终态错误码（决定要不要把该模型记进失败黑名单）。 */
+  serverErrorCode?: string;
 }
 
 /**
@@ -2687,9 +2704,16 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
   } else if (event.type === "error") {
     // 服务端明确宣告的终态：这条之后流再断也算「有结论」，不走中断收口。
     run.sawTerminal = true;
+    run.serverErrorCode = String(event.error?.code || event.code || "");
     const message = localizeToken(uiLocale.value, event.error, event.message || "GENERIC_UNKNOWN_ERROR");
     reply.error = message;
     state.error = message;
+    // 终态已到，但本地可能还挂着「执行中」的步骤 / 子代理（例如无进展收口 / 服务重启中断）：
+    // 一并按「中断」归一，否则气泡会一直显示「执行中」——与「快照里不存在正在跑」同一条纪律。
+    for (const step of reply.steps || []) if (step.status === "running") step.status = "interrupted";
+    for (const sa of reply.subagents || []) if (sa.status === "running") sa.status = "interrupted";
+    reply.pending = null;
+    reply.clarification = null;
   } else if (event.type === "todos") {
     // 任务规划（write_todos）：挂到当前回复气泡上，随执行推进状态。
     reply.todos = event.todos;
@@ -2750,6 +2774,10 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
     openReasoning.delete(reply.id);
     // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
     if (!reply.error) lastGoodModelId.value = run.chosenModel;
+    // 正常收束时理论上不该再有「执行中」的步骤 / 子代理（结果事件可能因缓冲裁剪等缺口没到）：
+    // 顺手归一，让「气泡里不留永久转圈的步骤」这条不变量在任何路径上都成立。
+    for (const step of reply.steps || []) if (step.status === "running") step.status = "interrupted";
+    for (const sa of reply.subagents || []) if (sa.status === "running") sa.status = "interrupted";
   }
 }
 
@@ -2765,7 +2793,13 @@ async function resumeRun(run: TurnRun, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || run.sawTerminal) break;
     try {
       // 服务端没有可续传的任务时返回 false（不抛错）：直接走「如实收口」分支。
-      await resumeChatTaskEvents(run.convId, run.lastSeq, (event) => applyChatEvent(run, event), signal);
+      // 游标带上 taskId：确认接的还是**这一轮**（同对话里旧游标遇到新一轮事件会串流）。
+      await resumeChatTaskEvents(
+        run.convId,
+        { from: run.lastSeq, ...(run.taskId ? { taskId: run.taskId } : {}) },
+        (event) => applyChatEvent(run, event),
+        signal,
+      );
     } catch {
       /* 连接仍不通：退避后重试 */
     }
@@ -2837,6 +2871,10 @@ async function runTurn(
       { conversationId: convId, model: chosenModel || undefined, images: imageIds, attachments: docIds, agentId: AGENT_ID },
       (event) => applyChatEvent(run, event),
       controller.signal,
+      // 任务 id 在响应头到达时立刻记下（流中途断开就拿不到返回值了），续传时带回去防跨轮串流。
+      (info) => {
+        if (info.taskId) run.taskId = info.taskId;
+      },
     );
     // 流结束了却一个终态事件都没收到：连接在收尾前就断了（服务端进程重启 / 代理切断 / 连接被回收）。
     // 先按游标自动续传（可恢复流的客户端重连 + 精确续读）；服务端确实没有这个任务时才如实收口，
@@ -2891,8 +2929,8 @@ async function runTurn(
     state.sending = false;
     state.controller = null;
     // auto 模式：本轮失败则把该模型记入黑名单（下次解析跳过），成功则清除其失败标记。
-    // 仅「真正出错」计入——用户主动停止 / 对话繁忙 / 后台继续 都不算模型不可用。
-    if (reply.error) failedModelIds.value.add(chosenModel);
+    // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 后台继续 / 中断 / 无进展收口 都不算。
+    if (reply.error && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode || "")) failedModelIds.value.add(chosenModel);
     else failedModelIds.value.delete(chosenModel);
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
     await persist(convId, state.bubbles);
@@ -3019,7 +3057,9 @@ async function settleInterruptedRun(run: TurnRun): Promise<void> {
 async function attachRunningTask(convId: string): Promise<void> {
   const state = states.get(convId);
   if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
-  if (!(await isChatTaskRunning(convId).catch(() => false))) return;
+  // 查状态时顺带拿**这一轮**的 task id：续传请求带上它，避免接错轮次。
+  const status = await fetchChatTaskStatus(convId).catch(() => null);
+  if (!status?.running) return;
   // 二次确认：等待期间用户可能已经发了新消息，或别的路径已经接上了。
   const fresh = states.get(convId);
   if (!fresh || fresh.sending || fresh.bubbles.some((b) => b.streaming)) return;
@@ -3042,12 +3082,18 @@ async function attachRunningTask(convId: string): Promise<void> {
     chosenModel: resolveModel(fresh.settings.modelId),
     sawTerminal: false,
     lastSeq: 0,
+    ...(status.task?.id ? { taskId: status.task.id } : {}),
   };
   const controller = new AbortController();
   fresh.controller = controller;
   fresh.sending = true;
   try {
-    const attached = await resumeChatTaskEvents(convId, 0, (event) => applyChatEvent(run, event), controller.signal);
+    const attached = await resumeChatTaskEvents(
+      convId,
+      { from: 0, ...(run.taskId ? { taskId: run.taskId } : {}) },
+      (event) => applyChatEvent(run, event),
+      controller.signal,
+    );
     if (!attached) {
       fresh.bubbles = fresh.bubbles.filter((b) => b.id !== reply.id);
       openReasoning.delete(reply.id);

@@ -6,7 +6,13 @@ import { config, defaultModel, listModels } from "./config.js";
 import { listEnabledMcpServers, pruneUnknownMcpServers } from "./conversations.js";
 import { loadServers } from "./mcp/config.js";
 import { connect, disconnectAll, startIdleSweeper } from "./mcp/hub.js";
-import { startTaskRetentionSweeper } from "./chat-tasks.js";
+import {
+  interruptOwnRunningTasks,
+  recoverStaleTasks,
+  startTaskRetentionSweeper,
+  startTaskWatchdog,
+} from "./chat-tasks.js";
+import { initTaskStore } from "./task-store.js";
 
 // 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
 assertBuiltinRiskCoverage();
@@ -19,10 +25,14 @@ if ((process.env.SUBAGENT_ALLOW_WRITE || "off").toLowerCase() === "on") {
 
 const app = createApp();
 
-// 进程退出前断开全部 MCP 连接（stdio 子进程随之回收）。
+// 进程退出前：先把自己还在跑的任务标成 interrupted（状态写实，晚到的重连据此如实收口），
+// 再断开全部 MCP 连接（stdio 子进程随之回收）。pm2 的 kill_timeout 很短，故两件事都只做最少的必要动作。
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
-    void disconnectAll().finally(() => process.exit(0));
+    void interruptOwnRunningTasks(signal)
+      .catch(() => 0)
+      .then(() => disconnectAll())
+      .finally(() => process.exit(0));
   });
 }
 serve({ fetch: app.fetch, port: config.port }, () => {
@@ -36,6 +46,14 @@ serve({ fetch: app.fetch, port: config.port }, () => {
   startIdleSweeper();
   // 周期回收「已收束任务的事件留档」（断线续传的取数窗口，过期即释放内存）。
   startTaskRetentionSweeper();
+  // 无进展看门狗：服务端判定「这一轮还活着吗」——长时间没有任何实质事件就主动收口，
+  // 免得极端情况下（某处 await 永不返回且不理会 abort）前端气泡永远停在「执行中」。
+  startTaskWatchdog();
+  // 任务留档（跨进程续传的读侧）：连得上 Mongo 才做启动恢复——把上一次进程留下的
+  // running 僵尸任务标成 interrupted，晚到的重连据此如实收口（不重放、不重试）。
+  void initTaskStore().then(async (ok) => {
+    if (ok) await recoverStaleTasks();
+  });
   // 启动维护：把「配置里已不存在」的 MCP id 从各对话启用集里摘掉。
   // 服务器的增减多来自 .env（只在启动时读），除了 DELETE 端点没有别的清理点；
   // 放在这里而不是 GET 里，见 conversations.ts 的 pruneUnknownMcpServers 注释（安全方法语义）。

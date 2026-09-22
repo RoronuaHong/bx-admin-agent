@@ -132,13 +132,19 @@ async function readNdjson(body: ReadableStream<Uint8Array>, onEvent: (event: Cha
   }
 }
 
-/** 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。 */
+/**
+ * 一轮对话（HTTP Streamable，NDJSON 分块）：每个事件一行 JSON，text_delta 流式增量，text 为最终全文，done 结束。
+ * 任务 id 在响应头 `X-Chat-Task-Id` 里：续传时带回去，服务端据此确认「接的还是同一轮」。
+ * `onStart` 在**拿到响应头时立刻回调**——流中途断开时函数会抛错，但这一轮的任务 id 已经交出去了，
+ * 调用方仍能按它续传（放在返回值里就太晚了）。
+ */
 export async function streamChat(
   text: string,
   opts: { conversationId?: string; model?: string; images?: string[]; attachments?: string[]; agentId?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
-) {
+  onStart?: (info: { taskId?: string }) => void,
+): Promise<{ taskId?: string }> {
   const res = await fetch(withOwnerParam("/agent/chat/stream"), {
     method: "POST",
     credentials: "include",
@@ -155,28 +161,32 @@ export async function streamChat(
       code: data.code,
     });
   }
+  const taskId = res.headers.get("X-Chat-Task-Id") || undefined;
+  onStart?.(taskId ? { taskId } : {});
   await readNdjson(res.body, onEvent);
+  return taskId ? { taskId } : {};
 }
 
 /**
  * 断线续传：带上次消费到的 `seq` 重新挂上后台任务的事件流（对齐 SSE 的 `Last-Event-ID` 重连语义）。
- * 返回 true = 已接上（终态 `done` 会在事件流里给出；正文由服务端补一条 `text` 快照，
- * 前端替换即可，不会把已显示的内容拼两遍）；返回 false = 服务端已没有可续传的任务
- * （进程重启后注册表为空、或收束后留档已过期），调用方应如实收口而不是假装还在跑。
+ * 返回 true = 已接上（终态会在事件流里给出；正文由服务端补一条 `text` 快照，前端替换即可，
+ * 不会把已显示的内容拼两遍）；返回 false = 服务端已没有可续传的任务（进程重启后连留档也没有、
+ * 收束后留档已过期、或 `taskId` 不匹配——游标属于更早的一轮），调用方应如实收口而不是假装还在跑。
  */
 export async function resumeChatTaskEvents(
   conversationId: string,
-  fromSeq: number,
+  cursor: { from: number; taskId?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const cursor = Math.max(0, Math.floor(fromSeq) || 0);
+  const from = Math.max(0, Math.floor(cursor.from) || 0);
+  const taskParam = cursor.taskId ? `&taskId=${encodeURIComponent(cursor.taskId)}` : "";
   const res = await fetch(
-    withOwnerParam(`/agent/chat/task/events?conversationId=${encodeURIComponent(conversationId)}&from=${cursor}`),
+    withOwnerParam(`/agent/chat/task/events?conversationId=${encodeURIComponent(conversationId)}&from=${from}${taskParam}`),
     {
       credentials: "include",
       // 与 ?from= 同值：既保留 SSE 习惯（服务端也认这个头），也让中间层日志一眼看出在续传。
-      headers: { "Last-Event-ID": String(cursor) },
+      headers: { "Last-Event-ID": String(from) },
       signal,
     },
   );

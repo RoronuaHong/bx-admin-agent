@@ -53,7 +53,9 @@ import {
   getRetainedTask,
   getRunningTask,
   isTaskRunning,
+  loadTaskForResume,
   publishTaskEvent,
+  replayRecord,
   startTask,
   type ChatTask,
 } from "./chat-tasks.js";
@@ -125,6 +127,19 @@ const SCHEDULE_TASK_GUIDE =
   "1) 必须从数据源重新取数，不得沿用本对话历史轮次的结论、数字或图表数据；\n" +
   "2) 结论要能独立阅读：正文里给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。" +
   "图仍要用 render_chart 工具出（图在对话里看得到），但不要在正文里写图片链接或图片占位符。";
+
+/**
+ * 断线续传的收口语（跨进程）：补齐内容之后如实说明「这一轮已经不在了」。
+ * 措辞刻意把两件事分开讲——**已产出的一字不丢**（都补发了），**未完成的不会自动继续**（不假装）。
+ */
+const TASK_INTERRUPTED_NOTICE =
+  "本轮在执行中被中断（服务重启或进程退出）：已产出的内容已全部补发到上面，未完成的部分请重新发起。";
+
+/**
+ * 「这一轮在别处跑」的收口语（只在真多实例部署下会出现）：本进程只能读到已落库的部分，
+ * 后半段事件在承载该任务的那个实例上——如实说清，不假装补全。
+ */
+const TASK_ELSEWHERE_NOTICE = "本轮正由另一个服务实例执行：上面只补齐了已落库的部分，其余请稍后重开该对话查看。";
 
 /** 从任务事件缓冲提取 run 级统计（usage / model / error 事件），落 run 级 trace。
  * model：buffer 有 model 事件时优先用它；该事件在**起始**发射，长 run 会被 chat-tasks.ts 的
@@ -926,7 +941,7 @@ export function createApp() {
         ownerKey: owner,
       });
 
-      return streamNdjson(async (send) => {
+      const stream = streamNdjson(async (send) => {
         try {
           for await (const event of followTask(task)) {
             send(event);
@@ -936,6 +951,10 @@ export function createApp() {
           detachTask(task);
         }
       });
+      // 任务 id 交给客户端：续传时原样带回来，避免「上一轮的游标 + 新一轮的事件」串流（见 /chat/task/events）。
+      // 必须走 `c.header()`：中间件（安全头）会用上下文里的头重建最终响应，直接设在 Response 对象上会被丢掉。
+      c.header("X-Chat-Task-Id", task.id);
+      return stream;
     } catch (error) {
       console.error("[chat/stream] error:", error);
       return errorJson(c, 500, "CHAT_STREAM_FAILED", error instanceof Error ? error.message : "请求失败");
@@ -944,10 +963,12 @@ export function createApp() {
 
   // ---- 异步任务端点（断线续传 / 显式取消 / 状态查询）----
 
-  // 断线重连续传：从客户端游标处续读并继续跟随（客户端用同一套 NDJSON 解析逻辑消费）。
-  // 游标 = 客户端最后消费到的 `seq`：优先显式 `?from=`，也接受 SSE 习惯的 `Last-Event-ID` 头；
-  // 缺省 0 = 从头回放（刷新后重新挂上一次正在跑的 run）。正文由服务端发一条 `text` 快照补上，
-  // 客户端是替换语义 → 重复续传不会把已显示的正文再拼一遍。
+  // 断线重连续传：从客户端游标处续读（内存优先，其次留档），必要时继续跟随。
+  //  - 游标 = 客户端最后消费到的 `seq`：优先 `?from=`，也接受 SSE 习惯的 `Last-Event-ID` 头；缺省 0 = 从头。
+  //  - `taskId`（可选）：客户端带上「这一轮」的任务 id，**防跨轮串流**——同一对话里旧游标配上新一轮的
+  //    事件，会把 B 轮的输出画进 A 轮的气泡；不匹配一律按「没有可续传的任务」处理。
+  //  - 进程重启后内存注册表为空，这里退回**留档**（`task-store`）：把断线期间产出的事件补齐，
+  //    再按留档里的状态如实收口。能续的是「流的读取」，不是「这一轮的执行」（见 chat-tasks 注释）。
   app.get("/chat/task/events", async (c) => {
     const conversationId = c.req.query("conversationId") || "";
     if (await conversationNotFoundFor(c, conversationId)) {
@@ -956,28 +977,57 @@ export function createApp() {
     const rawFrom = c.req.query("from") ?? c.req.header("last-event-id") ?? "0";
     const parsedFrom = Number(rawFrom);
     const from = Number.isFinite(parsedFrom) ? Math.max(0, Math.floor(parsedFrom)) : 0;
-    // 运行中优先；没有运行中的就看留档——收束后的一小段时间内仍能取到尾部终态，
-    // 断线刚好发生在收尾那一刻的重连不必「重开对话才知道结果」。
+    const wantTaskId = (c.req.query("taskId") || "").trim();
     const task = getRunningTask(conversationId) || getRetainedTask(conversationId);
-    if (!task) {
-      const finished = getLastTaskSummary(conversationId);
-      if (!finished) {
-        return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或留档期内可续传的任务");
-      }
-      // 已收束且留档已过期（缓冲随之回收）：给一个明确的终态，不假装还能续读。
+    if (task && wantTaskId && task.id !== wantTaskId) {
+      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "游标属于更早的一轮，该任务已结束：请重新发起");
+    }
+    if (task) {
       return streamNdjson(async (send) => {
-        send({ type: "error", error: { code: "CHAT_TASK_ALREADY_SETTLED", defaultMessage: "任务已收束，结果已回投到对话记录" }, message: "任务已收束" });
+        let sawDone = false;
+        for await (const event of followTask(task, from)) {
+          if (event.type === "done") sawDone = true;
+          send(event);
+        }
+        // 已收束的任务：客户端游标可能已经在末尾（没有可回放的事件）——补一个终态，别让连接悬着。
+        if (!sawDone && task.status !== "running") send({ type: "done" });
+      });
+    }
+    // 内存里没有这一轮：读留档（跨进程续传）。断线期间产出的事件照旧按游标补齐。
+    const persisted = await loadTaskForResume(conversationId);
+    if (persisted && (!wantTaskId || persisted.record.taskId === wantTaskId)) {
+      const { record, canContinue } = persisted;
+      return streamNdjson(async (send) => {
+        for (const event of replayRecord(record, from)) send(event);
+        // 收口语由**留档的真实状态**决定，不能一律说「被中断」：
+        //   · interrupted：进程重启留下的半截 → 说清「已产出的都补齐了，未完成的部分请重新发起」；
+        //   · success / cancelled / failed：当时连接断了，但这一轮其实**已经跑完** → 正常收束，
+        //     误报「中断」会让用户以为结果不完整（而它一字不少）；
+        //   · 还在别处跑（canContinue）：只能补发已落库的部分，如实说明。
+        if (canContinue) {
+          send({
+            type: "error",
+            error: { code: "CHAT_TASK_ELSEWHERE", defaultMessage: TASK_ELSEWHERE_NOTICE },
+            message: TASK_ELSEWHERE_NOTICE,
+          });
+        } else if (record.status === "interrupted") {
+          send({
+            type: "error",
+            error: { code: "CHAT_TASK_INTERRUPTED", defaultMessage: TASK_INTERRUPTED_NOTICE },
+            message: TASK_INTERRUPTED_NOTICE,
+          });
+        }
         send({ type: "done" });
       });
     }
+    const finished = getLastTaskSummary(conversationId);
+    if (!finished) {
+      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或留档期内可续传的任务");
+    }
+    // 已收束且留档已过期（缓冲与落档都回收了）：给一个明确的终态，不假装还能续读。
     return streamNdjson(async (send) => {
-      let sawDone = false;
-      for await (const event of followTask(task, from)) {
-        if (event.type === "done") sawDone = true;
-        send(event);
-      }
-      // 已收束的任务：客户端游标可能已经在末尾（没有可回放的事件）——补一个终态，别让连接悬着。
-      if (!sawDone && task.status !== "running") send({ type: "done" });
+      send({ type: "error", error: { code: "CHAT_TASK_ALREADY_SETTLED", defaultMessage: "任务已收束，结果已回投到对话记录" }, message: "任务已收束" });
+      send({ type: "done" });
     });
   });
 
@@ -1010,7 +1060,25 @@ export function createApp() {
     const conversationId = c.req.query("conversationId") || "";
     const owned = await conversationOwnedBy(conversationId, c.get("owner"));
     const task = owned ? getRunningTask(conversationId) : undefined;
-    const last = owned ? getLastTaskSummary(conversationId) : undefined;
+    let last = owned ? getLastTaskSummary(conversationId) : undefined;
+    // 进程重启后内存注册表为空：退回留档——「上次那一轮跑到什么状态」仍然可见（running 恒为 false），
+    // 前端据此才能如实收口，而不是一律显示「没有任务」。留档仍新鲜则说明是别的实例在跑（多实例部署）。
+    if (owned && !task && !last) {
+      const persisted = await loadTaskForResume(conversationId);
+      if (persisted) {
+        const { record, canContinue } = persisted;
+        const settledAt = record.settledAt ?? record.updatedAt;
+        last = {
+          id: record.taskId,
+          conversationId,
+          status: canContinue ? "running" : record.status,
+          startedAt: record.startedAt,
+          settledAt,
+          durationMs: Math.max(0, settledAt - record.startedAt),
+          outcomePersisted: false,
+        };
+      }
+    }
     return c.json({
       conversationId,
       running: Boolean(task),

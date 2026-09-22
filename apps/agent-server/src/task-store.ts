@@ -132,13 +132,16 @@ export function taskStoreBackend(): "mongo" | "memory" {
 }
 
 /**
- * 落一次快照：状态与正文整体覆盖，事件按 `$push + $slice` 只追加新增部分（避免整表重写）。
- * 失败只告警，不影响本轮执行。
+ * 落一次快照：状态与正文整体覆盖，**只把 `pendingEvents` 追加进留档**（`$push + $slice`，避免整表重写）。
+ * 注意 `record.events` **不参与写入**（它只是快照形状的一部分，读侧才用）——把「全量事件」与
+ * 「本次新增」混为一谈会重复追加。失败只告警，不影响本轮执行。
  */
-export async function flushTask(record: TaskRecord, newEvents: ChatEvent[]): Promise<void> {
+export async function flushTask(record: TaskRecord, pendingEvents: ChatEvent[]): Promise<boolean> {
+  const newEvents = pendingEvents;
   memPut(record, newEvents);
   const coll = await getColl();
-  if (!coll) return;
+  // 内存降级路径算「写成功」：事件已进内存副本（进程内续传照旧可用）。
+  if (!coll) return true;
   try {
     await coll.updateOne(
       { _id: record.conversationId } as never,
@@ -164,8 +167,12 @@ export async function flushTask(record: TaskRecord, newEvents: ChatEvent[]): Pro
       } as never,
       { upsert: true },
     );
+    return true;
   } catch (err) {
-    console.warn(`[task-store] 落库失败（不影响本轮）：${String((err as Error)?.message || err)}`);
+    // 返回 false = 这批事件没进去：调用方**不要**前移水位，下次重试同一批
+    // （宁可重复落档——读侧按 seq 去重——也不要静默丢事件）。
+    console.warn(`[task-store] 落库失败（不影响本轮，下次重试）：${String((err as Error)?.message || err)}`);
+    return false;
   }
 }
 

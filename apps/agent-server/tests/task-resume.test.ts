@@ -14,6 +14,7 @@ import {
   publishTaskEvent,
   startTask,
   startTaskRetentionSweeper,
+  startTaskWatchdog,
 } from "../src/chat-tasks.js";
 
 /** 收集一个（已收束）任务的回放。 */
@@ -110,6 +111,30 @@ test("[E] 收束留档：晚到的重连仍能取到尾部；过期即回收", a
   // 手动过期（等价于清扫器跑到）：读取路径顺手回收，不依赖定时器准时
   getRetainedTask("conv_e")!.retainedUntil = Date.now() - 1;
   expect(getRetainedTask("conv_e")).toBeUndefined();
+});
+
+test("[G] 无进展看门狗：长时间没有实质事件就主动收口，并丢弃迟到产物", async () => {
+  const task = startTask({ conversationId: "conv_watchdog", userText: "hi" });
+  const seen: ChatEvent[] = [];
+  const pump = (async () => {
+    for await (const event of followTask(task)) seen.push(event);
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const watchdog = startTaskWatchdog({ stallMs: 40, tickMs: 10 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  clearInterval(watchdog);
+  await pump;
+
+  const stalled = seen.find((event) => event.type === "error");
+  expect(stalled && stalled.type === "error" ? stalled.error.code : "").toBe("CHAT_TASK_STALLED");
+  expect(getRunningTask("conv_watchdog")).toBeUndefined();
+
+  // 迟到产物必须被丢弃：已收口的一轮不能再往留档 / 续传里塞事件（否则与「已收束」自相矛盾）
+  const before = task.buffer.length;
+  publishTaskEvent(task, { type: "text_delta", text: "迟到的正文" });
+  publishTaskEvent(task, { type: "done" });
+  expect(task.buffer.length).toBe(before);
+  expect(task.text).toBe("");
 });
 
 test("[F] 留档可关闭（CHAT_TASK_RETAIN_MS=0）：不留档、不启清扫器", async () => {

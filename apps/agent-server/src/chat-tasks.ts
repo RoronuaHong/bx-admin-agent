@@ -17,6 +17,7 @@ import {
   TASK_DB_RETAIN_MS,
   flushTask,
   listStaleRunningTasks,
+  loadTaskRecord,
   markTaskInterrupted,
   type TaskRecord,
 } from "./task-store.js";
@@ -36,10 +37,13 @@ const MODEL_TIMEOUT_MS = Math.max(10_000, Number(process.env.MODEL_TIMEOUT_MS ??
  * 默认 = 模型超时 + 5 分钟（留出「模型最长静默 + 工具执行」的余量），因此正常长跑不会误杀。
  */
 const STALL_MS = Math.max(60_000, Number(process.env.CHAT_TASK_STALL_MS ?? MODEL_TIMEOUT_MS + 300_000));
-/** 看门狗巡检间隔。 */
-const WATCHDOG_TICK_MS = Math.max(5_000, Math.min(30_000, Math.floor(STALL_MS / 10)));
-/** 僵尸任务判定：别的实例的心跳停了这么久，就认为它已经不在了（进程重启 / 崩溃）。 */
-const RECOVER_STALE_MS = Math.max(30_000, Number(process.env.CHAT_TASK_RECOVER_STALE_MS ?? 120_000));
+/**
+ * 本进程启动时刻：判定「留档里的任务是不是在我们启动之前就没了」的唯一可靠基准。
+ * 为什么不用「心跳超过 N 秒算过期」：那个阈值必须大于任何合法静默步长（模型长调用期间本来就不产出事件），
+ * 于是「刚重启完的头两分钟」会被误判成「还活着」。用启动时刻做界则精确得多——
+ * 心跳停在我们启动之前，说明它的主人进程在我们起来之前就不在了（重启 / 崩溃）。
+ */
+const BOOTED_AT = Date.now();
 /** 本进程实例标识：写进留档，供恢复扫描区分「这任务是不是我这边的」。 */
 const INSTANCE_ID = process.env.CHAT_INSTANCE_ID || `${process.pid}-${randomUUID().slice(0, 8)}`;
 
@@ -167,11 +171,6 @@ export function startTask(input: { conversationId: string; userText: string; own
   return task;
 }
 
-/** 本进程实例标识（落库与恢复扫描共用；排障时能看出任务归哪个进程）。 */
-export function instanceIdOf(): string {
-  return INSTANCE_ID;
-}
-
 /** 任务快照 → 留档记录（事件另行增量追加，这里 events 留空）。 */
 function snapshotOf(task: ChatTask): TaskRecord {
   return {
@@ -192,11 +191,17 @@ function snapshotOf(task: ChatTask): TaskRecord {
   };
 }
 
-/** 立即落一次（任务开始 / 收束 / 定时器到期）。失败只告警——落档是尽力而为，不阻断本轮。 */
+/**
+ * 立即落一次（任务开始 / 收束 / 定时器到期）。落档是尽力而为，失败只告警、不阻断本轮——
+ * 但**水位只在写成功后前进**：失败时下次重试同一批，宁可重复落档（读侧按 `seq` 去重），
+ * 也不要「水位前进了、事件却没进库」这种静默丢事件。
+ */
 async function flushNow(task: ChatTask): Promise<void> {
   const pending = task.buffer.filter((event) => (event.seq ?? 0) > task.flushedSeq);
-  task.flushedSeq = Math.max(task.flushedSeq, task.seq);
-  await flushTask(snapshotOf(task), pending);
+  const ok = await flushTask(snapshotOf(task), pending);
+  if (ok) {
+    task.flushedSeq = pending.reduce((max, event) => Math.max(max, event.seq ?? 0), task.flushedSeq);
+  }
 }
 
 /** 按批合并落库：同一轮里高频事件不会每个都往返一次 Mongo。 */
@@ -274,20 +279,35 @@ export function finishTask(task: ChatTask, status: TaskStatus, outcomePersisted:
 }
 
 /**
+ * 看门狗判据（纯函数，便于单测与按部署调整口径）：距最后一个实质事件达到阈值即判「无进展」。
+ * 返回 null = 还活着；返回数字 = 已闲置的毫秒数。
+ */
+export function stallIdleMs(
+  task: Pick<ChatTask, "lastEventAt">,
+  now: number,
+  thresholdMs: number = STALL_MS,
+): number | null {
+  const idle = now - task.lastEventAt;
+  return idle >= thresholdMs ? idle : null;
+}
+
+/**
  * 无进展看门狗：由**服务端**判定「这一轮还活着吗」。
  * 判据只有一个——**距最后一个实质事件的时长**（`lastEventAt`）：HTTP 层的 `ping` 是无条件保活，
  * 不能当进展证据。命中后先发一条诚实的 `error` 事件（前端据此收口并保留已产出内容），
  * 再 abort 并收束；之后迟到的产出由 `publishTaskEvent` 的守卫丢弃。
  */
-export function startTaskWatchdog(): NodeJS.Timeout {
+export function startTaskWatchdog(opts: { stallMs?: number; tickMs?: number } = {}): NodeJS.Timeout {
+  const stallMs = opts.stallMs ?? STALL_MS;
+  const tickMs = opts.tickMs ?? Math.max(5_000, Math.min(30_000, Math.floor(stallMs / 10))); // 至少 5s、至多 30s 巡检一次
   const timer = setInterval(() => {
     const now = Date.now();
     for (const task of [...running.values()]) {
-      const idle = now - task.lastEventAt;
-      if (idle < STALL_MS) continue;
+      const idle = stallIdleMs(task, now, stallMs);
+      if (idle === null) continue;
       const seconds = Math.round(idle / 1000);
       console.warn(
-        `[chat:watchdog] 任务 ${task.id} 已 ${seconds}s 无进展（阈值 ${Math.round(STALL_MS / 1000)}s），主动收口`,
+        `[chat:watchdog] 任务 ${task.id} 已 ${seconds}s 无进展（阈值 ${Math.round(stallMs / 1000)}s），主动收口`,
       );
       const message = `本轮已 ${seconds} 秒没有任何进展，已主动结束。已产出的内容保留在上面；未完成的部分请重新发起，或缩小问题范围后再试。`;
       publishTaskEvent(task, {
@@ -298,7 +318,7 @@ export function startTaskWatchdog(): NodeJS.Timeout {
       task.abort.abort();
       finishTask(task, "failed", false);
     }
-  }, WATCHDOG_TICK_MS);
+  }, tickMs);
   timer.unref?.();
   return timer;
 }
@@ -308,8 +328,25 @@ export function startTaskWatchdog(): NodeJS.Timeout {
  * 刻意**不重放、不重试**——进程一没，那一轮的模型循环就消失了；重放调用可能重复副作用。
  * 恢复只做两件事：状态诚实（晚到的重连据此收口）+ 已落库的事件照旧可续读。
  */
+/**
+ * 进程**正常退出**时（SIGINT/SIGTERM——`pm2 delete / restart` 走的就是这条路）把自己还在跑的任务
+ * 就地标成 `interrupted` 并落库：不靠「心跳过期」那套猜法，退出前就把状态写实，
+ * 晚到的重连立刻拿到「未完成的部分请重新发起」，而不是先被告知「还在别处跑」等两分钟再翻案。
+ * SIGKILL / 真崩溃没有这个机会，那时才落到恢复扫描的陈旧心跳判定。
+ */
+export async function interruptOwnRunningTasks(reason: string): Promise<number> {
+  const tasks = [...running.values()];
+  for (const task of tasks) {
+    console.warn(`[chat:tasks] 进程退出（${reason}）：任务 ${task.id} 标记为 interrupted`);
+    finishTask(task, "interrupted", false); // 内部立即落一次终态
+  }
+  await Promise.all(tasks.map((task) => flushNow(task)));
+  return tasks.length;
+}
+
 export async function recoverStaleTasks(): Promise<number> {
-  const stale = await listStaleRunningTasks(Date.now() - RECOVER_STALE_MS, INSTANCE_ID);
+  // 判据 = 心跳早于本进程启动：那是上一次进程（或崩溃的那次）留下的残档。
+  const stale = await listStaleRunningTasks(BOOTED_AT, INSTANCE_ID);
   let recovered = 0;
   for (const item of stale) {
     if (await markTaskInterrupted(item.conversationId)) recovered += 1;
@@ -318,6 +355,48 @@ export async function recoverStaleTasks(): Promise<number> {
     console.log(`[chat:tasks] 启动恢复：${recovered} 个僵尸任务已标记 interrupted（上次进程留下的）`);
   }
   return recovered;
+}
+
+/**
+ * 续传取数（跨进程续传的**读侧**）：内存里没有这个任务时退回留档。
+ * 返回 null = 没有任何留档。
+ *
+ * `canContinue` 只有一个含义：**这一轮还在别处跑**（留档心跳新鲜且属于别的进程实例），
+ * 调用方只能补发已落库的部分。它为 false 时，`record.status` 决定收口语——
+ *   · `interrupted`：进程重启/崩溃留下的，**没跑完**，要如实说明「未完成的部分请重新发起」；
+ *   · `success` / `cancelled` / `failed`：这一轮**其实已经跑完**（只是当时连接断了），
+ *     补发完整事件后正常收束即可——**不要**误报「被中断」，那会让用户以为结果不完整。
+ */
+export async function loadTaskForResume(
+  conversationId: string,
+): Promise<{ record: TaskRecord; canContinue: boolean } | null> {
+  const record = await loadTaskRecord(conversationId);
+  if (!record) return null;
+  if (record.status !== "running") return { record, canContinue: false };
+  // 心跳落在我们启动之后、且属于**别的**实例 = 那边真的还在跑（真多实例部署）。
+  // 否则就是「主人进程已不在」的残档：就地改成 interrupted，让状态与事实一致。
+  const alive = record.updatedAt >= BOOTED_AT && record.instanceId !== INSTANCE_ID;
+  if (alive) return { record, canContinue: true };
+  await markTaskInterrupted(conversationId);
+  return { record: { ...record, status: "interrupted" }, canContinue: false };
+}
+
+/**
+ * 用留档回放（正文快照 + `seq > from` 的事件），续读语义与内存路径逐字一致。
+ * 按 `seq` 去重：落档失败后的重试可能把同一批事件写两次，重复投递会让步骤/图卡在界面上渲染两遍。
+ */
+export function replayRecord(record: TaskRecord, from: number): ChatEvent[] {
+  const out: ChatEvent[] = [];
+  if (record.text && record.textSeq > from) out.push({ type: "text", text: record.text, seq: record.textSeq });
+  const seen = new Set<number>();
+  for (const event of record.events) {
+    const seq = event.seq ?? 0;
+    if (seq <= from) continue;
+    if (seq && seen.has(seq)) continue;
+    if (seq) seen.add(seq);
+    out.push(event);
+  }
+  return out;
 }
 
 /** 留档：每对话只留最新一条，按最久未更新淘汰（超量时）。 */
