@@ -8389,6 +8389,9 @@ onBeforeUnmount(() => {
 /* 步骤行头：有结果时整行可点开（对齐 antd Collapse：默认收起、收起时给一行摘要、点开看全文）。
    无结果的步骤同一结构但 disabled —— 一半的样式与键盘可达性都走原生 button，不用 div 模拟。 */
 .step-head {
+  /* button 默认 shrink-to-fit：摘要长文本会把整行撑出气泡（横向溢出）。
+     必须显式占满父级宽度，flex 子项的 min-width:0 省略号链路才生效。 */
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 8px;
