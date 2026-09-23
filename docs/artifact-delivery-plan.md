@@ -13,7 +13,7 @@
 | 3 | P0 产物交付闭环（导出工具 + 下载端点 + `file` 事件 + 下载卡片） | ✅ 已落地（`export_data`：xlsx/csv/json/md） |
 | 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ⬜ 待实施 |
 | 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
-| 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | 🟡 评审中（2026-09-23） |
+| 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
 
 ---
 
@@ -285,3 +285,31 @@ user: 123
 1. **字体方案**：NotoSansSC 子集直接入库（简单）vs 部署脚本按需下载（仓库瘦）——推荐前者（一次性 ~5MB）。
 2. **pdf 2000 行上限**是否合适（可放宽到 5000，代价是百页文档）。
 3. `txt` 是否要（Code Interpreter 有；本项目场景偏少，砍掉也行）。
+
+---
+
+## 10.7 落地记录（2026-09-23）
+
+`export_data` 已从 4 种格式扩到 **8 种**（`xlsx / csv / json / md / docx / pdf / html / txt`），全部走同一个工具、前端与下载端点**零改动**。
+
+**新增依赖与资产**
+
+| 项 | 内容 |
+|---|---|
+| `docx@^9.7.1` | 生成 Word（纯 JS，中文由 Word 按字体名解析，**无需内嵌字体**） |
+| `pdfmake@^0.3.11` | 生成 PDF（声明式表格布局） |
+| `assets/fonts/NotoSansSC-Regular.otf` | PDF 中文字体（Noto Sans SC，**SIL OFL 1.1**，8.3MB，同目录带 `LICENSE-NotoSansSC.txt`） |
+
+**实现要点**
+
+1. `EXPORT_FORMATS` 8 种；新增 `MULTI_SHEET_FORMATS = {xlsx, docx, pdf}`（其余格式多表明确拒绝）、`TEXT_EXPORT_FORMATS = {csv, json, md, html, txt}`（走 `fsWrite` 文本路径，其余走 `fsWriteBinary`）。
+2. 生成器：`buildDocx` / `buildPdf` / `buildHtml` / `buildTxt`，全部**动态 `import`**（真用到才付加载成本，对齐既有 `buildXlsx`）。
+3. 分格式行数上限：`pdf` 2000 行、`docx` 2 万行（PDF 页数会随行数线性膨胀），其余沿用 5 万；超限报错并**引导改用 xlsx**。
+4. `pdfmake 0.3` 是**新 API**（不再是 `new PdfPrinter(fonts)`）：`setFonts()` + `setLocalAccessPolicy()` + `setUrlAccessPolicy()` + `createPdf().getBuffer()`；实例为模块单例，**只初始化一次**。安全上按最小权限：本地访问只放行字体目录，外部 URL 一律拒绝。
+5. 字体缺失时 `pdf` **如实报错并引导改用 docx/html**，绝不产出中文空白/乱码的坏 PDF（诚实失败优于坏产物）。
+6. 别名归一：`.xls → xlsx`、`.htm → html`（修掉 10.1 的「小坑」）。
+7. **`fs-store.ts` 实际需一处改动**（§10.4 原判「零改动」不准确）：`MIME_BY_EXT` 缺 `.html/.htm`，会回落 `application/octet-stream`，已补 `text/html; charset=utf-8`。
+
+**验证**：`tests/export-formats.test.ts` 7/7（八格式落盘非空、pdf `%PDF-` / docx `PK` 魔数、html 表格与标题、多表策略、别名归一、不支持格式拒绝、pdf 行数上限）；全量 `pnpm test` **20 文件 / 126 测试全绿**。真实产物抽检：PDF 与 docx 的中文均可被 `unpdf` / `mammoth` 正确提取，PDF 因 **pdfkit 自动 subset** 仅约 48KB（源字体 8.3MB）。
+
+**尚未做**：`pptx`（§10.2 列出但未纳入本批 `EXPORT_FORMATS`）、`png`（图表存图属前端 ChartCard 改动）。

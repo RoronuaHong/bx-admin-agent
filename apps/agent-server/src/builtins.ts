@@ -2,6 +2,9 @@
 // 与 MCP 工具同台竞争：同一套 tool_calls 循环、同一套事件契约（server 标记为 "builtin"）。
 // 注入策略：内置工具是**本机能力**，始终注入（不依赖「勾选了哪个连接器」）；
 // 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
+import { existsSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ArtifactSpec, ClarifyOption, TodoItem } from "@bx/shared";
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf } from "./fs-store.js";
@@ -124,14 +127,33 @@ const MAX_CLARIFY_WHY = 200;
  * 这里刻意只做「数据 → 文件」的确定性转换，不接通用代码执行：模型给行数据，格式由服务端保证，
  * 弱模型也不会因为写错脚本而产出坏文件（对齐「产物需求可枚举」的取舍，见 docs/artifact-delivery-plan.md §6）。
  */
-const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md"]);
+const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md", "docx", "pdf", "html", "txt"]);
+/** 能承载多张表的格式：其余格式散成多个文件语义更差，故只允许单表。 */
+const MULTI_SHEET_FORMATS = new Set(["xlsx", "docx", "pdf"]);
+/** 走文本路径（fsWrite，256KB 上限）的格式；其余走二进制路径（fsWriteBinary，20MB 上限）。 */
+const TEXT_EXPORT_FORMATS = new Set(["csv", "json", "md", "html", "txt"]);
 /** 单次导出的行数上限（所有 sheet 合计）：超了应先聚合/筛选或分批导出，而不是把整表灌进来。 */
 const MAX_EXPORT_ROWS = Number(process.env.FS_MAX_EXPORT_ROWS || 50_000);
+/** 分格式收紧的行数上限：PDF 页数会随行数线性膨胀，docx 长篇也一样（对齐 artifact-delivery-plan §10.4）。 */
+const MAX_EXPORT_ROWS_BY_FORMAT: Record<string, number> = {
+  pdf: Number(process.env.FS_MAX_EXPORT_PDF_ROWS || 2_000),
+  docx: Number(process.env.FS_MAX_EXPORT_DOCX_ROWS || 20_000),
+};
 /** 文件名 / 工作表名的长度上限（工作表名另受 31 字符的格式限制）。 */
 const MAX_EXPORT_NAME = 80;
 const MAX_SHEET_NAME = 31;
 /** Excel 单个单元格的字符上限（超出应先在数据侧截断，而不是让文件写入失败）。 */
 const MAX_CELL_CHARS = 32_000;
+
+/**
+ * PDF 中文字体资产（Noto Sans SC，SIL OFL，随仓库入库）。
+ * PDF 必须内嵌 CJK 字体，否则中文会渲染成空白；资产缺失时**如实报错并引导改用 docx/html**，
+ * 绝不产出「中文全空白」的坏产物（诚实失败优于坏交付，对齐 artifact-delivery-plan §10.3）。
+ */
+const SRC_DIR = dirname(fileURLToPath(import.meta.url));
+const EXPORT_FONT_DIR = resolvePath(SRC_DIR, "..", "assets", "fonts");
+const PDF_FONT_FILE = resolvePath(EXPORT_FONT_DIR, "NotoSansSC-Regular.otf");
+const PDF_FONT_NAME = "NotoSansSC";
 
 function spec(name: string, description: string, parameters: Record<string, unknown>): ToolSpec {
   return { name, description, parameters };
@@ -378,9 +400,10 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "export_data",
-      "把**真实数据**导出成可下载文件（xlsx / csv / json / md），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
-        "用户说「导出 / 生成表格 / 生成 excel / 生成 csv / 下载数据」时用它；**不要**用 fs_write 写文本文件去冒充表格文件。" +
-        "数据必须来自工具真实返回，禁止编造；行数很多时先在数据侧聚合或筛选（单次上限 5 万行）。" +
+      "把**真实数据**导出成可下载文件（xlsx / csv / json / md / docx / pdf / html / txt），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
+        "格式选择：表格/数据 → xlsx 或 csv；文档式排版（打印/存档）→ pdf 或 docx；网页预览 → html；纯文本 → txt。" +
+        "用户说「导出 / 生成 excel / 生成表格 / 生成 csv / 生成 pdf / 导出 word / 生成文档 / 下载数据」时都用它；**不要**用 fs_write 写文本文件去冒充表格或文档文件。" +
+        "数据必须来自工具真实返回，禁止编造；行数很多时先在数据侧聚合或筛选（pdf 上限 2000 行、docx 2 万行，其余 5 万行）。" +
         "行数据的两种写法：行对象数组（对象的键就是表头文字，可直接用中文键名）或二维数组（第一行即表头）。" +
         "多张表用 sheets（[{ name, rows, columns? }]），单张表直接用 rows。" +
         "filename 是给用户看的文件名（含扩展名，如 用户列表.xlsx）；format 省略时按 filename 的扩展名推断，再默认 xlsx。" +
@@ -389,7 +412,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         type: "object",
         properties: {
           filename: jsonType("string", "文件名（含扩展名，如 报表.xlsx、用户列表.csv）"),
-          format: jsonType("string", "csv | xlsx | json | md（省略时按 filename 扩展名推断，默认 xlsx）"),
+          format: jsonType("string", "csv | xlsx | json | md | docx | pdf | html | txt（省略时按 filename 扩展名推断，默认 xlsx）"),
           rows: {
             type: "array",
             description: "单张表的行数据：行对象数组（键即表头）或二维数组（第一行为表头）",
@@ -401,10 +424,10 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           },
           sheets: {
             type: "array",
-            description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；仅 xlsx 支持多表）",
+            description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；只有 xlsx / docx / pdf 支持多表）",
             items: { type: "object" },
           },
-          title: jsonType("string", "可选：标题（md 的标题；未给 sheets 时 xlsx 的工作表名）"),
+          title: jsonType("string", "可选：标题（md / html / pdf / docx 的标题；未给 sheets 时 xlsx 的工作表名）"),
         },
         required: ["filename"],
       },
@@ -542,6 +565,13 @@ function normalizeClarification(
   };
 }
 
+/** 扩展名归一：把同一产物的别名映射到标准格式（`.xls → xlsx`、`.htm → html`）。 */
+function normalizeExportFormat(format: string): string {
+  if (format === "xls") return "xlsx";
+  if (format === "htm") return "html";
+  return format;
+}
+
 /** 导出目标归一：format 优先，其次 filename 的扩展名，默认 xlsx；文件名清洗到工作区可用的安全集合。 */
 function resolveExportTarget(
   filenameRaw: string,
@@ -549,7 +579,7 @@ function resolveExportTarget(
 ): { name: string; format: string } | { error: string } {
   const raw = String(filenameRaw || "").trim();
   const fromName = (raw.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
-  const format = String(formatRaw || "").trim().toLowerCase() || fromName || "xlsx";
+  const format = normalizeExportFormat(String(formatRaw || "").trim().toLowerCase() || fromName || "xlsx");
   if (!EXPORT_FORMATS.has(format)) {
     return { error: `不支持的导出格式：${format}（支持 ${[...EXPORT_FORMATS].join(" / ")}）` };
   }
@@ -695,6 +725,207 @@ function toMarkdownText(title: string, matrix: unknown[][]): string {
     ...matrix.slice(1).map((row) => `| ${row.map(esc).join(" | ")} |`),
     "",
   ].join("\n");
+}
+
+/** 单元格文本化（pdf 用）：数字保留原样，其余转字符串（否则表格里是 "[object Object]"）。 */
+function textCell(v: unknown): string | number {
+  if (typeof v === "number") return v;
+  if (v == null) return "";
+  return String(v);
+}
+
+/** 生成自包含单文件 HTML（内联样式，浏览器可直接打开；也是「Ctrl+P 存 PDF」的零成本兜底通道）。 */
+function buildHtml(title: string, matrix: unknown[][]): string {
+  const esc = (v: unknown) =>
+    String(v ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  const head = matrix[0] || [];
+  const body = matrix.slice(1);
+  // lang 按内容判定（CJK → zh-CN，否则 en）：写死会让英文导出的断行/朗读规则错位。
+  const lang = /[\u3400-\u9FFF]/.test(`${title}${head.join("")}`) ? "zh-CN" : "en";
+  return [
+    "<!doctype html>",
+    `<html lang="${lang}">`,
+    "<head>",
+    '<meta charset="utf-8" />',
+    `<title>${esc(title || "导出数据")}</title>`,
+    "<style>",
+    "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;margin:24px;color:#1f2329}",
+    "h1{font-size:20px;margin:0 0 16px}",
+    "table{border-collapse:collapse;width:100%;font-size:13px}",
+    "th,td{border:1px solid #dcdfe6;padding:6px 10px;text-align:left;vertical-align:top}",
+    "th{background:#f5f7fa;font-weight:600}",
+    "tr:nth-child(even) td{background:#fafbfc}",
+    "</style>",
+    "</head>",
+    "<body>",
+    ...(title ? [`<h1>${esc(title)}</h1>`] : []),
+    "<table>",
+    `<thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>`,
+    "<tbody>",
+    ...body.map((row) => `<tr>${head.map((_, i) => `<td>${esc(row[i] ?? "")}</td>`).join("")}</tr>`),
+    "</tbody>",
+    "</table>",
+    "</body>",
+    "</html>",
+    "",
+  ].join("\n");
+}
+
+/** 生成等宽对齐的纯文本表（CJK 记 2 计算列宽，避免中文列错位）。 */
+function buildTxt(title: string, matrix: unknown[][]): string {
+  const head = matrix[0] || [];
+  const widths = head.map((_, col) => {
+    let max = 2;
+    for (const row of matrix) max = Math.max(max, displayWidth(String(row[col] ?? "")));
+    return Math.min(60, max);
+  });
+  const pad = (text: string, width: number) => text + " ".repeat(Math.max(0, width - displayWidth(text)));
+  const lines = matrix.map((row) => head.map((_, col) => pad(String(row[col] ?? ""), widths[col]!)).join("  ").trimEnd());
+  const divider = widths.map((w) => "-".repeat(w)).join("  ");
+  return [...(title ? [title, ""] : []), lines[0] ?? "", divider, ...lines.slice(1), ""].join("\n");
+}
+
+/** 生成 docx（Word）。中文由 Word 按字体名解析，**无需内嵌字体资产**。 */
+async function buildDocx(
+  sheets: Array<{ name: string; matrix: unknown[][] }>,
+  title: string,
+): Promise<Uint8Array | { error: string }> {
+  try {
+    const mod = (await import("docx")) as unknown as { default?: unknown };
+    const api = ((mod as Record<string, unknown>).default ?? mod) as Record<string, unknown>;
+    const Document = api.Document as new (opts: unknown) => unknown;
+    const Packer = api.Packer as { toBuffer: (doc: unknown) => Promise<Buffer | Uint8Array> };
+    const Paragraph = api.Paragraph as new (opts: unknown) => unknown;
+    const TextRun = api.TextRun as new (opts: unknown) => unknown;
+    const Table = api.Table as new (opts: unknown) => unknown;
+    const TableRow = api.TableRow as new (opts: unknown) => unknown;
+    const TableCell = api.TableCell as new (opts: unknown) => unknown;
+    // 枚举从库里取（而不是把 "Heading1"/"pct" 写成魔法字符串）：库改枚举值时不会静默失效。
+    const HeadingLevel = (api.HeadingLevel ?? {}) as Record<string, string>;
+    const BorderStyle = (api.BorderStyle ?? {}) as Record<string, string>;
+    const WidthType = (api.WidthType ?? {}) as Record<string, string>;
+    const ShadingType = (api.ShadingType ?? {}) as Record<string, string>;
+    const h1 = HeadingLevel.HEADING_1 ?? "Heading1";
+    const h2 = HeadingLevel.HEADING_2 ?? "Heading2";
+    // 表格必须有可见网格线：docx 的 Table **只在传了 borders 时才输出 w:tblBorders**，
+    // 不传的话 Word 里是无框的（与 xlsx 加粗表头、pdf lightHorizontalLines 的「表头可辨识」约定不一致）。
+    const solid = () => ({ style: BorderStyle.SINGLE ?? "single", size: 4, color: "D0D5DD" });
+    const makeBorders = () => ({
+      top: solid(),
+      bottom: solid(),
+      left: solid(),
+      right: solid(),
+      insideHorizontal: solid(),
+      insideVertical: solid(),
+    });
+    const children: unknown[] = [];
+    if (title) children.push(new Paragraph({ text: title, heading: h1 }));
+    sheets.forEach((sheet, index) => {
+      if (sheets.length > 1) children.push(new Paragraph({ text: sheet.name, heading: h2 }));
+      else if (!title && index === 0) children.push(new Paragraph({ text: sheet.name, heading: h1 }));
+      const head = sheet.matrix[0] || [];
+      const rows = sheet.matrix.map(
+        (row, rowIndex) =>
+          new TableRow({
+            children: head.map(
+              (_, col) =>
+                new TableCell({
+                  children: [
+                    new Paragraph({
+                      children: [new TextRun({ text: String(row[col] ?? ""), bold: rowIndex === 0 })],
+                    }),
+                  ],
+                  // 表头底色：与 html 的 th 底色对齐，「表头一行」在三种文档格式里都可一眼认出。
+                  ...(rowIndex === 0
+                    ? { shading: { type: ShadingType.CLEAR ?? "clear", fill: "F5F7FA" } }
+                    : {}),
+                }),
+            ),
+          }),
+      );
+      children.push(
+        new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE ?? "pct" }, borders: makeBorders() }),
+      );
+    });
+    const buf = await Packer.toBuffer(new Document({ sections: [{ children }] }));
+    return new Uint8Array(buf as ArrayBuffer);
+  } catch (err) {
+    return { error: `生成 docx 失败：${String((err as Error)?.message || err)}` };
+  }
+}
+
+/**
+ * pdfmake 实例（字体与访问策略是**全局状态**，只初始化一次）。
+ * 缓存 Promise 而非实例：并发首次导出时也只初始化一次，不会重复 `import` 与 `setFonts`。
+ */
+let pdfMakeInit: Promise<Record<string, unknown> | null> | null = null;
+
+function loadPdfMake(): Promise<Record<string, unknown> | null> {
+  pdfMakeInit ??= (async () => {
+    if (!existsSync(PDF_FONT_FILE)) return null;
+    const mod = (await import("pdfmake")) as unknown as { default?: unknown };
+    const pdfmake = ((mod as Record<string, unknown>).default ?? mod) as Record<string, unknown>;
+    // 最小权限：本地读取只放行字体目录（用 relative 判定，避免 "/a/fonts" 前缀误匹配 "/a/fonts-evil"）；
+    // 外部 URL 一律拒绝——我们只生成文本/表格，本就不需要拉取任何外部资源。
+    (pdfmake.setLocalAccessPolicy as (cb: (p: string) => boolean) => void)((p: string) => {
+      try {
+        const rel = relative(EXPORT_FONT_DIR, resolvePath(String(p)));
+        return Boolean(rel) && !rel.startsWith("..") && !isAbsolute(rel);
+      } catch {
+        return false;
+      }
+    });
+    (pdfmake.setUrlAccessPolicy as (cb: (url: string) => boolean) => void)(() => false);
+    (pdfmake.setFonts as (fonts: unknown) => void)({
+      [PDF_FONT_NAME]: {
+        normal: PDF_FONT_FILE,
+        bold: PDF_FONT_FILE,
+        italics: PDF_FONT_FILE,
+        bolditalics: PDF_FONT_FILE,
+      },
+    });
+    return pdfmake;
+  })().catch(() => null);
+  return pdfMakeInit;
+}
+
+/** 生成 PDF（pdfmake + 内嵌中文字体；字体资产缺失时如实报错，绝不产出中文空白的 PDF）。 */
+async function buildPdf(
+  sheets: Array<{ name: string; matrix: unknown[][] }>,
+  title: string,
+): Promise<Uint8Array | { error: string }> {
+  if (!existsSync(PDF_FONT_FILE)) {
+    return { error: "PDF 字体资产缺失（assets/fonts/NotoSansSC-Regular.otf），无法生成中文 PDF；请改用 docx 或 html 导出" };
+  }
+  try {
+    const pdfmake = await loadPdfMake();
+    if (!pdfmake) return { error: "无法加载 PDF 生成器（pdfmake）" };
+    const content: unknown[] = [];
+    if (title) content.push({ text: title, fontSize: 16, bold: true, margin: [0, 0, 0, 10] });
+    sheets.forEach((sheet, index) => {
+      if (sheets.length > 1) {
+        content.push({ text: sheet.name, fontSize: 13, bold: true, margin: [0, index ? 12 : 0, 0, 6] });
+      }
+      content.push({
+        table: { headerRows: 1, body: sheet.matrix.map((row) => row.map(textCell)) },
+        layout: "lightHorizontalLines",
+      });
+    });
+    const doc = (pdfmake.createPdf as (def: unknown) => { getBuffer: () => Promise<Buffer> })({
+      content,
+      defaultStyle: { font: PDF_FONT_NAME, fontSize: 10 },
+      pageSize: "A4",
+      pageMargins: [36, 36, 36, 36],
+    });
+    const buf = await doc.getBuffer();
+    return new Uint8Array(buf);
+  } catch (err) {
+    return { error: `生成 pdf 失败：${String((err as Error)?.message || err)}` };
+  }
 }
 
 /**
@@ -857,11 +1088,12 @@ export async function execBuiltin(
     case "export_data": {
       const target = resolveExportTarget(str(args, "filename"), str(args, "format"));
       if ("error" in target) return { ok: false, text: `导出失败：${target.error}` };
+      const title = str(args, "title");
       // 单表（rows）与多表（sheets）统一成 sheets 列表处理，后续只维护一条路径。
       const rawSheets: unknown[] =
         Array.isArray(args.sheets) && args.sheets.length
           ? args.sheets
-          : [{ name: str(args, "title"), rows: args.rows, columns: args.columns }];
+          : [{ name: title, rows: args.rows, columns: args.columns }];
       const built: Array<{ name: string; matrix: unknown[][] }> = [];
       let totalRows = 0;
       for (const raw of rawSheets) {
@@ -870,26 +1102,37 @@ export async function execBuiltin(
         if ("error" in matrix) return { ok: false, text: `导出失败：${matrix.error}` };
         totalRows += Math.max(0, matrix.matrix.length - 1);
         built.push({
-          name: str(rec, "name") || str(args, "title") || target.name.replace(/\.[a-z0-9]+$/i, ""),
+          name: str(rec, "name") || title || target.name.replace(/\.[a-z0-9]+$/i, ""),
           matrix: matrix.matrix,
         });
       }
-      if (totalRows > MAX_EXPORT_ROWS) {
+      // 分格式行数上限：PDF/docx 的页数会随行数膨胀，单独收紧（超限时引导改用 xlsx）。
+      const rowLimit = MAX_EXPORT_ROWS_BY_FORMAT[target.format] ?? MAX_EXPORT_ROWS;
+      if (totalRows > rowLimit) {
+        const hint = rowLimit < MAX_EXPORT_ROWS ? "，建议改用 xlsx 导出" : "";
         return {
           ok: false,
-          text: `导出失败：数据行过多（${totalRows} 行，上限 ${MAX_EXPORT_ROWS}）。请先聚合或筛选后再导出，或分批导出。`,
+          text: `导出失败：数据行过多（${totalRows} 行，${target.format} 上限 ${rowLimit}）${hint}。请先聚合或筛选后再导出，或分批导出。`,
         };
       }
-      // 多表只有 xlsx 能承载：散成多个文件会让「一次导出」变成多张卡片，语义更差，故明确拒绝而不是静默只导第一张。
-      if (built.length > 1 && target.format !== "xlsx") {
+      // 多表只有 xlsx/docx/pdf 能承载：散成多个文件会让「一次导出」变成多张卡片，语义更差，故明确拒绝而不是静默只导第一张。
+      if (built.length > 1 && !MULTI_SHEET_FORMATS.has(target.format)) {
         return {
           ok: false,
-          text: `导出失败：多张表只能用 xlsx（当前 format=${target.format}）。请改用 .xlsx，或把多张表合并成一张。`,
+          text: `导出失败：多张表只能用 ${[...MULTI_SHEET_FORMATS].join(" / ")}（当前 format=${target.format}）。请改用 .xlsx，或把多张表合并成一张。`,
         };
       }
       let written: { path: string; bytes: number } | { error: string };
       if (target.format === "xlsx") {
         const bytes = await buildXlsx(built);
+        if ("error" in bytes) return { ok: false, text: bytes.error };
+        written = fsWriteBinary(conversationId, target.name, bytes);
+      } else if (target.format === "docx") {
+        const bytes = await buildDocx(built, title);
+        if ("error" in bytes) return { ok: false, text: bytes.error };
+        written = fsWriteBinary(conversationId, target.name, bytes);
+      } else if (target.format === "pdf") {
+        const bytes = await buildPdf(built, title);
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else {
@@ -899,14 +1142,17 @@ export async function execBuiltin(
             ? toCsvText(matrix)
             : target.format === "json"
               ? toJsonText(matrix)
-              : toMarkdownText(str(args, "title"), matrix);
+              : target.format === "html"
+                ? buildHtml(title, matrix)
+                : target.format === "txt"
+                  ? buildTxt(title, matrix)
+                  : toMarkdownText(title, matrix);
         written = fsWrite(conversationId, target.name, text);
       }
       if ("error" in written) {
-        const hint =
-          target.format === "xlsx"
-            ? ""
-            : "（文本格式单文件上限 256KB：数据量较大时请改用 xlsx 导出）";
+        const hint = TEXT_EXPORT_FORMATS.has(target.format)
+          ? "（文本格式单文件上限 256KB：数据量较大时请改用 xlsx 导出）"
+          : "";
         return { ok: false, text: `导出失败：${written.error}${hint}` };
       }
       const fileName = written.path.split("/").pop() || written.path;
