@@ -346,7 +346,9 @@ export async function sendToChannel(
 
   const res = await doFetch(request.url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    // 必须显式带 charset=UTF-8：钉钉 / 飞书自定义机器人按 Content-Type 判定解码方式，
+    // 缺省 charset 时部分网关会拿 latin1/GBK 去解 UTF-8 字节 → 中文变成「??????」乱码。
+    headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(request.payload),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });

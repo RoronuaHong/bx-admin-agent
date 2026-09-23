@@ -1,4 +1,4 @@
-import type { LocalizedToken, ApiErrorPayload, ChatEvent, ChartSpec } from "@bx/shared";
+import type { ArtifactSpec, LocalizedToken, ApiErrorPayload, ChatEvent, ChartSpec } from "@bx/shared";
 
 export class ApiError extends Error {
   status?: number;
@@ -202,7 +202,7 @@ export async function clearConversationContext(id: string) {
 
 /** 本地渲染图表的 spec（render_chart 产出；前端 ChartCard 按它绘制）。
  *  形状定义在 @bx/shared（与 chat 事件、服务端落库快照共用一份），这里只做转出。 */
-export type { ChartSpec };
+export type { ArtifactSpec, ChartSpec };
 
 // ---- 会话持久化（服务端存储）----
 export interface StoredMessage {
@@ -229,6 +229,11 @@ export interface StoredMessage {
   charts?: ChartSpec[];
   /** @deprecated 旧的单张结构（历史快照）：读取时并入 charts；写入一律用 charts。 */
   chart?: ChartSpec;
+  /**
+   * 可下载产物（export_data 产出的 ArtifactSpec 数组）：产物实体始终在服务端工作区，
+   * 快照只存「指针 + 展示元数据」，必须随快照落库，否则刷新后下载卡片消失（与 charts 同理）。
+   */
+  artifacts?: ArtifactSpec[];
 }
 
 /** 排队中的待发消息（后端持久化，`conversation.pendingQueue`）。 */
@@ -608,6 +613,11 @@ export async function readWorkspaceFile(conversationId: string, path: string): P
   return data.content || "";
 }
 
+/** 工作区文件下载链接（对话卡片 / 资源面板「下载」按钮用；二进制安全，中文名走 RFC5987）。 */
+export function workspaceDownloadUrl(conversationId: string, path: string): string {
+  return `/agent/chat/conversations/${encodeURIComponent(conversationId)}/files/download?path=${encodeURIComponent(path)}`;
+}
+
 // ---- 定时任务（服务端持久化；到点执行，结果回投对话，可选推送到 IM 机器人）----
 
 export type ScheduleStatus = "success" | "failed" | "cancelled" | "skipped" | "error";
@@ -627,8 +637,6 @@ export interface ScheduleDto {
   onceAt?: number;
   /** 任务级外部工具允许清单（MCP 服务器 id）：与对话启用集取交集，只收窄不放开。 */
   mcpServers?: string[];
-  /** 结果投递通道（全局通道注册表 id）。 */
-  notifyChannelIds?: string[];
   notifyOn?: ScheduleNotifyOn[];
   locale?: string;
   lastDelivery?: { at: number; ok: boolean; sent: number; error?: string };
@@ -650,7 +658,6 @@ export interface ScheduleInput {
   cron?: string;
   onceAt?: number;
   mcpServers?: string[];
-  notifyChannelIds?: string[];
   notifyOn?: ScheduleNotifyOn[];
   locale?: string;
 }

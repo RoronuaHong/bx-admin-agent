@@ -10,9 +10,10 @@
 |---|---|---|
 | 1 | 问题定性与断链核查（§1 / §2） | ✅ 已完成 |
 | 2 | 形态判定准则（内置 / MCP / Skill / 定时任务） | ✅ 已完成（§4） |
-| 3 | P0 产物交付闭环（导出工具 + 下载端点 + `file` 事件 + 下载卡片） | ⬜ 待实施 |
+| 3 | P0 产物交付闭环（导出工具 + 下载端点 + `file` 事件 + 下载卡片） | ✅ 已落地（`export_data`：xlsx/csv/json/md） |
 | 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ⬜ 待实施 |
 | 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
+| 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | 🟡 评审中（2026-09-23） |
 
 ---
 
@@ -181,8 +182,8 @@ user: 123
 | CSV | **内置工具** | `export_data`（`format: "csv"`） | 纯文本序列化，零依赖、零自由度 |
 | XLSX | **内置工具**（+ Skill 承载格式约定） | `export_data`（`exceljs`）+ `skills/office-export` | 「数据 → 表格文件」是确定性转换，模型不该自己拼字节；格式策略（多 sheet / 列宽 / 数字格式）属技能层 |
 | JSON / MD | 内置工具（同一工具） | `export_data` | 同属数据序列化，不额外建工具 |
-| PDF | P1：**内置渲染工具** | 计划 `export_document`（md/html → pdf） | 排版引擎选型待定：无头浏览器体积大、`pdfkit` 需自写排版；**兜底方案**是先交付 md + 浏览器打印，不阻塞 P0 |
-| DOCX | 暂不做 | —— | 生成需求低频（解析侧 `mammoth` 已有） |
+| PDF | ~~P1：内置渲染工具~~ → **v2 内置扩展** | `export_data`（`format: "pdf"`），选型与实现见 §10 | 原定「待选型后并入同一工具族」，现选型完成（pdfmake + CJK 字体内嵌） |
+| DOCX | ~~暂不做~~ → **v2 内置扩展** | `export_data`（`format: "docx"`），见 §10 | 用户明确要求补齐 Office 双件套（Word/PDF），推翻 v1「暂不做」决策 |
 | 图表 | 已落地 | 内置 `render_chart` | 前端本地渲染，零外链 |
 | 图片生成 | 走 MCP | 外部生图服务 | 需外部凭据，不属本机确定性能力 |
 
@@ -205,4 +206,82 @@ user: 123
 - 上传附件不进工作区（P1 #9）。
 - 定时任务仅前端可建（P1 #10）。
 - 工作区为单机单用户假设（并发写与配额未做）。
-- PDF 渲染引擎选型（体积 vs 排版能力）未定。
+- ~~PDF 渲染引擎选型（体积 vs 排版能力）未定~~ → 已在 §10 v2 定案。
+
+---
+
+## 10. v2 格式扩展：PDF / Word / HTML / TXT（2026-09-23 评审稿）
+
+> 触发：用户在 `/chat` 实测「123 / 上述导出pdf」→ 模型只能如实回答「不支持 PDF」。
+> 结论先行：**基础设施早已预埋好（`.pdf`/`.docx` 早在二进制白名单与 MIME 表里），缺的只是「生成器」一段代码与两个依赖**。
+
+### 10.1 为什么导不了 PDF（代码级根因）
+
+| 环节 | 落点 | 现状 |
+|---|---|---|
+| 格式白名单 | `builtins.ts` `EXPORT_FORMATS = new Set(["xlsx","csv","json","md"])` | ❌ pdf/docx 不在集合，`resolveExportTarget` 直接报「不支持的导出格式」 |
+| 工具 schema | `builtins.ts` `export_data` spec 的 `format` 描述 | ❌ 只声明 `csv \| xlsx \| json \| md`，模型无从得知可请求 PDF |
+| 生成器 | `builtins.ts` `execExportData` 分支：xlsx → `buildXlsx`；其余 → 文本序列化 | ❌ 无 PDF/DOCX 生成函数 |
+| 二进制落盘 | `fs-store.ts` `BINARY_EXTS`（含 `.xlsx .xls .pdf .docx .zip`） | ✅ **已预埋** |
+| MIME | `fs-store.ts` `MIME_BY_EXT`（`.pdf`/`.docx` 齐全） | ✅ **已预埋** |
+| 下载卡片 / 下载端点 | artifact 事件 + `GET .../files/download`（`mimeOf` 通用） | ✅ 通用，新格式零前端改动 |
+| 依赖 | `package.json`：`exceljs`（生成 xlsx）/ `unpdf`+`mammoth`（解析侧） | ❌ 缺 PDF 生成库与 DOCX 生成库 |
+| 顺手的小坑 | 文件名 `x.xls` → 扩展名推断 `xls` → 报「不支持」 | 🟡 应友好映射为 `xlsx`（白名单里 `.xls` 本就指向同一产物） |
+
+### 10.2 目标格式矩阵（对齐 ChatGPT Code Interpreter / CodeBuddy 文件产物口径）
+
+| 格式 | 优先级 | 生成方式 | 新增依赖 | 说明 |
+|---|---|---|---|---|
+| xlsx | ✅ 已有 | `exceljs`（多 sheet/冻结表头/列宽） | — | 不动 |
+| csv / json / md | ✅ 已有 | 文本序列化 | — | 不动 |
+| **docx（Word）** | P0 本批 | `docx` npm 包（声明式：标题+表格+样式） | `docx`（纯 JS，零原生依赖） | 中文无需内嵌字体（Word 按名称取系统字体）；P0 最高性价比 |
+| **pdf** | P0 本批 | `pdfmake`（声明式表格布局，字体经 vfs 注入） | `pdfmake` + NotoSansSC TTF 字体资产 | **唯一硬点：PDF 必须内嵌 CJK 字体**，否则中文全变空白；详见 10.3 |
+| **html** | P0 本批 | 自包含单文件（内联 CSS 的样式表格），走 `fsWrite` 文本路径 | **零依赖** | 双重价值：①本身可预览/二次加工；②浏览器打开 Ctrl+P 即存 PDF——是 PDF 的**零成本兜底通道**（v1 §7 的兜底方案正式落地） |
+| **txt** | P0 本批 | 等宽对齐纯文本（CJK 记 2 计算列宽），走 `fsWrite` | 零依赖 | 补齐 Code Interpreter 基线格式 |
+| **pptx（PowerPoint）** | P0 本批 | `pptxgenjs`（标题页 + 每表一页幻灯表格） | `pptxgenjs`（纯 JS，零原生依赖） | 用户拍板全量补齐；表格数据 → 每表一页幻灯，中文走系统字体无需内嵌；密集表格建议仍用 xlsx |
+| **png（图表图片）** | P0 本批 | 前端 ChartCard 增加「存 PNG」按钮：G2 canvas `toDataURL` 白底合成后下载 | **零依赖、零服务端改动** | 对齐 Cursor/CodeBuddy 图表卡标配；图表本就前端本地渲染（v1 §7 判定维持），服务端重复渲染无意义 |
+
+**不新增第二个工具**：全部并入 `export_data`（v1 §4 准则「不为每种格式各建一个工具」不变）。工具名/描述/schema 全协议级英文，不含业务词（红线）。
+
+### 10.3 PDF 引擎选型（v1 挂账项定案）
+
+| 方案 | 结论 | 理由 |
+|---|---|---|
+| **pdfmake（选定）** | ✅ | 声明式 content 定义（table/文本/分页），API 与 `docx` 包同风格；字体经 vfs 注入；纯 JS 无原生编译 |
+| pdfkit | 备选 | 命令式坐标排版，表格需自写循环；与 docx 的声明式风格不统一 |
+| puppeteer / 无头浏览器 | ❌ | Chromium 体积数百 MB、启动秒级，服务端不可接受（v1 §7 已否，维持） |
+| pdf-lib | ❌ | 过低层（逐字符定位），表格排版全部自写，得不偿失 |
+
+**CJK 字体内嵌（PDF 唯一硬点）**：
+- 资产：`apps/agent-server/assets/fonts/NotoSansSC-Regular.ttf`（思源黑体子集，体积预计 2~8MB；完整版 ~10MB 过大，做子集裁剪）。
+- 构建：pdfmake 的 `vfs_fonts.js` 由脚本从 TTF 生成，不进 npm。
+- 兜底：字体资产缺失时 `format:"pdf"` 如实报错并提示改用 `docx`/`html`，**绝不输出中文空白/乱码的 PDF**（诚实失败优于坏产物）。
+- `.gitignore`/LFS 取舍：字体入库（一次性资产），若嫌大改走部署时下载脚本，评审时定。
+
+### 10.4 服务端实现落点（全部在 `apps/agent-server`）
+
+1. **`builtins.ts`**
+   - `EXPORT_FORMATS` 扩为 `xlsx / csv / json / md / docx / pdf / html / txt`；
+   - `export_data` 工具描述与 `format` schema 同步（「生成 pdf / word 文档」话术进触发条件）；错误提示同步支持集合；
+   - `resolveExportTarget`：扩展名 `xls` → 归一为 `xlsx`（小坑修复）；
+   - 新增 `buildDocx(sheets)` / `buildPdf(sheets, title)` / `buildHtml(...)` / `buildTxt(...)`，全部**动态 `import`**（对齐 `buildXlsx` 现有模式：真用到才付加载成本）。
+2. **多表（sheets）策略**：xlsx = 多工作表（现状）；docx / pdf = 按序「小标题 + 表格」分节（同一循环，几乎零额外成本）；html / txt = 沿用「多表仅限 xlsx/docx/pdf」拒绝路径（提示语同步）。
+3. **行数上限分级**（PDF 页数会爆炸，不能沿用 5 万行一刀切）：`xlsx` 5 万（现状）/ `docx` 2 万 / `pdf` 2000 / `html` 5 万 / `txt` 5 万；超限报错并给分流建议（如「数据量较大请改用 xlsx」）。
+4. **`fs-store.ts`**：零改动（白名单/MIME 已备好；html/txt 走既有文本路径）。
+5. **`app.ts` / 前端 `api.ts` / `ChatPage.vue`**：零改动（下载卡片与端点按 mime/文件名通用渲染）。
+6. **依赖**：`pnpm add docx pdfmake`（都在 `apps/agent-server`）；字体资产一处新增。
+
+### 10.5 验收标准（v2）
+
+1. 「导出pdf / 导出word」→ 气泡出现 `.pdf` / `.docx` 下载卡片；文件可被 Adobe/WPS/Word 打开，**中文正常显示**（PDF 字体内嵌验证）。
+2. 多表导出：`sheets` 给 pdf/docx → 分节呈现；给 html/txt → 明确报错拒绝。
+3. 超行数上限 → 明确报错 + 分流建议，不产出残缺文档。
+4. 字体资产缺失时 PDF 如实报错引导替代格式（兜底路径）。
+5. 回归：xlsx/csv/json/md 四种既有格式产物逐字节语义不变；`fs_write` 文本、对话导出、`render_chart` 无变化。
+6. 工具 schema / 描述 / 错误提示零业务词（红线审计）。
+
+### 10.6 评审待定项（需要用户拍板）
+
+1. **字体方案**：NotoSansSC 子集直接入库（简单）vs 部署脚本按需下载（仓库瘦）——推荐前者（一次性 ~5MB）。
+2. **pdf 2000 行上限**是否合适（可放宽到 5000，代价是百页文档）。
+3. `txt` 是否要（Code Interpreter 有；本项目场景偏少，砍掉也行）。

@@ -51,6 +51,7 @@ import {
   getApiErrorCode,
   addMemoryItem,
   readWorkspaceFile,
+  workspaceDownloadUrl,
   removeMemoryItem,
   isChatTaskRunning,
   patchChatSchedule,
@@ -86,7 +87,7 @@ import {
   type UploadResult,
   type WorkspaceFile,
 } from "../api";
-import type { ChatEvent, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ChatEvent, TodoItem } from "@bx/shared";
 
 /** 侧栏视图：对话列表 / 定时任务。为后续接入定时任务预留结构化入口（占位面板）。 */
 const view = ref<"chat" | "tasks">("chat");
@@ -107,8 +108,6 @@ const taskDraft = reactive({
   scheduledAt: "",
   /** 本任务允许使用的 MCP 服务器（空 = 不带任何 MCP 工具运行）。 */
   mcpServers: [] as string[],
-  /** 结果投递通道（空 = 只回投对话，不推送）。 */
-  notifyChannelIds: [] as string[],
 });
 /** 正在编辑的任务 id（空 = 新建）。 */
 const editingTaskId = ref("");
@@ -138,21 +137,13 @@ function taskToolsFact(t: ScheduleDto): string {
     .join(tx("、", ", ", ", ", ", "));
 }
 
-/** 任务表单里切换某个通知通道的勾选状态（每个任务选自己的通道）。 */
-function toggleTaskChannel(id: string) {
-  const i = taskDraft.notifyChannelIds.indexOf(id);
-  if (i >= 0) taskDraft.notifyChannelIds.splice(i, 1);
-  else taskDraft.notifyChannelIds.push(id);
-}
 
-/** 任务卡片「通知」事实：本任务勾选的通道标签 + 上次投递结果。 */
+
+/** 任务卡片「通知」事实：任务启用且通道启用即推送；列出所有启用通道标签 + 上次投递结果。 */
 function taskNotifyFact(t: ScheduleDto): string {
-  const ids = t.notifyChannelIds || [];
-  if (!ids.length) return "";
-  const labels = ids
-    .map((id) => notifyChannels.value.find((c) => c.id === id)?.label || id)
-    .join(tx("、", ", ", ", ", ", "));
-  if (!labels) return "";
+  const enabled = notifyChannels.value.filter((c) => c.enabled !== false);
+  if (!enabled.length) return "";
+  const labels = enabled.map((c) => c.label).join(tx("、", ", ", ", ", ", "));
   const last = t.lastDelivery;
   if (!last) return labels;
   return `${labels} · ${
@@ -224,7 +215,6 @@ async function saveChannelDraft() {
       ...(channelDraft.keyword.trim() ? { keyword: channelDraft.keyword.trim() } : {}),
     });
     notifyChannels.value = [saved, ...notifyChannels.value.filter((c) => c.id !== saved.id)];
-    if (!taskDraft.notifyChannelIds.includes(saved.id)) taskDraft.notifyChannelIds.push(saved.id);
     channelDraft.label = "";
     channelDraft.webhook = "";
     channelDraft.secret = "";
@@ -258,7 +248,6 @@ async function removeChannel(id: string) {
   try {
     await deleteNotifyChannel(id);
     notifyChannels.value = notifyChannels.value.filter((c) => c.id !== id);
-    taskDraft.notifyChannelIds = taskDraft.notifyChannelIds.filter((x) => x !== id);
     notifyNote.value = "";
   } catch (err) {
     notifyNote.value = channelErrorText(err, tx("删除失败", "Delete failed", "Falha ao excluir", "हटाना विफल"));
@@ -277,7 +266,6 @@ async function toggleChannelEnabled(ch: NotifyChannelDto) {
     const idx = notifyChannels.value.findIndex((c) => c.id === ch.id);
     if (idx >= 0) notifyChannels.value[idx] = saved;
     // 关闭后从当前任务的勾选里摘掉，避免「停用却仍显示已开启」。
-    if (!nextEnabled) taskDraft.notifyChannelIds = taskDraft.notifyChannelIds.filter((x) => x !== ch.id);
     notifyNote.value = nextEnabled
       ? tx("已启用，引用它的任务到点会推送", "Enabled — tasks referencing it will deliver", "Ativado — tarefas que o referenciam entregarão", "सक्षम — इसे संदर्भित कार्य वितरित करेंगे")
       : tx("已停用，所有任务不再推送到该通道", "Disabled — no task will deliver to it", "Desativado — nenhuma tarefa entregará a ele", "अक्षम — कोई कार्य इसे नहीं भेजेगा");
@@ -711,7 +699,6 @@ function openTaskForm(task?: ScheduleDto) {
   taskDraft.scheduleType = task?.onceAt ? "once" : "recurring";
   taskDraft.scheduledAt = task?.onceAt ? toLocalInput(task.onceAt) : "";
   taskDraft.mcpServers = [...(task?.mcpServers || [])];
-  taskDraft.notifyChannelIds = [...(task?.notifyChannelIds || [])];
   taskRepeat.freq = parsed?.freq || "DAILY";
   taskRepeat.interval = parsed?.interval || 1;
   taskRepeat.byday = parsed?.byday.length ? [...parsed.byday] : ["MO"];
@@ -770,7 +757,6 @@ async function submitTask() {
     name,
     prompt,
     mcpServers: taskDraft.mcpServers.slice(),
-    notifyChannelIds: taskDraft.notifyChannelIds.slice(),
     // 成功与失败都推（跳过不推，因为「这次没跑」不是需要人处理的结果）。
     notifyOn: ["success", "failed"] as ScheduleNotifyOn[],
   };
@@ -993,6 +979,8 @@ interface Bubble {
   todos?: TodoItem[];
   /** 前端本地渲染图表（render_chart 产出；零外链，浏览器用 AntV 绘制）。一轮可出多张，按顺序展示。 */
   charts?: ChartSpec[];
+  /** 可下载产物（export_data 产出；随对话快照恢复，前端渲染下载卡片，点一下即可拿走文件）。 */
+  artifacts?: ArtifactSpec[];
   /** 子代理（task）实时状态：独立事件维度，随流式进度更新，仅作展示（不落库）。 */
   subagents?: Array<{
     id: string;
@@ -1732,7 +1720,7 @@ function settleStep(step: ToolStep): ToolStep {
 function toStored(list: Bubble[]): StoredMessage[] {
   return list
     // 只出图、没有正文的气泡也必须落库：否则整条消息（连图一起）刷新后消失。
-    .filter((b) => b.text || b.images?.length || b.charts?.length)
+    .filter((b) => b.text || b.images?.length || b.charts?.length || b.artifacts?.length)
     .map((b) => ({
       role: b.role,
       text: b.text,
@@ -1744,6 +1732,8 @@ function toStored(list: Bubble[]): StoredMessage[] {
       ...(b.todos?.length ? { todos: b.todos } : {}),
       // 图表 spec 也要落库：图是浏览器现场画的、产物只在内存，不存就会「刷新即消失」。
       ...(b.charts?.length ? { charts: b.charts } : {}),
+      // 下载卡片同理：产物实体在服务端，快照只存 spec，刷新后由卡片按 path 重绘。
+      ...(b.artifacts?.length ? { artifacts: b.artifacts } : {}),
     }));
 }
 
@@ -1794,6 +1784,8 @@ function selectConversation(conv: ConversationDto) {
       ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
       // 图表卡片恢复（与 toStored 对称）：刷新后由 ChartCard 按 spec 重绘。
       ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
+      // 下载卡片恢复（与 toStored 对称）：刷新后由卡片按 spec 重绘。
+      ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
     }));
   }
   // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
@@ -2730,6 +2722,19 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
       encode: event.encode,
       options: event.options,
     });
+    queueScrollIfCurrent(convId);
+  } else if (event.type === "artifact") {
+    // 可下载产物（export_data）：累积到当前回复气泡，刷新后由下载卡片按 spec 重绘。
+    // 同一文件可能被同一轮重试多次产出，按 path 去重（保留最后一次，字节数以最新为准）。
+    reply.artifacts = reply.artifacts || [];
+    const existing = reply.artifacts.find((a) => a.path === event.path);
+    if (existing) {
+      existing.name = event.name;
+      existing.bytes = event.bytes;
+      existing.mime = event.mime;
+    } else {
+      reply.artifacts.push({ path: event.path, name: event.name, bytes: event.bytes, mime: event.mime });
+    }
     queueScrollIfCurrent(convId);
   } else if (event.type === "subagent_start") {
     reply.subagents = reply.subagents || [];
@@ -4588,48 +4593,15 @@ onBeforeUnmount(() => {
                   )
                 }}</p>
               </div>
-              <!-- 结果通知：勾了通道，到点跑完推送到钉钉/飞书机器人；不勾只回投对话。 -->
+              <!-- 结果通知：任务到点跑完即向所有已启用通道推送（由通道「启用」开关控制，无需逐任务勾选）。 -->
               <div class="field">
                 <span class="field__label">{{ tx("执行结果通知", "Notify results", "Notificar resultados", "परिणाम सूचित करें") }}</span>
-              <!-- 每个任务选自己的通知通道；通道的增删改在顶部工具条「通知」里管理。 -->
-              <div class="notify-rows">
-                <button
-                  v-for="ch in notifyChannels"
-                  :key="ch.id"
-                  type="button"
-                  class="notify-row"
-                  :class="{ active: taskDraft.notifyChannelIds.includes(ch.id), disabled: !ch.enabled }"
-                  role="switch"
-                  :aria-checked="taskDraft.notifyChannelIds.includes(ch.id)"
-                  :aria-disabled="!ch.enabled"
-                  :disabled="!ch.enabled"
-                  @click="toggleTaskChannel(ch.id)"
-                >
-                  <span class="notify-row__text">
-                    <span class="notify-row__name">{{ ch.label }}</span>
-                    <span class="notify-row__host">{{ ch.kind }} · {{ ch.host }}</span>
-                  </span>
-                  <span class="notify-row__meta">
-                    <span class="notify-row__state" :class="{ on: taskDraft.notifyChannelIds.includes(ch.id) }">{{
-                      !ch.enabled
-                        ? tx("已停用", "Disabled", "Desativado", "अक्षम")
-                        : (taskDraft.notifyChannelIds.includes(ch.id) ? tx("已开启", "On", "Ativo", "चालू") : tx("已关闭", "Off", "Desligado", "बंद"))
-                    }}</span>
-                    <span class="notify-switch" :class="{ on: taskDraft.notifyChannelIds.includes(ch.id) }" aria-hidden="true">
-                      <span class="notify-switch__knob"></span>
-                    </span>
-                  </span>
-                </button>
-                <span v-if="!notifyChannels.length" class="notify-empty">{{
-                  tx("还没有通知通道，去顶部「通知」里添加", "No channels yet — add one from Notify in the top bar", "Nenhum canal ainda — adicione no Notificar da barra superior", "अभी कोई चैनल नहीं — शीर्ष पट्टी के नोटिफ़ाई से जोड़ें")
-                }}</span>
-              </div>
               <p class="repeat-preview">{{
                 tx(
-                  "勾选的通道会在本任务到点运行结束时收到结果推送（成功与失败都推）；不勾则结果只回投到对话里。通道的增删改见下方「管理通知通道」。",
-                  "Checked channels receive this task's result on completion (success and failure); otherwise the result stays in the chat. Add or edit channels under Manage channels below.",
-                  "Os canais marcados recebem o resultado desta tarefa ao concluir (sucesso e falha); caso contrário, fica no chat. Adicione/edite canais em Gerenciar canais abaixo.",
-                  "चुने गए चैनल को इस कार्य का परिणाम मिलेगा (सफल/विफल); वरना चैट में रहेगा। चैनल नीचे 'चैनल प्रबंधित करें' से जोड़ें/बदलें।",
+                  "任务到点运行结束时，会向所有已启用的通知通道推送结果（成功与失败都推）；只需启用通道、无需逐任务勾选。通道的启用 / 停用见下方「管理通知通道」。",
+                  "On completion the result is pushed to every enabled notify channel (success and failure); no per-task selection needed. Enable/disable channels under Manage channels below.",
+                  "Ao concluir, o resultado é enviado a todo canal de notificação ativado (sucesso e falha); sem seleção por tarefa. Ative/desative canais em Gerenciar canais abaixo.",
+                  "पूर्ण होने पर परिणाम हर सक्षम अधिसूचना चैनल को भेजा जाता है (सफल/विफल); कोई कार्य-वार चयन नहीं। चैनल ऊपर 'चैनल प्रबंधित करें' से सक्षम/अक्षम करें।",
                 )
               }}</p>
               <div class="notify-manage">
@@ -4911,16 +4883,27 @@ onBeforeUnmount(() => {
                 <div v-else-if="!wsFiles.length" class="empty-hint">
                   {{ tx("工作区为空（对话里可用 fs_write 保存文件）", "Workspace is empty (use fs_write in chat to save files)", "El espacio está vacío (usa fs_write)", "वर्कस्पेस खाली है (fs_write का उपयोग करें)") }}
                 </div>
-                <button
+                <div
                   v-for="f in wsFiles"
                   :key="f.path"
                   class="res-file"
-                  type="button"
-                  @click="openWorkspaceFile(f.path)"
                 >
-                  <span class="res-row__text">{{ f.path }}</span>
-                  <span class="mcp-row__sub">{{ formatBytes(f.bytes) }}</span>
-                </button>
+                  <button
+                    class="res-file__view"
+                    type="button"
+                    :title="tx('查看', 'View', 'Ver', 'देखें')"
+                    @click="openWorkspaceFile(f.path)"
+                  >
+                    <span class="res-row__text">{{ f.path }}</span>
+                    <span class="mcp-row__sub">{{ formatBytes(f.bytes) }}</span>
+                  </button>
+                  <a
+                    class="res-file__dl"
+                    :href="workspaceDownloadUrl(currentId, f.path)"
+                    :download="f.path.split('/').pop() || f.path"
+                    :title="tx('下载', 'Download', 'Descargar', 'डाउनलोड')"
+                  >⤓</a>
+                </div>
               </div>
               <pre v-if="wsFileContent" class="res-preview">{{ wsFileContent?.content }}</pre>
             </div>
@@ -4964,6 +4947,7 @@ onBeforeUnmount(() => {
             >
               <button
                 class="reasoning__head"
+                :class="{ 'is-streaming': b.streaming }"
                 type="button"
                 :aria-expanded="openReasoning.has(b.id)"
                 @click="toggleReasoning(b.id)"
@@ -5170,6 +5154,15 @@ onBeforeUnmount(() => {
                 :encode="c.encode"
                 :options="c.options"
               />
+            </div>
+            <div v-for="(a, ai) in b.artifacts || []" :key="`artifact-${ai}`" class="artifact-card">
+              <span class="artifact-card__name" :title="a.name">{{ a.name }}</span>
+              <span class="artifact-card__meta">{{ formatBytes(a.bytes) }}</span>
+              <a
+                class="artifact-card__btn"
+                :href="workspaceDownloadUrl(currentId, a.path)"
+                :download="a.name"
+              >{{ tx('下载', 'Download', 'Descargar', 'डाउनलोड') }}</a>
             </div>
             <div v-if="isStoppedBubble(b)" class="stopped-tag">
               <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true">
@@ -8818,6 +8811,79 @@ button.step-head:disabled {
   background: color-mix(in srgb, var(--line) 30%, transparent);
 }
 
+.res-file__view {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.res-file__dl {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.res-file__dl:hover {
+  background: color-mix(in srgb, var(--line) 30%, transparent);
+  color: var(--ink);
+}
+
+.artifact-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg) 75%, var(--line));
+}
+
+.artifact-card__name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.artifact-card__meta {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.artifact-card__btn {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.artifact-card__btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .res-preview {
   margin: 8px 0 0;
   max-height: 200px;
@@ -9433,6 +9499,35 @@ button.step-head:disabled {
   background: color-mix(in srgb, var(--ink) 5%, transparent);
 }
 
+/* 流式中的标题：微光扫过（ChatGPT/Claude「Thinking…」的招牌动效）——
+   比 spinner 更轻地传达「正在生成思考」，且不复用 spinner 的品牌色（动效语言分离）。 */
+.reasoning__head.is-streaming .reasoning__title {
+  background: linear-gradient(
+    90deg,
+    var(--muted) 38%,
+    color-mix(in srgb, var(--ink) 82%, var(--muted)) 50%,
+    var(--muted) 62%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: reason-shimmer 2.4s linear infinite;
+}
+
+@keyframes reason-shimmer {
+  from { background-position: 180% 0; }
+  to { background-position: -180% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reasoning__head.is-streaming .reasoning__title {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    animation: none;
+  }
+}
+
 .reasoning__caret {
   flex: none;
   width: 6px;
@@ -9493,6 +9588,26 @@ button.step-head:disabled {
      两个主题下 20%+ 的 fill-soft 叠出来都正好落在这一档）。分层交给描边，
      让「有底的卡片」始终是层级里更明显的那一层。 */
   background: color-mix(in srgb, var(--fill-soft) 14%, transparent);
+  /* v-show 从 display:none 切回时会重放该动画：展开即有 3px 轻落 + 淡入，
+     折叠/展开不再「闪现」，对齐 Cursor 步骤面板的入场手感。 */
+  animation: reason-open 0.22s var(--ease);
+}
+
+@keyframes reason-open {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reasoning__body {
+    animation: none;
+  }
 }
 
 /* 规划/思考阶段的状态行：比纯圆点更明确地传达「agent 正在规划」，缓解静默加载的卡顿感。 */
@@ -9569,6 +9684,26 @@ button.step-head:disabled {
   /* 细左轨保留「这是推理过程」的纵向语义（面板内再收一层，不额外套盒子）。
      用 --rail（而非 --line）：深色主题下连接线需要比边框更亮，否则会「断成几个点」。 */
   border-left: 2px solid var(--rail);
+  /* 细滚动条：思考流限高内滚，原生宽滚动条在窄面板里喧宾夺主。 */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 18%, transparent) transparent;
+}
+
+.reasoning__thinking::-webkit-scrollbar {
+  width: 6px;
+}
+
+.reasoning__thinking::-webkit-scrollbar-thumb {
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--ink) 16%, transparent);
+}
+
+.reasoning__thinking::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ink) 26%, transparent);
+}
+
+.reasoning__thinking::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .reasoning__body .todos,

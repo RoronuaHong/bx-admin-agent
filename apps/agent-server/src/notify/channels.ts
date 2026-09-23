@@ -89,21 +89,27 @@ export function hostAllowed(host: string): boolean {
   return allowedHostSuffixes().some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
 }
 
-/** 入参校验：返回错误文案或 null。地址只做「形状 + 白名单」校验，连通性由测试端点验证。 */
-export function validateChannelInput(input: NotifyChannelInput): string | null {
+/**
+ * 入参校验：返回错误文案或 null。地址只做「形状 + 白名单」校验，连通性由测试端点验证。
+ * @param existing 更新已存在通道时传入原记录——此时 webhook 可省略（沿用原值），仅新建要求必填。
+ */
+export function validateChannelInput(input: NotifyChannelInput, existing?: NotifyChannel | null): string | null {
   if (input.id !== undefined && !ID_RE.test(String(input.id).trim())) {
     return "id 仅允许字母、数字、下划线、短横线（1-32 字符）";
   }
   if (input.kind !== undefined && !KINDS.includes(input.kind)) {
     return `通道类型非法（可选 ${KINDS.join(" / ")}）`;
   }
+  // 更新已存在通道时 webhook 可省略（沿用原有值）；仅新建要求必填。
   const webhook = String(input.webhook || "").trim();
-  if (!webhook) return "webhook 必填";
-  const host = hostOf(webhook);
-  if (!host) return "webhook 不是合法 URL";
-  if (!/^https?:$/.test(new URL(webhook).protocol)) return "webhook 只支持 http/https";
-  if (!hostAllowed(host)) {
-    return `webhook 域名不在允许列表（可选 ${allowedHostSuffixes().join(" / ")}；自建网关用 NOTIFY_ALLOWED_HOSTS 追加）`;
+  if (!existing && !webhook) return "webhook 必填";
+  if (webhook) {
+    const host = hostOf(webhook);
+    if (!host) return "webhook 不是合法 URL";
+    if (!/^https?:$/.test(new URL(webhook).protocol)) return "webhook 只支持 http/https";
+    if (!hostAllowed(host)) {
+      return `webhook 域名不在允许列表（可选 ${allowedHostSuffixes().join(" / ")}；自建网关用 NOTIFY_ALLOWED_HOSTS 追加）`;
+    }
   }
   if (input.label !== undefined && String(input.label).length > MAX_LABEL_LEN) {
     return `展示名不超过 ${MAX_LABEL_LEN} 字符`;

@@ -59,7 +59,7 @@ import {
   startTask,
   type ChatTask,
 } from "./chat-tasks.js";
-import { fsList, fsRead, fsRemoveConversation } from "./fs-store.js";
+import { fsList, fsRead, fsRemoveConversation, fsResolve, fsStat, mimeOf } from "./fs-store.js";
 import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, type RunTrace } from "./trace.js";
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
@@ -82,7 +82,6 @@ import {
   toPublic as toPublicChannel,
   upsertChannel,
   validateChannelInput,
-  type NotifyChannel,
   type NotifyChannelInput,
 } from "./notify/channels.js";
 import { buildScheduleDelivery, deliverToChannels } from "./notify/deliver.js";
@@ -246,10 +245,7 @@ function knownMcpIds(ids?: string[]): string[] {
   return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
 }
 
-function knownChannelIds(ids?: string[]): string[] {
-  const known = new Set(loadChannels().map((channel) => channel.id));
-  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
-}
+
 
 /** 投递触发条件：只认这两个状态，其余（跳过/取消）一律不推。 */
 function pickNotifyOn(values?: ScheduleNotifyOn[]): ScheduleNotifyOn[] {
@@ -419,17 +415,13 @@ async function deliverScheduleResult(
   text: string,
   charts: ChartSpec[] = [],
 ): Promise<void> {
-  const ids = schedule.notifyChannelIds || [];
-  // 每个任务勾选自己的通知通道；空 = 该任务不推送。通道「启用」开关是全局总闸，
-  // 即便任务勾了，通道被停用也不投递。
-  if (!ids.length) return;
+  // 通知由「通道启用」开关控制：任务到点跑完即推送所有启用通道（不再逐任务勾选，
+  // 见前端任务表单说明）。通道「启用」是全局总闸，停用的通道不投递。
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
   if (!notifyOn.includes(status)) return;
-  const channels = ids
-    .map((id) => getChannel(id))
-    .filter((channel): channel is NotifyChannel => channel != null && channel.enabled !== false);
+  const channels = loadChannels().filter((channel) => channel.enabled !== false);
   if (!channels.length) {
-    console.warn(`[scheduler] ${schedule.id} 的通知通道都已不存在/被停用，跳过投递`);
+    console.warn(`[scheduler] ${schedule.id} 没有启用的通知通道，跳过投递`);
     return;
   }
   const summary = await deliverToChannels(
@@ -593,7 +585,6 @@ export function createApp() {
       onceAt?: number;
       name?: string;
       mcpServers?: string[];
-      notifyChannelIds?: string[];
       notifyOn?: ScheduleNotifyOn[];
       locale?: string;
       /** Agent 角色（/support 这类非 generic 入口建任务时带上，专属对话按角色分槽）。 */
@@ -636,7 +627,6 @@ export function createApp() {
         ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : { cron: String(body.cron || "") }),
         ...(body.name ? { name: body.name } : {}),
         mcpServers: taskMcp,
-        notifyChannelIds: knownChannelIds(body.notifyChannelIds),
         notifyOn: pickNotifyOn(body.notifyOn),
         ...(body.locale ? { locale: String(body.locale) } : {}),
       });
@@ -655,7 +645,6 @@ export function createApp() {
       onceAt?: number;
       enabled?: boolean;
       mcpServers?: string[];
-      notifyChannelIds?: string[];
       notifyOn?: ScheduleNotifyOn[];
     }>(c);
     if (body.cron !== undefined || body.onceAt !== undefined) {
@@ -669,7 +658,6 @@ export function createApp() {
       ...(body.onceAt === undefined && body.cron !== undefined ? { cron: String(body.cron) } : {}),
       ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
       ...(body.mcpServers !== undefined ? { mcpServers: knownMcpIds(body.mcpServers) } : {}),
-      ...(body.notifyChannelIds !== undefined ? { notifyChannelIds: knownChannelIds(body.notifyChannelIds) } : {}),
       ...(body.notifyOn !== undefined ? { notifyOn: pickNotifyOn(body.notifyOn) } : {}),
     });
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
@@ -688,7 +676,8 @@ export function createApp() {
 
   app.post("/notify/channels", async (c) => {
     const body = await readJson<NotifyChannelInput>(c);
-    const invalid = validateChannelInput(body);
+    const existing = body.id ? getChannel(body.id) : null;
+    const invalid = validateChannelInput(body, existing);
     if (invalid) return errorJson(c, 400, "NOTIFY_CHANNEL_INVALID", invalid);
     return c.json({ channel: toPublicChannel(upsertChannel(body)) });
   });
@@ -1306,6 +1295,39 @@ export function createApp() {
     const result = fsRead(id, path, paging);
     if ("error" in result) return errorJson(c, 404, "WORKSPACE_FILE_NOT_FOUND", result.error);
     return c.json({ path, content: result.content, ...(result.totalLines ? { totalLines: result.totalLines } : {}) });
+  });
+
+  // ---- 工作区文件下载（CodeBuddy 式：对话里点卡片即可拿走文件）----
+  // 与 /files/content（纯文本预览）分工：这里是二进制安全、带 Content-Disposition 的下载端点。
+  app.get("/chat/conversations/:id/files/download", async (c) => {
+    const id = c.req.param("id");
+    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    const path = c.req.query("path") || "";
+    // 复用 safePath：越出工作区沙箱即拒（与 fs_* 工具同一套边界）。
+    const abs = fsResolve(id, path);
+    if (!abs) return errorJson(c, 400, "WORKSPACE_FILE_INVALID_PATH", "非法路径（越出工作区）");
+    const stat = fsStat(id, path);
+    if (!stat) return errorJson(c, 404, "WORKSPACE_FILE_NOT_FOUND", "文件不存在");
+    let data: Uint8Array<ArrayBuffer>;
+    try {
+      const nodeFs = await import("node:fs");
+      const buf = nodeFs.readFileSync(abs);
+      // 显式锚定到 ArrayBuffer：readFileSync 回 Buffer，其 .buffer 类型是 ArrayBufferLike；
+      // TS 5.9 下 lib.dom 的 BodyInit 只接受 Uint8Array<ArrayBuffer>，否则 new Response 类型报错。
+      data = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) as Uint8Array<ArrayBuffer>;
+    } catch {
+      return errorJson(c, 404, "WORKSPACE_FILE_NOT_FOUND", "文件读取失败");
+    }
+    // 中文名走 RFC5987（filename*=UTF-8''…），避免下载时乱码 / 落空。
+    const dispName = encodeURIComponent(stat.path.split("/").pop() || "file");
+    return new Response(data, {
+      headers: {
+        "Content-Type": mimeOf(path),
+        "Content-Disposition": `attachment; filename*=UTF-8''${dispName}`,
+        "Content-Length": String(data.length),
+        "Cache-Control": "no-store",
+      },
+    });
   });
 
   // ---- 设备级偏好（原前端 localStorage：主题 / 客户端默认语言 / 上次打开的对话 / 会话排序模式）----

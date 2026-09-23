@@ -38,8 +38,7 @@ export interface ChatSchedule {
    * 无人值守场景的通行最小权限做法：任务只带它真正需要的数据源。缺省 = 跟随对话启用集。
    */
   mcpServers?: string[];
-  /** 结果投递通道 id（全局通道注册表，见 src/notify/channels.ts）。空 = 只回投对话。 */
-  notifyChannelIds?: string[];
+
   /** 投递触发条件；缺省 success + failed，跳过不投。 */
   notifyOn?: ScheduleNotifyOn[];
   /** 投递文案语言（建任务时由前端写入；缺省中文）。 */
@@ -146,7 +145,6 @@ export async function createSchedule(input: {
   onceAt?: number;
   name?: string;
   mcpServers?: string[];
-  notifyChannelIds?: string[];
   notifyOn?: ScheduleNotifyOn[];
   locale?: string;
 }): Promise<ChatSchedule> {
@@ -163,7 +161,6 @@ export async function createSchedule(input: {
       ? { onceAt: Number(input.onceAt) }
       : { cron: String(input.cron || "").trim() }),
     ...(input.mcpServers?.length ? { mcpServers: [...new Set(input.mcpServers)] } : {}),
-    ...(input.notifyChannelIds?.length ? { notifyChannelIds: [...new Set(input.notifyChannelIds)] } : {}),
     ...(input.notifyOn?.length ? { notifyOn: [...new Set(input.notifyOn)] } : {}),
     ...(input.locale ? { locale: input.locale } : {}),
     enabled: true,
@@ -202,7 +199,6 @@ export interface SchedulePatch {
   onceAt?: number;
   enabled?: boolean;
   mcpServers?: string[];
-  notifyChannelIds?: string[];
   notifyOn?: ScheduleNotifyOn[];
   /** 重新绑定结果回投对话（迁移到专属对话 / 专属对话被删后重建时用）。 */
   conversationId?: string;
@@ -233,7 +229,6 @@ export async function patchSchedule(
     ...(switchingToCron ? { cron: String(patch.cron).trim() } : {}),
     ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
     ...(patch.mcpServers !== undefined ? { mcpServers: [...new Set(patch.mcpServers)] } : {}),
-    ...(patch.notifyChannelIds !== undefined ? { notifyChannelIds: [...new Set(patch.notifyChannelIds)] } : {}),
     ...(patch.notifyOn !== undefined ? { notifyOn: [...new Set(patch.notifyOn)] } : {}),
     ...(patch.conversationId ? { conversationId: patch.conversationId } : {}),
     ...(patch.ownConversation !== undefined ? { ownConversation: patch.ownConversation } : {}),

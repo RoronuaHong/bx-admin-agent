@@ -1248,6 +1248,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       executed: boolean;
       todos?: TodoItem[];
       chart?: { title?: string; chartType: string; data: unknown; encode?: Record<string, string>; options?: Record<string, unknown> };
+      artifact?: ArtifactSpec;
     }> => {
       const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
       if (builtin) {
@@ -1257,6 +1258,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           executed: true,
           ...(builtin.todos ? { todos: builtin.todos } : {}),
           ...(builtin.chart ? { chart: builtin.chart } : {}),
+          ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
       if (ctx.toolSearch && specOfTool.has(c.name) && !ctx.loadedTools.has(c.name)) {
@@ -1463,6 +1465,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
                 encode: out.chart.encode,
                 options: out.chart.options,
               };
+            if (out.artifact) yield { type: "artifact", ...out.artifact };
             const outContent = truncateResult(out.rawText);
             yield { type: "tool_result", id: item.call.id, name: item.call.name, ok: out.ok, text: outContent };
             const wrappedOut = wrapUntrusted(outContent, {
@@ -1607,6 +1610,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             encode: builtin.chart.encode,
             options: builtin.chart.options,
           };
+        if (builtin.artifact) yield { type: "artifact", ...builtin.artifact };
         // 结构化澄清：工具层不能自己挂起（事件发不出去），由循环下发事件并等待用户选择。
         if (builtin.clarification) {
           const pending = requestClarification({
