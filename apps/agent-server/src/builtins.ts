@@ -2,9 +2,9 @@
 // 与 MCP 工具同台竞争：同一套 tool_calls 循环、同一套事件契约（server 标记为 "builtin"）。
 // 注入策略：内置工具是**本机能力**，始终注入（不依赖「勾选了哪个连接器」）；
 // 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
-import type { ClarifyOption, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ClarifyOption, TodoItem } from "@bx/shared";
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
-import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite } from "./fs-store.js";
+import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf } from "./fs-store.js";
 import { setConversationTodos } from "./conversations.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
@@ -46,6 +46,7 @@ export const BUILTIN_RISK: Record<
   fetch_url: { level: "read", scope: "workspace", reason: "抓取公网网页正文（只读，无外部副作用）" },
   fs_write: { level: "write", scope: "workspace", reason: "写入本对话工作区文件（无外部副作用）" },
   fs_edit: { level: "write", scope: "workspace", reason: "编辑本对话工作区文件（无外部副作用）" },
+  export_data: { level: "write", scope: "workspace", reason: "在本对话工作区生成可下载文件（无外部副作用）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
   record_watched_movies: {
@@ -60,7 +61,7 @@ export const BUILTIN_RISK: Record<
  * 用途：这类调用已免确认（见 risk.ts verdictNeedsConfirm），免确认之后唯一的保障是「可回查」，
  * 故 chat.ts 对它们留一条 `allowed` 审计；工作区只读工具与 write_todos 不记，避免噪音。
  */
-export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit"]);
+export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit", "export_data"]);
 
 /** 启动断言：内置工具漏登记级别时直接抛错（在启动即暴露，而不是运行时静默放行）。 */
 export function assertBuiltinRiskCoverage(): void {
@@ -100,6 +101,11 @@ export interface BuiltinOutcome {
     encode?: Record<string, string>;
     options?: Record<string, unknown>;
   };
+  /**
+   * 可下载产物（export_data 产出）：工具层只声明「工作区里多了这个文件」，
+   * 由 chat 循环负责下发 artifact 事件（前端渲染下载卡片）并写入消息快照。
+   */
+  artifact?: ArtifactSpec;
 }
 
 const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
@@ -112,6 +118,20 @@ const MAX_CLARIFY_LABEL = 80;
 const MAX_CLARIFY_DESC = 200;
 const MAX_CLARIFY_FIELD = 60;
 const MAX_CLARIFY_WHY = 200;
+
+/**
+ * 导出产物的形态与限制（内置工具 `export_data`）。
+ * 这里刻意只做「数据 → 文件」的确定性转换，不接通用代码执行：模型给行数据，格式由服务端保证，
+ * 弱模型也不会因为写错脚本而产出坏文件（对齐「产物需求可枚举」的取舍，见 docs/artifact-delivery-plan.md §6）。
+ */
+const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md"]);
+/** 单次导出的行数上限（所有 sheet 合计）：超了应先聚合/筛选或分批导出，而不是把整表灌进来。 */
+const MAX_EXPORT_ROWS = Number(process.env.FS_MAX_EXPORT_ROWS || 50_000);
+/** 文件名 / 工作表名的长度上限（工作表名另受 31 字符的格式限制）。 */
+const MAX_EXPORT_NAME = 80;
+const MAX_SHEET_NAME = 31;
+/** Excel 单个单元格的字符上限（超出应先在数据侧截断，而不是让文件写入失败）。 */
+const MAX_CELL_CHARS = 32_000;
 
 function spec(name: string, description: string, parameters: Record<string, unknown>): ToolSpec {
   return { name, description, parameters };
@@ -357,6 +377,39 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       },
     ),
     spec(
+      "export_data",
+      "把**真实数据**导出成可下载文件（xlsx / csv / json / md），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
+        "用户说「导出 / 生成表格 / 生成 excel / 生成 csv / 下载数据」时用它；**不要**用 fs_write 写文本文件去冒充表格文件。" +
+        "数据必须来自工具真实返回，禁止编造；行数很多时先在数据侧聚合或筛选（单次上限 5 万行）。" +
+        "行数据的两种写法：行对象数组（对象的键就是表头文字，可直接用中文键名）或二维数组（第一行即表头）。" +
+        "多张表用 sheets（[{ name, rows, columns? }]），单张表直接用 rows。" +
+        "filename 是给用户看的文件名（含扩展名，如 用户列表.xlsx）；format 省略时按 filename 的扩展名推断，再默认 xlsx。" +
+        "生成成功后：不要再用 fs_write 另存文本副本，也不要在回复里粘贴文件内容（文件本身就是交付物）。",
+      {
+        type: "object",
+        properties: {
+          filename: jsonType("string", "文件名（含扩展名，如 报表.xlsx、用户列表.csv）"),
+          format: jsonType("string", "csv | xlsx | json | md（省略时按 filename 扩展名推断，默认 xlsx）"),
+          rows: {
+            type: "array",
+            description: "单张表的行数据：行对象数组（键即表头）或二维数组（第一行为表头）",
+          },
+          columns: {
+            type: "array",
+            description: "可选：限定或重排列（行对象数组时给键名）",
+            items: { type: "string" },
+          },
+          sheets: {
+            type: "array",
+            description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；仅 xlsx 支持多表）",
+            items: { type: "object" },
+          },
+          title: jsonType("string", "可选：标题（md 的标题；未给 sheets 时 xlsx 的工作表名）"),
+        },
+        required: ["filename"],
+      },
+    ),
+    spec(
       "search_knowledge",
       "检索本地知识库（已入库的企业文档）。当用户问的是文档里才有的内容时，用它取原文片段；" +
         "检索为空说明库中没有这份资料，如实说明，不要用通用知识代替。",
@@ -487,6 +540,161 @@ function normalizeClarification(
       ...(whyItMatters ? { whyItMatters } : {}),
     },
   };
+}
+
+/** 导出目标归一：format 优先，其次 filename 的扩展名，默认 xlsx；文件名清洗到工作区可用的安全集合。 */
+function resolveExportTarget(
+  filenameRaw: string,
+  formatRaw: string,
+): { name: string; format: string } | { error: string } {
+  const raw = String(filenameRaw || "").trim();
+  const fromName = (raw.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+  const format = String(formatRaw || "").trim().toLowerCase() || fromName || "xlsx";
+  if (!EXPORT_FORMATS.has(format)) {
+    return { error: `不支持的导出格式：${format}（支持 ${[...EXPORT_FORMATS].join(" / ")}）` };
+  }
+  const base =
+    raw
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .replace(/^\.+/, "")
+      .replace(/\.[a-z0-9]+$/i, "")
+      .slice(0, MAX_EXPORT_NAME) || "export";
+  return { name: `${base}.${format}`, format };
+}
+
+/** 单元格值归一：长文本截断、对象转 JSON（否则写进表格是 "[object Object]"）。 */
+function cellValue(v: unknown): unknown {
+  if (v == null) return "";
+  if (typeof v === "number" || typeof v === "boolean") return v;
+  if (typeof v === "string") return v.length > MAX_CELL_CHARS ? v.slice(0, MAX_CELL_CHARS) : v;
+  try {
+    const text = JSON.stringify(v);
+    if (text == null) return String(v);
+    return text.length > MAX_CELL_CHARS ? text.slice(0, MAX_CELL_CHARS) : text;
+  } catch {
+    return String(v);
+  }
+}
+
+/**
+ * 行数据 → 矩阵（第一行是表头）。两种输入形态：
+ * - 行对象数组：键即表头（按首现顺序；给了 columns 就按 columns 先排，再追加未列出的键）；
+ * - 二维数组：第一行即表头（columns 长度一致时用它覆盖首行）。
+ * 刻意不接受「纯标量数组」：没有表头的表格不是可用产物，静默猜一个列名比报错更糟。
+ */
+function exportMatrix(raw: unknown, columns?: string[]): { matrix: unknown[][] } | { error: string } {
+  if (!Array.isArray(raw) || !raw.length) return { error: "缺少数据行（rows 必须是非空数组）" };
+  const first = raw[0];
+  if (Array.isArray(first)) {
+    const matrix = raw.map((row) => (Array.isArray(row) ? row.map(cellValue) : [cellValue(row)]));
+    if (columns?.length && columns.length === matrix[0]!.length) matrix[0] = columns.slice();
+    return { matrix };
+  }
+  if (first && typeof first === "object") {
+    const keys: string[] = [];
+    for (const row of raw) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      for (const key of Object.keys(row as Record<string, unknown>)) if (!keys.includes(key)) keys.push(key);
+    }
+    if (!keys.length) return { error: "数据行里没有任何字段（行对象至少需要一个键）" };
+    const picked = columns?.filter((c) => keys.includes(c)) ?? [];
+    const ordered = picked.length ? [...picked, ...keys.filter((k) => !picked.includes(k))] : keys;
+    const matrix: unknown[][] = [ordered.slice()];
+    for (const row of raw) {
+      const rec = (row && typeof row === "object" && !Array.isArray(row) ? row : {}) as Record<string, unknown>;
+      matrix.push(ordered.map((key) => cellValue(rec[key])));
+    }
+    return { matrix };
+  }
+  return { error: "rows 只能是行对象数组或二维数组（第一行为表头）" };
+}
+
+/** 工作表名清洗：Excel 限制 31 字符且不允许 []:*?/\ 。 */
+function exportSheetName(raw: string, index: number): string {
+  const cleaned = String(raw || "")
+    .replace(/[\\/?*[\]:]/g, " ")
+    .trim()
+    .slice(0, MAX_SHEET_NAME);
+  return cleaned || `Sheet${index + 1}`;
+}
+
+/** 显示宽度（CJK 记 2）：用于估算列宽，避免中文列全被压成窄条。 */
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) {
+    width += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1;
+  }
+  return width;
+}
+
+/** 生成真实 xlsx（exceljs 动态载入：只有真的导出表格时才付这份启动成本）。 */
+async function buildXlsx(
+  sheets: Array<{ name: string; matrix: unknown[][] }>,
+): Promise<Uint8Array | { error: string }> {
+  try {
+    const mod = (await import("exceljs")) as unknown as { default?: unknown };
+    const ExcelJS = (mod.default ?? mod) as {
+      Workbook: new () => {
+        addWorksheet: (name: string) => {
+          addRow: (row: unknown[]) => unknown;
+          getRow: (n: number) => { font: unknown };
+          getColumn: (n: number) => { width: number };
+          views: unknown;
+        };
+        xlsx: { writeBuffer: () => Promise<unknown> };
+      };
+    };
+    const workbook = new ExcelJS.Workbook();
+    sheets.forEach((sheet, index) => {
+      const ws = workbook.addWorksheet(exportSheetName(sheet.name, index));
+      for (const row of sheet.matrix) ws.addRow(row);
+      // 表头加粗 + 冻结首行：表格产物最常见的两项可用性要求。
+      ws.getRow(1).font = { bold: true };
+      ws.views = [{ state: "frozen", ySplit: 1 }];
+      const width = sheet.matrix[0]?.length ?? 0;
+      for (let col = 1; col <= width; col += 1) {
+        let max = 8;
+        for (const row of sheet.matrix) {
+          const text = String(row[col - 1] ?? "");
+          max = Math.max(max, displayWidth(text.length > 40 ? text.slice(0, 40) : text));
+        }
+        ws.getColumn(col).width = Math.min(60, max + 2);
+      }
+    });
+    const buf = (await workbook.xlsx.writeBuffer()) as ArrayBuffer;
+    return new Uint8Array(buf);
+  } catch (err) {
+    return { error: `生成 xlsx 失败：${String((err as Error)?.message || err)}` };
+  }
+}
+
+/** CSV 单元格转义（RFC 4180：含分隔符/引号/换行时加引号并把内部引号翻倍）。 */
+function csvCell(v: unknown): string {
+  const text = v == null ? "" : String(v);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsvText(matrix: unknown[][]): string {
+  // BOM 前置：否则 Excel 打开含中文的 CSV 会按本地编码解码成乱码（Windows 上尤其明显）。
+  return `${"\uFEFF"}${matrix.map((row) => row.map(csvCell).join(",")).join("\r\n")}\r\n`;
+}
+
+function toJsonText(matrix: unknown[][]): string {
+  const head = (matrix[0] || []).map((h, i) => String(h ?? "") || `field${i + 1}`);
+  const body = matrix.slice(1).map((row) => Object.fromEntries(head.map((key, i) => [key, row[i] ?? null])));
+  return `${JSON.stringify(body, null, 2)}\n`;
+}
+
+function toMarkdownText(title: string, matrix: unknown[][]): string {
+  const esc = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  const head = matrix[0] || [];
+  return [
+    ...(title ? [`# ${title}`, ""] : []),
+    `| ${head.map(esc).join(" | ")} |`,
+    `| ${head.map(() => "---").join(" | ")} |`,
+    ...matrix.slice(1).map((row) => `| ${row.map(esc).join(" | ")} |`),
+    "",
+  ].join("\n");
 }
 
 /**
@@ -644,6 +852,74 @@ export async function execBuiltin(
         ok: true,
         text: `已生成图表（${title || chartType}），将在对话内本地渲染。`,
         chart: { title, chartType, data, encode, options },
+      };
+    }
+    case "export_data": {
+      const target = resolveExportTarget(str(args, "filename"), str(args, "format"));
+      if ("error" in target) return { ok: false, text: `导出失败：${target.error}` };
+      // 单表（rows）与多表（sheets）统一成 sheets 列表处理，后续只维护一条路径。
+      const rawSheets: unknown[] =
+        Array.isArray(args.sheets) && args.sheets.length
+          ? args.sheets
+          : [{ name: str(args, "title"), rows: args.rows, columns: args.columns }];
+      const built: Array<{ name: string; matrix: unknown[][] }> = [];
+      let totalRows = 0;
+      for (const raw of rawSheets) {
+        const rec = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+        const matrix = exportMatrix(rec.rows, Array.isArray(rec.columns) ? rec.columns.map((x) => String(x)) : undefined);
+        if ("error" in matrix) return { ok: false, text: `导出失败：${matrix.error}` };
+        totalRows += Math.max(0, matrix.matrix.length - 1);
+        built.push({
+          name: str(rec, "name") || str(args, "title") || target.name.replace(/\.[a-z0-9]+$/i, ""),
+          matrix: matrix.matrix,
+        });
+      }
+      if (totalRows > MAX_EXPORT_ROWS) {
+        return {
+          ok: false,
+          text: `导出失败：数据行过多（${totalRows} 行，上限 ${MAX_EXPORT_ROWS}）。请先聚合或筛选后再导出，或分批导出。`,
+        };
+      }
+      // 多表只有 xlsx 能承载：散成多个文件会让「一次导出」变成多张卡片，语义更差，故明确拒绝而不是静默只导第一张。
+      if (built.length > 1 && target.format !== "xlsx") {
+        return {
+          ok: false,
+          text: `导出失败：多张表只能用 xlsx（当前 format=${target.format}）。请改用 .xlsx，或把多张表合并成一张。`,
+        };
+      }
+      let written: { path: string; bytes: number } | { error: string };
+      if (target.format === "xlsx") {
+        const bytes = await buildXlsx(built);
+        if ("error" in bytes) return { ok: false, text: bytes.error };
+        written = fsWriteBinary(conversationId, target.name, bytes);
+      } else {
+        const matrix = built[0]!.matrix;
+        const text =
+          target.format === "csv"
+            ? toCsvText(matrix)
+            : target.format === "json"
+              ? toJsonText(matrix)
+              : toMarkdownText(str(args, "title"), matrix);
+        written = fsWrite(conversationId, target.name, text);
+      }
+      if ("error" in written) {
+        const hint =
+          target.format === "xlsx"
+            ? ""
+            : "（文本格式单文件上限 256KB：数据量较大时请改用 xlsx 导出）";
+        return { ok: false, text: `导出失败：${written.error}${hint}` };
+      }
+      const fileName = written.path.split("/").pop() || written.path;
+      const detail = built
+        .map((sheet) => `${sheet.name}（${Math.max(0, sheet.matrix.length - 1)} 行）`)
+        .join("、");
+      return {
+        ok: true,
+        text:
+          `已生成可下载文件：${written.path}（${written.bytes} 字节，${totalRows} 行 × ${built[0]!.matrix[0]?.length ?? 0} 列` +
+          `${built.length > 1 ? `；工作表：${detail}` : ""}）。` +
+          "它已作为下载卡片显示在对话中；不要在回复里粘贴文件内容，也不要再用 fs_write 另存副本。",
+        artifact: { path: written.path, name: fileName, bytes: written.bytes, mime: mimeOf(written.path) },
       };
     }
     case "search_knowledge": {

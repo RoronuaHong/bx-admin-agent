@@ -5,7 +5,7 @@
 //  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
-import type { ChartSpec, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ChartSpec, TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 import { defaultMcpServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
@@ -38,6 +38,12 @@ export interface StoredMessage {
   charts?: ChartSpec[];
   /** @deprecated 早期单图字段，已被 `charts`（数组）取代；保留仅用于兼容历史数据。 */
   chart?: ChartSpec;
+  /**
+   * 可下载产物（export_data 产出的 ArtifactSpec 数组；前端一并落库）。
+   * 与 charts 同构——产物实体始终在服务端工作区，快照只存「指针 + 展示元数据」，
+   * 刷新后由下载卡片按 spec 重绘；不随快照存就会「刷新即消失」。
+   */
+  artifacts?: ArtifactSpec[];
 }
 
 /** 忙碌期间排队的待发消息（按对话持久化，先进先出）。 */

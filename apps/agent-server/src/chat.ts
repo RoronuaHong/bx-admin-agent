@@ -5,7 +5,7 @@
 //           模型出 tool_calls → 执行 → 结果回灌 → 再调用，直到结论或轮次上限。
 // 能力层：系统提示两段式（稳定前缀可缓存）· 工具结果超预算卸载到工作区 · 任务规划持久化 ·
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
-import type { ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";

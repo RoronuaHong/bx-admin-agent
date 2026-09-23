@@ -2,6 +2,10 @@
 // 作用：给大结果/中间产物一个「落盘 + 指针」的中间态，替代"要么塞上下文、要么清成占位符"。
 // backend：磁盘 `.data/fs/<conversationId>/`（单机单用户起步；后续可换 GridFS/对象存储）。
 // 安全：所有路径都限制在该对话命名空间内 —— 拒绝绝对路径、`..`、反斜杠；单文件与总量有上限。
+// 两条写入路径，刻意分开：
+//   · `fsWrite`（文本，256KB 上限）—— 模型自己读写的中间结果；
+//   · `fsWriteBinary`（字节，20MB 上限 + 扩展名白名单）—— 生成给用户下载的产物文件（xlsx/zip…）。
+// 读取侧只服务文本语义：二进制扩展名在 `fsRead` 处明确拒绝（乱码比报错更糟）。
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +15,47 @@ const FS_ROOT = resolve(__dirname, "..", ".data", "fs");
 
 const MAX_FILE_BYTES = Number(process.env.FS_MAX_FILE_BYTES || 256 * 1024);
 const MAX_FILES = Number(process.env.FS_MAX_FILES || 100);
+/**
+ * 二进制产物的独立上限（默认 20MB）：与文本上限刻意分开——
+ * 文本上限管的是「塞进模型上下文的中间结果」，二进制管的是「交给用户下载的真实文件」，
+ * 后者按体积大得多的量级设计（表格导出、将来的文档/压缩包），共用一个上限只会两头都不合适。
+ */
+const MAX_BINARY_BYTES = Number(process.env.FS_MAX_BINARY_BYTES || 20 * 1024 * 1024);
+
+/**
+ * 允许二进制落盘的扩展名白名单（小写含点）。白名单之外一律拒绝：
+ * 工作区不是任意二进制仓库，放行未知扩展名等于给「下载任意字节」开后门。
+ * 文本类扩展名（csv/json/md/txt）不在此列——它们走 `fsWrite` 的文本路径。
+ */
+const BINARY_EXTS = new Set([".xlsx", ".xls", ".pdf", ".docx", ".zip"]);
+
+/** 扩展名 → MIME（下载响应与产物卡片共用一份；未知扩展名回落 application/octet-stream）。 */
+const MIME_BY_EXT: Record<string, string> = {
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".xls": "application/vnd.ms-excel",
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".zip": "application/zip",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+};
+
+function extOf(path: string): string {
+  const name = String(path || "").split(/[/\\]/).pop() || "";
+  const idx = name.lastIndexOf(".");
+  return idx > 0 ? name.slice(idx).toLowerCase() : "";
+}
+
+/** 路径 → MIME（未知扩展名不猜，回落二进制流，避免「按文本发给浏览器」造成乱码）。 */
+export function mimeOf(path: string): string {
+  return MIME_BY_EXT[extOf(path)] || "application/octet-stream";
+}
 
 function convDir(conversationId: string): string {
   const id = String(conversationId || "").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -48,6 +93,57 @@ export function fsWrite(conversationId: string, path: string, content: string): 
 }
 
 /**
+ * 写二进制文件（覆盖；仅供产物生成用）。
+ * 与 `fsWrite` 的差异只有两点：**按字节写**、**扩展名白名单**。路径安全判定完全复用 `safePath`。
+ */
+export function fsWriteBinary(
+  conversationId: string,
+  path: string,
+  data: Uint8Array,
+): { path: string; bytes: number } | { error: string } {
+  const target = safePath(conversationId, path);
+  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  const ext = extOf(path);
+  if (!BINARY_EXTS.has(ext)) {
+    return { error: `不允许写入该类型的二进制文件：${ext || "(无扩展名)"}（允许：${[...BINARY_EXTS].join("、")}）` };
+  }
+  const bytes = data.byteLength;
+  if (bytes > MAX_BINARY_BYTES) {
+    return { error: `文件过大（${bytes} 字节，上限 ${MAX_BINARY_BYTES}）` };
+  }
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    const count = countFiles(conversationId);
+    if (!existsSync(target) && count >= MAX_FILES) return { error: `文件数已达上限（${MAX_FILES}）` };
+    writeFileSync(target, data);
+    return { path: normalizeRel(conversationId, target), bytes };
+  } catch (err) {
+    return { error: String((err as Error)?.message || err) };
+  }
+}
+
+/**
+ * 解析工作区内相对路径为**绝对路径**（越界/非法返回 null）。
+ * 给下载端点用：它需要把文件交给 HTTP 响应，而不是读成字符串。
+ * 注意：调用方必须只在服务端内部使用该绝对路径，绝不回传给模型或前端。
+ */
+export function fsResolve(conversationId: string, path: string): string | null {
+  return safePath(conversationId, path);
+}
+
+/** 查询工作区文件状态（存在且是普通文件时返回字节数）；不存在/越界返回 null。 */
+export function fsStat(conversationId: string, path: string): { path: string; bytes: number } | null {
+  const target = safePath(conversationId, path);
+  if (!target) return null;
+  try {
+    if (!existsSync(target) || !statSync(target).isFile()) return null;
+    return { path: normalizeRel(conversationId, target), bytes: statSync(target).size };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 读文件；支持按**行**分页（对齐参考实现的 read_file offset/limit）：
  * offset 从 0 起，limit 为最多返回行数；不传即整读（向后兼容）。
  * 分页时回报总行数与实际区间，便于模型决定是否需要继续翻。
@@ -59,6 +155,11 @@ export function fsRead(
 ): { content: string; totalLines?: number } | { error: string } {
   const target = safePath(conversationId, path);
   if (!target) return { error: "非法路径" };
+  // 二进制产物（xlsx 等）按 UTF-8 读出来是乱码：明确拒绝胜过把乱码喂给模型。
+  // 产物文件的用途是「交给用户下载」，本来也不需要读回内容。
+  if (BINARY_EXTS.has(extOf(path))) {
+    return { error: `${extOf(path)} 是二进制文件，无法按文本读取（产物文件提供下载，不必读回内容）` };
+  }
   try {
     if (!existsSync(target) || !statSync(target).isFile()) return { error: `文件不存在：${path}` };
     let content = readFileSync(target, "utf-8");

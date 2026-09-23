@@ -80,6 +80,27 @@ export interface ChartSpec {
   options?: Record<string, unknown>;
 }
 
+/**
+ * 可下载产物（内置工具 `export_data` 的产出）：对话工作区里的一个真实文件，
+ * 用户通过下方 `artifact` 事件对应的下载卡片取走。
+ *
+ * 与 `ChartSpec` 同一条纪律——**三处共用同一定义**：chat 事件（`ChatEvent` 的 artifact 变体）、
+ * 落库快照（`StoredMessage.artifacts`）、前端下载卡片。各自声明一份的后果是「落库形状与渲染形状漂移」。
+ *
+ * 这里**不放文件内容**：内容始终留在服务端工作区，事件只带「指针 + 展示元数据」，
+ * 下载走 `GET /chat/conversations/:id/files/download?path=`。
+ */
+export interface ArtifactSpec {
+  /** 工作区内相对路径（下载端点的 path 参数，同时是前端的去重键）。 */
+  path: string;
+  /** 展示名（含扩展名，供下载卡片与 Content-Disposition 用）。 */
+  name: string;
+  /** 字节数（展示用；真实大小以下载时的文件系统状态为准）。 */
+  bytes: number;
+  /** MIME（下载响应的 Content-Type）。 */
+  mime: string;
+}
+
 // 流式事件契约（server → web，HTTP Streamable / NDJSON 每行一条）：直连大模型时只有
 // 模型标识、流式文本与终态；勾选 MCP 后额外产出工具步骤事件（tool_call / tool_result）
 // 与写操作确认事件；任务规划（write_todos）产出 todos 事件。
@@ -149,6 +170,11 @@ type ChatEventBody =
     }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
   | ({ type: "chart" } & ChartSpec)
+  /**
+   * 可下载产物（`export_data` 产出）：前端渲染成下载卡片。
+   * 与 chart 同构——产物实体在服务端，事件只负责「让界面知道有这个文件可下载」。
+   */
+  | ({ type: "artifact" } & ArtifactSpec)
   | {
       /** 本轮上下文用量（透明度）：跨轮 token 占用、预算、丢弃条数与被清理的工具结果数。 */
       type: "usage";
