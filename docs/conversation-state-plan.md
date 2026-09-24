@@ -143,7 +143,7 @@ interface ConversationDoc {
 
 > 整理类字段（`title` / `pinnedAt` / `archived` / `muted` / `readGrants` / `skillsEnabled`）属于
 > `ACTIVITY_NEUTRAL_KEYS`：**改动它们不刷新 `updatedAt`**，否则在「按最近活动排序」下会把该对话顶到列表最前，
-> 与用户预期相反（已由 `scripts/_mute-check.mjs` 断言锁定）。
+> 与用户预期相反（由 `conversations.ts` 的 `ACTIVITY_NEUTRAL_KEYS` 逻辑保证；历史上曾由 `_mute-check.mjs` 断言锁定，该脚本已随调试脚本清理移除）。
 
 > `summary*` 三个字段（`summary` / `summaryAt` / `summaryCovered`，`src/conversations.ts:81-85`）原为「已存在但从未被调用」的预留字段，**现已落地**（2026-09-18 对齐）：上下文压缩真的发生时由 `chat.ts` 写回（`setConversationSummary`，`conversations.ts:293`），水位线单调前移，下一轮在此基础上增量扩展。
 
@@ -194,7 +194,7 @@ interface Session {
 
 ### 6.3 兼容与回退
 
-- `conversationId` 缺省时：回退到"该 cookie 的默认对话"（`session.activeConversationId` 或自动创建），保证 `scripts/_chat-bi.ts` 等既有调用不炸。
+- `conversationId` 缺省时：回退到"该 cookie 的默认对话"（`session.activeConversationId` 或自动创建），保证既有直连 `chatStream` 的调用不炸（历史上由 `scripts/_chat-bi.ts` 等脚本覆盖，已随调试脚本清理移除；当前由缺省回退路径兜底）。
 - 旧 `/chat/context/clear`、旧 `session.mcpServers` 保留一个版本作为兼容路径，标注 `@deprecated`。
 
 ---
@@ -286,7 +286,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 | `session.messages`（旧线性历史） | 一次性：归入该 cookie 的"默认对话"的 `context`，并在日志标注；之后 `session.messages` 删除 |
 | `session.mcpServers` | 一次性：归入"默认对话"的 `mcpServers` |
 | 前端 3 个 localStorage 键 | 首启迁移到后端后删除（见 8.2） |
-| 既有脚本 | `scripts/_chat-bi.ts` 等调用 `chatStream` 不带 `conversationId` → 走"默认对话"回退路径 |
+| 既有直连调用 | 调用 `chatStream` 不带 `conversationId` → 走"默认对话"回退路径（历史上 `scripts/_chat-bi.ts` 等脚本覆盖此路径，已移除） |
 
 ---
 
@@ -356,7 +356,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 
 ## 13. 实施状态（截至 2026-09-17）
 
-**已完成 = 服务端半场 + 上下文/记忆层**（每一行都有代码位置，可复核）：
+**已完成 = 服务端半场 + 上下文/记忆层**（每一行都有代码位置，可复核；**行号自 2026-09-18 锚点刷新后可能再次漂移，以函数名为准**，见 `docs/README.md` 效力约定）：
 
 | 能力 | 落点 |
 |---|---|
@@ -393,7 +393,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 - **新对话继承当前界面语言**并写成该对话自己的 `locale`：语言是 UI 偏好，不应每个对话都重设一次；写成对话自己的 locale 后，改 A 仍不影响 B。模型 / MCP 新对话仍为空（干净起点）。
 - **后台出队用「该对话」的模型设置**，而不是当前展示的对话（`runTurn(convId, …)` 内取 `stateOf(convId).settings.modelId`）——否则队列在别的对话后台触发时会用错模型。
 
-**回归**：`tsc --noEmit` ✓、`vite build` ✓、`_bi-tools-check.mjs` 全绿 ✓、NDJSON 流式 / usage 行 / 新对话默认无 MCP ✓。
+**回归**：`tsc --noEmit` ✓、`vite build` ✓、`pnpm test` 全绿 ✓、NDJSON 流式 / usage 行 / 新对话默认无 MCP ✓。
 
 **遗留观察（待查）**：2026-09-17 发现 Mongo `bx_agent.chat_conversations` 只剩 1–2 条（此前 15+）。已排除：前端 DELETE（网络面板无该请求）、TTL 索引（集合只有 `_id_` 索引）、`resolveConversation` / `clearConversation`（无删除路径）；`_thread-check.mjs` 的 DELETE 均限定在自建 id。待排查是否有外部清理脚本或人工操作。
 

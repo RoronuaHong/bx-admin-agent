@@ -2,6 +2,8 @@
 
 > 配套文档：`write-op-safety-plan.md`（确认闸门、风险分级）、`mcp-guide.md`（MCP 接入）。
 > 本文只处理「自然语言 → 结构化查询 / 接口调用」这条链路上的**准确率**与**安全边界**问题。
+>
+> **路径约定（对齐用）**：文中 `src/…` 指 `apps/agent-server/src/…`，`scripts/…` 指 `apps/agent-server/scripts/…`——仓库根**无**顶层 `src/`/`scripts/`，这两处都落在 `apps/agent-server/` 下；行号会漂移，核对以函数名为准（见 `docs/README.md` 效力约定第 1 条）。`readOnlySqlTools` 是 **MCP 服务器级配置字段**（持久化于 `.data/mcp-servers.json`，由 `MCP_BUILTIN_SERVERS` 种子化），**非**顶层 `.env` 变量。
 
 ## 0. 结论速览
 
@@ -80,7 +82,7 @@
 
 | 项 | 内容 | 位置 |
 |---|---|---|
-| 只读 SQL 降级 | `run_native_query` 定为 `destructive`，但实参 SQL 经服务端只读判定时降为 `read`（免确认） | `src/sql-readonly.ts`、`src/risk.ts`、`src/chat.ts`、`src/mcp/{config,hub}.ts`、`.env` 的 `readOnlySqlTools` |
+| 只读 SQL 降级 | `run_native_query` 定为 `destructive`，但实参 SQL 经服务端只读判定时降为 `read`（免确认） | `src/sql-readonly.ts`、`src/risk.ts`、`src/chat.ts`、`src/mcp/{config,hub}.ts`、MCP 服务器配置的 `readOnlySqlTools`（持久化于 `.data/mcp-servers.json`，由 `MCP_BUILTIN_SERVERS` 种子化；非顶层 `.env` 变量） |
 | 只读凭据切换（代码层） | `KEY` 改为 `BI_READONLY_API_KEY \|\| BI_API_KEY`，未设则回退原 key，行为零变化 | `scripts/metabase-mcp.mjs:19` |
 | 语句超时 | `/dataset` 等调用加 `AbortSignal.timeout`，默认 30s，`BI_TIMEOUT_MS` 覆盖 | `scripts/metabase-mcp.mjs:28,40` |
 | 工具描述补「何时不用」 | `run_native_query` 描述加「先看 list_cards/get_card 现成查询」+「回复给出实际 SQL 与口径」 | `scripts/metabase-mcp.mjs:381` |

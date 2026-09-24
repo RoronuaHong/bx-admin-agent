@@ -8,6 +8,7 @@
 > 2. 同名主题以**现行**文档为准；留档/快照只用于理解决策背景。
 > 3. 文档间冲突时：现行 > 留档/快照，并在冲突处回写指引（如 `mcp-connect-plan.md` 顶部已标注以 `mcp-guide.md` 为准）。
 > 4. 「未逐条复核」= 本次只验证了文中声明的关键落点存在，**不代表逐句比对过**。
+> 5. **路径约定**：文中 `src/…` 指 `apps/agent-server/src/…`，`scripts/…` 指 `apps/agent-server/scripts/…`，`apps/web/src/…` 维持原样——**仓库根无顶层 `src/`/`scripts/`**；行号会漂移，核对先搜函数名。
 
 ---
 
@@ -44,14 +45,14 @@
 ### [text2sql-text2api-plan.md](./text2sql-text2api-plan.md)
 - **定位**：bi（text2sql）/ yapi（text2api）两类取数通道的最佳实践对齐。
 - **现行落点**：`scripts/metabase-mcp.mjs`（8 工具 + MCP 侧 `isReadOnlySql`）· `scripts/yapi-mcp.mjs`（GET-only + 项目白名单）· `src/sql-readonly.ts`（服务端同口径，**双层必须同步改**）· `risk.ts` 的只读 SQL 降级。
-- **状态**：✅ 现行（2026-09-24 核过落点存在，未逐句复核）。
+- **状态**：✅ 现行（2026-09-24 已逐项核对关键声明与代码一致：bi/yapi 工具名、只读降级 + 非只读硬拒、`call_api` 硬编码 GET、调试脚本确已移除；仅补了路径/配置落点说明）。
 - **注意**：文内 ❌（DB 层只读角色、行级权限/身份透传）指的是**安全边界**仍缺，不要因为看到 `sql-readonly.ts` 就以为已补齐。
 
 ### [conversation-state-plan.md](./conversation-state-plan.md)
 - **定位**：会话状态与上下文/记忆层契约（thread / 并发 / 队列）。
 - **现行落点**：`conversations.ts` · `history.ts`（四层上下文策略：prune → LLM 摘要）· `chat-tasks.ts`（异步任务 / 断线续传 / 结果回投）。
 - **回归**：`tests/task-persistence.test.ts`、`tests/task-resume.test.ts`。
-- **状态**：✅ 现行（未逐条复核）。
+- **状态**：✅ 现行（2026-09-24 已核对关键声明与代码一致：对话文档字段、`CONVERSATION_BUSY`↔`isTaskRunning` 链路、`running` 标志、`assembleContext`、`usage` 扩展字段、前端 `ConvState`/`states`/`convStatus`；修正了若干已删除脚本的残留引用）。
 - **注意**：任务状态在进程内存（`project-review.html` 标为「有意偏离」），多实例部署需另做。
 
 ### [conversation-list-ux-plan.md](./conversation-list-ux-plan.md)
@@ -79,7 +80,7 @@
 
 ### [movie-mobile-ui-plan.md](./movie-mobile-ui-plan.md)
 - **定位**：影视移动端 UI 方案。
-- **状态**：✅ 现行（未复核）。
+- **状态**：✅ 现行（2026-09-24 已核对关键声明与代码一致：`MoviePage.vue` 存在、`isMovieMode` 全仓库 0 处、`getApiErrorCode`/`foldAgentBlocks`/`theme.ts` 优雅降级/`styles.css` forced-colors/`ModelSelect` aria-label 均吻合）。
 
 ---
 
@@ -130,6 +131,6 @@
 
 1. ~~**仓库根无 `README.md`**~~ → ✅ **已补齐（2026-09-24）**：根 [`README.md`](../README.md) 覆盖工程结构、
    快速开始、端口与关键环境变量、内置工具清单（21 个）、五条项目红线。本文只管「文档怎么读」。
-2. 标「未复核 / 未逐条复核」的文档（`text2sql-text2api-plan.md`、`conversation-state-plan.md`、`movie-mobile-ui-plan.md`）本次只验证了关键落点存在，建议随后续改动顺手复核。
+2. 标「未复核 / 未逐条复核」的三份文档（`text2sql-text2api-plan.md`、`conversation-state-plan.md`、`movie-mobile-ui-plan.md`）**已于 2026-09-24 完成对齐复核**（关键声明逐项比对代码，修正了若干 stale 脚本引用与措辞偏差；见各文档状态行）。
 3. `project-review.html` 停在 `cc6c7a6`，与现状差距持续扩大（已越差越大）。
 4. 多数计划文档里的**行号引用**会漂移，已在效力约定第 1 条统一说明（先搜函数名）。
