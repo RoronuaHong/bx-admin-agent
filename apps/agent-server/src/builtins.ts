@@ -79,6 +79,18 @@ export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit"
 const RUN_MAX_BUFFER = Number(process.env.FS_MAX_FILE_BYTES || 256 * 1024) * 8; // 2MB
 const RUN_TIMEOUT_MS = Number(process.env.RUN_COMMAND_TIMEOUT_MS || 120_000);
 
+/**
+ * 统一拼接 shell 输出的 stdout/stderr。失败分支把 stderr 放前面（失败时 stderr 才是关键信息），
+ * 成功分支把 stdout 放前面，避免两处各写一套拼接逻辑、格式漂移。
+ */
+function formatShellStream(stdout: string, stderr: string, primary: "stdout" | "stderr"): string {
+  const out = String(stdout || "").trim();
+  const errOut = String(stderr || "").trim();
+  if (!errOut) return out || "(无输出)";
+  if (primary === "stdout") return `${out}\n--- stderr ---\n${errOut}`;
+  return `${errOut}\n--- stdout ---\n${out}`;
+}
+
 function runShell(
   command: string,
   opts: { cwd: string; timeoutMs: number },
@@ -91,17 +103,29 @@ function runShell(
         const out = String(stdout || "");
         const errOut = String(stderr || "");
         if (err) {
-          const code = (err as { code?: number }).code;
+          // err.code 可能是数字（真实退出码）、也可能是字符串 errno（ENOENT / ERR_CHILD_PROCESS_MAXBUFFER 等），
+          // 不能一律叫「退出码」——那样会把「找不到 shell」渲染成「退出码 ENOENT」，误导模型。
+          const code = (err as { code?: number | string }).code;
           const killed = (err as { killed?: boolean }).killed;
-          const body = [errOut, `--- stdout ---`, out].filter(Boolean).join("\n").trim().slice(0, RUN_MAX_BUFFER);
-          resolve({
-            ok: false,
-            text: `命令执行失败${code != null ? `（退出码 ${code}）` : ""}${killed ? "（超时）" : ""}：\n${body || String((err as Error).message || err)}`,
-          });
+          const signal = (err as { signal?: string }).signal;
+          let reason: string;
+          if (killed) {
+            reason = `（超时，已在 ${opts.timeoutMs}ms 后终止${signal ? `，信号 ${signal}` : ""}）`;
+          } else if (code === "ENOENT") {
+            reason = "（找不到命令或解释器，请确认运行环境）";
+          } else if (typeof code === "number") {
+            reason = `（退出码 ${code}）`;
+          } else if (typeof code === "string") {
+            reason = `（${code}）`;
+          } else {
+            reason = "";
+          }
+          const body = formatShellStream(out, errOut, "stderr").slice(0, RUN_MAX_BUFFER);
+          const detail = body || String((err as Error).message || err);
+          resolve({ ok: false, text: `命令执行失败${reason}：\n${detail}` });
           return;
         }
-        const combined = `${out}${errOut ? `\n--- stderr ---\n${errOut}` : ""}`.trim();
-        resolve({ ok: true, text: combined.slice(0, RUN_MAX_BUFFER) || "(无输出)" });
+        resolve({ ok: true, text: formatShellStream(out, errOut, "stdout").slice(0, RUN_MAX_BUFFER) });
       },
     );
   });
