@@ -63,11 +63,12 @@ pnpm dev:web
 
 完整清单与注释见 `apps/agent-server/.env.example`。
 
-## 4. 内置工具（21 个，恒注入，与是否勾选 MCP 无关）
+## 4. 内置工具（24 个，恒注入，与是否勾选 MCP 无关）
 
 `builtins.ts` 的 `BUILTIN_RISK` 登记表是唯一口径：
 
-- **工作区文件**：`fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit`
+- **工作区文件**：`fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `fs_delete`（删除**走确认闸门**：不可逆）
+- **定时任务**：`list_schedules`（只读）`manage_schedule`（创建 / 暂停 / 恢复 / 删除，**走确认闸门**——会产生无人值守周期运行）
 - **产物交付**：`export_data`（xlsx / csv / json / md / docx / pdf / html / txt）
 - **图表**：`render_chart`（前端本地渲染，数据不出本机）
 - **规划与委派**：`write_todos` `task`（子代理，独立上下文、只回摘要）
@@ -75,7 +76,9 @@ pnpm dev:web
 - **记忆**：`save_memory` `recall_memory` `record_watched_movies`
 - **交互与执行**：`request_clarification` `run_command`（destructive / external，走确认闸门）
 
-> 缺 `fs_delete`：工作区只增不删，属已知待办（见 `docs/artifact-delivery-plan.md` 第 4 项）。
+> **附件会落工作区**：聊天里上传的文档（pdf/docx/xlsx/md/txt/csv）除解析进上下文外，
+> 会同步一份到 `uploads/`，可用 `fs_read` 取回原文、`export_data` 加工导出（`docs/artifact-delivery-plan.md` §16）。
+> 工作区有文件数上限（默认 100，可 `fs_delete` 清理）。
 
 ## 5. 几条项目红线
 

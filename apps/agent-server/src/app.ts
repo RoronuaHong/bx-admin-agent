@@ -64,17 +64,20 @@ import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, ty
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import {
-  countSchedulesOf,
-  createSchedule,
   deleteSchedule,
   listSchedules,
-  MAX_SCHEDULES_PER_OWNER,
   patchSchedule,
   startScheduleLoop,
-  validateTiming,
   type ChatSchedule,
   type ScheduleNotifyOn,
 } from "./schedules.js";
+import {
+  createScheduleTask,
+  createTaskConversation,
+  knownMcpIds,
+  pickNotifyOn,
+  scheduleConversationTitle,
+} from "./schedule-service.js";
 import {
   deleteChannel,
   getChannel,
@@ -235,22 +238,9 @@ async function consumeTask(
   if (summary) summary.outcomePersisted = outcomePersisted;
 }
 
-/**
- * 定时任务入参里的 id 集合一律**按当前配置过滤**：
- * 悬空引用（服务器/通道已被删）写进任务只会让到点运行静默少能力/少推送，排查时毫无线索。
- * 只过滤、不报错——响应里回传落库后的任务，调用方一眼能看出哪些没生效。
- */
-function knownMcpIds(ids?: string[]): string[] {
-  const known = new Set(loadServers().map((server) => server.id));
-  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
-}
-
-
-
-/** 投递触发条件：只认这两个状态，其余（跳过/取消）一律不推。 */
-function pickNotifyOn(values?: ScheduleNotifyOn[]): ScheduleNotifyOn[] {
-  return [...new Set((values || []).filter((v): v is ScheduleNotifyOn => v === "success" || v === "failed"))];
-}
+// knownMcpIds / pickNotifyOn / scheduleConversationTitle / createTaskConversation 已抽到
+// schedule-service.ts（§17）：HTTP 与内置工具 `manage_schedule` 共用同一套建任务逻辑，
+// 避免两条路径漂移成「网页建的回投专属对话、模型建的把结果刷进当前聊天」。
 
 /**
  * 定时任务的结果回投对话 = **每个任务独占一个**（不再绑到「建任务时正打开的那个对话」）。
@@ -258,30 +248,6 @@ function pickNotifyOn(values?: ScheduleNotifyOn[]): ScheduleNotifyOn[] {
  * 为什么必须独占：周期任务的每一期结果都会落进它的对话，绑在用户自己的聊天上等于每期刷屏一次；
  * 独占之后结果有一个稳定入口——任务卡片上的「打开对话」与 IM 推送里的 `?conv=` 都指向它。
  */
-
-/** 任务专属对话的标题：任务名优先（侧栏里一眼认出），缺省退回任务内容的前 24 字。 */
-function scheduleConversationTitle(schedule: Pick<ChatSchedule, "name" | "prompt">): string {
-  const name = (schedule.name || "").trim();
-  if (name) return name.slice(0, 40);
-  return schedule.prompt.trim().replace(/\s+/g, " ").slice(0, 24) || "定时任务";
-}
-
-/** 建一个任务专属对话（id 生成口径与 POST /chat/conversations 一致）。 */
-async function createTaskConversation(input: {
-  ownerKey: string;
-  title: string;
-  /** 任务勾了哪些服务器就带哪些（空 = 跟随默认启用集，别写成空数组把工具能力清掉）。 */
-  mcpServers?: string[];
-  agentId?: string;
-}) {
-  return createConversation({
-    id: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    title: input.title,
-    ownerKey: input.ownerKey,
-    ...(input.agentId ? { agentId: input.agentId } : {}),
-    ...(input.mcpServers?.length ? { mcpServers: input.mcpServers } : {}),
-  });
-}
 
 /**
  * 专属对话的 MCP 启用集：任务显式勾了就用任务的；没勾（= 运行时回落对话启用集）就继承来源对话的，
@@ -590,51 +556,23 @@ export function createApp() {
       /** Agent 角色（/support 这类非 generic 入口建任务时带上，专属对话按角色分槽）。 */
       agentId?: string;
     }>(c);
-    const prompt = String(body.prompt || "").trim();
-    if (!prompt) {
-      return errorJson(c, 400, "SCHEDULE_INVALID", "prompt 必填");
-    }
-    const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
-    if (timingError) return errorJson(c, 400, "SCHEDULE_INVALID_TIME", timingError);
     const owner = c.get("owner");
-    if ((await countSchedulesOf(owner)) >= MAX_SCHEDULES_PER_OWNER) {
-      return errorJson(c, 400, "SCHEDULE_LIMIT", `每个设备最多 ${MAX_SCHEDULES_PER_OWNER} 个定时任务`);
-    }
-    // 角色：显式传入优先，其次沿用来源对话的角色（旧客户端只带 conversationId 的兼容路径）。
-    const agentId = String(body.agentId || "").trim();
-    if (agentId && !hasRole(agentId)) {
-      return errorJson(c, 400, "AGENT_ROLE_UNKNOWN", `未知 Agent 角色：${agentId}`);
-    }
-    const sourceId = String(body.conversationId || "").trim();
-    const sourceAgentId =
-      agentId ||
-      (sourceId ? (await getConversation(sourceId))?.agentId : undefined) ||
-      undefined;
-    const taskMcp = knownMcpIds(body.mcpServers);
-    // 专属对话：先建对话再落任务；任务落库失败就把对话删掉，别在侧栏留一个空对话。
-    const conversation = await createTaskConversation({
+    // 与内置工具 `manage_schedule` 共用同一实现（§17）：建任务要连带建专属对话、配额校验、
+    // MCP id 过滤与失败回滚，这些不能两处各写一套。
+    const result = await createScheduleTask({
       ownerKey: owner,
-      title: scheduleConversationTitle({ name: String(body.name || ""), prompt }),
-      mcpServers: taskMcp,
-      ...(sourceAgentId ? { agentId: sourceAgentId } : {}),
+      prompt: String(body.prompt || ""),
+      name: body.name,
+      cron: body.cron,
+      onceAt: body.onceAt,
+      mcpServers: body.mcpServers,
+      notifyOn: body.notifyOn,
+      locale: body.locale,
+      sourceConversationId: body.conversationId,
+      agentId: body.agentId,
     });
-    try {
-      const schedule = await createSchedule({
-        conversationId: conversation.id,
-        ownConversation: true,
-        ownerKey: owner,
-        prompt,
-        ...(body.onceAt !== undefined ? { onceAt: Number(body.onceAt) } : { cron: String(body.cron || "") }),
-        ...(body.name ? { name: body.name } : {}),
-        mcpServers: taskMcp,
-        notifyOn: pickNotifyOn(body.notifyOn),
-        ...(body.locale ? { locale: String(body.locale) } : {}),
-      });
-      return c.json({ schedule, conversation });
-    } catch (err) {
-      await deleteConversation(conversation.id).catch(() => undefined);
-      throw err;
-    }
+    if (!result.ok) return errorJson(c, 400, result.code, result.error);
+    return c.json({ schedule: result.schedule, conversation: result.conversation });
   });
 
   app.patch("/chat/schedules/:id", async (c) => {

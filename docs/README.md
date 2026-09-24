@@ -18,7 +18,7 @@
 - **覆盖**：§1–2 断链核查 · §4 形态判定（内置/MCP/Skill/定时任务）· §10 v2 格式扩展 · §11 报告式导出 + 手写 HTML 零外链护栏 · §12 全对话审计与上下文工程全链路对照 · §13 `run_command` 治理 · §14 配置热重载缓存失效键。
 - **现行落点**：`export_data`（8 种格式，`builtins.ts`）· 下载端点（`app.ts` `GET .../files/download`）· `artifact` 事件（`packages/shared`）· `fs_write` 写 `.html` 下发卡片 · `externalRefHint` · `wrapUpWith`（轮次耗尽补位收尾）· `repeatCallHint` + `executedSigRounds` · `appendRoundTrace` · `decodeShellBytes` / `truncateShellOutput`。
 - **状态**：✅ 现行（2026-09-24 复核，顶部主状态表 13 项）。
-- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**仍待实施**——以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **21** 个（19 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理），**确无 `fs_delete`**；第 5 项 `run_script` / `image_gen` 维持暂缓（论证见 §6）。
+- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**2026-09-24 全部落地**——`fs_delete` 见 §15、上传附件进工作区见 §16、定时任务工具化见 §17。以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **24** 个（22 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理）；第 5 项 `run_script` / `image_gen` 维持暂缓（论证见 §6）。
 
 ### [mcp-guide.md](./mcp-guide.md)
 - **定位**：MCP 连接与内置服务器的**权威口径**（其它 MCP 文档与它冲突时以本文为准）。

@@ -11,6 +11,8 @@ import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CH
 import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
+import { createScheduleTask } from "./schedule-service.js";
+import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
 import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
@@ -58,6 +60,15 @@ export const BUILTIN_RISK: Record<
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
   run_command: { level: "destructive", scope: "external", reason: "执行终端命令（可能改动系统、安装软件、读写任意位置的文件）" },
+  // 定时任务（§17）：拆成「只读列举」与「变更管理」两个工具，而不是一个带 action 的多面工具——
+  // risk.ts 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别，
+  // 合并就会让「列举」也被要求确认。
+  list_schedules: { level: "read", scope: "workspace", reason: "列出本设备的定时任务（只读）" },
+  manage_schedule: {
+    level: "write",
+    scope: "external",
+    reason: "创建 / 暂停 / 恢复 / 删除定时任务（会产生无人值守的周期性运行，跨出本轮对话）",
+  },
   record_watched_movies: {
     level: "write",
     scope: "workspace",
@@ -370,6 +381,34 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           content: jsonType("string", "要写入的完整内容"),
         },
         required: ["path", "content"],
+      },
+    ),
+    spec(
+      "list_schedules",
+      "列出本设备的定时任务（名称 / 启用状态 / 执行时间 / 下次与上次运行结果）。" +
+        "用户问「我有哪些定时任务」「那个日报任务还在跑吗」时用它；**创建或改动任务前先列一次**，" +
+        "避免重复建同一个任务，也用它的 id 去做暂停 / 恢复 / 删除。",
+      { type: "object", properties: {}, required: [] },
+    ),
+    spec(
+      "manage_schedule",
+      "创建 / 暂停 / 恢复 / 删除**定时任务**（到点自动跑一次指令，结果回投到任务专属对话，不刷当前聊天）。" +
+        "action=create 时必填 prompt（到点要执行的完整指令），时间给 cron（5 段，如 `0 9 * * *` 每天 9 点）" +
+        "或 onceAt（毫秒时间戳，一次性）二者之一；可给 name 便于识别。" +
+        "action=pause / resume / delete 时需要 id（先用 list_schedules 查）。" +
+        "只在用户明确要求「定时 / 每天 / 每周 / 到点提醒我」时才创建；创建会弹确认卡，用户批准后才生效。",
+      {
+        type: "object",
+        properties: {
+          action: jsonType("string", "create | pause | resume | delete"),
+          prompt: jsonType("string", "action=create 时必填：到点要执行的完整指令（写法与用户直接提问一致）"),
+          cron: jsonType("string", "action=create 时的 5 段 cron 表达式，如 0 9 * * *"),
+          onceAt: jsonType("number", "action=create 时的一次性执行时刻（毫秒时间戳）"),
+          name: jsonType("string", "任务名（便于在列表里识别）"),
+          mcpServers: { type: "array", description: "限定该任务可用的 MCP 服务器 id（不填则沿用对话勾选）", items: { type: "string" } },
+          id: jsonType("string", "action=pause / resume / delete 时的任务 id"),
+        },
+        required: ["action"],
       },
     ),
     spec(
@@ -1239,6 +1278,68 @@ export async function execBuiltin(
         };
       }
       return { ok: true, text: `已写入 ${result.path}（${result.bytes} 字节）` };
+    }
+    case "list_schedules": {
+      if (!ownerKey) return { ok: false, text: "无法列出定时任务：缺少用户标识" };
+      const list = await listSchedules(ownerKey);
+      if (!list.length) return { ok: true, text: "（当前没有定时任务）" };
+      return {
+        ok: true,
+        text: list
+          .map(
+            (s) =>
+              `- ${s.id}｜${s.name || s.prompt.slice(0, 20)}｜${s.enabled ? "启用" : "已暂停"}` +
+              `｜${s.cron ? `cron: ${s.cron}` : s.onceAt ? `一次性: ${new Date(s.onceAt).toLocaleString("zh-CN")}` : "未设置时间"}` +
+              `${s.nextRunAt ? `｜下次: ${new Date(s.nextRunAt).toLocaleString("zh-CN")}` : ""}` +
+              `${s.lastStatus ? `｜上次: ${s.lastStatus}` : ""}`,
+          )
+          .join("\n"),
+      };
+    }
+    case "manage_schedule": {
+      const action = str(args, "action");
+      if (!action) return { ok: false, text: "manage_schedule 需要 action" };
+      if (!ownerKey) return { ok: false, text: "无法管理定时任务：缺少用户标识" };
+      if (action === "create") {
+        const prompt = str(args, "prompt").trim();
+        if (!prompt) return { ok: false, text: "创建定时任务需要 prompt（到点要执行的指令）" };
+        const result = await createScheduleTask({
+          ownerKey,
+          prompt,
+          name: str(args, "name").trim() || undefined,
+          cron: str(args, "cron").trim() || undefined,
+          ...(args.onceAt != null ? { onceAt: Number(args.onceAt) } : {}),
+          ...(Array.isArray(args.mcpServers) ? { mcpServers: args.mcpServers.map(String) } : {}),
+          // 沿用当前对话的角色；结果回投到任务专属对话（与 HTTP 建任务同一实现，不会刷屏当前聊天）
+          sourceConversationId: conversationId,
+        });
+        if (!result.ok) return { ok: false, text: `创建失败：${result.error}` };
+        return {
+          ok: true,
+          text:
+            `已创建定时任务 ${result.schedule.id}（${result.schedule.name || "未命名"}）。` +
+            `执行时间：${result.schedule.cron ? `cron ${result.schedule.cron}` : result.schedule.onceAt ? new Date(result.schedule.onceAt).toLocaleString("zh-CN") : "未设置"}；` +
+            `结果会回投到任务专属对话，不会塞进当前聊天。`,
+        };
+      }
+      // 先校验 action 本身：否则未知 action 会掉进下面的「需要 id」分支，
+      // 报出「explode 需要 id」这种误导文案（「不支持的 action」永远不可达）。
+      if (action !== "pause" && action !== "resume" && action !== "delete") {
+        return { ok: false, text: `不支持的 action：${action}（支持 create / pause / resume / delete）` };
+      }
+      const id = str(args, "id").trim();
+      if (!id) return { ok: false, text: `${action} 需要 id（可用 list_schedules 查看）` };
+      if (action === "pause" || action === "resume") {
+        const updated = await patchSchedule(id, ownerKey, { enabled: action === "resume" });
+        if (!updated) return { ok: false, text: `定时任务不存在：${id}` };
+        return { ok: true, text: `已${action === "pause" ? "暂停" : "恢复"}定时任务 ${id}` };
+      }
+      if (action === "delete") {
+        const removed = await deleteSchedule(id, ownerKey);
+        if (!removed) return { ok: false, text: `定时任务不存在：${id}` };
+        return { ok: true, text: `已删除定时任务 ${id}（不可恢复）` };
+      }
+      return { ok: false, text: `不支持的 action：${action}` };
     }
     case "fs_delete": {
       const result = fsDelete(conversationId, str(args, "path"));

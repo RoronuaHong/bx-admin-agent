@@ -11,7 +11,7 @@
 | 1 | 问题定性与断链核查（§1 / §2） | ✅ 已完成 |
 | 2 | 形态判定准则（内置 / MCP / Skill / 定时任务） | ✅ 已完成（§4） |
 | 3 | P0 产物交付闭环（导出工具 + 下载端点 + `file` 事件 + 下载卡片） | ✅ 已落地（`export_data`：xlsx/csv/json/md） |
-| 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ⬜ 待实施 |
+| 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ✅ 已完成（2026-09-24，§15 / §16 / §17） |
 | 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
 | 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
 | 7 | v2.1 报告式导出交付断链修复（零表格报告 + fs_write 下载卡片，§11） | ✅ 已落地（2026-09-24，见 §11.4） |
@@ -22,13 +22,13 @@
 | 12 | `run_command` 命令执行治理（编码 / 截断 / 干净环境 / 非交互，§13） | ✅ 已落地（2026-09-24） |
 | 13 | MCP 配置热重载缓存失效键 `mtime + size`（§14） | ✅ 已落地（2026-09-24） |
 
-> 说明：第 4 项经 2026-09-24 复核仍为待实施。复核口径（以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准）：
-> 内置工具共 **21** 个 —— `fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `read_skill`
+> 说明：第 4 项 **2026-09-24 全部落地**（`fs_delete` §15、上传附件进工作区 §16、定时任务工具化 §17）。
+> 复核口径（以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准）：
+> 内置工具共 **24** 个 —— `fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `fs_delete` `read_skill`
 > `render_chart` `request_clarification` `recall_memory` `save_memory` `search_tools` `search_knowledge`
 > `knowledge_sources` `web_search` `fetch_url` `export_data` `write_todos` `task` `run_command`
-> `record_watched_movies`；其中 19 个在 `execBuiltin` 里分发，`task` 与 `search_tools` 由 `chat.ts`
-> 循环内直接处理。**确无 `fs_delete`**；上传附件仍只做本轮解析、不进工作区；定时任务未工具化。
-> 第 5 项 `run_script` / `image_gen` 维持暂缓，论证见 §6。
+> `record_watched_movies` `list_schedules` `manage_schedule`；其中 22 个在 `execBuiltin` 里分发，
+> `task` 与 `search_tools` 由 `chat.ts` 循环内直接处理。第 5 项 `run_script` / `image_gen` 维持暂缓，论证见 §6。
 
 ---
 
@@ -613,4 +613,82 @@ user: 123
 
 - `fs_write` / `fs_read` / `fs_edit` 等工具描述里的「绝对路径一律被拒绝」与 `safePath` 实际行为不符
   （实际是关进工作区，安全性没问题，措辞不准）。建议一次性统一全部 `fs_*` 的措辞，本次未动。
-- P1 第 4 项剩余两项未做：**上传附件进工作区**、**定时任务工具化**。
+
+---
+
+## 16. 上传附件进工作区（2026-09-24，P1 第 4 项之二）
+
+### 16.1 问题：闭环不成立
+
+`uploads.ts` 的附件落在 `UPLOAD_DIR`、**7 天 TTL**，`chat.ts` 的 `buildAttachmentContext` 只把它
+**解析成文本注进本轮上下文**。后果：
+
+| 现象 | 原因 |
+|---|---|
+| 「上传 → 加工 → 导出」闭环不成立 | 模型拿不到原文文件，只能拿着解析文本加工；要导出结果只能凭文本重建 |
+| 附件 7 天后失效 | 之后的对话里 `fs_read` 取不回原文，用户重新问就得重新上传 |
+| 过期提示困惑 | 现有文案是「附件 X 已过期或不存在」——用户刚传的文件凭空消失 |
+
+### 16.2 关键设计决策
+
+| 决策 | 依据 |
+|---|---|
+| **另设导入白名单，不复用 `BINARY_EXTS`** | `BINARY_EXTS`（xlsx/pdf/docx/zip）是「产物类型」白名单；把 `.md/.txt/.csv` 加进去会让 `fsRead` **拒绝按文本读它们**（乱码比报错更糟）。故独立 `IMPORT_EXTS = pdf/docx/xlsx/xls/md/txt/csv`，即「上传侧支持的类型」 |
+| **按原始字节导入** | 不重编码，避免破坏 xlsx/docx 这类二进制结构；也不受 `fsWrite` 的 256KB 文本上限约束 |
+| **图片不进工作区** | png/jpeg/webp 走 vision 通道，进工作区无用途且白占 `MAX_FILES` 配额 |
+| **失败不中断对话** | 配额满 / 类型不支持时，只在注入文本里附一行原因；现在有了 `fs_delete`，模型可自行清理后重试 |
+| **同名覆盖** | 与 `fs_write` 同口径（覆盖同名文件），不引入分支逻辑 |
+
+### 16.3 实现
+
+- `fs-store.ts` 新增 `fsImportFile(conversationId, path, data)`：`safePath` 越界拒绝 → 扩展名白名单 → 体积上限 → 文件数配额 → 落盘。
+- `chat.ts` `buildAttachmentContext` 增加 `conversationId` 入参，成功取到附件后同步一份到 `uploads/<原文件名>`，
+  并在注入文本里回报路径与可用动作（`fs_read` 取回 / `export_data` 加工 / `fs_delete` 清理）。
+
+### 16.4 验证
+
+`tests/upload-to-workspace.test.ts`：
+[A] 二进制附件（xlsx / pdf）导入成功且可在 `fsList` 看到 ·
+[B] 文本附件（md / txt / csv）**也能导入**（不受 256KB 文本上限限制）·
+[C] 不在白名单的类型被拒且不中断 · [D] 配额满时优雅降级（返回原因而非抛错）·
+[E] 注入文本中包含工作区路径提示。
+
+全量回归：**29 文件 / 172 测试全绿**。
+
+---
+
+## 17. 定时任务工具化（2026-09-24，P1 第 4 项之三）
+
+### 17.1 问题：能力只挂在 HTTP 上
+
+定时任务原本**只能经 HTTP 接口管理**（`GET/POST/PATCH/DELETE /chat/schedules`），模型无法创建或管理。
+后果：用户说「每天 9 点给我跑一次报表」时，模型只能空口答应，或者诱导用户去网页端配置——**闭环断在这里**。
+
+### 17.2 关键设计决策
+
+| 决策 | 依据 |
+|---|---|
+| **拆成 `list_schedules` + `manage_schedule`，而不是一个带 `action` 的多面工具** | `risk.ts` 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别。若合并，`list`（只读）也会被要求确认——既错又烦。两个工具分别登记 `read`/`workspace` 与 `write`/`external` |
+| **抽出 `schedule-service.ts`，HTTP 与工具共用同一套建任务逻辑** | 建定时任务**不是只插一条记录**：它要连带建「任务专属对话」（否则每期结果都灌进用户当前聊天、周期任务 = 反复刷屏），还要做配额校验、MCP id 过滤、落库失败回滚删对话。这段逻辑原本只在 `app.ts` 的 POST 处理器里——**复制一份给工具**必然漂移，表现就是「网页建的回投专属对话、模型建的把结果刷进当前聊天」。故抽到共享服务层，错误带 `code`（供 HTTP 映射状态码）与 `error`（供工具用文案） |
+| **`manage_schedule` 走确认闸门** | 创建 = 产生无人值守的周期运行（到点会调 MCP 工具、跨出本轮对话），属不可逆 / 跨边界动作，按 §15.2 同一口径需确认 |
+| **沿用当前对话角色，结果回投专属对话** | 工具建任务时把 `sourceConversationId` 传当前对话，复用「沿用来源对话角色」的既有兼容路径；结果与 HTTP 建的任务一致回投到专属对话，不污染当前聊天 |
+| **未知 `action` 先校验，再取 `id`** | 实现时测试抓到：未知 action 会先掉进「需要 id」分支，报出 `explode 需要 id` 这种误导文案；已调整判定顺序，先判定 action 合法性 |
+
+### 17.3 实现
+
+- `schedule-service.ts`（新）：`knownMcpIds` / `pickNotifyOn` / `scheduleConversationTitle` / `createTaskConversation`
+  从 `app.ts` 迁入；新增 `createScheduleTask({...})` 作为建任务的唯一入口（含配额、校验、回滚）。
+- `app.ts`：POST `/chat/schedules` 改为委托 `createScheduleTask`，删除重复的本地定义；`PATCH/DELETE` 仍用 `schedules.ts` 既有函数。
+- `builtins.ts`：`BUILTIN_RISK` 登记 `list_schedules`（`read`/`workspace`）+ `manage_schedule`（`write`/`external`）；
+  spec + `execBuiltin` 分支：`list` 列全部（`cron`/一次性/下次/上次状态）；`manage` 支持 `create/pause/resume/delete`。
+
+### 17.4 验证
+
+`tests/schedule-tools.test.ts`（6/6 通过）：
+[A] **工具建任务会连带建任务专属对话**（`ownConversation=true` 且 `conversationId ≠ 当前对话`——这正是抽服务的根本目的）·
+[B] `list_schedules` 能列出、登记为只读免确认 · [C] `manage_schedule` 走确认闸门 ·
+[D] 暂停 → 恢复 → 删除（按 id，删除不可恢复，未知 id 明确报错）·
+[E] 参数校验与 HTTP 同一套（缺 prompt / 时间非法 / 未知 action 均明确报错）·
+[F] 无 `ownerKey` 时如实拒绝（不做「全员可见」兜底）。
+
+全量回归：**30 文件 / 178 测试全绿**，lint 干净，服务重启 health 200。
