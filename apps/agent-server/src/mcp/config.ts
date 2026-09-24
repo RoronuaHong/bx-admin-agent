@@ -65,6 +65,14 @@ let fileCache: McpServerConfig[] | null = null;
  * 这里与 rag/store.ts 同一口径：**按文件 mtime 失效**，而不是「只有自己写过才刷新」。
  */
 let fileCacheMtime = 0;
+/**
+ * 缓存对应文件的 size（与 mtime 共同构成失效键）。
+ *
+ * 只看 mtime 不够：同一毫秒内连续改写（部署脚本 write+write、或极快的外部编辑）mtime 可能完全相同，
+ * 缓存就会命中旧值——正是这套缓存要消灭的「文件已改、服务仍用旧值」。加上 size 后，
+ * 长度变化的改写即使 mtime 撞车也能被感知（长度恰好相同的改写由 mtime 递增兜底，概率极低且无害）。
+ */
+let fileCacheSize = 0;
 /** 内置服务器（由环境变量提供，不落盘）。 */
 let builtinCache: McpServerConfig[] | null = null;
 
@@ -90,12 +98,17 @@ function fileServers(): McpServerConfig[] {
   // 缓存命中还要再看 mtime：外部改过文件就重新读（见 fileCacheMtime 的注释）。
   // 文件被删（mtime=0）也要能感知：否则删除后仍按旧列表提供服务。
   let mtime = 0;
+  let size = 0;
   try {
-    mtime = statSync(CONFIG_PATH).mtimeMs;
+    const stat = statSync(CONFIG_PATH);
+    mtime = stat.mtimeMs;
+    size = stat.size;
   } catch {
     mtime = 0;
+    size = 0;
   }
-  if (fileCache && mtime === fileCacheMtime) return fileCache;
+  // 失效键 = mtime + size（见 fileCacheSize 注释）：同毫秒改写的兜底。
+  if (fileCache && mtime === fileCacheMtime && size === fileCacheSize) return fileCache;
   if (fileCache && mtime !== fileCacheMtime) {
     console.log("[mcp:config] 检测到配置文件变更（mtime 变化），已重新加载");
   }
@@ -107,6 +120,7 @@ function fileServers(): McpServerConfig[] {
           .filter((s): s is McpServerConfig => Boolean(s && typeof s === "object" && (s as McpServerConfig).id))
           .map((s) => ({ ...s, enabled: s.enabled !== false }));
         fileCacheMtime = mtime;
+        fileCacheSize = size;
         return fileCache;
       }
     }
@@ -115,6 +129,7 @@ function fileServers(): McpServerConfig[] {
   }
   fileCache = [];
   fileCacheMtime = mtime;
+  fileCacheSize = size;
   return fileCache;
 }
 
@@ -153,9 +168,12 @@ function persist(list: McpServerConfig[]): void {
   atomicWriteJson(CONFIG_PATH, list, { logLabel: "mcp:config" });
   // 写回后同步 mtime：否则下一次读取会把「自己刚写的文件」当成外部变更，白刷一次并打日志。
   try {
-    fileCacheMtime = statSync(CONFIG_PATH).mtimeMs;
+    const stat = statSync(CONFIG_PATH);
+    fileCacheMtime = stat.mtimeMs;
+    fileCacheSize = stat.size;
   } catch {
     fileCacheMtime = 0;
+    fileCacheSize = 0;
   }
 }
 

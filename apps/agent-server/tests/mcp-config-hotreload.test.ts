@@ -25,6 +25,20 @@ beforeAll(async () => {
   loadServers = mod.loadServers as typeof loadServers;
 });
 
+/**
+ * 每次改写把 mtime 推后一个**严格递增**的量。
+ *
+ * 不能只写 `Date.now() + 1000`：本文件用例各只跑 1ms 左右，相邻两个用例极可能落在**同一毫秒**，
+ * 平移后 mtime 依旧相同 → 缓存命中旧值 → 用例假红（曾连续两次在全量跑里随机失败）。
+ * 递增偏移量保证后一次一定大于前一次，与机器快慢无关。
+ */
+let clockTick = 0;
+function touch(): void {
+  clockTick += 1;
+  const t = new Date(Date.now() + 1000 * clockTick);
+  utimesSync(CFG, t, t);
+}
+
 afterAll(() => {
   delete process.env.AGENT_DATA_DIR;
 });
@@ -39,23 +53,36 @@ test("[B] 进程外改写文件 → 下次 loadServers 立即看到新值（本�
     JSON.stringify([{ id: "gitlab", label: "GitLab", transport: "stdio", enabled: true, env: { TOKEN: "new" } }]),
     "utf-8",
   );
-  // mtime 精度到毫秒，显式推后 1 秒，避免同毫秒写入导致用例在快机器上假绿。
-  const t = new Date(Date.now() + 1000);
-  utimesSync(CFG, t, t);
+  touch();
   expect(loadServers().find((s) => s.id === "gitlab")?.env?.TOKEN).toBe("new");
 });
 
 test("[C] 内容未变时不重复解析（缓存仍生效，不是每次都读盘）", () => {
   const before = loadServers().find((s) => s.id === "gitlab")?.env?.TOKEN;
-  writeFileSync(CFG, readFileSync(CFG, "utf-8"), "utf-8"); // 重写但保持 mtime 语义一致
-  const t = new Date(Date.now() + 1000);
-  utimesSync(CFG, t, t); // mtime 变了 → 会重读，但值应完全一致
+  writeFileSync(CFG, readFileSync(CFG, "utf-8"), "utf-8"); // 重写但内容一致
+  touch(); // mtime 变了 → 会重读，但值应完全一致
   expect(loadServers().find((s) => s.id === "gitlab")?.env?.TOKEN).toBe(before);
 });
 
-test("[D] 文件被删除 → 不再返回已删除的服务器（不留在旧列表里）", () => {
+test("[D] 列表清空 → 不再返回已移除的服务器（不留在旧列表里）", () => {
   writeFileSync(CFG, "[]", "utf-8");
-  const t = new Date(Date.now() + 1000);
-  utimesSync(CFG, t, t);
+  touch();
   expect(loadServers().find((s) => s.id === "gitlab")).toBeUndefined();
+});
+
+// 钉住「失效键含 size」：mtime 完全没变、只有长度变化时也必须重载——
+// 只按 mtime 失效的话，同毫秒内的改写会被缓存吞掉（改了却用旧值）。
+test("[E] mtime 相同但长度变化 → 仍然重载（size 参与失效）", () => {
+  writeFileSync(
+    CFG,
+    JSON.stringify([{ id: "gitlab", label: "GitLab", transport: "stdio", enabled: true, env: { TOKEN: "same-ms" } }]),
+    "utf-8",
+  );
+  const t = new Date(Date.now() + 1000 * 100); // 固定到一个更远的未来时间
+  utimesSync(CFG, t, t);
+  expect(loadServers().find((s) => s.id === "gitlab")?.env?.TOKEN).toBe("same-ms");
+  // 关键：mtime 保持不动，只改内容（长度不同）
+  writeFileSync(CFG, JSON.stringify([{ id: "gitlab", label: "GitLab", transport: "stdio", enabled: true, env: { TOKEN: "x" } }]), "utf-8");
+  utimesSync(CFG, t, t);
+  expect(loadServers().find((s) => s.id === "gitlab")?.env?.TOKEN).toBe("x");
 });
