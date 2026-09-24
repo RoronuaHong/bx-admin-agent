@@ -4,6 +4,7 @@
 // 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
 import { existsSync, mkdirSync } from "node:fs";
 import { exec as nodeExec } from "node:child_process";
+import type { ExecOptionsWithBufferEncoding } from "node:child_process";
 import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/shared";
@@ -156,11 +157,13 @@ function runShell(
         maxBuffer: RUN_MAX_BUFFER,
         windowsHide: true,
         // 不接管 stdin：需要交互输入的命令立即失败，而不是空等到超时（§13.4 C）。
+        // 注：`stdio` 不是 `exec` 选项 TS 声明里的字段，但 Node 运行时会透传给 spawn 生效；
+        // 这里用交叉类型断言保留该运行时行为并通过类型检查。
         stdio: ["ignore", "pipe", "pipe"],
         encoding: "buffer",
         env,
-      },
-      (err, stdout, stderr) => {
+      } as ExecOptionsWithBufferEncoding & { stdio?: ("ignore" | "pipe")[] },
+      (err: Error | null, stdout: Buffer, stderr: Buffer) => {
         const out = decodeShellBytes(stdout as Buffer);
         const errOut = decodeShellBytes(stderr as Buffer);
         if (err) {
