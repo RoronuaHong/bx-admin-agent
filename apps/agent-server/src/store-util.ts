@@ -4,8 +4,11 @@ import { mkdirSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** 运行时数据目录（.data），各持久化文件以此为锚解析，避免按文件深度拼 `..` 的脆弱写法。 */
-export const DATA_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", ".data");
+/** 运行时数据目录（.data），各持久化文件以此为锚解析，避免按文件深度拼 `..` 的脆弱写法。
+ *  AGENT_DATA_DIR 仅在测试 / 特殊部署下覆盖（默认走仓库内 .data，行为不变）。 */
+export const DATA_DIR = process.env.AGENT_DATA_DIR
+  ? resolve(process.env.AGENT_DATA_DIR)
+  : resolve(dirname(fileURLToPath(import.meta.url)), "..", ".data");
 
 /**
  * 原子写 JSON：先写临时文件再 rename（rename 在同文件系统上是原子操作，避免进程崩溃留下半写文件）。

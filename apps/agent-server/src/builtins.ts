@@ -2,12 +2,14 @@
 // 与 MCP 工具同台竞争：同一套 tool_calls 循环、同一套事件契约（server 标记为 "builtin"）。
 // 注入策略：内置工具是**本机能力**，始终注入（不依赖「勾选了哪个连接器」）；
 // 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { exec as nodeExec } from "node:child_process";
 import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ArtifactSpec, ClarifyOption, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/shared";
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
-import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf } from "./fs-store.js";
+import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
+import { buildHtmlReport, chartSvgs, chartFallbackTables } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
@@ -52,6 +54,7 @@ export const BUILTIN_RISK: Record<
   export_data: { level: "write", scope: "workspace", reason: "在本对话工作区生成可下载文件（无外部副作用）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
+  run_command: { level: "destructive", scope: "external", reason: "执行终端命令（可能改动系统、安装软件、读写任意位置的文件）" },
   record_watched_movies: {
     level: "write",
     scope: "workspace",
@@ -65,6 +68,44 @@ export const BUILTIN_RISK: Record<
  * 故 chat.ts 对它们留一条 `allowed` 审计；工作区只读工具与 write_todos 不记，避免噪音。
  */
 export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit", "export_data"]);
+
+/**
+ * 终端命令执行（对齐 CodeBuddy「完全访问」的「终端命令」能力）：
+ * 用 shell 跑一条命令，cwd 默认是对话工作区（产物可直接 fs_read 取回）。
+ * 这是**外部破坏性**操作，级别在 BUILTIN_RISK 登记为 destructive/external；
+ * 仅在「完全访问」开启（缺省）时免去确认，否则会走二次确认闸门。
+ * 超时按失败处理（fail-closed），输出有体积上限，避免把大日志灌回上下文。
+ */
+const RUN_MAX_BUFFER = Number(process.env.FS_MAX_FILE_BYTES || 256 * 1024) * 8; // 2MB
+const RUN_TIMEOUT_MS = Number(process.env.RUN_COMMAND_TIMEOUT_MS || 120_000);
+
+function runShell(
+  command: string,
+  opts: { cwd: string; timeoutMs: number },
+): Promise<{ ok: boolean; text: string }> {
+  return new Promise((resolve) => {
+    nodeExec(
+      command,
+      { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: RUN_MAX_BUFFER, windowsHide: true },
+      (err, stdout, stderr) => {
+        const out = String(stdout || "");
+        const errOut = String(stderr || "");
+        if (err) {
+          const code = (err as { code?: number }).code;
+          const killed = (err as { killed?: boolean }).killed;
+          const body = [errOut, `--- stdout ---`, out].filter(Boolean).join("\n").trim().slice(0, RUN_MAX_BUFFER);
+          resolve({
+            ok: false,
+            text: `命令执行失败${code != null ? `（退出码 ${code}）` : ""}${killed ? "（超时）" : ""}：\n${body || String((err as Error).message || err)}`,
+          });
+          return;
+        }
+        const combined = `${out}${errOut ? `\n--- stderr ---\n${errOut}` : ""}`.trim();
+        resolve({ ok: true, text: combined.slice(0, RUN_MAX_BUFFER) || "(无输出)" });
+      },
+    );
+  });
+}
 
 /** 启动断言：内置工具漏登记级别时直接抛错（在启动即暴露，而不是运行时静默放行）。 */
 export function assertBuiltinRiskCoverage(): void {
@@ -307,6 +348,21 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       },
     ),
     spec(
+      "run_command",
+      "在终端执行一条 shell 命令（如列目录、跑脚本、装依赖、调系统命令）。" +
+        "命令在**当前对话工作区**目录下运行（产物可直接用 fs_read 取回），但也能访问系统其它位置。" +
+        "只执行用户明确要求或明显必要的命令；不要在一条命令里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
+        "命令较长或需要管道时正常写；超时（默认 120s）会被判为失败。",
+      {
+        type: "object",
+        properties: {
+          command: jsonType("string", "要执行的 shell 命令（如 ls -la、npm install lodash、python -c \"...\"）"),
+          timeoutMs: jsonType("number", "超时毫秒数（默认 120000，上限 600000）"),
+        },
+        required: ["command"],
+      },
+    ),
+    spec(
       "request_clarification",
       // 「何时该问」的判据只在系统提示第 6 条（单一真相），这里只写「怎么问」的行为约定。
       "就当前需求向用户提问，让用户从你给的选项里选一个。一次只问一个能改变你下一步动作的关键决策。" +
@@ -401,9 +457,13 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     spec(
       "export_data",
       "把**真实数据**导出成可下载文件（xlsx / csv / json / md / docx / pdf / html / txt），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
-        "格式选择：表格/数据 → xlsx 或 csv；文档式排版（打印/存档）→ pdf 或 docx；网页预览 → html；纯文本 → txt。" +
-        "用户说「导出 / 生成 excel / 生成表格 / 生成 csv / 生成 pdf / 导出 word / 生成文档 / 下载数据」时都用它；**不要**用 fs_write 写文本文件去冒充表格或文档文件。" +
+        "格式选择：表格/数据 → xlsx 或 csv；网页预览（自包含、可离线打开）→ html；文档式排版（打印/存档）→ pdf 或 docx；纯文本 → txt。" +
+        "用户说「导出 / 生成 excel / 生成表格 / 生成 csv / 生成 pdf / 导出 word / 生成文档 / 下载数据 / 生成报告 / 全部放进去」时都用它；**不要**用 fs_write 写文本文件去冒充表格或文档文件。" +
         "数据必须来自工具真实返回，禁止编造；行数很多时先在数据侧聚合或筛选（pdf 上限 2000 行、docx 2 万行，其余 5 万行）。" +
+        "**报告式导出（html / pdf / docx）可把图表和叙述也一并装进文件**：" +
+        "把本轮回话里 render_chart 产出的图表 spec 原样放进 `charts` 数组（html 会渲染成内联 SVG，pdf 渲染成矢量图，docx 退化为数据表）；" +
+        "把口径说明 / 预测 / 建议等叙述文字（markdown）放进 `sections`（字符串或字符串数组）。" +
+        "这样用户要的「表 + 图 + 结论全部进一个文件」就能满足，而不是只在聊天里出图、文件里只有表。" +
         "行数据的两种写法：行对象数组（对象的键就是表头文字，可直接用中文键名）或二维数组（第一行即表头）。" +
         "多张表用 sheets（[{ name, rows, columns? }]），单张表直接用 rows。" +
         "filename 是给用户看的文件名（含扩展名，如 用户列表.xlsx）；format 省略时按 filename 的扩展名推断，再默认 xlsx。" +
@@ -411,7 +471,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       {
         type: "object",
         properties: {
-          filename: jsonType("string", "文件名（含扩展名，如 报表.xlsx、用户列表.csv）"),
+          filename: jsonType("string", "文件名（含扩展名，如 报表.xlsx、分析报告.html）"),
           format: jsonType("string", "csv | xlsx | json | md | docx | pdf | html | txt（省略时按 filename 扩展名推断，默认 xlsx）"),
           rows: {
             type: "array",
@@ -427,7 +487,16 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
             description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；只有 xlsx / docx / pdf 支持多表）",
             items: { type: "object" },
           },
-          title: jsonType("string", "可选：标题（md / html / pdf / docx 的标题；未给 sheets 时 xlsx 的工作表名）"),
+          title: jsonType("string", "可选：报告标题（html / pdf / docx 的大标题）"),
+          sections: {
+            type: ["array", "string"],
+            description: "可选：叙述段落（markdown 文本）。数组则每段一个元素；字符串则整体作为一个段落。html/pdf/docx 会渲染成标题/列表/正文，把口径说明、预测、建议等文字一并装进文件",
+          },
+          charts: {
+            type: "array",
+            description: "可选：图表数组，元素为 render_chart 产出的 ChartSpec（{ chartType, data, encode?, options?, title? }）。html/pdf 会渲染成图形，docx 退化为数据表",
+            items: { type: "object" },
+          },
         },
         required: ["filename"],
       },
@@ -789,10 +858,13 @@ function buildTxt(title: string, matrix: unknown[][]): string {
   return [...(title ? [title, ""] : []), lines[0] ?? "", divider, ...lines.slice(1), ""].join("\n");
 }
 
-/** 生成 docx（Word）。中文由 Word 按字体名解析，**无需内嵌字体资产**。 */
+/** 生成 docx（Word）。中文由 Word 按字体名解析，**无需内嵌字体资产**。
+ *  支持叙述段落(sections, markdown)与图表降级数据表(chartTables)；图表在 docx 中以数据表呈现（docx 不支持内联 SVG）。 */
 async function buildDocx(
   sheets: Array<{ name: string; matrix: unknown[][] }>,
   title: string,
+  sections: string[] = [],
+  chartTables: Array<{ title?: string; matrix: string[][] }> = [],
 ): Promise<Uint8Array | { error: string }> {
   try {
     const mod = (await import("docx")) as unknown as { default?: unknown };
@@ -823,12 +895,9 @@ async function buildDocx(
       insideVertical: solid(),
     });
     const children: unknown[] = [];
-    if (title) children.push(new Paragraph({ text: title, heading: h1 }));
-    sheets.forEach((sheet, index) => {
-      if (sheets.length > 1) children.push(new Paragraph({ text: sheet.name, heading: h2 }));
-      else if (!title && index === 0) children.push(new Paragraph({ text: sheet.name, heading: h1 }));
-      const head = sheet.matrix[0] || [];
-      const rows = sheet.matrix.map(
+    const addTable = (matrix: unknown[][]) => {
+      const head = matrix[0] || [];
+      const rows = matrix.map(
         (row, rowIndex) =>
           new TableRow({
             children: head.map(
@@ -850,9 +919,38 @@ async function buildDocx(
       children.push(
         new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE ?? "pct" }, borders: makeBorders() }),
       );
+    };
+    // 叙述段落（最小 markdown → docx 段落）：标题 / 列表 / 行内加粗。
+    const stripMd = (s: string) => s.replace(/\*\*/g, "").replace(/`/g, "");
+    const inlineRuns = (text: string) =>
+      text.split(/\*\*/).map((p, i) => new TextRun({ text: p, bold: i % 2 === 1 }));
+    const addMarkdown = (md: string) => {
+      for (const raw of md.replace(/\r\n/g, "\n").split("\n")) {
+        const line = raw;
+        if (!line.trim()) continue;
+        const h = line.match(/^(#{1,4})\s+(.*)$/);
+        if (h) { children.push(new Paragraph({ text: stripMd(h[2]), heading: h[1].length <= 1 ? h1 : h2 })); continue; }
+        const ul = line.match(/^\s*[-*]\s+(.*)$/);
+        if (ul) { children.push(new Paragraph({ text: stripMd(ul[1]), bullet: { level: 0 } })); continue; }
+        const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+        if (ol) { children.push(new Paragraph({ text: stripMd(ol[1]), bullet: { level: 0 } })); continue; }
+        children.push(new Paragraph({ children: inlineRuns(line) }));
+      }
+    };
+    if (title) children.push(new Paragraph({ text: title, heading: h1 }));
+    for (const sec of sections) addMarkdown(sec);
+    sheets.forEach((sheet, index) => {
+      if (sheets.length > 1) children.push(new Paragraph({ text: sheet.name, heading: h2 }));
+      else if (!title && !sections.length && index === 0) children.push(new Paragraph({ text: sheet.name, heading: h1 }));
+      addTable(sheet.matrix);
     });
+    for (const ct of chartTables) {
+      if (ct.title) children.push(new Paragraph({ text: ct.title, heading: h2 }));
+      children.push(new Paragraph({ text: "（该图型在 PDF / HTML 中以图形呈现，此处以数据表呈现）", italics: true }));
+      if (ct.matrix.length) addTable(ct.matrix);
+    }
     const buf = await Packer.toBuffer(new Document({ sections: [{ children }] }));
-    return new Uint8Array(buf as ArrayBuffer);
+    return new Uint8Array(buf as unknown as ArrayBuffer);
   } catch (err) {
     return { error: `生成 docx 失败：${String((err as Error)?.message || err)}` };
   }
@@ -893,36 +991,73 @@ function loadPdfMake(): Promise<Record<string, unknown> | null> {
   return pdfMakeInit;
 }
 
-/** 生成 PDF（pdfmake + 内嵌中文字体；字体资产缺失时如实报错，绝不产出中文空白的 PDF）。 */
+/** 生成 PDF（pdfmake + 内嵌中文字体；字体资产缺失时如实报错，绝不产出中文空白的 PDF）。
+ *  支持叙述段落(sections)、图表内联 SVG(chartSvgs)与降级数据表(chartTables)；
+ *  SVG 优先，若 pdfmake 的 SVG 解析不支持某图则整体降级为数据表，保证内容不丢。 */
 async function buildPdf(
   sheets: Array<{ name: string; matrix: unknown[][] }>,
   title: string,
+  sections: string[] = [],
+  chartSvgs: string[] = [],
+  chartTables: Array<{ title?: string; matrix: string[][] }> = [],
 ): Promise<Uint8Array | { error: string }> {
   if (!existsSync(PDF_FONT_FILE)) {
     return { error: "PDF 字体资产缺失（assets/fonts/NotoSansSC-Regular.otf），无法生成中文 PDF；请改用 docx 或 html 导出" };
   }
+  const pdfmake = await loadPdfMake();
+  if (!pdfmake) return { error: "无法加载 PDF 生成器（pdfmake）" };
+  const stripMd = (s: string) => s.replace(/\*\*/g, "").replace(/`/g, "");
+  const inlineNodes = (text: string) =>
+    text.split(/\*\*/).map((p, i) => (i % 2 === 1 ? { text: p, bold: true } : { text: p }));
+  const pushMarkdown = (content: unknown[], md: string) => {
+    for (const line of md.replace(/\r\n/g, "\n").split("\n")) {
+      if (!line.trim()) continue;
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) { content.push({ text: stripMd(h[2]), fontSize: h[1].length <= 1 ? 15 : 13, bold: true, margin: [0, h[1].length <= 1 ? 10 : 6, 0, 4] }); continue; }
+      const ul = line.match(/^\s*[-*]\s+(.*)$/);
+      if (ul) { content.push({ ul: [{ text: stripMd(ul[1]) }] }); continue; }
+      const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+      if (ol) { content.push({ ol: [{ text: stripMd(ol[1]) }] }); continue; }
+      content.push({ text: inlineNodes(line), margin: [0, 2, 0, 2] });
+    }
+  };
+  const pushChartTables = (content: unknown[]) => {
+    for (const ct of chartTables) {
+      if (ct.title) content.push({ text: ct.title, fontSize: 13, bold: true, margin: [0, 10, 0, 4] });
+      content.push({ text: "（该图型在 HTML 中以图形呈现，此处以数据表呈现）", italics: true, fontSize: 9, margin: [0, 0, 0, 4] });
+      if (ct.matrix.length) content.push({ table: { headerRows: 1, body: ct.matrix.map((r) => r.map((c) => ({ text: c }))) }, layout: "lightHorizontalLines" });
+    }
+  };
+  const makeDef = (content: unknown[]) => ({
+    content,
+    defaultStyle: { font: PDF_FONT_NAME, fontSize: 10 },
+    pageSize: "A4" as const,
+    pageMargins: [36, 36, 36, 36],
+  });
+  const render = async (content: unknown[]) => {
+    const doc = (pdfmake.createPdf as (def: unknown) => { getBuffer: () => Promise<Buffer> })(makeDef(content));
+    return new Uint8Array(await doc.getBuffer());
+  };
+  const base: unknown[] = [];
+  if (title) base.push({ text: title, fontSize: 16, bold: true, margin: [0, 0, 0, 10] });
+  for (const sec of sections) pushMarkdown(base, sec);
+  sheets.forEach((sheet, index) => {
+    if (sheets.length > 1) base.push({ text: sheet.name, fontSize: 13, bold: true, margin: [0, index ? 12 : 0, 0, 6] });
+    base.push({ table: { headerRows: 1, body: sheet.matrix.map((row) => row.map(textCell)) }, layout: "lightHorizontalLines" });
+  });
   try {
-    const pdfmake = await loadPdfMake();
-    if (!pdfmake) return { error: "无法加载 PDF 生成器（pdfmake）" };
-    const content: unknown[] = [];
-    if (title) content.push({ text: title, fontSize: 16, bold: true, margin: [0, 0, 0, 10] });
-    sheets.forEach((sheet, index) => {
-      if (sheets.length > 1) {
-        content.push({ text: sheet.name, fontSize: 13, bold: true, margin: [0, index ? 12 : 0, 0, 6] });
-      }
-      content.push({
-        table: { headerRows: 1, body: sheet.matrix.map((row) => row.map(textCell)) },
-        layout: "lightHorizontalLines",
-      });
-    });
-    const doc = (pdfmake.createPdf as (def: unknown) => { getBuffer: () => Promise<Buffer> })({
-      content,
-      defaultStyle: { font: PDF_FONT_NAME, fontSize: 10 },
-      pageSize: "A4",
-      pageMargins: [36, 36, 36, 36],
-    });
-    const buf = await doc.getBuffer();
-    return new Uint8Array(buf);
+    // 优先：图表以内联 SVG 呈现。
+    const svgContent = chartSvgs.length
+      ? base.concat(chartSvgs.map((svg) => ({ svg, width: 520, margin: [0, 6, 0, 12] } as unknown)))
+      : base;
+    try {
+      return await render(svgContent);
+    } catch {
+      // SVG 解析失败（pdfmake 对部分 SVG 属性支持有限）：降级为数据表，保证内容不丢。
+      const safe = base.concat();
+      pushChartTables(safe);
+      return await render(safe);
+    }
   } catch (err) {
     return { error: `生成 pdf 失败：${String((err as Error)?.message || err)}` };
   }
@@ -1002,6 +1137,22 @@ export async function execBuiltin(
         ok: true,
         text: files.map((file) => `${file.path}（${file.bytes} 字节）`).join("\n"),
       };
+    }
+    case "run_command": {
+      const command = str(args, "command").trim();
+      if (!command) return { ok: false, text: "run_command 需要 command" };
+      const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || RUN_TIMEOUT_MS, 1_000), 600_000);
+      const cwd = conversationFsRoot(conversationId);
+      // 工作区目录可能尚未创建（本场对话还没写过文件）；exec 的 cwd 不存在会直接 ENOENT，
+      // 表现为「所有命令都失败」，与「环境无 shell」难以区分。先确保目录存在。
+      try {
+        mkdirSync(cwd, { recursive: true });
+      } catch {
+        // 忽略：下面用 existsSync 兜底判断。
+      }
+      const safeCwd = existsSync(cwd) ? cwd : process.cwd();
+      const out = await runShell(command, { cwd: safeCwd, timeoutMs });
+      return out;
     }
     case "save_memory": {
       const text = str(args, "text").trim();
@@ -1089,6 +1240,20 @@ export async function execBuiltin(
       const target = resolveExportTarget(str(args, "filename"), str(args, "format"));
       if ("error" in target) return { ok: false, text: `导出失败：${target.error}` };
       const title = str(args, "title");
+      // 叙述段落（markdown）：支持字符串或字符串数组；供 html/pdf/docx 一并渲染。
+      const sectionsRaw = args.sections;
+      const sections: string[] = Array.isArray(sectionsRaw)
+        ? sectionsRaw.map((s) => String(s)).filter((s) => s.trim())
+        : typeof sectionsRaw === "string" && sectionsRaw.trim()
+          ? [sectionsRaw]
+          : [];
+      // 图表（复用 render_chart 产出的 ChartSpec）：支持的类型烘焙成内联 SVG，其余降级为数据表。
+      const chartsRaw = args.charts;
+      const charts: ChartSpec[] = Array.isArray(chartsRaw)
+        ? chartsRaw
+            .filter((c) => c && typeof c === "object" && typeof (c as Record<string, unknown>).chartType === "string")
+            .map((c) => c as ChartSpec)
+        : [];
       // 单表（rows）与多表（sheets）统一成 sheets 列表处理，后续只维护一条路径。
       const rawSheets: unknown[] =
         Array.isArray(args.sheets) && args.sheets.length
@@ -1128,11 +1293,11 @@ export async function execBuiltin(
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else if (target.format === "docx") {
-        const bytes = await buildDocx(built, title);
+        const bytes = await buildDocx(built, title, sections, chartFallbackTables(charts));
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else if (target.format === "pdf") {
-        const bytes = await buildPdf(built, title);
+        const bytes = await buildPdf(built, title, sections, chartSvgs(charts), chartFallbackTables(charts));
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else {
@@ -1143,7 +1308,9 @@ export async function execBuiltin(
             : target.format === "json"
               ? toJsonText(matrix)
               : target.format === "html"
-                ? buildHtml(title, matrix)
+                ? (sections.length || charts.length
+                    ? buildHtmlReport({ title, sections, tables: built, charts })
+                    : buildHtml(title, matrix))
                 : target.format === "txt"
                   ? buildTxt(title, matrix)
                   : toMarkdownText(title, matrix);

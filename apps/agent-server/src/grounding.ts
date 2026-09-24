@@ -24,6 +24,30 @@ export function isGroundingEvidenceTool(name: string): boolean {
 }
 
 /**
+ * 「外部数据源」工具：能引入本轮之外的真实数据的工具（MCP 工具 + 联网检索 / 知识库检索）。
+ *
+ * 为什么要和 `isGroundingEvidenceTool` 分开：后者问的是「这次执行能不能当证据」（工作区读取也算，
+ * 因为它能读回被卸载的工具结果）；前者问的是「本轮有没有外部事实来源」。
+ * 用后者去开护栏会让「只挂了工作区工具」的通用轮次也进入零证据拦截——而那类轮次本就该允许
+ * 「没有合适工具时用自身知识作答」，拦了就是误伤（写代码、翻译、创作都会被逼着去凑证据）。
+ *
+ * `mcp__` 是 MCP 工具命名空间前缀（协议级契约，非业务词）。
+ */
+const EXTERNAL_DATA_BUILTINS = new Set(["web_search", "fetch_url", "search_knowledge", "knowledge_sources"]);
+
+/** 单个工具名是否属于外部数据源。 */
+export function isExternalDataSourceTool(name: string): boolean {
+  if (!name) return false;
+  if (name.startsWith("mcp__")) return true;
+  return EXTERNAL_DATA_BUILTINS.has(name);
+}
+
+/** 本轮是否注入了外部数据源工具：决定了接地护栏参不参与（按工具动态开启，而非按角色写死）。 */
+export function hasExternalDataSource(toolNames: readonly string[]): boolean {
+  return (toolNames || []).some(isExternalDataSourceTool);
+}
+
+/**
  * 零数据作答被拦截后的纠正提示（回灌给模型）。
  *
  * 刻意写成分支口径而非「一定要去取数」的单分支引导。单分支的代价实测过：把「本轮根本不需要外部数据的
@@ -74,24 +98,36 @@ export function buildGroundedFallbackSystem(roleLabel: string): string {
 }
 
 /**
- * 「本轮是否需要外部数据」的轻判定（零证据收束时的分诊，避免把不需要数据的轮次也拖进重试）。
+ * 「这段回答是否含必须有外部数据支撑的断言」的轻判定（零证据收束时的分诊）。
  *
  * 为什么需要它：零证据收束以前只有一条路——作废正文 + 回灌纠正提示再跑一整轮（工具集全量注入的重提示）。
- * 对**本就不需要外部数据**的轮次（打招呼、闲聊、问身份/能力、超出职责范围的提问），这是纯粹的浪费：
- * 模型两轮都答得没错，却要等到第三次「轻兜底」调用才上屏。实测一次问候因此耗时 ~15s（4s + 10s + 0.5s），
- * 而第三次轻调用只用 0.5s —— 差别就在「重提示 vs 轻提示」。
+ * 对**回答里根本没有事实断言**的轮次（打招呼、闲聊、问身份/能力、超出职责范围的提问、纯推理与创作），
+ * 这是纯粹的浪费：模型两轮都答得没错，却要等到第三次「轻兜底」调用才上屏。
  *
- * 判定口径（模型判定，不是服务端正则）：这个问题**是否必须依赖外部数据/实时信息**才能可靠回答。
- * 拿不准就判 DATA（保守方向：宁可多跑一轮重试，也不放过可能编造的事实型回答）。
+ * ⚠️ 判定对象是**待上屏的回答本身**，不是用户的问题。只看问题会把「用户问了事实、但回答里没有断言」
+ * （例如已如实说明取不到）误判成 DATA，也会把「用户只是寒暄、但回答里顺手补了个具体数字」漏判成 NO_DATA。
+ * 护栏拦的是「无证据的事实断言」，所以必须以回答为准——对齐输出侧护栏（output guardrail）而不是输入侧分诊。
+ *
+ * 判定口径（模型判定，不是服务端正则）：这段回答里有没有只能由工具返回的真实数据支撑的具体事实。
+ * 拿不准就判 DATA（保守方向：宁可多跑一轮重试，也不放过可能编造的事实型断言）。
  */
 export const DATA_NEED_SYSTEM = [
-  "你是分诊器，只做一件事：判断用户这句话是否必须依赖外部数据或实时信息才能可靠回答。",
+  "你是接地分诊器，只做一件事：判断下面这段**回答**里有没有「必须有外部数据支撑」的事实性断言。",
   "判定口径：",
-  "1. 需要具体事实、数字、日期、实时状态、第三方信息（含作品、人物、事件、行情、天气等）才能回答 → 输出 DATA。",
-  "2. 打招呼、寒暄、闲聊、询问你的身份或能力、让你说明已有结论、明显超出你职责范围而只需说明边界的请求 → 输出 NO_DATA。",
-  "3. 无法确定时输出 DATA。",
+  "1. 回答里出现具体事实（名称、数字、日期、标识、归属或关系、事件细节等），且这类内容只能由工具返回的真实数据支撑 → 输出 DATA。",
+  "2. 回答里只有寒暄、身份与能力说明、职责边界说明、对已有结论的复述或总结，或纯推理与创作内容（不含上述事实断言）→ 输出 NO_DATA。",
+  // 这一条是防误伤的关键：护栏只在「这个事实错了会造成实际后果、且只有本轮数据源才可能给对」时才该拦。
+  // 通用常识、概念解释、代码与算法说明即使夹着日期/版本号这类具体细节，也判 NO_DATA——
+  // 否则「解释一段语法」「说清一个概念」都会被当成编造拦下来，护栏就成了问答的拦路虎。
+  "3. 回答里的具体事实属于不依赖本次数据源的通用常识、概念解释、代码与算法说明（即使含日期 / 版本号这类细节）→ 输出 NO_DATA。",
+  "4. 无法确定时输出 DATA。",
   "只输出 DATA 或 NO_DATA 两个词之一，不要解释、不要标点、不要任何其它内容。",
 ].join("\n");
+
+/** 分诊调用的输入（问题 + 待判定回答）：纯函数，便于单测与 token 估算。 */
+export function buildDataNeedPrompt(question: string, answer: string): string {
+  return [`用户问题：${question}`, "", "待判定的回答：", answer].join("\n");
+}
 
 /** 解析分诊结果；无法识别返回 null（调用方按 DATA 处理，保守）。 */
 export function parseDataNeed(raw: string): "data" | "no_data" | null {
@@ -144,7 +180,13 @@ export const VERIFY_SYSTEM = [
   "3. 由证据可推出的等价改写（同义表达、单位换算、四则运算）算「有支持」。",
   "4. 只对齐给定证据，不引入你自己的知识，也不替回答补充内容。",
   "5. 证据每条以「【来源 工具名】」开头，核对时可据此判断具体由哪个工具返回支撑；不要把来源标签当作断言内容。",
-  "输出：仅输出一个 JSON 对象，形如 {\"unsupported\":[\"逐条摘录无支持的断言\"]}；全部有支持时输出 {\"unsupported\":[]}。",
+  // 引用溯源（对齐「强制引用 + 系统自动校验引用存在性」）：模型可能引用一个本轮根本没调过的工具/数据源，
+  // 这类引用必然是编造的。抽取交给模型（语义），但只收**标识形态**的来源名（工具名 / 服务器标识），
+  // 自然语言来源名（如某个平台的俗称）不填——它由服务端另做确定性比对，避免核验器自由发挥。
+  "6. 另外把回答里声称、但在证据的「【来源 …】」标签中找不到的**标识形态**来源（工具名 / 服务器标识，如 mcp__x__y）" +
+    "列入 unknown_sources；证据里出现过的来源不要列入，也不要填自然语言描述。",
+  "输出：仅输出一个 JSON 对象，形如 {\"unsupported\":[\"逐条摘录无支持的断言\"],\"unknown_sources\":[\"来源标识\"]}；" +
+    "全部有支持且来源都存在时输出 {\"unsupported\":[],\"unknown_sources\":[]}。",
   "除该 JSON 外不要输出任何其它内容（不要解释、不要围栏、不要前后缀）。",
 ].join("\n");
 
@@ -173,30 +215,97 @@ export function buildVerifyPrompt(input: VerifyInput): string {
   ].join("\n");
 }
 
+export interface VerifyResult {
+  /** 无支持的断言；`null` = 核验不可用（解析失败），调用方按不阻断处理。 */
+  unsupported: string[] | null;
+  /** 回答里声称但证据中不存在的来源标识；`null` = 该字段不可用。 */
+  unknownSources: string[] | null;
+}
+
 /**
- * 从核验器输出里稳健取出「无支持断言」列表。
+ * 从核验器输出里稳健取出「无支持断言」与「不存在的来源」。
  * 解析失败（非 JSON / 缺字段）返回 `null` —— 语义是「核验不可用」，调用方按不阻断处理，绝不因此拒答。
  */
-export function parseUnsupportedClaims(raw: string): string[] | null {
+export function parseVerifyResult(raw: string): VerifyResult {
   const text = String(raw || "").trim();
-  if (!text) return null;
+  if (!text) return { unsupported: null, unknownSources: null };
   // 容忍围栏或解释性前后缀：取首个 `{` 到末个 `}` 之间的片段。
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
+  if (start < 0 || end <= start) return { unsupported: null, unknownSources: null };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text.slice(start, end + 1));
   } catch {
-    return null;
+    return { unsupported: null, unknownSources: null };
   }
-  if (!parsed || typeof parsed !== "object") return null;
-  const list = (parsed as { unsupported?: unknown }).unsupported;
-  if (!Array.isArray(list)) return null;
-  return list
+  if (!parsed || typeof parsed !== "object") return { unsupported: null, unknownSources: null };
+  return {
+    unsupported: asStringList((parsed as { unsupported?: unknown }).unsupported, MAX_UNSUPPORTED_CLAIMS),
+    unknownSources: asStringList((parsed as { unknown_sources?: unknown }).unknown_sources, MAX_UNSUPPORTED_CLAIMS),
+  };
+}
+
+/** 只收字符串数组；空数组是合法结果（「全部有支持」），非数组才是不可用。 */
+function asStringList(value: unknown, cap: number): string[] | null {
+  if (!Array.isArray(value)) return null;
+  return value
     .map((item) => String(item ?? "").trim())
     .filter(Boolean)
-    .slice(0, MAX_UNSUPPORTED_CLAIMS);
+    .slice(0, cap);
+}
+
+/** 向后兼容的窄接口：只要「无支持断言」时用这个。 */
+export function parseUnsupportedClaims(raw: string): string[] | null {
+  return parseVerifyResult(raw).unsupported;
+}
+
+// ───────────────────────── 引用溯源校验（确定性部分） ─────────────────────────
+// 核验器是模型，会漏也会错报；来源存在性这种**可确定性判定**的事不该交给它。
+// 这里做两件零业务词的事：①直接从回答里抽协议级工具引用，比对本轮真实工具集合；
+// ②把核验器报的来源做一次集合比对，只保留确实对不上的「标识形态」来源（自然语言来源名不参与判定，避免误伤）。
+
+/** 回答里的「工具引用」形态：`mcp__<服务器>__<工具>`（MCP 命名空间契约，协议级、非业务词）。 */
+const TOOL_REF_RE = /mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+/g;
+
+/** 抽出回答里出现过的工具引用（去重，保持出现顺序）。 */
+export function extractToolRefs(text: string): string[] {
+  const out = new Set<string>();
+  for (const match of String(text || "").matchAll(TOOL_REF_RE)) out.add(match[0]);
+  return [...out];
+}
+
+/** 回答声称调用了、但本轮根本没注入的工具 → 编造的来源（典型幻觉形态）。 */
+export function unknownToolRefs(text: string, knownTools: readonly string[]): string[] {
+  const known = new Set((knownTools || []).filter(Boolean));
+  return extractToolRefs(text).filter((ref) => !known.has(ref));
+}
+
+/** 标识形态的来源名（工具名 / 服务器标识）：自然语言来源名不参与确定性判定。 */
+const PROTOCOL_REF_RE = /^[A-Za-z_][A-Za-z0-9_.:-]{2,}$/;
+
+function normalizeRef(raw: string): string {
+  return String(raw || "")
+    .trim()
+    .replace(/^[`"'`]+|[`"'`]+$/g, "")
+    .toLowerCase();
+}
+
+/**
+ * 把核验器报的来源与真实来源集合比对，只留下确实对不上的「标识形态」来源。
+ * 命中规则：相等或互为子串（`mcp__bi__list` 与 `bi` 视为同一来源）即算已知。
+ * 非标识形态（自然语言来源名）一律跳过——它可能只是回答里随口一提，判了就是误伤。
+ */
+export function crossCheckSources(claimed: readonly string[], known: readonly string[]): string[] {
+  const knownList = (known || []).map(normalizeRef).filter(Boolean);
+  const out: string[] = [];
+  for (const item of claimed || []) {
+    const ref = normalizeRef(item);
+    if (!ref || !PROTOCOL_REF_RE.test(ref)) continue;
+    if (knownList.some((k) => k === ref || k.includes(ref) || ref.includes(k))) continue;
+    out.push(String(item).trim());
+  }
+  return [...new Set(out)].slice(0, MAX_UNSUPPORTED_CLAIMS);
 }
 
 /** 回灌给模型的纠正提示头/尾（中间嵌经非信定界处理的断言清单）。 */

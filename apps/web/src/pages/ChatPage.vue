@@ -1174,6 +1174,28 @@ const confirmDialogEl = ref<HTMLElement | null>(null);
 const confirmPrimaryBtn = ref<HTMLElement | null>(null);
 let confirmReturnFocus: HTMLElement | null = null;
 
+// ---- HTML 产物预览（对齐 CodeBuddy / Cursor 的 artifact 预览：自包含 HTML 在独立面板里直接渲染）----
+const previewHtml = ref<{ name: string; path: string; content: string } | null>(null);
+const previewLoading = ref(false);
+function isHtmlArtifact(a: { name: string; path: string }): boolean {
+  return /\.html?$/i.test(a.name || "") || /\.html?$/i.test(a.path || "");
+}
+async function openArtifactPreview(a: { name: string; path: string }) {
+  previewLoading.value = true;
+  previewHtml.value = { name: a.name, path: a.path, content: "" };
+  try {
+    const content = await readWorkspaceFile(currentId.value, a.path);
+    previewHtml.value = { name: a.name, path: a.path, content };
+  } catch {
+    previewHtml.value = null;
+  } finally {
+    previewLoading.value = false;
+  }
+}
+function closeArtifactPreview() {
+  previewHtml.value = null;
+}
+
 function askDeleteConversation(conv: ConversationDto) {
   confirmReturnFocus = (document.activeElement as HTMLElement) || null;
   const fallback = tx("新对话", "New chat", "Nova conversa", "नई चैट");
@@ -2186,6 +2208,22 @@ async function toggleMute(id: string) {
   if (!updated) {
     // 失败回滚：以服务端为唯一真相。
     conversations.value = conversations.value.map((c) => (c.id === id ? { ...c, muted: !muted } : c));
+  }
+}
+
+/**
+ * 完全访问：开 = 该对话的写/破坏性/外部操作不逐项弹确认卡、直接执行（默认开）。
+ * 仅切「人审确认」，不影响免打扰等其它设置；失败以服务端为准回滚。
+ */
+async function toggleFullAccess(id: string) {
+  const conv = conversations.value.find((c) => c.id === id);
+  if (!conv) return;
+  const fullAccess = !(conv.fullAccess ?? true);
+  closeCtxMenu();
+  conversations.value = conversations.value.map((c) => (c.id === id ? { ...c, fullAccess } : c));
+  const updated = await patchConversation(id, { fullAccess }).catch(() => null);
+  if (!updated) {
+    conversations.value = conversations.value.map((c) => (c.id === id ? { ...c, fullAccess: !fullAccess } : c));
   }
 }
 
@@ -4387,6 +4425,13 @@ onBeforeUnmount(() => {
               : tx("免打扰", "Mute", "Silenciar", "सूचनाएं बंद करें")
           }}
         </button>
+        <button type="button" class="ctx-item" role="menuitem" @click="toggleFullAccess(ctxMenu.targetId)">
+          {{
+            ctxTarget?.fullAccess === false
+              ? tx("开启完全访问", "Enable full access", "Ativar acesso total", "पूर्ण एक्सेस चालू करें")
+              : tx("关闭完全访问", "Disable full access", "Desativar acesso total", "पूर्ण एक्सेस बंद करें")
+          }}
+        </button>
         <button type="button" class="ctx-item" role="menuitem" @click="duplicateCurrent(ctxMenu.targetId)">
           {{ tx("复制对话", "Duplicate", "Duplicar", "डुप्लिकेट करें") }}
         </button>
@@ -4466,6 +4511,28 @@ onBeforeUnmount(() => {
             >
               {{ confirmDialog.confirmLabel }}
             </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="previewHtml" class="modal-mask" @click.self="closeArtifactPreview">
+        <div class="modal modal--preview" role="dialog" aria-modal="true" :aria-label="previewHtml.name">
+          <div class="modal__head">
+            <span class="modal__title">{{ previewHtml.name }}</span>
+            <div class="modal__head-actions">
+              <a
+                class="ghost-btn"
+                :href="workspaceDownloadUrl(currentId, previewHtml.path)"
+                :download="previewHtml.name"
+              >{{ tx("下载", "Download", "Descargar", "डाउनलोड") }}</a>
+              <button class="modal__close" type="button" aria-label="Close" @click="closeArtifactPreview">×</button>
+            </div>
+          </div>
+          <div class="modal__body preview-body">
+            <div v-if="previewLoading" class="preview-loading">{{ tx("加载中…", "Loading…", "Cargando…", "लोड हो रहा है…") }}</div>
+            <iframe v-else class="preview-frame" :srcdoc="previewHtml.content" sandbox="allow-scripts"></iframe>
           </div>
         </div>
       </div>
@@ -5158,6 +5225,12 @@ onBeforeUnmount(() => {
             <div v-for="(a, ai) in b.artifacts || []" :key="`artifact-${ai}`" class="artifact-card">
               <span class="artifact-card__name" :title="a.name">{{ a.name }}</span>
               <span class="artifact-card__meta">{{ formatBytes(a.bytes) }}</span>
+              <button
+                v-if="isHtmlArtifact(a)"
+                type="button"
+                class="artifact-card__btn"
+                @click="openArtifactPreview(a)"
+              >{{ tx('预览', 'Preview', 'Vista', 'पूर्वावलोकन') }}</button>
               <a
                 class="artifact-card__btn"
                 :href="workspaceDownloadUrl(currentId, a.path)"
@@ -8885,6 +8958,52 @@ button.step-head:disabled {
 .artifact-card__btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* HTML 产物预览模态（对齐 CodeBuddy / Cursor 的 artifact 预览面板）。 */
+.modal--preview {
+  width: min(960px, 92vw);
+  height: min(720px, 88vh);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+.modal--preview .modal__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.modal__head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal--preview .modal__body.preview-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.preview-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+}
+
+.preview-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
 }
 
 .res-preview {

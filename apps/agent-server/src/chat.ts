@@ -29,19 +29,25 @@ import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStat
 import { getRole } from "./roles.js";
 import { enforceRoleIdentity } from "./role-guard.js";
 import {
+  buildDataNeedPrompt,
   buildGroundedFallbackSystem,
   buildVerifyHint,
   buildVerifyPrompt,
   consensusUnsupported,
+  crossCheckSources,
   DATA_NEED_SYSTEM,
   decideGrounding,
   GROUNDING_HINT,
+  hasExternalDataSource,
   isGroundingEvidenceTool,
+  MAX_UNSUPPORTED_CLAIMS,
   parseDataNeed,
-  parseUnsupportedClaims,
+  parseVerifyResult,
   shouldRunVerification,
+  unknownToolRefs,
   UNGROUNDED_REPLY,
   VERIFY_SYSTEM,
+  type VerifyResult,
 } from "./grounding.js";
 import { wrapUntrusted } from "./untrusted.js";
 import { webSearchStatus } from "./web-search.js";
@@ -202,16 +208,17 @@ async function verifyAnswerWith(
   model: ModelEntry,
   input: { question: string; evidence: string; answer: string },
   signal?: AbortSignal,
-): Promise<string[] | null> {
+): Promise<VerifyResult> {
   const result = await callAgent(
     model,
     [{ role: "user", content: buildVerifyPrompt(input) }],
     [],
     signal,
     undefined,
-    { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" } },
+    // 判定型调用：温度归零——核验器自己在采样会让同一段回答今天拦、明天放，护栏就成了新的随机源。
+    { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" }, temperature: 0 },
   );
-  return parseUnsupportedClaims(result.text);
+  return parseVerifyResult(result.text);
 }
 
 /**
@@ -227,15 +234,21 @@ async function verifyAnswerWith(
  * 只在**零证据收束**时使用（见 runLoop 的 grounding 分支），用来决定是「补取数据再答」（重试重提示）
  * 还是「本就不需要数据 → 直接受约束兜底」（轻提示）。判定不可用（异常 / 解析不出）返回 null = 按 DATA 处理。
  */
-async function probeNeedsExternalData(model: ModelEntry, question: string, signal?: AbortSignal): Promise<"data" | "no_data" | null> {
+async function probeNeedsExternalData(
+  model: ModelEntry,
+  question: string,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<"data" | "no_data" | null> {
   try {
     const result = await callAgent(
       model,
-      [{ role: "user", content: question.trim() || "（本轮没有可识别的文本输入）" }],
+      [{ role: "user", content: buildDataNeedPrompt(question.trim() || "（本轮没有可识别的文本输入）", answer) }],
       [],
       signal,
       undefined,
-      { systemParts: { stable: DATA_NEED_SYSTEM, dynamic: "" }, disableThinking: true },
+      // 判定对象是「待上屏的回答」，不是用户的问题：护栏拦的是无证据的事实断言，必须以回答为准。
+      { systemParts: { stable: DATA_NEED_SYSTEM, dynamic: "" }, disableThinking: true, temperature: 0 },
     );
     return parseDataNeed(result.text);
   } catch (err) {
@@ -257,7 +270,11 @@ async function honestFallbackWith(
       [],
       signal,
       undefined,
-      { systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" }, disableThinking: true },
+      {
+        systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" },
+        disableThinking: true,
+        temperature: 0,
+      },
     );
     return result.text.trim() || null;
   } catch (err) {
@@ -886,6 +903,12 @@ interface LoopContext {
   allowWrite: boolean;
   /** 会话级只读授权（conversation.readGrants）：仅对「未声明级别」的同服务器工具降级为只读。 */
   grantServers: ReadonlySet<string>;
+  /**
+   * 完全访问（conversation.fullAccess）：true = 写/破坏性/外部操作**不**逐项弹确认卡，直接执行
+   * （对齐 CodeBuddy「完全访问模式」）。缺省按 true 处理（开箱即完全授权）。
+   * 仅影响「人审确认」：clarify 挂起、失败熔断等安全流程不因此失效；deny（如未知工具=deny）在完全访问下也放行。
+   */
+  fullAccess: boolean;
   /** 发起请求的会话 id：确认票据与它绑定（跨会话应答会被拒绝）。 */
   sessionId?: string;
   /** 发起请求的设备 owner：用于按用户隔离的本地状态（如观影画像），不暴露给模型。 */
@@ -977,11 +1000,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let groundingVerifications = 0;
   const evidence: string[] = [];
   let evidenceChars = 0;
+  /** 本轮证据的**来源集合**（工具名 / 服务器标识）：回答里声称的来源要能与它对上，否则就是编造的引用。 */
+  const evidenceSources = new Set<string>();
   /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
    *  每条以「【来源 工具名】」前缀标注来源——这是「断言→具体来源」逐条归因的基础（详见 docs），
    *  也便于核验器在口径里据此判断某断言由哪个工具返回支撑。 */
   const pushEvidence = (raw: string, source?: string) => {
     if (!raw || evidenceChars >= GROUNDING_EVIDENCE_CHARS) return;
+    if (source) evidenceSources.add(source);
     const labeled = source ? `【来源 ${source}】\n${raw}` : raw;
     const room = GROUNDING_EVIDENCE_CHARS - evidenceChars;
     const piece = labeled.slice(0, room);
@@ -1105,12 +1131,20 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         retries: groundingRetries,
         maxRetries: GROUNDING_MAX_RETRIES,
       });
-      // 零证据收束先做一次**轻分诊**（无工具、极短提示）：这轮到底需不需要外部数据？
-      //   NO_DATA（问候/闲聊/问身份/超范围提问）→ 直接走受约束诚实兜底，省掉一整轮「重提示重试」。
-      //     实测一次问候的耗时几乎全在这里：重提示每轮 4-10s，而轻提示 <1s（15s → ~5s）。
+      // 零证据收束先做一次**轻分诊**（无工具、极短提示）：判定对象是**待上屏的回答本身**。
+      //   NO_DATA（回答里没有需外部数据支撑的事实断言：寒暄、身份与能力说明、职责边界、纯推理创作）
+      //     → **直接放行**：这类回答不是幻觉来源，纠正它只会把模型本来正确的回复换成兜底话术
+      //       （实测过：问候被换成「没取到数据」，既与事实不符、观感也更差）。
       //   DATA / 判定失败 → 维持原路（作废 + 回灌纠正提示再跑一轮），反编造的自愈路径完全不变。
-      const noDataTurn = grounding === "retry" && (await probeNeedsExternalData(ctx.model, userQuestion, ctx.signal)) === "no_data";
-      if (grounding === "retry" && !noDataTurn) {
+      //     实测一次问候的耗时几乎全在「重提示重试」：重提示每轮 4-10s，轻提示 <1s。
+      if (grounding === "retry") {
+        const need = await probeNeedsExternalData(ctx.model, userQuestion, outcome.text, ctx.signal);
+        if (need === "no_data") {
+          console.log("[chat:grounding] 分诊判定本轮回答不含需外部数据支撑的断言：放行，不作废也不兜底");
+          synthesisText = outcome.text;
+          if (roundText) yield { type: "text_delta", text: roundText };
+          break;
+        }
         groundingRetries += 1;
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         conversation.push({ role: "assistant", content: outcome.text });
@@ -1118,20 +1152,17 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         console.log("[chat:grounding] 未取得任何工具数据即作答，已作废并回灌纠正提示");
         continue;
       }
-      if (noDataTurn) {
-        console.log("[chat:grounding] 分诊判定本轮不需要外部数据：跳过重试，直接走受约束的诚实兜底");
-      }
-      if (grounding === "block" || noDataTurn) {
+      if (grounding === "block") {
         ungrounded = true;
         // 丢弃本轮未接地的正文（不上屏），改为一次「受约束的诚实兜底」（禁止任何事实性断言）：
-        // 不能直接回固定话术——固定话术无法区分「本轮本来就不需要数据」（问候/闲聊/超范围提问）与
-        // 「需要数据但没取到」，会把「没有取得任何数据源返回的数据」当成结论告诉用户（与事实不符）。
+        // 不能直接回固定话术——固定话术无法区分「本轮本来就不需要数据」与「需要数据但没取到」，
+        // 会把「没有取得任何数据源返回的数据」当成结论告诉用户（与事实不符）。
+        // 注：前者已由上面的分诊放行（NO_DATA 直接上屏），走到这里的都是「需要数据但确实没取到」。
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         const honest = await honestFallbackWith(ctx.model, userQuestion, getRole(ctx.namespace).label, ctx.signal);
         const finalHonest = honest || UNGROUNDED_REPLY;
         console.log(
-          `[chat:grounding] ${noDataTurn ? "零数据且不需要外部数据" : "纠正后仍未取得工具数据"}，` +
-            `改走受约束的诚实兜底${honest ? "" : "（调用不可用，回落确定性文案）"}`,
+          `[chat:grounding] 纠正后仍未取得工具数据，改走受约束的诚实兜底${honest ? "" : "（调用不可用，回落确定性文案）"}`,
         );
         spentTokens += estimateTokens(finalHonest);
         text += finalHonest;
@@ -1157,17 +1188,35 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         // 任一票不可用（解析失败 / 调用异常）→ 整体视为「未核验」，不阻断作答（不静默、也不误判）。
         let claims: string[] | null = null;
         let anyVerifyFail = false;
-        const runs: Array<string[] | null> = [];
+        const results: VerifyResult[] = [];
         for (let v = 0; v < GROUNDING_VERIFY_VOTES; v += 1) {
           spentTokens += estimateTokens(buildVerifyPrompt(verifyInput));
           try {
-            runs.push(await verifyAnswerWith(ctx.model, verifyInput, ctx.signal));
+            results.push(await verifyAnswerWith(ctx.model, verifyInput, ctx.signal));
           } catch (err) {
             anyVerifyFail = true;
             console.warn(`[chat:grounding] 事后核验调用失败（票 ${v + 1}），本轮跳过核验：${String((err as Error)?.message || err)}`);
           }
         }
-        if (!anyVerifyFail) claims = consensusUnsupported(runs);
+        // 引用溯源的确定性部分（不依赖核验器，成败都不受影响）：
+        // 「声称调用了一个本轮根本不存在的工具」是最典型的硬幻觉，纯字符串比对即可判定，零额外成本。
+        const knownSources = [...evidenceSources, ...specs.map((spec) => spec.name)];
+        const fakeToolClaims = unknownToolRefs(outcome.text, knownSources).map(
+          (ref) => `声称调用的工具「${ref}」本轮并不存在`,
+        );
+        if (!anyVerifyFail) {
+          const unsupported = consensusUnsupported(results.map((run) => run.unsupported));
+          const reported = consensusUnsupported(results.map((run) => run.unknownSources));
+          // 核验器报出的来源再做一次集合比对：它也可能错报，只有真的对不上本轮来源才算数。
+          const unknownSourceClaims = crossCheckSources(reported || [], knownSources).map(
+            (ref) => `声称的来源「${ref}」在本轮工具返回的数据里不存在`,
+          );
+          const merged = [...new Set([...(unsupported || []), ...unknownSourceClaims, ...fakeToolClaims])];
+          claims = merged.length ? merged.slice(0, MAX_UNSUPPORTED_CLAIMS) : null;
+        } else if (fakeToolClaims.length) {
+          // 核验不可用时不阻断作答，但编造的工具引用照样不放过。
+          claims = fakeToolClaims.slice(0, MAX_UNSUPPORTED_CLAIMS);
+        }
         if (claims && claims.length) {
           // 断言条目来自模型（可能转述了外部内容）→ 按不可信数据处理，回灌前定界。
           const wrapped = wrapUntrusted(claims.map((claim) => `- ${claim}`).join("\n"), {
@@ -1517,7 +1566,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       // 未声明工具按 MCP_UNKNOWN_TOOLS=deny 的口径直接拒绝；原生 SQL 工具的非只读查询也走此处。
-      if (verdict.deny) {
+      // 完全访问模式下跳过该硬拒（用户已明确授权，缺省即完全访问）。
+      if (verdict.deny && !ctx.fullAccess) {
         ok = false;
         rawText = verdict.reason
           ? `工具 ${call.name} 被安全闸门拒绝：${verdict.reason}`
@@ -1542,7 +1592,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         appendAudit({ kind: "gate", decision: "clarify_deferred", ...auditBase });
         continue;
       }
-      if (verdictNeedsConfirm(verdict)) {
+      // 完全访问：跳过二次确认，直接执行（缺省即完全访问）。仍走 verdict.deny 之外的正常执行路径。
+      if (verdictNeedsConfirm(verdict) && !ctx.fullAccess) {
         // 先登记等待器（拿到票据）再下发确认事件：避免调用方在 waiter 注册前应答导致永久挂起（竞态）。
         const pending = requestConfirmation({
           sessionId: ctx.sessionId || "",
@@ -1819,6 +1870,11 @@ async function* runSubagent(
     loadedTools: new Set<string>(),
     system: { stable: SUBAGENT_PROMPT, dynamic: "" },
     allowTask: false,
+    // 子代理不参与接地护栏：它的产出是回传给主代理的**中间摘要**，不是用户可见的最终答案；
+    // 最终答案由主代理那一层护栏把关（零证据照样拦）。让子代理也走护栏会把它正常的工作区操作
+    // （fs_write 存中间结果这类工具不构成证据）判成「零证据作答」，摘要被换成兜底话术，
+    // 主代理拿到的是一句「没取到数据」而不是子代理真正做出来的东西。
+    enforceGrounding: false,
     // 子代理不自己弹确认卡（写操作安全闸门 P0-5）：需要用户拍板的操作由闸门按作用域拒绝
     // （risk.ts subagentMayExecute）——免确认的工作区写可用，外部写留给主对话。
     // SUBAGENT_ALLOW_WRITE=on 仅作预留（确认事件转发未实现，放开会导致挂起到超时），不改变本值。
@@ -2030,6 +2086,17 @@ export async function* chatStream(
   // 内置工具与本对话勾了哪些 MCP 无关，始终注入（见上方 mcpEnabled 注释）。
   const builtinSpecs = builtinToolSpecs({ toolSearch });
   const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
+  // 接地护栏的第二路开启条件：**按工具动态判定**，而不是只认角色声明。
+  // 本轮存在外部数据源工具（MCP 工具 / 联网检索 / 知识库检索）时，答案就应当接地于工具数据——
+  // 否则「手上明明有取数工具、一次都没调就直接给事实结论」这条最典型的编造路径，
+  // 对通用角色与客服角色完全没有拦截（最容易编数字的业务取数、BI 问答恰恰都在这一类）。
+  // 只挂工作区工具（fs_* / write_todos 等）时不开启：那类轮次本就允许「没有合适工具时用自身知识作答」，
+  // 开了会把写代码、翻译、创作也逼去凑证据——护栏拦的是「无证据的事实断言」，不是「没调工具」。
+  // 注意用 `collected.tools`（本轮可用的全部 MCP 工具）而不是 `specs`：按需加载模式下 MCP schema 未注入，
+  // 但模型仍可检索后调用，能力并未消失，不能因此放弃护栏。
+  const enforceGrounding =
+    roleEnforceGrounding === true ||
+    hasExternalDataSource([...collected.tools.map((tool) => tool.name), ...builtinSpecs.map((spec) => spec.name)]);
   // 只要有工具就进工具循环。内置工具恒在 → 这里恒真；保留该判断是为了让语义显式：
   // 「零工具直连」只在真的没有任何工具可用时成立，而不是由「勾了几个连接器」间接决定。
   const useTools = specs.length > 0;
@@ -2167,13 +2234,15 @@ export async function* chatStream(
           allowTask: true,
           allowWrite: true,
           grantServers: new Set(conversation?.readGrants || []),
+          // 完全访问：缺省开箱即 true（conversation.fullAccess 未设置 = 完全授权）。
+          fullAccess: conversation?.fullAccess ?? true,
           sessionId: opts.sessionId,
           // 调用方给了预算就用它（无人值守的定时任务比交互式宽），否则走全局默认。
           maxRounds: opts.maxRounds && opts.maxRounds > 0 ? Math.floor(opts.maxRounds) : MAX_TOOL_ROUNDS,
           ...(opts.forceWrapUp ? { forceWrapUp: true } : {}),
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
-          enforceGrounding: roleEnforceGrounding,
+          enforceGrounding,
           ownerKey: opts.ownerKey,
           system: systemPrompt,
         },

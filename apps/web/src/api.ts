@@ -267,6 +267,8 @@ export interface ConversationDto {
   archived?: boolean;
   /** 免打扰：静默该对话的后台完成提醒（不弹提示，不影响消息落库与状态点）。 */
   muted?: boolean;
+  /** 完全访问：true = 写/破坏性/外部操作不逐项弹确认卡（默认 true）。 */
+  fullAccess?: boolean;
 }
 
 export async function fetchConversations(includeArchived = false, agentId?: string): Promise<ConversationDto[]> {
@@ -336,6 +338,8 @@ export async function patchConversation(
     archived?: boolean;
     /** 免打扰：静默该对话的「后台任务完成」提醒。 */
     muted?: boolean;
+    /** 完全访问：true = 不逐项弹确认卡（默认 true）。 */
+    fullAccess?: boolean;
   },
 ): Promise<ConversationDto> {
   const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`, {

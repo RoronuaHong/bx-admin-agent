@@ -91,6 +91,12 @@ interface ConversationDoc {
   muted?: boolean;
   /** 会话级只读授权：该对话内，把这些 MCP 服务器上「未声明级别」的工具按只读处理（写操作安全闸门 P0-3）。 */
   readGrants?: string[];
+  /**
+   * 完全访问：true（默认）= 该对话内的写/破坏性/外部操作不再逐项弹确认卡，直接执行
+   * （对齐 CodeBuddy「完全访问模式」）。false = 恢复默认的安全闸门（每次外部副作用前确认）。
+   * 缺省按 true 处理，即开箱即「完全授权」。
+   */
+  fullAccess?: boolean;
   /** 设备 owner 标注（轻量归属隔离，方案 A）：创建该对话的设备标识；缺省 = 遗留数据（对所有人可见）。 */
   ownerKey?: string;
   /**
@@ -247,6 +253,8 @@ export async function createConversation(input: {
     mcpServers: mcp,
     createdAt: now,
     updatedAt: now,
+    // 开箱即「完全访问」：写/破坏性/外部操作不逐项弹确认卡。
+    fullAccess: true,
     ...(input.agentId ? { agentId: input.agentId } : {}),
     ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
   };
@@ -268,6 +276,7 @@ export async function createConversation(input: {
       $setOnInsert: {
         createdAt: now,
         mcpServers: doc.mcpServers,
+        fullAccess: true,
         ...(input.agentId ? { agentId: input.agentId } : {}),
         ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
       },
@@ -385,13 +394,15 @@ export interface ConversationPatch {
   muted?: boolean;
   /** 会话级只读授权（服务器 id 白名单）。 */
   readGrants?: string[];
+  /** 完全访问开关（true = 不逐项弹确认卡，默认 true）。 */
+  fullAccess?: boolean;
 }
 
 /**
  * 只改变「列表怎么组织」、不代表对话有新活动的字段：
  * 改它们不应刷新 `updatedAt`，否则在「按最近活动排序」下会把该对话弹到列表最前（与用户预期不符）。
  */
-const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled"]);
+const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled", "fullAccess"]);
 
 /**
  * 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。
@@ -400,7 +411,7 @@ const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted",
  */
 export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
   const set: Record<string, unknown> = {};
-  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants"] as const) {
+  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
   if (!Object.keys(set).length) return getConversation(id);

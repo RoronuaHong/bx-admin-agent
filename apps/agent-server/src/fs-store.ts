@@ -64,6 +64,11 @@ function convDir(conversationId: string): string {
   return join(FS_ROOT, id || "anonymous");
 }
 
+/** 对话工作区根目录（供 run_command 等需要 cwd 的工具使用，避免重复推导路径）。 */
+export function conversationFsRoot(conversationId: string): string {
+  return convDir(conversationId);
+}
+
 /** 校验并解析对话内相对路径；越界/非法返回 null。 */
 function safePath(conversationId: string, rawPath: string): string | null {
   const raw = String(rawPath || "").trim().replace(/^\/+/, "");

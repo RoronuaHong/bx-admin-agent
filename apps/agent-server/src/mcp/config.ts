@@ -1,6 +1,6 @@
 // MCP 服务器配置持久化（全局一份列表；会话只存「启用的 id 集合」）。
 // 凭据（env / headers）只落本机 .data/mcp-servers.json，对外接口一律只返回键名。
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { DATA_DIR, atomicWriteJson } from "../store-util.js";
 
@@ -56,6 +56,15 @@ const TRANSPORTS: McpTransport[] = ["stdio", "http"];
 
 /** 文件配置（唯一会被写回 .data/mcp-servers.json 的部分）。 */
 let fileCache: McpServerConfig[] | null = null;
+/**
+ * 缓存对应的文件 mtime（毫秒）。
+ *
+ * 为什么必须记 mtime：配置可能被**本进程之外**改动（手工编辑文件、部署脚本写盘、另起脚本初始化），
+ * 只靠内存缓存会让「文件已改、服务仍用旧值」——最痛的表现是换了 token 却一直 401，
+ * 而且直连 API 与独立起 MCP 进程都能验证通过，唯独对话里失败，排查成本极高。
+ * 这里与 rag/store.ts 同一口径：**按文件 mtime 失效**，而不是「只有自己写过才刷新」。
+ */
+let fileCacheMtime = 0;
 /** 内置服务器（由环境变量提供，不落盘）。 */
 let builtinCache: McpServerConfig[] | null = null;
 
@@ -78,7 +87,18 @@ export function validateServerInput(input: Partial<McpServerConfig>): string | n
 
 /** 文件配置：读取 .data/mcp-servers.json（可写，用户可增删改）。 */
 function fileServers(): McpServerConfig[] {
-  if (fileCache) return fileCache;
+  // 缓存命中还要再看 mtime：外部改过文件就重新读（见 fileCacheMtime 的注释）。
+  // 文件被删（mtime=0）也要能感知：否则删除后仍按旧列表提供服务。
+  let mtime = 0;
+  try {
+    mtime = statSync(CONFIG_PATH).mtimeMs;
+  } catch {
+    mtime = 0;
+  }
+  if (fileCache && mtime === fileCacheMtime) return fileCache;
+  if (fileCache && mtime !== fileCacheMtime) {
+    console.log("[mcp:config] 检测到配置文件变更（mtime 变化），已重新加载");
+  }
   try {
     if (existsSync(CONFIG_PATH)) {
       const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as unknown;
@@ -86,6 +106,7 @@ function fileServers(): McpServerConfig[] {
         fileCache = parsed
           .filter((s): s is McpServerConfig => Boolean(s && typeof s === "object" && (s as McpServerConfig).id))
           .map((s) => ({ ...s, enabled: s.enabled !== false }));
+        fileCacheMtime = mtime;
         return fileCache;
       }
     }
@@ -93,6 +114,7 @@ function fileServers(): McpServerConfig[] {
     console.warn(`[mcp:config] 读取失败，按空配置处理：${String((err as Error)?.message || err)}`);
   }
   fileCache = [];
+  fileCacheMtime = mtime;
   return fileCache;
 }
 
@@ -129,6 +151,12 @@ export function loadServers(): McpServerConfig[] {
 function persist(list: McpServerConfig[]): void {
   fileCache = list;
   atomicWriteJson(CONFIG_PATH, list, { logLabel: "mcp:config" });
+  // 写回后同步 mtime：否则下一次读取会把「自己刚写的文件」当成外部变更，白刷一次并打日志。
+  try {
+    fileCacheMtime = statSync(CONFIG_PATH).mtimeMs;
+  } catch {
+    fileCacheMtime = 0;
+  }
 }
 
 export function getServer(id: string): McpServerConfig | null {

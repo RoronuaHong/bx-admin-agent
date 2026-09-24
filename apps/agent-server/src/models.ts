@@ -90,6 +90,13 @@ export interface CallOptions {
    */
   disableThinking?: boolean;
   /**
+   * 采样温度。**只给判定型内部调用显式设置**（事后核验 / 数据需求分诊 / 诚实兜底）——
+   * 它们是「判对错」的调用，采样随机会让同一段回答今天拦、明天放，护栏自己就成了新的随机源。
+   * 主对话刻意不设：通用聊天与创作需要多样性，且各网关默认值不同，统一写死反而改变既有行为。
+   * 与 `disableThinking` 同风格：不传就不塞参数，避免把可能不被接受的字段塞给所有调用。
+   */
+  temperature?: number;
+  /**
    * 系统提示的两段式形态（Deep Agents 的 prompt caching 思路）：
    * `stable` 跨轮不变（角色守则 + skills 索引）→ anthropic 加 cache_control 标记缓存；
    * `dynamic` 低频变化（记忆 / 摘要 / 语言）。OpenAI 兼容通道的隐式前缀缓存无需标记。
@@ -279,6 +286,7 @@ async function callAnthropic(
     max_tokens: config.maxOutputTokens,
     // 流式：边生成边回包，避免网关对慢模型整包超时（不支持时按非流式降级解析）。
     stream: true,
+    ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
     ...(budget ? { thinking: { type: "enabled", budget_tokens: budget } } : {}),
     ...(system ? { system } : {}),
     messages,
@@ -595,6 +603,7 @@ async function callOpenAi(
       max_tokens: config.maxOutputTokens,
       // 流式：边生成边回包，避免网关对慢模型整包超时。
       stream: true,
+      ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       messages,
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
