@@ -278,7 +278,7 @@
 <tr><td>缺口：路由</td><td>漏 <code>/support</code></td><td>补：<code>/support</code> 复用 ChatPage，用 props 注入 <code>agentId</code> 做会话分槽</td></tr>
 <tr><td>缺口：观影画像 / 通知投递</td><td>提了一句</td><td>补 <code>movie/profile.ts</code>（Mongo <code>movie_profiles</code>、上限 200 条）与 <code>notify/deliver.ts</code>（钉钉加签 + 关键词 / 飞书）</td></tr>
 <tr><td>缺口：内置 MCP / 脚本 / 测试 / 文档</td><td>完全没写</td><td>新增 A 章：<code>MCP_BUILTIN_SERVERS</code>（bi / yapi / movie + <code>toolRisks</code>）、4 个脚本、<strong>20 个测试用例</strong>按四组归类、<code>docs/knowledge/</code> 同时是 RAG 语料</td></tr>
-<tr><td>MCP 配置缓存缺陷</td><td>标为 🐞 已知缺陷</td><td><strong>已实际修复</strong>：<code>config.ts</code> 按 mtime 失效 + <code>persist()</code> 同步 mtime + <code>AGENT_DATA_DIR</code> 可覆盖（便于测试）+ <code>tests/mcp-config-hotreload.test.ts</code> 4 例全绿</td></tr>
+<tr><td>MCP 配置缓存缺陷</td><td>标为 🐞 已知缺陷</td><td><strong>已实际修复</strong>：<code>config.ts</code> 按 <strong>mtime + size</strong> 失效（2026-09-24 起，只按 mtime 会漏掉同毫秒改写）+ <code>persist()</code> 同步两者 + <code>AGENT_DATA_DIR</code> 可覆盖（便于测试）+ <code>tests/mcp-config-hotreload.test.ts</code> 5 例全绿（详见 <code>docs/artifact-delivery-plan.md</code> §14）</td></tr>
 </tbody>
 </table>
 </div>

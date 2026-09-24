@@ -277,7 +277,12 @@
 
 **验收**：任何一次失败都能用 runId 还原全链路；能回答"昨天谁花了最多 token、哪次最慢、空响应率多少"。
 
-**本项目对照**：🟡 部分 — **最小版已落地（2026-09-17）**：`src/trace.ts`——每次对话任务收束落一行 run 级 JSONL（`.data/traces/runs-YYYYMM.jsonl`：runId / ownerKey / sessionId / 模型 / 状态 / 耗时 / rounds / toolCalls / tokens / 错误 / release），统计取自任务事件缓冲零侵入模型循环；`GET /chat/trace/runs`（owner 过滤 + limit + release）；`GET /health` 带 release 标记。仍缺：❌ span 细分（llm/tool 分层）、❌ 指标看板、❌ 按会话回放完整事件序列。
+**本项目对照**：🟡 部分 — **最小版已落地（2026-09-17）**：`src/trace.ts`——每次对话任务收束落一行 run 级 JSONL（`.data/traces/runs-YYYYMM.jsonl`：runId / ownerKey / sessionId / 模型 / 状态 / 耗时 / rounds / toolCalls / tokens / 错误 / release），统计取自任务事件缓冲零侵入模型循环；`GET /chat/trace/runs`（owner 过滤 + limit + release）；`GET /health` 带 release 标记。
+**逐轮 trace 已补（2026-09-24）**：`.data/traces/rounds-<runId>.jsonl` 每个工具循环轮次落一行
+（round / mode / toolCallsThisRound / clearedDelta / offloadedDelta / groundingEvidence / spentTokens / note），
+runId 由 `app.ts` 经 `traceMeta.runId` 透传，使「重复探查 / 预算耗尽 / 熔断」可复盘
+（设计与验证见 `docs/artifact-delivery-plan.md` §12.7）。
+仍缺：❌ span 细分（**llm / tool 分层**，现有只到轮次级）、❌ 指标看板、❌ 按会话回放完整事件序列。
 **补齐建议**：成本聚合（§12）可直接消费这份 JSONL；span 细分等有排障需求再上。
 
 ---

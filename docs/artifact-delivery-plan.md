@@ -16,6 +16,19 @@
 | 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
 | 7 | v2.1 报告式导出交付断链修复（零表格报告 + fs_write 下载卡片，§11） | ✅ 已落地（2026-09-24，见 §11.4） |
 | 8 | 交互式轮次耗尽「补位收尾」（全程审计产物，§12） | ✅ 已落地（2026-09-24，见 §12.3） |
+| 9 | 跨轮重复调用观察提示（软提示不硬拦，§12.4） | ✅ 已落地（2026-09-24） |
+| 10 | 逐轮 trace 可观测（`rounds-<runId>.jsonl`，§12.7） | ✅ 已落地（2026-09-24） |
+| 11 | 手写 HTML 零外链软护栏（`externalRefHint`，§11.5） | ✅ 已落地（2026-09-24） |
+| 12 | `run_command` 命令执行治理（编码 / 截断 / 干净环境 / 非交互，§13） | ✅ 已落地（2026-09-24） |
+| 13 | MCP 配置热重载缓存失效键 `mtime + size`（§14） | ✅ 已落地（2026-09-24） |
+
+> 说明：第 4 项经 2026-09-24 复核仍为待实施。复核口径（以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准）：
+> 内置工具共 **21** 个 —— `fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `read_skill`
+> `render_chart` `request_clarification` `recall_memory` `save_memory` `search_tools` `search_knowledge`
+> `knowledge_sources` `web_search` `fetch_url` `export_data` `write_todos` `task` `run_command`
+> `record_watched_movies`；其中 19 个在 `execBuiltin` 里分发，`task` 与 `search_tools` 由 `chat.ts`
+> 循环内直接处理。**确无 `fs_delete`**；上传附件仍只做本轮解析、不进工作区；定时任务未工具化。
+> 第 5 项 `run_script` / `image_gen` 维持暂缓，论证见 §6。
 
 ---
 
