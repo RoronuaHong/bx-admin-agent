@@ -176,6 +176,35 @@ export interface BuiltinOutcome {
   artifact?: ArtifactSpec;
 }
 
+/**
+ * 外部资源引用检测（产物自包含护栏，§11.2 原则 1 的软提示版）。
+ *
+ * `fs_write` 写出的 HTML 是模型手写的，可能引用外部 CDN（echarts / 字体 / 样式）——
+ * 用户下载后离线打开，图表与样式会空白，只剩一张空壳页面（正是 §11.1 断链的观感）。
+ * 与「跨轮重复调用」同口径：**只提示不硬拦**（对齐 Goldilocks——不过度硬编码 if-else，
+ * 且模型确有「内嵌第三方库做自检页」的合法场景），引导它改用 export_data（服务端合成、内联 SVG）。
+ */
+const EXTERNAL_REF_RE =
+  /<(?:script|link|img|iframe|embed|source)\b[^>]*?(?:src|href)\s*=\s*["']\s*(?:https?:)?\/\/[^"']+/gi;
+/** 提示里只列前 3 个样例：目的是让模型看清「引用了外部资源」，不是把整份依赖清单灌回上下文。 */
+const EXTERNAL_REF_SAMPLES = 3;
+
+export function externalRefHint(content: string): string {
+  if (!content) return "";
+  const hits = content.match(EXTERNAL_REF_RE);
+  if (!hits?.length) return "";
+  const samples = hits.slice(0, EXTERNAL_REF_SAMPLES).map((hit) => {
+    const url = hit.match(/(?:https?:)?\/\/[^"'\s]+/);
+    return url ? url[0] : hit.slice(0, 40);
+  });
+  return (
+    `\n\n注意：该文件引用了 ${hits.length} 处外部资源（${samples.join("、")}），` +
+    "离线 / 断网打开时图表与样式会空白，用户可能只看到一张空壳页面。" +
+    "交付物必须自包含：请用 export_data(format=html) 让服务端合成（图表烘焙成内联 SVG），" +
+    "或把依赖改成内联 <style> / <svg> 后重写本文件。"
+  );
+}
+
 const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const MAX_TODOS = 20;
 const MAX_TODO_CHARS = 200;
@@ -1120,7 +1149,10 @@ export async function execBuiltin(
         const fileName = result.path.split("/").pop() || result.path;
         return {
           ok: true,
-          text: `已写入 ${result.path}（${result.bytes} 字节），已作为下载卡片显示在对话中。`,
+          // 外链检测：手写 HTML 引用 CDN 时回灌软提示，引导改用 export_data 合成自包含文件（不硬拦）。
+          text:
+            `已写入 ${result.path}（${result.bytes} 字节），已作为下载卡片显示在对话中。` +
+            externalRefHint(str(args, "content")),
           artifact: { path: result.path, name: fileName, bytes: result.bytes, mime: mimeOf(result.path) },
         };
       }
