@@ -14,6 +14,7 @@
 | 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ⬜ 待实施 |
 | 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
 | 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
+| 7 | v2.1 报告式导出交付断链修复（零表格报告 + fs_write 下载卡片，§11） | ✅ 已落地（2026-09-24，见 §11.4） |
 
 ---
 
@@ -313,3 +314,45 @@ user: 123
 **验证**：`tests/export-formats.test.ts` 7/7（八格式落盘非空、pdf `%PDF-` / docx `PK` 魔数、html 表格与标题、多表策略、别名归一、不支持格式拒绝、pdf 行数上限）；全量 `pnpm test` **20 文件 / 126 测试全绿**。真实产物抽检：PDF 与 docx 的中文均可被 `unpdf` / `mammoth` 正确提取，PDF 因 **pdfkit 自动 subset** 仅约 48KB（源字体 8.3MB）。
 
 **尚未做**：`pptx`（§10.2 列出但未纳入本批 `EXPORT_FORMATS`）、`png`（图表存图属前端 ChartCard 改动）。
+
+---
+
+## 11. v2.1 修复：报告式导出交付断链（2026-09-24）
+
+> 触发：实测会话（「分组统计 + 表格 + 折线图 + 饼图 + 预测与建议，全部生成到 html 里」）——
+> 模型取数、核实字段、画图（`render_chart` × 2）全部成功，最终交付却失败：用户既没看到下载卡片，
+> 模型收束文本还停在「参数未正常传入导致写入失败，重新写入：」。
+> 事后核查：HTML 文件**其实已写到工作区**（16KB），但用户拿不到——典型的「交付断链」复发。
+
+### 11.1 断链核查（代码级，逐层）
+
+| # | 环节 | 落点 | 现象 / 根因 |
+|---|---|---|---|
+| 1 | `export_data` 报告格式表格必填 | `builtins.ts` `export_data` → `exportMatrix` | 报告式格式（html/pdf/docx）即使给了 `sections`+`charts`，只要没给 `rows`/`sheets`，`rawSheets` 无条件兜底 `{rows: args.rows}` → 「缺少数据行」直接报错。模型想交付「叙述+图表、无明细表」的报告被拒——它口中的「参数未正常传入」即此 |
+| 2 | `fs_write` 不下发 artifact | `builtins.ts` `case "fs_write"` | 返回只有 text；`artifact` 事件是 `export_data` 专属。模型被 #1 拒后退而用 `fs_write` 手写 HTML → 文件写进工作区、**前端没有任何下载入口**（下载卡片三段一体缺一段，v1 §4 结论复现） |
+| 3 | 手写 HTML 带外链 CDN | 模型行为（fs_write 的 content） | `<script src="https://cdn.jsdelivr.net/.../echarts.min.js">`——违反本仓导出物「**自包含、零外链**」设计原则（`report.ts` 头注）：断网 / CDN 不可达时打开就是图表空白 |
+| 4 | 首次 `fs_write` 非法路径 | `fs-store.ts` `safePath` | 模型第一次传了工作区外路径 → 「非法路径」报错。`safePath` 拦截正确；但工具描述未强调「只接受相对路径」，加剧了试错轮次 |
+| 5 | （附带）预测 SQL 报错 | ClickHouse `ILLEGAL_AGGREGATION` | 聚合函数套聚合，属模型写错 SQL，与交付断链无关，不计入本修复 |
+
+### 11.2 最佳实践对齐（修复原则）
+
+1. **导出物自包含、零外链**：HTML 报告一律由服务端合成（`report.ts` 的 `buildHtmlReport`：内联样式 + 图表烘焙成内联 SVG），绝不接受模型手写引用 CDN 的网页。
+2. **交付走 `export_data` 单一通道**：下载卡片 = `artifact` 事件 + 下载端点 + 前端卡片，三段一体；`fs_write` 是工作区**草稿**语义（对齐 §5 P0 #7 的引导原则）。
+3. **报告与数据分离**：报告式格式（html/pdf/docx）的载体是「叙述 + 图表 + 表格（可选）」；数据格式（xlsx/csv/json/md/txt）的载体是表格（必填）。「缺表格就报错」只应约束后者——v2 只实现了「报告格式可带 sections/charts」，漏了「可**只**带 sections/charts」。
+4. **诚实失败**：表格 / 叙述 / 图表三种内容全空时明确报错，不产出空文件。
+
+### 11.3 修复设计（三条，全部服务端，前端零改动）
+
+| # | 改动 | 落点 | 要点 |
+|---|---|---|---|
+| A | 报告格式允许零表格 | `builtins.ts` `export_data` | 新增 `REPORT_EXPORT_FORMATS = {html, pdf, docx}`：无 `rows`/`sheets` 时跳过建表（`built=[]`），只渲染 `sections`+`charts`；数据格式维持必填并提前明确报错；三者全空报「缺少内容」；总结文案适配零表格形态（原 `${built[0]!.matrix...}` 在空表时会崩） |
+| B | `fs_write` 写 `.html` 下发下载卡片 | `builtins.ts` `case "fs_write"` | 命中 `.html/.htm` 扩展名（协议级判定，无业务词）时返回 `artifact`——前端既有 `isHtmlArtifact` 自动带「预览 + 下载」双按钮；其余扩展名维持草稿语义不下发卡片 |
+| C | 工具描述引导 | `builtins.ts` `export_data` / `fs_write` spec | `export_data`：「报告式格式可只给 sections+charts」「导出物必须自包含，禁止用 fs_write 手写带外链 CDN 的网页代替本工具」；`fs_write`：「草稿通道，不出下载卡片（.html 除外）；交付用户的文件用 export_data；只接受工作区内相对路径」 |
+
+### 11.4 验收标准（v2.1）
+
+1. `export_data` html 仅 `sections`+`charts`（无 rows）→ 成功产出含 `<figure>`/内联 `<svg>` 的自包含 HTML（无 `<script` 外链），下载卡片出现。
+2. html/pdf/docx 零表格可用；xlsx/csv/json/md/txt 无 rows 仍明确报「缺少数据行」。
+3. 三者全空（无 rows/sections/charts）→ 明确报「缺少内容」，不产出空文件。
+4. `fs_write` 写 `.html` → 对话出现下载卡片（可预览/下载）；写 `.md`/`.txt` → 无卡片（草稿语义不变）。
+5. 回归：`tests/export-formats.test.ts` 既有 7 组用例全绿 + 新增零表格 / 全空拒绝 / fs_write 卡片用例；xlsx 等既有格式产物语义不变。

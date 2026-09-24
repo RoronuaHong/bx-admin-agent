@@ -1,0 +1,89 @@
+$ vitest run
+
+[1m[46m RUN [49m[22m [36mv3.2.7 [39m[90mD:/Code/bx-admin-agent/apps/agent-server[39m
+
+[90mstdout[2m | tests/mcp-config-hotreload.test.ts[2m > [22m[2m[B] 进程外改写文件 → 下次 loadServers 立即看到新值（本次修复的核心）
+[22m[39m[mcp:config] 检测到配置文件变更（mtime 变化），已重新加载
+
+[90mstdout[2m | tests/mcp-config-hotreload.test.ts[2m > [22m[2m[C] 内容未变时不重复解析（缓存仍生效，不是每次都读盘）
+[22m[39m[mcp:config] 检测到配置文件变更（mtime 变化），已重新加载
+
+[90mstdout[2m | tests/mcp-config-hotreload.test.ts[2m > [22m[2m[D] 文件被删除 → 不再返回已删除的服务器（不留在旧列表里）
+[22m[39m[mcp:config] 检测到配置文件变更（mtime 变化），已重新加载
+
+ [32m✓[39m tests/mcp-config-hotreload.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 63[2mms[22m[39m
+ [32m✓[39m tests/role-guard.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m tests/grounding-guard.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m tests/notify-deliver.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+ [32m✓[39m tests/system-prompt-contract.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m tests/hallucination-contract.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+[90mstderr[2m | tests/task-persistence.test.ts[2m > [22m[2m[F] 进程退出：把自己在跑的任务就地标成 interrupted 并落档（不等心跳过期）
+[22m[39m[chat:tasks] 进程退出（SIGTERM）：任务 task_5e9d6d27-79dc-4161-8dd6-3b03327bf8a4 标记为 interrupted
+[chat:tasks] 进程退出（SIGTERM）：任务 task_3e0033cd-cfe0-43e3-92e3-4350e324a866 标记为 interrupted
+
+ [32m✓[39m tests/task-persistence.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m tests/schedule-retry.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 71[2mms[22m[39m
+[90mstderr[2m | tests/task-resume.test.ts[2m > [22m[2m[G] 无进展看门狗：长时间没有实质事件就主动收口，并丢弃迟到产物
+[22m[39m[chat:watchdog] 任务 task_ec90ddf2-f024-465b-8c24-f50fa34a505f 已 0s 无进展（阈值 0s），主动收口
+
+[90mstderr[2m | tests/task-resume.test.ts[2m > [22m[2m[G] 无进展看门狗：长时间没有实质事件就主动收口，并丢弃迟到产物
+[22m[39m[chat:watchdog] 任务 task_2acc0121-35a4-4146-b710-b9fc184aae2e 已 0s 无进展（阈值 0s），主动收口
+
+ [32m✓[39m tests/chart-render.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m tests/web-api-error-code.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m tests/task-resume.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 193[2mms[22m[39m
+[90mstderr[2m | tests/deep-agent-control.test.ts[2m > [22m[2m[E] 强制工具通道端点记忆：被拒一次后不再尝试 required（未受影响/换端点仍可尝试）
+[22m[39m[chat:tool-choice] 端点不接受强制工具通道（模型 probe-a）：反编造由提示词纪律 + 接地护栏承担，该端点不再尝试 tool_choice=required
+
+ [32m✓[39m tests/deep-agent-control.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m tests/answer-protocol-guard.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m tests/attachment-budget.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+[90mstderr[2m | tests/thinking.test.ts[2m > [22m[2m思考回灌（reasoning_content）：能力学习 + 自愈重发[2m > [22m[2m未学到的端点：不塞未知字段；学到后：带 reasoning_content（有原文用原文，没有给空串）
+[22m[39m[models] 端点要求 assistant 工具调用消息回灌 reasoning_content（模型 probe-with-reasoning）：已按该口径重发，且该端点后续都按此口径组装消息
+
+[90mstderr[2m | tests/thinking.test.ts[2m > [22m[2m思考回灌（reasoning_content）：能力学习 + 自愈重发[2m > [22m[2m未学到的端点：不塞未知字段；学到后：带 reasoning_content（有原文用原文，没有给空串）
+[22m[39m[models] 端点要求 assistant 工具调用消息回灌 reasoning_content（模型 probe-no-reasoning）：已按该口径重发，且该端点后续都按此口径组装消息
+
+[90mstderr[2m | tests/thinking.test.ts[2m > [22m[2m思考回灌（reasoning_content）：能力学习 + 自愈重发[2m > [22m[2m首跳被拒 → 同一轮内补字段重发一次，之后该端点不再白打 400
+[22m[39m[models] 端点要求 assistant 工具调用消息回灌 reasoning_content（模型 probe-learn）：已按该口径重发，且该端点后续都按此口径组装消息
+
+ [32m✓[39m tests/thinking.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 19[2mms[22m[39m
+ [32m✓[39m tests/sql-readonly.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m tests/write-gate.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m tests/context-budget.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 347[2mms[22m[39m
+   [33m[2m✓[22m[39m [4] governToolResults（本轮工具结果治理：卸载到工作区） [33m 341[2mms[22m[39m
+ [32m✓[39m tests/export-formats.test.ts [2m([22m[2m11 tests[22m[2m)[22m[33m 977[2mms[22m[39m
+   [33m[2m✓[22m[39m [A] 八种格式都生成真实文件（非空、可落盘） [33m 488[2mms[22m[39m
+[90mstderr[2m | tests/clarification-flow.test.ts[2m > [22m[2m[A] 澄清挂起期间冻结非只读调用；契约字段与选项完整下发；点选后正常收束
+[22m[39m[conversations] MongoDB 连接失败，降级内存存储：connect ECONNREFUSED 127.0.0.1:1
+
+[90mstderr[2m | tests/deep-agent-live.test.ts[2m > [22m[2mDeep Agent 端到端循环：主代理委派 → 子代理执行内置工具 → 收敛
+[22m[39m[conversations] MongoDB 连接失败，降级内存存储：connect ECONNREFUSED 127.0.0.1:1
+
+[90mstderr[2m | tests/pseudo-chart-guard.test.ts[2m > [22m[2m图片占位符被拦截：正文不上屏、改由 render_chart 真正出图
+[22m[39m[conversations] MongoDB 连接失败，降级内存存储：connect ECONNREFUSED 127.0.0.1:1
+
+[90mstdout[2m | tests/pseudo-chart-guard.test.ts[2m > [22m[2m图片占位符被拦截：正文不上屏、改由 render_chart 真正出图
+[22m[39m[chat:tools] mode=eager mcp=0/0 builtin=18 ready=- unavailable=- dropped=- web=off
+
+[90mstdout[2m | tests/deep-agent-live.test.ts[2m > [22m[2mDeep Agent 端到端循环：主代理委派 → 子代理执行内置工具 → 收敛
+[22m[39m[chat:tools] mode=eager mcp=0/0 builtin=18 ready=- unavailable=mock(服务端未配置该服务器) dropped=- web=off
+
+[90mstdout[2m | tests/clarification-flow.test.ts[2m > [22m[2m[A] 澄清挂起期间冻结非只读调用；契约字段与选项完整下发；点选后正常收束
+[22m[39m[chat:tools] mode=eager mcp=0/0 builtin=18 ready=- unavailable=mock(服务端未配置该服务器) dropped=- web=off
+
+[90mstdout[2m | tests/pseudo-chart-guard.test.ts[2m > [22m[2m图片占位符被拦截：正文不上屏、改由 render_chart 真正出图
+[22m[39m[chat:pseudo-chart] 检出图片占位符（chart），已作废并回灌纠正提示
+
+ [32m✓[39m tests/pseudo-chart-guard.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 3632[2mms[22m[39m
+   [33m[2m✓[22m[39m 图片占位符被拦截：正文不上屏、改由 render_chart 真正出图 [33m 3041[2mms[22m[39m
+ [32m✓[39m tests/clarification-flow.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 3634[2mms[22m[39m
+   [33m[2m✓[22m[39m [A] 澄清挂起期间冻结非只读调用；契约字段与选项完整下发；点选后正常收束 [33m 3041[2mms[22m[39m
+ [32m✓[39m tests/deep-agent-live.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 3966[2mms[22m[39m
+   [33m[2m✓[22m[39m Deep Agent 端到端循环：主代理委派 → 子代理执行内置工具 → 收敛 [33m 3374[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m22 passed[39m[22m[90m (22)[39m
+[2m      Tests [22m [1m[32m148 passed[39m[22m[90m (148)[39m
+[2m   Start at [22m 13:41:01
+[2m   Duration [22m 4.27s[2m (transform 976ms, setup 0ms, collect 6.01s, tests 12.98s, environment 3ms, prepare 2.12s)[22m
+

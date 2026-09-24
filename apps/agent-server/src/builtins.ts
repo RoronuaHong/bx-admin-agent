@@ -173,6 +173,9 @@ const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md", "docx", "pdf", "htm
 const MULTI_SHEET_FORMATS = new Set(["xlsx", "docx", "pdf"]);
 /** 走文本路径（fsWrite，256KB 上限）的格式；其余走二进制路径（fsWriteBinary，20MB 上限）。 */
 const TEXT_EXPORT_FORMATS = new Set(["csv", "json", "md", "html", "txt"]);
+/** 报告式格式：载体是「叙述 + 图表 + 表格（可选）」，允许零表格（只给 sections/charts 也能成文）；
+ *  数据格式的载体就是表格，仍必填（见 docs/artifact-delivery-plan.md §11.2 原则 3）。 */
+const REPORT_EXPORT_FORMATS = new Set(["html", "pdf", "docx"]);
 /** 单次导出的行数上限（所有 sheet 合计）：超了应先聚合/筛选或分批导出，而不是把整表灌进来。 */
 const MAX_EXPORT_ROWS = Number(process.env.FS_MAX_EXPORT_ROWS || 50_000);
 /** 分格式收紧的行数上限：PDF 页数会随行数线性膨胀，docx 长篇也一样（对齐 artifact-delivery-plan §10.4）。 */
@@ -240,6 +243,9 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "fs_write",
       "把内容写入当前对话的工作区文件（**覆盖同名文件，旧内容不保留**）。" +
         "用于保存中间结果、大段数据或待办材料，之后可用 fs_read 取回。" +
+        "path 只接受工作区内**相对路径**（绝对路径与 .. 一律被拒绝）。" +
+        "fs_write 是草稿通道：写出的文件不出现在下载卡片（.html 网页除外）；" +
+        "**要交付给用户的文件（表格 / 报告 / 文档）用 export_data**——不要用它手写引用外部 CDN 的网页冒充交付物（导出物必须自包含，断网也能打开）。" +
         "写之前先用 fs_read 确认同名文件里有没有要保留的内容；本次回答用不到第二遍的中间过程不必落盘。",
       {
         type: "object",
@@ -463,6 +469,8 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         "**报告式导出（html / pdf / docx）可把图表和叙述也一并装进文件**：" +
         "把本轮回话里 render_chart 产出的图表 spec 原样放进 `charts` 数组（html 会渲染成内联 SVG，pdf 渲染成矢量图，docx 退化为数据表）；" +
         "把口径说明 / 预测 / 建议等叙述文字（markdown）放进 `sections`（字符串或字符串数组）。" +
+        "报告式格式**可以不带表格**：只给 sections 与 charts（不给 rows/sheets）也能成文；xlsx/csv/json/md/txt 则必须给 rows 或 sheets。" +
+        "导出物由服务端合成为自包含文件（内联样式与图表）：**不要用 fs_write 手写引用外部 CDN 的网页代替本工具**——那既不出下载卡片（.html 除外），断网打开还会图表空白。" +
         "这样用户要的「表 + 图 + 结论全部进一个文件」就能满足，而不是只在聊天里出图、文件里只有表。" +
         "行数据的两种写法：行对象数组（对象的键就是表头文字，可直接用中文键名）或二维数组（第一行即表头）。" +
         "多张表用 sheets（[{ name, rows, columns? }]），单张表直接用 rows。" +
@@ -475,7 +483,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           format: jsonType("string", "csv | xlsx | json | md | docx | pdf | html | txt（省略时按 filename 扩展名推断，默认 xlsx）"),
           rows: {
             type: "array",
-            description: "单张表的行数据：行对象数组（键即表头）或二维数组（第一行为表头）",
+            description: "单张表的行数据：行对象数组（键即表头）或二维数组（第一行为表头）。报告式导出（html/pdf/docx）可省略（只给 sections/charts）",
           },
           columns: {
             type: "array",
@@ -1080,6 +1088,18 @@ export async function execBuiltin(
     case "fs_write": {
       const result = fsWrite(conversationId, str(args, "path"), str(args, "content"));
       if ("error" in result) return { ok: false, text: `写入失败：${result.error}` };
+      // HTML 是「可直接打开的成品」：与 export_data 同待遇下发下载卡片（产物交付三段一体），
+      // 堵住「模型用 fs_write 交付 → 文件写了、用户拿不到」的断链（§11.1 #2）。
+      // 扩展名是协议级判定，无业务词；前端 isHtmlArtifact 识别 .html 自动带预览按钮，零前端改动。
+      // 其余扩展名维持草稿语义（不出卡片）。
+      if (/\.html?$/i.test(result.path)) {
+        const fileName = result.path.split("/").pop() || result.path;
+        return {
+          ok: true,
+          text: `已写入 ${result.path}（${result.bytes} 字节），已作为下载卡片显示在对话中。`,
+          artifact: { path: result.path, name: fileName, bytes: result.bytes, mime: mimeOf(result.path) },
+        };
+      }
       return { ok: true, text: `已写入 ${result.path}（${result.bytes} 字节）` };
     }
     case "fs_read": {
@@ -1254,11 +1274,24 @@ export async function execBuiltin(
             .filter((c) => c && typeof c === "object" && typeof (c as Record<string, unknown>).chartType === "string")
             .map((c) => c as ChartSpec)
         : [];
-      // 单表（rows）与多表（sheets）统一成 sheets 列表处理，后续只维护一条路径。
-      const rawSheets: unknown[] =
-        Array.isArray(args.sheets) && args.sheets.length
+      // 表格输入检测：rows/sheets 任一非空才算「有表格」。数据格式的载体就是表格，仍必填；
+      // 报告式格式允许零表格——只给叙述与图表也能成文（§11 断链点：原实现无条件兜底
+      // {rows: args.rows}，模型想交付「无明细表的报告」会被「缺少数据行」拒绝）。
+      const hasTableInput =
+        (Array.isArray(args.sheets) && args.sheets.length > 0) ||
+        (Array.isArray(args.rows) && args.rows.length > 0);
+      if (!hasTableInput && !REPORT_EXPORT_FORMATS.has(target.format)) {
+        return { ok: false, text: "导出失败：缺少数据行（rows 必须是非空数组）" };
+      }
+      if (!hasTableInput && !sections.length && !charts.length) {
+        return { ok: false, text: "导出失败：缺少内容（rows/sheets、sections、charts 至少提供一项）" };
+      }
+      // 单表（rows）与多表（sheets）统一成 sheets 列表处理，后续只维护一条路径；零表格时为空列表。
+      const rawSheets: unknown[] = hasTableInput
+        ? Array.isArray(args.sheets) && args.sheets.length
           ? args.sheets
-          : [{ name: title, rows: args.rows, columns: args.columns }];
+          : [{ name: title, rows: args.rows, columns: args.columns }]
+        : [];
       const built: Array<{ name: string; matrix: unknown[][] }> = [];
       let totalRows = 0;
       for (const raw of rawSheets) {
@@ -1301,19 +1334,20 @@ export async function execBuiltin(
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else {
-        const matrix = built[0]!.matrix;
+        // matrix 惰性取用：报告式零表格时 built 为空，只有数据格式与「无叙述无图表的 html」会取——
+        // 两类都已被前置校验保证有表格，! 断言安全。
         const text =
           target.format === "csv"
-            ? toCsvText(matrix)
+            ? toCsvText(built[0]!.matrix)
             : target.format === "json"
-              ? toJsonText(matrix)
+              ? toJsonText(built[0]!.matrix)
               : target.format === "html"
                 ? (sections.length || charts.length
                     ? buildHtmlReport({ title, sections, tables: built, charts })
-                    : buildHtml(title, matrix))
+                    : buildHtml(title, built[0]!.matrix))
                 : target.format === "txt"
-                  ? buildTxt(title, matrix)
-                  : toMarkdownText(title, matrix);
+                  ? buildTxt(title, built[0]!.matrix)
+                  : toMarkdownText(title, built[0]!.matrix);
         written = fsWrite(conversationId, target.name, text);
       }
       if ("error" in written) {
@@ -1326,11 +1360,14 @@ export async function execBuiltin(
       const detail = built
         .map((sheet) => `${sheet.name}（${Math.max(0, sheet.matrix.length - 1)} 行）`)
         .join("、");
+      // 形态摘要随内容自适应：零表格的报告报「叙述段数 + 图表张数」，而不是在空表上取列数（会崩）。
+      const shape = built.length
+        ? `${totalRows} 行 × ${built[0]!.matrix[0]?.length ?? 0} 列${built.length > 1 ? `；工作表：${detail}` : ""}`
+        : `${sections.length} 段叙述${charts.length ? ` + ${charts.length} 张图表` : ""}`;
       return {
         ok: true,
         text:
-          `已生成可下载文件：${written.path}（${written.bytes} 字节，${totalRows} 行 × ${built[0]!.matrix[0]?.length ?? 0} 列` +
-          `${built.length > 1 ? `；工作表：${detail}` : ""}）。` +
+          `已生成可下载文件：${written.path}（${written.bytes} 字节，${shape}）。` +
           "它已作为下载卡片显示在对话中；不要在回复里粘贴文件内容，也不要再用 fs_write 另存副本。",
         artifact: { path: written.path, name: fileName, bytes: written.bytes, mime: mimeOf(written.path) },
       };

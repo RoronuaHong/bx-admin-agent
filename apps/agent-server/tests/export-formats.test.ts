@@ -84,3 +84,58 @@ test("[G] pdf 行数上限收紧：超限报错并引导改用 xlsx", async () =
   expect(out.text).toContain("pdf 上限");
   expect(out.text).toContain("xlsx");
 });
+
+// ---- v2.1（docs/artifact-delivery-plan.md §11）：报告式零表格 + fs_write 下载卡片 ----
+
+test("[H] 报告式零表格：html 仅 sections+charts 可成文（内联 SVG、无外链脚本）", async () => {
+  const out = await run({
+    filename: "纯报告.html",
+    title: "零表格报告",
+    sections: ["## 结论", "- 第一条", "- 第二条"],
+    charts: [{ chartType: "line", title: "趋势", data: [{ x: "周一", y: 1 }, { x: "周二", y: 3 }] }],
+  });
+  expect(out.ok, out.text).toBe(true);
+  expect(out.artifact!.mime).toContain("text/html");
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).toContain("<h1>零表格报告</h1>");
+  expect(html).toContain("第一条");
+  expect(html).toContain("<svg");
+  // 自包含零外链：不接受 <script src=CDN>（对齐 report.ts 设计原则，§11.2 原则 1）
+  expect(html).not.toContain("<script");
+  expect(html).not.toContain("cdn.");
+});
+
+test("[I] 报告式零表格：pdf/docx 同样允许；数据格式无 rows 仍明确拒绝", async () => {
+  for (const fmt of ["pdf", "docx"]) {
+    const out = await run({ filename: `纯报告.${fmt}`, title: "零表格", sections: ["叙述"] });
+    expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
+  }
+  for (const fmt of ["xlsx", "csv", "json", "md", "txt"]) {
+    const out = await run({ filename: `无行.${fmt}`, title: "无行" });
+    expect(out.ok, fmt).toBe(false);
+    expect(out.text, fmt).toContain("缺少数据行");
+  }
+});
+
+test("[J] 三者全空（无 rows/sections/charts）明确拒绝，不产出空文件", async () => {
+  for (const fmt of ["html", "pdf", "docx"]) {
+    const out = await run({ filename: `空报告.${fmt}` });
+    expect(out.ok, fmt).toBe(false);
+    expect(out.text, fmt).toContain("缺少内容");
+  }
+});
+
+test("[K] fs_write 写 .html 下发下载卡片；写 .md 维持草稿语义", async () => {
+  const html = await execBuiltin(
+    "fs_write",
+    JSON.stringify({ path: "草稿页.html", content: "<h1>预览</h1>" }),
+    CONV,
+  );
+  expect(html.ok, html.text).toBe(true);
+  expect(html.artifact).toBeTruthy();
+  expect(html.artifact!.mime).toContain("text/html");
+  expect(html.artifact!.name).toBe("草稿页.html");
+  const md = await execBuiltin("fs_write", JSON.stringify({ path: "草稿.md", content: "# 草稿" }), CONV);
+  expect(md.ok, md.text).toBe(true);
+  expect(md.artifact).toBeUndefined();
+});
