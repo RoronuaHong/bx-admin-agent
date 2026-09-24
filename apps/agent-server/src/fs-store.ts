@@ -374,6 +374,46 @@ function normalizeRel(conversationId: string, absolute: string): string {
 }
 
 /**
+ * 允许导入工作区的**上传附件**类型（§16）：与 uploads 侧支持的类型一致。
+ *
+ * 刻意**不复用 `BINARY_EXTS`**：后者是「产物类型」白名单（xlsx/pdf/docx/zip），
+ * 把 .md/.txt/.csv 加进去会让 `fsRead` 拒绝按文本读它们（二进制按 UTF-8 读是乱码，
+ * 报错胜过喂乱码）。两类白名单语义不同，必须分开。
+ */
+const IMPORT_EXTS = new Set([".pdf", ".docx", ".xlsx", ".xls", ".md", ".txt", ".csv"]);
+const MAX_IMPORT_BYTES = Number(process.env.FS_MAX_IMPORT_BYTES || 20 * 1024 * 1024);
+
+/**
+ * 把已上传的文档附件**按原始字节**导入工作区（§16）：让「上传 → 加工 → 导出」闭环成立。
+ * 与 `fsWrite` 的差异：不重编码（保住 xlsx/docx 的结构），且不受文本路径 256KB 上限约束。
+ */
+export function fsImportFile(
+  conversationId: string,
+  path: string,
+  data: Uint8Array,
+): { path: string; bytes: number } | { error: string } {
+  const target = safePath(conversationId, path);
+  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  const ext = extOf(path);
+  if (!IMPORT_EXTS.has(ext)) {
+    return { error: `不允许导入该类型：${ext || "(无扩展名)"}（允许：${[...IMPORT_EXTS].join("、")}）` };
+  }
+  const bytes = data.byteLength;
+  if (bytes > MAX_IMPORT_BYTES) {
+    return { error: `文件过大（${bytes} 字节，上限 ${MAX_IMPORT_BYTES}）` };
+  }
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    const count = countFiles(conversationId);
+    if (!existsSync(target) && count >= MAX_FILES) return { error: `文件数已达上限（${MAX_FILES}）` };
+    writeFileSync(target, data);
+    return { path: normalizeRel(conversationId, target), bytes };
+  } catch (err) {
+    return { error: String((err as Error)?.message || err) };
+  }
+}
+
+/**
  * 删除工作区内**单个文件**（§15）。
  *
  * 只删文件、不删目录，也不支持批量：误伤面按「一条命令最多毁掉一个文件」收口，

@@ -55,6 +55,8 @@ import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 import { appendRoundTrace } from "./trace.js";
+import { readFileSync } from "node:fs";
+import { fsImportFile } from "./fs-store.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
@@ -659,7 +661,26 @@ export function truncateToTokens(text: string, maxTokens: number): { text: strin
  * 解析失败的附件不中断对话，仅附一行提示让模型知道它不可用；
  * 超出预算的附件按 token 截断或整体跳过，并把「跳过了哪些」如实写进注入内容（不静默丢）。
  */
-async function buildAttachmentContext(ids: string[] | undefined): Promise<string> {
+/**
+ * 把附件同步一份到工作区（§16）：附件原本只有 7 天 TTL 且只以「解析文本」的形式存在于本轮上下文，
+ * 模型拿不到原文 —— 「上传 → 加工 → 导出」闭环因此不成立。落工作区后可用 fs_read 取回、
+ * export_data 加工、fs_delete 清理。
+ * **失败不中断对话**：只把原因回报进注入文本（配额满时可让模型先 fs_delete 再重试）。
+ */
+function importUploadToWorkspace(conversationId: string, f: { name: string; path: string }): string {
+  try {
+    const data = readFileSync(f.path);
+    // 文件名只做「去路径分隔符 + 截断」：safePath 已保证不会越界，这里只是避免奇怪的子路径。
+    const safeName = String(f.name || "upload").replace(/[/\\]/g, "_").slice(0, 80) || "upload";
+    const res = fsImportFile(conversationId, `uploads/${safeName}`, data);
+    if ("error" in res) return `（未能存入工作区：${res.error}）`;
+    return `已同步到工作区：${res.path}（${res.bytes} 字节；可用 fs_read 取回原文、export_data 加工导出、fs_delete 清理）`;
+  } catch (err) {
+    return `（未能存入工作区：${String((err as Error)?.message || err)}）`;
+  }
+}
+
+async function buildAttachmentContext(ids: string[] | undefined, conversationId: string): Promise<string> {
   if (!ids?.length) return "";
   const blocks: string[] = [];
   const skipped: string[] = [];
@@ -670,6 +691,7 @@ async function buildAttachmentContext(ids: string[] | undefined): Promise<string
       blocks.push(`（附件 ${id} 已过期或不存在，已跳过）`);
       continue;
     }
+    const wsNote = importUploadToWorkspace(conversationId, f);
     let parsed: Awaited<ReturnType<typeof parseFile>>;
     try {
       parsed = await parseFile(f.path);
@@ -694,7 +716,8 @@ async function buildAttachmentContext(ids: string[] | undefined): Promise<string
       `### 附件《${f.name}》\n${capped.text}` +
         (capped.truncated
           ? `\n…（附件过长，已截断到约 ${cap} token；原文共 ${parsed.text.length} 字符）`
-          : ""),
+          : "") +
+        `\n\n（${wsNote}）`,
     );
   }
   if (skipped.length) {
@@ -2317,7 +2340,7 @@ export async function* chatStream(
       ownerKey: opts.ownerKey,
     });
     // 聊天里随手贴的文档：解析为文本注入系统提示（本轮临时上下文，不污染持久历史）。
-    const attachmentCtx = await buildAttachmentContext(opts.attachments);
+    const attachmentCtx = await buildAttachmentContext(opts.attachments, conversationId);
     // 附件文本与任务级指引都属「本轮临时上下文」，拼进系统提示的**动态后缀**
     // （不污染稳定前缀、不影响 prompt cache；也都不进用户可见历史）。
     const dynamicExtras = [attachmentCtx, opts.taskGuide].filter(
