@@ -446,3 +446,97 @@ user: 123
 | 透传 | `app.ts newRunId()` 生成 runId → 经 `chatStream(.., traceMeta)` 的 `traceMeta.runId` → `LoopContext.runId` → 每轮结束 `appendRoundTrace` |
 | 开销 | 每轮一次 `appendFileSync`（同步小写入）；只写工具轮（综合轮直接收束不落），约 14 行/次长 run，可忽略 |
 | 验证 | `tests/round-trace.test.ts`：透传 runId → 断言 `rounds-<runId>.jsonl` 至少每轮一行且字段正确 |
+
+---
+
+## 13. run_command 命令执行治理（2026-09-24）
+
+> 触发：用户在对话里说「你运行下 ipconfig，然后告诉我结果」→ `run_command` 失败（退出码 1），
+> 返回体是 ipconfig 的用法说明，且**中文全部乱码**（`错误: 无法识别…` 显示成 `����: �޷�ʶ��…`）。
+
+### 13.1 根因分析（两个独立问题，必须分开记）
+
+| # | 问题 | 归属 | 证据 |
+|---|---|---|---|
+| 1 | **命令参数不被识别**：ipconfig 收到不认识的选项 → 打印「错误: 无法识别或不完整的命令行。」+ 用法，退出码 1 | 模型侧（Linux 习惯迁移） | 实测：`ipconfig /all`、`ipconfig -all` → 正常输出 `Windows IP 配置`；`ipconfig /?` → 只打印用法；**`ipconfig --all`、`ipconfig /foo` → 错误 + 用法，退出码 1**。Windows 的 ipconfig 认 `/` 与 `-`，**不认 `--`** |
+| 2 | **输出乱码**：无论命令对错，中文输出全部不可读 | **我们的缺陷** | `runShell` 用 `child_process.exec` 且**未指定 encoding** → Node 默认按 UTF-8 解码；Windows 控制台实际输出 **GBK(cp936)**。字节证据：`Windows IP \xc5\xe4…`（`c5 e4` = GBK 的「配」，在 UTF-8 下是非法序列） |
+
+> 关键区分：#1 是模型写错参数（换个参数就好）；#2 是稳定复现的产品缺陷——
+> **即使命令写对，用户看到的仍是乱码**（`dir`、`netstat`、git 中文路径、任何中文报错都一样）。
+
+### 13.2 最佳实践对照
+
+| 来源 | 官方做法 | 我们现状 | 判定 |
+|---|---|---|---|
+| Cursor Docs › Agent › Terminal | 命令在终端执行；**Run Mode** 控制何时执行/何时询问；**sandbox** 限制未授权的文件访问与网络 | 有风险闸门 + 确认卡（`destructive/external`），**无沙箱** | ⚠️ 沙箱缺口 |
+| Cursor Docs › Terminal › Troubleshooting | shell 主题（Powerlevel9k/10k）会**污染捕获到的输出**；官方给出 `CURSOR_AGENT` 环境变量让 shell 降级 | 未做任何防污染处理（ANSI 色码 / shell 配置都可能混入）；未关 stdin（遇 `pause`、`npm init` 会空等到超时） | ❌ |
+| 腾讯云 WorkBuddy/CodeBuddy 安全概述 | 执行 bash **前需批准**；权限模式分级；**沙箱化 bash 工具**（隔离文件系统与网络） | 批准/分级已有；沙箱无 | ⚠️ |
+| CodeBuddy Code 实践教程 | 「上下文窗口承载每条消息、每个文件、**每个命令的输出**」→ 输出会迅速填满上下文并导致性能下降 | 只有 `maxBuffer` 2MB，**超限直接报 `ERR_CHILD_PROCESS_MAXBUFFER`**——既拿不到结果，也可能一次灌爆上下文 | ❌ |
+| Anthropic《Effective context engineering》 | 截断**保头尾**（报错常在尾部）；看得见每一次运行 | 超限即整体失败，无头尾截断 | ❌ |
+
+已确认无需改的点：Node 在 Windows 上调用的是 `cmd.exe /d /s /c`（实测 `echo %CMDCMDLINE%` 证实，
+`/d` 跳过 AutoRun 注册表项），因此「cmd 自动运行项污染输出」这一项**本来就不存在**。
+
+### 13.3 缺口与优先级
+
+| # | 缺口 | 优先级 | 说明 |
+|---|---|---|---|
+| A | 输出编码（GBK 乱码） | **P0** | 本次直接现象，影响所有中文命令输出 |
+| B | 输出体积（超限即失败、可能灌爆上下文） | P1 | 改「截断保头尾 + 显式省略量」，不再整体失败 |
+| C | 输出纯净度 / 不挂死 | P1 | `stdin: "ignore"`；`NO_COLOR=1`、`TERM=dumb`；注入 `BX_AGENT=1`（对齐 Cursor 的 `CURSOR_AGENT`） |
+| D | 工具描述缺「非交互」指引 | P1 | 提示模型加 `-y/--yes`、避开 watch / `tail -f` / 会等待输入的命令 |
+| E | 沙箱（隔离 FS + 网络） | P2 挂账 | Windows 真沙箱成本高；最小版可做危险命令黑名单 + 可选禁用网络 |
+
+### 13.4 实施方案（本批做 A/B/C/D）
+
+- **A 编码**：`exec` 改 `encoding: "buffer"` 捕获原始字节，再 `decodeShellBytes()`：
+  先按 UTF-8 **严格**解码（`fatal: true`），失败则回退 `gb18030`（GBK 超集，更宽容），
+  再失败才用 UTF-8 替换式解码兜底。**不采用**前置 `chcp 65001`（会改子进程行为、有副作用）。
+  本机已验证 `TextDecoder` 对 `gb18030` / `gbk` / `utf-8(fatal)` 均可用。
+- **B 体积**：新增 `RUN_OUTPUT_MAX_CHARS`（默认 32_000，env 可调）。超预算时**保留头尾**并插
+  `…（已省略 N 字符）`；`ERR_CHILD_PROCESS_MAXBUFFER` 不再判失败，而是按「已截断」返回并标注，
+  保证模型至少拿到头尾而不是什么都没有。
+- **C 纯净度**：`stdin: "ignore"`（需输入的命令立即失败，不再空等 120s）；env 合并
+  `NO_COLOR=1`、`TERM=dumb`、`BX_AGENT=1`（`BX_AGENT` 让用户的 shell 配置可自检降级，对齐 Cursor）。
+- **D 描述**：`run_command` schema 描述补「需要确认时自行加 `-y/--yes`；不要跑 watch / `tail -f` /
+  会等待输入的命令；Windows 选项用 `/` 或 `-`，不要用 `--`」。
+
+### 13.5 验证与验收
+
+- `tests/run-command-shell.test.ts`：
+  [A] 中文输出不乱码（`ipconfig /all` 或等价命令，断言含可识别中文而非替换字符）；
+  [B] 超长输出被头尾截断且含「已省略」标注，不再是失败；
+  [C] 需要 stdin 的命令不会挂死（在超时时间内返回）；
+  [D] env 注入生效（`BX_AGENT=1` / `NO_COLOR=1` 可被子进程读到）。
+- 回归：全量测试 + lint；重启 `agent-server-dev` 后在 UI 里实际跑一次含中文输出的命令确认可读。
+- 实测结果（2026-09-24）：`tests/run-command-shell.test.ts` 6/6 通过——
+  [A] GBK 字节按中文还原；[A2] 端到端无替换字符；**[A3] `ipconfig /all` 输出含「配置」，乱码不再复现**；
+  [B] 头尾截断含「已省略」；[C] `pause` 不再挂死；[D] `BX_AGENT=1` 对子进程可见。
+  全量 27 文件 / 167 测试两轮连续全绿。
+
+---
+
+## 14. 附带修复：MCP 配置热重载缓存失效键（2026-09-24）
+
+> 触发：§13 回归时 `mcp-config-hotreload [D]` 在**连续两轮全量**里随机失败（隔离开 4/4 通过）。
+> 不再当作「偶发」——新增测试改变了并发时序，把它背后的真实竞态暴露出来了。
+
+### 14.1 根因
+
+| 层 | 问题 |
+|---|---|
+| 测试 | [B]/[C]/[D] 都用 `Date.now() + 1000` 推 mtime，但用例各只跑约 1ms，**相邻用例可能落在同一毫秒** → 平移后 mtime 依旧相同 → 缓存命中旧值。注释里担心的「同毫秒」恰恰没被固定 `+1000` 挡住（两者一起平移） |
+| 产品 | `mcp/config.ts` 的失效键**只看 mtime**：同一毫秒内改写、且长度变化时感知不到——正是这套缓存要消灭的「文件已改、服务仍用旧值」（换 token 仍 401 的老问题） |
+
+### 14.2 修法
+
+- **产品**：失效键改为 **mtime + size**（`fileCacheMtime` / `fileCacheSize`，`persist()` 同步写回）。
+  长度变化的改写即使 mtime 撞车也能被感知；代价仅一次 `statSync`（本来就在做）。
+- **测试**：`touch()` 用**严格递增**偏移（`Date.now() + 1000 * ++tick`），保证后一次 mtime 一定大于前一次，与机器快慢无关。
+- **新增 [E]**：mtime 完全不动、只改内容（长度不同）→ 断言仍然重载，把「size 参与失效」钉死。
+
+### 14.3 遗留一致项（挂账，未改）
+
+`rag/store.ts` 的 `loadIndex` / `loadVectors` 也是「只按 mtime 失效」同一口径。
+本次不动它（改动面与索引重建耦合，风险不低）；若后续出现「入库成功但检索不到」，优先查这里，
+按 §14.2 同一口径补 size 即可。
