@@ -78,6 +78,8 @@ export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit"
  */
 const RUN_MAX_BUFFER = Number(process.env.FS_MAX_FILE_BYTES || 256 * 1024) * 8; // 2MB
 const RUN_TIMEOUT_MS = Number(process.env.RUN_COMMAND_TIMEOUT_MS || 120_000);
+/** 命令输出的展示预算（字符）：超了按「保头尾」截断（§13.4 B）——命令输出是最容易灌爆上下文的一类内容。 */
+const RUN_OUTPUT_MAX_CHARS = Math.max(2000, Number(process.env.RUN_OUTPUT_MAX_CHARS || 32_000));
 
 /**
  * 统一拼接 shell 输出的 stdout/stderr。失败分支把 stderr 放前面（失败时 stderr 才是关键信息），
@@ -91,21 +93,74 @@ function formatShellStream(stdout: string, stderr: string, primary: "stdout" | "
   return `${errOut}\n--- stdout ---\n${out}`;
 }
 
+/**
+ * 解码 shell 输出的原始字节（§13.4 A）。
+ *
+ * `exec` 不指定 encoding 时 Node 按 UTF-8 解码，但 Windows 控制台输出是 GBK(cp936)——
+ * 中文会整体乱码（实测 `ipconfig` 的「配」= `c5 e4`，在 UTF-8 下是非法序列）。
+ * 先严格 UTF-8，失败回退 gb18030（GBK 超集、更宽容），再失败才用替换式解码兜底。
+ * 不采用前置 `chcp 65001`：那会改动子进程行为（有副作用），这里是纯解码侧修正。
+ */
+export function decodeShellBytes(buf: Buffer | string | undefined): string {
+  if (buf == null) return "";
+  if (typeof buf === "string") return buf;
+  if (!buf.length) return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder("gb18030").decode(buf);
+    } catch {
+      return buf.toString("utf-8");
+    }
+  }
+}
+
+/** 保头尾截断（对齐 Anthropic「报错常在尾部」）：中间插显式省略计数，不让模型误以为输出就这么多。 */
+export function truncateShellOutput(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.6);
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n…（已省略 ${text.length - maxChars} 字符）\n${text.slice(text.length - tail)}`;
+}
+
 function runShell(
   command: string,
   opts: { cwd: string; timeoutMs: number },
 ): Promise<{ ok: boolean; text: string }> {
+  // 干净的执行环境（§13.4 C）：关掉颜色与交互式 TERM 特性，避免 ANSI 色码污染捕获到的输出
+  // （对齐 Cursor 用 CURSOR_AGENT 让 shell 自降级）；注入 BX_AGENT 供用户的 shell 配置自检降级。
+  const env = { ...process.env, NO_COLOR: "1", TERM: "dumb", BX_AGENT: "1" };
   return new Promise((resolve) => {
     nodeExec(
       command,
-      { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: RUN_MAX_BUFFER, windowsHide: true },
+      {
+        cwd: opts.cwd,
+        timeout: opts.timeoutMs,
+        maxBuffer: RUN_MAX_BUFFER,
+        windowsHide: true,
+        // 不接管 stdin：需要交互输入的命令立即失败，而不是空等到超时（§13.4 C）。
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "buffer",
+        env,
+      },
       (err, stdout, stderr) => {
-        const out = String(stdout || "");
-        const errOut = String(stderr || "");
+        const out = decodeShellBytes(stdout as Buffer);
+        const errOut = decodeShellBytes(stderr as Buffer);
         if (err) {
-          // err.code 可能是数字（真实退出码）、也可能是字符串 errno（ENOENT / ERR_CHILD_PROCESS_MAXBUFFER 等），
-          // 不能一律叫「退出码」——那样会把「找不到 shell」渲染成「退出码 ENOENT」，误导模型。
           const code = (err as { code?: number | string }).code;
+          // 输出超缓冲不再判「整体失败」：命令其实跑过了，给模型头尾并显式标注被截断（§13.4 B），
+          // 好过一句「执行失败」却什么内容都拿不到。
+          if (code === "ERR_CHILD_PROCESS_MAXBUFFER") {
+            const body = truncateShellOutput(formatShellStream(out, errOut, "stdout"), RUN_OUTPUT_MAX_CHARS);
+            resolve({
+              ok: true,
+              text: `命令已执行，但输出超过 ${RUN_MAX_BUFFER} 字节已被截断：\n${body}`,
+            });
+            return;
+          }
+          // 注：err.code 可能是数字（真实退出码）、也可能是字符串 errno（ENOENT / ERR_CHILD_PROCESS_MAXBUFFER 等），
+          // 不能一律叫「退出码」——那样会把「找不到 shell」渲染成「退出码 ENOENT」，误导模型。
           const killed = (err as { killed?: boolean }).killed;
           const signal = (err as { signal?: string }).signal;
           let reason: string;
@@ -120,12 +175,15 @@ function runShell(
           } else {
             reason = "";
           }
-          const body = formatShellStream(out, errOut, "stderr").slice(0, RUN_MAX_BUFFER);
+          const body = truncateShellOutput(formatShellStream(out, errOut, "stderr"), RUN_OUTPUT_MAX_CHARS);
           const detail = body || String((err as Error).message || err);
           resolve({ ok: false, text: `命令执行失败${reason}：\n${detail}` });
           return;
         }
-        resolve({ ok: true, text: formatShellStream(out, errOut, "stdout").slice(0, RUN_MAX_BUFFER) });
+        resolve({
+          ok: true,
+          text: truncateShellOutput(formatShellStream(out, errOut, "stdout"), RUN_OUTPUT_MAX_CHARS),
+        });
       },
     );
   });
@@ -411,7 +469,10 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "在终端执行一条 shell 命令（如列目录、跑脚本、装依赖、调系统命令）。" +
         "命令在**当前对话工作区**目录下运行（产物可直接用 fs_read 取回），但也能访问系统其它位置。" +
         "只执行用户明确要求或明显必要的命令；不要在一条命令里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
-        "命令较长或需要管道时正常写；超时（默认 120s）会被判为失败。",
+        "命令较长或需要管道时正常写；超时（默认 120s）会被判为失败。" +
+        "**必须非交互**：需要确认时自行加 -y / --yes 等免交互参数（如 npm init -y、apt-get install -y）；" +
+        "不要跑常驻型命令（watch / tail -f / dev server）或会等待输入的命令——stdin 已关闭，这类命令会直接失败而不是等你输入。" +
+        "Windows 命令的选项用 / 或 -，**不要用 --**（如 ipconfig /all、ipconfig -all；ipconfig --all 会报「无法识别的命令行」）。",
       {
         type: "object",
         properties: {
