@@ -15,6 +15,7 @@
 | 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
 | 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
 | 7 | v2.1 报告式导出交付断链修复（零表格报告 + fs_write 下载卡片，§11） | ✅ 已落地（2026-09-24，见 §11.4） |
+| 8 | 交互式轮次耗尽「补位收尾」（全程审计产物，§12） | ✅ 已落地（2026-09-24，见 §12.3） |
 
 ---
 
@@ -356,3 +357,92 @@ user: 123
 3. 三者全空（无 rows/sections/charts）→ 明确报「缺少内容」，不产出空文件。
 4. `fs_write` 写 `.html` → 对话出现下载卡片（可预览/下载）；写 `.md`/`.txt` → 无卡片（草稿语义不变）。
 5. 回归：`tests/export-formats.test.ts` 既有 7 组用例全绿 + 新增零表格 / 全空拒绝 / fs_write 卡片用例；xlsx 等既有格式产物语义不变。
+
+---
+
+## 12. 全对话审计与「轮次耗尽补位收尾」修复（2026-09-24）
+
+> 触发：对触发 §11 的同一会话做全程逐步审计（36 步 / 14 轮 / 16 分钟，模型 glm53fx，trace：`rounds=14` 正好打满 `MAX_TOOL_ROUNDS`），对照 best practice 逐项检查取数 → 出图 → 交付 → 收束全链路。
+
+### 12.1 逐步对照（阶段 × 最佳实践）
+
+| 阶段 | 步骤 | 做了什么 | 对照最佳实践 | 判定 |
+|---|---|---|---|---|
+| 取证 | 1-2 | `read_skill`（业务取数 / 陌生库探查） | 技能先行（口径三问 / 先找存量口径再写查询） | ✅ |
+| 探查 | 3-13 | list_databases → search → schema ×3 → 取值域 ×4 → get_card ×2（存量口径） | schema-probe 流程完整：元数据 → 取值域 → 存量口径，未跳步、未瞎猜字段语义 | ✅ |
+| 取数 | 14-16 | 3 条 SQL（14 报 ILLEGAL_AGGREGATION，15/16 成功） | SQL 写错后同轮自愈重写，未把原始异常抛给用户 | ✅ |
+| 规划 | 17 | write_todos | 计划落盘，进度可追溯 | ✅ |
+| 重复探查 | 18-26 | 重读 skill、list_databases / search / schema / 取值域——与 1-13 大面积重复 | **浪费约 3-4 轮预算**；诱因是早期大结果被上下文治理替换为句柄（「需要该数据请重新调用对应工具」），模型选择重新探查而非 fs_read 句柄 | ⚠️ 效率损耗（行为符合引导，但吃掉预算，是打满 14 轮的直接推手之一） |
+| 取数 | 27-28 | 主表（7 天 × 4 语言）+ 8 月全月趋势（作预测依据） | 口径与用户要求逐项对齐，预测有数据依据 | ✅ |
+| 出图 | 29-31 | write_todos + render_chart ×2（折线 / 饼图） | 图表走 render_chart 通道（对话内卡片），未在正文画图占位 | ✅ |
+| 交付 | 32-33 | fs_write ×2（先非法路径被拒、后写出 16KB 带 CDN 的 HTML） | §11 的断链（A/B/C 已修：export_data 零表格报告 + fs_write .html 下发卡片 + 描述引导） | ❌ 已修 |
+| 补数 | 35-36 | 重跑主表 SQL（第 3 次）+ 预测汇总 SQL 报错 | 36 的失败发生在预算边缘，未再重试 | ⚠️ |
+| **收束** | — | 14 轮打满 `MAX_TOOL_ROUNDS`，从未出现综合轮；最终答案 = 各轮过程叙述拼接，**停在「重新写入：」的悬空半句**，且从未告知用户文件已落盘 | 无人值守有 `forceWrapUp`（最后一轮摘工具强制收尾，预防式）；**交互式没有**——预算耗尽把半截计划当答案返回 | ❌ 本节修复 |
+
+### 12.2 修复：轮次预算耗尽的「补位收尾」（chat.ts）
+
+| 项 | 内容 |
+|---|---|
+| 现状缺口 | `forceWrapUp` 只覆盖无人值守（预防式：`round === maxRounds - 1` 前摘工具 + WRAP_UP_HINT）；交互式预算耗尽 → 无综合轮 → `synthesisText \|\| text` 回落到过程叙述拼接 |
+| 修复 | 新增 `wrapUpWith()` + 循环后补位：`!synthesisText && !failure && text.trim()` 时，把过程记录（尾部 `WRAP_UP_NARRATION_CHARS=6000` 字符）交回同模型做一次**无工具**调用，按 `WRAP_UP_HINT` 口径产出最终结论；调用失败 / 空文本回落累计叙述（现状行为，绝不因此拒答） |
+| 与预防式的关系 | 预防式（`forceWrapUp`，无人值守）+ 补位式（本修复，交互式兜底）两层互补，共同保证「预算总有结论」；补位式不预占工具轮次，只多花一次调用，且仅在预算耗尽这种罕见路径上发生 |
+| 红线自查 | 无业务词、无词形/语言判定；触发条件纯协议（轮次预算 + 无综合轮）；「已生成文件」的告知由模型基于自身工具历史叙述，服务端不写死文案 |
+
+### 12.3 验收标准（§12）
+
+1. mock 端到端（`tests/wrap-up-cap.test.ts`）：模型每轮调工具打满 3 轮上限 → 发生一次无工具补位收尾调用，最终 `text` 事件是收尾结论而非悬空半句。
+2. 正常收敛路径（有综合轮）不触发补位调用；失败路径（`failure`）不触发；零证据兜底路径（`ungrounded`，已设 `synthesisText`）不重复触发。
+3. 全量测试回归绿；`WRAP_UP_NARRATION_CHARS` 可配，收尾送入内容取尾部防上下文膨胀。
+
+### 12.4 追加修复：跨轮重复调用的「观察提示」（对齐 Anthropic 观察→再决策）
+
+§12.1 的「重复探查」阶段（18-26 步与 1-13 大面积重复、主表查询跑 3 遍）浪费约 3-4 轮预算。现有护栏只覆盖两类：同轮同参去重（每轮重置）+ Doom Loop 连续熔断（≥3 次连续同签名组）；**非连续的跨轮同参重复**没有任何提示。修复（`chat.ts`）：
+
+- 记录每个签名首次**成功执行**的轮次（`executedSigRounds`；失败后的重试不算重复）；
+- 同参调用跨轮再次执行时**照常放行**（保留「刷新数据」语义），仅在回灌给模型的工具结果末尾附一句服务端观察提示：「该调用与第 N 轮的调用参数完全相同，上次结果已在上下文或已卸载到工作区；如非确需刷新数据，请基于已有结果继续，不要重复探查。」
+- 提示只进模型上下文，**不进事件流与接地证据**（它是服务端引导，不是工具数据），且附在不可信定界之外；覆盖批量（只读并发，BI 查询走此路）与顺序两条执行路径。
+
+### 12.5 全链路对照 Anthropic《Effective context engineering for AI agents》（2025-09）
+
+| Anthropic 实践 | 本仓落点 | 判定 |
+|---|---|---|
+| 工具结果清理（consumed results 是「低垂果实」） | `governToolResults` 每轮结束执行（预算 12k token / 保留最近 3 组 / env 白名单保护），先卸载到工作区（fs_read 指针）落盘失败才退化为占位符 | ✅ |
+| Just-in-time context（句柄 + 即时加载） | 卸载指针「需要时用 fs_read 读取，或重新调用工具」+ tool search 按需加载（对齐 Claude Code `ENABLE_TOOL_SEARCH=auto` 口径） | ✅ |
+| Compaction | 历史压缩（先 prune 后 LLM 摘要，保留任务目标/接口/规模/未解决问题） | ✅ |
+| 结构化笔记（recitation） | `write_todos` 持久化计划、跨轮可见 | ✅ |
+| Sub-agent 架构（干净上下文 + 只回摘要） | `task` 工具：独立上下文 + 最小工具集 + 只回摘要 | ✅ |
+| 工具集精简（模糊决策点是最常见失败模式） | `MCP_MAX_TOOLS` 上限 + 按需检索加载 | ✅ |
+| 截断保头尾（shell 报错常在尾部） | 确认卡参数摘要、历史修剪、附件截断均头尾保留 + 显式省略计数 | ✅ |
+| 跨轮重复调用治理 | 原只有同轮去重 + 连续熔断；非连续同参重复无提示 → **§12.4 补观察提示** | ⚠️→✅ |
+| 运行内可观测（逐轮 token / 上下文增长） | `rounds-<runId>.jsonl` 逐轮快照（runId 由 app.ts newRunId 透传，每轮落 round/mode/toolCalls/cleared/offloaded/groundingEvidence/spentTokens） | ✅（2026-09-24，§12.7） |
+
+### 11.5 手写 HTML 的「零外链」软护栏（2026-09-24，闭合残留缺口）
+
+> §11.2 原则 1 要求产物自包含，但该原则原本只在 `export_data` 路径由服务端合成保证（内联 SVG）。
+> 模型走 `fs_write` 手写带 CDN 的 HTML 时，文件能下载、但离线打开只剩空壳——原则未被覆盖。
+
+| 项 | 内容 |
+|---|---|
+| 检测 | `builtins.ts` `externalRefHint(content)`：正则匹配 `<script/link/img/iframe/embed/source>` 的 `src`/`href` 为绝对 `http(s)://` 或协议相对 `//` 的引用 |
+| 回灌 | `fs_write` 写 `.html` 成功时，把提示拼进工具结果（含引用处数 + 前 3 个样例域名），引导改用 `export_data(format=html)` 或改成内联 `<style>/<svg>` |
+| 口径 | **只提示不硬拦**——与「跨轮重复调用」（§12.4）同口径，对齐 Goldilocks（不过度硬编码 if-else；模型确有「内嵌第三方库做自检页」的合法场景） |
+| 不误报 | 内联 `<style>` / 内联 `<svg>` / 相对路径 `assets/logo.png` 一律放行（测试 [C] 钉住） |
+| 验证 | `tests/html-self-contained.test.ts`：[A] CDN 命中并含处数与样例、[B] `//cdn` 命中、[C] 自包含不误报、[D] fs_write .html 仍出下载卡片且提示回灌 |
+
+### 12.6 疑问清单（已拍板，按最佳实践落地）
+
+1. **重复探查的根因可观测性**：原 trace 只有 run 级汇总、无逐轮 span，根因无法实证。→ 已实现 `rounds-<runId>.jsonl` 逐轮落盘（见 §12.7），「弱模型重规划 / fallback 切换 / 上下文治理」三种假设下次运行即可复盘。
+2. **重复调用要不要硬拦**：拍板 **不硬拦**（对齐 Anthropic Goldilocks——不过度硬编码 if-else，避免脆弱拦截、牺牲「刷新数据」合法场景）。软提示已实现（§12.4），不默认加硬拦。
+3. **`MCP_TOOL_RESULT_BUDGET=12k` 取值**：拍板 **保持 env 可调、不默认改**（保守方向安全；多数结果在预算内保留）。如需更激进清理，调 `MCP_TOOL_RESULT_BUDGET` 即可。
+
+### 12.7 逐轮 trace 落盘（运行内可观测，2026-09-24）
+
+> 对齐最佳实践「看得见每一次运行」——run 级汇总只能看「打满 14 轮」，看不到每一轮在干嘛（重复探查、预算耗尽、熔断都藏在轮次里）。
+
+| 项 | 内容 |
+|---|---|
+| 落盘 | `apps/agent-server/.data/traces/rounds-<runId>.jsonl`，每轮一行 JSON（`append-only`，失败仅告警不阻断对话） |
+| 字段 | `runId / round / at / mode(tool\|synthesis) / toolCallsThisRound / clearedDelta / offloadedDelta / groundingEvidence / spentTokens / note?` |
+| 透传 | `app.ts newRunId()` 生成 runId → 经 `chatStream(.., traceMeta)` 的 `traceMeta.runId` → `LoopContext.runId` → 每轮结束 `appendRoundTrace` |
+| 开销 | 每轮一次 `appendFileSync`（同步小写入）；只写工具轮（综合轮直接收束不落），约 14 行/次长 run，可忽略 |
+| 验证 | `tests/round-trace.test.ts`：透传 runId → 断言 `rounds-<runId>.jsonl` 至少每轮一行且字段正确 |
