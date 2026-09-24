@@ -84,6 +84,40 @@ export function appendRunTrace(trace: RunTrace): void {
   }
 }
 
+/** 逐轮运行快照：一次 run 内每个工具循环轮次的一行记录，按 runId 分文件 append-only（§12.6 疑问①：让重复探查 / 预算耗尽 / 熔断可被复盘）。 */
+export interface RoundTrace {
+  runId: string;
+  round: number;
+  at: number;
+  /** 本轮模式：综合轮（模型直接收束答复）或工具轮。 */
+  mode: "synthesis" | "tool";
+  /** 本轮实际执行的工具调用数（同轮去重 / 未执行的请求不计）。 */
+  toolCallsThisRound: number;
+  /** 较上一轮的增量（避免逐轮重复写累计值）。 */
+  clearedDelta: number;
+  offloadedDelta: number;
+  /** 截至本轮累计的「接地证据」工具成功次数。 */
+  groundingEvidence: number;
+  /** 截至本轮累计的 prompt token 估算（成本护栏累计）。 */
+  spentTokens: number;
+  /** 收束备注（如 failure / doom-loop 熔断 / 预算耗尽补位）。 */
+  note?: string;
+}
+
+function roundFile(runId: string): string {
+  return resolve(TRACE_DIR, `rounds-${runId}.jsonl`);
+}
+
+/** 追加一条逐轮快照；best-effort，失败仅告警不抛错（不阻断对话）。 */
+export function appendRoundTrace(entry: RoundTrace): void {
+  try {
+    mkdirSync(TRACE_DIR, { recursive: true });
+    appendFileSync(roundFile(entry.runId), `${JSON.stringify(entry)}\n`, "utf-8");
+  } catch (err) {
+    console.warn(`[trace] 逐轮写入失败：${String((err as Error)?.message || err)}`);
+  }
+}
+
 export interface RunTraceFilter {
   ownerKey?: string;
   conversationId?: string;

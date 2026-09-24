@@ -195,7 +195,7 @@ async function consumeTask(
   let status: RunStatus = "failed";
   let outcomePersisted = false;
   // run 级追踪旁路 sink：chatStream 在此记录实际服务模型（first-class，不依赖受限的事件缓冲）。
-  const traceMeta: { servedModel?: string } = {};
+  const traceMeta: { servedModel?: string; runId?: string } = { runId };
   try {
     for await (const event of chatStream(task.conversationId, task.userText, opts, task.abort.signal, traceMeta)) {
       publishTaskEvent(task, event);

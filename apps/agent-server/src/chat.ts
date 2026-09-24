@@ -54,6 +54,7 @@ import { webSearchStatus } from "./web-search.js";
 import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
+import { appendRoundTrace } from "./trace.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
@@ -85,6 +86,14 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
+/**
+ * 跨轮重复调用的观察提示（服务端文本，只进模型上下文；执行照常放行——数据可能需要刷新）。
+ * 对齐「观察 → 再决策」：不硬拦非连续的同参调用（Doom Loop 只管连续重复），但在回灌时附一句
+ * 「第 N 轮已执行过同参调用、结果在哪」，让弱模型基于已有结果继续，而不是重新探查一遍（实测浪费 3-4 轮预算）。
+ */
+const repeatCallHint = (priorRound: number): string =>
+  `\n\n（提示：该调用与第 ${priorRound} 轮的调用参数完全相同，上次结果已在上下文或已卸载到工作区；` +
+  "如非确需刷新数据，请基于已有结果继续，不要重复探查。）";
 /**
  * 从 `start` 起收集一段**连续的**可并发调用（纯函数，便于单测）。
  * 遇到「已执行过 / 批内重复 / 已熔断 / 不可并发」任一项即停止，长度受 `max` 限制。
@@ -253,6 +262,54 @@ async function probeNeedsExternalData(
     return parseDataNeed(result.text);
   } catch (err) {
     console.warn(`[chat:grounding] 数据需求分诊调用失败，按 DATA 处理：${String((err as Error)?.message || err)}`);
+    return null;
+  }
+}
+
+/** 补位收尾送入的过程叙述上限（字符）：取尾部——越接近终局的过程越关键；防止收尾调用本身变成新的上下文负担。 */
+const WRAP_UP_NARRATION_CHARS = Number(process.env.WRAP_UP_NARRATION_CHARS || 6000);
+
+/**
+ * 轮次预算耗尽后的「补位收尾」调用：把累计的过程叙述交回同一个模型，无工具、非流式，产出面向用户的最终结论。
+ *
+ * 为什么需要它：`forceWrapUp` 是无人值守的**预防式**收尾（最后一轮之前就摘工具）；交互式运行没有这层，
+ * 模型可以一路调工具打满轮次预算——此时循环里从未出现「综合轮」，返回值回落到各轮过程叙述的拼接，
+ * 实测会停在「我现在去做 X：」这样的悬空半句上（用户等十几分钟拿到的是没写完的计划，且收尾叙述从未
+ * 提及已成功落盘的文件）。这里做**事后补救**：不预占工具轮次（区别于 forceWrapUp 的预防式），
+ * 只在「整轮跑完仍无综合轮」时多花一次调用，把半截叙述换成结论。
+ * 返回 `null` = 收尾调用不可用（异常 / 空文本），由调用方回落到累计叙述（现状行为）。
+ */
+async function wrapUpWith(
+  model: ModelEntry,
+  question: string,
+  narration: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  try {
+    const result = await callAgent(
+      model,
+      [
+        {
+          role: "user",
+          content: [
+            `用户原始请求：${question.trim() || "（无文本输入）"}`,
+            "",
+            "以下是本次运行的过程记录（工具已不可再用；记录末尾若停在半截动作上，说明该动作没来得及执行，按未完成如实交代）：",
+            narration.slice(-WRAP_UP_NARRATION_CHARS),
+            "",
+            "请据此写面向用户的最终回复：给结论、交代已完成与未完成的部分；不要预告下一步动作，禁止编造数据。",
+          ].join("\n"),
+        },
+      ],
+      [],
+      signal,
+      undefined,
+      { systemParts: { stable: WRAP_UP_HINT, dynamic: "" }, disableThinking: true },
+    );
+    const t = result.text.trim();
+    return t || null;
+  } catch (err) {
+    console.warn(`[chat:wrap-up] 轮次耗尽收尾调用失败，回落过程叙述：${String((err as Error)?.message || err)}`);
     return null;
   }
 }
@@ -884,6 +941,8 @@ export async function* streamCall(
 /** 工具循环的运行上下文：主代理与子代理共用同一个循环，差别在工具集 / 系统提示 / 轮次上限。 */
 interface LoopContext {
   conversationId: string;
+  /** 本次运行 runId（来自 app.ts newRunId）：用于逐轮 trace 分文件落盘；缺省为空时不写逐轮 trace。 */
+  runId?: string;
   model: ModelEntry;
   images: OptionImage[];
   /** MCP 工具（执行用）。 */
@@ -982,6 +1041,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   // 循环护栏：同轮去重集合（每轮重置）+ 跨轮 Doom Loop 检测器。
   const executedSigs = new Set<string>();
   let roundExecuted: string[] = [];
+  // 跨轮重复调用软提示的依据：签名 → 首次**成功执行**的轮次（失败后的重试不算重复）。
+  const executedSigRounds = new Map<string, number>();
+  // 逐轮 trace 增量基线：每轮结束算「较上一轮的增量」，避免逐轮重复写累计值。
+  let lastCleared = 0;
+  let lastOffloaded = 0;
   const guard = new LoopGuard(DOOM_LOOP_MAX_ROUNDS);
   // 成本护栏：累计本轮已发送的 prompt token 估算；失败熔断：各工具连续失败计数。
   let spentTokens = 0;
@@ -1497,8 +1561,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             if (out.executed && item.verdict.level !== "read") sideEffects += 1;
             // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
             if (out.executed) {
-              if (out.ok) failedTools.delete(item.call.name);
-              else failedTools.set(item.call.name, (failedTools.get(item.call.name) || 0) + 1);
+              if (out.ok) {
+                failedTools.delete(item.call.name);
+                // 首执行轮次登记（跨轮重复软提示依据；失败后的重试不算重复）。
+                if (!executedSigRounds.has(item.sig)) executedSigRounds.set(item.sig, round);
+              } else {
+                failedTools.set(item.call.name, (failedTools.get(item.call.name) || 0) + 1);
+              }
             }
             if (out.executed && out.ok && isGroundingEvidenceTool(item.call.name)) {
               groundingEvidence += 1;
@@ -1521,11 +1590,17 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               kind: "tool_result",
               source: serverOf.get(item.call.name) || item.call.name,
             });
+            // 跨轮重复软提示：附在不可信定界之外（服务端引导，不是工具数据）；不进事件流与接地证据。
+            const priorBatchRound = executedSigRounds.get(item.sig);
+            const batchNote =
+              out.executed && out.ok && priorBatchRound !== undefined && priorBatchRound < round
+                ? repeatCallHint(priorBatchRound)
+                : "";
             conversation.push({
               role: "tool",
               toolCallId: item.call.id,
               name: item.call.name,
-              content: wrappedOut.text,
+              content: wrappedOut.text + batchNote,
             });
             handles.push({
               name: item.call.name,
@@ -1704,8 +1779,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (executed && verdict.level !== "read") sideEffects += 1;
       // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
       if (executed) {
-        if (ok) failedTools.delete(call.name);
-        else failedTools.set(call.name, (failedTools.get(call.name) || 0) + 1);
+        if (ok) {
+          failedTools.delete(call.name);
+          // 首执行轮次登记（跨轮重复软提示依据；失败后的重试不算重复）。
+          if (!executedSigRounds.has(sig)) executedSigRounds.set(sig, round);
+        } else {
+          failedTools.set(call.name, (failedTools.get(call.name) || 0) + 1);
+        }
       }
       // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；
       // 记账 / 工作区类内置工具（write_todos、fs_write 等）成功也不算证据。
@@ -1726,7 +1806,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           `[chat:guard] 工具 ${call.name} 返回内容已加固：中和伪造定界 ${wrapped.collisions} 处、剥离不可见控制符 ${wrapped.stripped} 个`,
         );
       }
-      conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: wrapped.text });
+      // 跨轮重复软提示：附在不可信定界之外（服务端引导，不是工具数据）；不进事件流与接地证据。
+      // 同批首执行时登记的轮次等于当前轮，条件 priorRound < round 天然不触发。
+      const priorRound = executedSigRounds.get(sig);
+      const repeatNote =
+        executed && ok && priorRound !== undefined && priorRound < round ? repeatCallHint(priorRound) : "";
+      conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: wrapped.text + repeatNote });
       // 句柄记录的是「原文规模」而非回灌后正文，便于下一轮按需重取。
       handles.push({
         name: call.name,
@@ -1738,12 +1823,42 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     const governed = governToolResults(conversation, ctx.conversationId);
     clearedToolResults += governed.cleared;
     offloadedToolResults += governed.offloaded;
+    // 逐轮追踪（best-effort，不阻断对话）：每轮落一行，使「重复探查 / 预算耗尽 / 熔断」可被复盘（§12.6 疑问①）。
+    if (ctx.runId) {
+      const clearedDelta = clearedToolResults - lastCleared;
+      const offloadedDelta = offloadedToolResults - lastOffloaded;
+      lastCleared = clearedToolResults;
+      lastOffloaded = offloadedToolResults;
+      appendRoundTrace({
+        runId: ctx.runId,
+        round,
+        at: Date.now(),
+        mode: "tool",
+        toolCallsThisRound: roundExecuted.length,
+        clearedDelta,
+        offloadedDelta,
+        groundingEvidence,
+        spentTokens,
+        ...(failure ? { note: "failure" } : {}),
+      });
+    }
     // 跨轮 Doom Loop 熔断：同一组工具调用连续重复达阈值 → 主动收束，避免无效循环空耗 token。
     if (guard.record(roundExecuted)) {
       text +=
         "\n\n（检测到工具调用陷入重复循环，已主动停止以避免无效消耗；如需继续，请调整问题、换用更具体的检索词，" +
         "或收窄勾选的服务器范围后再试。）";
       break;
+    }
+  }
+
+  // 轮次预算耗尽且从未出现综合轮（模型一路调工具到上限）：把各轮过程叙述的拼接换成一次补位收尾的结论。
+  // 与无人值守的 forceWrapUp（预防式）互补，两层共同保证「预算总有结论」——见 wrapUpWith 注释。
+  if (!synthesisText && !failure && text.trim()) {
+    console.log("[chat:wrap-up] 轮次预算耗尽且无综合轮，补一次无工具收尾生成结论");
+    const wrapped = await wrapUpWith(ctx.model, userQuestion, text, ctx.signal);
+    if (wrapped) {
+      synthesisText = wrapped;
+      spentTokens += estimateTokens(wrapped);
     }
   }
 
@@ -2019,7 +2134,7 @@ export async function* chatStream(
     taskGuide?: string;
   } = {},
   signal?: AbortSignal,
-  traceMeta?: { servedModel?: string },
+  traceMeta?: { servedModel?: string; runId?: string },
 ): AsyncGenerator<ChatEvent> {
   const conversation = await getConversation(conversationId);
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
@@ -2244,6 +2359,7 @@ export async function* chatStream(
           forceToolCall: roleForceToolCall,
           enforceGrounding,
           ownerKey: opts.ownerKey,
+          runId: traceMeta?.runId,
           system: systemPrompt,
         },
         turns,
