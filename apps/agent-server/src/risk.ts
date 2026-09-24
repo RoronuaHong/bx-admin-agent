@@ -193,12 +193,17 @@ function applyGrant(verdict: RiskVerdict, grantServers?: ReadonlySet<string>): R
 }
 
 /**
- * 该次调用是否需要用户确认（deny 由调用方先行拒绝，不走本判定）：
- * 只有**外部副作用**且级别非 read 才确认；内置工作区写（fs_write / fs_edit，scope=workspace）免确认。
- * 口径依据（2026-09-22）：闸门只留给不可逆 / 跨出信任边界的动作——闸门过密会制造确认疲劳，
+ * 该次调用是否需要用户确认（deny 由调用方先行拒绝，不走本判定）。
+ *
+ * 口径依据（2026-09-22）：闸门只留给**不可逆 / 跨出信任边界**的动作——闸门过密会制造确认疲劳，
  * 用户退化成橡皮图章，反而降低整体安全性；工作区写在沙箱内、有路径与体积上限，属可逆的本地动作。
+ *
+ * 2026-09-24 修订（docs/artifact-delivery-plan.md §15.2）：**destructive 一律进闸门**，不再看 scope。
+ * 因为上面「免确认」的前提是「可逆」，而删除（如 fs_delete，scope 仍是 workspace）**不可逆**——
+ * 只看 `external` 会让沙箱内的不可逆动作绕过闸门。
  */
 export function verdictNeedsConfirm(v: RiskVerdict): boolean {
+  if (v.level === "destructive") return true;
   if (!v.external) return false;
   return v.level !== "read";
 }
@@ -208,7 +213,8 @@ export function verdictNeedsConfirm(v: RiskVerdict): boolean {
  *
  * 判据不是「写不写」，而是「**用户还能不能在场拍板**」：子代理的确认事件送不进用户可见的事件流
  * （送不出去就只能挂到超时），所以只有「本来就需要用户确认」的动作才必须留给主对话。
- * 与 `verdictNeedsConfirm` 是同一条判据的另一面：
+ * 与 `verdictNeedsConfirm` 是同一条判据的另一面（**且必须同源**：否则子代理会执行「本来需要用户确认」
+ * 的动作，而它的确认事件送不进用户可见事件流，只能挂到超时——2026-09-24 随 §15.2 一并收口）：
  * - 只读：放行；
  * - 非只读但**无外部副作用**（`scope: workspace`，沙箱内、路径与体积有上限、可回查）：放行——
  *   它自身免确认，不存在确认事件送不出去的问题；
@@ -219,5 +225,6 @@ export function verdictNeedsConfirm(v: RiskVerdict): boolean {
 export function subagentMayExecute(v: RiskVerdict, allowWrite: boolean): boolean {
   if (allowWrite) return true;
   if (v.level === "read") return true;
-  return !v.external;
+  // 与 verdictNeedsConfirm 同源：需要用户确认的动作一律留给主对话。
+  return !verdictNeedsConfirm(v);
 }

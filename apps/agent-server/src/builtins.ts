@@ -8,7 +8,7 @@ import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path
 import { fileURLToPath } from "node:url";
 import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/shared";
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
-import { fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
+import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
@@ -51,6 +51,9 @@ export const BUILTIN_RISK: Record<
   fetch_url: { level: "read", scope: "workspace", reason: "抓取公网网页正文（只读，无外部副作用）" },
   fs_write: { level: "write", scope: "workspace", reason: "写入本对话工作区文件（无外部副作用）" },
   fs_edit: { level: "write", scope: "workspace", reason: "编辑本对话工作区文件（无外部副作用）" },
+  // 删除是**不可逆**的，不满足工作区写「免确认」的前提（见 docs/artifact-delivery-plan.md §15.2），
+  // 故登记为 destructive —— 即使 scope 仍是 workspace，也会走确认闸门。
+  fs_delete: { level: "destructive", scope: "workspace", reason: "删除本对话工作区内的文件（沙箱内，但不可逆）" },
   export_data: { level: "write", scope: "workspace", reason: "在本对话工作区生成可下载文件（无外部副作用）" },
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
@@ -67,6 +70,8 @@ export const BUILTIN_RISK: Record<
  * 用途：这类调用已免确认（见 risk.ts verdictNeedsConfirm），免确认之后唯一的保障是「可回查」，
  * 故 chat.ts 对它们留一条 `allowed` 审计；工作区只读工具与 write_todos 不记，避免噪音。
  */
+// 注：不含 fs_delete —— 本集合语义是「**已免确认**、靠审计兜底」；fs_delete 登记为 destructive 会走确认闸门，
+// 确认动作本身就有 confirmed / denied / timeout 留痕（audit.ts），不必再按「免确认」口径记一条。
 export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit", "export_data"]);
 
 /**
@@ -365,6 +370,22 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           content: jsonType("string", "要写入的完整内容"),
         },
         required: ["path", "content"],
+      },
+    ),
+    spec(
+      "fs_delete",
+      "删除当前对话工作区里的**单个文件**（不可逆，会弹确认卡请用户确认）。" +
+        "只用于清理自己写过的废弃草稿 / 中间产物，或用户明确要求删除的文件；" +
+        "**交付给用户的产物（export_data 生成的表格 / 报告 / 文档）删除前先确认用户确实不再需要**。" +
+        "一次只删一个文件（目录要用 fs_glob + 多次调用）；路径含 .. 或盘符一律被拒绝，" +
+        "写绝对路径时会被限定在工作区内（不会碰到系统文件）。" +
+        "工作区有文件数上限，写满时先清理不用的中间文件，而不是放弃写入。",
+      {
+        type: "object",
+        properties: {
+          path: jsonType("string", "工作区内相对路径，如 results/draft.md"),
+        },
+        required: ["path"],
       },
     ),
     spec(
@@ -1218,6 +1239,14 @@ export async function execBuiltin(
         };
       }
       return { ok: true, text: `已写入 ${result.path}（${result.bytes} 字节）` };
+    }
+    case "fs_delete": {
+      const result = fsDelete(conversationId, str(args, "path"));
+      if ("error" in result) return { ok: false, text: `删除失败：${result.error}` };
+      return {
+        ok: true,
+        text: `已删除 ${result.path}（释放 ${result.bytes} 字节）。该操作不可撤销——如误删，需重新生成该文件。`,
+      };
     }
     case "fs_read": {
       const paging =

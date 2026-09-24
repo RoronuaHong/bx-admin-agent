@@ -373,6 +373,27 @@ function normalizeRel(conversationId: string, absolute: string): string {
   return absolute.slice(root.length).replace(/^[/\\]/, "").replace(/\\/g, "/");
 }
 
+/**
+ * 删除工作区内**单个文件**（§15）。
+ *
+ * 只删文件、不删目录，也不支持批量：误伤面按「一条命令最多毁掉一个文件」收口，
+ * 批量需求由多轮调用完成（每轮各自过闸门）。路径安全判定复用 `safePath`（越界一律拒绝）。
+ * 返回删除前的字节数，便于模型在结果里回报「删掉了多大」。
+ */
+export function fsDelete(conversationId: string, path: string): { path: string; bytes: number } | { error: string } {
+  const target = safePath(conversationId, path);
+  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  if (!existsSync(target)) return { error: `文件不存在：${normalizeRel(conversationId, target)}` };
+  try {
+    if (!statSync(target).isFile()) return { error: "只能删除文件，不能删除目录" };
+    const bytes = statSync(target).size;
+    rmSync(target);
+    return { path: normalizeRel(conversationId, target), bytes };
+  } catch (err) {
+    return { error: `删除失败：${String((err as Error)?.message || err)}` };
+  }
+}
+
 /** 删除对话级联删除其工作区（对话删除时调用）。 */
 export function fsRemoveConversation(conversationId: string): void {
   try {
