@@ -1,3 +1,5 @@
+> ⚠️ **历史快照 · 与当前代码已脱节**：本文件描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本文件仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
+
 # 智能问法全场景流程（Chat Flow）
 
 > **说明**：用户输入一句话后，bx-admin-agent 从入口到最终回答的完整链路（按场景）。

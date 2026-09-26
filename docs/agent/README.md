@@ -1,3 +1,5 @@
+> ⚠️ **历史快照 · 与当前代码已脱节**：本目录文档描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本目录文档仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
+
 # Agent 文档目录（唯一来源）
 
 本目录是 **bx-admin-agent** 的 Agent 章程与 superpower 配置所在地。  

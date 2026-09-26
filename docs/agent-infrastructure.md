@@ -1,3 +1,5 @@
+> ⚠️ **历史快照 · 与当前代码已脱节**：本文件（旧基础设施基线）描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**，当前架构以 `docs/agent/CURRENT_ARCHITECTURE.md` 为准。本文件仅作历史参考。
+
 # 通用 AI Agent 应用基础设施指南
 
 > 版本：v1.1（2026-09-16 初版；2026-09-26 刷新：基于当前 `src/` 代码重新核对各章「本项目对照」，修正过期状态标记，详见各章标注）

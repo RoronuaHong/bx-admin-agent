@@ -1,3 +1,5 @@
+> ⚠️ **历史快照 · 与当前代码已脱节**：本文件描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本文件仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
+
 # Prompt 分层架构与精简规范
 
 > 对齐 **Function Calling 设计哲学**（工具定义 JSON Schema 承担引导，system prompt 回归人设与边界本职）与 **Cursor agent 方案**（Rules = 常驻底线、Skills = 按需加载、Context = 让 agent 自己找、不为罕见边缘情况加指令）。
