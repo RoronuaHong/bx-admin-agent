@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "desc": "PC 端后台字段渲染规则（superpower 层）。2026-08-23 起字段/枚举中文映射不再由本文件维护：表头/字段名中文与枚举值翻译由「源码提取（configs.data.tsx 列 title / options）+ pc-column-mapping 技能（模型读当前项目源码找映射）」承担，本文件只保留 renderRules（渲染行为定义：位掩码位值/图片/数组分隔/布尔/派生字段），保证服务端受控渲染的确定性。新模块无需在此加字段映射。",
+    "rule": "字段中文化：服务端从 PC configs.data.tsx 提取列 title；提取不到（英文表头）时走 [workflow/output-align] 交模型按 pc-column-mapping 技能读源码补映射。本文件仅定义渲染行为（renderRules）。",
+    "version": "2.0.0"
+  },
+
+  "modules": {
+    "film": {
+      "_comment": "影片模块渲染规则（渲染行为，非字段映射）。位掩码 terminalFlag 的位定义对应 PC 端 options.ts getClientType*ByOperatorOptions；boolean/nameFrom/image/arrayJoin/summary 与 renderCell 通用推断互为备份",
+      "renderRules": {
+        "boolean": ["woolUser"],
+        "nameFrom": {
+          "memberLevel": "memberLevelName"
+        },
+        "image": ["coverHorizontalImage", "coverVerticalImage"],
+        "arrayJoin": {
+          "languages": "、",
+          "tags": "、",
+          "countries": "、"
+        },
+        "bitmask": {
+          "terminalFlag": [
+            { "bit": 2, "label": "Android" },
+            { "bit": 4, "label": "iOS" },
+            { "bit": 8, "label": "Web" },
+            { "bit": 16, "label": "H5" },
+            { "bit": 32, "label": "Windows" },
+            { "bit": 64, "label": "Android TV" }
+          ]
+        },
+        "summary": [
+          {
+            "field": "tags",
+            "parts": ["movieTypeName", "countries", "tags"],
+            "sep": " · ",
+            "labelMap": { "movieTypeName": "类别", "countries": "地区" }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "version": "1.1.0",
+  "owner": "agent-platform",
+  "description": "Runtime clarification gate policy for enterprise assistants (prompt-independent).",
+
+  "intentSchema": {
+    "_comment": "标准输入四元组：所有用户输入必须解析成此结构，缺失必填槽位则触发反问",
+    "slots": {
+      "project": {
+        "required": true,
+        "globalContext": true,
+        "_comment": "项目标识。可从 session.activeProject 读取，无需每轮重复声明；首次未指定则反问",
+        "options": [
+          {
+            "key": "bx-film-admin",
+            "label": "影视后台管理系统",
+            "gitRepo": "web/bx-film-admin-in2",
+            "branch": "dev",
+            "codebaseRoot": "D:\\Code\\bx-film-admin-in2",
+            "_comment": "方案 A（2026-08-22）：代码库来自 gitlab（git 协议拉取到 codebaseRoot，测试环境分支 dev、生产 master）。codebaseRoot 指向 gitlab 拉取落地目录；已有本地 clone 的项目可沿用本地目录（如本项目）。模块定位 100% 交模型实时 grep 源码，无任何「中文→模块」关键词表"
+          },
+          {
+            "key": "global",
+            "label": "通用（不限项目）",
+            "codebaseRoot": ""
+          }
+        ]
+      },
+      "module": {
+        "required": true,
+        "_comment": "业务模块，对应 PC 端菜单模块名或接口分类，如 film、movietimetag、user、country"
+      },
+      "value": {
+        "required": false,
+        "_comment": "操作对象的值，如 id、名称、状态值等；查询详情时需要 id，创建时可选"
+      },
+      "operation": {
+        "required": true,
+        "_comment": "操作类型，必须是 read/write 中的一种，再细化到具体动作",
+        "readOps":  ["list", "detail", "search", "export", "stat"],
+        "writeOps": ["create", "update", "delete", "toggle", "batch"]
+      }
+    },
+    "resolutionOrder": ["project", "module", "operation", "value"],
+    "_rule": "按此顺序逐个确认槽位；project 优先从 session.activeProject 补全；缺哪个问哪个，一次只问一个"
+  },
+
+  "executionMode": {
+    "promptIndependent": true,
+    "decisionSource": [
+      "policy_config",
+      "workflow_state",
+      "tool_observation",
+      "mcp_retrieval"
+    ],
+    "ambiguityDefaultAction": "request_clarification",
+    "principle": "Use clarification questions to narrow scope before execution when intent is underspecified."
+  },
+  "scoring": {
+    "requestUncertainty": {
+      "min": 0.0,
+      "max": 1.0,
+      "askThreshold": 0.55
+    },
+    "actionConfidence": {
+      "min": 0.0,
+      "max": 1.0,
+      "reflectThreshold": 0.45
+    }
+  },
+  "riskTiers": {
+    "read": {
+      "examples": [
+        "detail",
+        "list",
+        "search",
+        "exportPreview"
+      ],
+      "requiresExplicitConfirm": false
+    },
+    "write": {
+      "examples": [
+        "create",
+        "update",
+        "toggle",
+        "publish",
+        "delete",
+        "batchUpdate"
+      ],
+      "requiresExplicitConfirm": true
+    }
+  },
+  "routingRules": [
+    {
+      "id": "R1",
+      "when": "requestUncertainty >= askThreshold",
+      "action": "request_clarification",
+      "reason": "User intent is underspecified."
+    },
+    {
+      "id": "R2",
+      "when": "requestUncertainty < askThreshold && actionConfidence < reflectThreshold",
+      "action": "retrieve_then_retry",
+      "reason": "Intent is clear but tool/parameter confidence is low."
+    },
+    {
+      "id": "R3",
+      "when": "riskTier == write",
+      "action": "require_explicit_confirmation",
+      "reason": "High-impact operations must have user confirmation."
+    },
+    {
+      "id": "R4",
+      "when": "clarificationTurns >= 2",
+      "action": "present_ranked_options",
+      "reason": "Avoid looping questions and force bounded choices."
+    }
+  ],
+  "questionPolicy": {
+    "clarificationAsPrimaryDisambiguation": true,
+    "maxClarificationTurnsPerIntent": 2,
+    "singleAmbiguityPerQuestion": true,
+    "optionsPerQuestion": {
+      "min": 2,
+      "max": 4
+    },
+    "forbiddenPatterns": [
+      "你再说清楚一点",
+      "我不太明白",
+      "请补充更多信息"
+    ]
+  },
+  "toolContract": {
+    "request_clarification": {
+      "requiredFields": [
+        "intentId",
+        "missingSlots",
+        "question",
+        "options",
+        "riskLevel"
+      ],
+      "optionalFields": [
+        "defaultCandidate",
+        "impactNote"
+      ]
+    }
+  },
+  "observability": {
+    "metrics": [
+      "clarification_ask_rate",
+      "clarification_resolution_rate",
+      "avg_clarification_turns",
+      "wrong_tool_call_rate",
+      "write_confirmation_bypass_rate"
+    ],
+    "logFields": [
+      "intentId",
+      "module",
+      "operation",
+      "requestUncertainty",
+      "actionConfidence",
+      "selectedRoute",
+      "clarificationTurns",
+      "userChoice"
+    ]
+  }
+}
