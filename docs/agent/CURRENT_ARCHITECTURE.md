@@ -43,10 +43,23 @@
 
 ## 4. 工具与数据接入
 
-- **MCP**：`mcp/hub.ts`（HTTP Streamable + 确认门 + 引用计数）；外部工具命名空间 `mcp__`。
-- **内置工具**（`builtins.ts`）：`request_clarification`、`web_search`、`search_dingtalk_doc`、`write_todos`、`task`、`fs_*`、`read_skill`、`search_tools` 等。
-- **知识/检索**：`web-search.ts`（`web_search`/`fetch_url` provider，`WEB_SEARCH_PROVIDER` 可配）+ 知识库 `search_knowledge`/`knowledge_sources` + 钉钉文档 `tools/dingtalk-doc.ts`（`searchDingtalkDoc`，只读 fail-soft）。
-- **角色（领域适配）**：`roles.ts` —— `AgentRole` 注册表（模式 B）：按 role 选人设（`basePrompt`）/ 默认 MCP 服务器 / 默认模型 / `forceEagerTools` / `forceToolCall` / `enforceGrounding`；已含 `movie` 观影角色（接 TMDb MCP `mcp__movie__`）。
+工具分两层：**内置工具**（agent-server 自带）与 **MCP 工具**（外部服务器提供，命名空间 `mcp__<serverId>__*`）。**领域适配完全发生在 MCP 层——换后台 = 换 MCP server，框架源码不动**，这正是「领域无关的 deep-agent 框架」的含义。
+
+### 4.1 内置工具（`builtins.ts`）
+`request_clarification`、`web_search`、`search_dingtalk_doc`、`write_todos`、`task`、`fs_*`、`read_skill`、`search_tools` 等；风险等级见 §3 `risk.ts`。
+
+### 4.2 MCP 子系统（`mcp/`）
+- `mcp/config.ts`：服务器来源有二——① `MCP_BUILTIN_SERVERS`（`.env` 里的 JSON 数组，部署期确定、不落盘；stdio 子进程继承父进程环境，凭据放 `.env` 即可）；② 运行时经 `POST /mcp/servers` 由用户添加。`conversation.mcpServers` 持久化「本对话启用集」。
+- `mcp/hub.ts`：`connect()` → `buildTransport()`（`StdioClientTransport` 命令式 / `StreamableHTTPClientTransport`）→ 拉取工具清单；含空闲回收、重连冷却、stdio 子进程 stderr 转发（避免日志黑洞）。外部工具统一命名空间 `mcp__<serverId>__*`。
+- 启动期（`index.ts`）自动重连所有已启用服务器；面板勾选态经 `app.ts` 增删并清理悬空引用。
+
+### 4.3 领域适配器（MCP 接入的真实例子）
+| 领域 | MCP server | 接入方式 | 暴露的关键工具 |
+|---|---|---|---|
+| **PC 后台管理**（bx-film-admin-in2） | `scripts/yapi-mcp.mjs`（stdio，`name: yapi-docs`） | `.env` 的 `MCP_BUILTIN_SERVERS` | `call_api`（**仅 GET** 只读调用 YApi 接口）、`render_table`、`export_dataset`、`search_api_module`、`get_list_columns`、`list_projects`/`search_apis`/`get_api_desc` 等 |
+| 观影助手 | TMDb（公共托管，Streamable HTTP） | `roles.ts` 的 `movie` 角色 `defaultMcpServers: ["movie"]` | `mcp__movie__*`（21 个只读工具：检索/详情/相似/榜单/评分/分季分集等） |
+
+> **与 `docs/agent/` 历史文档的关系**：被标记为「历史快照」的 PC 后台文档（`PC_STRUCTURE_AND_OUTPUT_TYPES` / `WORKFLOW_CLARIFICATION_GATE` / `PORTAL_*` / `CHAT_FLOW` 等）描述的正是上表第一行的 `yapi-docs` MCP 集成——**该能力当前仍活跃**，只是以 MCP server 形式存在、而非写死在 agent-server 源码里（故 `apps/agent-server/src` 中搜不到 `call_api` 等字样）。标记「历史」是因为这些文档写的是该 MCP server 暴露的接口契约/治理约定，不属于 deep-agent 框架本身。
 
 ## 5. 异步与定时
 
