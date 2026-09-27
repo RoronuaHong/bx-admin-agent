@@ -56,7 +56,7 @@
 ### 4.3 领域适配器（MCP 接入的真实例子）
 | 领域 | MCP server | 接入方式 | 暴露的关键工具 |
 |---|---|---|---|
-| **PC 后台管理**（bx-film-admin-in2） | `scripts/yapi-mcp.mjs`（stdio，`name: yapi-docs`） | `.env` 的 `MCP_BUILTIN_SERVERS` | `call_api`（**仅 GET** 只读调用 YApi 接口）、`render_table`、`export_dataset`、`search_api_module`、`get_list_columns`、`list_projects`/`search_apis`/`get_api_desc` 等 |
+| **PC 后台管理**（bx-film-admin-in2） | `scripts/yapi-mcp.mjs`（stdio，`name: yapi-docs`） | `.env` 的 `MCP_BUILTIN_SERVERS` → `mcp/hub.ts` | `list_projects` / `list_categories` / `search_apis` / `get_api_desc` / `call_api`（**仅 GET** 只读调用 YApi 接口）；完整规范 → [yapi-mcp 集成规范](./yapi-mcp.md) |
 | 观影助手 | TMDb（公共托管，Streamable HTTP） | `roles.ts` 的 `movie` 角色 `defaultMcpServers: ["movie"]` | `mcp__movie__*`（21 个只读工具：检索/详情/相似/榜单/评分/分季分集等） |
 
 > **与 `docs/agent/` 历史文档的关系**：被标记为「历史快照」的 PC 后台文档（`PC_STRUCTURE_AND_OUTPUT_TYPES` / `WORKFLOW_CLARIFICATION_GATE` / `PORTAL_*` / `CHAT_FLOW` 等）描述的正是上表第一行的 `yapi-docs` MCP 集成——**该能力当前仍活跃**，只是以 MCP server 形式存在、而非写死在 agent-server 源码里（故 `apps/agent-server/src` 中搜不到 `call_api` 等字样）。标记「历史」是因为这些文档写的是该 MCP server 暴露的接口契约/治理约定，不属于 deep-agent 框架本身。
