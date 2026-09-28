@@ -143,11 +143,30 @@ function getClient(): Promise<MongoClient> {
   return clientPromise;
 }
 
+let indexEnsured = false;
+
+/**
+ * 会话集合索引：`id` 必须唯一。
+ * 没有唯一索引时，并发 upsert 会产生同 id 的重复文档——列表侧 dedupeDocs 正是为这个症状打的补丁。
+ * 已有重复文档时建唯一索引会失败：这里 fail-soft 只告警，绝不删数据（避免破坏性自愈）。
+ */
+async function ensureIndexes(coll: Collection<ConversationDoc>): Promise<void> {
+  if (indexEnsured) return;
+  indexEnsured = true;
+  await coll.createIndex({ id: 1 }, { unique: true }).catch((err) => {
+    console.warn(
+      `[conversations] id 唯一索引未创建（多半是库里已有同 id 重复文档，需人工去重后再建）：${String((err as Error)?.message || err)}`,
+    );
+  });
+}
+
 async function getColl(): Promise<Collection<ConversationDoc> | null> {
   try {
     const client = await getClient();
     const db: Db = client.db(MONGO_DB);
-    return db.collection<ConversationDoc>(COLL);
+    const coll = db.collection<ConversationDoc>(COLL);
+    await ensureIndexes(coll);
+    return coll;
   } catch {
     return null;
   }
