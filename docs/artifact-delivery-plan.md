@@ -401,7 +401,7 @@ user: 123
 
 **契约（`builtins.ts` `export_data`）**：新增可选 `kpis` 参数（`[{ label, value, delta?, hint?, tone? }]`）；`buildHtml`（数据表路径）复用同款 `REPORT_CSS`，报告式与数据式视觉一致。
 
-**回归锁死**：`tests/export-formats.test.ts` 新增 [C5]（KPI 卡渲染 + 零外链）、[C6]（无 KPI 不编造容器、有标题才渲染 hero）。
+**回归锁死**：`tests/export-formats.test.ts` 新增 [C5]（KPI 卡渲染 + 零外链）、[C6]（无 KPI 不编造容器、有标题才渲染 hero）、[C7]（全局零外链护栏：覆盖 `buildHtml`/`buildHtmlReport` 双路径与有/无标题、KPI、单/多图表等多种形态，断言无 `<script>`/`cdn`/`https://`，且仅允许 SVG 命名空间这一处 `http://`）。
 
 **验收**：13512 字节示例报告含 `hero`/`kpis`/`card`/内联 `<svg>`/`table`；外链 `https://` 数 = 2（仅 SVG 命名空间）→ 实质零外链。
 
