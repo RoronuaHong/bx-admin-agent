@@ -595,11 +595,12 @@ user: 123
 - **测试**：`touch()` 用**严格递增**偏移（`Date.now() + 1000 * ++tick`），保证后一次 mtime 一定大于前一次，与机器快慢无关。
 - **新增 [E]**：mtime 完全不动、只改内容（长度不同）→ 断言仍然重载，把「size 参与失效」钉死。
 
-### 14.3 遗留一致项（挂账，未改）
+### 14.3 遗留一致项（已闭环，2026-09-28）
 
-`rag/store.ts` 的 `loadIndex` / `loadVectors` 也是「只按 mtime 失效」同一口径。
-本次不动它（改动面与索引重建耦合，风险不低）；若后续出现「入库成功但检索不到」，优先查这里，
-按 §14.2 同一口径补 size 即可。
+~~`rag/store.ts` 的 `loadIndex` / `loadVectors` 也是「只按 mtime 失效」同一口径~~ → **已按 §14.2 同一口径补齐**：
+失效键改为 `mtimeMs:size`（单次 `statSync` 同时取两值），`saveIndex`/`saveVectors` 同步写回；同毫秒改写且长度变化即可被感知，
+「入库成功但检索不到」的隐患消除。
+回归锁死：`tests/rag-store-invalidate.test.ts`（[A] index 同 mtime 变长必重载、[B] vectors 同 mtime 变长必重载、[C] 文件消失回落空索引）——复刻 mcp-config-hotreload 的竞态法。
 
 ---
 

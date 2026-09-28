@@ -40,6 +40,22 @@ function matchesNamespace(doc: RagDoc, namespace: string): boolean {
   return namespace === "generic";
 }
 
+/**
+ * 读路径（检索/列来源）的命名空间解析：角色**专属语料为空** → 回落公共语料（generic）。
+ *
+ * 为什么需要：隔离的初衷（领域适配指南 §13）是「领域语料不得泄漏给通用助手」——方向是
+ * generic 检索不带其它角色语料；反过来，暂无专属语料的角色（如客服助手，制度/FAQ 语料
+ * 都在公共库）检索自己的空命名空间等于功能缺失。回落是**整体**的（不做逐条合并）：
+ * 角色一旦入库专属语料即停用回落，届时若需「专属+公共」混排再单独立项。
+ * 写路径（sourceHashes）**不**走这里：入库脚本的增量指纹必须只看本命名空间，
+ * 否则 --namespace X 首次入库会被 generic 的同源指纹跳过。
+ */
+function effectiveNamespace(namespace: string): string {
+  if (!namespace || namespace === "generic") return "generic";
+  const hasOwn = loadIndex().docs.some((d) => matchesNamespace(d, namespace));
+  return hasOwn ? namespace : "generic";
+}
+
 interface RagIndex {
   updatedAt: number;
   docs: RagDoc[];
@@ -69,33 +85,35 @@ function vectorsPath(): string {
   return path.join(ragDir(), "vectors.json");
 }
 
-// 进程内缓存按**文件 mtime** 失效：入库脚本是独立进程，改完索引后正在运行的服务
-// 无需重启即可看到新文档（否则「入库成功但检索不到」）。
-let indexMtime = -1;
-let vectorMtime = -1;
+// 进程内缓存按**文件 mtime + size** 失效（§14.2 同一口径）：入库脚本是独立进程，改完索引后正在运行的服务
+// 无需重启即可看到新文档（否则「入库成功但检索不到」）。只看 mtime 有同毫秒竞态——
+// 同一毫秒内改写且长度变化时感知不到；size 参与失效后即可命中，代价仅一次 statSync（本来就在做）。
+let indexStamp = "";
+let vectorStamp = "";
 
-function mtimeOf(file: string): number {
+function fileStamp(file: string): string {
   try {
-    return fs.statSync(file).mtimeMs;
+    const st = fs.statSync(file);
+    return `${st.mtimeMs}:${st.size}`;
   } catch {
-    return -1;
+    return "-1:-1";
   }
 }
 
 function loadIndex(): RagIndex {
-  const mtime = mtimeOf(indexPath());
-  if (indexCache && mtime === indexMtime) return indexCache;
+  const stamp = fileStamp(indexPath());
+  if (indexCache && stamp === indexStamp) return indexCache;
   try {
     if (fs.existsSync(indexPath())) {
       indexCache = JSON.parse(fs.readFileSync(indexPath(), "utf8")) as RagIndex;
-      indexMtime = mtime;
+      indexStamp = stamp;
       return indexCache;
     }
   } catch (err) {
     console.warn(`[rag] 索引读取失败：${String((err as Error)?.message || err)}`);
   }
   indexCache = { updatedAt: 0, docs: [] };
-  indexMtime = mtime;
+  indexStamp = stamp;
   return indexCache;
 }
 
@@ -105,26 +123,26 @@ function saveIndex(idx: RagIndex): void {
     fs.mkdirSync(ragDir(), { recursive: true });
     const file = indexPath();
     fs.writeFileSync(file, JSON.stringify(idx), "utf8");
-    indexMtime = mtimeOf(file);
+    indexStamp = fileStamp(file);
   } catch (err) {
     console.warn(`[rag] 索引写入失败：${String((err as Error)?.message || err)}`);
   }
 }
 
 function loadVectors() {
-  const mtime = mtimeOf(vectorsPath());
-  if (vectorCache && mtime === vectorMtime) return vectorCache;
+  const stamp = fileStamp(vectorsPath());
+  if (vectorCache && stamp === vectorStamp) return vectorCache;
   try {
     if (fs.existsSync(vectorsPath())) {
       vectorCache = JSON.parse(fs.readFileSync(vectorsPath(), "utf8")) as typeof vectorCache;
-      vectorMtime = mtime;
+      vectorStamp = stamp;
       return vectorCache;
     }
   } catch {
     /* 缓存损坏：按空处理，下次入库重建 */
   }
   vectorCache = { model: "", dim: 0, vectors: {} };
-  vectorMtime = mtime;
+  vectorStamp = stamp;
   return vectorCache;
 }
 
@@ -134,7 +152,7 @@ function saveVectors(): void {
     fs.mkdirSync(ragDir(), { recursive: true });
     const file = vectorsPath();
     fs.writeFileSync(file, JSON.stringify(vectorCache), "utf8");
-    vectorMtime = mtimeOf(file);
+    vectorStamp = fileStamp(file);
   } catch {
     /* 写失败不影响检索（降级词法） */
   }
@@ -254,8 +272,9 @@ export function clearAll(): number {
 
 export function listSources(namespace?: string): Array<{ source: string; title: string; chunks: number }> {
   const map = new Map<string, { source: string; title: string; chunks: number }>();
+  const ns = namespace ? effectiveNamespace(namespace) : "";
   for (const d of loadIndex().docs) {
-    if (namespace && !matchesNamespace(d, namespace)) continue;
+    if (ns && !matchesNamespace(d, ns)) continue;
     const cur = map.get(d.source);
     if (cur) cur.chunks += 1;
     else map.set(d.source, { source: d.source, title: d.title, chunks: 1 });
@@ -306,10 +325,10 @@ export interface RagHit {
   score: number;
 }
 
-/** 混合检索：词法 TF-IDF 与向量余弦各自排序，RRF 融合（1/(60+rank)）。可按命名空间隔离。 */
+/** 混合检索：词法 TF-IDF 与向量余弦各自排序，RRF 融合（1/(60+rank)）。可按命名空间隔离；角色专属语料为空时回落公共语料。 */
 export async function search(query: string, topK = 5, namespace?: string): Promise<RagHit[]> {
   let docs = loadIndex().docs;
-  if (namespace) docs = docs.filter((d) => matchesNamespace(d, namespace));
+  if (namespace) docs = docs.filter((d) => matchesNamespace(d, effectiveNamespace(namespace)));
   if (!docs.length) return [];
   const q = query.trim();
   if (!q) return [];

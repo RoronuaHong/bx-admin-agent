@@ -289,7 +289,7 @@ routes: [
 - ✅ 通用助手明确不算专家，不出现在「专家」菜单与门户专家网格，仅作默认态单独呈现。
 - ✅ 专家入口在输入框「+」工具菜单，跳路由、会话按 `agentId` 分槽隔离。
 - ✅ 四语文案、键盘可达（Tab / Enter / Esc，焦点可见）、当前项高亮。
-- ✅ `support` 客服助手成为真·专家：前端路由（`/support`）+ 后端 `roles.ts` 角色（人设 / 服务守则）已补。
+- ✅ `support` 客服助手成为真·专家：前端路由（`/support`，复用 `ChatPage` + props 注入 `agentId`）+ 后端 `roles.ts` 角色（人设 / 数据源与调用约定 / 服务守则 + `enforceGrounding` 接地护栏）。事实类回答走 `search_knowledge` 检索企业文档——客服暂无专属语料，KB 读路径按「角色专属语料为空→回落公共语料 generic」继承公共库（`rag/store.ts` 的 `effectiveNamespace`，写路径 `sourceHashes` 不回落）；不启用 `forceToolCall`（客服问候/安抚占比高，首轮强制工具会破坏自然开场）。端到端（2026-09-28，kimi27）：制度问题调 `search_knowledge` 命中考勤制度并如实说明文档未覆盖的部分（不编造）、「你是谁」正确自报客服助手。
 - 🗺️ 路线图：专家团（Team）、分类检索、企业权限。
 
 #### 8.7.4 决策记录（2026-09-20 已决并落地）
@@ -464,7 +464,7 @@ routes: [
 | `BASE_PROMPT`（角色人设） | 否（硬编码） | 模式 A/B 的改造对象 |
 | skill 索引 `renderSkillIndex()` | ❌ 否 | **必需改动**（稳定前缀，影响 cache） |
 | MCP 启用集 | ✅ 是（已按**对话**持久化） | 观影 MCP 只在观影对话启用，天然隔离 |
-| 知识库语料 | ✅ 是（`namespace` 过滤） | `rag/store.ts` 按角色隔离，检索透传会话角色；观影语料 `--namespace movie` 入库即与 `generic` 隔离（历史索引按 `undefined→generic` 兜底兼容） |
+| 知识库语料 | ✅ 是（`namespace` 过滤） | `rag/store.ts` 按角色隔离，检索透传会话角色；观影语料 `--namespace movie` 入库即与 `generic` 隔离（历史索引按 `undefined→generic` 兜底兼容）。**读路径回落（2026-09-28）**：角色专属语料为空时 `search`/`listSources` 回落公共语料 generic（客服助手继承制度/FAQ 公共库，入库专属语料后自动停用回落）；写路径 `sourceHashes` 不回落（否则 `--namespace X` 首次入库会被 generic 指纹跳过） |
 
 ---
 
