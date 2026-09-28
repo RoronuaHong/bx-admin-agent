@@ -12,7 +12,7 @@
 | 2 | 形态判定准则（内置 / MCP / Skill / 定时任务） | ✅ 已完成（§4） |
 | 3 | P0 产物交付闭环（导出工具 + 下载端点 + `file` 事件 + 下载卡片） | ✅ 已落地（`export_data`：xlsx/csv/json/md） |
 | 4 | P1 工具面补齐（`fs_delete` / 上传入工作区 / 定时任务工具化） | ✅ 已完成（2026-09-24，§15 / §16 / §17） |
-| 5 | P2 `run_script`（受控代码执行）/ `image_gen` | 🟡 暂缓，见 §6 论证 |
+| 5 | P2 `run_script`（受控代码执行）/ `image_gen` | ✅ 已落地并纳入统一交付物护栏（见 §11.8 / `docs/DELIVERABLE_GUARDRAILS.md`） |
 | 6 | v2 格式扩展（PDF / Word / HTML / TXT，§10） | ✅ 已落地（2026-09-23，见 §10.7） |
 | 7 | v2.1 报告式导出交付断链修复（零表格报告 + fs_write 下载卡片，§11） | ✅ 已落地（2026-09-24，见 §11.4） |
 | 8 | 交互式轮次耗尽「补位收尾」（全程审计产物，§12） | ✅ 已落地（2026-09-24，见 §12.3） |
@@ -30,7 +30,7 @@
 > `render_chart` `request_clarification` `recall_memory` `save_memory` `search_tools` `search_knowledge`
 > `knowledge_sources` `web_search` `fetch_url` `export_data` `write_todos` `task` `run_command`
 > `record_watched_movies` `list_schedules` `manage_schedule`；其中 22 个在 `execBuiltin` 里分发，
-> `task` 与 `search_tools` 由 `chat.ts` 循环内直接处理。第 5 项 `run_script` / `image_gen` 维持暂缓，论证见 §6。
+> `task` 与 `search_tools` 由 `chat.ts` 循环内直接处理。第 5 项 `run_script` / `image_gen` 已落地，对齐 `docs/DELIVERABLE_GUARDRAILS.md`（§11.8）。
 
 ---
 
@@ -406,6 +406,17 @@ user: 123
 **回归锁死**：`tests/export-formats.test.ts` 新增 [C5]（KPI 卡渲染 + 零外链）、[C6]（无 KPI 不编造容器、有标题才渲染 hero）、[C7]（全局零外链护栏：覆盖 `buildHtml`/`buildHtmlReport` 双路径与有/无标题、KPI、单/多图表等多种形态，断言无 `<script>`/`cdn`/`https://`，且仅允许 SVG 命名空间这一处 `http://`）、[C8]（零外链 / 反编造扩展到 pdf/docx 全家族：合法文件签名 + 无 `https://`/`cdn` 外链 + 缺标题不注入默认大标题）。
 
 **验收**：13512 字节示例报告含 `hero`/`kpis`/`card`/内联 `<svg>`/`table`；外链 `https://` 数 = 2（仅 SVG 命名空间）→ 实质零外链。
+
+### 11.8 跨工具统一护栏（2026-09-28 落地）
+
+`export_data` 全家族（html/pdf/docx/xlsx/csv/json/md/txt）的反编造 / 自包含零外链 / 观感治理闭环后，把五条硬原则抽成**可复用规范** `docs/DELIVERABLE_GUARDRAILS.md`，覆盖所有"产出可下载/可查看文件"的内置工具，避免每加一个工具重踩坑。
+
+- **P2 工具对齐**：`run_script`（受控代码执行）与 `image_gen`（外部生图）现已真实落地，并核对符合统一护栏——
+  - `image_gen`：把远端 `url` 本地化落盘（`fsWriteBinary`），交付物不含外部链接；优先 `b64_json` 内联字节，绝不把外部 URL 透传给用户。
+  - `run_script`：只透传原始执行输出（`runShell`），不包裹编造文案。
+- **CI 级硬卡点**：新增 `tests/governance-guardrails.test.ts`（[G1]–[G4]），在套件内随 CI 运行——源码级钉死「`report.ts` 零外链字面量」「无默认标题兜底 `|| "数据分析报告"`/`|| "导出数据"`」「`externalRefHint` 与 `.html` 卡片逻辑存在」「`image_gen` 本地化 / `run_script` 透传」。行为级回归仍由 `export-formats.test.ts`（[C2]–[C8]）与 `html-self-contained.test.ts`（[A]–[D]）锁死。
+
+> 说明：本计划 §5 / §6 的「P2 暂缓 / 暂不给」表述为早期规划口径；`run_script`/`image_gen` 后续按需求实现并已达统一护栏，故本表第 5 项状态更新为「已落地并纳入护栏」。
 
 ---
 
