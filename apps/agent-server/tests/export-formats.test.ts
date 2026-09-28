@@ -129,6 +129,33 @@ test("[C7] 全局零外链护栏：多种 html 形态均自包含（无 script/c
   }
 });
 
+test("[C8] pdf/docx 同样自包含（零外链）：合法文件签名 + 无 https 外链，且缺标题不注入默认大标题", async () => {
+  // 把「零外链 / 反编造」从 html 扩展到 pdf/docx 全家族：与 [C7] 同口径。
+  for (const fmt of ["pdf", "docx"] as const) {
+    const out = await run({
+      filename: `零外链.${fmt}`,
+      title: "小语种时长",
+      sections: ["## 概览", "说明文字。"],
+      charts: [{ chartType: "line", title: "趋势", data: [{ x: "周一", y: 1 }, { x: "周二", y: 3 }] }],
+    });
+    expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
+    const buf = fs.readFileSync(absOf(out.artifact!.path));
+    if (fmt === "pdf") expect(buf.subarray(0, 5).toString("latin1")).toBe("%PDF-");
+    else expect(buf.subarray(0, 2).toString("latin1")).toBe("PK");
+    // 自包含：成品二进制不得引用任何外部 https 资源（字体/样式/图床）
+    const ascii = buf.toString("latin1");
+    expect(ascii, fmt).not.toContain("https://");
+    expect(ascii, fmt).not.toContain("cdn.");
+  }
+  // 无标题也不编造默认标题、不崩：buildPdf/buildDocx 走 `if (title)` 守卫，缺标题就不注入大标题
+  for (const fmt of ["pdf", "docx"] as const) {
+    const out = await run({ filename: `无标题.${fmt}`, sections: ["正文"] });
+    expect(out.ok, `${fmt} 无标题: ${out.text}`).toBe(true);
+    const buf = fs.readFileSync(absOf(out.artifact!.path));
+    expect(buf.length, fmt).toBeGreaterThan(0);
+  }
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
