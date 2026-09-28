@@ -46,7 +46,22 @@
 工具分两层：**内置工具**（agent-server 自带）与 **MCP 工具**（外部服务器提供，命名空间 `mcp__<serverId>__*`）。**领域适配完全发生在 MCP 层——换后台 = 换 MCP server，框架源码不动**，这正是「领域无关的 deep-agent 框架」的含义。
 
 ### 4.1 内置工具（`builtins.ts`）
-`request_clarification`、`web_search`、`search_dingtalk_doc`、`write_todos`、`task`、`fs_*`、`read_skill`、`search_tools` 等；风险等级见 §3 `risk.ts`。
+
+agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内部路由工具 `task` / `search_tools`）。完整清单（与 `builtins.ts` 的 `execBuiltin` 分支及 `BUILTIN_RISK` 一一对应，无遗漏、无臆造）：
+
+- **文件系统 `fs_*`**（7 个，无 move/chmod）：`fs_read` / `fs_write` / `fs_ls` / `fs_glob` / `fs_grep` / `fs_edit` / `fs_delete`
+- **规划与记忆**：`write_todos`（任务规划卡）/ `save_memory` / `recall_memory`
+- **知识与检索**：`search_knowledge` / `knowledge_sources`（本地资料库）/ `search_dingtalk_doc`（钉钉文档）/ `web_search` / `fetch_url`（公网抓取，含 SSRF 防护）
+- **可视化与成稿**：`render_chart`（浏览器本地 AntV 渲染，数据不出本机）/ `export_data`（叙述 + 图表 + 表格 → html/pdf/docx/csv 文件）
+- **定时任务**：`list_schedules` / `manage_schedule`（复用 `schedules.ts` 底座）
+- **本机执行**：`run_command` / `run_script`（对应 chat.ts 注释里的 exec 概念）
+- **图像**：`image_gen`（OpenAI 兼容 `/images/generations`，需 `IMAGE_GEN_*`，未配置如实报错不静默跳过）
+- **交互**：`request_clarification`（澄清门）
+- **技能**：`read_skill`（按需读取 SKILL.md）
+- **内部路由**：`task`（子 Agent 委派）/ `search_tools`（工具按需检索入口，deferred 模式下唯一可见入口）
+- **领域专属**：`record_watched_movies`（movie 角色写本地观影画像，见 `movie/profile.ts`）
+
+风险等级（`read`/`write` × `workspace`/`external`）由 `builtins.ts` 的 `BUILTIN_RISK` 声明，与服务端 `risk.ts` 策略联动（见 §3）；服务端 `toolRisks` 优先级更高。
 
 ### 4.2 MCP 子系统（`mcp/`）
 - `mcp/config.ts`：服务器来源有二——① `MCP_BUILTIN_SERVERS`（`.env` 里的 JSON 数组，部署期确定、不落盘；stdio 子进程继承父进程环境，凭据放 `.env` 即可）；② 运行时经 `POST /mcp/servers` 由用户添加。`conversation.mcpServers` 持久化「本对话启用集」。
