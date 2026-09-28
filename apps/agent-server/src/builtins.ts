@@ -690,6 +690,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     spec(
       "export_data",
       "把**真实数据**导出成可下载文件（xlsx / csv / json / md / docx / pdf / html / txt），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
+        "**调用必带内容**：rows / sheets / sections / charts 至少提供一项；光给 filename 或只给 title 都不行（title 只是大标题文字，不是正文）。" +
         "格式选择：表格/数据 → xlsx 或 csv；网页预览（自包含、可离线打开）→ html；文档式排版（打印/存档）→ pdf 或 docx；纯文本 → txt。" +
         "用户说「导出 / 生成 excel / 生成表格 / 生成 csv / 生成 pdf / 导出 word / 生成文档 / 下载数据 / 生成报告 / 全部放进去」时都用它；**不要**用 fs_write 写文本文件去冒充表格或文档文件。" +
         "数据必须来自工具真实返回，禁止编造；行数很多时先在数据侧聚合或筛选（pdf 上限 2000 行、docx 2 万行，其余 5 万行）。" +
@@ -722,7 +723,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
             description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；只有 xlsx / docx / pdf 支持多表）",
             items: { type: "object" },
           },
-          title: jsonType("string", "可选：报告标题（html / pdf / docx 的大标题）"),
+          title: jsonType("string", "可选：报告标题（html / pdf / docx 的大标题）。注意：title 仅作标题文字，不能替代正文——仍需另行提供 rows / sheets / sections / charts 之一"),
           sections: {
             type: ["array", "string"],
             description: "可选：叙述段落（markdown 文本）。数组则每段一个元素；字符串则整体作为一个段落。html/pdf/docx 会渲染成标题/列表/正文，把口径说明、预测、建议等文字一并装进文件",

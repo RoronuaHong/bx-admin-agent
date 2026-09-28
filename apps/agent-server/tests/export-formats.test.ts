@@ -56,6 +56,13 @@ test("[C2] 无标题时不编造默认大标题（回归『胡编乱造』缺陷
   expect(html).toContain("纯内容段落，没有标题");
 });
 
+test("[C3] 只给 filename+title（无正文）必须如实报错，不编造内容", async () => {
+  // 复现缺陷：模型曾只传 title 当正文 → 工具必须明确拒绝，而不是把标题当内容塞进空文件。
+  const out = await run({ filename: "空.html", title: "只有标题" });
+  expect(out.ok).toBe(false);
+  expect(out.text).toContain("至少提供一项");
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
