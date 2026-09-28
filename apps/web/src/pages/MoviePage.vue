@@ -737,6 +737,9 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100dvh;
+  /* dvh 在移动端动态工具栏/设备模拟下可能大于真实视口：钳到 #app-main（height:100% 链，
+     即真实窗口高），防止壳被撑出 body 后 body 滚动、header 滚丢并露出 html 底色。 */
+  max-height: 100%;
   width: 100%;
   color: var(--ink);
   font-family: var(--font-body);
@@ -1111,6 +1114,10 @@ html[data-theme="dark"] .mc-btn-danger:hover {
 }
 
 .mc-bubble {
+  /* 必须定位：内部 sr-only 说话人前缀是 absolute，若这里不锚定，
+     包含块会逃逸到 #app（position:relative），绕过 .mc-scroll 的 overflow 裁剪，
+     把 #app 撑出几千 px 的隐藏滚动空间，聚焦/滚动锚定时整页被滚偏。 */
+  position: relative;
   max-width: 88%;
   padding: 11px 15px;
   border-radius: 18px;

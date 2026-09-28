@@ -21,6 +21,14 @@ export interface ModelEntry {
   timeoutMs: number;
   /** 上下文窗口（token）。上下文预算由此推导，不再用与模型无关的固定字符数。 */
   contextWindow: number;
+  /**
+   * 该模型的**主对话**也关闭「扩展思考」（OpenAI 兼容通道发 `thinking:{type:"disabled"}`）。
+   * 实测动因：部分模型把推理链写进正文 `<think>` 块（`reasoning_content` 为空，前端走不到思考通道），
+   * 思考占掉绝大部分生成时间——同一请求 7.3s vs 关闭后 3.1s，而它并不提升答案正确性。
+   * 默认 false（不改变任何既有模型的行为）；只对实测确认「思考链纯属延迟负担」的模型显式开启
+   * （`MODEL_<ID>_DISABLE_THINKING=true`）。端点不接受该字段时由 models.ts 运行时学习后省略重发。
+   */
+  disableThinking?: boolean;
 }
 
 export function listModels(): ModelEntry[] {
@@ -64,6 +72,8 @@ export function listModels(): ModelEntry[] {
       contextWindow: Number(
         process.env[`${prefix}CONTEXT_WINDOW`] || process.env.MODEL_CONTEXT_WINDOW || 128000,
       ),
+      // 未配置 = false（主对话保留端点默认行为，只由调用方 opts 显式关思考）。
+      disableThinking: /^(1|true|yes|on)$/i.test((process.env[`${prefix}DISABLE_THINKING`] || "").trim()),
     });
   }
   return entries;

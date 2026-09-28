@@ -84,7 +84,20 @@ body,
   height: 100%;
   width: 100%;
   max-width: 100%;
+}
+
+html,
+body {
   overflow-x: hidden;
+}
+
+/* #app 必须用 clip 而不是 hidden：hidden 会把 #app 升格成滚动容器
+   （overflow-x:hidden 时 overflow-y 计算为 auto），内部一旦有 absolute 元素
+   逃逸进来（如 .mc-bubble 未定位时的 sr-only 说话人前缀）就会产生几千 px 的
+   隐藏可滚空间，聚焦/滚动锚定会把整页滚偏——header 滚丢、底部露出 body 底色。
+   clip 同样裁掉横向溢出，但不产生滚动容器。 */
+#app {
+  overflow-x: clip;
 }
 
 html {
@@ -144,6 +157,14 @@ body::before {
 #app {
   position: relative;
   z-index: 1;
+}
+
+/* App 壳层高度锚点：html/body/#app 已是 height:100% 链，#app-main 补齐这一环。
+   各路由的 100dvh 壳（.chat/.mc）靠它做 max-height:100% 兜底——移动端动态工具栏、
+   DevTools 设备模拟等场景下 dvh 可能大于真实视口，不钳制会把壳撑出 body，
+   body（overflow hidden auto）一滚，header 滚丢、底部露出 html 底色一条带。 */
+#app-main {
+  height: 100%;
 }
 
 button,

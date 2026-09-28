@@ -5702,6 +5702,8 @@ onBeforeUnmount(() => {
 .chat {
   display: flex;
   height: 100dvh;
+  /* 同 .mc：dvh 大于真实视口时（动态工具栏/设备模拟）钳回 #app-main，防 body 滚动露出底色。 */
+  max-height: 100%;
   width: 100%;
   background: var(--bg);
   color: var(--ink);

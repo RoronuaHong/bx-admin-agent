@@ -7,6 +7,8 @@ dist
 *.err
 # 运行时产物：pm2 日志与调试抓包/截图（此前未忽略，git add -A 会把它们带进仓库）
 apps/agent-server/logs/
+# 一次性排查脚本与它们的输出（如 .tmp/probe-*.mjs）：只在本地排查响应慢等问题时用，不进仓库
+apps/agent-server/.tmp/
 test-output.txt
 _test_result.txt
 .DS_Store

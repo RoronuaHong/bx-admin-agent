@@ -8,6 +8,10 @@ export interface AgentRole {
   basePrompt?: string;
   /** 该角色**新建对话**默认勾选的 MCP 服务器 id（用户显式勾选时以请求为准）。 */
   defaultMcpServers?: string[];
+  /** 该角色**新建对话**默认的「完全访问」开关：false = 写/破坏性/外部操作逐项弹确认卡；
+   * 缺省 = true（开箱即完全授权，对齐全局默认）。客服助手只有 ticket_create 一枚写工具、
+   * 且面向真实用户建单，故默认关掉完全访问，让建单走人审确认（见 support-data-source-plan.md）。 */
+  defaultFullAccess?: boolean;
   /** 该角色默认模型 id（请求未指定、对话未设置时回落到此；不填 = 全局默认模型）。 */
   defaultModel?: string;
   /** 该角色强制全量注入 MCP 工具 schema（不走「按需检索加载」deferred）。仅对依赖工具强、弱模型易在
@@ -65,12 +69,16 @@ const SUPPORT_BASE_PROMPT = [
   "你是「客服助手」，面向用户的客户服务 AI：处理咨询、售后问题与常见问答（FAQ），帮助用户查订单、跟进工单、给出标准解答话术。被问到「你是谁」时只说你是客服助手。",
   "",
   "数据源与调用约定（工具使用的通用纪律不在此重复）：",
-  "1. 公司制度、政策、流程、产品说明等事实性问题（规则细节、办理条件、收费标准、标准话术等），" +
+  "1. 订单、物流、工单状态等业务数据（状态、进度、运单号、处理时间线），**必须先调用订单/工单工具取真实数据**" +
+    "（order_search / order_get / ticket_list / ticket_get），严禁凭记忆或猜测报状态；查不到就如实说没有这单/单号，不要编一个结果顶上。",
+  "2. 用户反馈商品或服务问题、要求跟进处理时，用 ticket_create 创建工单（这是写操作，会弹出确认卡等用户确认——确认前不要重复发起）。" +
+    "创建后把工单号与当前受理状态告知用户。",
+  "3. 公司制度、政策、流程、产品说明等事实性问题（规则细节、办理条件、收费标准、标准话术等），" +
     "**必须先调用 search_knowledge 检索企业文档**，依据检索到的原文回答并注明来源文件；" +
     "检索不到就如实说「文档里没有这项内容」，严禁凭通用记忆编造条款或细则。",
-  "2. 以下情形**不要调用任何工具**，直接用你自己的话回答：打招呼与闲聊、情绪安抚、询问你是谁 / 能做什么、" +
+  "4. 以下情形**不要调用任何工具**，直接用你自己的话回答：打招呼与闲聊、情绪安抚、询问你是谁 / 能做什么、" +
     "对上一轮结论的解释或展开。这类轮次没有数据可查，也不要声称数据源故障、未连接或无法访问。",
-  "3. 超出权限或需要人工处理的事项（退款审批、赔偿、投诉升级、账号申诉等），" +
+  "5. 超出权限或需要人工处理的事项（退款审批、赔偿、投诉升级、账号申诉等），" +
     "给出标准流程引导并建议转人工处理，不擅自替用户或公司做出承诺。",
   "",
   "服务守则：",
@@ -115,13 +123,19 @@ const ROLES: Record<string, AgentRole> = {
     id: "support",
     label: "客服助手",
     basePrompt: SUPPORT_BASE_PROMPT,
-    // 暂无专属 MCP（订单/工单系统接入时再加 defaultMcpServers）；事实类回答靠 search_knowledge
-    // 检索企业文档——客服角色暂无专属语料，检索按「角色专属语料为空→回落公共语料」继承 generic 库
-    // （见 rag/store.ts 的 effectiveNamespace）。
-    // 接地护栏：客服答错 = 编造条款/政策，事实必须来自文档 → 与 movie 同一护栏（src/grounding.ts）：
+    // 订单/工单数据源：当前为示例 MCP（scripts/order-mock-mcp.mjs，内存 mock 数据，写操作 ticket_create
+    // 走确认卡）；接真实系统时只改 .env 的 MCP_BUILTIN_SERVERS orders 条目（换 command/url + 凭据），
+    // 工具契约与角色配置零改动（方案见 docs/agent/support-data-source-plan.md）。
+    // 制度/FAQ 事实回答靠 search_knowledge 检索企业文档——客服角色暂无专属语料，检索按
+    // 「角色专属语料为空→回落公共语料」继承 generic 库（见 rag/store.ts 的 effectiveNamespace）。
+    // 接地护栏：客服答错 = 编造条款/订单状态，事实必须来自数据源 → 与 movie 同一护栏（src/grounding.ts）：
     // 零工具数据以正文结论收束时先纠正回灌，重试仍无数据则受约束的诚实兜底。
     // 不启用 forceToolCall：客服对话问候/安抚占比高，首轮强制工具调用会破坏自然开场
     // （该开关的代价见上方 AgentRole 注释），反编造由人设第 1 条 + enforceGrounding 承担。
+    defaultMcpServers: ["orders"],
+    // 客服助手只有 ticket_create 一枚写工具、且面向真实用户建单 → 默认关闭完全访问，
+    // 让建单走人审确认卡（对齐 support-data-source-plan.md 的「ticket_create 永远弹确认卡」）。
+    defaultFullAccess: false,
     enforceGrounding: true,
   },
 };

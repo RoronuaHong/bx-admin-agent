@@ -261,10 +261,14 @@ export async function createConversation(input: {
   agentId?: string;
   /** 显式指定 MCP 启用集（缺省 = 角色默认）。 */
   mcpServers?: string[];
+  /** 显式指定「完全访问」开关（缺省 = 角色默认，再缺省 = true）。 */
+  fullAccess?: boolean;
 }): Promise<ConversationDoc> {
   const now = Date.now();
   // MCP 默认勾选：显式传入 > 角色默认 > 配置了 defaultEnabled 的服务器。
   const mcp = input.mcpServers || getRole(input.agentId).defaultMcpServers || defaultMcpServers();
+  // 「完全访问」默认：显式传入 > 角色默认（如客服助手关，让写工具走人审确认）> 开箱即完全授权。
+  const fullAccess = input.fullAccess ?? getRole(input.agentId).defaultFullAccess ?? true;
   // 新对话默认勾选配置了 defaultEnabled 的 MCP 服务器（已有对话不受影响）。
   const doc: ConversationDoc = {
     id: input.id,
@@ -273,8 +277,8 @@ export async function createConversation(input: {
     mcpServers: mcp,
     createdAt: now,
     updatedAt: now,
-    // 开箱即「完全访问」：写/破坏性/外部操作不逐项弹确认卡。
-    fullAccess: true,
+    // 角色可关掉完全访问：写/破坏性/外部操作逐项弹确认卡（客服助手即如此）。
+    fullAccess,
     ...(input.agentId ? { agentId: input.agentId } : {}),
     ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
   };
@@ -299,7 +303,7 @@ export async function createConversation(input: {
         messages: doc.messages,
         createdAt: now,
         mcpServers: doc.mcpServers,
-        fullAccess: true,
+        fullAccess,
         ...(input.agentId ? { agentId: input.agentId } : {}),
         ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
       },

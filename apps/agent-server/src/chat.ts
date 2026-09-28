@@ -82,8 +82,27 @@ const TOOL_RESULT_CLEARED = "…（较早的工具结果已清理以节省上下
 const HANDLE_ARGS_CHARS = Number(process.env.MCP_HANDLE_ARGS_CHARS || 200);
 // MCP 护栏：工具数量、工具循环轮次、单条工具结果回灌长度。
 const MCP_MAX_TOOLS = Number(process.env.MCP_MAX_TOOLS || 80);
-const MAX_TOOL_ROUNDS = Number(process.env.MCP_MAX_TOOL_ROUNDS || 14);
+// 交互式轮次预算：默认 28，与无人值守（SCHEDULE_MAX_TOOL_ROUNDS）拉齐。
+// 历史默认 14 在「翻 schema → 取数 → 出多张图 → 出表 → 导出」这类多产物任务上会在收尾（导出/落盘）前被截断——
+// app.ts 注释里已记载调度任务因此从 14 提到 28，交互式是同因同症，故对齐到 28。
+// 真正防失控的是独立的 Doom Loop 熔断（TOOL_SIGNATURE 连续同参≥阈值即强制收束），轮次上限只是任务复杂度预算，
+// 调大不会放大失控风险；仍可用 MCP_MAX_TOOL_ROUNDS 按需收紧。
+const MAX_TOOL_ROUNDS = Number(process.env.MCP_MAX_TOOL_ROUNDS || 28);
 const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12_000);
+
+// ---- 额度类失败的进程内冷却 ----
+// 实测动因：网关的免费额度是被用完的小池子，某些模型 402（额度耗尽）后短则几小时不会恢复，
+// 而候选链是「注册表顺序」，于是每次对话都要把已经死掉的模型从头打一遍（本次 5 个），
+// 既白付延迟（每个 20-100ms，慢模型更多）也刷满 402 日志噪音，还让「实际服务模型」的判定绕远路。
+// 因此给确定性额度失败加冷却窗口：窗口内该模型不进候选链（用户显式指定的模型除外——
+// 否则「指定模型 + 该模型额度耗尽」会直接失败，而不是诚实地把 402 展示给用户）。
+const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 10 * 60 * 1000);
+const quotaCooldownUntil = new Map<string, number>();
+
+/** 是否属「额度/未开通」类确定性失败（与 models.ts 的 402 判定同口径，不认厂商）。 */
+function isQuotaFailure(failure: string | null): boolean {
+  return /401008|402|额度|未开通|余额|quota/i.test(String(failure || ""));
+}
 
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
@@ -2282,7 +2301,15 @@ export async function* chatStream(
   // 候选模型链：选定模型失败（瞬态 / 限流）时按注册表顺序切到下一个可用模型重试（韧性降级）。
   // 永久错误（4xx / 配额耗尽）不切模型。每段依赖模型的预算 / 上下文装配在循环内基于候选模型重算。
   const allModels = listModels();
-  const candidates = [model, ...allModels.filter((m) => m.id !== model.id)];
+  // 冷却过滤：只过滤「非用户显式指定」的候选；若除指定模型外全部在冷却中，则照常全量尝试
+  // （宁可多打几次 402，也不能让请求直接无模型可用）。
+  const others = allModels.filter((m) => m.id !== model.id);
+  const fresh = others.filter((m) => (quotaCooldownUntil.get(m.id) || 0) <= Date.now());
+  const cooling = others.filter((m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now());
+  if (cooling.length) {
+    console.log(`[chat:model] 额度冷却中已跳过：${cooling.map((m) => m.id).join(",")}`);
+  }
+  const candidates = [model, ...(fresh.length ? fresh : others)];
   let text = "";
   let failure: string | null = null;
   let handles: ToolHandle[] = [];
@@ -2415,6 +2442,7 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
+    if (isQuotaFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + QUOTA_COOLDOWN_MS);
     // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
     // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，

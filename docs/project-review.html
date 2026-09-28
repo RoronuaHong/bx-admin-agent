@@ -242,7 +242,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-09-28） · 面向：项目梳理与技术复盘 · 代码基准：master @ d9db377（§2 体量、§3 起的源码行号引用、§8 内置工具清单、A 章工程配套已按此基准刷新）</p>
+  <p class="kv">生成日期：2026-09-23（末次刷新 2026-09-28） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；§2 体量、§3 起的源码行号引用、§8 内置工具清单、A 章工程配套已按此口径刷新）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -278,7 +278,7 @@
 <tr><td>缺口：提示注入防护</td><td>缺</td><td>补 <code>untrusted.ts</code>（nonce 围栏 + 伪造标签中和 + 控制字符剥离）与 <code>role-guard.ts</code>（禁止模型自报为其他品牌）</td></tr>
 <tr><td>缺口：路由</td><td>漏 <code>/support</code></td><td>补：<code>/support</code> 复用 ChatPage，用 props 注入 <code>agentId</code> 做会话分槽</td></tr>
 <tr><td>缺口：观影画像 / 通知投递</td><td>提了一句</td><td>补 <code>movie/profile.ts</code>（Mongo <code>movie_profiles</code>、上限 200 条）与 <code>notify/deliver.ts</code>（钉钉加签 + 关键词 / 飞书）</td></tr>
-<tr><td>缺口：内置 MCP / 脚本 / 测试 / 文档</td><td>完全没写</td><td>新增 A 章：<code>MCP_BUILTIN_SERVERS</code>（bi / yapi / movie + <code>toolRisks</code>）、4 个脚本、<strong>20 个测试用例</strong>按四组归类（当时口径；截至 <code>d9db377</code> 已增至 35 个文件 / 约 200 例，见 A3）、<code>docs/knowledge/</code> 同时是 RAG 语料</td></tr>
+<tr><td>缺口：内置 MCP / 脚本 / 测试 / 文档</td><td>完全没写</td><td>新增 A 章：<code>MCP_BUILTIN_SERVERS</code>（bi / yapi / movie + <code>toolRisks</code>）、4 个脚本、<strong>20 个测试用例</strong>按四组归类（当时口径；截至方向 2 已增至 38 个文件 / 约 210 例，见 A3）、<code>docs/knowledge/</code> 同时是 RAG 语料</td></tr>
 <tr><td>MCP 配置缓存缺陷</td><td>标为 🐞 已知缺陷</td><td><strong>已实际修复</strong>：<code>config.ts</code> 按 <strong>mtime + size</strong> 失效（2026-09-24 起，只按 mtime 会漏掉同毫秒改写）+ <code>persist()</code> 同步两者 + <code>AGENT_DATA_DIR</code> 可覆盖（便于测试）+ <code>tests/mcp-config-hotreload.test.ts</code> 5 例全绿（详见 <code>docs/artifact-delivery-plan.md</code> §14）</td></tr>
 <tr><td>上下文工程（本轮补齐）</td><td>只写了「去重 / 熔断 / 卸载 / 接地」四条</td><td>补成<strong>六条</strong>：⑤ 跨轮重复只给观察提示（反馈 &gt; 硬拦）、⑥ 预算耗尽补位收尾 <code>wrapUpWith()</code>；另补 <code>GROUNDING_VERIFY</code> 事后核验 + 多票裁决、逐轮 trace、产物零外链软护栏，并在 §12 / §23 各新增卡片。对齐 Anthropic《Effective context engineering for AI agents》</td></tr>
 </tbody>
@@ -356,7 +356,7 @@ d:\Code\bx-admin-agent
 │  │  ├─ assets/fonts/         PDF 中文渲染字体 Noto Sans SC
 │  │  ├─ config/ data/         索引与策略 JSON
 │  │  └─ .data/                运行时产物（gitignore）
-│  └─ web/src/                 前端（25 个文件，ChatPage.vue 9853 行 / 365KB）
+│  └─ web/src/                 前端（25 个文件，ChatPage.vue 10201 行 / 365KB）
 ├─ packages/shared/            共享类型（ChatEvent、ArtifactSpec、TodoItem…）
 ├─ docs/                       设计文档 17 篇 + agent/ 22 篇 + knowledge/ 本地知识库
 ├─ pnpm-workspace.yaml         monorepo 配置
@@ -376,7 +376,7 @@ d:\Code\bx-admin-agent
 <tr><td><code>schedules.ts</code></td><td class="num">392</td><td>cron 定时任务 + 专属对话 + 通知投递</td></tr>
 <tr><td><code>fs-store.ts</code></td><td class="num">420</td><td>每会话独立虚拟文件系统（读/写/grep/glob/edit）</td></tr>
 <tr><td><code>system-prompt.ts</code></td><td class="num">257</td><td>系统提示词组装与角色人设注入</td></tr>
-<tr><td><code>ChatPage.vue</code></td><td class="num">≈9900（365KB）</td><td>整个聊天界面：流消费、渲染、交互全在一处</td></tr>
+<tr><td><code>ChatPage.vue</code></td><td class="num">≈10200（365KB）</td><td>整个聊天界面：流消费、渲染、交互全在一处</td></tr>
 </tbody>
 </table>
 <div class="note"><strong>知识点</strong>：ChatPage.vue 体量大是有意取舍——对话 UI 的状态高度耦合（事件、滚动、折叠态、渲染），拆组件会带来跨组件同步成本；但长期看「流解析 / 事件归一化」应抽成 composable。</div>
@@ -568,7 +568,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <h2 class="sec">7 · 工具循环与护栏（项目的心脏）</h2>
 <p>工具循环是 Agent 与「只会聊天的机器人」的分界线，也是最容易失控的地方。这里用一串<strong>显式常量</strong>把行为钉死。</p>
 
-<h3>护栏常量一览 <span class="kv">src/chat.ts:62-159</span></h3>
+<h3>护栏常量一览 <span class="kv">src/chat.ts:62-659</span></h3>
 <table>
 <thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
 <tbody>
@@ -1412,7 +1412,7 @@ src/
 
 <div class="kp-card" tabindex="0" role="button">
   <div class="kp-h"><b>前端单文件 ChatPage.vue</b><span class="tag warn">⚠️ 已知欠账</span></div>
-  <p class="kp-1">365KB / 9853 行：流解析、状态、渲染、交互都在一处</p>
+  <p class="kp-1">365KB / 10201 行：流解析、状态、渲染、交互都在一处</p>
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界最佳实践</dt><dd>按职责拆分：流解析 / 状态管理 / 渲染组件各自独立，便于测试与并行开发。</dd>
@@ -1430,7 +1430,7 @@ src/
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界最佳实践</dt><dd>复杂编排用成熟框架（LangGraph / Vercel AI SDK）省轮子，状态和重试模型化。</dd>
-      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环，护栏由 <strong>25 个显式常量</strong>控制（集中在 <code>chat.ts:62-291</code>，§7 表按 17 组列出），行为可预测可观测。</dd>
+      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环，护栏由 <strong>39 个显式常量</strong>控制（集中在 <code>chat.ts:62-659</code>，§7 表按 17 组归类），行为可预测可观测。</dd>
       <dt>判定</dt><dd>⚠️ 有意偏离。</dd>
       <dt>偏离原因</dt><dd>护栏细节必须在自己手里：降级触发点、熔断阈值、结果治理都是本项目的核心资产，抽象到框架后调试与调参成本骤增；同时避免额外依赖。</dd>
       <dt>何时改回去</dt><dd>当编排复杂度真的需要「图」来表达（多分支长期运行工作流）时再评估；在此之前自研循环的确定性更值钱。</dd>
@@ -1487,7 +1487,7 @@ src/
     <dl>
       <dt>业界最佳实践</dt><dd>配置可能被本进程之外改动（手工编辑、部署脚本、初始化脚本），缓存必须按<strong>文件 mtime</strong> 失效，而不是「只有自己写过才刷新」。</dd>
       <dt>本项目做法（修复后）</dt><dd><code>config.ts</code> 记录 <code>fileCacheMtime</code> 与 <code>fileCacheSize</code>，读取前比对 <strong>mtime + size</strong>（size 兜住同毫秒改写）；<code>persist()</code> 写回后同步两者；文件删除也能感知。与 <code>rag/store.ts</code> 同口径。</dd>
-      <dt>判定</dt><dd>✅ 已与最佳实践对齐（此前是 🐞 缺陷，2026-09-23 修复）。</dd>
+      <dt>判定</dt><dd>✅ 已与最佳实践对齐（此前是 🐞 缺陷，2026-09-24 修复）。</dd>
       <dt>为什么重要</dt><dd>旧行为下「直连 200 + 独立进程 authenticated:true，但对话里 401」，排查成本极高——症状指向 token，根因却在缓存。</dd>
       <dt>何时改回去</dt><dd>无需改。已用 <code>tests/mcp-config-hotreload.test.ts</code> 钉死，防止回退。</dd>
     </dl>
@@ -1570,8 +1570,8 @@ src/
 <table>
 <thead><tr><th>方向</th><th>现状缺口</th><th>建议</th></tr></thead>
 <tbody>
-<tr><td>前端分层</td><td>ChatPage.vue 365KB / 9853 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
-<tr><td>评测体系</td><td><code>eval:core</code> 已进 CI（无源码/凭证的层不进）；端到端 gate 仍靠本地跑</td><td>关键场景固化成用例集；把 read/write 场景接进定时回归</td></tr>
+<tr><td>前端分层</td><td>ChatPage.vue 365KB / 10201 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
+<tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16），当前无 CI 门禁；护栏行为由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 与 workflow，把 read/write 场景接进定时回归</td></tr>
 <tr><td>权限与多租户</td><td>owner cookie 非认证</td><td>若要对外，补真实登录 + 服务端 session</td></tr>
 <tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>权限过滤仍缺</strong></td><td>先补权限过滤；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
 <tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合</td><td>前端可视化页面 / Prometheus 指标 / 跨进程任务队列</td></tr>
@@ -1610,7 +1610,7 @@ src/
 </tbody>
 </table>
 
-<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（35 个测试文件 / 约 200 个用例，<code>pnpm test</code> = vitest run）</span></h3>
+<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（38 个测试文件 / 约 210 个用例，<code>pnpm test</code> = vitest run）</span></h3>
 <p>测试文件名几乎就是「护栏清单」——每一条都对应一个曾出过事或必须钉死的行为：</p>
 <table>
 <thead><tr><th>分组</th><th>用例</th><th>钉住什么</th></tr></thead>
@@ -1624,18 +1624,20 @@ src/
 <tr><td><code>governance-guardrails</code></td><td>治理级红线（源码级钉死，不随改动放宽）</td></tr>
 <tr><td><code>html-self-contained</code></td><td>手写 HTML 零外链（产物断网也能打开）</td></tr>
 <tr><td><code>fs-delete</code></td><td>工作区删除需确认、不越界</td></tr>
-<tr><td rowspan="7">上下文与预算</td><td><code>context-budget</code></td><td>历史预算与丢弃策略</td></tr>
+<tr><td rowspan="9">上下文与预算</td><td><code>context-budget</code></td><td>历史预算与丢弃策略</td></tr>
 <tr><td><code>attachment-budget</code></td><td>附件 token 预算</td></tr>
 <tr><td><code>deep-agent-control</code></td><td>循环护栏（轮数/去重/熔断）</td></tr>
 <tr><td><code>deep-agent-live</code></td><td>需要真实模型的冒烟（可跳过）</td></tr>
 <tr><td><code>cross-round-repeat</code></td><td>跨轮重复调用只提示不硬拦</td></tr>
 <tr><td><code>round-trace</code></td><td>逐轮 trace 落盘（根因可观测）</td></tr>
 <tr><td><code>wrap-up-cap</code></td><td>轮次耗尽补位收尾（必有结论）</td></tr>
-<tr><td rowspan="7">交付与流程</td><td><code>export-formats</code></td><td>8 种导出格式的产物正确性</td></tr>
+<tr><td><code>round-cap-14</code> / <code>round-cap-28</code></td><td>交互式轮次预算默认值（历史 14 与现行 28 两口径都钉死，防回退）</td></tr>
+<tr><td rowspan="8">交付与流程</td><td><code>export-formats</code></td><td>8 种导出格式的产物正确性</td></tr>
 <tr><td><code>chart-render</code></td><td>图表 spec 渲染</td></tr>
 <tr><td><code>clarification-flow</code></td><td>结构化澄清票据流</td></tr>
 <tr><td><code>notify-deliver</code></td><td>IM 投递（含关键词/加签）</td></tr>
 <tr><td><code>thinking</code></td><td>扩展思考事件链路</td></tr>
+<tr><td><code>model-disable-thinking</code></td><td>模型级关思考开关（<code>MODEL_&lt;ID&gt;_DISABLE_THINKING</code>）与端点拒绝时的学习自愈</td></tr>
 <tr><td><code>upload-to-workspace</code></td><td>上传件进入会话工作区</td></tr>
 <tr><td><code>run-command-shell</code></td><td>命令执行解码与输出截断</td></tr>
 <tr><td rowspan="11">任务与契约</td><td><code>task-persistence</code> / <code>task-resume</code></td><td>结果落库 / 断线续传</td></tr>
@@ -1678,7 +1680,7 @@ src/
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
 <tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
 <tr><td>工具检索策略</td><td>统一按需检索（deferred），工具 schema 不占上下文</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>，但对 movie 这类强依赖工具的角色开 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据</td><td>主用模型能稳定主动检索时取消 per-role 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
-<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td><code>eval:core</code>（零依赖 17 用例）CI 必跑；需要真实模型 / 凭证的层与端到端 gate 仍靠本地跑</td><td>端到端依赖真实模型与凭证，进 CI 会 flaky；先保证零依赖层永不红</td><td>凭证可安全注入 CI、用例集稳定后接定时回归（见 §26）</td></tr>
+<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（38 文件 / 约 210 例）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>

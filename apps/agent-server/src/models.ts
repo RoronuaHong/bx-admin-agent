@@ -484,6 +484,14 @@ export function isReasoningReplayRejected(detail: string): boolean {
  */
 const disableThinkingUnsupportedEndpoints = new Set<string>();
 
+/**
+ * 本次调用是否要关思考：内部辅助调用（判定型）或模型级主对话开关任一为真。
+ * 主对话开关默认关闭，只有被实测确认「思考链是纯延迟负担」的模型才会打开，故不影响通用行为。
+ */
+function wantNoThinking(model: ModelEntry, opts: CallOptions): boolean {
+  return Boolean(opts.disableThinking || model.disableThinking);
+}
+
 /** 该模型端点是否仍可尝试关闭思考（false = 已实测被拒，辅助调用省略 thinking 字段）。 */
 export function disableThinkingSupported(model: ModelEntry): boolean {
   return !disableThinkingUnsupportedEndpoints.has(openAiEndpointKeyOf(model));
@@ -607,9 +615,12 @@ async function callOpenAi(
       messages,
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
-      // 内部辅助调用按需关思考（见 CallOptions.disableThinking 的实测记录）；
+      // 关思考有两个来源：内部辅助调用（判定型，只要一两个词，见 CallOptions.disableThinking）
+      // 与模型级主对话开关（MODEL_<ID>_DISABLE_THINKING，见 config.ts）。
       // 该端点实测不支持 disabled 时省略字段（运行时学习，见 markDisableThinkingUnsupported）。
-      ...(opts.disableThinking && disableThinkingSupported(model) ? { thinking: { type: "disabled" } } : {}),
+      ...(wantNoThinking(model, opts) && disableThinkingSupported(model)
+        ? { thinking: { type: "disabled" } }
+        : {}),
     };
     if (functionTools.length) {
       body.tools = functionTools;
@@ -639,8 +650,8 @@ async function callOpenAi(
       detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
     }
     // 学习型自愈：端点拒绝 disabled 思考（如 kimi27hs 只接受 enabled）→ 记住并去掉 thinking 字段重发一次，
-    // 否则每次辅助调用都白打 400，连带拖垮接地护栏的兜底路径（问候/超范围提问被回成「没取到数据」）。
-    if (opts.disableThinking && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
+    // 否则每次调用都白打 400（主对话拖慢首个增量、辅助调用拖垮接地护栏的兜底路径）。
+    if (wantNoThinking(model, opts) && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
       markDisableThinkingUnsupported(model);
       response = await postOnce(alreadyReplaying);
       detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);

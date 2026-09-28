@@ -1139,6 +1139,8 @@ export function createApp() {
       archived?: boolean;
       /** 免打扰：静默该对话的后台完成提醒。 */
       muted?: boolean;
+      /** 完全访问：false = 恢复写/破坏性操作的逐项确认卡（前端「完全访问」开关走这里）。 */
+      fullAccess?: boolean;
     }>(c);
     const patch: ConversationPatch = {};
     if (typeof body.title === "string") patch.title = body.title;
@@ -1152,6 +1154,7 @@ export function createApp() {
     if (body.pinnedAt === null) patch.pinnedAt = null;
     else if (typeof body.pinnedAt === "number") patch.pinnedAt = body.pinnedAt;
     if (typeof body.archived === "boolean") patch.archived = body.archived;
+    if (typeof body.fullAccess === "boolean") patch.fullAccess = body.fullAccess;
     if (typeof body.muted === "boolean") patch.muted = body.muted;
     const updated = await patchConversation(id, patch);
     if (!updated) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
