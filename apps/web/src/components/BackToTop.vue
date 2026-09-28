@@ -129,6 +129,16 @@ function watchAvoided() {
   if (!avoided) return;
   avoidObserver = new ResizeObserver(() => syncBottomGap());
   avoidObserver.observe(avoided);
+  // 健壮性：连祖先容器一起观察。dev 下 HMR 换样式存在「无样式中间帧」——那一帧页面根容器
+  // （如 .mc）塌成内容高，输入框被量到页中，gap 会撞上 280px 钳制上限；布局恢复后输入框自身
+  // 尺寸不变，只观察它就不会触发重算，按钮 gap 得停在下一次滚动才自愈。根容器盒子一变就重算，
+  // 把自愈时机从「下次滚动」提前到「样式恢复那一帧」。回调里只写 fixed 定位的 bottom，不会反过来
+  // 改动被观察元素的盒子，无 ResizeObserver 循环风险。
+  let parent: HTMLElement | null = avoided.parentElement;
+  while (parent && parent !== document.body) {
+    avoidObserver.observe(parent);
+    parent = parent.parentElement;
+  }
 }
 
 onMounted(() => {
