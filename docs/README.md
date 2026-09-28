@@ -19,7 +19,7 @@
 - **覆盖**：§1–2 断链核查 · §4 形态判定（内置/MCP/Skill/定时任务）· §10 v2 格式扩展 · §11 报告式导出 + 手写 HTML 零外链护栏 · §12 全对话审计与上下文工程全链路对照 · §13 `run_command` 治理 · §14 配置热重载缓存失效键。
 - **现行落点**：`export_data`（8 种格式，`builtins.ts`）· 下载端点（`app.ts` `GET .../files/download`）· `artifact` 事件（`packages/shared`）· `fs_write` 写 `.html` 下发卡片 · `externalRefHint` · `wrapUpWith`（轮次耗尽补位收尾）· `repeatCallHint` + `executedSigRounds` · `appendRoundTrace` · `decodeShellBytes` / `truncateShellOutput`。
 - **状态**：✅ 现行（2026-09-24 复核，顶部主状态表 13 项）。
-- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**2026-09-24 全部落地**——`fs_delete` 见 §15、上传附件进工作区见 §16、定时任务工具化见 §17。以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **24** 个（22 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理）；第 5 项 `run_script` / `image_gen` **已落地**并纳入统一交付物护栏（§11.8 / `DELIVERABLE_GUARDRAILS.md`；早期「维持暂缓」口径作废，2026-09-28 复核更正）。
+- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**2026-09-24 全部落地**——`fs_delete` 见 §15、上传附件进工作区见 §16、定时任务工具化见 §17。以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **27** 条登记（**25** 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理）——2026-09-28 复核更正，早期「24 个 / 22 个」口径作废；第 5 项 `run_script` / `image_gen` **已落地**并纳入统一交付物护栏（§11.8 / `DELIVERABLE_GUARDRAILS.md`；早期「维持暂缓」口径作废，2026-09-28 复核更正）。
 
 ### [mcp-guide.md](./mcp-guide.md)
 - **定位**：MCP 连接与内置服务器的**权威口径**（其它 MCP 文档与它冲突时以本文为准）。
@@ -113,7 +113,7 @@
 
 ### [project-review.html](./project-review.html)
 - **定位**：项目整体复盘（业界做法 → 本项目做法 → 是否最佳实践 → 偏离原因 → 何时改回）。
-- **状态**：🗂 快照；**2026-09-28 已刷新到 master @ `d9db377`**：§1 技术栈、§2 代码地图体量、§3 起各章的源码行号引用、§8 内置工具清单（26 个）、A 章工程配套（脚本 / 测试 35 文件 / MCP 与 RAG 缓存 `mtime + size` 口径）。**其余叙述性段落（各章「知识点 / 最佳实践对照 / 偏离汇总」）仍是 `cc6c7a6` 时期内容**，仅作背景阅读。
+- **状态**：🗂 快照；**2026-09-28 已刷新到 master @ `d9db377`**：§1 技术栈、§2 代码地图体量、§3 起各章的源码行号引用、§8 内置工具清单（26 个 spec + `search_tools`；风险登记 27 条，口径差异见 §8 末尾 note）、A 章工程配套（脚本 / 测试 35 文件 / MCP 与 RAG 缓存 `mtime + size` 口径）。**其余叙述性段落（各章「知识点 / 最佳实践对照 / 偏离汇总」）仍是 `cc6c7a6` 时期内容**，仅作背景阅读。
 - **注意**：其中「MCP 配置缓存：按 mtime 失效、4 例全绿」已过时——现为 `mtime + size`、5 例（见 `artifact-delivery-plan.md` §14）。
 
 ---

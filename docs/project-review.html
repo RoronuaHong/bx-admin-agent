@@ -266,7 +266,7 @@
 </div>
 <div class="note">引用的行号基于当前工作区快照；代码会变，行号会漂，<strong>函数名是稳定锚点</strong>，先搜函数名再看行号。</div>
 <div class="card">
-<h4>本次「对齐 + 查缺补漏」订正记录</h4>
+<details><summary><b>本次「对齐 + 查缺补漏」订正记录（12 项 · 均已并入正文，点开只看历史）</b></summary>
 <table>
 <thead><tr><th>订正项</th><th>旧说法 / 缺口</th><th>按当前代码更正为</th></tr></thead>
 <tbody>
@@ -283,6 +283,7 @@
 <tr><td>上下文工程（本轮补齐）</td><td>只写了「去重 / 熔断 / 卸载 / 接地」四条</td><td>补成<strong>六条</strong>：⑤ 跨轮重复只给观察提示（反馈 &gt; 硬拦）、⑥ 预算耗尽补位收尾 <code>wrapUpWith()</code>；另补 <code>GROUNDING_VERIFY</code> 事后核验 + 多票裁决、逐轮 trace、产物零外链软护栏，并在 §12 / §23 各新增卡片。对齐 Anthropic《Effective context engineering for AI agents》</td></tr>
 </tbody>
 </table>
+</details>
 </div>
 </section>
 
@@ -571,7 +572,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <table>
 <thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
 <tbody>
-<tr><td><code>MAX_TOOL_ROUNDS</code></td><td class="num">14</td><td>工具循环最多多少轮（一轮 = 一次模型调用 + 一批工具执行）</td></tr>
+<tr><td><code>MAX_TOOL_ROUNDS</code></td><td class="num">28</td><td>工具循环最多多少轮（一轮 = 一次模型调用 + 一批工具执行）<br/><span class="tag acc">口径变更</span>原默认 14，现<strong>与无人值守拉齐为 28</strong>（<code>chat.ts:85-90</code> 注释：调大不放大失控风险，仍可用 <code>MCP_MAX_TOOL_ROUNDS</code> 收紧）；定时任务走 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（<code>app.ts:120</code>，同样默认 28）</td></tr>
 <tr><td><code>MAX_TOOL_RESULT_CHARS</code></td><td class="num">12000</td><td>单条工具结果喂回模型的字符上限</td></tr>
 <tr><td><code>TOOL_RESULT_BUDGET</code> / <code>KEEP</code></td><td class="num">12000 / 3</td><td>工具结果总预算：超了把<strong>较早的</strong>结果占位化（保留最近 3 条原文）</td></tr>
 <tr><td><code>MCP_MAX_TOOLS</code></td><td class="num">80</td><td>注入模型的工具上限（超出按服务器丢弃并记录 dropped）</td></tr>
@@ -614,7 +615,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 
 <!-- ===================== 8 ===================== -->
 <section id="s10">
-<h2 class="sec">8 · 内置工具清单 <span class="kv">src/builtins.ts · 26 个（spec 定义 + risk.ts 风险登记双份必须一致）</span></h2>
+<h2 class="sec">8 · 内置工具清单 <span class="kv">src/builtins.ts · 26 个 spec（deferred 模式另加 search_tools = 27，与 BUILTIN_RISK 登记 27 条双份一致）</span></h2>
 <p>内置工具<strong>始终注入</strong>（本机能力，不依赖用户勾选连接器）；勾选只决定外部 MCP。</p>
 <table>
 <thead><tr><th>工具</th><th>用途</th><th>实现落点</th></tr></thead>
@@ -636,7 +637,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>record_watched_movies</code></td><td>观影画像记录（角色专用）</td><td><code>builtins.ts:764</code> · <code>movie/profile.ts</code></td></tr>
 </tbody>
 </table>
-<div class="note"><strong>知识点</strong>：每个内置工具必须在 <code>risk.ts</code> 登记风险级别，<code>index.ts</code> 启动时 <code>assertBuiltinRiskCoverage()</code> 会校验覆盖，漏登记<strong>拒绝启动</strong>——把「忘了标风险」变成一个不可绕过错误，而不是线上惊喜。</div>
+<div class="note"><strong>知识点</strong>：每个内置工具必须在 <code>BUILTIN_RISK</code> 登记风险级别，<code>index.ts</code> 启动时 <code>assertBuiltinRiskCoverage()</code> 校验覆盖，漏登记<strong>拒绝启动</strong>——把「忘了标风险」变成不可绕过的错误，而不是线上惊喜。<br/><strong>三个数字别互相改</strong>：风险登记 <strong>27 条</strong>（26 个 spec 工具 + <code>search_tools</code>）；<code>builtinToolSpecs()</code> 常态产出 <strong>26 个</strong>（deferred 模式下才追加 <code>search_tools</code>）；<strong>执行分发 25 个</strong>走 <code>execBuiltin</code> 的 switch，<code>task</code> 与 <code>search_tools</code> 在 <code>chat.ts</code> 循环内处理。</div>
 </section>
 
 <!-- ===================== 9 ===================== -->
@@ -726,6 +727,15 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 </table>
 <div class="good"><strong>知识点</strong>：为什么不接「通用代码执行让模型自己写脚本导出」？因为<strong>格式正确性由服务端保证</strong>是最短路径：模型给行列数据，格式、编码、中文字体由服务端兜住，弱模型也不会产出坏文件。<br/>PDF 必内嵌 CJK 字体，否则中文渲染成空白——字体缺失时<strong>如实报错并引导改用 docx/html</strong>，而不是产出「看起来正常但中文全白」的坏产物。这就是「诚实失败优于坏交付」。</div>
 <div class="note">多表（sheets）只有 xlsx / docx / pdf 支持，其余格式散成多文件语义更差。导出后前端收到 <code>artifact</code> 事件渲染下载卡片；实体在服务端，<strong>刷新不丢</strong>（只存 spec，按 path 重绘）。</div>
+
+<h3>HTML 报告的「烘焙」<span class="kv">src/report.ts (473 行)</span></h3>
+<p>导出 <code>html</code> 时不是让模型手写页面，而是服务端合成：<code>builtins.ts:14</code> 引入 <code>buildHtmlReport / chartSvgs / chartFallbackTables / REPORT_CSS</code>。</p>
+<ul>
+<li><strong>图表烘焙成内联 SVG</strong>：<code>isSvgChart()</code> 判断类型能否出图（line / area / column / bar / pie / scatter / histogram），不能的由 <code>chartDataMatrix()</code> 回落成表格——图出不来也不会留空白块</li>
+<li><strong>零外链</strong>：<code>REPORT_CSS</code> 内联，字体只用系统字体栈，<strong>不引任何 CDN / web font</strong>——这是 §23「产物自包含」那条软提示的<strong>服务端落点</strong></li>
+<li><code>escapeHtml()</code> / <code>renderMarkdown()</code>：模型给的叙述先转义再渲染，正文里的尖括号不会被当成标签</li>
+</ul>
+<div class="note"><strong>对照</strong>：模型用 <code>fs_write</code> 手写 HTML 会引外部 CDN（断网打开图表空白），所以 <code>externalRefHint()</code> 会把它拦回 <code>export_data</code>——两边是同一条纪律的<strong>软提示与硬兜底</strong>。</div>
 </section>
 
 <!-- ===================== 12 ===================== -->
@@ -757,12 +767,12 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <p>把「历史条数 / token / 预算 / 丢弃条数 / 被清理的工具结果数 / 各类重试与熔断计数」回给前端。用户看不见护栏，但排查者必须看得见。</p>
 </div>
 <div class="card">
-<h4>预算耗尽也要有结论 <code>wrapUpWith()</code></h4>
-<p>轮次打满时各轮叙述会拼成<strong>半截话</strong>。做法是同模型、<strong>无工具</strong>、非流式再调一次，输入「用户原始请求 + 过程记录尾部 <code>WRAP_UP_NARRATION_CHARS=6000</code>」，让它把过程收束成结论；停在半截动作上必须如实说「未完成」。<br/><span class="tag acc">要点</span>收尾调用复用同一系统提示的稳定前缀（<code>WRAP_UP_HINT</code>），不额外污染缓存。</p>
+<h4>补位收尾的缓存细节 <code>WRAP_UP_HINT</code></h4>
+<p>收尾调用<strong>复用同一系统提示的稳定前缀</strong>（<code>WRAP_UP_HINT</code>），不额外污染 prompt cache。<br/>机制见 <strong>§7 ⑥</strong>，实践对照见 <strong>§23「预算耗尽必有结论」</strong>——此处只记这一个与上下文工程相关的增量。</p>
 </div>
 <div class="card">
-<h4>重复行为：给反馈而不是替它决策</h4>
-<p>跨轮同签名调用只回灌 <code>repeatCallHint()</code>（说明第几轮已执行过，需要就换参数或说明为何重复），交给模型自己收敛。<br/><span class="tag warn">为什么</span>硬拦会误伤「用户就是要再查一次」；上下文工程的取向是<strong>让模型看见自己的行为</strong>，而不是替它做决定。</p>
+<h4>重复行为的两层分工</h4>
+<p>跨轮同签名<strong>只回灌</strong> <code>repeatCallHint()</code>，不阻断执行；真正的硬护栏是同轮去重与跨轮 Doom Loop 熔断。<br/>机制见 <strong>§7 ⑤</strong>，对照见 <strong>§23「重复行为：反馈 &gt; 硬拦」</strong>。<br/><span class="tag warn">为什么</span>上下文工程的取向是<strong>让模型看见自己的行为</strong>，而不是替它做决定。</p>
 </div>
 </div>
 <div class="bad"><strong>历史坑</strong>：曾经在护栏里塞过「问候句式 / 功能词 / 中文参数键」的正则来识别闲聊与伪调用，结果把模型的自由发挥空间压死。现在的纪律是：<strong>服务端只做协议形态判断（工具调用写成文本），语义判定（业务 vs 闲聊 vs 意图）100% 交模型</strong>。</div>
@@ -820,10 +830,17 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
   <div class="arrow">▼</div>
   <div class="step"><div class="t">② 专属对话</div><div class="d">每个任务建自己的专属对话承载每期结果（不灌进用户自己的聊天）；继承来源对话的角色与 MCP 启用集</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">③ 到点执行</div><div class="d">croner 调度 → 走同一套 chatStream 执行（工具轮数上限独立放宽到 28）；结果持久化 + 投递</div></div>
+  <div class="step"><div class="t">③ 到点执行</div><div class="d">croner 调度 → 走同一套 chatStream 执行（轮数预算 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>，默认 <strong>28，与交互式已拉齐</strong>——早期是交互式 14 / 无人值守 28）；结果持久化 + 投递</div><div class="f">app.ts:120 / schedules.ts (392 行)</div></div>
   <div class="arrow">▼</div>
   <div class="step"><div class="t">④ 通知</div><div class="d">通道配置 <code>.data/notify-channels.json</code>；钉钉通道<strong>消息必须含关键词 bx-agent</strong>（否则平台静默拒收：HTTP 200 + errcode 310000），投递时自动追加关键词</div><div class="f">notify/{channels,deliver}.ts</div></div>
 </div>
+<h3>创建期校验 <span class="kv">src/schedule-service.ts（118 行）</span></h3>
+<p><code>createScheduleTask()</code> 是 <code>POST /chat/schedules</code> 与内置工具 <code>manage_schedule</code> 的<strong>共用校验层</strong>（同一份校验，避免两处口径漂移）：</p>
+<ul>
+<li>错误码 <code>SCHEDULE_INVALID</code>（cron 解析失败）/ <code>SCHEDULE_INVALID_TIME</code> / <code>SCHEDULE_LIMIT</code>（条数上限）/ <code>AGENT_ROLE_UNKNOWN</code>（目标角色不存在）——<strong>结构化错误码，不是散文报错</strong></li>
+<li><code>knownMcpIds()</code>：继承的 MCP 启用集只保留当前确实存在的 id；<code>pickNotifyOn()</code> 规范化通知时机</li>
+<li><code>createTaskConversation()</code> / <code>scheduleConversationTitle()</code>：建专属对话承载每期结果，标题带任务名（不灌进用户自己的聊天）</li>
+</ul>
 <div class="grid g2">
 <div class="card"><h4>投递层职责 <code>notify/deliver.ts</code></h4>
 <p class="muted">只做两件事：① 把 Agent 产出的 Markdown 排版成 IM 能可靠显示的文本；② 按平台协议发一条消息。<strong>平台差异全部收在这里</strong>：载荷形状、加签算法、成功判定（钉钉看 <code>errcode</code>、飞书看 <code>code</code>）、关键词安全设置。<br/><span class="tag acc">边界</span>钉钉关键词不满足 → <strong>HTTP 200 + 业务错误</strong>，所以必须按业务结果而非状态码判成功。</p></div>
@@ -838,7 +855,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <h2 class="sec">16 · 可观测：Trace / Cost / Audit</h2>
 <div class="grid g3">
 <div class="card"><h4>Trace <code>trace.ts</code></h4>
-<p class="muted">JSONL 按月分文件；run / llm / tool span；meta 带 ownerKey + <code>release</code>（git short SHA）。<br/><strong>轮级</strong>：每轮一行落 <code>rounds-&lt;runId&gt;.jsonl</code>（<code>appendRoundTrace()</code>，轮次 / 模型 / token / 工具签名与结果摘要）——「某一轮模型空转 / 工具空返」只有轮级粒度能定位。<br/>端点 <code>GET /chat/trace/runs</code>（owner 隔离，只看自己的）</p></div>
+<p class="muted">JSONL 按月分文件，<strong>两层</strong>：<code>RunTrace</code>（run 级一行：模型 / 状态 / durationMs / rounds / toolCalls / tokens，并带<strong>护栏计数</strong> <code>groundingRetries</code> / <code>groundingVerifications</code> / <code>ungrounded</code> 与 <code>ownerKey</code> + <code>release</code>）+ <code>RoundTrace</code>（每轮一行落 <code>rounds-&lt;runId&gt;.jsonl</code>，轮次 / mode / 模型 / token / 工具签名与结果摘要）——「某一轮模型空转 / 工具空返」只有轮级粒度能定位。<br/><span class="tag warn">对齐代码</span><strong>没有 llm / tool 分层 span</strong>：只有 run 级与轮级两层记录，这是与 OTel 的主要差距（见 B 章「可观测」）。<br/>端点 <code>GET /chat/trace/runs</code>（owner 隔离，只看自己的）</p></div>
 <div class="card"><h4>Cost <code>cost.ts</code></h4>
 <p class="muted">纯只读遍历 JSONL，按日/模型/会话聚合 token 与费用 + 慢调用 TopN + 预算告警；未配单价的模型<strong>只计 token 并计入 unpricedTokens</strong>（诚实不编造金额）。<br/>端点 <code>GET /chat/cost/summary</code></p></div>
 <div class="card"><h4>Audit <code>audit.ts</code></h4>
@@ -854,7 +871,8 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <div class="card">
 <h4>本地知识库 <code>knowledge-base.ts</code></h4>
 <ul>
-<li>文档源 <code>docs/knowledge/**</code>：md / txt / html / pdf(x) / xlsx / docx → <strong>按扩展名分发的解析器注册表</strong></li>
+<li>文档源 <code>docs/knowledge/**</code>：md / txt / html / pdf / docx / xlsx → <code>rag/parsers.ts</code> 的<strong>按扩展名分发的解析器注册表</strong>（<code>TEXT_EXT</code> / <code>HTML_EXT</code> / <code>PDF_EXT</code> / <code>DOCX_EXT</code> / <code>XLSX_EXT</code>）</li>
+<li><code>isSupportedExt()</code> 之外的两道保护：<code>looksBinary()</code> 拦二进制、<code>optionalDepInstalled()</code> 检测解析依赖（mammoth / unpdf / exceljs）是否装了——<strong>依赖缺失时如实不可用，不是静默吞掉</strong>；HTML 走 <code>stripHtml()</code> 去标签</li>
 <li>标题分段 → 本地索引 <code>.data/rag/index.json</code>；可选 embedding 向量缓存 <code>.data/rag/vectors.json</code>（OpenAI 兼容 /embeddings，1024 维）</li>
 <li>检索：词法 TF-IDF + 语义余弦 → <strong>RRF 融合</strong>（<code>1/(60+rank)</code>）</li>
 <li>embedding 失败/关闭自动降级纯词法，不报错</li>
@@ -883,7 +901,7 @@ API: ingest / listSources(namespace) / removeSource / clearAll / stats / search(
 <h3>观影画像 <span class="kv">src/movie/profile.ts</span></h3>
 <p>Mongo 集合 <code>movie_profiles</code>（失败降级内存），按 ownerKey 一条；记录看过 / 喜欢 / 不喜欢，<code>MAX_HISTORY=200</code> / <code>MAX_FEEDBACK=200</code>。唯一写入口是内置工具 <code>record_watched_movies</code>。<br/><span class="tag">沿革</span>2026-09-18 已整体移除「离线推荐管线 + 5 个 HTTP 端点 + 豆瓣 MCP + 前端推荐面板」——<strong>画像退化为「口味记录」</strong>，推荐交给模型现场用 TMDb 工具做。</p>
 
-<div class="note"><strong>选型结论（写在设计稿里）</strong>：现阶段<strong>不引入独立向量数据库</strong>——几十到万级 chunk，文件索引 + 向量缓存 + RRF 已够。触发迁移的阈值：chunk &gt; 5~10 万 / 多实例并发写 / 需要权限过滤 / 增量同步常态化，届时首选 Qdrant。</div>
+<div class="note"><strong>选型结论</strong>：现阶段<strong>不引入独立向量数据库</strong>——几十到万级 chunk，暴力扫描毫秒级。迁移阈值与首选方案见 §23「无向量数据库」与 B 章「检索存储」，此处不重复。</div>
 </section>
 
 <!-- ===================== 18 ===================== -->
@@ -922,7 +940,8 @@ API: ingest / listSources(namespace) / removeSource / clearAll / stats / search(
 <tr><td>GET</td><td><code>/chat/conversations/:id/files/download</code></td><td>下载产物</td></tr>
 <tr><td>GET/PUT</td><td><code>/chat/preferences</code></td><td>偏好设置</td></tr>
 <tr><td>POST/GET</td><td><code>/chat/upload</code>, <code>/chat/upload/:id</code></td><td>附件上传与读取</td></tr>
-<tr><td>GET/POST/DELETE</td><td><code>/chat/memory</code></td><td>长期记忆</td></tr>
+<tr><td>GET/POST</td><td><code>/chat/memory</code></td><td>长期记忆读写</td></tr>
+<tr><td>DELETE</td><td><code>/chat/memory/:id</code>、<code>/chat/memory</code></td><td>删单条 / 清空（按 owner 隔离）</td></tr>
 </tbody></table></details>
 
 <details><summary>MCP / 技能 / 定时任务 / 通知</summary>
@@ -1044,7 +1063,7 @@ src/
 <li><code>memory.json</code>：长期记忆</li>
 <li><code>fs/&lt;conv&gt;/</code>：会话工作区（含 <code>results/</code> 卸载的工具结果）</li>
 <li><code>rag/</code>：知识库索引与向量缓存（<code>index.json</code> / <code>vectors.json</code>）</li>
-<li><code>traces/</code>、<code>audit/</code>：JSONL 按月（traces 另有轮级 <code>rounds-&lt;runId&gt;.jsonl</code>）</li>
+<li><code>traces/</code>、<code>audit/</code>：JSONL 按月（traces 另有轮级文件，见 §16）</li>
 <li><code>notify-channels.json</code>、<code>uploads/</code>、<code>downloads/</code>、<code>user-prefs/</code></li>
 </ul>
 </div>
@@ -1068,6 +1087,7 @@ src/
 <li><code>WRAP_UP_NARRATION_CHARS</code>（轮次耗尽补位收尾带入的过程记录长度）</li>
 <li><code>IMAGE_GEN_BASE_URL / _API_KEY / _MODEL</code>（图片生成；未配时工具返回指引而非报错）</li>
 <li><code>DINGTALK_CLIENT_ID / _CLIENT_SECRET / _DOC_BASE_URL</code>（外部文档源；未配时同样返回指引）</li>
+<li><code>load-env.ts</code>：进程启动时从 <code>apps/agent-server/.env</code> 载入（早于任何模块读取）——<strong>改 .env 必须重启，无热重载</strong></li>
 </ul>
 </div>
 </div>
@@ -1410,7 +1430,7 @@ src/
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界最佳实践</dt><dd>复杂编排用成熟框架（LangGraph / Vercel AI SDK）省轮子，状态和重试模型化。</dd>
-      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环，护栏用 16 个显式常量控制，行为可预测可观测。</dd>
+      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环，护栏由 <strong>25 个显式常量</strong>控制（集中在 <code>chat.ts:62-291</code>，§7 表按 17 组列出），行为可预测可观测。</dd>
       <dt>判定</dt><dd>⚠️ 有意偏离。</dd>
       <dt>偏离原因</dt><dd>护栏细节必须在自己手里：降级触发点、熔断阈值、结果治理都是本项目的核心资产，抽象到框架后调试与调参成本骤增；同时避免额外依赖。</dd>
       <dt>何时改回去</dt><dd>当编排复杂度真的需要「图」来表达（多分支长期运行工作流）时再评估；在此之前自研循环的确定性更值钱。</dd>
@@ -1427,7 +1447,7 @@ src/
       <dt>本项目做法</dt><dd>JSONL 按月文件 + 只读 HTTP 端点 + CLI 聚合。</dd>
       <dt>判定</dt><dd>⚠️ 有意偏离。</dd>
       <dt>偏离原因</dt><dd>单机规模下零依赖落地最快；三份文件职责分离（trace 可轮转、audit 必须留、cost 是聚合视图）已经覆盖当前需求。</dd>
-      <dt>何时改回去</dt><dd>需要告警、需要多实例聚合、需要前端可视化页面时迁移到 OTel + Prometheus；<code>trace.ts</code> 的 span 结构已是 OTel 风格，迁移成本可控。</dd>
+      <dt>何时改回去</dt><dd>需要告警、需要多实例聚合、需要前端可视化页面，或需要 <strong>llm / tool 分层 span</strong> 时迁移到 OTel + Prometheus。<br/><span class="tag warn">常见误解</span>「<code>trace.ts</code> 的 span 结构已是 OTel 风格」——实际只有 <code>RunTrace</code>（run 级）与 <code>RoundTrace</code>（轮级）两层，<strong>没有 llm / tool 分层 span</strong>；迁移成本主要在补埋点这一层，不在改结构。</dd>
     </dl>
   </div>
 </div>
@@ -1648,22 +1668,25 @@ src/
 <table>
 <thead><tr><th>项</th><th>最佳实践</th><th>本项目做法</th><th>为什么现在不做</th><th>触发改造的条件</th></tr></thead>
 <tbody>
-<tr><td>检索存储</td><td>专用向量库（Qdrant 等）</td><td>文件索引 + 向量缓存 + RRF</td><td>数据量小，暴力扫描毫秒级；引入服务收益为负</td><td>chunk &gt; 5~10 万 / 多实例并发写 / 需权限过滤 / 增量同步常态化</td></tr>
+<tr><td>检索存储</td><td>专用向量库（Qdrant 等）</td><td>文件索引 + 向量缓存 + RRF（<strong>无权限过滤</strong>）</td><td>数据量小，暴力扫描毫秒级；引入服务收益为负。<strong>权限过滤是已知缺口</strong>，不是权衡掉的选择（见 §26）</td><td>chunk &gt; 5~10 万 / 多实例并发写 / 增量同步常态化；<strong>权限过滤应优先于迁库</strong></td></tr>
 <tr><td>身份认证</td><td>登录体系（OIDC / SSO）</td><td>设备 owner cookie</td><td>内网自用，登录 = 引入用户体系与运维负担</td><td><strong>对外暴露或多租户之前必须补</strong></td></tr>
 <tr><td>前端架构</td><td>组件化 + 状态分层</td><td>单文件 ChatPage.vue</td><td>状态高耦合，拆分会引入同步成本（属欠账非取舍）</td><td>下个迭代就应抽 <code>useChatStream</code> / <code>useBubbles</code></td></tr>
 <tr><td>编排框架</td><td>LangGraph / AI SDK</td><td>自建 while 循环 + 显式常量</td><td>护栏细节必须在自己手里，可预测可观测，且零依赖</td><td>工作流复杂到需要「图」表达时再评估</td></tr>
-<tr><td>可观测</td><td>OTel + Prometheus/Jaeger</td><td>JSONL + HTTP + CLI</td><td>单机规模零依赖落地最快，职责已分离</td><td>需要告警 / 多实例聚合 / 前端可视化时</td></tr>
-<tr><td>异步任务</td><td>外部队列（Redis/Temporal）</td><td>进程内 Map + 恢复 + 看门狗</td><td>单实例；已有恢复逻辑解决最疼的永久转圈</td><td>多实例部署 / 需重试与优先级</td></tr>
+<tr><td>可观测</td><td>OTel + Prometheus/Jaeger</td><td>JSONL + HTTP + CLI；<strong>run 级 + 轮级两层</strong>，无 llm / tool 分层 span</td><td>单机规模零依赖落地最快，职责已分离（trace 轮转 / audit 长留 / cost 聚合）</td><td>需要告警 / 多实例聚合 / 前端可视化，或需要 <strong>llm / tool 分层 span</strong> 时</td></tr>
+<tr><td>异步任务</td><td>外部队列（Redis/Temporal）</td><td>进程内 Map + 恢复 + 看门狗；<strong>任务级</strong>可续传（事件重放 + 结果落库），<strong>轮次级断点恢复仍缺</strong></td><td>单实例；已有恢复逻辑解决最疼的永久转圈</td><td>多实例部署 / 需重试与优先级 / 需要进程重启后从<strong>某一轮</strong>续跑</td></tr>
 <tr><td>提示词管理</td><td>外置托管 + A/B</td><td>内联 TS + SKILL.md 随代码版本</td><td>提示词是行为代码：必须过评审、必须能随代码回滚</td><td>非工程角色需参与迭代或要做线上 A/B</td></tr>
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
+<tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
+<tr><td>工具检索策略</td><td>统一按需检索（deferred），工具 schema 不占上下文</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>，但对 movie 这类强依赖工具的角色开 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据</td><td>主用模型能稳定主动检索时取消 per-role 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
+<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td><code>eval:core</code>（零依赖 17 用例）CI 必跑；需要真实模型 / 凭证的层与端到端 gate 仍靠本地跑</td><td>端到端依赖真实模型与凭证，进 CI 会 flaky；先保证零依赖层永不红</td><td>凭证可安全注入 CI、用例集稳定后接定时回归（见 §26）</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>
-<div class="bad"><strong>读这份表的方法</strong>：前 8 项是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）；最后 1 项是<strong>欠账</strong>，不该被「设计取舍」这个词掩盖。把两者分开写，是为了避免把 bug 包装成架构决策。</div>
+<div class="bad"><strong>读这份表的方法</strong>：前 <strong>11 项</strong>是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）——其中「前端架构」一格实际是<strong>欠账</strong>（明知该拆而没拆，§23 卡片同样标「已知欠账」）；「检索存储」「异步任务」「可观测」三格里各自嵌了一条<strong>已知缺口</strong>（无权限过滤 / 无轮次级断点恢复 / 无 llm-tool 分层 span），它们是**待补的功能**而非取舍。最后一行是<strong>曾为缺陷、现已修复</strong>的项，保留只为记录教训。把三者分开写，是为了避免把 bug 包装成架构决策。</div>
 </section>
 
 <hr />
-<p class="muted">本文档面向「梳理项目 + 复盘知识点」。<strong>事实性内容（体量 / 源码行号 / 工具清单 / 测试与脚本）已刷新到 master @ d9db377（2026-09-28）</strong>；叙述性段落（知识点 / 业界对照 / 偏离汇总）以 <code>cc6c7a6</code> 为底稿，并已按 Anthropic《Effective context engineering for AI agents》补齐上下文四项（见 §7 / §12 / §23）。行号会漂，先搜函数名。知识点弹窗中「⚠️/🐞」标记的是偏离或缺陷，其余为与业界最佳实践一致。</p>
+<p class="muted">本文档面向「梳理项目 + 复盘知识点」。行号会漂，<strong>先搜函数名</strong>；知识点弹窗里「⚠️/🐞」标记的是偏离或缺陷，其余为与业界最佳实践一致。同一机制只在它归属的章节展开一次，其余处给交叉引用。</p>
 </main>
 </div>
 <button class="toc-btn" id="topBtn">回到顶部 ↑</button>

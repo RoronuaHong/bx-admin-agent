@@ -169,8 +169,8 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 | `TOOL_CATALOG_MAX_NAMES` | 200 | `TOOL_CATALOG_MAX_NAMES` | 系统提示里工具索引（仅名称）最多列多少个，防止索引本身变成新负担。 |
 | `MCP_IDLE_TIMEOUT_MS` | 1800000 | `MCP_IDLE_TIMEOUT_MS` | 空闲连接回收阈值（0 = 关闭回收）。 |
 | `MCP_IDLE_SWEEP_MS` | 300000 | `MCP_IDLE_SWEEP_MS` | 空闲回收扫描间隔（定时器 unref，不阻止进程退出）。 |
-| `MCP_CONFIRM_STRICT` | off | `MCP_CONFIRM_STRICT` | 设为 `on` 时，「无注解」工具也需用户确认（对齐规范里 `destructiveHint` 缺省 true 的保守口径）。 |
-| `MAX_TOOL_ROUNDS` | 14 | `MAX_TOOL_ROUNDS` | 工具循环轮次上限，达上限即收束报错而非编造。 |
+| ~~`MCP_CONFIRM_STRICT`~~ | — | ~~`MCP_CONFIRM_STRICT`~~ | **已废弃**（见 `src/mcp/hub.ts:79` 注释）：保守语义「未声明风险 = 需确认」现在是内置默认行为，不再由该环境变量开关控制。 |
+| `MAX_TOOL_ROUNDS` | 28 | `MCP_MAX_TOOL_ROUNDS` | 工具循环轮次上限，达上限即收束而非编造。**2026-09-28 复核更正：原写 14，现默认 28**（`chat.ts:85-90`，与无人值守 `SCHEDULE_MAX_TOOL_ROUNDS` 拉齐）；定时任务另有 `MCP_SCHEDULE_MAX_TOOL_ROUNDS`（默认同为 28）。 |
 | `MAX_TOOL_RESULT_CHARS` | 12000 | `MAX_TOOL_RESULT_CHARS` | 单条工具结果回灌截断长度。 |
 | `TOOL_DEDUP_SAME_ROUND` | on | `TOOL_DEDUP_SAME_ROUND` | 同轮同参数去重：一轮内模型重复发出的相同工具调用（`name` + 规范化参数）只执行一次，其余回灌「已跳过（同轮重复）」。 |
 | `DOOM_LOOP_MAX_ROUNDS` | 3 | `MCP_DOOM_LOOP_MAX` | 跨轮 Doom Loop 熔断：同一组工具调用**连续**重复达到该轮数即主动收束（追加提示并 `break`），避免无限循环空耗 token；设置 ≥2。 |
