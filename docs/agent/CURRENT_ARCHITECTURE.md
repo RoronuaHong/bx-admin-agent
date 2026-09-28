@@ -66,6 +66,22 @@
 
 图表出图走 `skills/chart-visualization` 技能 + 内置工具 `render_chart`：**本地渲染**（浏览器 AntV，**零外链、数据不出本机**，故无需数据外发确认卡），数据必须来自真实取数工具（如 BI）**禁止编造**；建议 ≤50 数据点（服务端 5000 行兜底截断）。详见 [chart-visualization 规范](./chart-visualization.md)。
 
+### 4.5 技能层（skills/）
+
+适配器与内置工具只解决"能不能调"，**技能（SKILL.md）解决"拿到工具后怎么用"**——把领域流程与纪律写进 system（`default: true` 的技能默认全部注入，除非角色另有指定）。角色（`roles.ts`）决定启用哪些 MCP 与默认工具集；技能决定具体怎么驱动它们。各技能自带 `SKILL.md` 即其规范：
+
+| 技能 | 触发场景 | 关键依赖 |
+|---|---|---|
+| [`business-data-query`](../../apps/agent-server/skills/business-data-query/SKILL.md)（业务取数） | 要真实业务数字（占比/趋势/排名/对比），哪怕用户没说"查一下" | BI MCP（`mcp__bi__*`） |
+| [`schema-probe`](../../apps/agent-server/skills/schema-probe/SKILL.md)（陌生库探查） | 首次接触陌生库/表，字段语义/表关系/主键不确定 | BI MCP 元数据工具（`get_database_schema` / `get_field_values`） |
+| [`metric-caliber-check`](../../apps/agent-server/skills/metric-caliber-check/SKILL.md)（指标口径核对） | 指标定义/口径差异/数据对不上 | BI MCP（`list_cards` / `get_card` / `run_native_query`） |
+| [`chart-visualization`](../../apps/agent-server/skills/chart-visualization/SKILL.md)（图表可视化） | 画图/可视化（饼/柱/折线/趋势/占比/结构/关系） | 上游取数 + 内置 `render_chart`（本地 AntV） |
+| [`movie`](../../apps/agent-server/skills/movie/SKILL.md)（观影助手） | 找片/了解影片/推荐/对比 | TMDb MCP（`mcp__movie__*`） |
+| [`pdf`](../../apps/agent-server/skills/pdf/SKILL.md)（PDF 资料问答） | 答案只在文档里（制度/报告/合同/附件） | 本地资料库检索（pdf/docx/xlsx 入库；无解析器如实报错，不静默跳过） |
+| [`web-research`](../../apps/agent-server/skills/web-research/SKILL.md)（联网检索与核实） | 时效信息/站外资料/可核实事实 | 内置 `web_search` / `fetch_url` |
+
+> 取数链路：`business-data-query` / `schema-probe` / `metric-caliber-check` 三者服务于 BI 取数正确性（先取证、再取数、再核对口径）；`movie` 对应 `roles.ts` 的 `movie` 角色；其余为通用角色默认注入。
+
 ## 5. 异步与定时
 
 - `chat-tasks.ts`：任务底座（`startTask`/`consumeTask`、运行中流、pending 队列、对话级 409）。
