@@ -46,6 +46,16 @@ test("[C] html 自带表格与标题，mime 为 text/html", async () => {
   expect(html).toContain("甲");
 });
 
+test("[C2] 无标题时不编造默认大标题（回归『胡编乱造』缺陷）", async () => {
+  // 用户只给了内容、没给标题：html 不得凭空塞 <h1>数据分析报告</h1>。
+  const out = await run({ filename: "无标题.html", sections: ["纯内容段落，没有标题"] });
+  expect(out.ok, out.text).toBe(true);
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).not.toContain("数据分析报告");
+  expect(html).not.toContain("<h1>");
+  expect(html).toContain("纯内容段落，没有标题");
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },

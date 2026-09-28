@@ -348,8 +348,13 @@ export interface BuildHtmlReportOpts {
 }
 
 export function buildHtmlReport(opts: BuildHtmlReportOpts): string {
-  const title = opts.title || "数据分析报告";
-  const lang = /[\u3400-\u9FFF]/.test(title) ? "zh-CN" : "en";
+  // 标题缺失时**不编造**：既不塞默认大标题，也不拿它去猜语言。
+  // 旧实现 `opts.title || "数据分析报告"` 会往用户文件里硬塞一行「数据分析报告」——
+  // 用户只是要把「123」生成 HTML，却凭空多出一个报告大标题，
+  // 与「内容必须来自真实输入、禁止编造」的口径直接冲突。
+  const title = (opts.title || "").trim();
+  // 语言改从「标题 + 正文」一起判断：标题现在可能为空，只看标题会把中文正文误判成 en。
+  const lang = /[\u3400-\u9FFF]/.test(`${title}\n${(opts.sections || []).join("\n")}`) ? "zh-CN" : "en";
   const blocks: string[] = [];
 
   for (const sec of opts.sections || []) {
@@ -402,7 +407,8 @@ export function buildHtmlReport(opts: BuildHtmlReportOpts): string {
     "</style>",
     "</head>",
     "<body>",
-    `<h1>${escapeHtml(title)}</h1>`,
+    // 没有标题就不输出 h1：宁可少一个标题，也不塞用户没给过的文案。
+    ...(title ? [`<h1>${escapeHtml(title)}</h1>`] : []),
     ...blocks,
     "</body>",
     "</html>",
