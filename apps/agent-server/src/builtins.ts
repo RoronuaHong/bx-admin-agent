@@ -1056,7 +1056,7 @@ function buildHtml(title: string, matrix: unknown[][]): string {
     `<html lang="${lang}">`,
     "<head>",
     '<meta charset="utf-8" />',
-    `<title>${esc(title || "导出数据")}</title>`,
+    `<title>${esc(title)}</title>`,
     "<style>",
     "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;margin:24px;color:#1f2329}",
     "h1{font-size:20px;margin:0 0 16px}",

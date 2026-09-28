@@ -63,6 +63,15 @@ test("[C3] 只给 filename+title（无正文）必须如实报错，不编造内
   expect(out.text).toContain("至少提供一项");
 });
 
+test("[C4] 纯数据表导出 html 无标题时不编造默认标题（导出数据）", async () => {
+  // 复现同源漏洞：buildHtml 旧实现 title || "导出数据" 会在无标题时往 <title> 硬塞默认值。
+  const out = await run({ filename: "表.html", rows: [{ 名称: "甲", 数量: 1 }] });
+  expect(out.ok).toBe(true);
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).not.toContain("导出数据");
+  expect(html).not.toContain("<h1>");
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
