@@ -308,7 +308,7 @@
 <li><strong>Hono</strong> + <code>@hono/node-server</code>：HTTP 框架与 Node 服务</li>
 <li><strong>TypeScript + tsx</strong>：直接跑 TS 源码，PM2 托管</li>
 <li><strong>MongoDB Driver</strong>：会话/消息/任务/定时任务/技能开关持久化</li>
-<li><strong>MCP SDK</strong>（<code>@modelcontextprotocol/sdk</code>）：stdio / Streamable HTTP 两种传输</li>
+<li><strong>MCP SDK</strong>（<code>@modelcontextprotocol/sdk</code>）：stdio / Streamable HTTP 两种传输；另内置 GitLab MCP（<code>@zereight/mcp-gitlab</code>）</li>
 <li><strong>exceljs / pdfmake / docx</strong>：产物导出</li>
 <li><strong>mammoth / unpdf / exceljs</strong>：知识库文档解析</li>
 <li><strong>croner</strong>：定时任务调度</li>
@@ -317,10 +317,10 @@
 <div class="card">
 <h4>前端 apps/web</h4>
 <ul>
-<li><strong>Vue 3</strong>（SFC + Composition API）+ <strong>Vite</strong></li>
+<li><strong>Vue 3</strong>（SFC + Composition API）+ <strong>Vite</strong> + <strong>vue-router</strong>（多 Agent 门户：<code>/</code> 门户、<code>/chat</code> 通用助手、<code>/movie</code> 观影助手、<code>/support</code> 客服助手）</li>
 <li>原生 <code>fetch + ReadableStream</code> 消费 NDJSON 流（不用 EventSource，因为要 POST 且要自定义头/断线续传）</li>
-<li>图表：<code>ChartCard.vue</code> 内置渲染（含 G2 系图表类型）</li>
-<li>Markdown：自研渲染 <code>chat-richtext.ts</code> + <code>md-tables.ts</code>，前端 sanitize</li>
+<li>图表：<code>ChartCard.vue</code> 内置渲染——统计类走 <strong>G2</strong>、图形类（网络/拓扑等）走 <strong>G6</strong>，图表类型清单同源于 <code>@bx/shared</code> 避免两端漂移</li>
+<li>Markdown：<code>markdown-it</code> 渲染 + <code>DOMPurify</code> 白名单 sanitize（<code>chat-richtext.ts</code>）+ <code>md-tables.ts</code> 表格修复；sanitize 属性钩子必须挂 <code>afterSanitizeAttributes</code></li>
 <li>i18n：自研 <code>tx()</code> 四语函数（中/英/葡/印地）</li>
 </ul>
 </div>
