@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/shared";
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
+import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
 import { createScheduleTask } from "./schedule-service.js";
@@ -61,6 +62,13 @@ export const BUILTIN_RISK: Record<
   write_todos: { level: "write", scope: "workspace", reason: "更新任务计划（对话内部状态）" },
   task: { level: "read", scope: "workspace", reason: "委派子任务（子代理自身只读）" },
   run_command: { level: "destructive", scope: "external", reason: "执行终端命令（可能改动系统、安装软件、读写任意位置的文件）" },
+  // 受控代码执行（§6 暂缓项落地）：与 run_command 同底座（超时 / 体积护栏 / 工作区沙箱），
+  // 但语义是「执行一段脚本」而非「执行一条命令」，便于多行 Python/Node/Shell 程序化处理。
+  run_script: { level: "destructive", scope: "external", reason: "执行脚本（可能改动系统、读写任意位置的文件）" },
+  // 外部生图服务（建议走 MCP，但内置一个配置驱动版本以便无 MCP 时也能用）：只把结果写入工作区，无其它外部副作用。
+  image_gen: { level: "write", scope: "workspace", reason: "调用外部生图服务并把结果写入工作区（无外部副作用）" },
+  // 钉钉文档检索（方案 A）：只读检索，凭证缺失时返回配置指引而不报错。
+  search_dingtalk_doc: { level: "read", scope: "external", reason: "检索钉钉文档（只读，无外部副作用）" },
   // 定时任务（§17）：拆成「只读列举」与「变更管理」两个工具，而不是一个带 action 的多面工具——
   // risk.ts 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别，
   // 合并就会让「列举」也被要求确认。
@@ -543,6 +551,48 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           timeoutMs: jsonType("number", "超时毫秒数（默认 120000，上限 600000）"),
         },
         required: ["command"],
+      },
+    ),
+    spec(
+      "run_script",
+      "在工作区沙箱内执行一段脚本（如 Python / Node / Shell），用于受控的代码执行、跑测试、处理数据。" +
+        "shell 类语言直接交给系统 shell 执行（与 run_command 同护栏：超时 / 体积上限 / 工作区沙箱）；python/node 会先写入工作区再调用解释器。" +
+        "只执行用户明确要求的脚本；不要在脚本里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
+        "超时（默认 120s）会被判为失败；需要交互输入的脚本会立即失败。",
+      {
+        type: "object",
+        properties: {
+          language: jsonType("string", "脚本语言：shell / bash / sh / python / py / node / js / javascript"),
+          code: jsonType("string", "脚本源码（多行文本）"),
+          timeoutMs: jsonType("number", "超时毫秒数（默认 120000，上限 600000）"),
+        },
+        required: ["code"],
+      },
+    ),
+    spec(
+      "image_gen",
+      "调用外部生图服务，根据文本提示词生成一张图片并写入工作区（作为可下载产物）。" +
+        "需服务端配置 IMAGE_GEN_BASE_URL / IMAGE_GEN_API_KEY / IMAGE_GEN_MODEL（OpenAI 兼容 /images/generations）；未配置时返回配置指引而不报错。" +
+        "生成的图片为 PNG，保存在当前对话工作区，不下发到任何外部系统。",
+      {
+        type: "object",
+        properties: {
+          prompt: jsonType("string", "图像描述提示词（越具体越好）"),
+          size: jsonType("string", "图片尺寸，如 1024x1024 / 512x512（默认 1024x1024，取决于所配服务）"),
+        },
+        required: ["prompt"],
+      },
+    ),
+    spec(
+      "search_dingtalk_doc",
+      "在企业钉钉文档中按关键词检索文档（只读）。需服务端配置 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_DOC_BASE_URL（企业内部应用凭证）；未配置时返回配置指引而不报错。",
+      {
+        type: "object",
+        properties: {
+          query: jsonType("string", "检索关键词或短语"),
+          limit: jsonType("number", "返回条数上限（默认 10）"),
+        },
+        required: ["query"],
       },
     ),
     spec(
@@ -1423,6 +1473,88 @@ export async function execBuiltin(
       const safeCwd = existsSync(cwd) ? cwd : process.cwd();
       const out = await runShell(command, { cwd: safeCwd, timeoutMs });
       return out;
+    }
+    case "run_script": {
+      const language = str(args, "language").trim().toLowerCase() || "shell";
+      const code = str(args, "code");
+      if (!code.trim()) return { ok: false, text: "run_script 需要 code" };
+      const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || RUN_TIMEOUT_MS, 1_000), 600_000);
+      const cwd = conversationFsRoot(conversationId);
+      try {
+        mkdirSync(cwd, { recursive: true });
+      } catch {
+        /* 忽略：下面用 existsSync 兜底 */
+      }
+      const safeCwd = existsSync(cwd) ? cwd : process.cwd();
+      // shell 类语言直接交给系统 shell 执行（与 run_command 同底座，复用超时 / 体积护栏）。
+      if (language === "shell" || language === "bash" || language === "sh") {
+        return runShell(code, { cwd: safeCwd, timeoutMs });
+      }
+      // 其余语言：落盘到工作区沙箱后由对应解释器执行（路径受 safePath 约束，不会越界）。
+      const extByLang: Record<string, string> = { python: ".py", py: ".py", node: ".js", js: ".mjs", javascript: ".mjs" };
+      const ext = extByLang[language];
+      if (!ext) {
+        return { ok: false, text: `不支持的 run_script 语言：${language || "(空)"}（支持：shell/bash/sh、python/py、node/js/javascript）` };
+      }
+      const relName = `script_${Date.now()}${ext}`;
+      const written = fsWrite(conversationId, relName, code);
+      if ("error" in written) return { ok: false, text: `脚本写入失败：${written.error}` };
+      const runner = language.startsWith("py") ? `python "${relName}"` : `node "${relName}"`;
+      return runShell(runner, { cwd: safeCwd, timeoutMs });
+    }
+    case "image_gen": {
+      const prompt = str(args, "prompt").trim();
+      if (!prompt) return { ok: false, text: "image_gen 需要 prompt" };
+      const baseUrl = process.env.IMAGE_GEN_BASE_URL;
+      const apiKey = process.env.IMAGE_GEN_API_KEY;
+      const model = process.env.IMAGE_GEN_MODEL;
+      if (!baseUrl || !apiKey || !model) {
+        return {
+          ok: false,
+          text: "image_gen 未配置：服务端需设置 IMAGE_GEN_BASE_URL / IMAGE_GEN_API_KEY / IMAGE_GEN_MODEL（OpenAI 兼容 /images/generations）后启用。",
+        };
+      }
+      const size = str(args, "size").trim() || "1024x1024";
+      try {
+        const resp = await fetch(`${baseUrl.replace(/\/+$/, "")}/images/generations`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ model, prompt, n: 1, size, response_format: "b64_json" }),
+          signal: AbortSignal.timeout(120_000),
+        });
+        if (!resp.ok) return { ok: false, text: `image_gen 请求失败：HTTP ${resp.status}` };
+        const data = (await resp.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
+        const item = data.data?.[0];
+        if (!item) return { ok: false, text: "image_gen 返回为空" };
+        let bytes: Buffer;
+        if (item.b64_json) bytes = Buffer.from(item.b64_json, "base64");
+        else if (item.url) bytes = Buffer.from(await (await fetch(item.url)).arrayBuffer());
+        else return { ok: false, text: "image_gen 返回格式无法解析（既无 b64_json 也无 url）" };
+        const cwd = conversationFsRoot(conversationId);
+        try {
+          mkdirSync(cwd, { recursive: true });
+        } catch {
+          /* 忽略 */
+        }
+        const safeCwd = existsSync(cwd) ? cwd : process.cwd();
+        const fileName = `image_${Date.now()}.png`;
+        const written = fsWriteBinary(conversationId, fileName, bytes);
+        if ("error" in written) return { ok: false, text: `图片写入失败：${written.error}` };
+        return {
+          ok: true,
+          text: `已生成图片（${bytes.length} 字节），保存于工作区 ${fileName}，已作为下载卡片显示。`,
+          artifact: { path: written.path, name: fileName, bytes: written.bytes, mime: "image/png" },
+        };
+      } catch (err) {
+        return { ok: false, text: `image_gen 调用异常：${String((err as Error)?.message || err)}` };
+      }
+    }
+    case "search_dingtalk_doc": {
+      const query = str(args, "query").trim();
+      if (!query) return { ok: false, text: "search_dingtalk_doc 需要 query" };
+      const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
+      const result = await searchDingtalkDoc(query, limit);
+      return { ok: result.ok, text: result.text };
     }
     case "save_memory": {
       const text = str(args, "text").trim();

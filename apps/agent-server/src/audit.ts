@@ -5,6 +5,9 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadChannels } from "./notify/channels.js";
+import { deliverToChannels } from "./notify/deliver.js";
+import type { DeliveryMessage } from "./notify/deliver.js";
 
 export type AuditDecision =
   | "allowed" // 只读外部工具直接放行（工作区工具不记，避免噪音）
@@ -59,6 +62,47 @@ export function appendAudit(event: Omit<AuditEvent, "at" | "kind"> & { kind?: Au
     appendFileSync(monthFile(record.at), `${JSON.stringify(record)}\n`, "utf-8");
   } catch (err) {
     console.warn(`[audit] 写入失败：${String((err as Error)?.message || err)}`);
+  }
+  // 高风险决策主动推送告警（fail-soft：投递失败不影响主流程）。
+  if (AUDIT_ALERT_DECISIONS.has(record.decision)) {
+    void deliverAuditAlert(record);
+  }
+}
+
+// 需要主动推送告警的审计决策（拒绝 / 越权 / 子代理拒绝 / 超时）。
+const AUDIT_ALERT_DECISIONS = new Set<AuditDecision>([
+  "denied",
+  "ownership_mismatch",
+  "subagent_refused",
+  "timeout",
+]);
+
+// 把高风险审计事件推送到已启用的通知渠道。
+// 可通过 AUDIT_ALERT_CHANNELS 环境变量（逗号分隔的 channel id）收窄范围；未设置则推全部启用渠道。
+export function deliverAuditAlert(event: AuditEvent): void {
+  try {
+    const scoped = (process.env.AUDIT_ALERT_CHANNELS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const channels = loadChannels().filter((c) => c.enabled !== false && (!scoped.length || scoped.includes(c.id)));
+    if (!channels.length) return;
+    const lines = [
+      `决策：${event.decision}`,
+      `工具：${event.tool}${event.server ? `（${event.server}）` : ""}`,
+      `时间：${new Date(event.at).toLocaleString()}`,
+    ];
+    if (event.ownerKey) lines.push(`归属：${event.ownerKey}`);
+    if (event.reason) lines.push(`原因：${event.reason}`);
+    const message: DeliveryMessage = {
+      title: "bx-agent 安全审计告警",
+      body: lines.join("\n"),
+    };
+    void deliverToChannels(channels, message).catch((err) => {
+      console.warn(`[audit] 告警投递失败：${String((err as Error)?.message || err)}`);
+    });
+  } catch (err) {
+    console.warn(`[audit] 告警投递异常：${String((err as Error)?.message || err)}`);
   }
 }
 

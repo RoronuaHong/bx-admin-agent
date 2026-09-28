@@ -5,6 +5,7 @@
 import { Cron } from "croner";
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -85,6 +86,45 @@ async function getColl(): Promise<Collection<ChatSchedule> | null> {
     clientPromise = null;
     return null;
   }
+}
+// ---- 跨实例分布式锁（agent-infrastructure §8「跨进程任务队列」最小必要补齐）----
+// 多实例部署下，每个进程都跑 startScheduleLoop；同一日程若被多个进程同时走到「到点」，会重复触发。
+// 用 Mongo 单文档锁（findOneAndUpdate upsert + TTL）保证同一时刻只有一个进程执行该日程；
+// 抢不到锁的实例直接跳过，交给其它实例或下一 tick。无 Mongo 时退化为单进程原行为（不阻塞）。
+const SCHEDULE_LOCK_MS = 30 * 60_000; // 锁最长持有时间：runner 异常崩溃时由 TTL 自动释放，避免死锁
+interface ScheduleLockDoc {
+  _id: string;
+  owner: string;
+  expireAt: Date;
+  acquiredAt: Date;
+}
+async function getLockColl(): Promise<Collection<ScheduleLockDoc> | null> {
+  const coll = await getColl();
+  if (!coll) return null;
+  const lock = coll.db.collection<ScheduleLockDoc>("schedule_locks");
+  await lock.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
+  return lock;
+}
+async function tryAcquireScheduleLock(id: string, owner: string): Promise<boolean> {
+  const lock = await getLockColl();
+  if (!lock) return true; // 无 Mongo：退化为单进程原行为
+  const now = Date.now();
+  try {
+    // 仅当「锁不存在 / 属于自己 / 已过期」时才获取成功；并发插入冲突由 catch 吞掉（视为失败）。
+    const res = await lock.findOneAndUpdate(
+      { _id: id, $or: [{ owner }, { expireAt: { $lt: new Date(now) } }] },
+      { $set: { owner, expireAt: new Date(now + SCHEDULE_LOCK_MS), acquiredAt: new Date(now) } },
+      { upsert: true, returnDocument: "after" },
+    );
+    return !!res && (res as { owner?: string }).owner === owner;
+  } catch {
+    return false;
+  }
+}
+async function releaseScheduleLock(id: string, owner: string): Promise<void> {
+  const lock = await getLockColl();
+  if (!lock) return;
+  await lock.deleteOne({ _id: id, owner }).catch(() => {});
 }
 const memory = new Map<string, ChatSchedule>();
 
@@ -310,6 +350,9 @@ export async function schedulerTick(
     const fallback = new Date(now - 60_000);
     const due = schedule.onceAt ?? schedule.nextRunAt ?? nextRunAtOf(schedule, fallback);
     if (due === undefined || due > now) continue;
+    // 跨实例互斥：同一日程同一时刻只由一个进程触发；抢不到锁的交给其它实例或下一 tick。
+    const lockOwner = `${hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    if (!(await tryAcquireScheduleLock(schedule.id, lockOwner))) continue;
     triggered += 1;
     let outcome: "success" | "failed" | "cancelled" | "skipped" | "error" = "skipped";
     let note = "";
@@ -336,6 +379,8 @@ export async function schedulerTick(
     } catch (err) {
       outcome = "error";
       note = String((err as Error)?.message || err).slice(0, 200);
+    } finally {
+      await releaseScheduleLock(schedule.id, lockOwner).catch(() => {});
     }
     const updated: ChatSchedule = {
       ...schedule,
