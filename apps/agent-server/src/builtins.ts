@@ -1476,6 +1476,8 @@ export async function execBuiltin(
       const out = await runShell(command, { cwd: safeCwd, timeoutMs });
       return out;
     }
+    // 交付物护栏对齐（docs/DELIVERABLE_GUARDRAILS.md §1 原则 2/4）：
+    // run_script 只透传原始执行输出（runShell），不包裹任何编造文案；缺 code 即如实报错。
     case "run_script": {
       const language = str(args, "language").trim().toLowerCase() || "shell";
       const code = str(args, "code");
@@ -1504,6 +1506,9 @@ export async function execBuiltin(
       const runner = language.startsWith("py") ? `python "${relName}"` : `node "${relName}"`;
       return runShell(runner, { cwd: safeCwd, timeoutMs });
     }
+    // 交付物护栏对齐（docs/DELIVERABLE_GUARDRAILS.md §1 原则 1）：
+    // 自包含零外链——远端 url 取到本地再落盘（fsWriteBinary），交付物不含外部链接；
+    // 优先 b64_json 内联字节，绝不把外部 URL 透传给用户。缺 prompt 即如实报错。
     case "image_gen": {
       const prompt = str(args, "prompt").trim();
       if (!prompt) return { ok: false, text: "image_gen 需要 prompt" };
