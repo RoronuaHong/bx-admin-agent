@@ -230,7 +230,8 @@ export async function getConversation(id: string): Promise<ConversationDoc | nul
   const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
-  return rest as ConversationDoc;
+  // 老数据或 upsert 漏字段时可能没有 messages；兜底成空数组，保证返回形状始终符合契约。
+  return { ...rest, messages: rest.messages ?? [] } as ConversationDoc;
 }
 
 export async function createConversation(input: {
@@ -274,6 +275,9 @@ export async function createConversation(input: {
     {
       $set: { title: input.title || "新对话", updatedAt: now },
       $setOnInsert: {
+        // 新建会话必须落一个空消息数组：只在插入时生效；
+        // id 已存在时（幂等 create，如定时任务/ensure 复用 id）不覆盖，保留既有历史。
+        messages: doc.messages,
         createdAt: now,
         mcpServers: doc.mcpServers,
         fullAccess: true,
@@ -658,7 +662,8 @@ export async function getFullConversation(id: string): Promise<ConversationDoc |
   const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
-  return rest as ConversationDoc;
+  // 与 getConversation 同一契约：老数据缺 messages 时兜底成空数组（导出路径同样不能拿到 undefined）。
+  return { ...rest, messages: rest.messages ?? [] } as ConversationDoc;
 }
 
 /**
