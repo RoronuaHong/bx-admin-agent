@@ -325,7 +325,7 @@ Step 6 渲染     render_table / summarize_chart  → 按 PC 列序与形态输�
 - `tools`：`normalize_output` / `render_table` / `summarize_chart_data` 落地转换与渲染。
 - `superpower`：`field-mapping.json` + `PC_STRUCTURE_AND_OUTPUT_TYPES.md` 配置驱动，更新即生效不重启。
 
-> ⚠️ 现状缺口（2026-08-21 记录）：read 列表的「取列定义 → 转换 → 渲染」链路已通；但**列定义目前未严格按 PC List.vue 拉取**（兜底路径用了通用精简列），write 回显的多轮校对也未落地。实现时按本原则补齐，禁止继续静态查表式输出。
+> ✅ 缺口处置（2026-09-28 复核）：上面 2026-08-21 记录的缺口所指的 workflow 编排层（`workflow-orchestrate.ts` / `normalize_output` / `render_table` / `upstream` 兜底）**已随 harness 化架构演进整体移除**，原缺口不再适用。现行取数与展示由 deep agent 工具循环（`chat.ts` + `builtins.ts`）+ 技能（`pc-column-mapping` / `api-interface-routing` 等，源码驱动映射）承接；本原则（禁止静态查表式输出、不确定先反问）继续对现行链路生效。
 
 ---
 

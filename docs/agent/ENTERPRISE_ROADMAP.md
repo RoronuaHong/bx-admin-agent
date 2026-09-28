@@ -74,10 +74,10 @@
 - [x] 新工具 `search_knowledge_base`（tools.ts + mcp.ts 已注册）
 - [x] 引用出处渲染（回答中带 `来源：docs/knowledge/xxx`）
 - [x] 模型自主检索：`search_knowledge_base` 工具 description 明确触发场景，模型自主判断调用（2026-08-24 删除服务端 KB 预检短路——词表低召回/业务句误短路/forcedReply 无模型整合；chit-chat 分支补 KB 意图提示）
-- [ ] 语义检索升级（embedding 向量化，TODO 标注）——当前词法检索够用，接 embedding API 后可升级
+- [x] 语义检索升级（embedding 向量化）——✅ 已落地：`rag/embedding.ts`（`KB_EMBEDDING=on` 开关 + 余弦/RRF 融合，失败自动降级纯词法）
 - [ ] 权限过滤（按项目/角色过滤文档可见性）——当前全量可见
 - [ ] 钉钉文档拉取入库——凭证到位后接入
-- [ ] 增量索引——当前全量重建
+- [x] 增量索引——✅ 已落地：`build-rag-index.mjs` 按 `sourceHashes` 指纹增量（只重建变更文档，且按 namespace 隔离）
 
 ### P2：多项目权限隔离
 - [ ] session 增加 `roles` / `allowedProjects`
@@ -87,7 +87,7 @@
 
 ### P3：体验增强（低优先）
 - [ ] 闲聊稳定性：单字/短输入（如 "hello"）易被误读，加兜底
-- [ ] 写操作参数补全：多语言 `names` 的 languageId 动态获取（当前后端错误如实回显）
+- [x] 写操作参数补全：多语言 `names` 的 languageId 动态获取——✅ 按决策落地：`extractWriteBizParams` 禁止硬编码 languageId，缺失由后端错误如实回显（有意不做环境映射写死）
 - [ ] 能力清单：更多模块的中文操作说明（`logOperator` 补全）
 
 ---

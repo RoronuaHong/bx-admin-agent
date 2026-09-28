@@ -495,18 +495,20 @@ export function listAuditEvents(filter): Promise<AuditEvent[]>;
 
 ### 6.2 验收清单
 
-- [ ] `run_native_query` **无论 SQL 长什么样**都必须弹确认卡（含 SELECT 开头的情况）
-- [ ] 参数含 `PRAGMA` / `SELECT ... INTO OUTFILE` / `EXPLAIN ANALYZE` 的调用不再被自动批准
-- [ ] 前端 grep 不到 `isReadOnlyQuery` 与自动批准路径
-- [ ] `bi` 的 8 个只读工具**不弹卡**（无体验回归）；`run_native_query` 弹卡
-- [ ] 未声明注解 / 查不到的工具：默认弹确认卡（`MCP_UNKNOWN_TOOLS=deny` 时直接拒绝）
-- [ ] 伪造 / 跨会话复用 ticket 无法批准（`/chat/confirm` 返回 403 且记审计）
-- [ ] 子代理碰到**需用户确认**的操作：**立即**返回明确错误（不再等 120s）；免确认的工作区写可正常执行（§9.7）
-- [ ] 确认卡显示 工具名 / 服务器 / 级别 / 原因 / 关键参数摘要；敏感键已脱敏
-- [ ] 会话级只读授权后：该服务器**未声明**的工具不再弹卡；`run_native_query` 仍弹卡
-- [ ] `.data/audit/` 里能看到每次决策（含 denied / timeout / ownership_mismatch / subagent_refused）
-- [ ] 启动时若内置工具漏登记级别 → 直接报错
-- [ ] 原始那句 prompt 复现：模型不再编造 `create_card`、不再用散文征求写许可
+> 2026-09-28 静态核对：除最后两条外均已由代码与 `tests/*.test.ts` 落实（`sql-readonly.test.ts` / `write-gate.test.ts` 承接回归）；506 属待实现验证、509 属真机 e2e，保持未勾。
+
+- [x] `run_native_query` **无论 SQL 长什么样**都必须弹确认卡（含 SELECT 开头的情况）
+- [x] 参数含 `PRAGMA` / `SELECT ... INTO OUTFILE` / `EXPLAIN ANALYZE` 的调用不再被自动批准
+- [x] 前端 grep 不到 `isReadOnlyQuery` 与自动批准路径
+- [x] `bi` 的 8 个只读工具**不弹卡**（无体验回归）；`run_native_query` 弹卡
+- [x] 未声明注解 / 查不到的工具：默认弹确认卡（`MCP_UNKNOWN_TOOLS=deny` 时直接拒绝）
+- [x] 伪造 / 跨会话复用 ticket 无法批准（`/chat/confirm` 返回 403 且记审计）
+- [x] 子代理碰到**需用户确认**的操作：**立即**返回明确错误（不再等 120s）；免确认的工作区写可正常执行（§9.7）
+- [x] 确认卡显示 工具名 / 服务器 / 级别 / 原因 / 关键参数摘要；敏感键已脱敏
+- [ ] 会话级只读授权后：该服务器**未声明**的工具不再弹卡；`run_native_query` 仍弹卡（待实现/待验证）
+- [x] `.data/audit/` 里能看到每次决策（含 denied / timeout / ownership_mismatch / subagent_refused）
+- [x] 启动时若内置工具漏登记级别 → 直接报错
+- [ ] 原始那句 prompt 复现：模型不再编造 `create_card`、不再用散文征求写许可（真机 e2e，按需临时手写、用完即删）
 
 ---
 

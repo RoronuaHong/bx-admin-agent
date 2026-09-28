@@ -25,8 +25,8 @@ PC 后台仓库 `bx-film-admin-in2` 不再维护 `docs/agent` 正文（仅保留
 | ANALYTICS_ARCHITECTURE_REVIEW.md（已移除，链接失效） | **Analytics 子系统架构评审**（2026-09-13 快照；2026-09-14 更正：coverage 已是 GATE，今日 72/67/5 不是 1/71）。**实现计划以** [`../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md`](../superpowers/specs/2026-09-13-analytics-hybrid-sql-agent-design.md) **为准** |
 | ANALYTICS_INPUT_TO_LLM.md（已移除） | **问数：用户输入 → LLM 接收前**（清洗/记忆/检索/组包；相对时间 LLM 读懂、日期由代码算出） |
 | ANALYTICS_NL_TO_TABLE.md（已移除） | **自然语言 → 正确结果表**（10 步对照 + 代码锚点）。只比问句到结果行，不比身份/卡片 API/评测 |
-| ANALYTICS_CATALOG_DIGEST.md（自动生成，当前未落地） | **问数 Metabase 表结构说明（自动生成）**：全库可答/隐藏表、推断时间列、字段类型与已有 description。刷新：`pnpm --filter @bx/agent-server catalog-digest` |
-| ANALYTICS_CATALOG_INFERRED.md（自动生成，当前未落地） | **无官方说明表的暂存推断**（由 `catalog-inferred.json` 生成，不要手改）。源文件：`apps/agent-server/config/analytics/catalog-inferred.json` |
+| ANALYTICS_CATALOG_DIGEST.md（未落地，已随 `src/analytics` 删除而失效） | **问数 Metabase 表结构说明（自动生成）**：全库可答/隐藏表、推断时间列、字段类型与已有 description。刷新：`pnpm --filter @bx/agent-server catalog-digest` |
+| ANALYTICS_CATALOG_INFERRED.md（未落地，已随 `src/analytics` 删除而失效） | **无官方说明表的暂存推断**（由 `catalog-inferred.json` 生成，不要手改）。源文件：`apps/agent-server/config/analytics/catalog-inferred.json` |
 
 环境变量（`apps/agent-server/.env`）：
 
