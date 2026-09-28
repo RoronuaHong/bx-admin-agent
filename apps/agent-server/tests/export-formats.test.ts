@@ -103,6 +103,32 @@ test("[C6] html 报告无 KPI 时不渲染 kpis 容器（不编造概要卡）�
   expect(html).toContain("<h1>标题</h1>");
 });
 
+test("[C7] 全局零外链护栏：多种 html 形态均自包含（无 script/cdn/外链，仅 SVG 命名空间）", async () => {
+  // 覆盖两条生成路径（buildHtml 数据表 / buildHtmlReport 报告）与有/无标题、KPI、图表、多图等组合，
+  // 锁死「§11.2 原则 1 导出物自包含、零外链」——任何形态都不该出现外部资源引用。
+  const scenarios: Record<string, unknown>[] = [
+    { filename: "g1.html", title: "标题", rows },
+    { filename: "g2.html", rows },
+    { filename: "g3.html", sections: ["## 结论", "- 一条"] },
+    { filename: "g4.html", title: "报告", sections: ["正文"], charts: [{ chartType: "line", title: "趋势", data: [{ x: "一", y: 1 }, { x: "二", y: 2 }] }] },
+    { filename: "g5.html", title: "带KPI", kpis: [{ label: "A", value: "1" }], sections: ["## 概览", "说明"] },
+    { filename: "g6.html", title: "多图", charts: [{ chartType: "pie", title: "占比", data: [{ name: "甲", value: 1 }, { name: "乙", value: 2 }] }, { chartType: "bar", title: "对比", data: [{ x: "甲", y: 1 }, { x: "乙", y: 2 }] }] },
+  ];
+  for (const args of scenarios) {
+    const out = await run(args);
+    expect(out.ok, `${JSON.stringify(args.filename)}: ${out.text}`).toBe(true);
+    const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+    expect(html, String(args.filename)).not.toContain("<script");
+    expect(html, String(args.filename)).not.toContain("cdn.");
+    expect(html, String(args.filename)).not.toContain("https://"); // 服务端合成物任何情况下都不应引 https 资源
+    // 仅允许的 http 引用是内联 SVG 的命名空间（非网络请求）
+    const ext = html.match(/http:\/\/[^\s"')]+/g) || [];
+    for (const u of ext) {
+      expect(u, `${String(args.filename)}: 出现非 SVG 命名空间的外链 ${u}`).toBe("http://www.w3.org/2000/svg");
+    }
+  }
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
