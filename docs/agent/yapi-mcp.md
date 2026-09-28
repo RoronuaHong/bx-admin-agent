@@ -32,7 +32,7 @@
 
 > `call_api` 方法在 `run` 内被**硬编码为 GET**，且会先查 YApi 文档比对：若文档标注该接口为非 GET（POST/PUT/DELETE），直接拒绝，不执行写操作。唯一的非 GET 请求是适配器内部自动登录换 token，不暴露成工具。
 >
-> （运行实例若额外暴露 `render_table` / `export_dataset` / `search_api_module` / `get_list_columns` 等渲染导出类工具，属于部署期对 yapi 服务器的扩展，不在本仓库源码内。）
+> 注：`render_table` / `export_dataset` / `search_api_module` / `get_list_columns` 是**旧版 PC 后台 Agent 的内置工具**（见 `docs/agent/` 历史文档与 `docs/deep-agents-plan.md`：「原 call_api / search_api_module 等业务/领域能力已外置为 MCP 服务器 bi / yapi / movie / chart」）。它们在当前 `apps/agent-server/src` 已随「通用 deep-agent 框架」重构而移除；本 `yapi-docs` MCP server 是外置后的现实形态——只提供接口文档发现 + 只读 `call_api`，**不含**上述渲染/导出/模块检索类工具。这些旧工具名称仅在历史文档中保留作参考。
 
 ## 4. 只读安全模型
 
