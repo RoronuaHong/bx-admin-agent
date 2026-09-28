@@ -41,6 +41,18 @@
 | 运行追踪 | `trace.ts` | run 级 JSONL（runId/会话归属/模型/轮次/token/耗时/状态/错误），是排障、评测基线、成本聚合的地基 |
 | 成本计量 | `cost.ts` | 只读聚合 `trace.ts` 落盘的 run 级记录；tokens 估算，单价 `COST_RATE_<模型ID大写>_PER_1K`，未配置记 `unpricedTokens`（如实显示「未定价」，不编造金额） |
 
+> **完全访问模式（`fullAccess`）的姿态说明（已逐行核实源码；属既定产品决策，维持现状，仅记录在案）**
+>
+> `fullAccess` **缺省为 true（开箱即完全授权）**：`conversations.ts:94-99` 定义"缺省按 true 处理"；新建会话写死 `fullAccess: true`(277)，`$setOnInsert` 同样带 `fullAccess: true`(302)；运行期取值 `conversation?.fullAccess ?? true`（`chat.ts:2376`）。
+>
+> 完全访问下**跳过两道闸**：`chat.ts:1668` 的 `deny` 硬拒与 `chat.ts:1694` 的二次确认卡均带 `&& !ctx.fullAccess`；`chat.ts:991` 注释直言"deny（如未知工具=deny）在完全访问下也放行"。即开箱状态下，破坏性操作与未声明工具**均不弹确认卡、直接执行**。
+>
+> **这是既定决策而非缺陷**（对齐 CodeBuddy「完全访问模式」）：`risk.ts:198-204` 论证"闸门过密会制造确认疲劳，用户退化成橡皮图章，反而降低整体安全性"。可按对话关闭——`patchConversation` 支持该字段（`conversations.ts:437`），设 `false` 即恢复逐项确认。
+>
+> **不因完全访问而失效**：子代理范围闸（`chat.ts:1657`）、澄清期冻结（`1680`）、失败熔断、接地门禁、SQL 只读闸、不可信内容护栏、归属守卫、限流与审计留痕均照常生效（`chat.ts:991`）。
+>
+> **已知特性（记录在案，本次刻意不改）**：运维显式配置的 `MCP_UNKNOWN_TOOLS=deny` 也会被 `fullAccess` 覆盖——即"显式策略被默认开启的开关静默覆盖"。若将来要收紧，最小且无争议的改法是让 `deny` 不受 `fullAccess` 影响（只动这一处，确认卡跳过逻辑保持不变）。
+
 ## 4. 工具与数据接入
 
 工具分两层：**内置工具**（agent-server 自带）与 **MCP 工具**（外部服务器提供，命名空间 `mcp__<serverId>__*`）。**领域适配完全发生在 MCP 层——换后台 = 换 MCP server，框架源码不动**，这正是「领域无关的 deep-agent 框架」的含义。
