@@ -401,7 +401,9 @@ user: 123
 
 **契约（`builtins.ts` `export_data`）**：新增可选 `kpis` 参数（`[{ label, value, delta?, hint?, tone? }]`）；`buildHtml`（数据表路径）复用同款 `REPORT_CSS`，报告式与数据式视觉一致。
 
-**回归锁死**：`tests/export-formats.test.ts` 新增 [C5]（KPI 卡渲染 + 零外链）、[C6]（无 KPI 不编造容器、有标题才渲染 hero）、[C7]（全局零外链护栏：覆盖 `buildHtml`/`buildHtmlReport` 双路径与有/无标题、KPI、单/多图表等多种形态，断言无 `<script>`/`cdn`/`https://`，且仅允许 SVG 命名空间这一处 `http://`）。
+**家族一致性（pdf / docx）**：零外链 / 反编造原则同样覆盖 `export_data` 的 pdf、docx 路径——`buildPdf`/`buildDocx` 均以 `if (title)` 守卫，缺标题时**不注入默认大标题**（与 html 同口径，§11.5）；pdf 仅引本地字体资产 `assets/fonts/NotoSansSC-Regular.otf`、docx 由 Word 按字体名解析，二者成品均不含 `https://` 外链（[C8] 锁死）。
+
+**回归锁死**：`tests/export-formats.test.ts` 新增 [C5]（KPI 卡渲染 + 零外链）、[C6]（无 KPI 不编造容器、有标题才渲染 hero）、[C7]（全局零外链护栏：覆盖 `buildHtml`/`buildHtmlReport` 双路径与有/无标题、KPI、单/多图表等多种形态，断言无 `<script>`/`cdn`/`https://`，且仅允许 SVG 命名空间这一处 `http://`）、[C8]（零外链 / 反编造扩展到 pdf/docx 全家族：合法文件签名 + 无 `https://`/`cdn` 外链 + 缺标题不注入默认大标题）。
 
 **验收**：13512 字节示例报告含 `hero`/`kpis`/`card`/内联 `<svg>`/`table`；外链 `https://` 数 = 2（仅 SVG 命名空间）→ 实质零外链。
 
