@@ -32,6 +32,7 @@ import {
   createConversation,
   cancelSubagent as apiCancelSubagent,
   conversationExportUrl,
+  NOT_MODEL_FAULT_CODES,
   createChatSchedule,
   deleteChatSchedule,
   deleteConversation as apiDeleteConversation,
@@ -2621,17 +2622,7 @@ async function send() {
 const RESUME_ATTEMPTS = 3;
 const RESUME_BACKOFF_MS = 600;
 
-/**
- * 这些服务端终态码**不是**「模型不可用」：中断（服务重启）/ 无进展收口 / 已收束 / 流异常
- * 都不该把模型记进 auto 模式的失败黑名单（否则一次服务重启就会让「自动」跳过本来好用的模型）。
- */
-const NOT_MODEL_FAULT_CODES = new Set([
-  "CHAT_TASK_INTERRUPTED",
-  "CHAT_TASK_STALLED",
-  "CHAT_TASK_ELSEWHERE",
-  "CHAT_TASK_ALREADY_SETTLED",
-  "STREAM_ERROR",
-]);
+// 「非模型故障」终态码集合已上移到 api.ts（/movie 页共用同一份口径），这里直接 import 使用。
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 

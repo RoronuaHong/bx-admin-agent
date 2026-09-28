@@ -17,9 +17,11 @@ import {
   patchConversation,
   clearConversation,
   clearConversationContext,
+  cancelChatTask,
   getApiErrorToken,
   getApiErrorCode,
   isChatTaskRunning,
+  NOT_MODEL_FAULT_CODES,
   MODEL_AUTO_ID,
   type ModelInfo,
 } from "../api";
@@ -71,13 +73,13 @@ const scroller = ref<HTMLElement | null>(null);
 let seq = 0;
 let convId = "";
 let controller: AbortController | null = null;
+/** 会话建立中的防重入标记（send 内使用，见 send 的 ensureConversation 分支）。 */
+let starting = false;
 
 // ---- 模型选择（与 /chat 同源的「自动」逻辑）----
 // 模型列表来自服务端 /agent/models；空选 = 自动模式（运行时挑可用模型）。
 const models = ref<ModelInfo[]>([]);
 const modelId = ref<string>(MODEL_AUTO_ID);
-/** 当前生效模型（auto 已解析为具体模型）的展示名：服务端回传 model 事件时刷新。 */
-const activeModelLabel = ref("");
 const lastGoodModelId = ref<string>("");
 const failedModelIds = ref<Set<string>>(new Set());
 /**
@@ -95,7 +97,6 @@ function resolveModel(value: string): string {
   failedModelIds.value.clear();
   return ids[0] ?? "";
 }
-const resolvedModelId = computed(() => resolveModel(modelId.value));
 
 /** 「清空对话」确认弹窗：清空不可撤销，用弹窗显式确认，避免「点错一下就没了」。 */
 const showClearModal = ref(false);
@@ -274,7 +275,18 @@ async function send() {
   const text = input.value.trim();
   if (!text || sending.value) return;
   // 首屏会话可能仍在建立：确保有 conversationId 再发，避免落到服务端兜底会话。
-  if (!convId) await ensureConversation().catch(() => {});
+  // starting 防重入：ensureConversation 是两次网络请求，连按两次回车会各自建一个空会话。
+  if (!convId) {
+    if (starting) return;
+    starting = true;
+    try {
+      await ensureConversation();
+    } catch {
+      // 建会话失败不阻断发送（服务端仍有兜底会话），与原 .catch(() => {}) 语义一致。
+    } finally {
+      starting = false;
+    }
+  }
   notice.value = "";
   input.value = "";
   autoGrow();
@@ -287,12 +299,14 @@ async function send() {
   scrollToBottom(true); // 用户发送：无条件回底（新回复从底部开始展示）
   controller = new AbortController();
   // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
+  // 本页刻意不展示模型信息（终端用户界面），服务端 model 事件仅用于服务端标签跟踪，前端无需消费。
   const chosenModel = resolveModel(modelId.value);
-  activeModelLabel.value = models.value.find((m) => m.id === chosenModel)?.label || "";
   /** 本轮是否收到过终态事件（done / 服务端 error）：没收到的流结束 = 连接断了，必须如实收口。 */
   let sawTerminal = false;
   /** 用户是否按了停止（停止不是「中断」，不该报错）。 */
   let stopped = false;
+  /** 服务端终态码：用于把「非模型故障」（中断/流异常等）排除出 auto 失败黑名单（口径见 api.ts）。 */
+  let serverErrorCode = "";
   try {
     await streamChat(
       text,
@@ -310,12 +324,10 @@ async function send() {
           stickThinkingToBottom();
         } else if (event.type === "text") {
           reply.text = event.text;
-        } else if (event.type === "model") {
-          // 服务端实际选用的模型（含候选链自动切换）：刷新当前模型标签，用户可感知已切到备用模型。
-          activeModelLabel.value = event.label;
         } else if (event.type === "error") {
           // 服务端明确宣告的终态：这条之后流再断也算「有结论」。
           sawTerminal = true;
+          serverErrorCode = String(event.code ?? "");
           // 第三参数是兜底 code 而非文案：token 自带 defaultMessage，直接本地化即可。
           reply.error = localizeToken(uiLocale.value, event.error);
         } else if (event.type === "done") {
@@ -345,6 +357,7 @@ async function send() {
     } else if (!reply.error) {
       // 不要把失败原因吞成一句「出错了」：有服务端 token 就本地化还原（限流/额度/不支持等），
       // 否则退回原始错误信息，最后才是通用兜底。
+      serverErrorCode = getApiErrorCode(err) || "";
       const token = getApiErrorToken(err);
       const raw = ((err as Error)?.message || "").trim();
       reply.error = token
@@ -376,11 +389,13 @@ async function send() {
     sending.value = false;
     controller = null;
     // 自动模式：本轮成功则记下来实际用到的具体模型（下次优先复用），失败则记入黑名单（下次跳过）。
-    // 仅「真正出错」计入——用户主动停止 / 对话繁忙 都不算模型不可用。
-    if (reply.error) failedModelIds.value.add(chosenModel);
+    // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 中断 / 流异常（非模型故障终态码）都不算，
+    // 否则一次服务重启就会让「自动」跳过本来好用的模型（口径与 /chat 的 NOT_MODEL_FAULT_CODES 一致）。
+    if (reply.error && !NOT_MODEL_FAULT_CODES.has(serverErrorCode)) failedModelIds.value.add(chosenModel);
     else {
       failedModelIds.value.delete(chosenModel);
-      if (!reply.error) lastGoodModelId.value = chosenModel;
+      // 只有真正走完一轮（收到终态、没有错误、没被停止）才算「上次成功」；繁忙回滚不冒充成功。
+      if (sawTerminal && !reply.error) lastGoodModelId.value = chosenModel;
     }
     await persist();
     scrollToBottom();
@@ -389,6 +404,11 @@ async function send() {
 
 function stop() {
   controller?.abort();
+  // 执行与推送解耦后，断开连接不再中止生成：必须显式调取消端点，否则服务端任务会继续跑完
+  // （白烧 token），其结果还会落进「后台任务结果」隔离会话、不回本对话，且在它跑完前
+  // 本对话会被并发保护挡住（用户看到的却是「已停止生成」，以为可以继续发）。
+  // 口径与 /chat 的 stop() 一致；任务不存在 / 已收束时端点幂等返回，调用无害。
+  if (convId) void cancelChatTask(convId).catch(() => undefined);
 }
 
 /** 打开清空确认弹窗（生成中禁止打开，避免清完又被在途的流写回气泡）。 */

@@ -168,6 +168,19 @@ export async function streamChat(
 }
 
 /**
+ * 这些服务端终态码**不是**「模型不可用」：中断（服务重启）/ 无进展收口 / 已收束 / 流异常
+ * 都不该把模型记进 auto 模式的失败黑名单（否则一次服务重启就会让「自动」跳过本来好用的模型）。
+ * /chat 与 /movie 两个页面共用同一份口径。
+ */
+export const NOT_MODEL_FAULT_CODES = new Set([
+  "CHAT_TASK_INTERRUPTED",
+  "CHAT_TASK_STALLED",
+  "CHAT_TASK_ELSEWHERE",
+  "CHAT_TASK_ALREADY_SETTLED",
+  "STREAM_ERROR",
+]);
+
+/**
  * 断线续传：带上次消费到的 `seq` 重新挂上后台任务的事件流（对齐 SSE 的 `Last-Event-ID` 重连语义）。
  * 返回 true = 已接上（终态会在事件流里给出；正文由服务端补一条 `text` 快照，前端替换即可，
  * 不会把已显示的内容拼两遍）；返回 false = 服务端已没有可续传的任务（进程重启后连留档也没有、
