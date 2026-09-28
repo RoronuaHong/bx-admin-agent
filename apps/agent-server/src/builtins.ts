@@ -11,7 +11,7 @@ import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/share
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
 import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
-import { buildHtmlReport, chartSvgs, chartFallbackTables } from "./report.js";
+import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
 import { createScheduleTask } from "./schedule-service.js";
 import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
@@ -697,6 +697,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         "**报告式导出（html / pdf / docx）可把图表和叙述也一并装进文件**：" +
         "把本轮回话里 render_chart 产出的图表 spec 原样放进 `charts` 数组（html 会渲染成内联 SVG，pdf 渲染成矢量图，docx 退化为数据表）；" +
         "把口径说明 / 预测 / 建议等叙述文字（markdown）放进 `sections`（字符串或字符串数组）。" +
+        "可选 `kpis` 概要卡（[{ label, value, delta?, hint?, tone? }]）：仅当显式传入才渲染，工具不自动推算指标（避免编造），在 html 中以卡片网格呈现。" +
         "报告式格式**可以不带表格**：只给 sections 与 charts（不给 rows/sheets）也能成文；xlsx/csv/json/md/txt 则必须给 rows 或 sheets。" +
         "导出物由服务端合成为自包含文件（内联样式与图表）：**不要用 fs_write 手写引用外部 CDN 的网页代替本工具**——那既不出下载卡片（.html 除外），断网打开还会图表空白。" +
         "这样用户要的「表 + 图 + 结论全部进一个文件」就能满足，而不是只在聊天里出图、文件里只有表。" +
@@ -730,7 +731,12 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           },
           charts: {
             type: "array",
-            description: "可选：图表数组，元素为 render_chart 产出的 ChartSpec（{ chartType, data, encode?, options?, title? }）。html/pdf 会渲染成图形，docx 退化为数据表",
+            description: "可选：图表数组，元素为 render_chart 产出的 ChartSpec（{ chartType, data, encode?, options?, title? }）。html/pdf 会渲染成图形，docx 退化为数据表。可选 kpis 概要卡（[{ label, value, delta?, hint?, tone? }]）仅当显式传入才渲染（工具不自动推算，避免编造指标），html 中以卡片网格呈现",
+            items: { type: "object" },
+          },
+          kpis: {
+            type: "array",
+            description: "可选：KPI 概要卡数组 [{ label, value, delta?, hint?, tone? }]。label/value 必填，delta 为同比/环比提示，hint 为补充说明，tone 为涨跌色 up/down/flat（不传则按 delta 文案启发式判定）。仅显式传入才渲染，工具不自动从表格推算",
             items: { type: "object" },
           },
         },
@@ -1056,25 +1062,20 @@ function buildHtml(title: string, matrix: unknown[][]): string {
     `<html lang="${lang}">`,
     "<head>",
     '<meta charset="utf-8" />',
+    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
     `<title>${esc(title)}</title>`,
     "<style>",
-    "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;margin:24px;color:#1f2329}",
-    "h1{font-size:20px;margin:0 0 16px}",
-    "table{border-collapse:collapse;width:100%;font-size:13px}",
-    "th,td{border:1px solid #dcdfe6;padding:6px 10px;text-align:left;vertical-align:top}",
-    "th{background:#f5f7fa;font-weight:600}",
-    "tr:nth-child(even) td{background:#fafbfc}",
+    REPORT_CSS,
     "</style>",
     "</head>",
-    "<body>",
-    ...(title ? [`<h1>${esc(title)}</h1>`] : []),
-    "<table>",
-    `<thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>`,
-    "<tbody>",
-    ...body.map((row) => `<tr>${head.map((_, i) => `<td>${esc(row[i] ?? "")}</td>`).join("")}</tr>`),
-    "</tbody>",
-    "</table>",
-    "</body>",
+    '<body><div class="page">',
+    // 没有标题就不输出 h1/hero：宁可少一个标题，也不塞用户没给过的文案。
+    ...(title ? [`<header class="hero"><h1>${esc(title)}</h1></header>`] : []),
+    `<section class="card"><table>` +
+      `<thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>` +
+      `<tbody>${body.map((row) => `<tr>${head.map((_, i) => `<td>${esc(row[i] ?? "")}</td>`).join("")}</tr>`).join("")}</tbody>` +
+    `</table></section>`,
+    "</div></body>",
     "</html>",
     "",
   ].join("\n");
@@ -1657,6 +1658,27 @@ export async function execBuiltin(
             .filter((c) => c && typeof c === "object" && typeof (c as Record<string, unknown>).chartType === "string")
             .map((c) => c as ChartSpec)
         : [];
+      // KPI 概要卡（可选）：模型显式传入才渲染，工具不自动从表格推算（避免编造指标）。
+      const kpisRaw = (args as Record<string, unknown>).kpis;
+      const kpis: Array<{ label: string; value: string; delta?: string; hint?: string; tone?: string }> = Array.isArray(kpisRaw)
+        ? kpisRaw
+            .filter(
+              (k) =>
+                k && typeof k === "object" &&
+                typeof (k as Record<string, unknown>).label === "string" &&
+                typeof (k as Record<string, unknown>).value === "string",
+            )
+            .map((k) => {
+              const o = k as Record<string, unknown>;
+              return {
+                label: String(o.label),
+                value: String(o.value),
+                delta: o.delta != null ? String(o.delta) : undefined,
+                hint: o.hint != null ? String(o.hint) : undefined,
+                tone: o.tone != null ? String(o.tone) : undefined,
+              };
+            })
+        : [];
       // 表格输入检测：rows/sheets 任一非空才算「有表格」。数据格式的载体就是表格，仍必填；
       // 报告式格式允许零表格——只给叙述与图表也能成文（§11 断链点：原实现无条件兜底
       // {rows: args.rows}，模型想交付「无明细表的报告」会被「缺少数据行」拒绝）。
@@ -1726,7 +1748,7 @@ export async function execBuiltin(
               ? toJsonText(built[0]!.matrix)
               : target.format === "html"
                 ? (sections.length || charts.length
-                    ? buildHtmlReport({ title, sections, tables: built, charts })
+                    ? buildHtmlReport({ title, sections, tables: built, charts, kpis })
                     : buildHtml(title, built[0]!.matrix))
                 : target.format === "txt"
                   ? buildTxt(title, built[0]!.matrix)

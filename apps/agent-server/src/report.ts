@@ -340,17 +340,89 @@ function renderFallbackTable(spec: ChartSpec): string {
 // 自包含 HTML 报告合成器（零外链：内联样式 + 内联 SVG）。
 // ---------------------------------------------------------------------------
 export interface ReportTable { name: string; matrix: unknown[][] }
+export interface ReportKpi {
+  label: string;          // 指标名（如「泰米尔人均时长」）—— 由调用方显式提供
+  value: string;          // 指标值（如「68.8 分钟」）—— 由调用方显式提供
+  delta?: string;         // 同比/环比提示（如「+2.1%」「较上周 -3min」）
+  hint?: string;          // 补充说明（如「近 7 日」）
+  tone?: "up" | "down" | "flat"; // 涨跌色：不传则按 delta 文案启发式判定
+}
 export interface BuildHtmlReportOpts {
   title?: string;
   sections?: string[]; // markdown 段落
   tables?: ReportTable[];
   charts?: ChartSpec[];
+  kpis?: ReportKpi[];  // 可选 KPI 概要卡：仅当调用方显式传入才渲染，工具不自动推算（避免编造）
+}
+
+// 零外链设计系统：内联 CSS 变量 + 卡片化 + Hero + KPI 网格 + 打印友好。
+// 全部用系统字体栈，不引任何 CDN / web font；图表为内联 SVG（report.ts 烘焙）。
+// 与 §11.2 原则 1「导出物自包含、零外链」一致；同时保证 Ctrl+P 可干净存 PDF。
+export const REPORT_CSS = `
+:root{
+  --bg:#F4F6F9; --card:#FFFFFF; --ink:#1D2129; --ink-2:#4E5969; --muted:#86909C;
+  --line:#E5E6EB; --line-2:#F2F3F5; --brand:#3370FF; --brand-ink:#1D4ED8; --brand-soft:#EAF1FF;
+  --up:#00B42A; --down:#F53F3F; --radius:14px; --radius-sm:10px;
+  --shadow:0 1px 2px rgba(20,30,60,.04),0 8px 24px rgba(20,30,60,.06);
+  --maxw:980px;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--font);line-height:1.65;font-size:15px;-webkit-font-smoothing:antialiased}
+.page{max-width:var(--maxw);margin:0 auto;padding:32px 24px 56px}
+.hero{position:relative;background:linear-gradient(135deg,#3370FF 0%,#5B8FF9 100%);color:#fff;border-radius:var(--radius);padding:30px 32px;box-shadow:var(--shadow);overflow:hidden;margin-bottom:24px}
+.hero::after{content:"";position:absolute;right:-40px;top:-50px;width:190px;height:190px;border-radius:50%;background:rgba(255,255,255,.12)}
+.hero h1{font-size:26px;line-height:1.3;margin:0;font-weight:700;letter-spacing:.4px;position:relative}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:0 0 24px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);padding:16px 18px;box-shadow:var(--shadow)}
+.kpi-label{font-size:12.5px;color:var(--muted);margin-bottom:8px}
+.kpi-value{font-size:24px;font-weight:700;color:var(--ink);line-height:1.1}
+.kpi-delta{font-size:12px;margin-top:6px;font-weight:600}
+.kpi-delta.up{color:var(--up)} .kpi-delta.down{color:var(--down)} .kpi-delta.flat{color:var(--muted)}
+.kpi-hint{font-size:11.5px;color:var(--muted);margin-top:6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;box-shadow:var(--shadow);margin:0 0 20px;page-break-inside:avoid}
+.card > :first-child{margin-top:0} .card > :last-child{margin-bottom:0}
+h1,h2,h3{color:var(--ink)}
+h2{font-size:18px;margin:0 0 12px;padding-left:11px;border-left:4px solid var(--brand);line-height:1.4}
+h3{font-size:15px;margin:18px 0 8px;color:var(--ink-2)}
+p{margin:8px 0;color:var(--ink-2)}
+ul,ol{margin:8px 0;padding-left:22px;color:var(--ink-2)}
+li{margin:4px 0}
+strong{color:var(--ink)}
+code{background:var(--line-2);padding:1px 6px;border-radius:5px;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:#0F172A;color:#E2E8F0;padding:14px;border-radius:var(--radius-sm);overflow:auto}
+pre code{background:none;padding:0;color:inherit}
+blockquote{border-left:3px solid var(--brand);background:var(--brand-soft);margin:10px 0;padding:8px 14px;color:var(--ink-2);border-radius:0 var(--radius-sm) var(--radius-sm) 0}
+a{color:var(--brand-ink);text-decoration:none}
+a:hover{text-decoration:underline}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:6px 0}
+th,td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+th{background:var(--line-2);font-weight:600;color:var(--ink)}
+tr:nth-child(even) td{background:#FAFBFC}
+figure.chart{margin:0 0 20px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);page-break-inside:avoid}
+figure.chart svg{width:100%;height:auto;display:block}
+.chart-fallback{color:var(--muted);font-size:13px;margin:0 0 8px}
+img{max-width:100%;border-radius:var(--radius-sm)}
+@media print{
+  body{background:#fff}
+  .page{padding:0;max-width:none}
+  .hero,.card,figure.chart{box-shadow:none}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+}
+`;
+
+function kpiTone(delta: string, tone?: string): "up" | "down" | "flat" {
+  if (tone === "up" || tone === "down" || tone === "flat") return tone;
+  const t = delta.trim();
+  if (/^[-−]/.test(t) || /下降|减少|跌|降/.test(t)) return "down";
+  if (/^[+＋]/.test(t) || /上升|增长|涨|提升|增/.test(t)) return "up";
+  return "flat";
 }
 
 export function buildHtmlReport(opts: BuildHtmlReportOpts): string {
   // 标题缺失时**不编造**：既不塞默认大标题，也不拿它去猜语言。
-  // 旧实现 `opts.title || "数据分析报告"` 会往用户文件里硬塞一行「数据分析报告」——
-  // 用户只是要把「123」生成 HTML，却凭空多出一个报告大标题，
+  // 旧实现 `opts.title || "数据分析报告"` 会往用户文件里硬塞一行「数据分析报告」，
   // 与「内容必须来自真实输入、禁止编造」的口径直接冲突。
   const title = (opts.title || "").trim();
   // 语言改从「标题 + 正文」一起判断：标题现在可能为空，只看标题会把中文正文误判成 en。
@@ -359,58 +431,53 @@ export function buildHtmlReport(opts: BuildHtmlReportOpts): string {
 
   for (const sec of opts.sections || []) {
     const html = renderMarkdown(sec).trim();
-    if (html) blocks.push(`<section class="section">${html}</section>`);
+    if (html) blocks.push(`<section class="card">${html}</section>`);
   }
   for (const c of opts.charts || []) {
     const svg = renderChartSvg(c);
-    blocks.push(
-      `<figure class="chart">${svg ?? renderFallbackTable(c)}` +
-        (c.title && !svg ? "" : "") +
-        `</figure>`,
-    );
+    blocks.push(`<figure class="chart">${svg ?? renderFallbackTable(c)}</figure>`);
   }
   for (const t of opts.tables || []) {
     const head = t.matrix[0] || [];
     const body = t.matrix.slice(1);
     blocks.push(
-      `<section class="section"><table>` +
+      `<section class="card"><table>` +
         `<thead><tr>${head.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>` +
         `<tbody>${body.map((r) => `<tr>${head.map((_, i) => `<td>${escapeHtml(r[i] ?? "")}</td>`).join("")}</tr>`).join("")}</tbody>` +
         `</table></section>`,
     );
   }
 
+  // Hero：仅当真有标题才渲染，绝不编造任何默认标题文案。
+  const hero = title ? `<header class="hero"><h1>${escapeHtml(title)}</h1></header>` : "";
+
+  // KPI 概要卡：仅当调用方显式传入才渲染；工具不自动从表格推算（避免编造指标）。
+  const kpis = opts.kpis || [];
+  const kpisHtml = kpis.length
+    ? `<div class="kpis">` + kpis.map((k) => {
+        const tone = kpiTone(k.delta || "", k.tone);
+        const delta = k.delta ? `<div class="kpi-delta ${tone}">${escapeHtml(k.delta)}</div>` : "";
+        const hint = k.hint ? `<div class="kpi-hint">${escapeHtml(k.hint)}</div>` : "";
+        return `<div class="kpi"><div class="kpi-label">${escapeHtml(k.label)}</div><div class="kpi-value">${escapeHtml(k.value)}</div>${delta}${hint}</div>`;
+      }).join("") + `</div>`
+    : "";
+
   return [
     "<!doctype html>",
     `<html lang="${lang}">`,
     "<head>",
     '<meta charset="utf-8" />',
+    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
     `<title>${escapeHtml(title)}</title>`,
     "<style>",
-    "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;margin:28px;color:#1f2329;line-height:1.6}",
-    "h1{font-size:22px;margin:0 0 20px}",
-    "h2{font-size:17px;margin:22px 0 10px}",
-    "h3{font-size:15px;margin:16px 0 8px}",
-    "p{margin:8px 0}",
-    "ul,ol{margin:8px 0;padding-left:22px}",
-    "code{background:#f3f4f6;padding:1px 5px;border-radius:4px;font-size:13px}",
-    "pre{background:#f7f8fa;border:1px solid #eaecef;padding:12px;border-radius:8px;overflow:auto}",
-    "pre code{background:none;padding:0}",
-    "table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0}",
-    "th,td{border:1px solid #dcdfe6;padding:6px 10px;text-align:left;vertical-align:top}",
-    "th{background:#f5f7fa;font-weight:600}",
-    "tr:nth-child(even) td{background:#fafbfc}",
-    "figure.chart{margin:18px 0;padding:12px;border:1px solid #eef0f3;border-radius:10px;background:#fff}",
-    "figure.chart svg{width:100%;height:auto;display:block}",
-    ".chart-fallback{color:#8a94a6;font-size:13px;margin:0 0 8px}",
-    "a{color:#3370ff}",
+    REPORT_CSS,
     "</style>",
     "</head>",
-    "<body>",
-    // 没有标题就不输出 h1：宁可少一个标题，也不塞用户没给过的文案。
-    ...(title ? [`<h1>${escapeHtml(title)}</h1>`] : []),
+    '<body><div class="page">',
+    hero,
+    kpisHtml,
     ...blocks,
-    "</body>",
+    "</div></body>",
     "</html>",
     "",
   ].join("\n");

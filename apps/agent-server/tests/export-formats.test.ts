@@ -72,6 +72,37 @@ test("[C4] 纯数据表导出 html 无标题时不编造默认标题（导出数
   expect(html).not.toContain("<h1>");
 });
 
+test("[C5] html 报告支持 KPI 概要卡（仅显式传入才渲染，不自动编造、零外链）", async () => {
+  const out = await run({
+    filename: "带KPI.html",
+    title: "小语种时长",
+    kpis: [
+      { label: "泰米尔人均时长", value: "68.8 分钟", delta: "+2.1%", tone: "up" },
+      { label: "总观看量", value: "1.2M", hint: "近 7 日" },
+    ],
+    sections: ["## 概览\n说明文字。"],
+  });
+  expect(out.ok, out.text).toBe(true);
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).toContain('class="hero"');
+  expect(html).toContain('class="kpis"');
+  expect(html).toContain("泰米尔人均时长");
+  expect(html).toContain("68.8 分钟");
+  expect(html).toContain('class="kpi-delta up"');
+  expect(html).toContain("总观看量");
+  // 仍零外链：无脚本、无 cdn（对齐 §11.2 原则 1）
+  expect(html).not.toContain("<script");
+  expect(html).not.toContain("cdn.");
+});
+
+test("[C6] html 报告无 KPI 时不渲染 kpis 容器（不编造概要卡）；有标题才渲染 hero", async () => {
+  const out = await run({ filename: "无KPI.html", title: "标题", sections: ["正文"] });
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).not.toContain('class="kpis"');
+  expect(html).toContain('class="hero"');
+  expect(html).toContain("<h1>标题</h1>");
+});
+
 test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
