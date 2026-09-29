@@ -856,6 +856,21 @@ export function markForcedToolChoiceUnsupported(model: ModelEntry): void {
   );
 }
 
+/**
+ * 撤销「不接受强制工具通道」的记忆：降级 auto 重试仍失败 → 根因不在 tool_choice，回滚记忆。
+ * 与 models.ts 三条端点自愈（回灌思考 / 关思考 / 温度）同一条纪律：学习信号来自报错措辞，
+ * 措辞是通用串，有误判空间；若把推测固化成永久禁用，该角色（如 movie）会永久丢掉「首轮逼模型
+ * 先调工具」的防编造增强——自愈无效时必须撤销，让下次请求重新探测，而不是假装学会了。
+ */
+export function unmarkForcedToolChoiceUnsupported(model: ModelEntry): void {
+  const key = modelEndpointKey(model);
+  if (!forcedToolChoiceUnsupported.delete(key)) return;
+  console.warn(
+    `[chat:tool-choice] 端点（模型 ${model.id}）降级 auto 后仍失败：撤销「不接受强制通道」记忆，` +
+      "根因不在 tool_choice，按原始报错如实抛出",
+  );
+}
+
 /** 一次模型调用：边收增量边 yield text_delta / thinking_delta，结束时返回全文与工具调用。 */
 export async function* streamCall(
   model: ModelEntry,
@@ -976,6 +991,9 @@ export async function* streamCall(
     settled = false;
     wake = null;
     yield* invokeAndDrain();
+    // 自愈无效（降级 auto 仍失败）→ 撤销记忆：根因不在 tool_choice，别把推测固化成永久禁用，
+    // 否则该角色会永久丢掉「首轮逼模型先调工具」的防编造增强（见 models.ts 三条自愈同一条纪律）。
+    if (failure) unmarkForcedToolChoiceUnsupported(model);
   }
   return { text, toolCalls, failure, reasoning };
 }

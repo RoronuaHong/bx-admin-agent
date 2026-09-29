@@ -103,6 +103,41 @@ test("[C6] html 报告无 KPI 时不渲染 kpis 容器（不编造概要卡）�
   expect(html).toContain("<h1>标题</h1>");
 });
 
+test("[C6b] 脏图表在入口被判掉（不进渲染层撞崩）：未知图型 / 行里混 null / data 不是数组", async () => {
+  // 报告渲染按「行对象数组」取键名（Object.keys(row)）：行里混进 null / 标量会直接抛错，
+  // 把一次本可成功的导出打断。图表是装饰不是主体，判不掉就跳过，不留脏数据。
+  const out = await run({
+    filename: "脏图表.html",
+    title: "回归",
+    sections: ["## 结论", "- 图表均不可渲染，叙述仍在"],
+    charts: [
+      { chartType: "pie3d", data: [{ name: "甲", value: 1 }] }, // 未知图型
+      { chartType: "bar", data: [{ x: "甲", y: 1 }, null] }, // 行里混 null
+      { chartType: "line", data: "不是数组" }, // data 形态错
+      { chartType: "bar" }, // 缺 data
+    ],
+  });
+  expect(out.ok, out.text).toBe(true);
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  expect(html).toContain("结论"); // 叙述照常成文
+  expect(html).not.toContain("pie3d"); // 未知图型不进文件
+  expect(html).not.toContain("<figure"); // 没有图表被渲染
+  expect(html).not.toContain("null");
+});
+
+test("[C6c] 图形类图表（sankey：data 是 {nodes,edges}）不因「不是行数组」被误杀", async () => {
+  const out = await run({
+    filename: "桑基.html",
+    title: "流向",
+    charts: [{ chartType: "sankey", title: "来源流向", data: { nodes: [{ name: "A" }, { name: "B" }], edges: [{ source: "A", target: "B", value: 3 }] } }],
+  });
+  expect(out.ok, out.text).toBe(true);
+  const html = fs.readFileSync(absOf(out.artifact!.path), "utf-8");
+  // 数据不是行数组，退化成数据表也拿不到东西：图没丢，但必须说清是「哪张图」没渲染
+  expect(html).toContain("来源流向");
+  expect(html).toContain("不是行数据");
+});
+
 test("[C7] 全局零外链护栏：多种 html 形态均自包含（无 script/cdn/外链，仅 SVG 命名空间）", async () => {
   // 覆盖两条生成路径（buildHtml 数据表 / buildHtmlReport 报告）与有/无标题、KPI、图表、多图等组合，
   // 锁死「§11.2 原则 1 导出物自包含、零外链」——任何形态都不该出现外部资源引用。

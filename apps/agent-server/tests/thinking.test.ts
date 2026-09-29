@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callAgent, isReasoningReplayRejected, markReasoningReplayRequired, reasoningReplayRequired } from "../src/models.js";
+import { callAgent, disableThinkingSupported, isReasoningReplayRejected, markReasoningReplayRequired, reasoningReplayRequired } from "../src/models.js";
 import { streamCall } from "../src/chat.js";
 import { config } from "../src/config.js";
 import type { ModelEntry } from "../src/config.js";
@@ -317,6 +317,24 @@ describe("思考回灌（reasoning_content）：能力学习 + 自愈重发", ()
     expect(assistantMessageOf(bodies[2]).reasoning_content).toBe("");
   });
 
+  it("自愈无效（补上 reasoning_content 后仍失败）→ 回滚记忆并如实抛错，不把推测固化", async () => {
+    let calls = 0;
+    // 网关无论如何都拒：说明根因不是缺 reasoning_content，补它救不了。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls += 1;
+        return new Response(REASONING_REPLAY_COMPLAINT, { status: 400 });
+      }),
+    );
+
+    const model = makeModel("openai", "probe-replay-rollback");
+    await expect(callAgent(model, toolCallTurns(), [], undefined, undefined, {})).rejects.toThrow(/400/);
+    expect(calls).toBe(2); // 只试一次自愈，不无限重试
+    // 记忆必须回滚：否则此后每个 assistant 消息都会挂一个它本不需要的字段，真实原因也被掩盖。
+    expect(reasoningReplayRequired(model)).toBe(false);
+  });
+
   it("首跳被拒 → 同一轮内补字段重发一次，之后该端点不再白打 400", async () => {
     const bodies: unknown[] = [];
     // 行为化 mock（按网关语义）：assistant 工具调用消息没带 reasoning_content 就拒绝，带了才放行。
@@ -383,5 +401,61 @@ describe("streamCall 端到端（事件顺序 + 非流式 fallback 不丢正文�
     expect(thinkingEvents.map((e) => e.text).join("")).toBe("Offline thought.");
     // 关键回归点：非流式兜底必须把最终正文也下发，不能因为思考存在而丢弃
     expect(textEvents.map((e) => e.text).join("")).toBe("Offline answer.");
+  });
+});
+
+describe("关思考（disabled thinking）：能力学习 + 自愈回滚", () => {
+  const DISABLED_REJECTED = "type=disabled is not supported by this endpoint";
+
+  it("无关思考需求时默认不带 thinking 字段（通用行为不变）", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u, init) => {
+      bodies.push(init?.body ? JSON.parse(init.body) : null);
+      return sse(openaiPlainSse.split("\n"));
+    }));
+    await callAgent(makeModel("openai", "probe-think-baseline"), [{ role: "user", content: "hi" }]);
+    expect((bodies[0] as { thinking?: unknown }).thinking).toBeUndefined();
+  });
+
+  it("首跳被拒 → 重发一次（省略字段）成功 → 记住，后续调用默认省略不再白打 400", async () => {
+    const bodies: unknown[] = [];
+    // 行为化 mock（按网关语义）：带 thinking:{type:'disabled'} 就拒，省略即放行。
+    vi.stubGlobal("fetch", vi.fn(async (_u, init) => {
+      const body = init?.body ? JSON.parse(init.body) : null;
+      bodies.push(body);
+      const t = body?.thinking;
+      return t && t.type === "disabled"
+        ? new Response(DISABLED_REJECTED, { status: 400 })
+        : sse(openaiPlainSse.split("\n"));
+    }));
+    const model = makeModel("openai", "probe-think-learn", "probe-think-learn");
+    const res = await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, { disableThinking: true });
+    expect(bodies).toHaveLength(2); // 首跳被拒 + 省略字段重发
+    expect((bodies[0] as { thinking?: { type?: string } }).thinking?.type).toBe("disabled");
+    expect((bodies[1] as { thinking?: unknown }).thinking).toBeUndefined();
+    expect(res.text).toBe("Hi there");
+    expect(disableThinkingSupported(model)).toBe(false); // 已学到「端点不支持关闭思考」
+
+    // 第二次调用：能力已记住 → 默认省略 thinking 字段，一次请求即通过（不再白打 400）
+    bodies.length = 0;
+    await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, { disableThinking: true });
+    expect(bodies).toHaveLength(1);
+    expect((bodies[0] as { thinking?: unknown }).thinking).toBeUndefined();
+  });
+
+  it("自愈无效（省略后仍失败）→ 回滚记忆并如实抛错，不把推测固化", async () => {
+    let calls = 0;
+    // 网关无论如何都拒：说明根因不是这个字段，省略救不了。
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls += 1;
+      return new Response(DISABLED_REJECTED, { status: 400 });
+    }));
+    const model = makeModel("openai", "probe-think-rollback", "probe-think-rollback");
+    await expect(
+      callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, { disableThinking: true }),
+    ).rejects.toThrow(/400/);
+    expect(calls).toBe(2); // 只试一次自愈，不无限重试
+    // 记忆必须回滚（disableThinkingSupported 恢复 true）：否则此后每个辅助调用都会永远丢 thinking 字段，真实原因也被掩盖。
+    expect(disableThinkingSupported(model)).toBe(true);
   });
 });

@@ -444,6 +444,10 @@ async function callAnthropic(
  * 为什么不「一律带上」：各网关对未知字段的容忍度不同，给不需要它的端点塞这个字段有被 400 的风险
  * （同当年 `web_search_preview` 的教训）。所以按端点学习：首跳缺字段被拒 → 记住 → 同一轮内按新口径重发一次
  * → 之后该端点一直按新口径组装消息。学习信号来自网关自己的报错，不写死任何厂商名或固定话术。
+ *
+ * 统一纪律（本文件三条端点学习——回灌思考 / 关思考 / 温度——共用）：
+ * ①记住后必须落到**默认行为**，不能只在重发那一次生效；②重发仍失败必须**回滚记忆**
+ * （见 unmarkReasoningReplayRequired / unmarkDisableThinkingUnsupported / unmarkTemperatureUnsupported）。
  */
 const reasoningReplayRequiredEndpoints = new Set<string>();
 
@@ -464,6 +468,19 @@ export function markReasoningReplayRequired(model: ModelEntry): void {
   console.warn(
     `[models] 端点要求 assistant 工具调用消息回灌 reasoning_content（模型 ${model.id}）：` +
       "已按该口径重发，且该端点后续都按此口径组装消息",
+  );
+}
+
+/**
+ * 撤销「要求回灌思考」的记忆：补上 reasoning_content 后仍失败 → 根因不在该字段，回滚并如实报错。
+ * 与 unmarkTemperatureUnsupported 同一条纪律：学习信号来自报错措辞，措辞是通用串，
+ * 有误判空间；自愈无效时若把推测固化，就会永久给每个 assistant 消息挂一个它本不需要的字段。
+ */
+export function unmarkReasoningReplayRequired(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (!reasoningReplayRequiredEndpoints.delete(key)) return;
+  console.warn(
+    `[models] 端点（模型 ${model.id}）补 reasoning_content 后仍失败：撤销记忆，根因不在该字段，按原始报错如实抛出`,
   );
 }
 
@@ -507,10 +524,69 @@ function markDisableThinkingUnsupported(model: ModelEntry): void {
   );
 }
 
+/** 撤销「不支持关闭思考」的记忆：省略 thinking 后仍失败 → 根因不在该字段，回滚并如实报错（同 unmarkTemperatureUnsupported）。 */
+function unmarkDisableThinkingUnsupported(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (!disableThinkingUnsupportedEndpoints.delete(key)) return;
+  console.warn(
+    `[models] 端点（模型 ${model.id}）省略 thinking 字段后仍失败：撤销记忆，根因不在该字段，按原始报错如实抛出`,
+  );
+}
+
 /** 判定一次失败是否属于「端点拒绝 disabled 思考」。只认 thinking 相关的通用报错措辞，不绑定厂商。 */
 function isThinkingDisabledRejected(detail: string): boolean {
   const text = String(detail || "");
   return /invalid thinking|only type=enabled is allowed|type=disabled|thinking.*(not.*allowed|invalid|unsupported)/i.test(text);
+}
+
+/**
+ * 温度字段同样受端点兼容性制约：实测 TokenHub 的 kimi 系（kimi-k2.8-preview / kimi-k2.6）根本不接受
+ * `temperature` 参数——任何取值（含 0 与 0.01）都 400，但缺省（不带该字段）反而正常。
+ * 温度 0 只用于内部判定型辅助调用（见 CallOptions.temperature 注释），故影响的是接地护栏的
+ * 分诊 / 诚实兜底等路径。按端点运行时学习：首跳被拒 → 记住整字段不受支持 → 之后这类调用省略 temperature
+ * 重发一次，由模型按默认采样，避免每次白打 400、把接地护栏的兜底路径拖垮（表现为「明明有额度却回确定性兜底文案」）。
+ */
+const temperatureUnsupportedEndpoints = new Set<string>();
+
+/** 该模型端点是否仍可发送 temperature 字段（false = 已实测被拒，辅助调用省略该字段）。 */
+export function temperatureSupported(model: ModelEntry): boolean {
+  return !temperatureUnsupportedEndpoints.has(openAiEndpointKeyOf(model));
+}
+
+/** 记录「该端点不接受 temperature 字段」（进程内记忆）。 */
+function markTemperatureUnsupported(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (temperatureUnsupportedEndpoints.has(key)) return;
+  temperatureUnsupportedEndpoints.add(key);
+  console.warn(
+    `[models] 端点不接受 temperature 字段（模型 ${model.id}）：内部判定型辅助调用改为省略该字段，由模型按默认采样`,
+  );
+}
+
+/**
+ * 撤销上面的记忆（自愈无效时回滚）。
+ * 为什么必须能回滚：判定「是不是这个字段的锅」靠的是报错措辞，措辞是通用串（invalid_request 一类），
+ * 有误判空间。若省略后仍然 400，说明根因在别处——此时若把「该端点不接受 temperature」固化下来，
+ * 就会永久拿掉一个本可携带的参数，并把真实原因掩盖成一条无害的默认值。故失败即回滚，如实报错。
+ */
+function unmarkTemperatureUnsupported(model: ModelEntry): void {
+  const key = openAiEndpointKeyOf(model);
+  if (!temperatureUnsupportedEndpoints.delete(key)) return;
+  console.warn(
+    `[models] 端点（模型 ${model.id}）省略 temperature 后仍失败：撤销记忆，根因不在该字段，按原始报错如实抛出`,
+  );
+}
+
+/**
+ * 判定一次失败是否属于「端点拒绝 temperature: 0」。温度 0 只出现在内部辅助调用，
+ * 这类调用结构简单（无工具、短提示），且 thinking 拒绝已在上一道分支处理，故剩余 400 多半是温度 0。
+ * 只认 temperature 相关措辞或通用 invalid_request 报错，不绑定厂商。
+ */
+function isTempZeroRejected(detail: string): boolean {
+  const text = String(detail || "");
+  if (/invalid_request_error|invalid_request|rejected by an internal|check the request body|required fields/i.test(text)) return true;
+  if (/temperature/i.test(text)) return true;
+  return false;
 }
 
 /** 转成 OpenAI 消息：assistant 带 tool_calls，工具结果用 role:tool 回灌。 */
@@ -601,17 +677,27 @@ async function callOpenAi(
    * `withReasoningReplay` 打开时，带工具调用的 assistant 消息会补 `reasoning_content`（见上方
    * reasoningReplayRequired 的说明）。除该字段外，两次请求的一切都相同。
    */
-  const postOnce = (withReasoningReplay: boolean): Promise<Response> => {
+  const postOnce = (
+    withReasoningReplay: boolean,
+    // 默认跟随运行时学习结果：已确认「整字段拒收」的端点一律不再带 temperature（见 markTemperatureUnsupported）。
+    // 只在这里兜底还不够——自愈分支本身要求 temperatureSupported 为真，端点一旦被记住就会永远跳过自愈，
+    // 于是每次调用仍照带该字段、每次都白打 400。故省略必须是「默认行为」，自愈只是首次的触发点。
+    omitTemperature = !temperatureSupported(model),
+  ): Promise<Response> => {
     const messages: Array<Record<string, unknown>> = [
       ...(system ? [{ role: "system", content: system }] : []),
       ...toOpenAiMessages(model, turns, images, withReasoningReplay),
     ];
+    // 温度：仅内部判定型调用显式给 0（见 CallOptions.temperature 注释）。实测 TokenHub 部分端点
+    // （kimi 系）根本不接受 temperature 参数——任何值都 400，缺省反而正常；且同样的端点也不接受 top_p，
+    // 故这里始终不发送 top_p。拒收过的端点由 omitTemperature 默认值接管，天然不再带该字段。
+    const temp = omitTemperature ? undefined : opts.temperature;
     const body: Record<string, unknown> = {
       model: model.name,
       max_tokens: config.maxOutputTokens,
       // 流式：边生成边回包，避免网关对慢模型整包超时。
       stream: true,
-      ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
+      ...(temp != null ? { temperature: temp } : {}),
       messages,
       ...(freqPenalty != null ? { frequency_penalty: freqPenalty } : {}),
       ...(presPenalty != null ? { presence_penalty: presPenalty } : {}),
@@ -648,6 +734,8 @@ async function callOpenAi(
       markReasoningReplayRequired(model);
       response = await postOnce(true);
       detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+      // 自愈无效 → 回滚记忆（同 unmarkTemperatureUnsupported）：别把「按措辞做的推测」固化成永久口径。
+      if (!response.ok) unmarkReasoningReplayRequired(model);
     }
     // 学习型自愈：端点拒绝 disabled 思考（如 kimi27hs 只接受 enabled）→ 记住并去掉 thinking 字段重发一次，
     // 否则每次调用都白打 400（主对话拖慢首个增量、辅助调用拖垮接地护栏的兜底路径）。
@@ -655,6 +743,22 @@ async function callOpenAi(
       markDisableThinkingUnsupported(model);
       response = await postOnce(alreadyReplaying);
       detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+      // 自愈无效（省略后仍失败）→ 回滚记忆：根因不是这个字段，别把误判固化成永久行为。
+      if (!response.ok) unmarkDisableThinkingUnsupported(model);
+    }
+    // 学习型自愈：内部判定型调用以 temperature: 0 发送，端点若不接受 temperature 字段（任何值都 400）→
+    // 记住并省略该字段重发一次（模型按自身默认采样）。覆盖 kimi 系这类「整字段拒收」的端点。
+    // 记住之后由 postOnce 的默认参数接管（后续调用天然省略），这里只负责首次触发与「自愈无效即回滚」。
+    if (
+      opts.temperature === 0 &&
+      response.status === 400 &&
+      temperatureSupported(model) &&
+      isTempZeroRejected(detail)
+    ) {
+      markTemperatureUnsupported(model);
+      response = await postOnce(alreadyReplaying);
+      detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+      if (!response.ok) unmarkTemperatureUnsupported(model);
     }
   }
   if (!response.ok) {

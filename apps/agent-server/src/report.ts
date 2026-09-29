@@ -327,9 +327,14 @@ export function chartDataMatrix(spec: ChartSpec): string[][] {
 
 function renderFallbackTable(spec: ChartSpec): string {
   const m = chartDataMatrix(spec);
-  if (!m.length) return `<p class="chart-fallback">（无可渲染数据）</p>`;
+  // 指代要能认出是哪张图：只有图型时一句「无可渲染数据」没有主语，用户无从判断缺的是哪张。
+  // 图型 / 标题都取自调用方传入，不推算也不补默认值（无标题就只说图型）。
+  const name = spec.title ? `图表「${escapeHtml(spec.title)}」` : `未命名${escapeHtml(spec.chartType)}图`;
+  // 数据不是行对象数组（图形类的 {nodes,edges} / {name,children} 就是这种）时，退化成表也拿不到东西，
+  // 此时如实说明「未渲染」而不是塞一句没有主语的占位。
+  if (!m.length) return `<p class="chart-fallback">（${name}的数据不是行数据，未在报告中渲染）</p>`;
   return (
-    `<p class="chart-fallback">（该图型「${escapeHtml(spec.chartType)}」暂以数据表呈现）</p>` +
+    `<p class="chart-fallback">（${name}的图型为「${escapeHtml(spec.chartType)}」，暂以数据表呈现）</p>` +
     "<table><thead><tr>" + m[0].map((c) => `<th>${escapeHtml(c)}</th>`).join("") + "</tr></thead><tbody>" +
     m.slice(1).map((r) => `<tr>${r.map((c) => `<td>${escapeHtml(c)}</td>`).join("")}</tr>`).join("") +
     "</tbody></table>"

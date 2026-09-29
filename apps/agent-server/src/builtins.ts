@@ -11,7 +11,7 @@ import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/share
 import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
 import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
-import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS } from "./report.js";
+import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS, type ReportKpi } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
 import { createScheduleTask } from "./schedule-service.js";
 import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
@@ -348,6 +348,22 @@ export const CHART_TYPES = new Set<string>(SHARED_CHART_TYPES);
 
 /** 图形类（走 G6 而非 G2）：同样取自共享清单，避免「后端放行、前端按统计图画」的漂移。 */
 const GRAPH_CHART_TYPES = new Set<string>(SHARED_GRAPH_CHART_TYPES);
+
+/**
+ * 模型传来的图表是否真能渲染（入参侧收紧，而不是断言成 ChartSpec 交给渲染层去撞）。
+ * 为什么要在入口判：报告渲染按「行对象数组」取键名（`Object.keys(row)`），行里混入
+ * `null` / 标量会直接抛错，把一次本可成功的导出打断；图形类的 data 则是一个
+ * `{nodes,edges}` / `{name,children}` 对象，形态完全不同，不能用同一把尺子量。
+ * 判不通过的图表被跳过（图表是装饰，不是导出的主体），不让脏数据拖垮整个文件。
+ */
+function isChartSpecLike(v: unknown): v is ChartSpec {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.chartType !== "string") return false;
+  if (GRAPH_CHART_TYPES.has(o.chartType)) return !!o.data && typeof o.data === "object" && !Array.isArray(o.data);
+  if (!CHART_TYPES.has(o.chartType)) return false;
+  return Array.isArray(o.data) && o.data.every((row) => !!row && typeof row === "object");
+}
 
 /**
  * 工具检索（按需加载模式的入口：对齐 Claude Code 的 ToolSearch 与 Anthropic「Code execution with MCP」
@@ -1658,14 +1674,13 @@ export async function execBuiltin(
           : [];
       // 图表（复用 render_chart 产出的 ChartSpec）：支持的类型烘焙成内联 SVG，其余降级为数据表。
       const chartsRaw = args.charts;
-      const charts: ChartSpec[] = Array.isArray(chartsRaw)
-        ? chartsRaw
-            .filter((c) => c && typeof c === "object" && typeof (c as Record<string, unknown>).chartType === "string")
-            .map((c) => c as ChartSpec)
-        : [];
+      const charts: ChartSpec[] = Array.isArray(chartsRaw) ? chartsRaw.filter(isChartSpecLike) : [];
       // KPI 概要卡（可选）：模型显式传入才渲染，工具不自动从表格推算（避免编造指标）。
       const kpisRaw = (args as Record<string, unknown>).kpis;
-      const kpis: Array<{ label: string; value: string; delta?: string; hint?: string; tone?: string }> = Array.isArray(kpisRaw)
+      // 涨跌色只认契约里的三个字面量：模型传别的词（或拼错）时按「未传」处理，交给 report 按 delta 文案启发式判定，
+      // 既不把非法值塞进渲染层，也不因为一个可选装饰字段让整次导出失败。
+      const isKpiTone = (v: unknown): v is ReportKpi["tone"] => v === "up" || v === "down" || v === "flat";
+      const kpis: ReportKpi[] = Array.isArray(kpisRaw)
         ? kpisRaw
             .filter(
               (k) =>
@@ -1680,7 +1695,7 @@ export async function execBuiltin(
                 value: String(o.value),
                 delta: o.delta != null ? String(o.delta) : undefined,
                 hint: o.hint != null ? String(o.hint) : undefined,
-                tone: o.tone != null ? String(o.tone) : undefined,
+                tone: isKpiTone(o.tone) ? o.tone : undefined,
               };
             })
         : [];
