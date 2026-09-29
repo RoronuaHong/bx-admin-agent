@@ -646,6 +646,15 @@ export interface ScheduleDto {
   conversationId: string;
   /** 结果回投的对话是本任务专属（服务端创建，每个任务一个）；旧数据可能缺省。 */
   ownConversation?: boolean;
+  /**
+   * 每期结果的落点（docs/scheduled-task-sessions-plan.md §3.1）：
+   * "new"（缺省）= 每期开一个新会话，各期独立可回溯；"same" = 每期回投同一会话、沿用上下文。
+   */
+  runMode?: "new" | "same";
+  /** 各期运行记录（新的在前，受服务端上限截断）。 */
+  runs?: Array<{ conversationId: string; at: number; status?: ScheduleStatus }>;
+  /** 未读期数（>0 时侧栏显示角标；打开任一期会话后清零）。 */
+  unreadRuns?: number;
   name?: string;
   prompt: string;
   /** 周期任务：5 段 cron（分 时 日 月 周）。与 onceAt 二选一。 */
@@ -677,6 +686,8 @@ export interface ScheduleInput {
   mcpServers?: string[];
   notifyOn?: ScheduleNotifyOn[];
   locale?: string;
+  /** 每期结果的落点；缺省 "new"（每期新会话）。 */
+  runMode?: "new" | "same";
 }
 
 export async function fetchSchedules(conversationId?: string): Promise<ScheduleDto[]> {
@@ -696,10 +707,14 @@ export async function createChatSchedule(
   return data;
 }
 
-export async function patchChatSchedule(
-  id: string,
-  patch: Partial<Omit<ScheduleInput, "conversationId">> & { enabled?: boolean },
-): Promise<ScheduleDto> {
+/** PATCH 入参：在「建任务入参」之上多两个只能由客户端/调度器改的字段。 */
+export interface SchedulePatchInput extends Partial<Omit<ScheduleInput, "conversationId">> {
+  enabled?: boolean;
+  /** 未读期数（打开任一期会话后置 0）。 */
+  unreadRuns?: number;
+}
+
+export async function patchChatSchedule(id: string, patch: SchedulePatchInput): Promise<ScheduleDto> {
   const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
@@ -707,8 +722,12 @@ export async function patchChatSchedule(
   return data.schedule;
 }
 
-export async function deleteChatSchedule(id: string): Promise<void> {
-  await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
+/** 删除任务；返回被连带删除的结果会话数（服务端只删本任务产出的会话，不碰用户自己的对话）。 */
+export async function deleteChatSchedule(id: string): Promise<{ removedConversations?: number }> {
+  const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  })) as { removedConversations?: number };
+  return data || {};
 }
 
 // ---- 结果投递通道（钉钉 / 飞书自定义机器人；凭据只写不回显）----

@@ -104,6 +104,14 @@ interface ConversationDoc {
    * 决定系统提示人设 / skill 索引可见性；缺省 = generic（旧对话向后兼容）。
    */
   agentId?: string;
+  /**
+   * 产出该会话的定时任务 id（docs/scheduled-task-sessions-plan.md §3.2）。
+   * 「每期新会话」模式下每一期各带一个；有了它，任务被删后也能认出并清理这些会话，
+   * 不必依赖任务侧的 runs 列表（列表截断后就认不出来了）。
+   */
+  scheduleId?: string;
+  /** 该会话对应哪一期（运行时刻）；与 scheduleId 配套，用于标题与排序。 */
+  scheduleRunAt?: number;
 
   // ---- 模型上下文（thread）----
   /** 发往模型的对话历史（含工具轻量句柄），是上下文的唯一真相。 */
@@ -263,6 +271,10 @@ export async function createConversation(input: {
   mcpServers?: string[];
   /** 显式指定「完全访问」开关（缺省 = 角色默认，再缺省 = true）。 */
   fullAccess?: boolean;
+  /** 产出该会话的定时任务（每期会话带；见 ConversationDoc.scheduleId）。 */
+  scheduleId?: string;
+  /** 该会话对应的运行时刻（与 scheduleId 配套）。 */
+  scheduleRunAt?: number;
 }): Promise<ConversationDoc> {
   const now = Date.now();
   // MCP 默认勾选：显式传入 > 角色默认 > 配置了 defaultEnabled 的服务器。
@@ -281,6 +293,8 @@ export async function createConversation(input: {
     fullAccess,
     ...(input.agentId ? { agentId: input.agentId } : {}),
     ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
+    ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
+    ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
   };
   const coll = await getColl();
   if (!coll) {
@@ -306,12 +320,42 @@ export async function createConversation(input: {
         fullAccess,
         ...(input.agentId ? { agentId: input.agentId } : {}),
         ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
+        ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
+        ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
       },
     },
     { upsert: true },
   );
   const saved = await getConversation(input.id);
   return saved || doc;
+}
+
+/**
+ * 某定时任务产出的全部会话 id（清理用）。
+ * 为什么不能只看任务侧的 `runs`：runs 有保留上限，被截断的那些会话任务侧就认不出来了
+ * ——建任务时那个占位会话尤其典型，第一次运行后它就从 runs 里消失了。
+ */
+export async function listScheduleConversations(scheduleId: string): Promise<string[]> {
+  const coll = await getColl();
+  const docs = !coll
+    ? [...memory.values()].filter((doc) => doc.scheduleId === scheduleId)
+    : ((await coll.find({ scheduleId }, { projection: { id: 1 } }).toArray()) as unknown as Array<{ id: string }>);
+  return docs.map((doc) => doc.id);
+}
+
+/**
+ * 把会话标注为「某定时任务产出」（建任务时补标）。
+ * 为什么不在 createConversation 里一次带上：任务 id 由 createSchedule 生成，而会话要先建好才能给它——
+ * 顺序是「先建会话 → 再建任务（失败要回滚会话）」，故只能事后补这一笔。
+ */
+export async function markConversationSchedule(id: string, scheduleId: string): Promise<void> {
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (doc) doc.scheduleId = scheduleId;
+    return;
+  }
+  await coll.updateOne({ id }, { $set: { scheduleId } }).catch(() => undefined);
 }
 
 export async function upsertMessages(input: {

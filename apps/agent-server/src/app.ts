@@ -64,19 +64,22 @@ import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, ty
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import {
-  deleteSchedule,
   listSchedules,
   patchSchedule,
   startScheduleLoop,
   validateTiming,
   type ChatSchedule,
   type ScheduleNotifyOn,
+  type ScheduleRunMode,
 } from "./schedules.js";
 import {
+  createRunConversation,
   createScheduleTask,
   createTaskConversation,
+  deleteScheduleWithRuns,
   knownMcpIds,
   pickNotifyOn,
+  recordScheduleRun,
   scheduleConversationTitle,
 } from "./schedule-service.js";
 import {
@@ -260,8 +263,13 @@ async function taskConversationMcpServers(schedule: ChatSchedule, sourceId?: str
   return source?.mcpServers;
 }
 
+/** 最近一期的会话 id：并发判定与「打开对话」都用它（缺 runs 时回落到 schedule.conversationId）。 */
+function latestRunConversationId(schedule: ChatSchedule): string {
+  return schedule.runs?.[0]?.conversationId || schedule.conversationId;
+}
+
 /**
- * 专属对话的存活保障：返回本次运行真正该写的对话 id。
+ * 专属对话的存活保障（`runMode:"same"`：每期都回投同一个对话）。
  * 对话被用户删掉后必须重建——否则到点运行会把结果 upsert 进一个「无主孤儿对话」（没有 owner、没有标题），
  * 既不可见也不可整理。
  */
@@ -277,6 +285,21 @@ async function ensureTaskConversation(schedule: ChatSchedule): Promise<string> {
   console.warn(`[scheduler] ${schedule.id} 的专属对话不可用，已重建 ${conv.id}`);
   return conv.id;
 }
+
+/**
+ * 本次运行把结果写到哪个对话（docs/scheduled-task-sessions-plan.md §3.1）：
+ * - `new`（缺省）：**每期开一个新会话**，各期独立可回溯；
+ * - `same`：回投同一个专属对话、沿用上下文。
+ */
+async function ensureRunConversation(schedule: ChatSchedule, at: number): Promise<string> {
+  if (schedule.runMode !== "same") {
+    const conv = await createRunConversation(schedule, at);
+    return conv.id;
+  }
+  return ensureTaskConversation(schedule);
+}
+
+
 
 /**
  * 启动维护（幂等）：把「建任务时绑在随手打开的那个对话上」的老任务迁到专属对话。
@@ -296,13 +319,48 @@ async function migrateTaskConversations(): Promise<number> {
         ...(mcp?.length ? { mcpServers: mcp } : {}),
         ...(source?.agentId ? { agentId: source.agentId } : {}),
       });
-      await patchSchedule(schedule.id, schedule.ownerKey, { conversationId: conv.id, ownConversation: true });
+      await patchSchedule(schedule.id, schedule.ownerKey, {
+        conversationId: conv.id,
+        ownConversation: true,
+        // 老任务一律保持「每期回投同一个会话」的既有语义：既有内容都在这个会话里，
+        // 悄悄换成每期新会话会让它变成没人认领的孤儿（用户想切可在任务表单里切）。
+        runMode: "same",
+        runs: [{ conversationId: conv.id, at: schedule.createdAt }],
+      });
       moved += 1;
     } catch (err) {
       console.warn(`[scheduler] ${schedule.id} 迁移专属对话失败：${String((err as Error)?.message || err)}`);
     }
   }
-  return moved;
+  return moved + (await markLegacyRunMode());
+}
+
+/**
+ * 给「已经是专属对话、但没有落点策略」的老任务补 `runMode:"same"` 与首条运行记录。
+ * 幂等：有 runMode 或已有 runs 的跳过。只补标记，不动任何既有会话内容。
+ */
+async function markLegacyRunMode(): Promise<number> {
+  const list = await listSchedules();
+  let marked = 0;
+  for (const schedule of list) {
+    if (!schedule.ownConversation || schedule.runMode || schedule.runs?.length) continue;
+    try {
+      await patchSchedule(schedule.id, schedule.ownerKey, {
+        runMode: "same",
+        runs: [
+          {
+            conversationId: schedule.conversationId,
+            at: schedule.lastRunAt ?? schedule.createdAt,
+            ...(schedule.lastStatus ? { status: schedule.lastStatus } : {}),
+          },
+        ],
+      });
+      marked += 1;
+    } catch (err) {
+      console.warn(`[scheduler] ${schedule.id} 补落点策略失败：${String((err as Error)?.message || err)}`);
+    }
+  }
+  return marked;
 }
 
 /**
@@ -556,6 +614,8 @@ export function createApp() {
       locale?: string;
       /** Agent 角色（/support 这类非 generic 入口建任务时带上，专属对话按角色分槽）。 */
       agentId?: string;
+      /** 每期结果的落点："new"（缺省，每期新会话）/ "same"（回投同一会话沿用上下文）。 */
+      runMode?: string;
     }>(c);
     const owner = c.get("owner");
     // 与内置工具 `manage_schedule` 共用同一实现（§17）：建任务要连带建专属对话、配额校验、
@@ -571,6 +631,7 @@ export function createApp() {
       locale: body.locale,
       sourceConversationId: body.conversationId,
       agentId: body.agentId,
+      runMode: body.runMode === "same" ? "same" : ("new" as ScheduleRunMode),
     });
     if (!result.ok) return errorJson(c, 400, result.code, result.error);
     return c.json({ schedule: result.schedule, conversation: result.conversation });
@@ -585,6 +646,10 @@ export function createApp() {
       enabled?: boolean;
       mcpServers?: string[];
       notifyOn?: ScheduleNotifyOn[];
+      /** 每期结果的落点："new"（每期新会话）/ "same"（回投同一会话）；只影响此后的运行。 */
+      runMode?: string;
+      /** 未读期数：前端打开任一期会话后置 0。 */
+      unreadRuns?: number;
     }>(c);
     if (body.cron !== undefined || body.onceAt !== undefined) {
       const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
@@ -598,15 +663,18 @@ export function createApp() {
       ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
       ...(body.mcpServers !== undefined ? { mcpServers: knownMcpIds(body.mcpServers) } : {}),
       ...(body.notifyOn !== undefined ? { notifyOn: pickNotifyOn(body.notifyOn) } : {}),
+      ...(body.runMode === "same" || body.runMode === "new" ? { runMode: body.runMode as ScheduleRunMode } : {}),
+      ...(body.unreadRuns !== undefined ? { unreadRuns: Number(body.unreadRuns) || 0 } : {}),
     });
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
     return c.json({ schedule: updated });
   });
 
   app.delete("/chat/schedules/:id", async (c) => {
-    const ok = await deleteSchedule(c.req.param("id"), c.get("owner"));
-    if (!ok) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
-    return c.json({ ok: true });
+    // 连带清理本任务产出的会话（只删会话自己标着属于本任务的，不碰用户自己的对话）。
+    const result = await deleteScheduleWithRuns(c.req.param("id"), c.get("owner"));
+    if (!result.ok) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
+    return c.json({ ok: true, removedConversations: result.removedConversations });
   });
 
   // ---- 结果投递通道（钉钉 / 飞书自定义机器人）----
@@ -1384,10 +1452,14 @@ export function createApp() {
   // ---- 定时调度循环（§8）：到点即复用对话任务底座执行——
   // 定时运行没有 HTTP 订阅者 → 收束后自动「结果回投」进对话消息快照。
   startScheduleLoop(async (schedule) => {
+    // 上一期还在跑 → 本期跳过（排队补跑由 schedulerTick 负责）。
+    // 判据必须是「最近一期的会话」：`runMode:"new"` 下本期会话还没建，
+    // 用 schedule.conversationId（上一期）判定才等价于「同一任务串行、不并发重入」。
+    if (isTaskRunning(latestRunConversationId(schedule))) return "skipped";
     // 专属对话被删 → 就地重建（否则结果会 upsert 进一个无主孤儿对话）。
     // 后续一律用这个 id：重建后本地 schedule 里的旧 id 已过期（投递链接也要跟着新对话走）。
-    const conversationId = await ensureTaskConversation(schedule);
-    if (isTaskRunning(conversationId)) return "skipped"; // 对话在跑：跳过本次，排队等待由 schedulerTick 负责
+    const conversationId = await ensureRunConversation(schedule, Date.now());
+    if (isTaskRunning(conversationId)) return "skipped"; // 兜底：同一会话上已有任务在跑
     const task = startTask({ conversationId, userText: schedule.prompt });
     // 任务级工具清单：任务自己勾了就按任务的（独立启用集），任务没勾才回落到对话启用集
     // （见 chat.ts 的 taskServers 分支）——别按「只收窄」理解。
@@ -1412,6 +1484,9 @@ export function createApp() {
     if (finished === "success" && !text) {
       console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽），按 failed 记账`);
     }
+    // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：
+    // 必须在 schedulerTick 写回状态之前完成，schedulerTick 会以库里的最新值为基底合并（不会回退）。
+    await recordScheduleRun(schedule, conversationId, Date.now(), final);
     // 结果投递（钉钉 / 飞书机器人）：旁路，fire-and-forget，不拖住调度 tick、不影响任务状态。
     if (final === "success" || final === "failed") {
       // 重建过专属对话时 schedule.conversationId 是旧值，投递链接必须用解析后的 id。

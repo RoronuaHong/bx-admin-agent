@@ -109,6 +109,11 @@ const taskDraft = reactive({
   scheduledAt: "",
   /** 本任务允许使用的 MCP 服务器（空 = 不带任何 MCP 工具运行）。 */
   mcpServers: [] as string[],
+  /**
+   * 每期结果的落点（docs/scheduled-task-sessions-plan.md §3.1）：
+   * "new"（默认）= 每期开一个新会话，各期独立可回溯与对比；"same" = 每期回投同一会话、沿用上下文。
+   */
+  runMode: "new" as "new" | "same",
 });
 /** 正在编辑的任务 id（空 = 新建）。 */
 const editingTaskId = ref("");
@@ -700,6 +705,8 @@ function openTaskForm(task?: ScheduleDto) {
   taskDraft.scheduleType = task?.onceAt ? "once" : "recurring";
   taskDraft.scheduledAt = task?.onceAt ? toLocalInput(task.onceAt) : "";
   taskDraft.mcpServers = [...(task?.mcpServers || [])];
+  // 老任务（未带落点策略）按服务端的既有语义显示为「同一会话」，避免编辑保存时悄悄改掉行为。
+  taskDraft.runMode = task?.runMode === "same" ? "same" : "new";
   taskRepeat.freq = parsed?.freq || "DAILY";
   taskRepeat.interval = parsed?.interval || 1;
   taskRepeat.byday = parsed?.byday.length ? [...parsed.byday] : ["MO"];
@@ -760,6 +767,7 @@ async function submitTask() {
     mcpServers: taskDraft.mcpServers.slice(),
     // 成功与失败都推（跳过不推，因为「这次没跑」不是需要人处理的结果）。
     notifyOn: ["success", "failed"] as ScheduleNotifyOn[],
+    runMode: taskDraft.runMode,
   };
   // 频率：外部建的表达式（cronUnparsed）保存时不动它——界面选项表达不了它，
   // 顺手回传一个"最接近"的值等于把别人的调度改坏（服务端仍按原表达式跑）。
@@ -824,10 +832,29 @@ async function toggleTask(id: string) {
 }
 
 async function removeTask(id: string) {
+  const target = tasks.value.find((x) => x.id === id);
+  // 已经有运行结果的任务：删除会连带删掉这些会话（服务端只删本任务产出的），
+  // 属于有内容的破坏性操作 —— 必须让用户看清要删掉多少，不能一点就没。
+  const runs = target?.runs?.length || 0;
+  if (runs > 0) {
+    const msg = tx(
+      `删除后该任务的 ${runs} 期结果会话会一并删除，且不可恢复。确认删除？`,
+      `Deleting this task also removes its ${runs} run chats, permanently. Continue?`,
+      `Excluir esta tarefa também remove suas ${runs} conversas de execução, permanentemente. Continuar?`,
+      `इस कार्य को हटाने पर इसकी ${runs} रन चैट भी स्थायी रूप से हट जाएँगी। जारी रखें?`,
+    );
+    if (!window.confirm(msg)) return;
+  }
   const prev = tasks.value;
   tasks.value = tasks.value.filter((x) => x.id !== id);
   try {
-    await deleteChatSchedule(id);
+    const res = await deleteChatSchedule(id);
+    // 会话被连带删掉了：本地列表里同步移除，否则会留下一批点开即 404 的幽灵条目。
+    if (res.removedConversations && target?.ownConversation) {
+      const dead = new Set([target.conversationId, ...(target.runs || []).map((r) => r.conversationId)]);
+      conversations.value = conversations.value.filter((c) => !dead.has(c.id));
+      if (dead.has(currentId.value)) void newConversation();
+    }
   } catch {
     tasks.value = prev;
   }
@@ -1071,8 +1098,11 @@ const conversationsFiltered = computed(() => {
   // 读 pinyinReady 建立依赖：字典异步就绪后重算，启用拼音。
   void pinyinReady.value;
   const q = convQuery.value.trim().toLowerCase();
-  if (!q) return conversations.value;
-  return conversations.value.filter((c) => matchesFuzzy([c.title], q));
+  // 搜索态下**不过滤**任务会话：按标题搜时要能搜到某一期的结果
+  // （否则「昨天那期日报」搜出来是空的）；分组区只在无搜索时渲染，不会重复出现。
+  const base = q ? conversations.value : conversations.value.filter((c) => !taskConvIds.value.has(c.id));
+  if (!q) return base;
+  return base.filter((c) => matchesFuzzy([c.title], q));
 });
 function onConvSearchInput() {
   // 首次输入才拉起拼音字典（首屏不背这体积）。
@@ -1790,6 +1820,8 @@ function selectConversation(conv: ConversationDto) {
   currentId.value = conv.id;
   sidebarOpen.value = false; // 移动端选中对话后收起抽屉
   reportActiveConversation(conv.id);
+  // 打开的是某一期的结果 → 该任务的未读清零（放在选中之后：即便清零请求失败也不影响阅读）。
+  clearTaskUnread(conv.id);
   // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
   if (!state.bubbles.length) {
     state.bubbles = (conv.messages || []).map((m) => ({
@@ -2033,22 +2065,166 @@ function onConvKeydown(e: KeyboardEvent, conv: ConversationDto) {
 }
 
 /** 置顶项数量：模板据此在最后一置顶项后插入分隔线（归档项自成一组，不计入）。 */
-const pinnedCount = computed(() => conversations.value.filter((c) => !c.archived && c.pinnedAt).length);
+const pinnedCount = computed(() => conversationsFiltered.value.filter((c) => !c.archived && c.pinnedAt).length);
 
 /** 归档项数量（显示归档时用于在归档区前插入分隔线）。 */
-const archivedCount = computed(() => conversations.value.filter((c) => c.archived).length);
+const archivedCount = computed(() => conversationsFiltered.value.filter((c) => c.archived).length);
 
 /** 第一个归档项的下标：归档区固定在列表最末（由 convRank 保证）。 */
-const firstArchivedIndex = computed(() => conversations.value.length - archivedCount.value);
+const firstArchivedIndex = computed(() => conversationsFiltered.value.length - archivedCount.value);
 
-/** 定时任务专属对话的 id 集合：侧栏据此给这类对话加区别图标（结果只回投到这里，不混进普通对话）。 */
+/**
+ * 任务产出的会话 id 集合（专属对话 + 各期会话）：侧栏据此把它们**从平铺列表里移出**，
+ * 改到下方「定时任务」区按任务分组成树展示（docs/scheduled-task-sessions-plan.md §3.10）。
+ * 不移出的代价：周期任务每跑一期就刷新 `updatedAt`、顶到列表最上面，把自己的对话一直往下挤。
+ */
 const taskConvIds = computed(() => {
   const set = new Set<string>();
   for (const t of tasks.value) {
     if (t.ownConversation && t.conversationId) set.add(t.conversationId);
+    for (const r of t.runs || []) set.add(r.conversationId);
   }
   return set;
 });
+
+/** 定时任务分组（父 = 任务，子 = 各期会话）；按最近一期倒序，新的在上。 */
+interface TaskGroupRun {
+  conversationId: string;
+  at: number;
+  status?: string;
+  conv?: ConversationDto;
+}
+const taskGroups = computed<Array<{ schedule: ScheduleDto; runs: TaskGroupRun[] }>>(() => {
+  const byId = new Map(conversations.value.map((c) => [c.id, c]));
+  return tasks.value
+    .filter((t) => t.ownConversation)
+    .map((t) => ({
+      schedule: t,
+      // 老任务没有 runs：用它的专属对话顶一条，保证分组里不是空的（内容确实都在那里）。
+      runs: (
+        t.runs?.length
+          ? t.runs
+          : t.conversationId
+            ? [{ conversationId: t.conversationId, at: t.lastRunAt ?? t.createdAt }]
+            : []
+      )
+        .map((r) => ({ ...r, conv: byId.get(r.conversationId) }))
+        .sort((a, b) => b.at - a.at),
+    }))
+    .filter((g) => g.runs.length)
+    .sort((a, b) => (b.runs[0]?.at || 0) - (a.runs[0]?.at || 0));
+});
+
+/** 分组展开状态：默认折叠（任务多时不占地方），按任务 id 记在本地，刷新保持。 */
+const TASK_GROUP_KEY = "bx-agent-task-groups";
+const expandedTasks = ref<Record<string, boolean>>(readTaskGroupState());
+function readTaskGroupState(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(TASK_GROUP_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+function toggleTaskGroup(id: string) {
+  expandedTasks.value = { ...expandedTasks.value, [id]: !expandedTasks.value[id] };
+  try {
+    localStorage.setItem(TASK_GROUP_KEY, JSON.stringify(expandedTasks.value));
+  } catch {
+    /* 隐私模式下写不进去：只丢「展开状态」这一层偏好，不影响功能 */
+  }
+}
+function onTaskGroupKeydown(e: KeyboardEvent, id: string) {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    toggleTaskGroup(id);
+  }
+}
+
+/**
+ * 定时任务分组区整体折叠（置顶为可折叠分组后，允许一键收起整块，与文件树/CodeBuddy 同口径）。
+ * 默认展开，状态记本地；隐私模式写不进去时只丢这一层偏好。
+ */
+const TASK_SECTION_KEY = "bx-agent-task-section";
+const taskSectionOpen = ref(readTaskSectionState());
+function readTaskSectionState(): boolean {
+  try {
+    return localStorage.getItem(TASK_SECTION_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+function toggleTaskSection() {
+  taskSectionOpen.value = !taskSectionOpen.value;
+  try {
+    localStorage.setItem(TASK_SECTION_KEY, taskSectionOpen.value ? "1" : "0");
+  } catch {
+    /* 隐私模式下写不进去：只丢「分组区折叠状态」这一层偏好，不影响功能 */
+  }
+}
+
+/** 对话列表整体折叠（与定时任务分组头同款交互，CodeBuddy「空间/任务」两组同口径）。 */
+const CONV_SECTION_KEY = "bx-agent-conv-section";
+const convSectionOpen = ref(readConvSectionState());
+function readConvSectionState(): boolean {
+  try {
+    return localStorage.getItem(CONV_SECTION_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+function toggleConvSection() {
+  convSectionOpen.value = !convSectionOpen.value;
+  try {
+    localStorage.setItem(CONV_SECTION_KEY, convSectionOpen.value ? "1" : "0");
+  } catch {
+    /* 隐私模式下写不进去：只丢「对话折叠状态」这一层偏好，不影响功能 */
+  }
+}
+
+/** 分组里的「某一期」也要键盘可达（与 .conv-item 同口径：Enter/Space 打开）。 */
+function onRunKeydown(e: KeyboardEvent, schedule: ScheduleDto, run: TaskGroupRun) {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    void openRunConversation(schedule, run);
+  }
+}
+
+/** 某一期的显示文案：`MM-DD HH:mm`（会话标题里已带任务名，分组里重复一次没意义）。 */
+function runTimeText(at: number): string {
+  const d = new Date(at);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 打开某一期的结果会话（本地列表没有就先刷新一次，与 openTaskConversation 同口径）。 */
+async function openRunConversation(schedule: ScheduleDto, run: TaskGroupRun) {
+  let conv = conversations.value.find((c) => c.id === run.conversationId);
+  if (!conv) {
+    const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
+    if (list) {
+      conversations.value = list;
+      resortConversations();
+      conv = list.find((c) => c.id === run.conversationId);
+    }
+  }
+  if (!conv) {
+    showSettingsError(
+      tx("这一期的结果会话已不存在", "This run's chat no longer exists", "A conversa desta execução não existe mais", "इस रन की चैट अब मौजूद नहीं है"),
+    );
+    return;
+  }
+  selectConversation(conv);
+}
+
+/** 打开任一期即把该任务的未读清零（对齐 ChatGPT「Scheduled 视图当收件箱」）。 */
+function clearTaskUnread(convId: string) {
+  const t = tasks.value.find((x) => (x.runs || []).some((r) => r.conversationId === convId));
+  if (!t || !t.unreadRuns) return;
+  t.unreadRuns = 0;
+  void patchChatSchedule(t.id, { unreadRuns: 0 }).catch(() => undefined);
+}
 
 /** 菜单当前指向的会话（模板渲染菜单项状态用）。 */
 const ctxTarget = computed(() => conversations.value.find((c) => c.id === ctxMenu.value.targetId) || null);
@@ -4152,6 +4328,109 @@ onBeforeUnmount(() => {
         {{ tx("显示归档", "Archived", "Arquivadas", "आर्काइव") }}
       </label>
       <div ref="convListEl" class="conv-list">
+        <!-- 定时任务区（docs/scheduled-task-sessions-plan.md §3.10）：置顶为可折叠分组。
+             父 = 任务（未读角标 + 下次运行），子 = 各期会话（时间 + 状态点），默认折叠。
+             与 CodeBuddy「定时任务收在任务名下」、Finder/VS Code「分组置顶 + 箭头折叠」同口径：
+             分组头整行可点、chevron 箭头旋转、带 aria-expanded。 -->
+        <template v-if="!convQuery.trim() && taskGroups.length">
+          <button
+            class="group-head"
+            type="button"
+            :aria-expanded="taskSectionOpen ? 'true' : 'false'"
+            :aria-label="tx('定时任务', 'Scheduled', 'Agendados', 'अनुसूचित कार्य')"
+            @click="toggleTaskSection"
+          >
+            <span class="group-head__label">{{ tx("定时任务", "Scheduled", "Agendados", "अनुसूचित कार्य") }}</span>
+            <span class="group-head__count">({{ taskGroups.length }})</span>
+            <span class="group-head__caret" :class="{ open: taskSectionOpen }" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+            </span>
+          </button>
+          <div v-if="taskSectionOpen" class="task-groups">
+            <div v-for="g in taskGroups" :key="g.schedule.id" class="task-group">
+              <div
+                class="task-group__head"
+                role="button"
+                tabindex="0"
+                :aria-expanded="expandedTasks[g.schedule.id] ? 'true' : 'false'"
+                :aria-label="g.schedule.name || g.schedule.prompt"
+                @click="toggleTaskGroup(g.schedule.id)"
+                @keydown="onTaskGroupKeydown($event, g.schedule.id)"
+              >
+                <span class="task-group__caret" :class="{ open: expandedTasks[g.schedule.id] }" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+                </span>
+                <span
+                  v-if="g.schedule.lastStatus"
+                  class="conv-dot"
+                  :class="g.schedule.lastStatus"
+                  :title="taskRunText(g.schedule)"
+                  :aria-label="taskStatusText(g.schedule)"
+                  role="img"
+                ></span>
+                <span class="task-group__title" :title="taskCardTip(g.schedule)">{{ g.schedule.name || g.schedule.prompt }}</span>
+                <span
+                  v-if="g.schedule.unreadRuns"
+                  class="task-group__unread"
+                  :title="tx('有新的运行结果', 'New run results', 'Novos resultados de execução', 'नए रन परिणाम')"
+                  :aria-label="tx('有新的运行结果', 'New run results', 'Novos resultados de execução', 'नए रन परिणाम')"
+                >{{ g.schedule.unreadRuns }}</span>
+                <span class="task-group__next">{{ taskNextShort(g.schedule) }}</span>
+                <button
+                  class="task-group__open"
+                  type="button"
+                  :title="tx('打开最近一期', 'Open latest run', 'Abrir execução mais recente', 'नवीनतम रन खोलें')"
+                  :aria-label="tx('打开最近一期', 'Open latest run', 'Abrir execução mais recente', 'नवीनतम रन खोलें')"
+                  @click.stop="openTaskConversation(g.schedule)"
+                >
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M7 17 17 7" />
+                    <path d="M9 7h8v8" />
+                  </svg>
+                </button>
+              </div>
+              <template v-if="expandedTasks[g.schedule.id]">
+                <div
+                  v-for="r in g.runs"
+                  :key="r.conversationId"
+                  class="conv-item conv-item--run"
+                  :class="{ active: r.conversationId === currentId }"
+                  role="button"
+                  tabindex="0"
+                  :aria-current="r.conversationId === currentId ? 'true' : undefined"
+                  @click="openRunConversation(g.schedule, r)"
+                  @keydown="onRunKeydown($event, g.schedule, r)"
+                >
+                  <span
+                    v-if="r.status"
+                    class="conv-dot"
+                    :class="r.status"
+                    :title="taskStatusText({ ...g.schedule, lastStatus: r.status as ScheduleDto['lastStatus'] })"
+                    role="img"
+                  ></span>
+                  <span class="conv-title">{{ r.conv?.title || runTimeText(r.at) }}</span>
+                  <span class="conv-run-at">{{ runTimeText(r.at) }}</span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+        <!-- 对话分组头：与定时任务分组头同款（CodeBuddy「名称 (数量) ›」口径），可整列折叠；搜索时直接让位给结果。 -->
+        <button
+          v-if="!convQuery.trim() && conversationsFiltered.length"
+          class="group-head"
+          type="button"
+          :aria-expanded="convSectionOpen ? 'true' : 'false'"
+          :aria-label="tx('对话', 'Chats', 'Conversas', 'चैट')"
+          @click="toggleConvSection"
+        >
+          <span class="group-head__label">{{ tx("对话", "Chats", "Conversas", "चैट") }}</span>
+          <span class="group-head__count">({{ conversationsFiltered.length }})</span>
+          <span class="group-head__caret" :class="{ open: convSectionOpen }" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6" /></svg>
+          </span>
+        </button>
+        <template v-if="convSectionOpen || convQuery.trim()">
         <!-- 首屏慢加载才亮骨架行；快加载时不闪，直接等真实条目出现。 -->
         <template v-if="showSkeleton">
           <div class="conv-skeleton" aria-hidden="true"></div>
@@ -4211,17 +4490,6 @@ onBeforeUnmount(() => {
               @click.stop
             />
             <template v-else>
-              <span
-                v-if="taskConvIds.has(conv.id)"
-                class="conv-task"
-                :title="tx('定时任务专属对话：结果只回投到这里', 'Task-owned chat: results only land here', 'Conversa da tarefa: resultados só caem aqui', 'कार्य वार्तालाप: परिणाम केवल यहीं आते हैं')"
-                :aria-label="tx('定时任务专属对话', 'Task-owned chat', 'Conversa da tarefa', 'कार्य वार्तालाप')"
-              >
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 7v5l3 2" />
-                </svg>
-              </span>
               <span class="conv-title">{{ conv.title || tx("新对话", "New chat", "Nova conversa", "नई चैट") }}</span>
               <span
                 v-if="conv.muted"
@@ -4245,6 +4513,7 @@ onBeforeUnmount(() => {
               </button>
             </template>
           </div>
+        </template>
         </template>
       </div>
       <p v-if="convQuery.trim() && !conversationsFiltered.length" class="conv-empty">
@@ -4649,6 +4918,40 @@ onBeforeUnmount(() => {
                     "Esta conversa é exclusiva desta tarefa: cada resultado é escrito aqui e em nenhum outro lugar.",
                     "यह चैट केवल इस कार्य की है: हर रन का परिणाम यहीं लिखा जाएगा।",
                   )
+                }}</p>
+              </div>
+              <!-- 结果落点（docs/scheduled-task-sessions-plan.md §3.11）：对齐 ChatGPT 的 standalone / in-chat 两种任务，
+                   由用户按场景选；切换只影响**此后**的运行，不动已有会话。 -->
+              <div class="field">
+                <span class="field__label">{{ tx("结果落点", "Where results land", "Onde os resultados ficam", "परिणाम कहाँ जाएँ") }}</span>
+                <div class="seg" role="group">
+                  <button
+                    type="button"
+                    class="seg__btn"
+                    :class="{ active: taskDraft.runMode === 'new' }"
+                    @click="taskDraft.runMode = 'new'"
+                  >{{ tx("每期新会话", "New chat per run", "Nova conversa por execução", "हर रन के लिए नई चैट") }}</button>
+                  <button
+                    type="button"
+                    class="seg__btn"
+                    :class="{ active: taskDraft.runMode === 'same' }"
+                    @click="taskDraft.runMode = 'same'"
+                  >{{ tx("同一会话", "Same chat", "Mesma conversa", "वही चैट") }}</button>
+                </div>
+                <p class="repeat-preview">{{
+                  taskDraft.runMode === "same"
+                    ? tx(
+                        "每期结果都写进同一个会话、沿用上下文：适合「盯一件事直到它完成」这类需要连续上下文的任务。",
+                        "Every run writes into the same chat and keeps its context: for work that must follow one continuous thread until it finishes.",
+                        "Cada execução escreve na mesma conversa e mantém o contexto: para trabalhos que seguem um fio contínuo até concluir.",
+                        "हर रन उसी चैट में लिखता है और संदर्भ बनाए रखता है: उन कार्यों के लिए जो पूरे होने तक एक ही क्रम में चलते हैं।",
+                      )
+                    : tx(
+                        "每期结果各占一个会话、可单独回看与对比：适合日报 / 监控 / 周期报告（默认）。",
+                        "Each run gets its own chat, reviewable and comparable on its own: for daily reports, monitors and recurring briefings (default).",
+                        "Cada execução ganha sua própria conversa, revisável e comparável individualmente: para relatórios diários, monitores e boletins (padrão).",
+                        "हर रन की अपनी चैट होती है, अलग से देखी और तुलना की जा सकती है: दैनिक रिपोर्ट, मॉनिटर और आवधिक ब्रीफ़िंग के लिए (डिफ़ॉल्ट)।",
+                      )
                 }}</p>
               </div>
               <!-- 结果通知：任务到点跑完即向所有已启用通道推送（由通道「启用」开关控制，无需逐任务勾选）。 -->
@@ -7409,6 +7712,192 @@ onBeforeUnmount(() => {
 
 .conv-dot.error {
   background: var(--danger);
+}
+
+/* 定时任务分组里的结果状态点：跑成 / 失败 / 跳过（颜色之外还有 title/aria 文案，不靠颜色单打独斗）。 */
+.conv-dot.success {
+  background: var(--success);
+}
+
+.conv-dot.failed {
+  background: var(--danger);
+}
+
+.conv-dot.skipped,
+.conv-dot.cancelled {
+  background: var(--muted);
+}
+
+/* ---- 定时任务分组区（docs/scheduled-task-sessions-plan.md §3.10）----
+   置顶为可折叠分组：分组头（名称 (数量) + 右侧 chevron）整行可点收起整块，CodeBuddy「任务/空间」同口径；
+   父 = 任务（未读角标 + 下次时间 + 直达最近一期），子 = 各期会话。缩进靠 padding，与 .conv-item 对齐。 */
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 6px 10px 6px 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.group-head:hover {
+  background: var(--fill-soft);
+}
+
+.group-head:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.group-head__label {
+  flex: none;
+  font-weight: 600;
+}
+
+.group-head__count {
+  flex: none;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 分组头 chevron：折叠时指向右、展开时旋转 90° 指向下，固定在行末（CodeBuddy 同款）。 */
+.group-head__caret {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: auto;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.group-head__caret.open {
+  transform: rotate(90deg);
+}
+
+.task-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+}
+
+.task-group__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 7px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.task-group__head:hover {
+  background: var(--fill-soft);
+}
+
+.task-group__head:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* 折叠箭头：SVG chevron，展开时旋转 90° 指向下方（对齐文件树最佳实践，非图标字体）。 */
+.task-group__caret {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.task-group__caret.open {
+  transform: rotate(90deg);
+}
+
+.task-group__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+/* 未读角标：与 ChatGPT「Scheduled 视图当收件箱」同口径——有新结果要一眼看见。 */
+.task-group__unread {
+  flex: none;
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent, #4f7cff);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.task-group__next {
+  flex: none;
+  max-width: 76px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.task-group__open {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.task-group__open:hover {
+  color: var(--ink);
+  background: var(--fill-soft);
+}
+
+/* 某一期：比普通会话缩进一格，视觉上属于上面的任务。 */
+.conv-item--run {
+  padding-left: 26px;
+}
+
+.conv-item--run .conv-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-run-at {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 侧栏排队徽标：该对话有待发消息（不只用颜色，带 title/aria 文案）。 */

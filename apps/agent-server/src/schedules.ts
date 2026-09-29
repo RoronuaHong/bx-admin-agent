@@ -14,14 +14,42 @@ const COLL = "chat_schedules";
 /** 投递触发条件：只列「要推的状态」，未列的一律不推（跳过永远不推）。 */
 export type ScheduleNotifyOn = "success" | "failed";
 
+/**
+ * 每期结果的落点（docs/scheduled-task-sessions-plan.md §3.1，对齐 ChatGPT standalone / in-chat 两种任务）：
+ * - "new"（缺省）：每期开一个新会话——各期独立、可单独回溯与对比（日报 / 监控 / 周期报告）；
+ * - "same"：每期回投同一个会话、沿用上下文（盯一件事直到它完成）。
+ */
+export type ScheduleRunMode = "new" | "same";
+
+export type ScheduleRunStatus = "success" | "failed" | "cancelled" | "skipped" | "error";
+
+/** 一期的运行记录（新的在前）。 */
+export interface ScheduleRun {
+  /** 该期结果所在的会话。 */
+  conversationId: string;
+  /** 该期的运行时刻。 */
+  at: number;
+  /** 该期的真实结果（与 lastStatus 同一口径）。 */
+  status?: ScheduleRunStatus;
+}
+
 export interface ChatSchedule {
   id: string;
   /**
    * 结果回投的对话：默认是**任务专属**的那种（`ownConversation`）。
    * 历史形态是「绑到建任务时正打开的那个对话」，于是每期结果都灌进用户自己的聊天里（周期任务 = 反复刷屏），
    * 现已改为专属对话；老数据由启动维护一次性迁移（见 app.ts 的 migrateTaskConversations）。
+   * `runMode:"new"` 时语义收窄为「**最近一期**的会话」（IM 投递链接与任务卡片「打开对话」都指向最新一期）。
    */
   conversationId: string;
+  /** 每期结果的落点；缺省 "new"（每期新会话）。 */
+  runMode?: ScheduleRunMode;
+  /** 各期运行记录（新的在前，受 MAX_RUNS_PER_SCHEDULE 限制）。 */
+  runs?: ScheduleRun[];
+  /** 未读的期数：每期结束 +1，用户打开任一期会话后清零（对齐 ChatGPT「Scheduled 视图当收件箱」）。 */
+  unreadRuns?: number;
+  /** 建任务时的 Agent 角色：每期新建会话要继承它，否则新会话退回 generic、与老会话不在同一个入口。 */
+  agentId?: string;
   /** 该对话由本任务创建、结果只回到这里。缺省 = 老数据（待迁移）。 */
   ownConversation?: boolean;
   ownerKey: string;
@@ -64,6 +92,12 @@ export interface ChatSchedule {
 const MAX_SCHEDULES_PER_OWNER = 20;
 const MAX_PROMPT_LEN = 2000;
 const MAX_NAME_LEN = 60;
+/**
+ * 每任务保留的运行期数（`SCHEDULE_MAX_RUNS` 可配）。
+ * 超上限只把最旧的会话**归档**，不删除——静默删用户数据是这类系统里最坏的一类行为，
+ * 归档后仍可从「显示归档」找回（docs/scheduled-task-sessions-plan.md §3.4）。
+ */
+export const MAX_RUNS_PER_SCHEDULE = Math.max(1, Number(process.env.SCHEDULE_MAX_RUNS) || 50);
 /** 调度扫描间隔：既是 startScheduleLoop 的默认值，也是「补跑窗口」判定的步长。 */
 const SCHEDULE_TICK_MS = 30_000;
 /**
@@ -175,6 +209,15 @@ function cleanName(name?: unknown): string | undefined {
   return text ? text.slice(0, MAX_NAME_LEN) : undefined;
 }
 
+/**
+ * 追加一期运行记录（新的在前）并截断到上限。
+ * 被截掉的那几期只从本任务的历史里移除，会话本身由调用方决定是否归档（绝不在这里删）。
+ */
+export function prependRun(runs: ScheduleRun[] | undefined, run: ScheduleRun): ScheduleRun[] {
+  const next = [run, ...(runs || []).filter((r) => r.conversationId !== run.conversationId)];
+  return next.slice(0, MAX_RUNS_PER_SCHEDULE);
+}
+
 export async function createSchedule(input: {
   conversationId: string;
   /** 该对话是本任务专属（由调用方创建）；缺省按「调用方自己的对话」处理。 */
@@ -187,6 +230,10 @@ export async function createSchedule(input: {
   mcpServers?: string[];
   notifyOn?: ScheduleNotifyOn[];
   locale?: string;
+  /** 每期结果的落点（缺省 "new"）。 */
+  runMode?: ScheduleRunMode;
+  /** 建任务时的 Agent 角色（每期建会话继承）。 */
+  agentId?: string;
 }): Promise<ChatSchedule> {
   const now = Date.now();
   const name = cleanName(input.name);
@@ -203,6 +250,10 @@ export async function createSchedule(input: {
     ...(input.mcpServers?.length ? { mcpServers: [...new Set(input.mcpServers)] } : {}),
     ...(input.notifyOn?.length ? { notifyOn: [...new Set(input.notifyOn)] } : {}),
     ...(input.locale ? { locale: input.locale } : {}),
+    // 落点**总是显式落库**（缺省写 "new"）：把默认值留在「读的时候补」会让库里出现
+    // 「没写 = 新会话」和「写了 = 新会话」两种形态，排查时得多推一层。
+    runMode: input.runMode === "same" ? "same" : "new",
+    ...(input.agentId ? { agentId: input.agentId } : {}),
     enabled: true,
     createdAt: now,
   };
@@ -240,6 +291,14 @@ export interface SchedulePatch {
   enabled?: boolean;
   mcpServers?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  /** 每期结果的落点（docs/scheduled-task-sessions-plan.md §3.1）；只影响**此后**的运行。 */
+  runMode?: ScheduleRunMode;
+  /** 运行记录（调度器回写；前端不可改）。 */
+  runs?: ScheduleRun[];
+  /** 未读期数：前端打开任一期会话后置 0。 */
+  unreadRuns?: number;
+  /** Agent 角色（建任务时落库；每期建会话继承）。 */
+  agentId?: string;
   /** 重新绑定结果回投对话（迁移到专属对话 / 专属对话被删后重建时用）。 */
   conversationId?: string;
   /** 标记该对话为任务专属。 */
@@ -270,6 +329,10 @@ export async function patchSchedule(
     ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
     ...(patch.mcpServers !== undefined ? { mcpServers: [...new Set(patch.mcpServers)] } : {}),
     ...(patch.notifyOn !== undefined ? { notifyOn: [...new Set(patch.notifyOn)] } : {}),
+    ...(patch.runMode !== undefined ? { runMode: patch.runMode } : {}),
+    ...(patch.runs !== undefined ? { runs: patch.runs.slice(0, MAX_RUNS_PER_SCHEDULE) } : {}),
+    ...(patch.unreadRuns !== undefined ? { unreadRuns: Math.max(0, Math.floor(patch.unreadRuns)) } : {}),
+    ...(patch.agentId !== undefined ? { agentId: patch.agentId } : {}),
     ...(patch.conversationId ? { conversationId: patch.conversationId } : {}),
     ...(patch.ownConversation !== undefined ? { ownConversation: patch.ownConversation } : {}),
     ...(patch.lastDelivery !== undefined ? { lastDelivery: patch.lastDelivery } : {}),
@@ -382,8 +445,12 @@ export async function schedulerTick(
     } finally {
       await releaseScheduleLock(schedule.id, lockOwner).catch(() => {});
     }
+    // 写回前**重新读一次**：runner 内部可能已经写入了 runs / unreadRuns / conversationId
+    // （「每期新会话」的实现就写在 runner 里）。沿用 runner 执行前的快照整体写回会把这些字段
+    // 静默回退——症状是「运行记录偶发丢失」，且只在 schedulerTick 这一侧可见，极难定位。
+    const fresh = (await getSchedule(schedule.id)) ?? schedule;
     const updated: ChatSchedule = {
-      ...schedule,
+      ...fresh,
       lastRunAt: now,
       lastStatus: outcome,
       // 跑成的那一轮 note 为空也要写回：否则上一次的「跳过」说明会一直挂着，看着像这次也被跳过了。
