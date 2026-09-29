@@ -1060,7 +1060,7 @@ export function createApp() {
   });
 
   app.post("/chat/conversations", async (c) => {
-    const body = await readJson<{ id?: string; title?: string; agentId?: string }>(c);
+    const body = await readJson<{ id?: string; title?: string; agentId?: string; fullAccess?: boolean }>(c);
     // 角色合法性在服务端判定（前端不实现角色逻辑）；未知角色直接拒绝，防脏数据。
     if (body.agentId !== undefined && !hasRole(body.agentId)) {
       return errorJson(c, 400, "AGENT_ROLE_UNKNOWN", `未知 Agent 角色：${body.agentId}`);
@@ -1068,7 +1068,14 @@ export function createApp() {
     const id = body.id || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const agentId = body.agentId || "generic";
     // 新对话不带任何对话级设置（model / mcpServers / locale 均为空）→ 前端默认"不选中 MCP"；带 owner 标注。
-    const doc = await createConversation({ id, title: body.title || "新对话", ownerKey: c.get("owner"), ...(agentId !== "generic" ? { agentId } : {}) });
+    // fullAccess：显式传入 > 角色默认（如客服 false）> true——不传字段才走角色默认，不能写成 !!body.fullAccess。
+    const doc = await createConversation({
+      id,
+      title: body.title || "新对话",
+      ownerKey: c.get("owner"),
+      ...(agentId !== "generic" ? { agentId } : {}),
+      ...(typeof body.fullAccess === "boolean" ? { fullAccess: body.fullAccess } : {}),
+    });
     // 新建即激活：让仍不带 conversationId 的旧客户端也落在新对话上，
     // 否则回退到 activeConversationId 会读到上一个对话的启用集（新对话看起来"默认勾了 MCP"）。
     const session = c.get("session") as Session;
