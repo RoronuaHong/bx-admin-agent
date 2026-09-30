@@ -65,7 +65,16 @@ export function appendAudit(event: Omit<AuditEvent, "at" | "kind"> & { kind?: Au
   }
   // 高风险决策主动推送告警（fail-soft：投递失败不影响主流程）。
   if (AUDIT_ALERT_DECISIONS.has(record.decision)) {
-    void deliverAuditAlert(record);
+    if (!AUDIT_ALERT_THROTTLE) {
+      void deliverAuditAlert(record);
+      return;
+    }
+    const key = alertKeyOf(record);
+    const decision = decideAuditAlert({ now: record.at, state: alertStates.get(key) });
+    if (alertStates.size >= ALERT_STATE_CAP && !alertStates.has(key)) alertStates.clear();
+    alertStates.set(key, decision.next);
+    // 不推的那些不是丢了：JSONL 里一条不少，只是不打扰人。
+    if (decision.deliver) void deliverAuditAlert(record, decision.count);
   }
 }
 
@@ -77,9 +86,82 @@ const AUDIT_ALERT_DECISIONS = new Set<AuditDecision>([
   "timeout",
 ]);
 
+// ───────────────────── 告警节流（dedup + throttle） ─────────────────────
+// 拒绝一次就推一条，等于把「用户正常点了不同意」变成刷屏：真实对话里拒绝写操作是常态，
+// 真正值得告警的是**同一来源短时间内反复被拒**（探测/误配的信号），而不是单次拒绝。
+// 与定时任务告警同口径：窗口内累计到阈值才推，推完进冷静期，冷静期内只累计不推，
+// 冷静期结束还有新增就再推一条**带累计条数**的汇总（不丢信息，也不刷屏）。
+// 状态只在进程内（重启即重置）：这是提示级告警，不是合规留痕——留痕仍在 append-only JSONL。
+
+/** 累计窗口（默认 10 分钟）：跨窗口重新计数。 */
+export const AUDIT_ALERT_WINDOW_MS = Math.max(
+  60_000,
+  Number(process.env.AUDIT_ALERT_WINDOW_MS) || 10 * 60_000,
+);
+/** 冷静期（默认 30 分钟）：推送后抑制时长，期内事件照常累计。 */
+export const AUDIT_ALERT_COOLDOWN_MS = Math.max(
+  60_000,
+  Number(process.env.AUDIT_ALERT_COOLDOWN_MS) || 30 * 60_000,
+);
+/** 窗口内累计多少条才推第一条（默认 3）。 */
+export const AUDIT_ALERT_BURST = Math.max(1, Number(process.env.AUDIT_ALERT_BURST) || 3);
+/** 总开关：off = 退回「每次都推」的旧行为。 */
+export const AUDIT_ALERT_THROTTLE = (process.env.AUDIT_ALERT_THROTTLE || "on").toLowerCase() !== "off";
+/** 同一来源的节流键上限（防无限增长；超限整体清空，重启后自然重建）。 */
+const ALERT_STATE_CAP = 500;
+
+export interface AuditAlertState {
+  /** 当前窗口内累计条数。 */
+  count: number;
+  /** 窗口起点。 */
+  since: number;
+  /** 上次推送时刻（冷静期锚点）。 */
+  lastAlertAt?: number;
+}
+
+/**
+ * 纯决策函数：这条事件要不要推告警。
+ * - 跨窗口（now - since > windowMs）→ 重新计数；
+ * - 冷静期内 → 只累计，不推；
+ * - 累计未到阈值 → 不推；
+ * - 到阈值 → 推，并把累计清零、锚定冷静期（推的文案带上本次累计条数）。
+ */
+export function decideAuditAlert(input: {
+  now: number;
+  state?: AuditAlertState;
+  windowMs?: number;
+  cooldownMs?: number;
+  burst?: number;
+}): { deliver: boolean; count: number; next: AuditAlertState } {
+  const now = input.now;
+  const windowMs = input.windowMs ?? AUDIT_ALERT_WINDOW_MS;
+  const cooldownMs = input.cooldownMs ?? AUDIT_ALERT_COOLDOWN_MS;
+  const burst = Math.max(1, input.burst ?? AUDIT_ALERT_BURST);
+  const prev = input.state;
+  // 跨窗口：上一窗口的累计不再影响本窗口。
+  const stale = !prev || now - prev.since > windowMs;
+  const count = (stale ? 0 : prev!.count) + 1;
+  const since = stale ? now : prev!.since;
+  const lastAlertAt = stale ? undefined : prev!.lastAlertAt;
+  const inCooldown = lastAlertAt !== undefined && now - lastAlertAt < cooldownMs;
+  if (inCooldown || count < burst) {
+    return { deliver: false, count, next: { count, since, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}) } };
+  }
+  return { deliver: true, count, next: { count: 0, since: now, lastAlertAt: now } };
+}
+
+/** 节流状态（进程内）：键 = 归属/会话 + 工具名。 */
+const alertStates = new Map<string, AuditAlertState>();
+
+/** 节流键：按「谁 + 哪个工具」聚合，避免不同来源互相压制。 */
+function alertKeyOf(event: AuditEvent): string {
+  const who = event.ownerKey || event.sessionId || "(unknown)";
+  return `${who}|${event.tool}${event.server ? `@${event.server}` : ""}`;
+}
+
 // 把高风险审计事件推送到已启用的通知渠道。
 // 可通过 AUDIT_ALERT_CHANNELS 环境变量（逗号分隔的 channel id）收窄范围；未设置则推全部启用渠道。
-export function deliverAuditAlert(event: AuditEvent): void {
+export function deliverAuditAlert(event: AuditEvent, aggregated?: number): void {
   try {
     const scoped = (process.env.AUDIT_ALERT_CHANNELS || "")
       .split(",")
@@ -92,6 +174,8 @@ export function deliverAuditAlert(event: AuditEvent): void {
       `工具：${event.tool}${event.server ? `（${event.server}）` : ""}`,
       `时间：${new Date(event.at).toLocaleString()}`,
     ];
+    // 聚合推送时带上被合并的条数：不让人以为只发生了一次。
+    if (aggregated && aggregated > 1) lines.push(`合并：本窗口内同类事件 ${aggregated} 条（其余已合并，明细查审计留痕）`);
     if (event.ownerKey) lines.push(`归属：${event.ownerKey}`);
     if (event.reason) lines.push(`原因：${event.reason}`);
     const message: DeliveryMessage = {
