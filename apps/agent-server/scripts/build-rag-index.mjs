@@ -51,7 +51,8 @@ const failures = [];
 
 for (const abs of files) {
   const rel = path.relative(root, abs).split(path.sep).join("/");
-  const md5 = crypto.createHash("md5").update(fs.readFileSync(abs)).digest("hex");
+  const raw = fs.readFileSync(abs, "utf8");
+  const md5 = crypto.createHash("md5").update(raw).digest("hex");
   if (hashes.get(rel) === md5) {
     unchanged += 1;
     continue;
@@ -64,9 +65,15 @@ for (const abs of files) {
   }
   // 变更文件：先清掉旧切片（切片数可能变少，残留会污染检索）。
   removeSource(rel);
-  const n = await ingest([{ id: rel, title: parsed.title, source: rel, text: parsed.text, hash: md5, namespace }]);
+  // 文档级权限：从 frontmatter 就近声明（owners/roles 块列表）；没声明 = 公开（向后兼容老文档）。
+  const acl = parsers.extractAclFromFrontmatter(raw);
+  const n = await ingest([
+    { id: rel, title: parsed.title, source: rel, text: parsed.text, hash: md5, namespace, ...(acl ? { acl } : {}) },
+  ]);
   added += 1;
-  console.log(`[rag] 入库 ${rel}（${n} 切片，${parsed.title}）`);
+  console.log(
+    `[rag] 入库 ${rel}（${n} 切片，${parsed.title}${acl ? `，ACL=${JSON.stringify(acl)}` : ""}）`,
+  );
 }
 
 // 磁盘上已删除的来源：清理索引残留。

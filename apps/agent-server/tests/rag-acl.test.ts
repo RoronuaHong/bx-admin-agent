@@ -15,6 +15,7 @@ import {
   visibleTo,
   type RagDoc,
 } from "../src/rag/store.js";
+import { extractAclFromFrontmatter } from "../src/rag/parsers.js";
 
 let dir = "";
 const OWNER_A = "country_a:alice";
@@ -102,4 +103,47 @@ test("入库保留 ACL：同 id 覆盖后权限仍然生效", async () => {
   const hits = await search("第二版", 5, "generic", { ownerKey: OWNER_A });
   expect(hits.length).toBe(1);
   expect(await search("第二版", 5, "generic", { ownerKey: OWNER_B })).toEqual([]);
+});
+
+test("extractAclFromFrontmatter：文档自带权限声明解析", () => {
+  const withAcl = `---
+title: 内部薪酬制度
+acl:
+  owners:
+    - country_a:alice
+    - country_a:carol
+  roles:
+    - support
+---
+
+# 正文
+内部薪酬计算细则...`;
+  expect(extractAclFromFrontmatter(withAcl)).toEqual({
+    owners: ["country_a:alice", "country_a:carol"],
+    roles: ["support"],
+  });
+
+  // 无 acl 段 → undefined（公开）。
+  expect(extractAclFromFrontmatter("---\ntitle: x\n---\n正文")).toBeUndefined();
+  // 无 frontmatter → undefined。
+  expect(extractAclFromFrontmatter("# 正文\n没有 frontmatter")).toBeUndefined();
+  // 有 acl 但两维都空 → undefined（不锁死文档）。
+  expect(extractAclFromFrontmatter("---\nacl:\n  owners: []\n---\n正文")).toBeUndefined();
+  // 注释行被忽略，仍收集到有效条目。
+  expect(extractAclFromFrontmatter("---\nacl:\n  roles:\n    # 暂未指定\n    - support\n---\nx").roles).toEqual([
+    "support",
+  ]);
+});
+
+test("入库闭环：frontmatter 声明 ACL 经解析后生效", async () => {
+  const raw = `---
+acl:
+  owners:
+    - ${OWNER_A}
+---
+内容：仅 A 可见的薪酬细则`;
+  const acl = extractAclFromFrontmatter(raw)!;
+  await ingest([{ id: "d", title: "t", source: "s.md", text: "内容：仅 A 可见的薪酬细则", acl }]);
+  expect((await search("薪酬细则", 5, "generic", { ownerKey: OWNER_A })).length).toBe(1);
+  expect(await search("薪酬细则", 5, "generic", { ownerKey: OWNER_B })).toEqual([]);
 });

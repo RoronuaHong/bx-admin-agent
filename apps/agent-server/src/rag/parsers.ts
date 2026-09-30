@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import type { RagAcl } from "./store.js";
 
 export interface ParsedDoc {
   title: string;
@@ -182,4 +183,63 @@ export async function parseFile(absPath: string): Promise<ParsedDoc | { error: s
   }
   if (!text.trim()) return { error: "文件内容为空" };
   return { title: titleOf(text, fallbackTitle), text };
+}
+
+/**
+ * 从文档 frontmatter 提取文档级 ACL（§知识库 F15 的入库声明侧）。
+ * 约定：文档顶部 `---` YAML 块内用块列表声明：
+ *   ---
+ *   acl:
+ *     owners:
+ *       - country_a:alice
+ *     roles:
+ *       - support
+ *   ---
+ * 没有 acl 段 / 没有 frontmatter 一律返回 undefined（= 公开，向后兼容老文档）。
+ * 这是 YAML 极小子集解析（只认 acl.owners / acl.roles 两个块列表），不引入 yaml 依赖；
+ * 字段名是通用权限术语，无业务词。文档入库时把解析结果交给 ingest 的 acl 字段即可。
+ */
+export function extractAclFromFrontmatter(raw: string): RagAcl | undefined {
+  const lines = raw.split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return undefined;
+  const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+  if (end < 0) return undefined;
+
+  let aclIdx = -1;
+  for (let i = 1; i < end; i++) {
+    if (lines[i]!.trim() === "acl:") {
+      aclIdx = i;
+      break;
+    }
+  }
+  if (aclIdx < 0) return undefined;
+
+  const owners: string[] = [];
+  const roles: string[] = [];
+  let cur: "owners" | "roles" | null = null;
+  for (let i = aclIdx + 1; i < end; i++) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // 缩进归零且非空 → 已离开 acl 段。
+    if (line.length - line.trimStart().length === 0) break;
+    if (/^owners\s*:/.test(trimmed)) {
+      cur = "owners";
+      continue;
+    }
+    if (/^roles\s*:/.test(trimmed)) {
+      cur = "roles";
+      continue;
+    }
+    const item = /^-\s*(.+?)\s*$/.exec(trimmed);
+    if (item && cur) {
+      const val = item[1];
+      if (val && !val.startsWith("#")) (cur === "owners" ? owners : roles).push(val);
+    }
+  }
+  if (!owners.length && !roles.length) return undefined;
+  const acl: RagAcl = {};
+  if (owners.length) acl.owners = owners;
+  if (roles.length) acl.roles = roles;
+  return acl;
 }
