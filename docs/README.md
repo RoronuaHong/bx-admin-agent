@@ -38,7 +38,7 @@
 - **覆盖**：可观测（§10）· 安全与注入防护 · 评测门禁 · 成本归因（§12）· 发布灰度与回滚 · 调试。
 - **现行落点**：`trace.ts`（`runs-<YYYYMM>.jsonl` + 逐轮 `rounds-<runId>.jsonl`）· `cost.ts` · `audit.ts` · `rate-limit.ts` · `untrusted.ts` · `roles.ts`。
 - **状态**：✅ 现行（§10 已于 2026-09-24 补入逐轮 trace 说明）。本机投递试跑固定走通道 `dingtalk`（关键词 `bx-agent`），不打开印度业务通道。
-- **注意**：整体仍是「🟡 部分」——缺 llm/tool 分层 span、指标看板、按会话回放。
+- **注意**：整体仍是「🟡 部分」——缺 llm/tool 分层 span、指标看板、按会话回放。前端已有一页 run 级可视化（`/trace`，2026-09-30），不是指标看板。
 
 ### [write-op-safety-plan.md](./write-op-safety-plan.md)
 - **定位**：写操作确认闸门设计（风险分级 + 会话级只读授权）。

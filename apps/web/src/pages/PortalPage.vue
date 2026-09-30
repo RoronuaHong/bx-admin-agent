@@ -56,6 +56,7 @@ function onLocaleChange(next: UiLocale) {
   <div class="portal">
     <header class="portal__head">
       <span class="portal__brand">{{ tx("小助手", "Assistant", "Assistente", "सहायक") }}</span>
+      <RouterLink class="portal__trace" to="/trace">{{ tx("运行追踪", "Runs", "Execuções", "रन") }}</RouterLink>
       <UiLocaleSelect @change="onLocaleChange" />
     </header>
 
@@ -131,8 +132,22 @@ function onLocaleChange(next: UiLocale) {
 .portal__head {
   display: flex;
   align-items: center;
+  gap: 12px;
   justify-content: space-between;
   padding: 16px 22px;
+}
+
+/* 运行追踪入口：可观测页的落点（数据按设备过滤，全局视角走 CLI）。 */
+.portal__trace {
+  margin-left: auto;
+  margin-right: 4px;
+  font-size: 13px;
+  color: inherit;
+  text-decoration: none;
+  opacity: 0.7;
+}
+.portal__trace:hover {
+  opacity: 1;
 }
 
 .portal__brand {

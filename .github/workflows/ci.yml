@@ -1,0 +1,50 @@
+# CI：把「能自动判定」的那一层接住——类型检查 + 全量单测。
+#
+# 边界说清楚（不要把它当成评测门禁）：
+#   · 评测层（G1–G6 闸门、eval-core / adapter / gate）在当前工作区**已不存在**，只在历史文档里被提到。
+#     这里跑的是 vitest 全量，**不是**评测门禁；真正的评测闸门要么重建，要么记为不做。
+#   · 端到端评测需要真实模型与真实服务（凭证 + 额度），不进 CI。
+#   · 定时任务那批用例要连本地 MongoDB，用 service 容器给 27017；其余用例自己降级到内存。
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # 版本读 package.json 的 packageManager
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 服务端类型检查（前端 vue-tsc 对巨型单文件 SFC 结果不稳定，暂不进 CI 的判定口径）。
+      - name: Type check (agent-server)
+        run: pnpm --filter @bx/agent-server exec tsc --noEmit
+
+      - name: Unit tests (agent-server)
+        run: pnpm --filter @bx/agent-server test
+        env:
+          MONGO_URI: mongodb://127.0.0.1:27017

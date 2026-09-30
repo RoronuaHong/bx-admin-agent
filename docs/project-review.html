@@ -1596,10 +1596,10 @@ src/
 <thead><tr><th>方向</th><th>现状缺口</th><th>建议</th></tr></thead>
 <tbody>
 <tr><td>前端分层</td><td>ChatPage.vue ≈380KB / 约 10560 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
-<tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16），当前无 CI 门禁；护栏行为由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 与 workflow，把 read/write 场景接进定时回归</td></tr>
+<tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16）。<strong>2026-09-30 补了 <code>.github/workflows/ci.yml</code></strong>：跑类型检查 + 全量单测（带 mongo service）——它跑的是<strong>测试</strong>，不是评测门禁；护栏行为仍由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 并接进同一 workflow，把 read/write 场景接进定时回归</td></tr>
 <tr><td>权限与多租户</td><td>owner cookie 非认证</td><td>若要对外，补真实登录 + 服务端 session</td></tr>
 <tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>权限过滤仍缺</strong></td><td>先补权限过滤；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
-<tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合</td><td>前端可视化页面 / Prometheus 指标 / 跨进程任务队列</td></tr>
+<tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合 + <strong>2026-09-30 起有前端页面</strong>（<code>/trace</code>：run 列表 + 汇总卡片，含接地纠正 / 事后核验 / 未取证三列）</td><td>Prometheus 指标 / 跨进程任务队列 / llm-tool 分层 span</td></tr>
 <tr><td>技能治理</td><td>静态 SKILL.md</td><td>按项目/角色定制，加载成本度量</td></tr>
 </tbody>
 </table>

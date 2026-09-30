@@ -14,6 +14,8 @@ export const router = createRouter({
     // 客服助手：复用通用聊天引擎（ChatPage），以 props 注入 agentId 做会话分槽；
     // 专属人设（角色分流）在服务端 roles.ts，前端只透传。
     { path: "/support", component: ChatPage, props: { agentId: "support", agentLabel: "客服助手" } },
+    // 运行追踪（可观测）：run 级运行列表，数据来自 /chat/trace/runs（服务端按 owner 过滤）。
+    { path: "/trace", component: () => import("./pages/TracePage.vue") },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
 });

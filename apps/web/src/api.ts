@@ -831,3 +831,37 @@ export async function testNotifyChannel(id: string): Promise<{ ok: boolean; erro
   })) as { ok: boolean; error?: string };
   return { ok: Boolean(data.ok), ...(data.error ? { error: data.error } : {}) };
 }
+
+// ---- 运行追踪（可观测）：run 级摘要，服务端按 owner 过滤，只看本设备的运行 ----
+
+export interface RunTraceDto {
+  runId: string;
+  at: number;
+  conversationId: string;
+  model?: string;
+  status: "success" | "failed" | "cancelled";
+  durationMs: number;
+  rounds?: number;
+  toolCalls?: number;
+  tokens?: number;
+  costTokens?: number;
+  modelRetries?: number;
+  modelFallbacks?: number;
+  /** 接地护栏纠正次数：>0 说明本轮有过「零数据作答」被拦。 */
+  groundingRetries?: number;
+  /** 事后核验次数：>0 说明收束前做过断言级核对。 */
+  groundingVerifications?: number;
+  /** 纠正用尽仍未取得工具数据 → 以确定性拒答收束（有编造倾向的信号）。 */
+  ungrounded?: boolean;
+  error?: string;
+  release?: string;
+  userText?: string;
+}
+
+export async function fetchTraceRuns(limit = 50): Promise<{ release?: string; runs: RunTraceDto[] }> {
+  const data = (await jsonFetch(`/agent/chat/trace/runs?limit=${encodeURIComponent(String(limit))}`)) as {
+    release?: string;
+    runs?: RunTraceDto[];
+  };
+  return { release: data.release, runs: data.runs || [] };
+}
