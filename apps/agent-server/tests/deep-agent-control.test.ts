@@ -9,6 +9,8 @@ import {
   toolCallSignature,
   LoopGuard,
   selectMcpToolSpecs,
+  prefetchDeferredTools,
+  argsWithinToolSchema,
 } from "../src/chat.js";
 
 type FakeTool = { serverId: string; name: string; description?: string; inputSchema?: unknown };
@@ -77,6 +79,71 @@ test("[D] selectMcpToolSpecs（工具数上限截断）", () => {
   const r = selectMcpToolSpecs(many as never);
   expect(r.specs.length).toBe(3);
   expect(r.droppedServers.length).toBe(3);
+});
+
+test("[E2] prefetchDeferredTools（点名优先，长问题不扣分，不超过上限）", () => {
+  const zoho = {
+    serverId: "zoho-salesiq",
+    name: "mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList",
+    tool: "ZohoSalesIQ_getConversationsList",
+    description: "List conversations",
+    inputSchema: { type: "object" },
+  };
+  const other = {
+    serverId: "zoho-salesiq",
+    name: "mcp__zoho-salesiq__ZohoSalesIQ_getPortals",
+    tool: "ZohoSalesIQ_getPortals",
+    description: "List portals",
+    inputSchema: { type: "object" },
+  };
+  const noise = Array.from({ length: 8 }, (_, i) => ({
+    serverId: "other",
+    name: `mcp__other__tool${i}`,
+    tool: `tool${i}`,
+    description: "unrelated catalog entry",
+    inputSchema: { type: "object" },
+  }));
+  const question =
+    "【数据预警】工具 ZohoSalesIQ_getConversationsList。范围 visitor.country_code = IN。时间窗口最近 60 分钟。异常条件窗口内印度对话条数。失败不要猜数不要估算不要出图。" +
+    "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥";
+  const named = prefetchDeferredTools([other, ...noise, zoho] as never, question, 5);
+  expect(named[0]?.name).toBe(zoho.name);
+  expect(named.length).toBeLessThanOrEqual(5);
+
+  const capped = prefetchDeferredTools([zoho, other, ...noise] as never, "ZohoSalesIQ_getConversationsList 以及 portals", 2);
+  expect(capped).toHaveLength(2);
+  expect(capped[0]?.name).toBe(zoho.name);
+
+  const described =
+    "统计印度对话条数，用 getConversationsList，不要猜数。" + Array.from({ length: 40 }, () => "无关词组").join(" ");
+  const filled = prefetchDeferredTools([other, ...noise, zoho] as never, described, 5);
+  expect(filled.some((spec) => spec.name === zoho.name)).toBe(true);
+});
+
+test("[E3] argsWithinToolSchema：丢掉参数说明里没有的筛选字段，数字字符串改回数字", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      path_variables: { type: "object", properties: { screenname: { type: "string" } } },
+      query_params: {
+        type: "object",
+        properties: {
+          from_time: { type: "integer" },
+          to_time: { type: "integer" },
+          index: { type: "integer" },
+          limit: { type: "integer" },
+        },
+      },
+    },
+  };
+  const out = argsWithinToolSchema(schema, {
+    path_variables: { screenname: "castleapp" },
+    query_params: { index: "0", limit: "99", from_time: "1790000000000", visitor_country_code: "IN" },
+  }) as { query_params: Record<string, unknown> };
+  expect(out.query_params.visitor_country_code).toBeUndefined();
+  expect(out.query_params.from_time).toBe(1790000000000);
+  expect(out.query_params.index).toBe(0);
+  expect(out.query_params.limit).toBe(99);
 });
 
 test("[E] 强制工具通道端点记忆：被拒一次后不再尝试 required（未受影响/换端点仍可尝试）", () => {

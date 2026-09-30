@@ -24,6 +24,8 @@ import {
   type Turn,
 } from "./models.js";
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
+import { getServer } from "./mcp/config.js";
+import { annotateMcpToolSpec, applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
 import { resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
@@ -576,6 +578,16 @@ export function summarizeArgsForConfirm(argsJson: string): Array<{ key: string; 
  * 工具清单是注入模型的 system 前缀的一部分，顺序稳定才谈得上 prompt 缓存命中。
  * 超出 MCP_MAX_TOOLS 时按顺序截断，并把「被裁掉的服务器」回报给调用方 —— 不静默丢弃。
  */
+/** 模型看到的 MCP 工具说明：带上该服务器配置的固定 path_variables（如 SalesIQ screenname）。 */
+export function mcpToolSpec(tool: McpToolInfo): ToolSpec {
+  const presented = annotateMcpToolSpec({
+    description: tool.description,
+    parameters: tool.inputSchema,
+    defaults: pathDefaultsForTool(getServer(tool.serverId)?.pathDefaults, tool.tool),
+  });
+  return { name: tool.name, description: presented.description, parameters: presented.parameters };
+}
+
 export function selectMcpToolSpecs(tools: McpToolInfo[]): { specs: ToolSpec[]; droppedServers: string[] } {
   const specs: ToolSpec[] = [];
   const dropped = new Set<string>();
@@ -584,7 +596,7 @@ export function selectMcpToolSpecs(tools: McpToolInfo[]): { specs: ToolSpec[]; d
       dropped.add(tool.serverId);
       continue;
     }
-    specs.push({ name: tool.name, description: tool.description, parameters: tool.inputSchema });
+    specs.push(mcpToolSpec(tool));
   }
   return { specs, droppedServers: [...dropped].sort() };
 }
@@ -659,6 +671,79 @@ export function searchMcpTools(tools: McpToolInfo[], query: string, limit?: numb
     Math.min(TOOL_SEARCH_MAX_RESULTS, Math.floor(Number(limit)) || TOOL_SEARCH_RESULTS),
   );
   return matched.sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name)).slice(0, capped);
+}
+
+/**
+ * 按需加载时预载本轮要用的少量工具（Anthropic：常驻 3～5 个，其余再检索）。
+ * 用户原文里点名的工具优先；其余名额只按命中加分（长问题里的无关词不扣分）。不全量注入。
+ */
+export const PREFETCH_TOOL_LIMIT = 5;
+
+function prefetchScore(tool: McpToolInfo, terms: string[]): number {
+  const name = tool.name.toLowerCase();
+  const bare = (tool.tool || "").toLowerCase();
+  const description = (tool.description || "").toLowerCase();
+  const server = tool.serverId.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (term.length < 2) continue;
+    // 两字母拉丁词（IN、id）会扫中几乎所有英文说明，预载时丢掉。
+    if (term.length < 3 && !/[\u4e00-\u9fa5]/.test(term)) continue;
+    if (bare === term || name.endsWith(`__${term}`)) score += 100;
+    else if (bare.includes(term) || name.includes(term)) score += 60;
+    else if (description.includes(term)) score += 20;
+    else if (server.includes(term)) score += 10;
+  }
+  return score;
+}
+
+export function prefetchDeferredTools(tools: McpToolInfo[], question: string, limit = PREFETCH_TOOL_LIMIT): ToolSpec[] {
+  const text = String(question || "");
+  const cap = Math.max(1, Math.min(8, Math.floor(limit) || PREFETCH_TOOL_LIMIT));
+  const picked: McpToolInfo[] = [];
+  const seen = new Set<string>();
+  const add = (tool: McpToolInfo) => {
+    if (!tool?.name || seen.has(tool.name) || picked.length >= cap) return;
+    seen.add(tool.name);
+    picked.push(tool);
+  };
+  for (const tool of tools) {
+    if (tool.tool && text.includes(tool.tool)) add(tool);
+    else if (tool.name && text.includes(tool.name)) add(tool);
+  }
+  const terms = keywordsOf(text);
+  const ranked = tools
+    .map((tool) => ({ tool, score: prefetchScore(tool, terms) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name));
+  for (const match of ranked) add(match.tool);
+  return picked.map((tool) => mcpToolSpec(tool));
+}
+
+/**
+ * 按工具参数说明收参数：丢掉说明里没有的字段（否则接口直接 1068），
+ * 数字字段若被写成字符串则改回数字。没有说明时原样返回。
+ */
+export function argsWithinToolSchema(schema: unknown, args: unknown): unknown {
+  if (!schema || typeof schema !== "object") return args;
+  const node = schema as { type?: string; properties?: Record<string, unknown> };
+  if (node.type === "object" && node.properties && args && typeof args === "object" && !Array.isArray(args)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+      if (!(key in node.properties)) continue;
+      out[key] = argsWithinToolSchema(node.properties[key], value);
+    }
+    return out;
+  }
+  if (
+    (node.type === "integer" || node.type === "number") &&
+    typeof args === "string" &&
+    args.trim() !== "" &&
+    Number.isFinite(Number(args))
+  ) {
+    return Number(args);
+  }
+  return args;
 }
 
 /** 判断某条工具结果是否已被治理过（占位/卸载），避免重复处理。 */
@@ -860,8 +945,22 @@ export function compactFatListToolResult(toolName: string, text: string): string
   }
 }
 
+/**
+ * 列表还有下一页时，把「不要自己翻页」放在结果最前面。
+ * 截断从尾部切，提示留在头部才不会被 12KB 上限切掉。
+ */
+export function withListCountHint(toolName: string, text: string): string {
+  if (!/getConversationsList/i.test(toolName || "")) return text;
+  if (!/"more_data_available"\s*:\s*true/.test(text)) return text;
+  return (
+    "（跨页计数不要继续翻本列表：改调 count_list_by_time，由服务端翻完并只回小时计数。" +
+    "这一页不能用来估算总数或是否超阈值。）\n" +
+    text
+  );
+}
+
 function prepareToolResultText(toolName: string, text: string): string {
-  return truncateResult(compactFatListToolResult(toolName, text));
+  return truncateResult(withListCountHint(toolName, compactFatListToolResult(toolName, text)));
 }
 
 /** 递归按 key 排序对象，产出确定性 JSON（同语义不同 key 顺序的参数视为同一调用）。 */
@@ -1186,12 +1285,24 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   for (const item of builtinToolSpecs({ toolSearch: ctx.toolSearch })) serverOf.set(item.name, BUILTIN_SERVER);
   // 按需加载模式下 specs 会随检索增长，用局部变量（ctx.specs 只作初始值）。
   let specs = ctx.specs;
-  const specOfTool = new Map<string, ToolSpec>(
-    ctx.mcpTools.map((tool) => [
-      tool.name,
-      { name: tool.name, description: tool.description, parameters: tool.inputSchema },
-    ]),
-  );
+  const specOfTool = new Map<string, ToolSpec>(ctx.mcpTools.map((tool) => [tool.name, mcpToolSpec(tool)]));
+  // 模型直接点名未预载的工具时补上说明并执行（Anthropic：不要因 schema 未进上下文就拒绝）。
+  const hydrateDeferred = (name: string) => {
+    if (!ctx.toolSearch || ctx.loadedTools.has(name)) return;
+    const spec = specOfTool.get(name);
+    if (!spec) return;
+    ctx.loadedTools.add(name);
+    if (specs.length < MCP_MAX_TOOLS && !specs.some((item) => item.name === name)) {
+      specs = [...specs, spec];
+    }
+  };
+  const mcpArgs = (name: string, argsJson: string): Record<string, unknown> => {
+    const fitted = argsWithinToolSchema(specOfTool.get(name)?.parameters, safeJsonParse(argsJson));
+    const args = fitted && typeof fitted === "object" && !Array.isArray(fitted) ? (fitted as Record<string, unknown>) : {};
+    const tool = ctx.mcpTools.find((item) => item.name === name);
+    if (!tool) return args;
+    return applyPathDefaults(args, pathDefaultsForTool(getServer(tool.serverId)?.pathDefaults, tool.tool));
+  };
   const conversation: Turn[] = [...turns];
   const handles: ToolHandle[] = [];
   let text = "";
@@ -1560,7 +1671,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (ctx.deniedBuiltins?.has(c.name)) {
         return { ok: false, rawText: unattendedToolDenial(c.name), executed: false };
       }
-      const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
+      const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey, ctx.signal);
       if (builtin) {
         return {
           ok: builtin.ok,
@@ -1571,14 +1682,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
-      if (ctx.toolSearch && specOfTool.has(c.name) && !ctx.loadedTools.has(c.name)) {
-        return {
-          ok: false,
-          executed: false,
-          rawText: `工具 ${c.name} 尚未加载：请先调用 ${TOOL_SEARCH_NAME} 检索它（关键词可用工具名），加载后再调用。`,
-        };
-      }
-      const result = await callMcpTool(c.name, safeJsonParse(c.argsJson), ctx.signal);
+      hydrateDeferred(c.name);
+      const result = await callMcpTool(c.name, mcpArgs(c.name, c.argsJson), ctx.signal);
       return { ok: !result.isError, rawText: result.text, executed: true };
     };
     while (index < calls.length) {
@@ -1929,8 +2034,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       const toolStart = Date.now();
       executedSigs.add(sig);
       roundExecuted.push(sig);
-      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
-      // executed=false 表示并未真正执行（如按需加载模式下未检索的工具）——不计入失败熔断。
+      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey, ctx.signal);
+      // executed=false 表示并未真正执行（定时运行拒绝等）——不计入失败熔断。
       let executed = true;
       if (builtin) {
         ok = builtin.ok;
@@ -1974,13 +2079,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           // ok 已由 builtin.ok（澄清成功必为 true）给出，无需重复赋值。
           rawText = buildClarifyAck(answer, builtin.clarification.options);
         }
-      } else if (ctx.toolSearch && specOfTool.has(call.name) && !ctx.loadedTools.has(call.name)) {
-        // 按需加载模式：没检索加载过的工具不给调用（模型是照着索引里的名字猜的，参数说明它没见过）。
-        ok = false;
-        executed = false;
-        rawText = `工具 ${call.name} 尚未加载：请先调用 ${TOOL_SEARCH_NAME} 检索它（关键词可用工具名），加载后再调用。`;
       } else {
-        const result = await callMcpTool(call.name, safeJsonParse(call.argsJson), ctx.signal);
+        hydrateDeferred(call.name);
+        const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
         ok = !result.isError;
         rawText = result.text;
       }
@@ -2437,15 +2538,19 @@ export async function* chatStream(
     (opts.denyBuiltinTools || []).map((name) => String(name || "").trim()).filter(Boolean),
   );
   const builtinSpecs = builtinToolSpecs({ toolSearch }).filter((spec) => !omitBuiltins.has(spec.name));
-  const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
+  // 按需加载时仍预载本轮点名或检索命中的少量工具（不全量注入 281 份说明）。
+  const prefetched = toolSearch
+    ? prefetchDeferredTools(collected.tools, userText, Math.min(PREFETCH_TOOL_LIMIT, MCP_MAX_TOOLS))
+    : [];
+  const specs = [...builtinSpecs, ...(toolSearch ? prefetched : selection.specs)];
   // 接地护栏的第二路开启条件：**按工具动态判定**，而不是只认角色声明。
   // 本轮存在外部数据源工具（MCP 工具 / 联网检索 / 知识库检索）时，答案就应当接地于工具数据——
   // 否则「手上明明有取数工具、一次都没调就直接给事实结论」这条最典型的编造路径，
   // 对通用角色与客服角色完全没有拦截（最容易编数字的业务取数、BI 问答恰恰都在这一类）。
   // 只挂工作区工具（fs_* / write_todos 等）时不开启：那类轮次本就允许「没有合适工具时用自身知识作答」，
   // 开了会把写代码、翻译、创作也逼去凑证据——护栏拦的是「无证据的事实断言」，不是「没调工具」。
-  // 注意用 `collected.tools`（本轮可用的全部 MCP 工具）而不是 `specs`：按需加载模式下 MCP schema 未注入，
-  // 但模型仍可检索后调用，能力并未消失，不能因此放弃护栏。
+  // 注意用 `collected.tools`（本轮可用的全部 MCP 工具）而不是 `specs`：按需加载只预载少量 schema，
+  // 其余仍可检索或直接点名调用，能力并未消失，不能因此放弃护栏。
   const enforceGrounding =
     roleEnforceGrounding === true ||
     hasExternalDataSource([...collected.tools.map((tool) => tool.name), ...builtinSpecs.map((spec) => spec.name)]);
@@ -2461,7 +2566,7 @@ export async function* chatStream(
   // 否则模型会把「没有外部数据源」当成「那个域没有数据」。
   const tooling: ToolingStatus | null = useTools
     ? {
-        mcpToolCount: toolSearch ? 0 : selection.specs.length,
+        mcpToolCount: toolSearch ? prefetched.length : selection.specs.length,
         totalMcpTools: collected.tools.length,
         builtinToolCount: builtinSpecs.length,
         ready: collected.ready,
@@ -2474,6 +2579,7 @@ export async function* chatStream(
           ? {
               deferred: true,
               searchToolName: TOOL_SEARCH_NAME,
+              prefetchedCount: prefetched.length,
               catalog: catalogOf(collected.tools, labels),
             }
           : {}),
@@ -2589,7 +2695,7 @@ export async function* chatStream(
           mcpTools: collected.tools,
           specs,
           toolSearch,
-          loadedTools: new Set<string>(),
+          loadedTools: new Set(prefetched.map((spec) => spec.name)),
           signal,
           allowTask: true,
           allowWrite: true,

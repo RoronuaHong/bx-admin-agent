@@ -33,7 +33,13 @@ export function isGroundingEvidenceTool(name: string): boolean {
  *
  * `mcp__` 是 MCP 工具命名空间前缀（协议级契约，非业务词）。
  */
-const EXTERNAL_DATA_BUILTINS = new Set(["web_search", "fetch_url", "search_knowledge", "knowledge_sources"]);
+const EXTERNAL_DATA_BUILTINS = new Set([
+  "web_search",
+  "fetch_url",
+  "search_knowledge",
+  "knowledge_sources",
+  "count_list_by_time",
+]);
 
 /** 单个工具名是否属于外部数据源。 */
 export function isExternalDataSourceTool(name: string): boolean {
@@ -66,7 +72,8 @@ export const GROUNDING_HINT = [
   "2. 该请求本就不需要外部数据（打招呼、闲聊、询问你的身份或能力、超出你职责范围的请求、或只是让你说明/总结已有结论等）：" +
     "直接用自己的话如实回答——正常寒暄、说明你只负责哪一类事务并建议改用更合适的助手、或把问题问清楚；" +
     "不要声称数据源故障、未连接或无法访问（本轮并没有取数失败）。",
-  "无论走哪条路径：都不得凭记忆推断或编造（名称、数字、日期、归属、关系等），也不要叙述工具调用过程。",
+  "无论走哪条路径：都不得凭记忆推断或编造（名称、数字、日期、归属、关系等），也不要叙述工具调用过程。" +
+    "参数说明还没载入的工具先检索再调用；一次工具都没调用时，不得声称取不到数据。",
   "直接给出改好的回答正文：不要复述本条提示、不要说明你选了哪条路径、不要解释你的纠正过程。",
 ].join("\n");
 
@@ -123,6 +130,7 @@ export const DATA_NEED_SYSTEM = [
   // 否则「解释一段语法」「说清一个概念」都会被当成编造拦下来，护栏就成了问答的拦路虎。
   "3. 回答里的具体事实属于不依赖本次数据源的通用常识、概念解释、代码与算法说明（即使含日期 / 版本号这类细节）→ 输出 NO_DATA。",
   "4. 无法确定时输出 DATA。",
+  "5. 用户问题在要一个可核对的数量、名单或状态，回答却只说取不到、未能获取、没有统计到，或还在等工具返回、稍后填入数字、用占位符代替条数，且没有写明是用户禁止取数 → 输出 DATA。这是还没取数，不是无需外部数据。",
   "只输出 DATA 或 NO_DATA 两个词之一，不要解释、不要标点、不要任何其它内容。",
 ].join("\n");
 

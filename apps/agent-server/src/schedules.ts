@@ -441,15 +441,36 @@ export async function patchSchedule(
   return next;
 }
 
+// ---- 运行中定时任务的 abort 注册表（进程内；跨实例的最终兜底见 schedulerTick 的「跑完再查一次」）----
+// 删除任务时 abort 掉正在跑的那一期：否则它跑完仍会把结果（如 [NO_DATA] 预警）写进对话并投递，
+// 表现为「删了还收到预警」。key = schedule.id（同一任务串行，不会并发重入，故不会误覆盖）。
+const activeRunAborts = new Map<string, AbortController>();
+export function registerActiveScheduleRun(scheduleId: string, controller: AbortController): void {
+  activeRunAborts.set(scheduleId, controller);
+}
+export function unregisterActiveScheduleRun(scheduleId: string): void {
+  activeRunAborts.delete(scheduleId);
+}
+export function abortActiveScheduleRun(scheduleId: string): boolean {
+  const c = activeRunAborts.get(scheduleId);
+  if (!c) return false;
+  c.abort();
+  return true;
+}
+
 export async function deleteSchedule(id: string, ownerKey: string): Promise<boolean> {
   const prev = await getSchedule(id);
   if (!prev || prev.ownerKey !== ownerKey) return false;
   const coll = await getColl();
   if (!coll) {
     memory.delete(id);
+    abortActiveScheduleRun(id);
     return true;
   }
   await coll.deleteOne({ id });
+  // 任务可能在删除的这一刻正在跑（尤其多步工具 / 长思考的预警任务）：立刻中断它的运行，
+  // 避免它跑完把结果写进对话 + 投递出去 —— 这就是「删了还收到预警」的根因。
+  abortActiveScheduleRun(id);
   return true;
 }
 

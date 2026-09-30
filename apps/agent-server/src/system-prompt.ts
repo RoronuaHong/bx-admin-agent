@@ -86,6 +86,10 @@ const TOOLING_RULES = [
   "11. 收尾总结必须与真实情况一致：描述本次做了什么、生成了什么文件时，以工具实际返回与已落地的产物为准——" +
     "不要声称「导出失败 / 未生成」而实际产物卡片已生成，也不要声称「工具已用尽 / 已达上限」而实际调用远未触顶。" +
     "不确定某产物是否成功，就如实说「已为你生成 / 已尝试」，不要编造与事实相反的结论；做不到的事明说做不到，不把已做成的事说成没做成。",
+  "12. 查询参数只使用该工具参数说明里有的字段。用户要按某个字段筛选、但参数说明里没有这个查询参数时，不要写进参数，取回结果后再按该字段筛选计数。" +
+    "相对时间（最近 N 分钟、今天）按动态段里的当前时间换算成参数要求的格式，不要用记忆里的年份。",
+  "13. 分页列表要做跨页计数、按小时分桶或和阈值比较时，调用 count_list_by_time 一次取回计数。" +
+    "不要自己逐页翻列表，也不要把翻页委派给子代理。返回首行 complete 为 false（计数不完整）时，如实说没翻完，不要用已看到的页估算总数或是否超阈值。",
   "",
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
@@ -96,6 +100,7 @@ export const SUBAGENT_PROMPT = [
   "守则：",
   "1. 只依据工具返回的真实数据；查不到就如实说明。",
   "2. 最终回复是交给主代理的唯一交接物：结论与关键数字，400 字以内，不贴原始数据。",
+  "3. 分页列表的跨页计数用 count_list_by_time，不要自己逐页翻。complete 为 false 时只报告没翻完，不要估算。",
   "",
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
@@ -122,6 +127,8 @@ export interface ToolingStatus {
   deferred?: boolean;
   /** 检索工具名（按需加载模式的入口）。 */
   searchToolName?: string;
+  /** 按本轮问题预载了参数说明、可以直接调用的 MCP 工具数。 */
+  prefetchedCount?: number;
   /** 工具索引（仅名称，按服务器分组）。 */
   catalog?: Array<{ id: string; label: string; tools: string[] }>;
   /** 联网检索通道：可用性必须如实上报，否则模型会把「没有联网能力」当成「网上查不到」。 */
@@ -155,10 +162,16 @@ function renderToolingStatus(status: ToolingStatus): string {
     "工具通道现状（用于判断你的能力边界；不要向用户复述服务器标识）：",
   ];
   if (status.deferred) {
+    const searchName = status.searchToolName || "工具检索工具";
+    const prefetched = status.prefetchedCount ?? 0;
+    const rest = Math.max(0, (status.totalMcpTools ?? 0) - prefetched);
     lines.push(
-      `- 本次已注入内置工具 ${status.builtinToolCount} 个；可用的 MCP 工具共 ${status.totalMcpTools ?? 0} 个，` +
-        `参数说明**未载入**上下文（见下方索引）。要调用某个 MCP 工具前，先调 ${status.searchToolName || "工具检索工具"}` +
-        "按关键词加载它；未加载的工具直接调用会被拒绝。",
+      prefetched
+        ? `- 本次已注入内置工具 ${status.builtinToolCount} 个，并按本轮问题预载 ${prefetched} 个 MCP 工具的参数说明（这些可以直接调用）。` +
+            `其余 ${rest} 个的参数说明未载入，调用前先调 ${searchName}。一次工具都没调用时，不得声称取不到数据。`
+        : `- 本次已注入内置工具 ${status.builtinToolCount} 个；可用的 MCP 工具共 ${status.totalMcpTools ?? 0} 个，` +
+            `参数说明未载入上下文（见下方索引）。要调用某个 MCP 工具前，先调 ${searchName} 按关键词加载它。` +
+            "一次工具都没调用时，不得声称取不到数据。",
     );
   } else {
     lines.push(
@@ -247,6 +260,12 @@ export interface SystemPrompt {
   dynamic: string;
 }
 
+/** 当前时刻（动态段）：相对时间窗口必须按它换算，不能用模型记忆里的年份。 */
+export function renderNowClock(at = Date.now()): string {
+  const ms = Math.floor(at);
+  return `当前时间：${new Date(ms).toISOString()}（Unix 毫秒 ${ms}）。相对时间按这个时刻换算。`;
+}
+
 export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
   // 角色：人设与 skill 索引都随角色变化 → 两者都在**稳定前缀**里（同角色跨轮 cache 命中不变；
   // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
@@ -262,6 +281,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
     renderTodos(input.todos || []),
     renderEnabledSkills(input.enabledSkills),
     languageDirective(input.locale),
+    renderNowClock(),
   ].filter((part) => part && part.trim());
   return {
     stable: stableParts.join("\n\n"),

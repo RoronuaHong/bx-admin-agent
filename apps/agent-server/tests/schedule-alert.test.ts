@@ -79,6 +79,8 @@ test("SCHEDULE_ALERT_GUIDE：禁止出图/导出/截断估数，要求首行标�
   expect(SCHEDULE_ALERT_GUIDE).toMatch(/export_data/);
   expect(SCHEDULE_ALERT_GUIDE).toMatch(/结果已截断|截断/);
   expect(SCHEDULE_ALERT_GUIDE).toMatch(/短窗口|聚合|计数/);
+  expect(SCHEDULE_ALERT_GUIDE).toContain("count_list_by_time");
+  expect(SCHEDULE_ALERT_GUIDE).toMatch(/complete: false/);
   expect(SCHEDULE_ALERT_GUIDE).not.toMatch(/图仍要用/);
   const { SCHEDULE_UNGROUNDED_ALERT, decideAlertDelivery, parseAlertMarker } = await import("../src/schedule-alert.js");
   expect(parseAlertMarker(SCHEDULE_UNGROUNDED_ALERT)).toBe("NO_DATA");

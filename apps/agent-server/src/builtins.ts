@@ -22,6 +22,17 @@ import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
 import { addMemory, listMemory } from "./memory.js";
 import { addHistory, setFeedback } from "./movie/profile.js";
 import { fetchPage, readWebSearchConfig, webSearch } from "./web-search.js";
+import { callMcpTool } from "./mcp/hub.js";
+import { getServer } from "./mcp/config.js";
+import { applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
+import {
+  countPagedList,
+  formatCountReport,
+  LIST_COUNT_DEFAULT_PAGES,
+  mcpToolParts,
+  prepareListArgs,
+  type CountListReport,
+} from "./list-count.js";
 
 export const BUILTIN_SERVER = "builtin";
 
@@ -70,6 +81,13 @@ export const BUILTIN_RISK: Record<
   image_gen: { level: "write", scope: "workspace", reason: "调用外部生图服务并把结果写入工作区（无外部副作用）" },
   // 钉钉文档检索（方案 A）：只读检索，凭证缺失时返回配置指引而不报错。
   search_dingtalk_doc: { level: "read", scope: "external", reason: "检索钉钉文档（只读，无外部副作用）" },
+  // 只读拉取外部列表并在服务端计数。登记为 read：子代理可以调用（翻页不经过模型），
+  // 也不算副作用，额度失败后仍允许换模型重跑。
+  count_list_by_time: {
+    level: "read",
+    scope: "external",
+    reason: "分页拉取外部列表并在服务端按时间计数（只读，明细不进上下文）",
+  },
   // 定时任务（§17）：拆成「只读列举」与「变更管理」两个工具，而不是一个带 action 的多面工具——
   // risk.ts 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别，
   // 合并就会让「列举」也被要求确认。
@@ -539,6 +557,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "把一个独立子任务委派给子代理执行：子代理有自己独立的上下文和工具，执行完后只回传结论摘要。" +
         "适合：会产生大量中间数据的查询（主对话只拿结论）、可并行的多个独立子任务、多步骤小任务。" +
         "不适合一步就能完成的简单查询（直接调用工具更快）。" +
+        "分页列表的跨页计数不要委派，直接用 count_list_by_time。" +
         "注意：子代理看不到当前对话内容，description 必须自带全部背景。",
       {
         type: "object",
@@ -553,6 +572,31 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           },
         },
         required: ["description"],
+      },
+    ),
+    spec(
+      "count_list_by_time",
+      "把只返回分页明细的列表工具在服务端翻完，按整点小时计数，只把计数交回对话。" +
+        "用户要跨页统计（某一小时有没有超过 N、按小时的新开始条数）时用本工具一次完成。" +
+        "不要自己逐页调列表工具，也不要把翻页委派给子代理。" +
+        "payload 放列表工具本来的参数（时间窗口、筛选、排序），不要自己循环 index。" +
+        "分页字段写在 query_params.index / query_params.limit；没有 query_params 时写在顶层 index / limit。单页最多 99 条。" +
+        "返回首行 complete 为 false 表示没翻完，不能据此判断是否超过阈值。timeZone 用 IANA 名（默认 UTC）；above 是严格大于。",
+      {
+        type: "object",
+        properties: {
+          tool: jsonType("string", "MCP 工具全名，如 mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList"),
+          payload: {
+            type: "object",
+            description: "该列表工具的调用参数（含时间窗口）。服务端会写入 index/limit 并翻页，不要在这里循环。",
+          },
+          timeField: jsonType("string", "每行上的开始时间字段，毫秒时间戳（默认 start_time；没有时再看 in_time）"),
+          idField: jsonType("string", "去重用的 id 字段（默认 id）"),
+          timeZone: jsonType("string", "小时桶的 IANA 时区（默认 UTC）"),
+          above: jsonType("number", "只列出计数严格大于该值的小时；不传则只给峰值"),
+          maxPages: jsonType("number", `最多翻多少页（默认 ${LIST_COUNT_DEFAULT_PAGES}）`),
+        },
+        required: ["tool", "payload"],
       },
     ),
     spec(
@@ -1331,6 +1375,7 @@ export async function execBuiltin(
   conversationId: string,
   namespace = "generic",
   ownerKey?: string,
+  signal?: AbortSignal,
 ): Promise<BuiltinOutcome | null> {
   const args = safeJsonParse(argsJson);
   switch (name) {
@@ -1905,7 +1950,54 @@ export async function execBuiltin(
         text: `已记录 ${items.length} 部影片${withVerdict.length ? `（其中 ${withVerdict.length} 部带偏好态度）` : ""}，后续推荐会参考。`,
       };
     }
+    case "count_list_by_time": {
+      const toolName = str(args, "tool").trim();
+      if (!toolName) {
+        return { ok: false, text: "count_list_by_time 需要 tool（MCP 工具全名）" };
+      }
+      const rawArgs = args.payload;
+      if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
+        return { ok: false, text: "count_list_by_time 需要 payload（列表工具的调用参数，含时间窗口；不要自己翻 index）" };
+      }
+      const aboveRaw = args.above;
+      const above = aboveRaw == null || aboveRaw === "" ? undefined : Number(aboveRaw);
+      const parts = mcpToolParts(toolName);
+      const withDefaults = parts
+        ? applyPathDefaults(
+            rawArgs as Record<string, unknown>,
+            pathDefaultsForTool(getServer(parts.serverId)?.pathDefaults, parts.tool),
+          )
+        : (rawArgs as Record<string, unknown>);
+      const base = prepareListArgs(toolName, withDefaults);
+      const report = await countPagedList(
+        {
+          arguments: base,
+          timeField: str(args, "timeField").trim() || "start_time",
+          idField: str(args, "idField").trim() || "id",
+          timeZone: str(args, "timeZone").trim() || "UTC",
+          ...(above != null ? { above } : {}),
+          maxPages: Number(args.maxPages) || LIST_COUNT_DEFAULT_PAGES,
+        },
+        (pageArgs) => callMcpTool(toolName, pageArgs, signal),
+        signal,
+      );
+      attachHourFile(conversationId, report);
+      return { ok: report.ok, text: formatCountReport(report) };
+    }
     default:
       return null;
   }
+}
+
+function attachHourFile(conversationId: string, report: CountListReport): void {
+  if (!report.complete || !report.hours.length) return;
+  const file = `results/hour-counts-${Date.now()}.tsv`;
+  const body = [
+    `# complete: true`,
+    "hour\tcount",
+    ...report.hours.map((item) => `${item.hour}\t${item.count}`),
+  ].join("\n");
+  const written = fsWrite(conversationId, file, `${body}\n`);
+  if ("error" in written) report.fileError = written.error;
+  else report.file = written.path;
 }

@@ -3,7 +3,7 @@
 // 角色人设只保留角色特有内容。若再有人往人设里回填一份工具守则，这里会先红。
 // 设计口径见 src/system-prompt.ts 与 src/roles.ts 头注释。
 import { test, expect } from "vitest";
-import { buildSystemPrompt } from "../src/system-prompt.js";
+import { buildSystemPrompt, renderNowClock } from "../src/system-prompt.js";
 import { getRole } from "../src/roles.js";
 
 const TOOLING = {
@@ -57,6 +57,15 @@ test("[G] 工具纪律含事实核验条款（有检索工具就先核实；核�
   expect(stable).toContain("先用它核实");
   expect(stable).toContain("可能不准确");
   expect(stable).toContain("没有问到");
+});
+
+test("[H] 动态段带当前 Unix 毫秒，工具纪律要求按参数说明筛选", () => {
+  const { stable, dynamic } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
+  expect(stable).toContain("不要写进参数");
+  expect(stable).toContain("count_list_by_time");
+  expect(stable).toContain("不要自己逐页翻列表");
+  expect(dynamic).toContain("Unix 毫秒");
+  expect(renderNowClock(1_790_000_000_000)).toContain("1790000000000");
 });
 
 test("[F] 观影人设写清「何时该调工具 / 何时不该调工具」（对齐工具描述与系统提示的分工）", () => {

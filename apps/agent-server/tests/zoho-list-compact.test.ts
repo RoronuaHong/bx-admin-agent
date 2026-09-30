@@ -1,5 +1,5 @@
 import { test, expect } from "vitest";
-import { compactFatListToolResult } from "../src/chat.js";
+import { compactFatListToolResult, withListCountHint } from "../src/chat.js";
 
 test("compactFatListToolResult：压扁 Zoho getConversationsList 肥 JSON", () => {
   const fat = JSON.stringify({
@@ -28,6 +28,22 @@ test("compactFatListToolResult：压扁 Zoho getConversationsList 肥 JSON", () 
   expect(parsed.data[0]).toEqual({ id: "1", start_time: "1790676816781", country_code: "IN" });
   expect(parsed.data[1].country_code).toBe("UG");
   expect(slim).not.toMatch(/last_message_info/);
+});
+
+test("还有下一页时，计数提示放在结果头部", () => {
+  const slim = compactFatListToolResult(
+    "mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList",
+    JSON.stringify({ more_data_available: true, data: [{ id: "1", start_time: "1" }] }),
+  );
+  const hinted = withListCountHint("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", slim);
+  expect(hinted.startsWith("（跨页计数不要继续翻本列表")).toBe(true);
+  expect(hinted).toContain("count_list_by_time");
+  expect(withListCountHint("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", '{"more_data_available":false}')).not.toContain(
+    "count_list_by_time",
+  );
+  expect(
+    withListCountHint("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", '{ "more_data_available" : true }'),
+  ).toContain("count_list_by_time");
 });
 
 test("compactFatListToolResult：非列表工具原样返回", () => {

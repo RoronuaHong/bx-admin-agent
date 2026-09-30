@@ -52,9 +52,10 @@ test("[E] 子代理可执行范围按作用域判定：工作区写放行，需�
   for (const name of ["fs_write", "fs_edit"]) {
     expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
   }
-  // 只读照常放行。
-  for (const name of ["fs_read", "fs_ls"]) {
+  // 只读照常放行。分页计数也是只读：子代理必须能直接跑，不能再被脚本闸门挡住。
+  for (const name of ["fs_read", "fs_ls", "count_list_by_time"]) {
     expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
+    expect(verdictNeedsConfirm(resolveToolRisk(name)), name).toBe(false);
   }
   // 需要用户确认的外部写 / 破坏性：拒绝（子代理的确认事件送不倒用户面前，只能挂到超时）。
   const externalWrite: RiskVerdict = {

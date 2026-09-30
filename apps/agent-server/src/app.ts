@@ -75,11 +75,14 @@ import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import {
   garbledTextReason,
+  getSchedule,
   kickScheduleLoop,
   listSchedules,
   patchSchedule,
+  registerActiveScheduleRun,
   requestScheduleRun,
   startScheduleLoop,
+  unregisterActiveScheduleRun,
   validateTiming,
   type ChatSchedule,
   type ScheduleNotifyOn,
@@ -1646,6 +1649,8 @@ export function createApp() {
       conversationId,
       userText: wake ? `【事件唤醒】${wake}\n\n${schedule.prompt}` : schedule.prompt,
     });
+    // 登记本期的 abort 控制器，供删除任务时即时中断（见 schedules.ts 的 abortActiveScheduleRun）。
+    registerActiveScheduleRun(schedule.id, task.abort);
     // 任务级工具清单：任务自己勾了就按任务的（独立启用集），任务没勾才回落到对话启用集
     // （见 chat.ts 的 taskServers 分支）——别按「只收窄」理解。
     // 轮次预算也放宽：没人盯着，被轮次截断就等于这一期报告没有结论。
@@ -1659,20 +1664,31 @@ export function createApp() {
     // 同一份清单两处用：既从工具 schema 里摘掉（模型看不到就不会点），
     // 又在执行层兜底拒绝（模型若仍点名）——拒绝原因会记进本期运行记录。
     const deniedTools = [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])];
-    await consumeTask(task, {
-      ownerKey: schedule.ownerKey,
-      mcpServers: schedule.mcpServers,
-      // 预警要少轮次：列表截断后容易陷入「再取一页 / 再 parse」空转（实测 30+ 步、数分钟）。
-      maxRounds: onAlert
-        ? Math.min(SCHEDULE_MAX_TOOL_ROUNDS, Math.max(1, Number(process.env.MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS) || 12))
-        : SCHEDULE_MAX_TOOL_ROUNDS,
-      forceWrapUp: true,
-      // 预警：不注入报告型「必须出图」指引；并硬摘 render_chart / export_data。
-      taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
-      omitBuiltinTools: deniedTools,
-      denyBuiltinTools: deniedTools,
-      unattendedConclusion: isAlertRun ? "alert" : "report",
-    });
+    try {
+      await consumeTask(task, {
+        ownerKey: schedule.ownerKey,
+        mcpServers: schedule.mcpServers,
+        // 预警要少轮次：列表截断后容易陷入「再取一页 / 再 parse」空转（实测 30+ 步、数分钟）。
+        maxRounds: onAlert
+          ? Math.min(SCHEDULE_MAX_TOOL_ROUNDS, Math.max(1, Number(process.env.MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS) || 12))
+          : SCHEDULE_MAX_TOOL_ROUNDS,
+        forceWrapUp: true,
+        // 预警：不注入报告型「必须出图」指引；并硬摘 render_chart / export_data。
+        taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
+        omitBuiltinTools: deniedTools,
+        denyBuiltinTools: deniedTools,
+        unattendedConclusion: isAlertRun ? "alert" : "report",
+      });
+    } finally {
+      unregisterActiveScheduleRun(schedule.id);
+    }
+    // 运行期间任务被删除：即使上面的 abort 没在落库前拦住，这里也直接丢弃本期结果，
+    // 不再落运行记录、不再投递 —— 否则「删了还收到预警」会复现。删除那一刻跑完的进程
+    // 查 Mongo 已无此任务，必然走这里短路返回。
+    if (!(await getSchedule(schedule.id))) {
+      console.warn(`[scheduler] ${schedule.id} 运行期间被删除，丢弃本期结果（不落记录、不投递）`);
+      return "cancelled";
+    }
     const text = finalTextOf(task).trim();
     // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
     const charts = chartsOfTask(task);

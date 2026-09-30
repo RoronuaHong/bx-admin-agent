@@ -100,6 +100,8 @@ test("[J] 数据需求分诊：NO_DATA 必须先判（含 DATA 子串），识�
   expect(DATA_NEED_SYSTEM).toContain("NO_DATA");
   expect(DATA_NEED_SYSTEM).toContain("无法确定时输出 DATA");
   expect(DATA_NEED_SYSTEM).toContain("没有给出可核对的取值");
+  expect(DATA_NEED_SYSTEM).toContain("还没取数");
+  expect(DATA_NEED_SYSTEM).toContain("还在等工具返回");
 });
 
 test("[E3] 受约束的诚实兜底提示：带角色名、禁止外部事实断言、允许自报身份、禁止提及内部机制", () => {

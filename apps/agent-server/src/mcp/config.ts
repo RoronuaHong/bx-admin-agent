@@ -35,6 +35,12 @@ export interface McpServerConfig {
   tools?: string[];
   /** 新建对话默认勾选该服务器（仅影响新建，已有对话的启用集不受影响）。 */
   defaultEnabled?: boolean;
+  /**
+   * 固定的 path_variables。键 = 原始工具名（`*` = 该服务器全部工具），值 = 字段名 → 固定值。
+   * 典型用途：Zoho SalesIQ 的 screenname 不在工具说明里，模型会猜 test/default；
+   * 未知 portal 会被接口报成 1002 Invalid authorization header，看起来像授权坏了。
+   */
+  pathDefaults?: Record<string, Record<string, string>>;
 }
 
 /** 新建对话应默认启用的服务器 id 集（defaultEnabled 且未停用）。 */
@@ -195,6 +201,7 @@ export function upsertServer(input: Partial<McpServerConfig>): McpServerConfig {
     enabled: input.enabled === undefined ? (prev ? prev.enabled !== false : true) : input.enabled !== false,
     ...(input.env === undefined && prev?.env ? { env: prev.env } : {}),
     ...(input.headers === undefined && prev?.headers ? { headers: prev.headers } : {}),
+    ...(input.pathDefaults === undefined && prev?.pathDefaults ? { pathDefaults: prev.pathDefaults } : {}),
   };
   if (idx >= 0) list[idx] = merged;
   else list.push(merged);

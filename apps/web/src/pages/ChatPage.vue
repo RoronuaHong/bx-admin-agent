@@ -1664,8 +1664,6 @@ interface ConvState {
   pendingImages: UploadResult[];
   /** 待发的文档附件（PDF / Word / Excel / md / txt / csv）：随消息发 attachments，由服务端解析后注入上下文。 */
   pendingDocs: UploadResult[];
-  /** 服务端实际使用的模型名（可能因回退/降级与所选不同）。 */
-  activeModelLabel: string;
   /** 该对话最近一次错误（侧栏状态点用）。 */
   error: string;
   /** 对话级设置（模型 / 语言 / MCP 启用集 / 技能启用集）。 */
@@ -1682,7 +1680,6 @@ function blankState(): ConvState {
     controller: null,
     pendingImages: [],
     pendingDocs: [],
-    activeModelLabel: "",
     error: "",
     settings: { modelId: "", locale: "", mcpEnabled: [], skillsEnabled: [] },
     queue: [],
@@ -2128,14 +2125,12 @@ async function saveModelChoice(value: string) {
   const prev = state.settings.modelId;
   if (prev === value) return;
   state.settings.modelId = value;
-  state.activeModelLabel = models.value.find((m) => m.id === value)?.label || "";
   if (!convId) return;
   try {
     await patchConversation(convId, { model: value });
     syncConvLocal(convId, { model: value });
   } catch (err) {
     state.settings.modelId = prev;
-    state.activeModelLabel = models.value.find((m) => m.id === prev)?.label || "";
     showSettingsError(
       localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("模型保存失败", "Failed to save model", "Falha ao salvar o modelo", "मॉडल सहेजने में विफल")),
     );
@@ -2186,9 +2181,6 @@ let scrollQueued = false;
 const canSend = computed(
   () => Boolean(current.value.input.trim() || current.value.pendingImages.length) && !current.value.sending,
 );
-
-/** 当前选中的模型名（用于判断服务端实际使用的模型是否与选择一致）。 */
-const selectedModelLabel = computed(() => models.value.find((m) => m.id === modelId.value)?.label || "");
 
 /** 气泡更新时是否要跟随滚动：只有"正在看的这个对话"才滚，后台流不抢滚动条。 */
 function queueScrollIfCurrent(convId: string) {
@@ -2517,7 +2509,6 @@ async function createConvFromDraft(firstText: string): Promise<string> {
   // 草稿里挑过的设置带进新对话（runTurn 读的是新对话自己的 state，必须先搬再发）。
   const st = stateOf(conv.id);
   st.settings = { ...draft.settings, locale: uiLocale.value };
-  st.activeModelLabel = draft.activeModelLabel;
   currentId.value = conv.id;
   reportActiveConversation(conv.id);
   const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[] } = {
@@ -3571,8 +3562,6 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
     openReasoning.add(reply.id);
     queueScrollIfCurrent(convId);
     stickThinkingToBottom();
-  } else if (event.type === "model") {
-    state.activeModelLabel = event.label;
   } else if (event.type === "tool_call") {
     reply.steps = reply.steps || [];
     reply.steps.push({
@@ -3789,7 +3778,6 @@ async function runTurn(
   state.sending = true;
   state.error = "";
   const chosenModel = resolveModel(state.settings.modelId);
-  state.activeModelLabel = models.value.find((m) => m.id === chosenModel)?.label || "";
   // 中断句柄存进「该对话自己的」状态：切到别的对话后按停止不会误伤这一条。
   const controller = new AbortController();
   state.controller = controller;
@@ -5082,7 +5070,7 @@ onBeforeUnmount(() => {
             <button type="button" :class="{ active: runStatusFilter === 'failed' }" :aria-pressed="runStatusFilter === 'failed'" @click="runStatusFilter = 'failed'">{{ tx("失败", "Failed", "Falhou", "विफल") }}</button>
           </div>
           <div v-if="taskSectionOpen && !taskGroups.length" class="task-groups-empty">
-            {{ tx("还没有定时任务，用上方「新建定时任务」创建", "No tasks yet — create one above", "Nenhuma tarefa ainda — crie acima", "अभी कोई कार्य नहीं — ऊपर से बनाएँ") }}
+            {{ tx("还没有定时任务，点上方「新建」即可创建", "No tasks yet — click “New” above", "Nenhuma tarefa ainda — clique em “Novo” acima", "अभी कोई कार्य नहीं — ऊपर “नया” पर क्लिक करें") }}
           </div>
           <div v-if="taskSectionOpen" class="task-groups">
             <div v-for="g in taskGroups" :key="g.schedule.id" class="task-group">
@@ -6221,12 +6209,6 @@ onBeforeUnmount(() => {
           <span class="hamburger__bar" aria-hidden="true"></span>
         </button>
         <div class="top-actions">
-          <span
-            v-if="current.activeModelLabel && current.activeModelLabel !== selectedModelLabel"
-            class="model-tag"
-          >
-            {{ current.activeModelLabel }}
-          </span>
           <ModelSelect v-model="modelId" :models="models" />
           <span v-if="false" ref="resRoot" class="mcp-box">
             <button
@@ -9412,17 +9394,6 @@ onBeforeUnmount(() => {
   margin-left: auto;
 }
 
-.model-tag {
-  font-size: 12px;
-  line-height: 1;
-  color: var(--muted);
-  padding: 5px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--fill-soft) 65%, transparent);
-  white-space: nowrap;
-}
-
 /* ---- 资源/MCP 面板共用部件 ---- */
 .tools-badge {
   min-width: 16px;
@@ -11852,10 +11823,6 @@ button.step-head:disabled {
 }
 
 @media (max-width: 720px) {
-  .model-tag {
-    display: none;
-  }
-
   .top {
     gap: 8px;
     /* 顶部留出刘海屏安全区，避免被状态栏遮挡。 */
