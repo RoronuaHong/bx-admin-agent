@@ -737,28 +737,32 @@ async function callOpenAi(
       // 自愈无效 → 回滚记忆（同 unmarkTemperatureUnsupported）：别把「按措辞做的推测」固化成永久口径。
       if (!response.ok) unmarkReasoningReplayRequired(model);
     }
-    // 学习型自愈：端点拒绝 disabled 思考（如 kimi27hs 只接受 enabled）→ 记住并去掉 thinking 字段重发一次，
-    // 否则每次调用都白打 400（主对话拖慢首个增量、辅助调用拖垮接地护栏的兜底路径）。
-    if (wantNoThinking(model, opts) && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
-      markDisableThinkingUnsupported(model);
-      response = await postOnce(alreadyReplaying);
-      detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
-      // 自愈无效（省略后仍失败）→ 回滚记忆：根因不是这个字段，别把误判固化成永久行为。
-      if (!response.ok) unmarkDisableThinkingUnsupported(model);
-    }
-    // 学习型自愈：内部判定型调用以 temperature: 0 发送，端点若不接受 temperature 字段（任何值都 400）→
-    // 记住并省略该字段重发一次（模型按自身默认采样）。覆盖 kimi 系这类「整字段拒收」的端点。
-    // 记住之后由 postOnce 的默认参数接管（后续调用天然省略），这里只负责首次触发与「自愈无效即回滚」。
-    if (
-      opts.temperature === 0 &&
-      response.status === 400 &&
-      temperatureSupported(model) &&
-      isTempZeroRejected(detail)
-    ) {
-      markTemperatureUnsupported(model);
-      response = await postOnce(alreadyReplaying);
-      detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
-      if (!response.ok) unmarkTemperatureUnsupported(model);
+    // 学习型自愈（循环）：端点可能同时拒绝 disabled 思考与 temperature 字段，且报错往往只点名其一。
+    // 原「先思考后温度」的线性顺序有顺序缺陷：温度被识别并去掉、重发仍因 thinking:{type:disabled} 400，
+    // 而 thinking 分支已跳过、此后不再有 healing 入口 → 内部判定型辅助调用（接地护栏分诊 / 诚实兜底）
+    // 永远 400，最终回落确定性兜底文案（问候被回成「没取到数据」，与事实不符、观感也差）。
+    // 改为每轮重发后都重新评估两个字段，直到无 400 或两字段都已尝试过自愈。
+    let healedThinking = false;
+    let healedTemp = false;
+    while (!response.ok && (!healedThinking || !healedTemp)) {
+      if (!healedThinking && wantNoThinking(model, opts) && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
+        markDisableThinkingUnsupported(model);
+        response = await postOnce(alreadyReplaying);
+        detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+        // 自愈无效（省略后仍失败）→ 回滚记忆：根因不是这个字段，别把误判固化成永久行为。
+        if (!response.ok) unmarkDisableThinkingUnsupported(model);
+        healedThinking = true;
+        continue;
+      }
+      if (!healedTemp && opts.temperature === 0 && response.status === 400 && temperatureSupported(model) && isTempZeroRejected(detail)) {
+        markTemperatureUnsupported(model);
+        response = await postOnce(alreadyReplaying);
+        detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+        if (!response.ok) unmarkTemperatureUnsupported(model);
+        healedTemp = true;
+        continue;
+      }
+      break;
     }
   }
   if (!response.ok) {

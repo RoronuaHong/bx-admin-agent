@@ -320,7 +320,7 @@ export function feishuSign(secret: string, timestamp: number): string {
 }
 
 /** 关键词安全设置：正文/标题必须含该词，否则平台静默拒收（HTTP 200 + errcode 310000）。 */
-function applyKeyword(text: string, keyword?: string, singleLine = false): string {
+function applyKeyword(text: string, keyword?: string, _singleLine = false): string {
   const kw = (keyword || "").trim();
   if (!kw || text.includes(kw)) return text;
   // 贴在最后一行末尾，不要单独成段。单独一行会被当成结论（实测钉钉卡片末尾多出一个关键词）。
@@ -340,16 +340,27 @@ function dingtalkRequest(
     url.searchParams.set("timestamp", String(timestamp));
     url.searchParams.set("sign", dingtalkSign(channel.secret, timestamp));
   }
-  // 一律 markdown。带链接时若走 actionCard，部分钉钉客户端会把 UTF-8 正文按错误编码展示，中文变成乱码。
-  // 链接折进正文；自定义机器人不使用 action_card / btn_json_list（那是员工服务台的形状）。
-  const linkTail = links.length
-    ? `\n\n${links.map((link) => `[${link.title.slice(0, 20)}](${link.url.slice(0, 500)})`).join("  ")}`
-    : "";
+  // 有链接走整体跳转 actionCard：底部一个「打开对话」按钮，点击经 dingtalk:// 在钉钉内嵌 webview 打开
+  // （pc_slide=true = PC 侧边栏，移动端是应用内浏览器），不跳系统浏览器。正文仍是 markdown。
+  // 无链接才退回纯 markdown。历史上 actionCard 在部分客户端会把中文按错误编码显示成乱码，但本服务发送时
+  // 已显式 charset=utf-8 + 字节级 Content-Length（见 sendToChannel），乱码前提已堵，按钮卡片可放心用。
+  if (links.length) {
+    const payload = {
+      msgtype: "actionCard",
+      actionCard: {
+        title: title.slice(0, 100),
+        text: body.slice(0, 18000),
+        singleTitle: links[0].title.slice(0, 20),
+        singleURL: `dingtalk://dingtalkclient/page/link?url=${encodeURIComponent(links[0].url.slice(0, 500))}&pc_slide=true`,
+      },
+    };
+    return { url: url.toString(), payload };
+  }
   const payload = {
     msgtype: "markdown",
     markdown: {
       title: title.slice(0, 100),
-      text: `${body}${linkTail}`.slice(0, 18000),
+      text: body.slice(0, 18000),
     },
   };
   return { url: url.toString(), payload };
@@ -566,7 +577,7 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
           : "";
   const charts = (input.charts || []).filter((chart) => chart && chart.data !== undefined);
   const chartBlock = charts.length
-    ? [pack.chartSection(charts.length), ...charts.flatMap((chart) => chartToLines(chart, pack))].join("\n")
+    ? [pack.chartSection(charts.length), ...charts.flatMap((chart) => chartToLines(chart, pack))].join("\n\n")
     : "";
   const conclusion = input.text.trim() ? formatForIm(input.text, pack) : pack.empty;
   const record = [

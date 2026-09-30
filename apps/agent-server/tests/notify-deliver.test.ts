@@ -44,7 +44,7 @@ test("[A] 加签：钉钉/飞书算法不同且可复算（钉钉需 URL 编码�
   expect(dingtalkSign(secret, ts)).not.toBe(feishuSign(secret, ts));
 });
 
-test("[B] 钉钉：一律 markdown（链接折进正文），加签进 query", async () => {
+test("[B] 钉钉：无链接走 markdown；有链接走 actionCard（打开对话为按钮，dingtalk:// 内嵌打开），加签进 query", async () => {
   const { calls, impl } = fakeFetch();
   await sendToChannel(channel({ secret: "S" }), { title: "T", body: "B" }, { fetchImpl: impl, now: 123 });
   const plain = calls[0]!;
@@ -58,10 +58,19 @@ test("[B] 钉钉：一律 markdown（链接折进正文），加签进 query", a
     { title: "T", body: "B", links: [{ title: "打开", url: "https://x/y" }] },
     { fetchImpl: withLinks.impl },
   );
-  const payload = withLinks.calls[0]!.payload as { msgtype: string; markdown: { text: string } };
-  expect(payload.msgtype).toBe("markdown");
-  expect(payload.markdown.text).toContain("[打开](https://x/y)");
-  expect(payload).not.toHaveProperty("actionCard");
+  const payload = withLinks.calls[0]!.payload as {
+    msgtype: string;
+    actionCard: { singleTitle: string; singleURL: string; text: string };
+  };
+  expect(payload.msgtype).toBe("actionCard");
+  expect(payload.actionCard.singleTitle).toBe("打开");
+  // 按钮走 dingtalk://dingtalkclient/page/link：点击在钉钉内嵌 webview 打开，不跳系统浏览器
+  expect(payload.actionCard.singleURL).toBe(
+    "dingtalk://dingtalkclient/page/link?url=https%3A%2F%2Fx%2Fy&pc_slide=true",
+  );
+  // 正文仍是 markdown，且不再把链接折进正文（按钮承载跳转入口）
+  expect(payload.actionCard.text).toBe("B");
+  expect(payload.actionCard.text).not.toContain("dingtalk://");
 });
 
 test("[C] 飞书：走交互卡片，密钥进载荷，判定 code 而非 errcode", async () => {
@@ -120,6 +129,9 @@ test("[E] 关键词安全设置：正文/标题自动补关键词（平台要求
   const payload = calls[0]!.payload as { markdown: { title: string; text: string } };
   expect(payload.markdown.text).toContain("bx-agent");
   expect(payload.markdown.title).toContain("bx-agent");
+  // 关键词贴在正文末尾，不要单独成段，否则钉钉卡片会把关键词当成结论。
+  expect(payload.markdown.text).not.toContain("\n\nbx-agent");
+  expect(payload.markdown.text.endsWith("bx-agent")).toBe(true);
 });
 
 test("[F] Markdown → IM：表格折成「列=值」行、跳过分隔行、超出部分如实注明", () => {
@@ -252,6 +264,27 @@ test("[J] 通道校验：只放行已知机器人域名（SSRF 出口必须堵�
   } finally {
     delete process.env.NOTIFY_ALLOWED_HOSTS;
   }
+});
+
+test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单个换行粘成一行）", () => {
+  const msg = buildScheduleDelivery({
+    name: "印度对话量",
+    prompt: "检查",
+    status: "alert",
+    text: "[SPIKE]\n最近 60 分钟 320，阈值 300",
+    conversationId: "c",
+    locale: "zh",
+    trigger: "manual",
+    durationMs: 8_000,
+    at: Date.parse("2026-09-30T03:01:14Z"),
+  });
+  expect(msg.body.startsWith("【SPIKE】")).toBe(true);
+  expect(msg.body.indexOf("【SPIKE】")).toBeLessThan(msg.body.indexOf("任务：印度对话量"));
+  expect(msg.body).toContain("\n\n任务：印度对话量");
+  expect(msg.body).toContain("\n\n状态：预警");
+  expect(msg.body).toContain("\n\n触发：手动执行");
+  expect(msg.body).toContain("\n\n耗时：8 秒");
+  expect(msg.title).toBe("印度对话量 · 预警");
 });
 
 test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定时任务」", () => {
