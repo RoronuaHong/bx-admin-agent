@@ -92,7 +92,12 @@ test("对话持续占用超过等待窗口：如实记为已错过并推进下�
   expect(after?.lastStatus).toBe("skipped");
   expect(after?.lastNote || "").toContain("已错过");
   expect(after?.queuedSince).toBeUndefined();
-  expect(after?.nextRunAt || 0).toBeGreaterThan(later);
+  // 下一拍由 cron 的**绝对时刻**决定（本例是整点）：整点就在 11 分钟内时它会早于 later，
+  // 所以只断言「推进到了未来、且不再是排队时钉住的那个到点时刻」，不把周期长短假设进断言里。
+  const due0 = now - 20_000;
+  expect(after?.nextRunAt || 0).toBeGreaterThan(now);
+  expect(after?.nextRunAt || 0).not.toBe(due0);
+  expect(after?.nextRunAt || 0).toBeLessThanOrEqual(nextRunOf("0 * * * *", new Date(later))!);
 });
 
 test("长跑结束后 nextRunAt 落在『跑完之后』的下一拍，避免 */5 连环补跑", async () => {

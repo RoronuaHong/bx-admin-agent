@@ -8,7 +8,7 @@
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
-import { SCHEDULE_UNGROUNDED_ALERT, SCHEDULE_UNGROUNDED_REPORT, unattendedToolDenial } from "./schedule-alert.js";
+import { buildUnattendedConclusion, unattendedToolDenial } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
@@ -2611,15 +2611,11 @@ export async function* chatStream(
   // 没有事实断言的回答已在分诊放行。走到这里且 ungrounded 时，正文已是诚实兜底或确定性文案。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
-  // 协议句只替换确定性文案。兜底已经写出的话保留。
-  const cannedApology = !guarded || guarded === UNGROUNDED_REPLY;
-  const unattendedLine =
-    ungrounded && cannedApology && opts.unattendedConclusion === "alert"
-      ? SCHEDULE_UNGROUNDED_ALERT
-      : ungrounded && cannedApology && opts.unattendedConclusion === "report"
-        ? SCHEDULE_UNGROUNDED_REPORT
-        : "";
-  const finalText = unattendedLine || (ungrounded ? guarded || UNGROUNDED_REPLY : guarded);
+  // 无人值守（定时任务）且最终没取到可核对的数据时，正文按协议结论化（预警 = [NO_DATA] 首行标记）。
+  // 按状态判定，不比对措辞：这段是模型写的诚实兜底，措辞每期都可能不同。
+  const finalText =
+    buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: guarded }) ||
+    (ungrounded ? UNGROUNDED_REPLY : "");
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },

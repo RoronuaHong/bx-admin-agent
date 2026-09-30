@@ -2,10 +2,13 @@ import { test, expect } from "vitest";
 import {
   ALERT_COOLDOWN_MS,
   alertNextRunAt,
+  buildUnattendedConclusion,
   decideAlertDelivery,
   parseAlertMarker,
   pickNotifyPolicy,
   pickPurpose,
+  SCHEDULE_UNGROUNDED_ALERT,
+  SCHEDULE_UNGROUNDED_REPORT,
   unattendedToolDenial,
 } from "../src/schedule-alert.js";
 import { garbledTextReason, validateTiming } from "../src/schedules.js";
@@ -81,6 +84,40 @@ test("SCHEDULE_ALERT_GUIDE：禁止出图/导出/截断估数，要求首行标�
   expect(parseAlertMarker(SCHEDULE_UNGROUNDED_ALERT)).toBe("NO_DATA");
   expect(SCHEDULE_UNGROUNDED_ALERT).not.toMatch(/阈值/);
   expect(decideAlertDelivery({ marker: "NO_DATA" }).kind).toBe("skip");
+});
+
+test("buildUnattendedConclusion：交互对话不动正文，无人值守按状态判定不认措辞", () => {
+  // 交互对话（conclusion 缺省）：无论有没有取证失败，正文原样返回。
+  expect(buildUnattendedConclusion({ ungrounded: true, text: "这次没有实际取数" })).toBe("这次没有实际取数");
+  expect(buildUnattendedConclusion({ ungrounded: false, text: "取到了" })).toBe("取到了");
+
+  // 预警 + 取证失败：正文换成协议句，首行必须是 [NO_DATA]（投递旁路只认首行标记）。
+  // 关键回归：模型写的诚实兜底措辞不固定，不能靠「文案等于某句固定话术」来判定要不要注入。
+  const alertText = buildUnattendedConclusion({
+    ungrounded: true,
+    conclusion: "alert",
+    text: "没有实际取数，没法下结论",
+  });
+  expect(parseAlertMarker(alertText)).toBe("NO_DATA");
+  expect(alertText).toBe(SCHEDULE_UNGROUNDED_ALERT);
+
+  // 预警 + 取证失败 + 模型自己写了标记：尊重模型写的标记，不覆盖。
+  expect(
+    buildUnattendedConclusion({ ungrounded: true, conclusion: "alert", text: "[NORMAL]\n计数完整" }),
+  ).toBe("[NORMAL]\n计数完整");
+
+  // 预警 + 正常取得数据：不动正文（标不标记是模型的事）。
+  expect(buildUnattendedConclusion({ ungrounded: false, conclusion: "alert", text: "[SPIKE]\n破线" })).toBe(
+    "[SPIKE]\n破线",
+  );
+
+  // 报告 + 取证失败：保留模型写的正文（报告没有首行标记协议），空正文才回落确定性文案。
+  expect(buildUnattendedConclusion({ ungrounded: true, conclusion: "report", text: "这次没有实际取数" })).toBe(
+    "这次没有实际取数",
+  );
+  expect(buildUnattendedConclusion({ ungrounded: true, conclusion: "report", text: "  " })).toBe(
+    SCHEDULE_UNGROUNDED_REPORT,
+  );
 });
 
 test("alertNextRunAt：告警中加密到间隔的一半，平稳时回到 cron", () => {

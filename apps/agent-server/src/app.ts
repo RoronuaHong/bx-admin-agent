@@ -92,7 +92,6 @@ import {
   pickNotifyPolicy,
   pickPurpose,
   SCHEDULE_ALERT_GUIDE,
-  SCHEDULE_UNGROUNDED_REPORT,
   type ScheduleNotifyPolicy,
   type SchedulePurpose,
 } from "./schedule-alert.js";
@@ -234,6 +233,8 @@ async function consumeTask(
     omitBuiltinTools?: string[];
     /** 点名调用也会拒绝，并把拒绝写进本期工具记录（定时运行用）。 */
     denyBuiltinTools?: string[];
+    /** 无人值守结论协议：本轮没取到可核对的数据时，正文按 alert / report 协议结论化（定时运行用）。 */
+    unattendedConclusion?: "alert" | "report";
   },
 ): Promise<void> {
   const runId = newRunId();
@@ -418,6 +419,17 @@ function chartsOfTask(task: ChatTask): ChartSpec[] {
     });
   }
   return charts;
+}
+
+/**
+ * 本轮是否因「纠正后仍未取得工具数据」收束：读 usage 事件的协议字段，不比正文措辞——
+ * 正文是模型写的诚实兜底，措辞每期都可能不同，拿它当判据必然漏判。
+ */
+function ungroundedOfTask(task: ChatTask): boolean {
+  for (const event of task.buffer) {
+    if (event.type === "usage" && event.ungrounded) return true;
+  }
+  return false;
 }
 
 /** 把任务收束结果写进对话 UI 消息快照（upsertMessages 是全量替换，需先读后并）。 */
@@ -1605,6 +1617,8 @@ export function createApp() {
     // taskGuide：每期必须重新取数 + 正文要有可独立阅读的结论（上下文里躺着上期结论时尤其关键）。
     // 预警任务再追加结论协议（[SPIKE]/[NORMAL]/[NO_DATA]），投递旁路只认首行标记。
     const onAlert = pickNotifyPolicy(schedule.notifyPolicy) === "on_alert";
+    // 预警口径两处来源：显式勾了 on_alert 策略，或任务 purpose 就是 alert。
+    const isAlertRun = onAlert || schedule.purpose === "alert";
     // 无人值守默认拒绝改任务、删文件、跑命令/脚本；预警再拒绝出图/导出。
     // 同一份清单两处用：既从工具 schema 里摘掉（模型看不到就不会点），
     // 又在执行层兜底拒绝（模型若仍点名）——拒绝原因会记进本期运行记录。
@@ -1621,7 +1635,7 @@ export function createApp() {
       taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
       omitBuiltinTools: deniedTools,
       denyBuiltinTools: deniedTools,
-      unattendedConclusion: onAlert || schedule.purpose === "alert" ? "alert" : "report",
+      unattendedConclusion: isAlertRun ? "alert" : "report",
     });
     const text = finalTextOf(task).trim();
     // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
@@ -1631,12 +1645,16 @@ export function createApp() {
     // 跑完了却一句收尾文本都没有 = 这一期没产出结论（实测多为轮次预算耗尽）：
     // 记 success 会推一条「成功 ·（本次未产出内容）」的空报告，看着像一切正常，必须如实记 failed。
     // 报告被接地护栏拦住时正文是「没有写结论」，同样不能记成功。
-    const noConclusion = !text || text === SCHEDULE_UNGROUNDED_REPORT;
+    // 判据是 usage 的 ungrounded 状态而不是那句固定文案：模型写的诚实兜底措辞不固定，
+    // 按文案相等判定会让「没取到数据的一期」被记成成功（还要推一条空壳报告）。
+    // 预警例外：正文首行是 [NO_DATA]，属「检查过但没数据」的正常结果，仍记成功，由 marker 决定推不推。
+    const ungrounded = ungroundedOfTask(task);
+    const noConclusion = !text || (ungrounded && !isAlertRun);
     const final = finished === "success" && noConclusion ? "failed" : finished;
     if (finished === "success" && noConclusion) {
       console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽或未取到数据），按 failed 记账`);
     }
-    const marker = onAlert || schedule.purpose === "alert" ? parseAlertMarker(text) : null;
+    const marker = isAlertRun ? parseAlertMarker(text) : null;
     const finishedAt = Date.now();
     const runMeta = { trigger: runTrigger as "schedule" | "manual" | "wake", durationMs: finishedAt - runStartedAt };
     // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：

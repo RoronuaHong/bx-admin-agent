@@ -51,6 +51,30 @@ export const SCHEDULE_ALERT_GUIDE =
   "5) 必须重新取数；不得沿用本对话历史轮次的结论或数字。不要改用户指令里的阈值。" +
   "无 meaningful 变化时不要写长报告（引擎侧已按标记决定是否推送）。";
 
+/**
+ * 无人值守收束正文的协议化：接地护栏最终判定「没取到可核对的数据」时，把正文换成协议结论。
+ *
+ * 为什么按状态判定而不是比对措辞：这段正文是**模型写的受约束诚实兜底**，措辞每期都可能不同
+ * （实测出现过「没有实际取数」「未进行实际取数」）。原实现只在正文恰好等于确定性兜底文案时才注入
+ * 协议行，于是一旦模型自由发挥，预警正文就没有首行标记 —— parseAlertMarker 认不出来，
+ * 既落不到 marker，也和「模型没遵守协议」无法区分。判定依据只能是状态（本轮是否取证失败）。
+ */
+export function buildUnattendedConclusion(input: {
+  /** 本轮是否因「纠正后仍未取得工具数据」收束（chat.ts 的接地护栏状态）。 */
+  ungrounded: boolean;
+  /** 任务类型；不传 = 交互对话，正文原样不动。 */
+  conclusion?: "alert" | "report";
+  /** 收束正文（已过角色身份护栏）。 */
+  text: string;
+}): string {
+  const body = String(input.text || "").trim();
+  if (!input.ungrounded || !input.conclusion) return body;
+  if (input.conclusion === "report") return body || SCHEDULE_UNGROUNDED_REPORT;
+  // 预警：首行必须是协议标记。模型按指引自己写了标记就尊重它，没写就换成确定性协议句
+  // （不追加模型那句自由措辞——它是交互语境的话术，在这里只是噪音）。
+  return parseAlertMarker(body) ? body : SCHEDULE_UNGROUNDED_ALERT;
+}
+
 /** 从结论正文解析首行协议标记；认不出来返回 null（on_alert 下按不推处理）。 */
 export function parseAlertMarker(text: string): AlertMarker | null {
   const first = String(text || "")
