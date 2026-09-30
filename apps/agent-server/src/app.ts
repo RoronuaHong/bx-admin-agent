@@ -60,7 +60,16 @@ import {
   type ChatTask,
 } from "./chat-tasks.js";
 import { fsList, fsRead, fsRemoveConversation, fsResolve, fsStat, mimeOf } from "./fs-store.js";
-import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, type RunTrace } from "./trace.js";
+import {
+  appendRunTrace,
+  findRunTrace,
+  getRelease,
+  listRunTraces,
+  listSpanTraces,
+  newRunId,
+  type RunStatus,
+  type RunTrace,
+} from "./trace.js";
 import { buildMetrics } from "./metrics.js";
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
@@ -665,6 +674,19 @@ export function createApp() {
     const conversationId = c.req.query("conversationId") || undefined;
     const runs = listRunTraces({ ownerKey: c.get("owner"), conversationId, limit });
     return c.json({ release: getRelease(), runs });
+  });
+
+  // ---- span 级追踪（llm / tool 分层）：回答「时间花在哪一次调用上」 ----
+  // 归属校验必须回查 run：span 文件不带 owner，不校验就能拿别人的 runId 看整条调用链。
+  app.get("/chat/trace/spans", (c) => {
+    const runId = (c.req.query("runId") || "").trim();
+    if (!runId) return errorJson(c, 400, "CHAT_TRACE_RUN_ID_REQUIRED", "缺少 runId");
+    const run = findRunTrace(runId);
+    if (!run || (run.ownerKey && run.ownerKey !== c.get("owner"))) {
+      // 不存在与不属于自己统一 404（不泄漏存在性，与对话/审计同口径）。
+      return errorJson(c, 404, "CHAT_TRACE_RUN_NOT_FOUND", "该运行不存在");
+    }
+    return c.json({ runId, spans: listSpanTraces(runId) });
   });
 
   // ---- Prometheus 指标（§可观测）：纯只读聚合，不新建数据源 ----

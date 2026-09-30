@@ -22,6 +22,24 @@ const VECTORS_PATH = path.join(RAG_DIR, "vectors.json");
 const CHUNK_CHARS = 900;
 const CHUNK_OVERLAP = 120;
 
+/**
+ * 文档级访问控制（权限过滤，§知识库 F15）。
+ * 字段都可选、且**缺省 = 公开**：老索引没有 ACL 也能继续检索（不重建即丢数据）。
+ * 两个维度是「与」关系：同时给了 owners 与 roles，两个都要命中才可见。
+ */
+export interface RagAcl {
+  /** 允许查看的设备 owner 标注（与对话/记忆同口径的 ownerKey）。 */
+  owners?: string[];
+  /** 允许查看的角色（namespace / agentId）。 */
+  roles?: string[];
+}
+
+/** 检索者的身份：两维都可缺省，缺省即「没有该维度的身份」。 */
+export interface RagViewer {
+  ownerKey?: string;
+  role?: string;
+}
+
 export interface RagDoc {
   id: string;
   title: string;
@@ -32,12 +50,29 @@ export interface RagDoc {
   hash?: string;
   /** 命名空间（按角色隔离）：默认 "generic"。检索/列举按命名空间过滤，避免某角色语料对其它角色可见。 */
   namespace?: string;
+  /** 文档级访问控制；缺省 = 公开可见。 */
+  acl?: RagAcl;
 }
 
 /** 命名空间匹配：历史文档未打 namespace 一律归 generic（向后兼容旧索引，避免重建即丢检索）。 */
 function matchesNamespace(doc: RagDoc, namespace: string): boolean {
   if (doc.namespace) return doc.namespace === namespace;
   return namespace === "generic";
+}
+
+/**
+ * 文档对当前检索者是否可见（纯函数，便于单测）。
+ * 取向是**缺省放行、显式收敛**：没写 ACL 的文档谁都能检索到；
+ * 写了就必须命中，命中不了就看不见——而不是「猜一下给不给看」。
+ */
+export function visibleTo(doc: RagDoc, viewer?: RagViewer): boolean {
+  const acl = doc.acl;
+  if (!acl) return true;
+  const owners = (acl.owners || []).filter(Boolean);
+  const roles = (acl.roles || []).filter(Boolean);
+  if (owners.length && !(viewer?.ownerKey && owners.includes(viewer.ownerKey))) return false;
+  if (roles.length && !(viewer?.role && roles.includes(viewer.role))) return false;
+  return true;
 }
 
 /**
@@ -185,6 +220,8 @@ export interface IngestInput {
   hash?: string;
   /** 命名空间（按角色隔离），默认 "generic"。 */
   namespace?: string;
+  /** 文档级访问控制；缺省 = 公开可见。 */
+  acl?: RagAcl;
 }
 
 /** 入库：同 id 覆盖、其余保留；返回新增/更新的切片数。 */
@@ -204,6 +241,7 @@ export async function ingest(inputs: IngestInput[]): Promise<number> {
         updatedAt: now,
         namespace: ns,
         ...(input.hash ? { hash: input.hash } : {}),
+        ...(input.acl ? { acl: input.acl } : {}),
       });
     });
   }
@@ -270,11 +308,15 @@ export function clearAll(): number {
   return n;
 }
 
-export function listSources(namespace?: string): Array<{ source: string; title: string; chunks: number }> {
+export function listSources(
+  namespace?: string,
+  viewer?: RagViewer,
+): Array<{ source: string; title: string; chunks: number }> {
   const map = new Map<string, { source: string; title: string; chunks: number }>();
   const ns = namespace ? effectiveNamespace(namespace) : "";
   for (const d of loadIndex().docs) {
     if (ns && !matchesNamespace(d, ns)) continue;
+    if (!visibleTo(d, viewer)) continue;
     const cur = map.get(d.source);
     if (cur) cur.chunks += 1;
     else map.set(d.source, { source: d.source, title: d.title, chunks: 1 });
@@ -326,9 +368,17 @@ export interface RagHit {
 }
 
 /** 混合检索：词法 TF-IDF 与向量余弦各自排序，RRF 融合（1/(60+rank)）。可按命名空间隔离；角色专属语料为空时回落公共语料。 */
-export async function search(query: string, topK = 5, namespace?: string): Promise<RagHit[]> {
+export async function search(
+  query: string,
+  topK = 5,
+  namespace?: string,
+  viewer?: RagViewer,
+): Promise<RagHit[]> {
   let docs = loadIndex().docs;
   if (namespace) docs = docs.filter((d) => matchesNamespace(d, effectiveNamespace(namespace)));
+  // 权限过滤：与命名空间过滤同一层做掉，不可见的文档根本不进召回（不是「召回后隐藏」——
+  // 那样排序与 RRF 融合仍会被不可见内容影响，等于按别人的语料排自己的结果）。
+  docs = docs.filter((d) => visibleTo(d, viewer));
   if (!docs.length) return [];
   const q = query.trim();
   if (!q) return [];

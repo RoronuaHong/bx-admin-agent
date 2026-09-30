@@ -60,7 +60,7 @@ import { webSearchStatus } from "./web-search.js";
 import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
-import { appendRoundTrace } from "./trace.js";
+import { appendRoundTrace, appendSpanTrace } from "./trace.js";
 import { readFileSync } from "node:fs";
 import { fsImportFile } from "./fs-store.js";
 
@@ -1281,6 +1281,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         conversation.push({ role: "user", content: WRAP_UP_HINT });
       }
       // 强制工具通道在「没有工具」时无意义（部分网关会直接 400），收尾轮必须一起关掉。
+      const llmStart = Date.now();
       const gen = streamCall(
         ctx.model,
         conversation,
@@ -1301,6 +1302,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         step = await gen.next();
       }
       outcome = step.value as CallOutcome;
+      // span 级埋点：一次模型尝试一行（重试各记一条）。只记耗时与成败，不记内容
+      // （内容属于上下文治理，不该再抄一份；定位「时间花在哪」有这两项就够了）。
+      if (ctx.runId) {
+        appendSpanTrace({
+          runId: ctx.runId,
+          at: llmStart,
+          kind: "llm",
+          name: ctx.model.id,
+          durationMs: Math.max(0, Date.now() - llmStart),
+          ok: !outcome.failure,
+          ...(outcome.failure ? { error: outcome.failure.slice(0, 200) } : {}),
+        });
+      }
       if (!outcome.failure) {
         // 空回合（既无正文、也无工具调用、连思考都没有）不是「模型表示没有内容」，而是上游抖动：
         // 共享/免费端点上很常见。直接收束会让用户看到空白气泡（同一次提问重发往往就有内容），
@@ -1912,6 +1926,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       // 内置工具优先（fs_* / write_todos / read_skill）；其余走 MCP 通道。
+      const toolStart = Date.now();
       executedSigs.add(sig);
       roundExecuted.push(sig);
       const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
@@ -2013,6 +2028,18 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         args: truncateArgs(call.argsJson),
         summary: ok ? handleSummary(rawText) : "执行失败",
       });
+      // span 级埋点：单个工具一行。慢工具是「这一轮为什么这么久」最常见的答案，
+      // 轮级只有聚合数，看不出是哪一个卡住。
+      if (ctx.runId) {
+        appendSpanTrace({
+          runId: ctx.runId,
+          at: toolStart,
+          kind: "tool",
+          name: call.name,
+          durationMs: Math.max(0, Date.now() - toolStart),
+          ok: executed && ok,
+        });
+      }
     }
     // 每轮结束治理一次：给下一轮模型调用留出预算（超预算的大结果卸载到工作区）。
     const governed = governToolResults(conversation, ctx.conversationId);

@@ -118,6 +118,96 @@ export function appendRoundTrace(entry: RoundTrace): void {
   }
 }
 
+// ───────────────────────── span 级埋点（llm / tool 分层） ─────────────────────────
+// run 级回答「这次运行怎么样」，轮级回答「每一轮做了什么」，但都回答不了
+// 「时间到底花在哪一次模型调用 / 哪一个工具上」——这正是与 OTel 的主要差距（B 章「可观测」）。
+// 这里补最小的一层：只记**耗时、成功与否、规模**，不记内容（内容属于上下文治理，不该再抄一份）。
+// 落盘方式与轮级一致：按 runId 分文件 append-only，best-effort。
+
+export type SpanKind = "llm" | "tool";
+
+export interface SpanTrace {
+  runId: string;
+  /** span 起始时刻。 */
+  at: number;
+  kind: SpanKind;
+  /** 工具名（tool）/ 模型标识（llm）。 */
+  name?: string;
+  durationMs: number;
+  ok?: boolean;
+  /** token（llm span 才有；含 prompt+completion 的估算或 usage 上报值）。 */
+  tokens?: number;
+  /** 失败原因（截断，不落原文）。 */
+  error?: string;
+}
+
+function spanFile(runId: string): string {
+  return resolve(TRACE_DIR, `spans-${runId}.jsonl`);
+}
+
+/** 追加一条 span；best-effort，失败仅告警不抛错（不阻断对话）。 */
+export function appendSpanTrace(entry: SpanTrace): void {
+  try {
+    mkdirSync(TRACE_DIR, { recursive: true });
+    appendFileSync(spanFile(entry.runId), `${JSON.stringify(entry)}\n`, "utf-8");
+  } catch (err) {
+    console.warn(`[trace] span 写入失败：${String((err as Error)?.message || err)}`);
+  }
+}
+
+/** 只读：某次 run 的 span 列表（按时间正序，便于看调用链）。 */
+export function listSpanTraces(runId: string, limit = 200): SpanTrace[] {
+  const file = spanFile(runId);
+  if (!existsSync(file)) return [];
+  try {
+    const lines = readFileSync(file, "utf-8").split("\n");
+    const out: SpanTrace[] = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        out.push(JSON.parse(line) as SpanTrace);
+      } catch {
+        /* 单行损坏忽略 */
+      }
+      if (out.length >= Math.max(1, Math.min(2000, limit))) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 按 runId 回查 run 记录（span 端点做归属校验用）。
+ * span 文件本身不带 owner —— 不回查就能拿别人的 runId 看整条调用链，所以这一步是必须的。
+ */
+export function findRunTrace(runId: string): RunTrace | undefined {
+  const id = String(runId || "").trim();
+  if (!id || !existsSync(TRACE_DIR)) return undefined;
+  const files = readdirSync(TRACE_DIR)
+    .filter((name) => /^runs-\d{6}\.jsonl$/.test(name))
+    .sort()
+    .reverse();
+  for (const file of files) {
+    let lines: string[] = [];
+    try {
+      lines = readFileSync(resolve(TRACE_DIR, file), "utf-8").split("\n").reverse();
+    } catch {
+      continue;
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const run = JSON.parse(line) as RunTrace;
+        if (run.runId === id) return run;
+      } catch {
+        /* 单行损坏忽略 */
+      }
+    }
+  }
+  return undefined;
+}
+
 export interface RunTraceFilter {
   ownerKey?: string;
   conversationId?: string;

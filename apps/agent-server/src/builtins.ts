@@ -1809,7 +1809,7 @@ export async function execBuiltin(
       const query = str(args, "query").trim();
       if (!query) return { ok: false, text: "search_knowledge 需要 query" };
       const topK = Math.min(Math.max(Number(args.topK) || 5, 1), 20);
-      const hits = await ragSearch(query, topK, namespace);
+      const hits = await ragSearch(query, topK, namespace, { ownerKey, role: namespace });
       if (!hits.length) return { ok: true, text: "（知识库中没有匹配内容）" };
       return {
         ok: true,
@@ -1819,7 +1819,7 @@ export async function execBuiltin(
       };
     }
     case "knowledge_sources": {
-      const sources = ragSources(namespace);
+      const sources = ragSources(namespace, { ownerKey, role: namespace });
       if (!sources.length) return { ok: true, text: "（知识库为空：先用 build-rag-index 入库）" };
       return {
         ok: true,

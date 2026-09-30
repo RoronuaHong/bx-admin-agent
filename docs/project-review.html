@@ -1598,7 +1598,7 @@ src/
 <tr><td>前端分层</td><td>ChatPage.vue ≈380KB / 约 10560 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
 <tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16）。<strong>2026-09-30 补了 <code>.github/workflows/ci.yml</code></strong>：跑类型检查 + 全量单测（带 mongo service）——它跑的是<strong>测试</strong>，不是评测门禁；护栏行为仍由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 并接进同一 workflow，把 read/write 场景接进定时回归</td></tr>
 <tr><td>权限与多租户</td><td>owner cookie 非认证</td><td>若要对外，补真实登录 + 服务端 session</td></tr>
-<tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>权限过滤仍缺</strong></td><td>先补权限过滤；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
+<tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>2026-09-30 补上文档级权限过滤</strong>：<code>RagDoc.acl</code>（owners / roles，缺省 = 公开），检索与列来源在召回前过滤（不是召回后隐藏，避免不可见内容影响排序）</td><td>入库端按来源打 ACL 的策略（谁能给文档标权限）；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
 <tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合 + <strong>2026-09-30 起有前端页面</strong>（<code>/trace</code>：run 列表 + 汇总卡片，含接地纠正 / 事后核验 / 未取证三列）</td><td>跨进程任务队列 / llm-tool 分层 span（<strong>Prometheus 指标已于 2026-09-30 补上</strong>：<code>GET /chat/metrics</code> 文本格式，owner 隔离）</td></tr>
 <tr><td>技能治理</td><td>静态 SKILL.md</td><td>按项目/角色定制，加载成本度量</td></tr>
 </tbody>
@@ -1714,7 +1714,7 @@ src/
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>
-<div class="bad"><strong>读这份表的方法</strong>：前 <strong>11 项</strong>是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）——其中「前端架构」一格实际是<strong>欠账</strong>（明知该拆而没拆，§23 卡片同样标「已知欠账」）；「检索存储」「异步任务」「可观测」三格里各自嵌了一条<strong>已知缺口</strong>（无权限过滤 / 无轮次级断点恢复 / 无 llm-tool 分层 span），它们是**待补的功能**而非取舍。最后一行是<strong>曾为缺陷、现已修复</strong>的项，保留只为记录教训。把三者分开写，是为了避免把 bug 包装成架构决策。</div>
+<div class="bad"><strong>读这份表的方法</strong>：前 <strong>11 项</strong>是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）——其中「前端架构」一格实际是<strong>欠账</strong>（明知该拆而没拆，§23 卡片同样标「已知欠账」）；「检索存储」「异步任务」「可观测」三格里各自嵌过一条<strong>已知缺口</strong>（无权限过滤 / 无轮次级断点恢复 / 无 llm-tool 分层 span），它们是**待补的功能**而非取舍——其中「权限过滤」与「llm-tool 分层 span」已于 2026-09-30 补上（<code>rag/store.ts</code> 的 <code>acl</code> + <code>visibleTo</code>；<code>trace.ts</code> 的 <code>SpanTrace</code> + <code>GET /chat/trace/spans</code>），只剩轮次级断点恢复未做。最后一行是<strong>曾为缺陷、现已修复</strong>的项，保留只为记录教训。把三者分开写，是为了避免把 bug 包装成架构决策。</div>
 </section>
 
 <hr />
