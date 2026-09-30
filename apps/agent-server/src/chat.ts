@@ -8,7 +8,7 @@
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
-import { unattendedToolDenial } from "./schedule-alert.js";
+import { SCHEDULE_UNGROUNDED_ALERT, SCHEDULE_UNGROUNDED_REPORT, unattendedToolDenial } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
@@ -2255,6 +2255,12 @@ export async function* chatStream(
     omitBuiltinTools?: string[];
     /** 点名调用也拒绝，并把拒绝写进本期工具记录（定时运行用；交互式不传）。 */
     denyBuiltinTools?: string[];
+    /**
+     * 定时运行被接地护栏拦住时的收束口径。
+     * alert：正文改成 [NO_DATA] 协议行。report：一句「没有写结论」，由调度器记失败。
+     * 不传 = 交互对话，仍走诚实兜底。
+     */
+    unattendedConclusion?: "alert" | "report";
   } = {},
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string; runId?: string },
@@ -2605,7 +2611,14 @@ export async function* chatStream(
   // 宁如实说取不到，也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
-  const finalText = ungrounded ? guarded || UNGROUNDED_REPLY : guarded;
+  // 定时运行被接地护栏拦住时，不用交互对话那句道歉：预警要留下 [NO_DATA]，报告要明确「没有写结论」。
+  const unattendedLine =
+    ungrounded && opts.unattendedConclusion === "alert"
+      ? SCHEDULE_UNGROUNDED_ALERT
+      : ungrounded && opts.unattendedConclusion === "report"
+        ? SCHEDULE_UNGROUNDED_REPORT
+        : "";
+  const finalText = unattendedLine || (ungrounded ? guarded || UNGROUNDED_REPLY : guarded);
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },

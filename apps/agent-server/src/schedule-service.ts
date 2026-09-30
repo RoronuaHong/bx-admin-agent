@@ -44,9 +44,14 @@ import { loadServers } from "./mcp/config.js";
  * 悬空引用（服务器已被删）写进任务只会让到点运行静默少能力，排查时毫无线索。
  * 只过滤、不报错——响应里回传落库后的任务，调用方一眼能看出哪些没生效。
  */
+/** 任务级 id 集合一律按当前配置过滤：悬空引用写进任务只会让能力静默失效，不落库、诚实过滤。 */
+function filterKnown(ids: string[] | undefined, known: string[]): string[] {
+  const set = new Set(known);
+  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => set.has(id)))];
+}
+
 export function knownMcpIds(ids?: string[]): string[] {
-  const known = new Set(loadServers().map((server) => server.id));
-  return [...new Set((ids || []).map((id) => String(id || "").trim()).filter((id) => known.has(id)))];
+  return filterKnown(ids, loadServers().map((server) => server.id));
 }
 
 /**
@@ -54,8 +59,7 @@ export function knownMcpIds(ids?: string[]): string[] {
  * 悬空的目录名写进任务只会让勾选静默失效——不落库，诚实过滤。
  */
 export function knownSkillDirs(dirs?: string[]): string[] {
-  const known = new Set(listSkillMetas().map((s) => s.dir));
-  return [...new Set((dirs || []).map((d) => String(d || "").trim()).filter((d) => known.has(d)))];
+  return filterKnown(dirs, listSkillMetas().map((s) => s.dir));
 }
 
 /** 投递触发条件：只认这两个状态，其余（跳过/取消）一律不推。 */

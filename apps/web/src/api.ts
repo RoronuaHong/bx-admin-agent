@@ -664,7 +664,14 @@ export interface ScheduleDto {
    */
   runMode?: "new" | "same";
   /** 各期运行记录（新的在前，受服务端上限截断）。 */
-  runs?: Array<{ conversationId: string; at: number; status?: ScheduleStatus; marker?: AlertMarker }>;
+  runs?: Array<{
+    conversationId: string;
+    at: number;
+    status?: ScheduleStatus;
+    marker?: AlertMarker;
+    trigger?: "schedule" | "manual" | "wake";
+    durationMs?: number;
+  }>;
   /** 未读期数（>0 时侧栏显示角标；打开任一期会话后清零）。 */
   unreadRuns?: number;
   name?: string;

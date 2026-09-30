@@ -1506,26 +1506,38 @@ function taskConvText(t: ScheduleDto): string {
 const editingTask = computed(() => tasks.value.find((t) => t.id === editingTaskId.value) || null);
 
 /**
- * 打开任务的专属对话：每期结果都落在那里。
- * 本地列表没有它（换设备 / 刚被重建）就先刷新一次列表再选；实在没有则提示等下次运行时自动重建。
+ * 打开某个结果会话：本地列表没有（换设备 / 刚被重建）就先刷新一次列表再选；
+ * 实在没有则提示等下次运行时自动重建。任务对话与某一期对话共用这一段逻辑。
  */
-async function openTaskConversation(t: ScheduleDto) {
-  let conv = conversations.value.find((c) => c.id === t.conversationId);
+async function openConversationById(convId: string, notFound: "task" | "run"): Promise<void> {
+  let conv = conversations.value.find((c) => c.id === convId);
   if (!conv) {
     const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
     if (list) {
       conversations.value = list;
       resortConversations();
-      conv = list.find((c) => c.id === t.conversationId);
+      conv = list.find((c) => c.id === convId);
     }
   }
   if (!conv) {
     showSettingsError(
-      tx("该任务的对话已不存在，下次到点运行时会自动重建", "This task's chat is gone — it will be recreated on the next run", "A conversa desta tarefa não existe — será recriada na próxima execução", "इस कार्य की चैट मौजूद नहीं है — अगली रन पर फिर बनेगी"),
+      notFound === "task"
+        ? tx("该任务的对话已不存在，下次到点运行时会自动重建", "This task's chat is gone — it will be recreated on the next run", "A conversa desta tarefa não existe — será recriada na próxima execução", "इस कार्य की चैट मौजूद नहीं है — अगली रन पर फिर बनेगी")
+        : tx("这一期的结果会话已不存在", "This run's chat no longer exists", "A conversa desta execução não existe mais", "इस रन की चैट अब मौजूद नहीं है"),
     );
     return;
   }
   selectConversation(conv);
+}
+
+/** 打开任务的专属对话（每期结果都落在那里）。 */
+function openTaskConversation(t: ScheduleDto): void {
+  void openConversationById(t.conversationId, "task");
+}
+
+/** 打开某一期的结果会话。 */
+function openRunConversation(run: TaskGroupRun): void {
+  void openConversationById(run.conversationId, "run");
 }
 
 /** 工具步骤状态。`interrupted` = 没等到结果（连接中断 / 服务进程重启），如实展示，不冒充「失败」。 */
@@ -2508,18 +2520,22 @@ async function createConvFromDraft(firstText: string): Promise<string> {
   st.activeModelLabel = draft.activeModelLabel;
   currentId.value = conv.id;
   reportActiveConversation(conv.id);
-  void loadMcp(conv.id);
-  void loadSkills(conv.id);
   const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[] } = {
     locale: st.settings.locale,
   };
   if (st.settings.modelId) patch.model = st.settings.modelId;
   if (st.settings.mcpEnabled.length) patch.mcpServers = [...st.settings.mcpEnabled];
   if (st.settings.skillsEnabled.length) patch.skillsEnabled = [...st.settings.skillsEnabled];
-  void patchConversation(conv.id, patch).then(
-    () => syncConvLocal(conv.id, patch),
-    () => undefined,
-  );
+  // 首条消息紧接着就开跑，服务端按对话文档里的启用集取工具。必须等落库完成再拉列表，
+  // 否则 loadMcp 会用新建对话的空启用集把草稿勾选盖掉，这一轮也用不上连接器。
+  try {
+    await patchConversation(conv.id, patch);
+    syncConvLocal(conv.id, patch);
+  } catch {
+    /* 落库失败不阻断发送；前端 state 已带上设置，下次保存会再写 */
+  }
+  void loadMcp(conv.id);
+  void loadSkills(conv.id);
   return conv.id;
 }
 
@@ -2736,6 +2752,8 @@ interface TaskGroupRun {
   at: number;
   status?: string;
   marker?: string;
+  trigger?: "schedule" | "manual" | "wake";
+  durationMs?: number;
   conv?: ConversationDto;
 }
 const taskGroups = computed<Array<{ schedule: ScheduleDto; runs: TaskGroupRun[] }>>(() => {
@@ -2828,10 +2846,10 @@ function toggleConvSection() {
 }
 
 /** 分组里的「某一期」也要键盘可达（与 .conv-item 同口径：Enter/Space 打开）。 */
-function onRunKeydown(e: KeyboardEvent, schedule: ScheduleDto, run: TaskGroupRun) {
+function onRunKeydown(e: KeyboardEvent, run: TaskGroupRun) {
   if (e.key === "Enter" || e.key === " ") {
     e.preventDefault();
-    void openRunConversation(schedule, run);
+    void openRunConversation(run);
   }
 }
 
@@ -2842,25 +2860,23 @@ function runTimeText(at: number): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 打开某一期的结果会话（本地列表没有就先刷新一次，与 openTaskConversation 同口径）。 */
-async function openRunConversation(schedule: ScheduleDto, run: TaskGroupRun) {
-  let conv = conversations.value.find((c) => c.id === run.conversationId);
-  if (!conv) {
-    const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
-    if (list) {
-      conversations.value = list;
-      resortConversations();
-      conv = list.find((c) => c.id === run.conversationId);
-    }
-  }
-  if (!conv) {
-    showSettingsError(
-      tx("这一期的结果会话已不存在", "This run's chat no longer exists", "A conversa desta execução não existe mais", "इस रन की चैट अब मौजूद नहीं है"),
+/** 执行记录副文案：时间 · 触发方式 · 耗时。对齐千问办公执行记录里能在列表上看见的几项。 */
+function runMetaText(run: { at: number; trigger?: string; durationMs?: number }): string {
+  const parts = [runTimeText(run.at)];
+  if (run.trigger === "manual") parts.push(tx("手动", "Manual", "Manual", "मैनुअल"));
+  else if (run.trigger === "wake") parts.push(tx("唤醒", "Wake", "Evento", "वेक"));
+  else if (run.trigger === "schedule") parts.push(tx("定时", "Scheduled", "Agendado", "निर्धारित"));
+  if (run.durationMs !== undefined && run.durationMs >= 1000) {
+    const sec = Math.max(1, Math.round(run.durationMs / 1000));
+    parts.push(
+      sec < 60
+        ? tx(`${sec} 秒`, `${sec}s`, `${sec} s`, `${sec}s`)
+        : tx(`${Math.round(sec / 60)} 分`, `${Math.round(sec / 60)}m`, `${Math.round(sec / 60)} min`, `${Math.round(sec / 60)}m`),
     );
-    return;
   }
-  selectConversation(conv);
+  return parts.join(" · ");
 }
+
 
 /** 打开任一期即把该任务的未读清零（对齐 ChatGPT「Scheduled 视图当收件箱」）。 */
 function clearTaskUnread(convId: string) {
@@ -4226,7 +4242,13 @@ function confirmExpiryText(expiresInMs?: number): string {
  * 响应可能晚于对话切换，所以写回「发起时那个对话」的状态，避免串味。
  */
 async function loadMcp(convId = currentId.value) {
-  if (!convId) return;
+  // 草稿态没有对话 id。不带 conversationId 的 GET 会回退到服务端 activeConversationId，
+  // 只能取全局 available，不能把别的对话的启用集写进草稿。
+  if (!convId) {
+    const data = await fetchChatMcpServers().catch(() => null);
+    if (data) mcpAvailable.value = data.available;
+    return;
+  }
   const data = await fetchChatMcpServers(convId).catch(() => null);
   if (!data) return;
   mcpAvailable.value = data.available;
@@ -4259,13 +4281,18 @@ function openMcpPanel(focusSearch = true) {
 async function toggleMcp(id: string, on: boolean) {
   const convId = currentId.value;
   const state = current.value;
-  if (!convId) return;
   const prev = state.settings.mcpEnabled;
   const next = on ? [...new Set([...prev, id])] : prev.filter((item) => item !== id);
   state.settings.mcpEnabled = next;
+  if (!on && mcpExpanded.value === id) mcpExpanded.value = "";
+  // 草稿态只改内存，对齐模型选择：首条消息创建对话时再落库（createConvFromDraft）。
+  // 勾选时预热连接，行状态才能从「未启用」变成连接中/已连接。
+  if (!convId) {
+    if (on) void connectTaskMcp(id);
+    return;
+  }
   mcpBusy.value = true;
   mcpError.value = "";
-  if (!on && mcpExpanded.value === id) mcpExpanded.value = "";
   try {
     const data = await setChatMcpServers(next, convId);
     mcpAvailable.value = data.available;
@@ -4289,12 +4316,12 @@ async function toggleMcp(id: string, on: boolean) {
 async function clearMcpSelection() {
   const convId = currentId.value;
   const state = current.value;
-  if (!convId) return;
   const prev = state.settings.mcpEnabled;
   state.settings.mcpEnabled = [];
+  mcpExpanded.value = "";
+  if (!convId) return;
   mcpBusy.value = true;
   mcpError.value = "";
-  mcpExpanded.value = "";
   try {
     const data = await setChatMcpServers([], convId);
     mcpAvailable.value = data.available;
@@ -4364,9 +4391,11 @@ const skillBusy = ref(false);
 const skillError = ref("");
 
 async function loadSkills(convId = currentId.value) {
-  const data = await fetchChatSkills(convId).catch(() => null);
+  const data = await fetchChatSkills(convId || undefined).catch(() => null);
   if (!data) return;
   skillAvailable.value = data.available;
+  // 草稿态：不带 id 的响应会带回服务端当前活动对话的勾选，不能写进草稿。
+  if (!convId) return;
   const state = stateOf(convId);
   state.settings.skillsEnabled = data.enabled;
 }
@@ -4392,11 +4421,13 @@ function openSkillPanel(focusSearch = true) {
 /** 勾选/取消某个技能（乐观更新 + 失败回滚；语义：勾选 = 全文注入系统提示，不勾 = 按需加载）。 */
 async function toggleSkill(dir: string, on: boolean) {
   const convId = currentId.value;
-  if (!convId || skillBusy.value) return;
-  const state = stateOf(convId);
+  if (skillBusy.value) return;
+  const state = convId ? stateOf(convId) : current.value;
   const prev = state.settings.skillsEnabled;
   const next = on ? [...prev, dir] : prev.filter((x) => x !== dir);
   state.settings.skillsEnabled = next;
+  // 草稿态只改内存；创建对话时再落库（对齐 toggleMcp / saveModelChoice）。
+  if (!convId) return;
   skillBusy.value = true;
   skillError.value = "";
   try {
@@ -4417,10 +4448,10 @@ async function toggleSkill(dir: string, on: boolean) {
 
 async function clearSkillSelection() {
   const convId = currentId.value;
-  if (!convId) return;
-  const state = stateOf(convId);
+  const state = convId ? stateOf(convId) : current.value;
   const prev = state.settings.skillsEnabled;
   state.settings.skillsEnabled = [];
+  if (!convId) return;
   skillBusy.value = true;
   skillError.value = "";
   try {
@@ -5111,8 +5142,8 @@ onBeforeUnmount(() => {
                   role="button"
                   tabindex="0"
                   :aria-current="r.conversationId === currentId ? 'true' : undefined"
-                  @click="openRunConversation(g.schedule, r)"
-                  @keydown="onRunKeydown($event, g.schedule, r)"
+                  @click="openRunConversation(r)"
+                  @keydown="onRunKeydown($event, r)"
                   @contextmenu.prevent="r.conv && openCtxMenu($event, r.conv)"
                 >
                   <span
@@ -5123,7 +5154,7 @@ onBeforeUnmount(() => {
                     role="img"
                   ></span>
                   <span class="conv-title">{{ r.conv?.title || runTimeText(r.at) }}{{ r.marker ? ` · ${taskMarkerText(r.marker)}` : "" }}</span>
-                  <span class="conv-run-at">{{ runTimeText(r.at) }}</span>
+                  <span class="conv-run-at">{{ runMetaText(r) }}</span>
                 </div>
               </template>
             </div>
@@ -6400,7 +6431,7 @@ onBeforeUnmount(() => {
                 class="task-page__run"
                 :class="{ active: r.conversationId === currentId }"
                 type="button"
-                @click="openRunConversation(g.schedule, r)"
+                @click="openRunConversation(r)"
               >
                 <span
                   v-if="r.status"
@@ -6410,7 +6441,7 @@ onBeforeUnmount(() => {
                   role="img"
                 ></span>
                 <span class="task-page__run-title">{{ r.conv?.title || runTimeText(r.at) }}</span>
-                <span class="task-page__run-at">{{ runTimeText(r.at) }}</span>
+                <span class="task-page__run-at">{{ runMetaText(r) }}</span>
               </button>
             </div>
           </div>

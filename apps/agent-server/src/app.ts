@@ -92,6 +92,7 @@ import {
   pickNotifyPolicy,
   pickPurpose,
   SCHEDULE_ALERT_GUIDE,
+  SCHEDULE_UNGROUNDED_REPORT,
   type ScheduleNotifyPolicy,
   type SchedulePurpose,
 } from "./schedule-alert.js";
@@ -480,6 +481,7 @@ async function deliverScheduleResult(
   status: "success" | "failed",
   text: string,
   charts: ChartSpec[] = [],
+  meta?: { trigger?: "schedule" | "manual" | "wake"; durationMs?: number; finishedAt?: number },
 ): Promise<void> {
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
   if (!notifyOn.includes(status)) return;
@@ -536,6 +538,9 @@ async function deliverScheduleResult(
       ownerKey: schedule.ownerKey,
       ...(charts.length ? { charts } : {}),
       ...(schedule.locale ? { locale: schedule.locale } : {}),
+      ...(meta?.trigger ? { trigger: meta.trigger } : {}),
+      ...(meta?.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
+      ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
     }),
   );
   if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
@@ -1587,6 +1592,8 @@ export function createApp() {
     const conversationId = await ensureRunConversation(schedule, Date.now());
     if (isTaskRunning(conversationId)) return "skipped"; // 兜底：同一会话上已有任务在跑
     const wake = String(schedule.wakeReason || "").trim();
+    const runTrigger = wake ? "wake" : schedule.runRequestedAt !== undefined ? "manual" : "schedule";
+    const runStartedAt = Date.now();
     const task = startTask({
       conversationId,
       userText: wake ? `【事件唤醒】${wake}\n\n${schedule.prompt}` : schedule.prompt,
@@ -1598,6 +1605,10 @@ export function createApp() {
     // taskGuide：每期必须重新取数 + 正文要有可独立阅读的结论（上下文里躺着上期结论时尤其关键）。
     // 预警任务再追加结论协议（[SPIKE]/[NORMAL]/[NO_DATA]），投递旁路只认首行标记。
     const onAlert = pickNotifyPolicy(schedule.notifyPolicy) === "on_alert";
+    // 无人值守默认拒绝改任务、删文件、跑命令/脚本；预警再拒绝出图/导出。
+    // 同一份清单两处用：既从工具 schema 里摘掉（模型看不到就不会点），
+    // 又在执行层兜底拒绝（模型若仍点名）——拒绝原因会记进本期运行记录。
+    const deniedTools = [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])];
     await consumeTask(task, {
       ownerKey: schedule.ownerKey,
       mcpServers: schedule.mcpServers,
@@ -1608,10 +1619,9 @@ export function createApp() {
       forceWrapUp: true,
       // 预警：不注入报告型「必须出图」指引；并硬摘 render_chart / export_data。
       taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
-      // 无人值守默认拒绝改任务、删文件、跑命令/脚本；预警再拒绝出图/导出。
-      // 工具从清单里拿掉，模型若仍点名调用，执行层拒绝并把原因记进本期记录。
-      omitBuiltinTools: [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])],
-      denyBuiltinTools: [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])],
+      omitBuiltinTools: deniedTools,
+      denyBuiltinTools: deniedTools,
+      unattendedConclusion: onAlert || schedule.purpose === "alert" ? "alert" : "report",
     });
     const text = finalTextOf(task).trim();
     // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
@@ -1620,19 +1630,26 @@ export function createApp() {
     const finished = status === "success" || status === "cancelled" ? status : "failed";
     // 跑完了却一句收尾文本都没有 = 这一期没产出结论（实测多为轮次预算耗尽）：
     // 记 success 会推一条「成功 ·（本次未产出内容）」的空报告，看着像一切正常，必须如实记 failed。
-    const final = finished === "success" && !text ? "failed" : finished;
-    if (finished === "success" && !text) {
-      console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽），按 failed 记账`);
+    // 报告被接地护栏拦住时正文是「没有写结论」，同样不能记成功。
+    const noConclusion = !text || text === SCHEDULE_UNGROUNDED_REPORT;
+    const final = finished === "success" && noConclusion ? "failed" : finished;
+    if (finished === "success" && noConclusion) {
+      console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽或未取到数据），按 failed 记账`);
     }
-    const marker = onAlert ? parseAlertMarker(text) : null;
+    const marker = onAlert || schedule.purpose === "alert" ? parseAlertMarker(text) : null;
+    const finishedAt = Date.now();
+    const runMeta = { trigger: runTrigger as "schedule" | "manual" | "wake", durationMs: finishedAt - runStartedAt };
     // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：
     // 必须在 schedulerTick 写回状态之前完成，schedulerTick 会以库里的最新值为基底合并（不会回退）。
-    await recordScheduleRun(schedule, conversationId, Date.now(), final, marker || undefined);
+    await recordScheduleRun(schedule, conversationId, finishedAt, final, marker || undefined, runMeta);
     // 投递失败不改这一期的成败，但必须在调度器写下一拍之前写完。
     // patchSchedule 会整份回写：若投递还在飞，调度器刚算好的 nextRunAt / 清掉的立即执行标记会被旧快照盖回去。
     if (final === "success" || final === "failed") {
       // 重建过专属对话时 schedule.conversationId 是旧值，投递链接必须用解析后的 id。
-      await deliverScheduleResult({ ...schedule, conversationId }, final, text, charts).catch((err) =>
+      await deliverScheduleResult({ ...schedule, conversationId }, final, text, charts, {
+        ...runMeta,
+        finishedAt,
+      }).catch((err) =>
         console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
       );
     }
