@@ -29,9 +29,9 @@ export const ALERT_COOLDOWN_MS = Math.max(
  * 估数、再 render_chart / export_data，就会出现「正文 [NO_DATA] + 无关图表/HTML」的脏产出。
  * 成功跑完时投递旁路只认首行标记，不解析正文语义。
  */
-/** 定时预警在零数据被接地护栏拦住时的正文。首行必须是协议标记，供投递旁路识别。 */
+/** 定时预警在「本该取数却一条数据都没有」时的正文。不要写阈值：指令里未必有阈值。 */
 export const SCHEDULE_UNGROUNDED_ALERT =
-  "[NO_DATA]\n这次没有取到可核对的数据，没有按阈值下结论。";
+  "[NO_DATA]\n这次没有取到可核对的数据，没有下结论。";
 
 /** 定时报告在同样情况下的正文。不是交互对话那句道歉，也不编数字。 */
 export const SCHEDULE_UNGROUNDED_REPORT = "这次没有取到可核对的数据，没有写结论。";

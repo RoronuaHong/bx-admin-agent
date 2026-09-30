@@ -1321,6 +1321,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       if (grounding === "block") {
+        // 纠正次数用尽时，上一轮分诊看的是更早的回答。最后这一段可能已经按用户要求
+        // 改成「不需要数据」的回复（例如明确不要调用工具）。再分诊一次：没有事实断言就放行，
+        // 不要改写成「没按阈值下结论」。
+        const lastNeed = await probeNeedsExternalData(ctx.model, userQuestion, outcome.text, ctx.signal);
+        if (lastNeed === "no_data") {
+          console.log("[chat:grounding] 纠正用尽，但最后一段回答不含需外部数据支撑的断言：放行");
+          synthesisText = outcome.text;
+          if (roundText) yield { type: "text_delta", text: roundText };
+          break;
+        }
         ungrounded = true;
         // 丢弃本轮未接地的正文（不上屏），改为一次「受约束的诚实兜底」（禁止任何事实性断言）：
         // 不能直接回固定话术——固定话术无法区分「本轮本来就不需要数据」与「需要数据但没取到」，
@@ -2611,11 +2621,13 @@ export async function* chatStream(
   // 宁如实说取不到，也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
-  // 定时运行被接地护栏拦住时，不用交互对话那句道歉：预警要留下 [NO_DATA]，报告要明确「没有写结论」。
+  // 定时运行被接地护栏拦住、且诚实兜底也没写出可用正文时，才换协议句。
+  // 兜底已经说明「这次不用数据 / 没取到」时保留它，避免盖成指令里没有的「阈值」。
+  const cannedApology = !guarded || guarded === UNGROUNDED_REPLY;
   const unattendedLine =
-    ungrounded && opts.unattendedConclusion === "alert"
+    ungrounded && cannedApology && opts.unattendedConclusion === "alert"
       ? SCHEDULE_UNGROUNDED_ALERT
-      : ungrounded && opts.unattendedConclusion === "report"
+      : ungrounded && cannedApology && opts.unattendedConclusion === "report"
         ? SCHEDULE_UNGROUNDED_REPORT
         : "";
   const finalText = unattendedLine || (ungrounded ? guarded || UNGROUNDED_REPLY : guarded);
