@@ -6,6 +6,13 @@ import { Cron } from "croner";
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
+import {
+  alertNextRunAt,
+  type AlertMarker,
+  type ScheduleAlertState,
+  type ScheduleNotifyPolicy,
+  type SchedulePurpose,
+} from "./schedule-alert.js";
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
@@ -31,6 +38,12 @@ export interface ScheduleRun {
   at: number;
   /** 该期的真实结果（与 lastStatus 同一口径）。 */
   status?: ScheduleRunStatus;
+  /** 预警任务结论文本首行标记（SPIKE / NORMAL / NO_DATA）；报告型任务通常没有。 */
+  marker?: AlertMarker;
+  /** 定时触发 / 手动执行 / 事件唤醒。老记录没有这个字段。 */
+  trigger?: "schedule" | "manual" | "wake";
+  /** 从开跑到收尾的毫秒数。 */
+  durationMs?: number;
 }
 
 export interface ChatSchedule {
@@ -68,8 +81,29 @@ export interface ChatSchedule {
    */
   mcpServers?: string[];
 
+  /**
+   * 任务级技能勾选（技能目录名，落库前经服务端按清单过滤）：
+   * 写到任务专属对话与每期运行会话的 skillsEnabled 上，随当期运行注入系统提示。
+   * 缺省 = 不额外勾选（default: true 的技能本来就随索引生效，无需勾选）。
+   */
+  skills?: string[];
+
   /** 投递触发条件；缺省 success + failed，跳过不投。 */
   notifyOn?: ScheduleNotifyOn[];
+  /**
+   * 通知策略（docs/scheduled-spike-detection-plan.md）：
+   * - "always"（缺省）：成功/失败都推（报告型）；
+   * - "on_alert"：失败仍推；成功则只在结论首行 [SPIKE]（及恢复）时推。
+   */
+  notifyPolicy?: ScheduleNotifyPolicy;
+  /**
+   * 任务用途：表单「周期报告 / 数据预警」；引擎以 notifyPolicy 为准，purpose 便于列表展示与回填。
+   */
+  purpose?: SchedulePurpose;
+  /** 预警冷静期 / 恢复状态（调度器回写；前端不可改）。 */
+  alertState?: ScheduleAlertState;
+  /** 最近一期预警结论标记（调度器回写；侧栏健康态用；报告型任务通常没有）。 */
+  lastMarker?: AlertMarker;
   /** 投递文案语言（建任务时由前端写入；缺省中文）。 */
   locale?: string;
   /** 最近一次投递结果（前端显示「上次推送」用；不含任何凭据）。 */
@@ -87,6 +121,29 @@ export interface ChatSchedule {
    * 用到点时刻计时会把「被前面任务挤后」的时间也算成等待，凭空判成「已错过」。
    */
   queuedSince?: number;
+  /**
+   * 立即执行 / 事件唤醒：有值且已到点时，即使任务暂停、或 nextRunAt 还在未来，也会多跑一期。
+   * 跑完即清。只由运行入口写入，前端 PATCH 改不了。
+   */
+  runRequestedAt?: number;
+  /** 立即执行前记下的原 nextRunAt。跑完若仍在未来则还原，避免把原定周期推走。 */
+  holdNextRunAt?: number;
+  /** 事件唤醒说明：只加在这一期的用户消息前面，跑完即清。 */
+  wakeReason?: string;
+}
+
+/**
+ * 名称或任务内容几乎全是问号 / 替换符时返回原因。
+ * 正常中文、英文、数字返回 null。用来拦住已经损坏的任务名，避免再推成「??????」。
+ */
+export function garbledTextReason(text: string | undefined): string | null {
+  const compact = String(text ?? "").replace(/\s/g, "");
+  if (!compact) return null;
+  const marks = (compact.match(/[?？\uFFFD]/g) || []).length;
+  if (marks < 3) return null;
+  const rest = compact.replace(/[?？\uFFFD.,，。、;；:：!！'"“”‘’\-_\/\\|()[\]{}]/g, "");
+  if (rest.length === 0 || marks / compact.length >= 0.8) return "几乎全是问号，无法保存";
+  return null;
 }
 
 const MAX_SCHEDULES_PER_OWNER = 20;
@@ -191,6 +248,9 @@ export function nextRunAtOf(
   return schedule.cron ? nextRunOf(schedule.cron, after) : undefined;
 }
 
+/** 周期任务相邻两次触发的最小间隔：短于 1 分钟会打成风暴（单期 Agent 常要数十秒）。 */
+export const MIN_CRON_INTERVAL_MS = 60_000;
+
 /** 时间参数校验：周期任务给 cron，一次性任务给 onceAt；返回错误文案或 null。 */
 export function validateTiming(input: { cron?: unknown; onceAt?: unknown }): string | null {
   const raw = input.onceAt;
@@ -201,7 +261,16 @@ export function validateTiming(input: { cron?: unknown; onceAt?: unknown }): str
   }
   const cron = typeof input.cron === "string" ? input.cron : "";
   if (!cron.trim()) return "cron（周期任务）与 onceAt（一次性任务）必须提供其一";
-  return validateCron(cron);
+  const cronErr = validateCron(cron);
+  if (cronErr) return cronErr;
+  // 最小间隔：用两次 nextRun 差值卡住 */1 这类风暴表达式（croner 原生支持秒级步进）。
+  const first = nextRunOf(cron.trim());
+  if (first === undefined) return "非法 cron 表达式：无法计算下次触发";
+  const second = nextRunOf(cron.trim(), new Date(first));
+  if (second !== undefined && second - first < MIN_CRON_INTERVAL_MS) {
+    return "周期间隔不能短于 1 分钟";
+  }
+  return null;
 }
 
 function cleanName(name?: unknown): string | undefined {
@@ -228,7 +297,11 @@ export async function createSchedule(input: {
   onceAt?: number;
   name?: string;
   mcpServers?: string[];
+  /** 任务级技能勾选（调用方已过滤；存储层只去重）。 */
+  skills?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  notifyPolicy?: ScheduleNotifyPolicy;
+  purpose?: SchedulePurpose;
   locale?: string;
   /** 每期结果的落点（缺省 "new"）。 */
   runMode?: ScheduleRunMode;
@@ -248,7 +321,10 @@ export async function createSchedule(input: {
       ? { onceAt: Number(input.onceAt) }
       : { cron: String(input.cron || "").trim() }),
     ...(input.mcpServers?.length ? { mcpServers: [...new Set(input.mcpServers)] } : {}),
+    ...(input.skills?.length ? { skills: [...new Set(input.skills)] } : {}),
     ...(input.notifyOn?.length ? { notifyOn: [...new Set(input.notifyOn)] } : {}),
+    ...(input.notifyPolicy ? { notifyPolicy: input.notifyPolicy } : {}),
+    ...(input.purpose ? { purpose: input.purpose } : {}),
     ...(input.locale ? { locale: input.locale } : {}),
     // 落点**总是显式落库**（缺省写 "new"）：把默认值留在「读的时候补」会让库里出现
     // 「没写 = 新会话」和「写了 = 新会话」两种形态，排查时得多推一层。
@@ -290,7 +366,14 @@ export interface SchedulePatch {
   onceAt?: number;
   enabled?: boolean;
   mcpServers?: string[];
+  skills?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  notifyPolicy?: ScheduleNotifyPolicy;
+  purpose?: SchedulePurpose;
+  /** 预警状态（调度器回写；前端不可改）。 */
+  alertState?: ScheduleAlertState;
+  /** 最近一期预警结论标记（调度器回写；前端不可改）。 */
+  lastMarker?: AlertMarker;
   /** 每期结果的落点（docs/scheduled-task-sessions-plan.md §3.1）；只影响**此后**的运行。 */
   runMode?: ScheduleRunMode;
   /** 运行记录（调度器回写；前端不可改）。 */
@@ -328,7 +411,12 @@ export async function patchSchedule(
     ...(switchingToCron ? { cron: String(patch.cron).trim() } : {}),
     ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
     ...(patch.mcpServers !== undefined ? { mcpServers: [...new Set(patch.mcpServers)] } : {}),
+    ...(patch.skills !== undefined ? { skills: [...new Set(patch.skills)] } : {}),
     ...(patch.notifyOn !== undefined ? { notifyOn: [...new Set(patch.notifyOn)] } : {}),
+    ...(patch.notifyPolicy !== undefined ? { notifyPolicy: patch.notifyPolicy } : {}),
+    ...(patch.purpose !== undefined ? { purpose: patch.purpose } : {}),
+    ...(patch.alertState !== undefined ? { alertState: patch.alertState } : {}),
+    ...(patch.lastMarker !== undefined ? { lastMarker: patch.lastMarker } : {}),
     ...(patch.runMode !== undefined ? { runMode: patch.runMode } : {}),
     ...(patch.runs !== undefined ? { runs: patch.runs.slice(0, MAX_RUNS_PER_SCHEDULE) } : {}),
     ...(patch.unreadRuns !== undefined ? { unreadRuns: Math.max(0, Math.floor(patch.unreadRuns)) } : {}),
@@ -380,15 +468,21 @@ async function writeSchedule(next: ChatSchedule): Promise<void> {
     memory.set(doc.id, doc);
     return;
   }
-  const { nextRunAt, queuedSince, ...rest } = doc;
-  // 这两个字段「不存在」有语义（未排下次 / 未在排队）：有值就 $set，缺值就 $unset 真删。
-  // 注意 $set 的载荷必须**按值重新组装**——直接用 rest 会把 nextRunAt 一起漏掉。
+  const { nextRunAt, queuedSince, runRequestedAt, holdNextRunAt, wakeReason, ...rest } = doc;
+  // 这些字段「不存在」有语义：有值就 $set，缺值就 $unset 真删。
+  // 注意 $set 的载荷必须**按值重新组装**——直接用 rest 会把拆出来的字段一起漏掉。
   const set: Record<string, unknown> = { ...rest };
   const unset: Record<string, ""> = {};
   if (nextRunAt === undefined) unset.nextRunAt = "";
   else set.nextRunAt = nextRunAt;
   if (queuedSince === undefined) unset.queuedSince = "";
   else set.queuedSince = queuedSince;
+  if (runRequestedAt === undefined) unset.runRequestedAt = "";
+  else set.runRequestedAt = runRequestedAt;
+  if (holdNextRunAt === undefined) unset.holdNextRunAt = "";
+  else set.holdNextRunAt = holdNextRunAt;
+  if (wakeReason === undefined) unset.wakeReason = "";
+  else set.wakeReason = wakeReason;
   await coll.updateOne(
     { id: doc.id },
     Object.keys(unset).length ? { $set: set, $unset: unset } : { $set: set },
@@ -409,9 +503,13 @@ export async function schedulerTick(
   const all = await listSchedules();
   let triggered = 0;
   for (const schedule of all) {
-    if (!schedule.enabled) continue;
+    // 立即执行 / 事件唤醒：多跑一期，不看启用开关，也不等原来的 nextRunAt。
+    const manualDue = schedule.runRequestedAt !== undefined && schedule.runRequestedAt <= now;
+    if (!schedule.enabled && !manualDue) continue;
     const fallback = new Date(now - 60_000);
-    const due = schedule.onceAt ?? schedule.nextRunAt ?? nextRunAtOf(schedule, fallback);
+    const due = manualDue
+      ? schedule.runRequestedAt!
+      : (schedule.onceAt ?? schedule.nextRunAt ?? nextRunAtOf(schedule, fallback));
     if (due === undefined || due > now) continue;
     // 跨实例互斥：同一日程同一时刻只由一个进程触发；抢不到锁的交给其它实例或下一 tick。
     const lockOwner = `${hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
@@ -426,9 +524,14 @@ export async function schedulerTick(
         if (now - queuedSince + SCHEDULE_TICK_MS <= SKIP_RETRY_GRACE_MS) {
           // 钉住本次到点时刻（不能用 now 重算，否则窗口内会被推到下一周期，这期就真丢了）：
           // 下一 tick 发现仍然到点，继续尝试补跑。
+          // 立即执行排队时，界面上的「下次」仍显示原来的下一拍，不要改成已经过去的请求时刻。
+          const keepStanding =
+            schedule.runRequestedAt !== undefined &&
+            schedule.holdNextRunAt !== undefined &&
+            schedule.holdNextRunAt > now;
           await writeSchedule({
             ...schedule,
-            nextRunAt: due,
+            nextRunAt: keepStanding ? schedule.holdNextRunAt : due,
             queuedSince,
             lastStatus: outcome,
             lastNote: `对话正在生成中，已排队等待补跑（已等待 ${Math.round(
@@ -448,26 +551,94 @@ export async function schedulerTick(
     // 写回前**重新读一次**：runner 内部可能已经写入了 runs / unreadRuns / conversationId
     // （「每期新会话」的实现就写在 runner 里）。沿用 runner 执行前的快照整体写回会把这些字段
     // 静默回退——症状是「运行记录偶发丢失」，且只在 schedulerTick 这一侧可见，极难定位。
-    const fresh = (await getSchedule(schedule.id)) ?? schedule;
+    const fresh = await getSchedule(schedule.id);
+    // 本期里任务已被删掉：不能退回开跑前的快照再写回去，否则「删了又复活、明天继续推」。
+    if (!fresh) continue;
+    const finishedAt = Date.now();
+    // 本期里被暂停：保持暂停，且不要再排下一拍。
+    // 若仍用开跑前的 enabled=true 写回，或给暂停任务排上下一拍，它会在下一周期自己跑起来。
+    if (fresh.enabled === false) {
+      const paused: ChatSchedule = {
+        ...fresh,
+        lastRunAt: finishedAt,
+        lastStatus: outcome,
+        lastNote: note,
+      };
+      delete paused.queuedSince;
+      delete paused.nextRunAt;
+      delete paused.runRequestedAt;
+      delete paused.holdNextRunAt;
+      delete paused.wakeReason;
+      await writeSchedule(paused);
+      continue;
+    }
+    // 用「跑完时刻」推进周期：预警等长跑常跨过多个 cron 拍；若仍按 tick 入口的 `now` 算下一拍，
+    // 会得到已经过去的 nextRunAt，下一 tick 立刻连环补跑（实测 */5 + 4 分钟跑会连打）。
     const updated: ChatSchedule = {
       ...fresh,
-      lastRunAt: now,
+      lastRunAt: finishedAt,
       lastStatus: outcome,
       // 跑成的那一轮 note 为空也要写回：否则上一次的「跳过」说明会一直挂着，看着像这次也被跳过了。
       lastNote: note,
     };
     // 不再排队：清掉排队起点（下一期重新计时），writeSchedule 会把它从库里真删掉。
     delete updated.queuedSince;
+    const wasManual = fresh.runRequestedAt !== undefined || schedule.runRequestedAt !== undefined;
+    const held = fresh.holdNextRunAt ?? schedule.holdNextRunAt;
+    delete updated.runRequestedAt;
+    delete updated.holdNextRunAt;
+    delete updated.wakeReason;
     // 一次性任务跑完即停用：不能按 cron 推进（那会推到明年同一分钟）。
-    if (schedule.onceAt !== undefined) {
+    // 立即执行不算「到点的那一次」，未来的一次性时刻还留着。
+    if (schedule.onceAt !== undefined && !wasManual) {
       updated.enabled = false;
       delete updated.nextRunAt;
+    } else if (wasManual && held !== undefined && held > finishedAt) {
+      updated.nextRunAt = held;
     } else {
-      updated.nextRunAt = nextRunOf(schedule.cron || "", new Date(now + 1000));
+      const cron = fresh.cron || schedule.cron || "";
+      updated.nextRunAt = alertNextRunAt({
+        cron,
+        finishedAt,
+        purpose: fresh.purpose,
+        firing: fresh.alertState?.firing === true,
+        marker: fresh.lastMarker ?? null,
+        cronNext: nextRunOf,
+      });
     }
     await writeSchedule(updated);
   }
   return triggered;
+}
+
+/**
+ * 立即执行 / 事件唤醒：多跑一期，不改原来的 nextRunAt（若仍在未来）。
+ * 暂停中的任务也可以跑这一期，跑完仍然暂停。reason 有内容时当作事件唤醒，写进这一期的消息前缀。
+ */
+export async function requestScheduleRun(
+  id: string,
+  ownerKey: string,
+  reason?: string,
+): Promise<ChatSchedule | null> {
+  const prev = await getSchedule(id);
+  if (!prev || prev.ownerKey !== ownerKey) return null;
+  if (prev.runRequestedAt !== undefined) return prev;
+  const wake = String(reason || "").trim().slice(0, 200);
+  const now = Date.now();
+  const next: ChatSchedule = {
+    ...prev,
+    runRequestedAt: now,
+    ...(prev.nextRunAt !== undefined && prev.nextRunAt > now ? { holdNextRunAt: prev.nextRunAt } : {}),
+    ...(wake ? { wakeReason: wake } : {}),
+  };
+  await writeSchedule(next);
+  return next;
+}
+
+/** 调度循环的「马上再扫一次」。没启动循环时是空操作（测试直接调 schedulerTick）。 */
+let kickSchedule: (() => void) | null = null;
+export function kickScheduleLoop(): void {
+  kickSchedule?.();
 }
 
 /** 启动周期调度扫描（默认 30s tick；定时器 unref 不阻止进程退出）。 */
@@ -479,15 +650,24 @@ export function startScheduleLoop(
   // 否则并发 tick 各自读到同一份 nextRunAt 并回写，会把「已推进到下一周期」又改回本次的到点时刻，
   // 变成同一期重复触发（补跑逻辑上线后这个竞态就致命了）。
   let inFlight = false;
-  const timer = setInterval(() => {
-    if (inFlight) return;
+  let pending = false;
+  const run = (): void => {
+    if (inFlight) {
+      pending = true;
+      return;
+    }
     inFlight = true;
     void schedulerTick(runner)
       .catch((err) => console.warn(`[scheduler] tick 失败：${String((err as Error)?.message || err)}`))
       .finally(() => {
         inFlight = false;
+        if (!pending) return;
+        pending = false;
+        run();
       });
-  }, intervalMs);
+  };
+  kickSchedule = run;
+  const timer = setInterval(run, intervalMs);
   timer.unref();
   return timer;
 }

@@ -8,6 +8,7 @@
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
+import { unattendedToolDenial } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
@@ -752,12 +753,53 @@ async function buildAttachmentContext(ids: string[] | undefined, conversationId:
 }
 
 /** 截断工具结果；尽量切在行边界，避免把 TSV / JSON 的某一行从中间劈开。 */
-function truncateResult(text: string): string {
-  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
-  const head = text.slice(0, MAX_TOOL_RESULT_CHARS);
+function truncateResult(text: string, maxChars = MAX_TOOL_RESULT_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars);
   const cut = head.lastIndexOf("\n");
-  const kept = cut > MAX_TOOL_RESULT_CHARS * 0.6 ? head.slice(0, cut) : head;
-  return `${kept}\n…（结果已截断，原始长度 ${text.length} 字符）`;
+  const kept = cut > maxChars * 0.6 ? head.slice(0, cut) : head;
+  return `${kept}\n…（结果已截断，原始长度 ${text.length} 字符；计数/告警勿用截断片估算，请缩字段或 limit 后重取，否则标 [NO_DATA]）`;
+}
+
+/**
+ * Zoho SalesIQ 等列表接口常返回「整段访客/消息」肥 JSON（单行数 KB），
+ * 默认 12KB 截断后模型只能看到 2～3 条 → 估数/空转。预警取数只需 id + 时间 + 国家码。
+ * 能解析则压成瘦列表；解析失败原样返回。
+ */
+export function compactFatListToolResult(toolName: string, text: string): string {
+  if (!/getConversationsList/i.test(toolName || "")) return text;
+  try {
+    const parsed = JSON.parse(text) as {
+      object?: string;
+      more_data_available?: boolean;
+      data?: Array<Record<string, unknown>>;
+      url?: string;
+    };
+    if (!Array.isArray(parsed.data)) return text;
+    const slim = {
+      url: parsed.url,
+      object: parsed.object || "list",
+      more_data_available: Boolean(parsed.more_data_available),
+      count: parsed.data.length,
+      data: parsed.data.map((row) => {
+        const visitor = (row.visitor && typeof row.visitor === "object"
+          ? (row.visitor as Record<string, unknown>)
+          : null);
+        return {
+          id: row.id ?? null,
+          start_time: row.start_time ?? null,
+          country_code: visitor?.country_code ?? null,
+        };
+      }),
+    };
+    return JSON.stringify(slim);
+  } catch {
+    return text;
+  }
+}
+
+function prepareToolResultText(toolName: string, text: string): string {
+  return truncateResult(compactFatListToolResult(toolName, text));
 }
 
 /** 递归按 key 排序对象，产出确定性 JSON（同语义不同 key 顺序的参数视为同一调用）。 */
@@ -1044,6 +1086,8 @@ interface LoopContext {
   /** 角色级接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：本轮无任何外部数据时不允许收束。
    *  不填 = 不参与本护栏，通用角色行为不变。 */
   enforceGrounding?: boolean;
+  /** 定时运行拒绝执行的内置工具。模型仍可能点名调用，拒绝结果记入本期工具记录。 */
+  deniedBuiltins?: ReadonlySet<string>;
 }
 
 interface LoopOutcome {
@@ -1423,6 +1467,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       chart?: { title?: string; chartType: string; data: unknown; encode?: Record<string, string>; options?: Record<string, unknown> };
       artifact?: ArtifactSpec;
     }> => {
+      if (ctx.deniedBuiltins?.has(c.name)) {
+        return { ok: false, rawText: unattendedToolDenial(c.name), executed: false };
+      }
       const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey);
       if (builtin) {
         return {
@@ -1644,7 +1691,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
                 options: out.chart.options,
               };
             if (out.artifact) yield { type: "artifact", ...out.artifact };
-            const outContent = truncateResult(out.rawText);
+            const outContent = prepareToolResultText(item.call.name, out.rawText);
             yield { type: "tool_result", id: item.call.id, name: item.call.name, ok: out.ok, text: outContent };
             const wrappedOut = wrapUntrusted(outContent, {
               kind: "tool_result",
@@ -1665,7 +1712,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             handles.push({
               name: item.call.name,
               args: truncateArgs(item.call.argsJson),
-              summary: out.ok ? handleSummary(out.rawText) : "执行失败",
+              summary: out.ok
+                ? handleSummary(out.rawText)
+                : out.rawText.includes("定时运行拒绝")
+                  ? "未执行（定时运行拒绝）"
+                  : "执行失败",
             });
           }
           continue;
@@ -1776,6 +1827,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         appendAudit({ kind: "gate", decision: "allowed", ...auditBase });
       }
 
+      if (ctx.deniedBuiltins?.has(call.name)) {
+        ok = false;
+        rawText = unattendedToolDenial(call.name);
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（定时运行拒绝）" });
+        continue;
+      }
       // 内置工具优先（fs_* / write_todos / read_skill）；其余走 MCP 通道。
       executedSigs.add(sig);
       roundExecuted.push(sig);
@@ -1853,7 +1912,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         groundingEvidence += 1;
         pushEvidence(rawText, call.name);
       }
-      content = truncateResult(rawText);
+      content = prepareToolResultText(call.name, rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
       // 注入防护：外部内容回灌模型前包成带 nonce 与来源的不可信数据块（指令与数据分离）。
       // 展示给用户的事件流仍是原文（UI 不受影响），只有模型看到的上下文被定界。
@@ -2192,6 +2251,10 @@ export async function* chatStream(
     forceWrapUp?: boolean;
     /** 任务级附加指引：拼进系统提示的**动态后缀**（不进用户可见历史、不污染稳定前缀）。 */
     taskGuide?: string;
+    /** 本轮不注入的内置工具名（如预警任务摘掉 render_chart / export_data）。 */
+    omitBuiltinTools?: string[];
+    /** 点名调用也拒绝，并把拒绝写进本期工具记录（定时运行用；交互式不传）。 */
+    denyBuiltinTools?: string[];
   } = {},
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string; runId?: string },
@@ -2259,7 +2322,14 @@ export async function* chatStream(
   // 通用角色不设置该字段 → undefined → 不参与本护栏，行为不变。
   const roleEnforceGrounding = conversation?.agentId ? getRole(conversation.agentId).enforceGrounding : undefined;
   // 内置工具与本对话勾了哪些 MCP 无关，始终注入（见上方 mcpEnabled 注释）。
-  const builtinSpecs = builtinToolSpecs({ toolSearch });
+  // omitBuiltinTools：任务级收窄（预警跑禁止出图/导出，避免截断后估数再画图的脏产物）。
+  const omitBuiltins = new Set(
+    (opts.omitBuiltinTools || []).map((name) => String(name || "").trim()).filter(Boolean),
+  );
+  const deniedBuiltins = new Set(
+    (opts.denyBuiltinTools || []).map((name) => String(name || "").trim()).filter(Boolean),
+  );
+  const builtinSpecs = builtinToolSpecs({ toolSearch }).filter((spec) => !omitBuiltins.has(spec.name));
   const specs = [...builtinSpecs, ...(toolSearch ? [] : selection.specs)];
   // 接地护栏的第二路开启条件：**按工具动态判定**，而不是只认角色声明。
   // 本轮存在外部数据源工具（MCP 工具 / 联网检索 / 知识库检索）时，答案就应当接地于工具数据——
@@ -2429,6 +2499,7 @@ export async function* chatStream(
           ownerKey: opts.ownerKey,
           runId: traceMeta?.runId,
           system: systemPrompt,
+          ...(deniedBuiltins.size ? { deniedBuiltins } : {}),
         },
         turns,
       );

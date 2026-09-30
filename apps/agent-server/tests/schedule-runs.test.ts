@@ -128,7 +128,7 @@ test("[E] 超上限的最旧一期只归档、不删除（静默删用户数据�
   expect(after?.messages?.length).toBe(0); // 内容还在（只是被归档），不是被删除
 });
 
-test("[F] 删除任务连带清理本任务产出的会话；不带归属标记的老对话不误伤", async () => {
+test("[F] 删除任务保留历史结果会话；不带归属标记的老对话也不误伤", async () => {
   const { schedule, conversation } = await makeTask("f");
   const run1 = await createRunConversation(schedule, Date.now() - 3600_000);
   await recordScheduleRun(schedule, run1.id, Date.now() - 3600_000, "success");
@@ -147,10 +147,10 @@ test("[F] 删除任务连带清理本任务产出的会话；不带归属标记�
 
   const result = await deleteScheduleWithRuns(schedule.id, owner("f"));
   expect(result.ok).toBe(true);
-  // 专属会话 + 第一期，都被清理
-  expect(result.removedConversations).toBe(2);
-  expect(await getConversation(conversation.id)).toBe(null);
-  expect(await getConversation(run1.id)).toBe(null);
+  expect(result.removedConversations).toBe(0);
+  expect(result.keptConversations).toBe(2);
+  expect(await getConversation(conversation.id)).not.toBe(null);
+  expect(await getConversation(run1.id)).not.toBe(null);
 
   // 老任务那条：删任务不动它（删掉等于把用户自己的对话删了）
   if (legacyTask.ok) {

@@ -64,8 +64,11 @@ import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, ty
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import {
+  garbledTextReason,
+  kickScheduleLoop,
   listSchedules,
   patchSchedule,
+  requestScheduleRun,
   startScheduleLoop,
   validateTiming,
   type ChatSchedule,
@@ -78,10 +81,20 @@ import {
   createTaskConversation,
   deleteScheduleWithRuns,
   knownMcpIds,
+  knownSkillDirs,
   pickNotifyOn,
   recordScheduleRun,
   scheduleConversationTitle,
 } from "./schedule-service.js";
+import {
+  decideAlertDelivery,
+  parseAlertMarker,
+  pickNotifyPolicy,
+  pickPurpose,
+  SCHEDULE_ALERT_GUIDE,
+  type ScheduleNotifyPolicy,
+  type SchedulePurpose,
+} from "./schedule-alert.js";
 import {
   deleteChannel,
   getChannel,
@@ -128,11 +141,31 @@ const SCHEDULE_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.MCP_SCHEDULE_MAX
  *   ② 结论全靠图表承载时，IM 推送渲染不了图，推过去只剩一句「以上为完整监测结果」。
  * 走系统提示的动态后缀注入（不进用户可见历史，也不污染稳定前缀/不影响 prompt cache）。
  */
+const SCHEDULE_UNATTENDED_DENY =
+  "无人值守不允许调用 fs_delete、run_command、run_script、manage_schedule、request_clarification；若仍调用，会被拒绝并记入本期记录。";
+
 const SCHEDULE_TASK_GUIDE =
   "本次是定时任务的新一期运行，请遵守两条：\n" +
   "1) 必须从数据源重新取数，不得沿用本对话历史轮次的结论、数字或图表数据；\n" +
-  "2) 结论要能独立阅读：正文里给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。" +
-  "图仍要用 render_chart 工具出（图在对话里看得到），但不要在正文里写图片链接或图片占位符。";
+  "2) 结论要能独立阅读，并且放在正文最前面：给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。" +
+  "任务名、状态、触发方式和时间由通知另附，正文不要再写一遍。" +
+  "图仍要用 render_chart 工具出（图在对话里看得到），但不要在正文里写图片链接或图片占位符。\n" +
+  SCHEDULE_UNATTENDED_DENY;
+
+/** 预警任务只保留「重新取数」；出图/导出会污染 [SPIKE]/[NORMAL]/[NO_DATA] 协议（见 SCHEDULE_ALERT_GUIDE）。 */
+const SCHEDULE_ALERT_TASK_GUIDE =
+  "本次是定时预警检查的新一期运行：必须从数据源重新取数，不得沿用本对话历史轮次的结论或数字。\n" +
+  SCHEDULE_UNATTENDED_DENY +
+  " 预警检查也不允许 render_chart、export_data。";
+
+/** 定时运行默认拒绝的内置工具。交互式对话不传这份清单。澄清会空等用户，无人值守也不能挂起。 */
+const SCHEDULE_DENIED_BUILTINS = [
+  "manage_schedule",
+  "fs_delete",
+  "run_command",
+  "run_script",
+  "request_clarification",
+];
 
 /**
  * 断线续传的收口语（跨进程）：补齐内容之后如实说明「这一轮已经不在了」。
@@ -196,6 +229,10 @@ async function consumeTask(
     forceWrapUp?: boolean;
     /** 任务级附加指引：拼进系统提示动态段，不进用户可见历史（无人值守任务用）。 */
     taskGuide?: string;
+    /** 本轮不注入的内置工具名（预警任务摘掉出图/导出，避免脏产物）。 */
+    omitBuiltinTools?: string[];
+    /** 点名调用也会拒绝，并把拒绝写进本期工具记录（定时运行用）。 */
+    denyBuiltinTools?: string[];
   },
 ): Promise<void> {
   const runId = newRunId();
@@ -431,8 +468,12 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
 
 /**
  * 定时任务结果投递（钉钉 / 飞书机器人）。
- * 旁路职责：任何失败只落 lastDelivery + 日志，**不改任务状态、不阻塞调度 tick**——
+ * 旁路职责：任何失败只落 lastDelivery + 日志，**不改这一期的成败**——
  * 推送失败与任务本身跑成没跑成是两件事，混在一起会让状态失去诊断价值。
+ * 调用方要等它写完再算下一拍：这里的回写是整份文档，不能和调度器的 nextRunAt 交错。
+ *
+ * `notifyPolicy=on_alert`（docs/scheduled-spike-detection-plan.md）：
+ * 失败仍推；成功则按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] + 冷静期决定是否推。
  */
 async function deliverScheduleResult(
   schedule: ChatSchedule,
@@ -440,13 +481,47 @@ async function deliverScheduleResult(
   text: string,
   charts: ChartSpec[] = [],
 ): Promise<void> {
-  // 通知由「通道启用」开关控制：任务到点跑完即推送所有启用通道（不再逐任务勾选，
-  // 见前端任务表单说明）。通道「启用」是全局总闸，停用的通道不投递。
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
   if (!notifyOn.includes(status)) return;
+
+  const policy: ScheduleNotifyPolicy = pickNotifyPolicy(schedule.notifyPolicy);
+  let deliveryStatus: "success" | "failed" | "alert" | "recovered" = status;
+  let alertStatePatch: ChatSchedule["alertState"] | undefined;
+  let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
+
+  if (policy === "on_alert") {
+    if (status === "failed") {
+      deliveryStatus = "failed";
+    } else {
+      const marker = parseAlertMarker(text);
+      lastMarker = marker;
+      const decision = decideAlertDelivery({
+        marker,
+        alertState: schedule.alertState,
+      });
+      alertStatePatch = decision.nextState;
+      if (decision.kind === "skip") {
+        // 正常 / 无数据 / 冷静期内：不推，但仍回写标记与冷静期状态，侧栏才能显示「已检查」。
+        await patchSchedule(schedule.id, schedule.ownerKey, {
+          alertState: decision.nextState,
+          ...(marker ? { lastMarker: marker } : {}),
+        });
+        return;
+      }
+      deliveryStatus = decision.kind === "spike" ? "alert" : "recovered";
+    }
+  }
+
+  // 通知由「通道启用」开关控制：任务到点跑完即推送所有启用通道（不再逐任务勾选）。
   const channels = loadChannels().filter((channel) => channel.enabled !== false);
   if (!channels.length) {
     console.warn(`[scheduler] ${schedule.id} 没有启用的通知通道，跳过投递`);
+    if (alertStatePatch || lastMarker) {
+      await patchSchedule(schedule.id, schedule.ownerKey, {
+        ...(alertStatePatch ? { alertState: alertStatePatch } : {}),
+        ...(lastMarker ? { lastMarker } : {}),
+      });
+    }
     return;
   }
   const summary = await deliverToChannels(
@@ -454,7 +529,7 @@ async function deliverScheduleResult(
     buildScheduleDelivery({
       ...(schedule.name ? { name: schedule.name } : {}),
       prompt: schedule.prompt,
-      status,
+      status: deliveryStatus,
       text,
       conversationId: schedule.conversationId,
       webOrigin: config.webOrigin,
@@ -467,6 +542,8 @@ async function deliverScheduleResult(
   else console.log(`[scheduler] ${schedule.id} 结果已投递 ${summary.sent} 个通道`);
   await patchSchedule(schedule.id, schedule.ownerKey, {
     lastDelivery: { at: summary.at, ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) },
+    ...(alertStatePatch ? { alertState: alertStatePatch } : {}),
+    ...(lastMarker ? { lastMarker } : {}),
   });
 }
 
@@ -610,7 +687,13 @@ export function createApp() {
       onceAt?: number;
       name?: string;
       mcpServers?: string[];
+      /** 任务级技能勾选（目录名；服务端按清单过滤后落到任务会话与每期运行会话）。 */
+      skills?: string[];
       notifyOn?: ScheduleNotifyOn[];
+      /** 通知策略：always（缺省）/ on_alert（仅异常时推）。 */
+      notifyPolicy?: string;
+      /** 用途：report / alert。 */
+      purpose?: string;
       locale?: string;
       /** Agent 角色（/support 这类非 generic 入口建任务时带上，专属对话按角色分槽）。 */
       agentId?: string;
@@ -627,11 +710,14 @@ export function createApp() {
       cron: body.cron,
       onceAt: body.onceAt,
       mcpServers: body.mcpServers,
+      skills: body.skills,
       notifyOn: body.notifyOn,
+      notifyPolicy: pickNotifyPolicy(body.notifyPolicy),
+      purpose: pickPurpose(body.purpose) as SchedulePurpose | undefined,
       locale: body.locale,
       sourceConversationId: body.conversationId,
       agentId: body.agentId,
-      runMode: body.runMode === "same" ? "same" : ("new" as ScheduleRunMode),
+      runMode: body.runMode === "same" || body.runMode === "new" ? (body.runMode as ScheduleRunMode) : undefined,
     });
     if (!result.ok) return errorJson(c, 400, result.code, result.error);
     return c.json({ schedule: result.schedule, conversation: result.conversation });
@@ -645,7 +731,11 @@ export function createApp() {
       onceAt?: number;
       enabled?: boolean;
       mcpServers?: string[];
+      /** 任务级技能勾选（目录名；服务端按清单过滤）。 */
+      skills?: string[];
       notifyOn?: ScheduleNotifyOn[];
+      notifyPolicy?: string;
+      purpose?: string;
       /** 每期结果的落点："new"（每期新会话）/ "same"（回投同一会话）；只影响此后的运行。 */
       runMode?: string;
       /** 未读期数：前端打开任一期会话后置 0。 */
@@ -655,6 +745,14 @@ export function createApp() {
       const timingError = validateTiming({ cron: body.cron, onceAt: body.onceAt });
       if (timingError) return errorJson(c, 400, "SCHEDULE_INVALID_TIME", timingError);
     }
+    if (body.name !== undefined) {
+      const reason = garbledTextReason(body.name);
+      if (reason) return errorJson(c, 400, "SCHEDULE_INVALID", `任务名称${reason}`);
+    }
+    if (body.prompt !== undefined) {
+      const reason = garbledTextReason(body.prompt);
+      if (reason) return errorJson(c, 400, "SCHEDULE_INVALID", `任务内容${reason}`);
+    }
     const updated = await patchSchedule(c.req.param("id"), c.get("owner"), {
       ...(body.name !== undefined ? { name: body.name } : {}),
       ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
@@ -662,7 +760,12 @@ export function createApp() {
       ...(body.onceAt === undefined && body.cron !== undefined ? { cron: String(body.cron) } : {}),
       ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
       ...(body.mcpServers !== undefined ? { mcpServers: knownMcpIds(body.mcpServers) } : {}),
+      ...(body.skills !== undefined ? { skills: knownSkillDirs(body.skills) } : {}),
       ...(body.notifyOn !== undefined ? { notifyOn: pickNotifyOn(body.notifyOn) } : {}),
+      ...(body.notifyPolicy !== undefined ? { notifyPolicy: pickNotifyPolicy(body.notifyPolicy) } : {}),
+      ...(body.purpose !== undefined
+        ? { ...(pickPurpose(body.purpose) ? { purpose: pickPurpose(body.purpose)! } : {}) }
+        : {}),
       ...(body.runMode === "same" || body.runMode === "new" ? { runMode: body.runMode as ScheduleRunMode } : {}),
       ...(body.unreadRuns !== undefined ? { unreadRuns: Number(body.unreadRuns) || 0 } : {}),
     });
@@ -671,10 +774,33 @@ export function createApp() {
   });
 
   app.delete("/chat/schedules/:id", async (c) => {
-    // 连带清理本任务产出的会话（只删会话自己标着属于本任务的，不碰用户自己的对话）。
+    // 只删任务本身。结果会话保留在对话列表里，不跟任务一起消失。
     const result = await deleteScheduleWithRuns(c.req.param("id"), c.get("owner"));
     if (!result.ok) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
-    return c.json({ ok: true, removedConversations: result.removedConversations });
+    return c.json({
+      ok: true,
+      removedConversations: result.removedConversations,
+      keptConversations: result.keptConversations,
+    });
+  });
+
+  // 立即执行：多跑一期，不改原来的 nextRunAt。reason 有内容时当作事件唤醒。
+  app.post("/chat/schedules/:id/run", async (c) => {
+    const body = await readJson<{ reason?: string }>(c);
+    const updated = await requestScheduleRun(c.req.param("id"), c.get("owner"), body.reason);
+    if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
+    kickScheduleLoop();
+    return c.json({ schedule: updated });
+  });
+
+  // 事件唤醒：与立即执行同一条路径，但一定带上唤醒说明（缺省「外部事件」）。
+  app.post("/chat/schedules/:id/wake", async (c) => {
+    const body = await readJson<{ reason?: string }>(c);
+    const reason = String(body.reason || "").trim() || "外部事件";
+    const updated = await requestScheduleRun(c.req.param("id"), c.get("owner"), reason);
+    if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
+    kickScheduleLoop();
+    return c.json({ schedule: updated });
   });
 
   // ---- 结果投递通道（钉钉 / 飞书自定义机器人）----
@@ -1460,18 +1586,32 @@ export function createApp() {
     // 后续一律用这个 id：重建后本地 schedule 里的旧 id 已过期（投递链接也要跟着新对话走）。
     const conversationId = await ensureRunConversation(schedule, Date.now());
     if (isTaskRunning(conversationId)) return "skipped"; // 兜底：同一会话上已有任务在跑
-    const task = startTask({ conversationId, userText: schedule.prompt });
+    const wake = String(schedule.wakeReason || "").trim();
+    const task = startTask({
+      conversationId,
+      userText: wake ? `【事件唤醒】${wake}\n\n${schedule.prompt}` : schedule.prompt,
+    });
     // 任务级工具清单：任务自己勾了就按任务的（独立启用集），任务没勾才回落到对话启用集
     // （见 chat.ts 的 taskServers 分支）——别按「只收窄」理解。
     // 轮次预算也放宽：没人盯着，被轮次截断就等于这一期报告没有结论。
     // forceWrapUp 兜底：预算用到最后一轮时摘掉工具，强制它用已取到的数据收尾（不然只会留下一串过程叙述）。
     // taskGuide：每期必须重新取数 + 正文要有可独立阅读的结论（上下文里躺着上期结论时尤其关键）。
+    // 预警任务再追加结论协议（[SPIKE]/[NORMAL]/[NO_DATA]），投递旁路只认首行标记。
+    const onAlert = pickNotifyPolicy(schedule.notifyPolicy) === "on_alert";
     await consumeTask(task, {
       ownerKey: schedule.ownerKey,
       mcpServers: schedule.mcpServers,
-      maxRounds: SCHEDULE_MAX_TOOL_ROUNDS,
+      // 预警要少轮次：列表截断后容易陷入「再取一页 / 再 parse」空转（实测 30+ 步、数分钟）。
+      maxRounds: onAlert
+        ? Math.min(SCHEDULE_MAX_TOOL_ROUNDS, Math.max(1, Number(process.env.MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS) || 12))
+        : SCHEDULE_MAX_TOOL_ROUNDS,
       forceWrapUp: true,
-      taskGuide: SCHEDULE_TASK_GUIDE,
+      // 预警：不注入报告型「必须出图」指引；并硬摘 render_chart / export_data。
+      taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
+      // 无人值守默认拒绝改任务、删文件、跑命令/脚本；预警再拒绝出图/导出。
+      // 工具从清单里拿掉，模型若仍点名调用，执行层拒绝并把原因记进本期记录。
+      omitBuiltinTools: [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])],
+      denyBuiltinTools: [...SCHEDULE_DENIED_BUILTINS, ...(onAlert ? ["render_chart", "export_data"] : [])],
     });
     const text = finalTextOf(task).trim();
     // 图表数据一并投递：IM 两端都渲染不了图，而结论常常就落在图里（只推正文 = 推一句收尾话）。
@@ -1484,13 +1624,15 @@ export function createApp() {
     if (finished === "success" && !text) {
       console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽），按 failed 记账`);
     }
+    const marker = onAlert ? parseAlertMarker(text) : null;
     // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：
     // 必须在 schedulerTick 写回状态之前完成，schedulerTick 会以库里的最新值为基底合并（不会回退）。
-    await recordScheduleRun(schedule, conversationId, Date.now(), final);
-    // 结果投递（钉钉 / 飞书机器人）：旁路，fire-and-forget，不拖住调度 tick、不影响任务状态。
+    await recordScheduleRun(schedule, conversationId, Date.now(), final, marker || undefined);
+    // 投递失败不改这一期的成败，但必须在调度器写下一拍之前写完。
+    // patchSchedule 会整份回写：若投递还在飞，调度器刚算好的 nextRunAt / 清掉的立即执行标记会被旧快照盖回去。
     if (final === "success" || final === "failed") {
       // 重建过专属对话时 schedule.conversationId 是旧值，投递链接必须用解析后的 id。
-      void deliverScheduleResult({ ...schedule, conversationId }, final, text, charts).catch((err) =>
+      await deliverScheduleResult({ ...schedule, conversationId }, final, text, charts).catch((err) =>
         console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
       );
     }

@@ -44,7 +44,7 @@ test("[A] 加签：钉钉/飞书算法不同且可复算（钉钉需 URL 编码�
   expect(dingtalkSign(secret, ts)).not.toBe(feishuSign(secret, ts));
 });
 
-test("[B] 钉钉：无按钮走 markdown，有按钮走 actionCard（驼峰字段 + btns），加签进 query", async () => {
+test("[B] 钉钉：一律 markdown（链接折进正文），加签进 query", async () => {
   const { calls, impl } = fakeFetch();
   await sendToChannel(channel({ secret: "S" }), { title: "T", body: "B" }, { fetchImpl: impl, now: 123 });
   const plain = calls[0]!;
@@ -58,10 +58,10 @@ test("[B] 钉钉：无按钮走 markdown，有按钮走 actionCard（驼峰字�
     { title: "T", body: "B", links: [{ title: "打开", url: "https://x/y" }] },
     { fetchImpl: withLinks.impl },
   );
-  const payload = withLinks.calls[0]!.payload as { msgtype: string; actionCard: { btns: unknown[] } };
-  expect(payload.msgtype).toBe("actionCard");
-  // 自定义机器人的形状是驼峰 actionCard + btns[{title, actionURL}]（员工服务台机器人才是 action_card）。
-  expect(payload.actionCard.btns[0]).toEqual({ title: "打开", actionURL: "https://x/y" });
+  const payload = withLinks.calls[0]!.payload as { msgtype: string; markdown: { text: string } };
+  expect(payload.msgtype).toBe("markdown");
+  expect(payload.markdown.text).toContain("[打开](https://x/y)");
+  expect(payload).not.toHaveProperty("actionCard");
 });
 
 test("[C] 飞书：走交互卡片，密钥进载荷，判定 code 而非 errcode", async () => {
@@ -75,6 +75,31 @@ test("[C] 飞书：走交互卡片，密钥进载荷，判定 code 而非 errcod
   expect(payload.msg_type).toBe("interactive");
   expect(payload.timestamp).toBe("55");
   expect(payload.sign).toBe(feishuSign("S", 55));
+});
+
+test("[C2] 企业微信：markdown 单载荷、按钮折文内链接、不支持加签（secret 忽略）、判定 errcode", async () => {
+  const { calls, impl } = fakeFetch();
+  await sendToChannel(
+    channel({ kind: "wecom", webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=tok", secret: "S" }),
+    { title: "T", body: "B", links: [{ title: "打开对话", url: "https://x/y" }] },
+    { fetchImpl: impl, now: 7 },
+  );
+  const { url, payload } = calls[0]!;
+  // 企业微信机器人不支持加签：URL 不能拼 sign 参数，载荷也不带 sign
+  expect(url).not.toContain("sign=");
+  expect(payload).toEqual({
+    msgtype: "markdown",
+    markdown: { content: expect.stringContaining("[打开对话](https://x/y)") },
+  });
+  // 拒收判定与钉钉同形状：HTTP 200 + errcode 非 0 也必须抛错
+  const rejected = fakeFetch({ errcode: 93000, errmsg: "invalid webhook url" });
+  await expect(
+    sendToChannel(
+      channel({ kind: "wecom", webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=tok" }),
+      { title: "T", body: "B" },
+      { fetchImpl: rejected.impl },
+    ),
+  ).rejects.toThrow(/93000/);
 });
 
 test("[D] 平台拒收：HTTP 200 但错误码非 0 必须抛错（关键词/签名配错的典型场景）", async () => {
@@ -105,6 +130,22 @@ test("[F] Markdown → IM：表格折成「列=值」行、跳过分隔行、超
   // 分隔行不能变成数据行（否则 IM 里会出现一行 `---=---`）
   expect(out).not.toContain("---=");
   expect(out).toContain("结果如下：");
+});
+
+test("[F2] IM 正文去掉工具轨迹，并躲开钉钉把下划线/方括号当格式符", () => {
+  const md = [
+    "[NORMAL]",
+    "- 口径：country_code=IN",
+    "",
+    "[本轮已执行的工具]",
+    '- mcp__zoho {"fields":"country_code"} → 92690 字符',
+  ].join("\n");
+  const out = formatForIm(md, "zh");
+  expect(out).toContain("【NORMAL】");
+  expect(out).toContain("country＿code=IN");
+  expect(out).not.toContain("[本轮已执行的工具]");
+  expect(out).not.toContain("92690");
+  expect(out).not.toContain("_");
 });
 
 test("[G] 超长正文截断并注明（钉钉/飞书都有字节上限，宁可截断也不能被拒收）", () => {
@@ -193,6 +234,7 @@ test("[J] 通道校验：只放行已知机器人域名（SSRF 出口必须堵�
   expect(hostOf("not-a-url")).toBe("");
   expect(validateChannelInput({ kind: "dingtalk", webhook: "https://oapi.dingtalk.com/robot/send?a=1" })).toBeNull();
   expect(validateChannelInput({ kind: "feishu", webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/x" })).toBeNull();
+  expect(validateChannelInput({ kind: "wecom", webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x" })).toBeNull();
   expect(validateChannelInput({ kind: "dingtalk", webhook: "http://127.0.0.1:9000/hook" })).toMatch(/域名不在允许列表/);
   expect(validateChannelInput({ kind: "http", webhook: "https://oapi.dingtalk.com/x" } as never)).toMatch(/类型非法/);
   expect(validateChannelInput({ kind: "dingtalk", webhook: "" })).toMatch(/必填/);
@@ -210,4 +252,18 @@ test("[J] 通道校验：只放行已知机器人域名（SSRF 出口必须堵�
   } finally {
     delete process.env.NOTIFY_ALLOWED_HOSTS;
   }
+});
+
+test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定时任务」", () => {
+  const msg = buildScheduleDelivery({
+    name: "??????",
+    prompt: "????",
+    status: "success",
+    text: "已处理",
+    conversationId: "c",
+    locale: "zh",
+  });
+  expect(msg.title.startsWith("定时任务")).toBe(true);
+  expect(msg.body).toContain("任务：定时任务");
+  expect(msg.body).not.toContain("????");
 });

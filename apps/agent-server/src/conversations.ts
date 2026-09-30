@@ -269,6 +269,8 @@ export async function createConversation(input: {
   agentId?: string;
   /** 显式指定 MCP 启用集（缺省 = 角色默认）。 */
   mcpServers?: string[];
+  /** 显式指定技能勾选集（定时任务建会话时继承任务配置用；缺省 = 空，仅默认技能生效）。 */
+  skillsEnabled?: string[];
   /** 显式指定「完全访问」开关（缺省 = 角色默认，再缺省 = true）。 */
   fullAccess?: boolean;
   /** 产出该会话的定时任务（每期会话带；见 ConversationDoc.scheduleId）。 */
@@ -295,6 +297,7 @@ export async function createConversation(input: {
     ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
     ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
     ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
+    ...(input.skillsEnabled?.length ? { skillsEnabled: [...new Set(input.skillsEnabled)] } : {}),
   };
   const coll = await getColl();
   if (!coll) {
@@ -322,6 +325,7 @@ export async function createConversation(input: {
         ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
         ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
         ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
+        ...(input.skillsEnabled?.length ? { skillsEnabled: [...new Set(input.skillsEnabled)] } : {}),
       },
     },
     { upsert: true },

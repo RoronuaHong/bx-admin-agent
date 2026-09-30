@@ -640,6 +640,18 @@ export function workspaceDownloadUrl(conversationId: string, path: string): stri
 export type ScheduleStatus = "success" | "failed" | "cancelled" | "skipped" | "error";
 /** 触发投递的状态白名单（跳过/取消一律不推）。 */
 export type ScheduleNotifyOn = "success" | "failed";
+/** 通知策略：always=每期都推；on_alert=仅异常（+恢复）时推。 */
+export type ScheduleNotifyPolicy = "always" | "on_alert";
+/** 任务用途：报告 / 预警（表单回填；引擎以 notifyPolicy 为准）。 */
+export type SchedulePurpose = "report" | "alert";
+/** 预警结论文本首行标记。 */
+export type AlertMarker = "SPIKE" | "NORMAL" | "NO_DATA";
+
+export interface ScheduleAlertState {
+  firing?: boolean;
+  lastAlertAt?: number;
+  normalStreak?: number;
+}
 
 export interface ScheduleDto {
   id: string;
@@ -652,7 +664,7 @@ export interface ScheduleDto {
    */
   runMode?: "new" | "same";
   /** 各期运行记录（新的在前，受服务端上限截断）。 */
-  runs?: Array<{ conversationId: string; at: number; status?: ScheduleStatus }>;
+  runs?: Array<{ conversationId: string; at: number; status?: ScheduleStatus; marker?: AlertMarker }>;
   /** 未读期数（>0 时侧栏显示角标；打开任一期会话后清零）。 */
   unreadRuns?: number;
   name?: string;
@@ -663,7 +675,19 @@ export interface ScheduleDto {
   onceAt?: number;
   /** 任务级外部工具允许清单（MCP 服务器 id）：与对话启用集取交集，只收窄不放开。 */
   mcpServers?: string[];
+  /** 任务角色（建任务时确定；每期运行会话继承）。旧数据可能缺省。 */
+  agentId?: string;
+  /** 任务级技能勾选（技能目录名）：落到任务会话与每期运行会话，随运行注入系统提示。 */
+  skills?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  /** 通知策略（docs/scheduled-spike-detection-plan.md）。缺省 always。 */
+  notifyPolicy?: ScheduleNotifyPolicy;
+  /** 用途：report / alert。 */
+  purpose?: SchedulePurpose;
+  /** 预警冷静期 / 恢复状态（只读）。 */
+  alertState?: ScheduleAlertState;
+  /** 最近一期预警结论标记（只读）。 */
+  lastMarker?: AlertMarker;
   locale?: string;
   lastDelivery?: { at: number; ok: boolean; sent: number; error?: string };
   enabled: boolean;
@@ -672,6 +696,10 @@ export interface ScheduleDto {
   lastStatus?: ScheduleStatus;
   lastNote?: string;
   nextRunAt?: number;
+  /** 因对话占用而开始排队等待的时刻（只读）。 */
+  queuedSince?: number;
+  /** 已排队的立即执行 / 事件唤醒（只读）。 */
+  runRequestedAt?: number;
 }
 
 export interface ScheduleInput {
@@ -684,7 +712,11 @@ export interface ScheduleInput {
   cron?: string;
   onceAt?: number;
   mcpServers?: string[];
+  /** 任务级技能勾选（技能目录名）。 */
+  skills?: string[];
   notifyOn?: ScheduleNotifyOn[];
+  notifyPolicy?: ScheduleNotifyPolicy;
+  purpose?: SchedulePurpose;
   locale?: string;
   /** 每期结果的落点；缺省 "new"（每期新会话）。 */
   runMode?: "new" | "same";
@@ -722,17 +754,26 @@ export async function patchChatSchedule(id: string, patch: SchedulePatchInput): 
   return data.schedule;
 }
 
-/** 删除任务；返回被连带删除的结果会话数（服务端只删本任务产出的会话，不碰用户自己的对话）。 */
-export async function deleteChatSchedule(id: string): Promise<{ removedConversations?: number }> {
+/** 立即执行一期。不改原来的下次时间。reason 有内容时当作事件唤醒。 */
+export async function runChatSchedule(id: string, reason?: string): Promise<ScheduleDto> {
+  const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}/run`, {
+    method: "POST",
+    body: JSON.stringify(reason ? { reason } : {}),
+  })) as { schedule: ScheduleDto };
+  return data.schedule;
+}
+
+/** 删除任务。结果会话会保留；removedConversations 恒为 0。 */
+export async function deleteChatSchedule(id: string): Promise<{ removedConversations?: number; keptConversations?: number }> {
   const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, {
     method: "DELETE",
-  })) as { removedConversations?: number };
+  })) as { removedConversations?: number; keptConversations?: number };
   return data || {};
 }
 
 // ---- 结果投递通道（钉钉 / 飞书自定义机器人；凭据只写不回显）----
 
-export type NotifyChannelKind = "dingtalk" | "feishu";
+export type NotifyChannelKind = "dingtalk" | "feishu" | "wecom";
 
 export interface NotifyChannelDto {
   id: string;

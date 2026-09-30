@@ -12,17 +12,19 @@
 | 0 | 现状审计 + 最佳实践对比 | ✅ 已完成（§1 / §2） |
 | 1 | 数据模型：`runMode` / `runs[]` / `unreadRuns` / 会话侧 `scheduleId` | ✅ 已落码（`schedules.ts` / `conversations.ts` / `schedule-service.ts`）+ 回归测试 `tests/schedule-runs.test.ts` |
 | 2 | 调度循环：每期开新会话 + 落运行记录 + 并发判定修正 | ✅ 已落码（`app.ts` `schedulerTick`：`runMode` 分支 + `createRunConversation` + `recordScheduleRun`；并发判定改用 `lastStatus==="running"` 防重入，见 §3.9） |
-| 3 | 保留上限（超上限归档不删除）+ 删除任务连带清理 | ✅ 已落码并测（`prependRun` + `MAX_RUNS_PER_SCHEDULE` 截断；`recordScheduleRun` 超限归档最旧一期；`deleteScheduleWithRuns` 按 `scheduleId` 标记连带清理本任务会话，不碰用户自己的对话） |
+| 3 | 保留上限（超上限归档不删除）+ 删除任务 | ✅ 超上限归档。2026-09-30 起删除任务**保留**结果会话（`deleteScheduleWithRuns` 不再删对话） |
 | 4 | 侧栏：任务会话从主列表移出，按任务分组成树 + 未读角标 | ✅ 已落码（`ChatPage.vue` `taskGroups` 计算属性 + `taskConvIds` 改为含各期会话 + 模板分组区 + 折叠/未读角标/状态点；`clearTaskUnread` 打开任一期清零） |
 | 5 | 任务表单：结果落点可选（每期新会话 / 同一会话） | ✅ 已落码（表单「结果落点」两段式选择；`runMode` 随建/改提交；老任务缺省按 `same` 显示以不悄悄改既有行为） |
 | 6 | 老任务迁移 + 回归测试 + 端到端验证 | 🟡 回归测试已补 `tests/schedule-runs.test.ts` 7 例（A–G）全绿；老任务迁移 `migrateTaskConversations`（启动一次性）早于本期已落码；端到端（真实服务建任务→到点跑两期→侧栏出现两个子项）待手测 |
 
-> 进度注（2026-09-29）：阶段 1–5 全部落码；新增单元回归 `tests/schedule-runs.test.ts` 7 例覆盖「每期新会话 / 同一会话 / 落记录与未读 / 超上限归档不删 / 删除连带清理不误伤」等边界。
-> 验证：全量 40 文件 / 225 测试绿、`tsc --noEmit`（agent-server）与 `vue-tsc --noEmit`（web）均 0 错误。剩余：真实服务端到端手测（刷新等待 cron 自然触发，或临时把 cron 改成每分钟）。
+> 进度注（2026-09-30）：阶段 1–5 已落码。删除任务改为保留结果会话；`tests/schedule-runs.test.ts` 覆盖「删除后会话仍在」。
+> 验证：全量 43 文件 / 251 测试绿（2026-09-30）。剩余：真实服务上「建任务 → 到点跑两期 → 侧栏两个子项」的手测还没做。不要为了手测去打开已暂停的业务预警。
 
 ---
 
-## 1. 现状审计（代码级）
+## 1. 立项时现状（2026-09-29 快照，不是现行行为）
+
+下表是立项时的代码。现行行为以文首状态表和 §3 为准。
 
 | 能力 | 现状 | 位置 | 问题 |
 |---|---|---|---|
@@ -48,7 +50,7 @@
 | **独立的 Scheduled 视图当收件箱** | "The Scheduled view acts as your inbox… an unread indicator shows when a run needs your attention" | 任务结果要有**未读指示**，不能只在会话里躺着 |
 | **列表项形态** | `Daily inbox summary · Every weekday at 8:00 AM · Next run in 16 hours`；`All / Active / Paused` 筛选 + `Mark all as read` | 任务卡片要带**下次运行的相对时间**；未读要能一键清 |
 | **无人值守最小权限** | "Start with the narrowest access that lets the task succeed, grant network or broader file access only when required" | 我们已有的 `mcpServers` 任务级收窄方向正确，保持 |
-| **先测后跑** | "Before you schedule a task, test its prompt manually in a regular chat first… review the first few runs" | 新建任务时提示「先在普通对话里试一遍 prompt」 |
+| **先测后跑** | "Before you schedule a task, test its prompt manually in a regular chat first… review the first few runs" | **预警已落地**：对话试跑 →「设为数据预警」；报告型仍建议先手测 prompt（表单侧提示） |
 | **运行要可整理** | "Archive scheduled runs you no longer need, and avoid pinning runs unless you intend to keep" | 运行历史必须有**保留上限与整理手段**，不能无限膨胀 |
 
 ### 2.2 CodeBuddy（用户提供的截图）
@@ -64,8 +66,8 @@
 1. 周期结果灌进用户自己的聊天（刷屏）——2026-09-22 已用「任务专属对话」修掉，本方案保持。
 2. 每期结果互相覆盖 / 首尾相接无法回溯——本方案的主目标。
 3. 运行记录无限增长——`MAX_RUNS` + 超上限归档。
-4. 删除任务留下孤儿会话——删除连带清理（并前端二次确认）。
-5. 静默删除用户数据——超上限**归档不删除**；删除任务连带删会话时前端明确告知条数。
+4. 删任务时把历史结果一起删掉——2026-09-30 改为保留，结果会话回到对话列表（千问办公同口径）。
+5. 静默删除用户数据——超上限**归档不删除**。删除任务不再删会话。
 6. 「空闲」桶按活跃度分——活跃度是用户不可预测的状态（"我昨天才用的怎么跑到空闲里了"）；按**来源**分桶用户可预测。故本方案按来源分「定时任务」区，不引入「空闲」桶（"收起来不看"由已有的「归档」承担）。
 
 ### 2.4 调研结论
@@ -129,11 +131,11 @@ runMode?: "new" | "same";
 - 用户打开该任务的任一期会话 → 前端 `PATCH /chat/schedules/:id { unreadRuns: 0 }`（乐观清零，失败回滚）。
 - 与 ChatGPT「Scheduled 视图当收件箱 + 未读指示」同口径。
 
-### 3.6 删除任务连带清理
+### 3.6 删除任务（2026-09-30：保留历史会话）
 
-- `DELETE /chat/schedules/:id` → 删除任务后，**一并删除 `runs` 里记录的会话**（这些会话只装本任务的产物，留着既不可整理也认不出来源）。
-- 前端：任务已有运行记录时，删除按钮进入**二次确认**并如实告知「将同时删除 N 期结果」（对齐 `conversation-list-ux-plan.md` §2.5 删除最佳实践：破坏性且有内容 → 需确认）。
-- 不连带删除的是：老任务迁移前绑在用户自己聊天上的那种会话（`ownConversation` 为假）——那里面混着用户自己的内容，删不得。
+- `DELETE /chat/schedules/:id` 只删任务，**不删**结果会话。它们回到对话列表，仍可打开。
+- 前端：任务已有运行记录时仍二次确认，文案说明这些会话会保留。
+- `ownConversation` 为假的老对话本来就不碰。`manage_schedule` 的 delete 同样只删任务。
 
 ### 3.7 并发与跳过判定修正（连带项，必须一起改）
 
@@ -154,11 +156,11 @@ runMode?: "new" | "same";
 - 已有 `runs` → 跳过。
 - 不动任何既有会话内容（与现有迁移同口径）。
 
-### 3.9 调度循环改动要点（**隐藏的顺序坑**）
+### 3.9 调度循环改动要点（**隐藏的顺序坑，已按此修**）
 
-`schedulerTick` 在 runner 之后会用**runner 执行前**那份 `schedule` 快照整体 `writeSchedule`（`schedules.ts` L385-401），runner 内部写入的 `runs` / `unreadRuns` / `conversationId` 会被这一写**静默回退**。
+`schedulerTick` 若在 runner 之后用**开跑前**的快照整体 `writeSchedule`，runner 刚写入的 `runs` / `unreadRuns` / `conversationId` 会被静默回退。
 
-→ 修法：runner 返回后**重新读一次**日程（`getSchedule(id)`）再合并状态写回。不改这里，`runs` 永远写不进去，且现象是「偶发丢记录」，极难定位。
+已修：runner 返回后先 `getSchedule(id)`，再在这份最新文档上合并 `lastRunAt` / `nextRunAt`。任务已删则不再写回；本期被暂停则保持暂停且不排下一拍。投递也必须在这次写回之前结束（`patchSchedule` 是整份文档，交错会盖掉 `nextRunAt`）。
 
 ### 3.10 侧栏交互
 
@@ -199,7 +201,7 @@ runMode?: "new" | "same";
 |---|---|
 | `POST /chat/schedules` | 入参增 `runMode`（缺省 `new`）；响应 `schedule` 带 `runMode` / `runs` / `unreadRuns` |
 | `PATCH /chat/schedules/:id` | 入参增 `runMode`、`unreadRuns`（清零用） |
-| `DELETE /chat/schedules/:id` | 连带删除 `runs` 记录的会话（`ownConversation` 为真时） |
+| `DELETE /chat/schedules/:id` | 只删任务。结果会话保留（2026-09-30） |
 | `GET /chat/schedules` | 无形状变化（字段自然带出） |
 | `manage_schedule` 工具 | 描述与 `create` 入参说明补一句落点语义（不给新必填项，模型默认走 `new`） |
 
@@ -212,7 +214,7 @@ runMode?: "new" | "same";
 1. `schedules.ts`：`runMode` / `runs` / `unreadRuns` / `agentId` 字段 + `SchedulePatch` 扩字段 + `MAX_RUNS` 截断 + `schedulerTick` 合并写回（§3.9）。
 2. `conversations.ts`：`ConversationDoc` 增 `scheduleId` / `scheduleRunAt`，`createConversation` 透传。
 3. `schedule-service.ts`：`createTaskConversation` 支持 `scheduleId` / `scheduleRunAt` / `agentId`；新增 `scheduleRunTitle`；`createScheduleTask` 收 `runMode` 并落 `agentId`。
-4. `app.ts`：调度循环改 `ensureRunConversation` + 落 `runs` + 并发判定修正；DELETE 连带清理；PATCH/POST 透传新字段；`migrateTaskConversations` 扩展。
+4. `app.ts`：调度循环改 `ensureRunConversation` + 落 `runs` + 并发判定修正；DELETE 只删任务、保留结果会话；PATCH/POST 透传新字段；`migrateTaskConversations` 扩展。
 5. `builtins.ts`：`manage_schedule` 描述补落点语义。
 6. `apps/web/src/api.ts`：类型同步。
 7. `ChatPage.vue`：侧栏定时任务分组区 + 未读清零 + 表单落点选择 + 删除二次确认。
@@ -227,7 +229,7 @@ runMode?: "new" | "same";
 - [ ] 上一期还在跑时到点 → 本期 `skipped`，不并发重入。
 - [ ] `runs` 超过 `MAX_RUNS` → 最旧的会话被**归档**（仍存在、可找回），不被删除。
 - [ ] 每期结束 `unreadRuns +1`；打开任一期会话后清零。
-- [ ] 删除任务 → 其 `runs` 会话一并删除；`ownConversation` 为假的老任务会话**不**受影响。
+- [x] 删除任务 → 结果会话保留并回到对话列表；`ownConversation` 为假的老任务会话也不受影响。（2026-09-30）
 - [ ] 侧栏：任务会话不在主列表平铺区；定时任务区按任务分组、可折叠、未读角标正确、点击子项打开对应一期。
 - [ ] 老任务迁移后 `runMode="same"` 且 `runs[0]` = 原会话，内容不变。
 - [ ] `tsc --noEmit` / `vue-tsc --noEmit` / 全量测试全绿。
@@ -239,7 +241,7 @@ runMode?: "new" | "same";
 |---|---|
 | `schedulerTick` 快照覆盖导致 `runs` 丢失 | §3.9 显式重读合并；用测试钉住「runner 内写入不被回退」 |
 | 每期建会话放大存储 | `MAX_RUNS` 上限 + 超上限归档（不删） |
-| 删除任务连带删会话误伤 | 只删 `runs` 记录且 `ownConversation` 为真的会话 + 前端二次确认告知条数 |
+| 删除任务误伤用户自己的对话 | 不删任何会话；只删任务记录 |
 | 老任务行为变化 | 迁移统一置 `runMode="same"`，行为与现状逐字一致 |
 | 并发判定改动引入重入 | 测试覆盖「上一期在跑 → 本期 skipped」 |
 | 回滚 | 全部改动由 `runMode` 缺省 + 迁移兜底；出问题把默认改回 `same` 即回到旧行为，数据无需回滚 |
@@ -248,7 +250,10 @@ runMode?: "new" | "same";
 
 ## 8. 实施与验证记录
 
-（实施后填写：改动文件 / 关键实现点 / 实测记录 / 过程中的坑）
+- 阶段 1–5 已落码：`runMode` / `runs` / 侧栏分组 / 删除任务保留会话。
+- §3.9 的重读合并、忙时窗口内补跑、立即执行不改原周期，都在 `schedulerTick`。
+- 2026-09-30 全量 vitest：43 文件 / 251 例通过。
+- 未做：真实服务上连跑两期、看侧栏两个子项。验收清单里未打勾的项仍以那次手测为准。
 
 ---
 

@@ -14,6 +14,11 @@
 
 ## 一、现行设计 / 方案文档
 
+### [best-practice-alignment-review.md](./best-practice-alignment-review.md)
+- **定位**：2026-09-30 全项目逐步对照（千问办公 / CodeBuddy CLI / WorkBuddy / ChatGPT Monitoring）。
+- **覆盖**：定时任务 S1–S20；其余功能 F1–F20 只标是否要动。A1–A6 已落地。
+- **状态**：✅ A1–A6 已落地（2026-09-30）。产品口径仍以各主题现行文档为准。
+
 ### [artifact-delivery-plan.md](./artifact-delivery-plan.md)
 - **定位**：产物交付闭环（模型生成文件 → 用户真能拿到）的设计与落地记录；也是后续「命令执行治理」「配置缓存」修复的承载文档。
 - **覆盖**：§1–2 断链核查 · §4 形态判定（内置/MCP/Skill/定时任务）· §10 v2 格式扩展 · §11 报告式导出 + 手写 HTML 零外链护栏 · §12 全对话审计与上下文工程全链路对照 · §13 `run_command` 治理 · §14 配置热重载缓存失效键。
@@ -32,7 +37,7 @@
 - **定位**：通用 Agent 基建检查表（M0–M4 成熟度模型 + 反模式），每章带「本项目对照」。
 - **覆盖**：可观测（§10）· 安全与注入防护 · 评测门禁 · 成本归因（§12）· 发布灰度与回滚 · 调试。
 - **现行落点**：`trace.ts`（`runs-<YYYYMM>.jsonl` + 逐轮 `rounds-<runId>.jsonl`）· `cost.ts` · `audit.ts` · `rate-limit.ts` · `untrusted.ts` · `roles.ts`。
-- **状态**：✅ 现行（§10 已于 2026-09-24 补入逐轮 trace 说明）。
+- **状态**：✅ 现行（§10 已于 2026-09-24 补入逐轮 trace 说明）。本机投递试跑固定走通道 `dingtalk`（关键词 `bx-agent`），不打开印度业务通道。
 - **注意**：整体仍是「🟡 部分」——缺 llm/tool 分层 span、指标看板、按会话回放。
 
 ### [write-op-safety-plan.md](./write-op-safety-plan.md)

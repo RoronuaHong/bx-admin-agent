@@ -15,6 +15,7 @@ import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS, type Repor
 import { setConversationTodos } from "./conversations.js";
 import { createScheduleTask } from "./schedule-service.js";
 import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
+import { pickNotifyPolicy, pickPurpose } from "./schedule-alert.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
 import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
@@ -420,10 +421,11 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     spec(
       "manage_schedule",
       "创建 / 暂停 / 恢复 / 删除**定时任务**（到点自动跑一次指令，结果回投到任务专属对话，不刷当前聊天）。" +
+        "最佳实践：先在普通对话里试跑一轮、确认口径，再用本工具创建；预警类请带 purpose=alert（或 notifyPolicy=on_alert）。" +
         "action=create 时必填 prompt（到点要执行的完整指令），时间给 cron（5 段，如 `0 9 * * *` 每天 9 点）" +
         "或 onceAt（毫秒时间戳，一次性）二者之一；可给 name 便于识别。" +
         "action=pause / resume / delete 时需要 id（先用 list_schedules 查）。" +
-        "只在用户明确要求「定时 / 每天 / 每周 / 到点提醒我」时才创建；创建会弹确认卡，用户批准后才生效。",
+        "只在用户明确要求「定时 / 每天 / 每周 / 到点提醒我 / 挂预警」时才创建；创建会弹确认卡，用户批准后才生效。",
       {
         type: "object",
         properties: {
@@ -433,6 +435,8 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           onceAt: jsonType("number", "action=create 时的一次性执行时刻（毫秒时间戳）"),
           name: jsonType("string", "任务名（便于在列表里识别）"),
           mcpServers: { type: "array", description: "限定该任务可用的 MCP 服务器 id（不填则沿用对话勾选）", items: { type: "string" } },
+          purpose: jsonType("string", "action=create 可选：report（周期报告）| alert（数据预警；默认仅异常推、同一会话）"),
+          notifyPolicy: jsonType("string", "action=create 可选：always（每期都推）| on_alert（仅异常时推；预警建议用这个）"),
           id: jsonType("string", "action=pause / resume / delete 时的任务 id"),
         },
         required: ["action"],
@@ -1381,6 +1385,10 @@ export async function execBuiltin(
           cron: str(args, "cron").trim() || undefined,
           ...(args.onceAt != null ? { onceAt: Number(args.onceAt) } : {}),
           ...(Array.isArray(args.mcpServers) ? { mcpServers: args.mcpServers.map(String) } : {}),
+          ...(pickPurpose(args.purpose) ? { purpose: pickPurpose(args.purpose)! } : {}),
+          ...(args.notifyPolicy != null && String(args.notifyPolicy).trim() !== ""
+            ? { notifyPolicy: pickNotifyPolicy(args.notifyPolicy) }
+            : {}),
           // 沿用当前对话的角色；结果回投到任务专属对话（与 HTTP 建任务同一实现，不会刷屏当前聊天）
           sourceConversationId: conversationId,
         });
@@ -1408,7 +1416,7 @@ export async function execBuiltin(
       if (action === "delete") {
         const removed = await deleteSchedule(id, ownerKey);
         if (!removed) return { ok: false, text: `定时任务不存在：${id}` };
-        return { ok: true, text: `已删除定时任务 ${id}（不可恢复）` };
+        return { ok: true, text: `已删除定时任务 ${id}（任务不可恢复；已产生的结果会话会保留）` };
       }
       return { ok: false, text: `不支持的 action：${action}` };
     }

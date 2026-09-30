@@ -242,7 +242,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-09-29） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29 本轮：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；§2 体量、§3 起的源码行号引用、§6/§8/§15/§17 模块口径、A 章工程配套均已按当前工作区快照刷新）</p>
+  <p class="kv">生成日期：2026-09-23（末次刷新 2026-09-30） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；§15 已按当前工作区刷新）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -266,7 +266,7 @@
 </div>
 <div class="note">引用的行号基于当前工作区快照；代码会变，行号会漂，<strong>函数名是稳定锚点</strong>，先搜函数名再看行号。</div>
 <div class="card">
-<details><summary><b>本次「对齐 + 查缺补漏」订正记录（12 项 + 2026-09-29 本轮补充 7 项 · 均已并入正文，点开只看历史）</b></summary>
+<details><summary><b>本次「对齐 + 查缺补漏」订正记录（12 项 + 2026-09-29 补充 7 项 + 2026-09-30 预警 1 项 · 均已并入正文，点开只看历史）</b></summary>
 <table>
 <thead><tr><th>订正项</th><th>旧说法 / 缺口</th><th>按当前代码更正为</th></tr></thead>
 <tbody>
@@ -278,7 +278,7 @@
 <tr><td>缺口：提示注入防护</td><td>缺</td><td>补 <code>untrusted.ts</code>（nonce 围栏 + 伪造标签中和 + 控制字符剥离）与 <code>role-guard.ts</code>（禁止模型自报为其他品牌）</td></tr>
 <tr><td>缺口：路由</td><td>漏 <code>/support</code></td><td>补：<code>/support</code> 复用 ChatPage，用 props 注入 <code>agentId</code> 做会话分槽</td></tr>
 <tr><td>缺口：观影画像 / 通知投递</td><td>提了一句</td><td>补 <code>movie/profile.ts</code>（Mongo <code>movie_profiles</code>、上限 200 条）与 <code>notify/deliver.ts</code>（钉钉加签 + 关键词 / 飞书）</td></tr>
-<tr><td>缺口：内置 MCP / 脚本 / 测试 / 文档</td><td>完全没写</td><td>新增 A 章：<code>MCP_BUILTIN_SERVERS</code>（bi / yapi / movie + <code>toolRisks</code>）、4 个脚本、<strong>20 个测试用例</strong>按四组归类（当时口径；截至 2026-09-29 已增至 40 个文件 / 219 例，见 A3）、<code>docs/knowledge/</code> 同时是 RAG 语料</td></tr>
+<tr><td>缺口：内置 MCP / 脚本 / 测试 / 文档</td><td>完全没写</td><td>新增 A 章：<code>MCP_BUILTIN_SERVERS</code>（bi / yapi / movie + <code>toolRisks</code>）、4 个脚本、<strong>20 个测试用例</strong>按四组归类（当时口径；截至 2026-09-30 为 43 个文件 / 251 例，见 A3）、<code>docs/knowledge/</code> 同时是 RAG 语料</td></tr>
 <tr><td>MCP 配置缓存缺陷</td><td>标为 🐞 已知缺陷</td><td><strong>已实际修复</strong>：<code>config.ts</code> 按 <strong>mtime + size</strong> 失效（2026-09-24 起，只按 mtime 会漏掉同毫秒改写）+ <code>persist()</code> 同步两者 + <code>AGENT_DATA_DIR</code> 可覆盖（便于测试）+ <code>tests/mcp-config-hotreload.test.ts</code> 5 例全绿（详见 <code>docs/artifact-delivery-plan.md</code> §14）</td></tr>
 <tr><td>上下文工程（本轮补齐）</td><td>只写了「去重 / 熔断 / 卸载 / 接地」四条</td><td>补成<strong>六条</strong>：⑤ 跨轮重复只给观察提示（反馈 &gt; 硬拦）、⑥ 预算耗尽补位收尾 <code>wrapUpWith()</code>；另补 <code>GROUNDING_VERIFY</code> 事后核验 + 多票裁决、逐轮 trace、产物零外链软护栏，并在 §12 / §23 各新增卡片。对齐 Anthropic《Effective context engineering for AI agents》</td></tr>
 <tr><td>本轮·代码体量刷新</td><td>旧行号/行数</td><td>2026-09-29 刷新：app 1608 / chat 2528 / builtins 1891 / models 877 / conversations 785 / schedules 491 / report 497 / chat-tasks 469 / schedule-service 176；前端 25 文件、ChatPage ≈380KB/约 10560 行、api.ts 30KB；docs 根目录 18 篇</td></tr>
@@ -287,6 +287,8 @@
 <tr><td>本轮·定时任务每期会话</td><td>只写「专属对话 + 通知」</td><td>新增 <code>runMode</code>（new=每期新会话 / same=复用同一会话）、<code>runs[]</code> 运行记录与 <code>unreadRuns</code> 未读、<code>MAX_RUNS_PER_SCHEDULE</code> 上限（默认 50，超限归档不删）；老任务迁移统一标记 <code>same</code>；详见 <code>docs/scheduled-task-sessions-plan.md</code></td></tr>
 <tr><td>本轮·端点参数学习型自愈</td><td>只写 forced tool_choice / thinking 降级</td><td>新增 <code>temperature</code> 整字段拒收的自愈（记住并省略，自愈无效回滚记忆），覆盖 kimi 系这类端点；<code>models.ts:temperatureSupported / markTemperatureUnsupported / unmarkTemperatureUnsupported</code></td></tr>
 <tr><td>本轮·测试规模</td><td>38 文件 / 约 210 例</td><td>40 文件 / 219 例；新增 <code>schedule-runs</code>、<code>temperature-endpoint-learning</code> 两组回归（A3 已列）</td></tr>
+<tr><td>本轮·数据预警（2026-09-30）</td><td>§15 只写「专属对话 + 通知」</td><td>补齐用途 <code>purpose</code>（report/alert）、<code>notifyPolicy=on_alert</code>、结论协议 <code>[SPIKE]/[NORMAL]/[NO_DATA]</code>、冷静期 / 恢复、<strong>先测后跑</strong>（气泡「设为数据预警」）、预警硬摘 <code>render_chart</code>/<code>export_data</code>、预警轮次默认 12、长跑按跑完时刻推进 <code>nextRunAt</code>；同日补上立即执行 / 事件唤醒、定时运行拒绝无人值守工具、删除任务保留结果会话。方案见 <code>docs/scheduled-spike-detection-plan.md</code></td></tr>
+<tr><td>本轮·测试规模（2026-09-30）</td><td>40 文件 / 219 例</td><td>43 文件 / 251 例。新增 <code>schedule-alert</code>、<code>zoho-list-compact</code>、<code>tool-choice-learning</code> 等；全量 <code>vitest run</code> 已通过</td></tr>
 </tbody>
 </table>
 </details>
@@ -350,7 +352,8 @@ d:\Code\bx-admin-agent
 │  │  │  ├─ builtins.ts        内置工具定义与执行（1891 行）★核心
 │  │  │  ├─ models.ts          模型适配与调用（877 行）
 │  │  │  ├─ conversations.ts   会话持久化（785 行）
-│  │  │  ├─ schedules.ts       定时任务（491 行）
+│  │  │  ├─ schedules.ts       定时任务（~506 行）
+│  │  │  ├─ schedule-alert.ts  预警标记 / on_alert（~117 行）
 │  │  │  ├─ web-search.ts      联网搜索（378 行）
 │  │  │  ├─ fs-store.ts        会话工作区虚拟文件系统（456 行）
 │  │  │  ├─ chat-tasks.ts      异步任务注册表（469 行）
@@ -363,7 +366,7 @@ d:\Code\bx-admin-agent
 │  │  │     report / schedule-service / sql-readonly / untrusted / role-guard / rate-limit …
 │  │  ├─ skills/               7 个技能目录（SKILL.md）
 │  │  ├─ assets/fonts/         PDF 中文渲染字体 Noto Sans SC
-│  │  ├─ scripts/ tests/        脚本 7 个 + vitest 套件 40 文件 / 219 例（见 A2/A3）
+│  │  ├─ scripts/ tests/        脚本 7 个 + vitest 套件 43 文件 / 251 例（见 A2/A3）
 │  │  └─ .data/                运行时产物（gitignore）
 │  └─ web/src/                 前端（25 个文件，ChatPage.vue 约 10560 行 / 380KB）
 ├─ packages/shared/            共享类型（ChatEvent、ArtifactSpec、TodoItem…）
@@ -382,7 +385,9 @@ d:\Code\bx-admin-agent
 <tr><td><code>models.ts</code></td><td class="num">877</td><td>多模型适配、流式 tool_calls 拼接、重试降级、端点参数自愈</td></tr>
 <tr><td><code>conversations.ts</code></td><td class="num">785</td><td>会话与消息落库（Mongo / 内存双模）</td></tr>
 <tr><td><code>chat-tasks.ts</code></td><td class="num">469</td><td>任务注册表、断线续传、共性：执行与推送解耦</td></tr>
-<tr><td><code>schedules.ts</code></td><td class="num">491</td><td>cron 定时任务 + 每期会话 / 运行记录 + 通知投递</td></tr>
+<tr><td><code>schedules.ts</code></td><td class="num">~506</td><td>cron 定时 + 锁 / tick + 每期会话 runs + 跑完推进 nextRunAt</td></tr>
+<tr><td><code>schedule-alert.ts</code></td><td class="num">~117</td><td>预警标记 / on_alert 投递决策 / 冷静期 / SCHEDULE_ALERT_GUIDE</td></tr>
+<tr><td><code>schedule-service.ts</code></td><td class="num">~267</td><td>创建校验层（HTTP 与 manage_schedule 共用）</td></tr>
 <tr><td><code>fs-store.ts</code></td><td class="num">456</td><td>每会话独立虚拟文件系统（读/写/grep/glob/edit）</td></tr>
 <tr><td><code>system-prompt.ts</code></td><td class="num">257</td><td>系统提示词组装与角色人设注入</td></tr>
 <tr><td><code>report.ts</code></td><td class="num">497</td><td>HTML 报告合成（图表烘焙成内联 SVG，零外链）</td></tr>
@@ -583,7 +588,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <table>
 <thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
 <tbody>
-<tr><td><code>MAX_TOOL_ROUNDS</code></td><td class="num">28</td><td>工具循环最多多少轮（一轮 = 一次模型调用 + 一批工具执行）<br/><span class="tag acc">口径变更</span>原默认 14，现<strong>与无人值守拉齐为 28</strong>（<code>chat.ts:85-90</code> 注释：调大不放大失控风险，仍可用 <code>MCP_MAX_TOOL_ROUNDS</code> 收紧）；定时任务走 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（<code>app.ts:120</code>，同样默认 28）</td></tr>
+<tr><td><code>MAX_TOOL_ROUNDS</code></td><td class="num">28</td><td>工具循环最多多少轮（一轮 = 一次模型调用 + 一批工具执行）<br/><span class="tag acc">口径变更</span>原默认 14，现<strong>与无人值守拉齐为 28</strong>（仍可用 <code>MCP_MAX_TOOL_ROUNDS</code> 收紧）；报告型定时任务走 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（默认 28）；<strong>数据预警</strong>另限默认 <strong>12</strong>（<code>MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS</code>）</td></tr>
 <tr><td><code>MAX_TOOL_RESULT_CHARS</code></td><td class="num">12000</td><td>单条工具结果喂回模型的字符上限</td></tr>
 <tr><td><code>TOOL_RESULT_BUDGET</code> / <code>KEEP</code></td><td class="num">12000 / 3</td><td>工具结果总预算：超了把<strong>较早的</strong>结果占位化（保留最近 3 条原文）</td></tr>
 <tr><td><code>MCP_MAX_TOOLS</code></td><td class="num">80</td><td>注入模型的工具上限（超出按服务器丢弃并记录 dropped）</td></tr>
@@ -837,30 +842,36 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <section id="s17">
 <h2 class="sec">15 · 定时任务与通知</h2>
 <div class="flow">
-  <div class="step"><div class="t">① 创建</div><div class="d"><code>POST /chat/schedules</code>：cron 表达式 + 提示词 + 目标角色 + 通知通道</div><div class="f">app.ts / schedules.ts (491 行)</div></div>
+  <div class="step"><div class="t">① 创建</div><div class="d"><code>POST /chat/schedules</code>（与 <code>manage_schedule</code> 共用 <code>createScheduleTask</code>）：cron / onceAt + 指令 + 角色 + MCP；可选 <code>purpose</code>（report/alert）、<code>notifyPolicy</code>（always/on_alert）、<code>runMode</code></div><div class="f">app.ts / schedule-service.ts / schedules.ts</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">② 每期会话（runMode）</div><div class="d">每个任务选「每期开新会话（<code>new</code>，默认）」或「回投同一会话（<code>same</code>）」承载结果——对齐 ChatGPT standalone / in-chat 两类任务；结果对话挂在任务下（不灌进用户自己的聊天），继承来源对话的角色与 MCP 启用集。老任务迁移统一标记为 <code>same</code>（沿用既有内容所在的会话）</div><div class="f">app.ts:ensureRunConversation / schedule-service.ts:createRunConversation</div></div>
+  <div class="step"><div class="t">② 用途分流</div><div class="d"><strong>周期报告</strong>：默认每期新会话、每期都推、可出图；轮次预算 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（默认 28）。<strong>数据预警</strong>：默认同一会话、仅异常推、运行时追加 <code>SCHEDULE_ALERT_GUIDE</code>、硬摘 <code>render_chart</code>/<code>export_data</code>、轮次默认 <strong>12</strong>（<code>MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS</code>）</div><div class="f">schedule-alert.ts / app.ts deliverScheduleResult</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">③ 到点执行</div><div class="d">croner 调度 → 走同一套 chatStream 执行（轮数预算 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>，默认 <strong>28，与交互式已拉齐</strong>——早期是交互式 14 / 无人值守 28）；结果持久化 + 投递</div><div class="f">app.ts:125 / schedules.ts (491 行)</div></div>
+  <div class="step"><div class="t">③ 先测后跑（预警主路径）</div><div class="d">对齐 ChatGPT Automations：先在普通对话试跑至结论首行出现 <code>[NORMAL]</code>/<code>[SPIKE]</code>/<code>[NO_DATA]</code>，再点气泡「设为数据预警」（或表单「从对话带入」）——指令与当前 MCP 启用集写入表单，不必空表单猜工具名</div><div class="f">ChatPage.vue · docs/scheduled-spike-detection-plan.md</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">④ 运行记录与未读</div><div class="d">每期把运行记录写入 <code>schedule.runs[]</code>（近 <code>MAX_RUNS_PER_SCHEDULE</code> 期，默认 50；超限归档不删），并标记 <code>unreadRuns</code>；runner 写回前重读一次，避免并发覆盖</div><div class="f">schedules.ts:prependRun</div></div>
+  <div class="step"><div class="t">④ 每期会话（runMode）</div><div class="d">「每期开新会话（<code>new</code>）」或「回投同一会话（<code>same</code>）」——对齐 ChatGPT standalone / in-chat；结果挂在任务下，不灌进用户自己的聊天。预警默认 <code>same</code>，报告默认 <code>new</code></div><div class="f">app.ts:ensureRunConversation / schedule-service.ts</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">⑤ 通知</div><div class="d">通道配置 <code>.data/notify-channels.json</code>；钉钉通道<strong>消息必须含关键词 bx-agent</strong>（否则平台静默拒收：HTTP 200 + errcode 310000），投递时自动追加关键词</div><div class="f">notify/{channels,deliver}.ts</div></div>
+  <div class="step"><div class="t">⑤ 到点执行</div><div class="d">croner tick → 分布式锁 → 同一套 <code>chatStream</code>；跑完按<strong>完成时刻</strong>推进 <code>nextRunAt</code>（避免短 cron + 长跑连环补跑）；对话忙则钉住到点排队补跑。定时运行不带 <code>manage_schedule</code>，并拒绝 <code>fs_delete</code> / <code>run_command</code> / <code>run_script</code> / <code>request_clarification</code>（拒绝记入本期记录）。<code>POST .../run</code> 立即执行、<code>POST .../wake</code> 事件唤醒都不改原周期。预警在告警中把下一拍收到间隔的一半。删除任务保留结果会话。本期里若任务被暂停或删除，收尾不再把它排上下一拍、也不用开跑前的快照写回</div><div class="f">schedules.ts:schedulerTick / app.ts omitBuiltinTools</div></div>
+  <div class="arrow">▼</div>
+  <div class="step"><div class="t">⑥ 运行记录与未读</div><div class="d"><code>runs[]</code>（近 <code>MAX_RUNS_PER_SCHEDULE</code>，默认 50）+ <code>unreadRuns</code>；预警期可记 <code>marker</code>；写回前重读防并发覆盖</div><div class="f">schedules.ts:prependRun</div></div>
+  <div class="arrow">▼</div>
+  <div class="step"><div class="t">⑦ 通知</div><div class="d"><code>always</code>：成功/失败都推。<code>on_alert</code>：失败仍推；成功只认首行标记——<code>[SPIKE]</code> 推（冷静期 30m 内去重）、<code>[NORMAL]</code> 静默（曾告警且连续 2 期 → 推恢复）、<code>[NO_DATA]</code> 不推。通道 <code>.data/notify-channels.json</code>，关键词按通道配置（不满足则 HTTP 200 + 业务错误）。钉钉一律 markdown：去掉工具轨迹，避开下划线和协议方括号</div><div class="f">schedule-alert.ts / notify/{channels,deliver}.ts</div></div>
 </div>
-<h3>创建期校验 <span class="kv">src/schedule-service.ts（176 行）</span></h3>
-<p><code>createScheduleTask()</code> 是 <code>POST /chat/schedules</code> 与内置工具 <code>manage_schedule</code> 的<strong>共用校验层</strong>（同一份校验，避免两处口径漂移）：</p>
+<h3>创建期校验 <span class="kv">src/schedule-service.ts</span></h3>
+<p><code>createScheduleTask()</code> 是 <code>POST /chat/schedules</code> 与内置工具 <code>manage_schedule</code> 的<strong>共用校验层</strong>：</p>
 <ul>
-<li>错误码 <code>SCHEDULE_INVALID</code>（cron 解析失败）/ <code>SCHEDULE_INVALID_TIME</code> / <code>SCHEDULE_LIMIT</code>（条数上限）/ <code>AGENT_ROLE_UNKNOWN</code>（目标角色不存在）——<strong>结构化错误码，不是散文报错</strong></li>
-<li><code>knownMcpIds()</code>：继承的 MCP 启用集只保留当前确实存在的 id；<code>pickNotifyOn()</code> 规范化通知时机</li>
-<li><code>createTaskConversation()</code> / <code>scheduleConversationTitle()</code>：建专属对话承载每期结果，标题带任务名（不灌进用户自己的聊天）</li>
+<li>错误码 <code>SCHEDULE_INVALID</code> / <code>SCHEDULE_INVALID_TIME</code> / <code>SCHEDULE_LIMIT</code> / <code>AGENT_ROLE_UNKNOWN</code></li>
+<li><code>purpose=alert</code> 且未显式写 <code>notifyPolicy</code> 时默认 <code>on_alert</code>；预警默认 <code>runMode=same</code></li>
+<li><code>manage_schedule</code> create 可传 <code>purpose</code> / <code>notifyPolicy</code>；工具描述提示先测后跑</li>
+<li><code>knownMcpIds()</code> / <code>pickNotifyOn()</code> / <code>createTaskConversation()</code></li>
 </ul>
 <div class="grid g2">
 <div class="card"><h4>投递层职责 <code>notify/deliver.ts</code></h4>
-<p class="muted">只做两件事：① 把 Agent 产出的 Markdown 排版成 IM 能可靠显示的文本；② 按平台协议发一条消息。<strong>平台差异全部收在这里</strong>：载荷形状、加签算法、成功判定（钉钉看 <code>errcode</code>、飞书看 <code>code</code>）、关键词安全设置。<br/><span class="tag acc">边界</span>钉钉关键词不满足 → <strong>HTTP 200 + 业务错误</strong>，所以必须按业务结果而非状态码判成功。</p></div>
-<div class="card"><h4>先自测再等定时</h4>
-<p class="muted"><code>POST /notify/channels/:id/test</code>：配完立即自测。<br/><span class="tag warn">纪律</span>别等任务到点才发现 webhook / 关键词配错——这类错误在 IM 平台看来是「成功接收」。</p></div>
+<p class="muted">只做两件事：① 把 Agent 产出的 Markdown 排版成 IM 能可靠显示的文本；② 按平台协议发一条消息。<strong>平台差异全部收在这里</strong>。<br/><span class="tag acc">边界</span>钉钉关键词不满足 → <strong>HTTP 200 + 业务错误</strong>，必须按业务结果而非状态码判成功。<br/><span class="tag">预警</span>是否推送由 <code>decideAlertDelivery</code> 先判定；投递层不解析业务阈值。</p></div>
+<div class="card"><h4>先测后跑 / 通道自测</h4>
+<p class="muted"><strong>预警</strong>：对话试跑 →「设为数据预警」再挂定时（ChatGPT Automations 口径）。<br/><strong>通道</strong>：<code>POST /notify/channels/:id/test</code> 配完立即自测——别等任务到点才发现 webhook / 关键词配错。</p></div>
 </div>
-<div class="note"><strong>运维提示</strong>：调度接口 <code>PATCH /chat/schedules/:id</code> 不接收 <code>nextRunAt</code>——要改下次触发时刻只能直接改 Mongo 的 <code>chat_schedules</code>，或等 cron 自然触发。</div>
+<div class="note"><strong>运维提示</strong>：要提前跑一期用 <code>POST /chat/schedules/:id/run</code>（不改原来的下次时间），不要改 Mongo 里的 <code>nextRunAt</code>。<code>PATCH</code> 仍然不接收 <code>nextRunAt</code>。卡住不跑时先看 <code>schedule_locks</code> 是否过期未释。钉钉关键词是<strong>每个通道自己配的</strong>，不是固定的 <code>bx-agent</code>；不匹配时平台回 HTTP 200 + errcode 310000。</div>
+<div class="good"><strong>方案文档</strong>：产品口径 <code>docs/scheduled-spike-detection-plan.md</code>（SSOT）；竞品对照 <code>docs/scheduled-alert-best-practices-comparison.md</code>；会话落点 <code>docs/scheduled-task-sessions-plan.md</code>；逐步清单 <code>docs/best-practice-alignment-review.md</code>（A1–A6 已落地）。</div>
 </section>
 
 <!-- ===================== 16 ===================== -->
@@ -1561,7 +1572,7 @@ src/
 <p>① 图表放进折叠面板 → 容器 0×0（必须挂气泡内容层）。<br/>② 导出/表格若只见 XML 文本，是模型把工具调用写成正文（伪调用），服务端已拦截并回灌提示。<br/>③ 步骤行撑破布局 → 行头 button 需 <code>width:100%</code>。</p>
 </details>
 <details><summary><b>定时任务没跑 / 想改下次触发时间</b></summary>
-<p><code>PATCH /chat/schedules/:id</code> 不接收 <code>nextRunAt</code>；要么直接改 Mongo <code>chat_schedules</code>，要么等 cron 自然触发。<br/>钉钉通道记得关键词 <code>bx-agent</code>，否则平台静默拒收（HTTP 200 + errcode 310000）。</p>
+<p>提前跑一期用 <code>POST /chat/schedules/:id/run</code>，不改原来的下次时间。<code>PATCH</code> 不接收 <code>nextRunAt</code>，不要手改 Mongo。<br/>卡住不跑：查 <code>schedule_locks</code> 是否未过期死锁；长跑后若仍连环触发，确认服务端已按「跑完时刻」推进下一拍。<br/>钉钉关键词按<strong>该通道自己的配置</strong>匹配（不是固定 <code>bx-agent</code>）。不匹配时平台回 HTTP 200 + errcode 310000。</p>
 </details>
 </section>
 
@@ -1624,7 +1635,7 @@ src/
 </tbody>
 </table>
 
-<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（40 个测试文件 / 219 个用例，<code>pnpm test</code> = vitest run）</span></h3>
+<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（43 个测试文件 / 251 个用例，<code>pnpm test</code> = vitest run，2026-09-30 全绿）</span></h3>
 <p>测试文件名几乎就是「护栏清单」——每一条都对应一个曾出过事或必须钉死的行为：</p>
 <table>
 <thead><tr><th>分组</th><th>用例</th><th>钉住什么</th></tr></thead>
@@ -1655,9 +1666,10 @@ src/
 <tr><td><code>model-disable-thinking</code></td><td>模型级关思考开关（<code>MODEL_&lt;ID&gt;_DISABLE_THINKING</code>）与端点拒绝时的学习自愈</td></tr>
 <tr><td><code>upload-to-workspace</code></td><td>上传件进入会话工作区</td></tr>
 <tr><td><code>run-command-shell</code></td><td>命令执行解码与输出截断</td></tr>
-<tr><td rowspan="12">任务与契约</td><td><code>task-persistence</code> / <code>task-resume</code></td><td>结果落库 / 断线续传</td></tr>
-<tr><td><code>schedule-retry</code></td><td>定时任务重试</td></tr>
+<tr><td rowspan="15">任务与契约</td><td><code>task-persistence</code> / <code>task-resume</code></td><td>结果落库 / 断线续传</td></tr>
+<tr><td><code>schedule-retry</code></td><td>定时任务重试 / 长跑后 nextRunAt 推进</td></tr>
 <tr><td><code>schedule-tools</code></td><td>定时任务工具化入参校验</td></tr>
+<tr><td><code>schedule-alert</code></td><td>预警标记解析 / on_alert 投递决策 / 冷静期与恢复 / SCHEDULE_ALERT_GUIDE</td></tr>
 <tr><td><code>system-prompt-contract</code></td><td>提示词契约（改动即红灯）</td></tr>
 <tr><td><code>web-api-error-code</code></td><td>错误码与前端本地化映射</td></tr>
 <tr><td><code>mcp-config-hotreload</code></td><td>MCP 配置按 mtime + size 失效（外部改文件立刻可见，防回退）</td></tr>
@@ -1666,7 +1678,9 @@ src/
 <tr><td><code>dingtalk-doc</code></td><td>外部文档源未配置时的降级指引</td></tr>
 <tr><td><code>rag-namespace-fallback</code></td><td>RAG 命名空间回落（隔离方向不破）</td></tr>
 <tr><td><code>rag-store-invalidate</code></td><td>索引按 mtime + size 失效，不返回已删源</td></tr>
-<tr><td><code>schedule-runs</code></td><td>每期会话（runMode）/ 运行记录 runs[] / 未读计数 / 保留上限与老任务迁移语义</td></tr>
+<tr><td><code>schedule-runs</code></td><td>每期会话（runMode）/ 运行记录 runs[] / 未读计数 / 保留上限；删除任务保留结果会话</td></tr>
+<tr><td><code>zoho-list-compact</code></td><td>过宽的列表结果先压紧再交给模型</td></tr>
+<tr><td><code>tool-choice-learning</code></td><td>端点拒绝强制工具通道后记住，自愈无效则撤回</td></tr>
 </tbody>
 </table>
 <div class="good"><strong>最佳实践对照</strong>：✅ 用测试把「护栏行为」钉死，是本仓库最值得学的做法之一——护栏一旦被后续改动悄悄放宽，测试会立刻红。尤其 <code>system-prompt-contract</code>：提示词也算契约。</div>
@@ -1675,7 +1689,7 @@ src/
 <ul>
 <li><code>docs/agent/</code>：Agent 侧设计与策略（如 <code>RAG_INGESTION_PLAN.md</code>、澄清策略 JSON）</li>
 <li><code>docs/knowledge/</code>：<strong>知识库的入库源</strong>（不只是给人看的文档，也喂给 RAG）</li>
-<li>根目录 18 篇主题设计稿：<code>mcp-guide</code> / <code>artifact-delivery-plan</code> / <code>write-op-safety-plan</code> / <code>chart-visualization-plan</code> / <code>deep-agents-plan</code> / <code>agent-infrastructure</code> / <code>conversation-state-plan</code> / <code>conversation-list-ux-plan</code> / <code>text2sql-text2api-plan</code> / <code>web-search-guide</code> / <code>movie-*</code> / <code>domain-adaptation-guide</code> / <code>scheduled-task-sessions-plan</code> …</li>
+<li>根目录主题设计稿：<code>mcp-guide</code> / <code>artifact-delivery-plan</code> / <code>write-op-safety-plan</code> / <code>chart-visualization-plan</code> / <code>deep-agents-plan</code> / <code>agent-infrastructure</code> / <code>conversation-state-plan</code> / <code>conversation-list-ux-plan</code> / <code>text2sql-text2api-plan</code> / <code>web-search-guide</code> / <code>movie-*</code> / <code>domain-adaptation-guide</code> / <code>scheduled-task-sessions-plan</code> / <code>scheduled-spike-detection-plan</code> / <code>scheduled-alert-best-practices-comparison</code> …</li>
 </ul>
 <div class="note"><strong>易被忽略的耦合</strong>：<code>docs/knowledge/</code> 同时是「给人看的文档」和「给机器检索的语料」。改动它会同时影响检索结果，跑 <code>build-rag-index.mjs</code> 才会重新入库。</div>
 </section>
@@ -1696,7 +1710,7 @@ src/
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
 <tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
 <tr><td>工具检索策略</td><td>统一按需检索（deferred），工具 schema 不占上下文</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>，但对 movie 这类强依赖工具的角色开 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据</td><td>主用模型能稳定主动检索时取消 per-role 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
-<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（40 文件 / 219 例）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
+<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（43 文件 / 251 例）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>

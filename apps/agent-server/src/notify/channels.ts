@@ -1,4 +1,4 @@
-// 结果投递通道注册表（钉钉 / 飞书自定义机器人）：全局一份列表，任务只存「用哪些通道 id」。
+// 结果投递通道注册表（钉钉 / 飞书 / 企业微信机器人）：全局一份列表，任务只存「用哪些通道 id」。
 //
 // 凭据策略与 mcp/config.ts 的 toPublic 一致：webhook（含 token）与加签密钥只落本机
 // .data/notify-channels.json，对外接口一律只回**域名**与「是否已配密钥」，凭据不出服务端。
@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DATA_DIR, atomicWriteJson } from "../store-util.js";
 
-export type NotifyKind = "dingtalk" | "feishu";
+export type NotifyKind = "dingtalk" | "feishu" | "wecom";
 
 export interface NotifyChannel {
   id: string;
@@ -61,11 +61,11 @@ export interface NotifyChannelInput {
 
 const CONFIG_PATH = resolve(DATA_DIR, "notify-channels.json");
 const ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
-const KINDS: NotifyKind[] = ["dingtalk", "feishu"];
+const KINDS: NotifyKind[] = ["dingtalk", "feishu", "wecom"];
 const MAX_LABEL_LEN = 40;
 /** 不配 label 时的兜底展示名（通用协议词，与业务无关）。 */
-const KIND_LABEL: Record<NotifyKind, string> = { dingtalk: "DingTalk", feishu: "Feishu" };
-const DEFAULT_HOST_SUFFIXES = ["oapi.dingtalk.com", "open.feishu.cn", "open.larksuite.com"];
+const KIND_LABEL: Record<NotifyKind, string> = { dingtalk: "DingTalk", feishu: "Feishu", wecom: "WeCom" };
+const DEFAULT_HOST_SUFFIXES = ["oapi.dingtalk.com", "open.feishu.cn", "open.larksuite.com", "qyapi.weixin.qq.com"];
 
 /** 允许出站的域名（默认机器人域名 + NOTIFY_ALLOWED_HOSTS 追加）。 */
 export function allowedHostSuffixes(): string[] {

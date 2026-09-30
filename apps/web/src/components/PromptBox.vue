@@ -10,7 +10,7 @@
  *
  * 未声明的 attrs（id / name / rows / aria-* / @keydown / @input …）一律落到内部 textarea，不落到外壳。
  */
-import { computed, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 const props = withDefaults(
   defineProps<{
@@ -23,6 +23,12 @@ const props = withDefaults(
     maxHeight?: number;
     /** textarea 顶部内边距：挂了 #top（拖拽把手）时调用方通常要压小一点。 */
     padTop?: number;
+    /**
+     * 随内容自动长高（minHeight ~ maxHeight 之间）。
+     * 对话区不要开：它有自己的拖拽定高 + autoGrow 逻辑，开了会互相覆盖拖出来的高度。
+     * 任务表单这类「纯内容输入」场景开启——否则长指令被压在 minHeight 的小框里内部滚动。
+     */
+    autoGrow?: boolean;
   }>(),
   {
     placeholder: "",
@@ -30,6 +36,7 @@ const props = withDefaults(
     minHeight: 96,
     maxHeight: 420,
     padTop: 12,
+    autoGrow: false,
   },
 );
 
@@ -44,6 +51,36 @@ const boxStyle = computed(() => ({
   maxHeight: `${props.maxHeight}px`,
   paddingTop: `${props.padTop}px`,
 }));
+
+/**
+ * 自动增高：先置 height:auto 再读 scrollHeight（scrollHeight 返回 max(内容高, 当前高)，
+ * 不重置读不到收缩后的真实内容高），再夹在 minHeight ~ maxHeight 之间。
+ * 与对话区 autoGrow 同一套「两次 reflow」手法；目标高度与上次相同时写回原值，避免无谓样式失效。
+ */
+function resize() {
+  const ta = el.value;
+  if (!ta || !props.autoGrow) return;
+  const prev = ta.style.height;
+  ta.style.height = "auto";
+  const next = `${Math.min(Math.max(ta.scrollHeight, props.minHeight), props.maxHeight)}px`;
+  if (prev !== next) ta.style.height = next;
+  else ta.style.height = prev;
+}
+
+watch(
+  () => props.modelValue,
+  () => nextTick(resize),
+);
+
+onMounted(() => {
+  resize();
+  // 窗口缩放改变换行宽度 → 所需高度变化，需重算。
+  window.addEventListener("resize", resize);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", resize);
+});
 
 function onInput(event: Event) {
   emit("update:modelValue", (event.target as HTMLTextAreaElement).value);
