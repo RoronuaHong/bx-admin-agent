@@ -32,8 +32,13 @@ import { enforceRoleIdentity } from "./role-guard.js";
 import {
   buildDataNeedPrompt,
   buildGroundedFallbackSystem,
+  buildClaimExtractPrompt,
+  buildSupportPrompt,
   buildVerifyHint,
   buildVerifyPrompt,
+  CLAIM_EXTRACT_SYSTEM,
+  parseClaimExtraction,
+  SUPPORT_SYSTEM,
   consensusUnsupported,
   crossCheckSources,
   DATA_NEED_SYSTEM,
@@ -165,6 +170,12 @@ const GROUNDING_VERIFY_MAX = Math.max(0, Number(process.env.GROUNDING_VERIFY_MAX
 const GROUNDING_VERIFY_VOTES = Math.max(1, Number(process.env.GROUNDING_VERIFY_VOTES || 1));
 // 送入核验器的证据上限（字符）：证据本身也可能很长，核验不能变成新的上下文负担。
 const GROUNDING_EVIDENCE_CHARS = Math.max(1000, Number(process.env.GROUNDING_EVIDENCE_CHARS || 12_000));
+// 两阶段核验（对齐 CoVe 的「验证看不到草稿」）：先只抽断言，再拿「证据 + 断言」逐条判支持性。
+// 代价 = 多一次非流式调用；`GROUNDING_VERIFY_STAGES=single` 退回一步式（旧行为）。
+const GROUNDING_VERIFY_TWO_STAGES = (process.env.GROUNDING_VERIFY_STAGES || "two").toLowerCase() !== "single";
+// 独立核验模型（缓解 LLM-as-judge 的自我偏好：同一模型评自己的答案倾向于判「没问题」）。
+// 未配置 = 沿用本轮主模型，行为与配置前完全一致。
+const GROUNDING_VERIFY_MODEL_ID = String(process.env.GROUNDING_VERIFY_MODEL || "").trim();
 // 循环内层瞬时重试：某轮模型调用遇 SSE 断流 / 超时 / 限流等瞬态错误时重试，
 // 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
 const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
@@ -248,9 +259,59 @@ async function verifyAnswerWith(
     signal,
     undefined,
     // 判定型调用：温度归零——核验器自己在采样会让同一段回答今天拦、明天放，护栏就成了新的随机源。
-    { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" }, temperature: 0 },
+    // disableThinking 与分诊/兜底两个判定调用保持一致：这一步只输出严格 JSON，推理链只会拖慢并增加跑偏。
+    { systemParts: { stable: VERIFY_SYSTEM, dynamic: "" }, disableThinking: true, temperature: 0 },
   );
   return parseVerifyResult(result.text);
+}
+
+/**
+ * 两阶段核验：①只看回答 → 抽出原子断言与声称的来源；②只给「证据 + 断言」、**不回传原回答** → 逐条判支持性。
+ *
+ * 为什么拆开：一步式把「问题 + 证据 + 回答」一起喂进去问哪些断言没支持，模型全程看着自己刚写的草稿做判断，
+ * 自我确认偏差最大（CoVe 的关键正是验证环节看不到草稿）。拆开后判定阶段没有草稿可参照，只能拿证据对断言。
+ * 返回 `unsupported: null` = 核验不可用，调用方按不阻断处理（与一步式同口径）。
+ */
+async function verifyAnswerInTwoStages(
+  model: ModelEntry,
+  input: { question: string; evidence: string; answer: string },
+  signal?: AbortSignal,
+): Promise<VerifyResult> {
+  const judge = { systemParts: { stable: CLAIM_EXTRACT_SYSTEM, dynamic: "" }, disableThinking: true, temperature: 0 };
+  const extracted = await callAgent(
+    model,
+    [{ role: "user", content: buildClaimExtractPrompt(input.answer) }],
+    [],
+    signal,
+    undefined,
+    judge,
+  );
+  const parsed = parseClaimExtraction(extracted.text);
+  // 抽不出 = 这一轮没有可核验的东西（不是核验失败）：不阻断作答。
+  if (!parsed) return { unsupported: null, unknownSources: null };
+  if (!parsed.claims.length) return { unsupported: [], unknownSources: [], claimedSources: parsed.sources };
+  const verdict = await callAgent(
+    model,
+    [
+      {
+        role: "user",
+        content: buildSupportPrompt({ question: input.question, evidence: input.evidence, claims: parsed.claims }),
+      },
+    ],
+    [],
+    signal,
+    undefined,
+    { systemParts: { stable: SUPPORT_SYSTEM, dynamic: "" }, disableThinking: true, temperature: 0 },
+  );
+  const res = parseVerifyResult(verdict.text);
+  // 来源存在性不交给模型判：只把抽到的标识交回去，由服务端做集合比对（见 crossCheckSources）。
+  return { unsupported: res.unsupported, unknownSources: [], claimedSources: parsed.sources };
+}
+
+/** 核验用的模型：配了独立模型就用它，否则沿用本轮主模型。 */
+function verifyModelFor(fallback: ModelEntry): ModelEntry {
+  if (!GROUNDING_VERIFY_MODEL_ID) return fallback;
+  return getModel(GROUNDING_VERIFY_MODEL_ID) || fallback;
 }
 
 /**
@@ -1361,10 +1422,18 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         let claims: string[] | null = null;
         let anyVerifyFail = false;
         const results: VerifyResult[] = [];
+        const verifyModel = verifyModelFor(ctx.model);
         for (let v = 0; v < GROUNDING_VERIFY_VOTES; v += 1) {
-          spentTokens += estimateTokens(buildVerifyPrompt(verifyInput));
+          // 两阶段时估算要覆盖两次调用（抽取 + 判定），否则成本护栏会低估这一轮。
+          spentTokens += GROUNDING_VERIFY_TWO_STAGES
+            ? estimateTokens(`${buildClaimExtractPrompt(verifyInput.answer)}\n${verifyInput.evidence}`)
+            : estimateTokens(buildVerifyPrompt(verifyInput));
           try {
-            results.push(await verifyAnswerWith(ctx.model, verifyInput, ctx.signal));
+            results.push(
+              GROUNDING_VERIFY_TWO_STAGES
+                ? await verifyAnswerInTwoStages(verifyModel, verifyInput, ctx.signal)
+                : await verifyAnswerWith(verifyModel, verifyInput, ctx.signal),
+            );
           } catch (err) {
             anyVerifyFail = true;
             console.warn(`[chat:grounding] 事后核验调用失败（票 ${v + 1}），本轮跳过核验：${String((err as Error)?.message || err)}`);
@@ -1378,9 +1447,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         );
         if (!anyVerifyFail) {
           const unsupported = consensusUnsupported(results.map((run) => run.unsupported));
-          const reported = consensusUnsupported(results.map((run) => run.unknownSources));
+          // 来源：两阶段模式下由抽取环节给出（核验器不判存在性），一步式模式下仍用核验器报的，
+          // 两路取并集后再做确定性集合比对——「存在不存在」永远由服务端判定，不由模型判定。
+          const votedSources = consensusUnsupported(results.map((run) => run.unknownSources)) || [];
+          const reported = [...new Set([...results.flatMap((run) => run.claimedSources || []), ...votedSources])];
           // 核验器报出的来源再做一次集合比对：它也可能错报，只有真的对不上本轮来源才算数。
-          const unknownSourceClaims = crossCheckSources(reported || [], knownSources).map(
+          const unknownSourceClaims = crossCheckSources(reported, knownSources).map(
             (ref) => `声称的来源「${ref}」在本轮工具返回的数据里不存在`,
           );
           const merged = [...new Set([...(unsupported || []), ...unknownSourceClaims, ...fakeToolClaims])];

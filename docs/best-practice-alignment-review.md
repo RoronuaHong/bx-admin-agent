@@ -73,7 +73,7 @@
 | F3 | 会话归属 | 设备 owner cookie，无登录 | 维持偏离。对外或多租户之前必须补登录 |
 | F4 | 限流 | 有 `rate-limit.ts` | 已对齐到现行文档，本次不改 |
 | F5 | 模型适配 / 回退 / 思考字段兼容 | `models.ts` 按端点学习 | 已对齐。额度 402 是供应商侧，不是产品缺口 |
-| F6 | 接地护栏 | 有外部数据源工具时，没取数不许编造结论 | 已对齐。失败文案要保留，不要改成猜数 |
+| F6 | 接地护栏 | 有外部数据源工具时，没取数不许编造结论 | 已对齐。失败文案要保留，不要改成猜数。**事后核验**的逐步对照另见 `grounding-verify-alignment.md`（2026-09-30 已按 CoVe 独立性落地两阶段） |
 | F7 | 写操作确认 | 交互里按风险询问。千问/WorkBuddy：无人值守不能等人点确认 | 交互路径已对齐。定时路径见 **A2** |
 | F8 | SQL / API 只读 | 服务端 + MCP 双层只读；数据库账号本身的只读角色仍缺 | 维持文档里的 ❌。那是安全边界，不是这次定时任务能补上的 |
 | F9 | MCP 连接、缓存失效 | `mtime + size` | 已对齐 |
@@ -113,5 +113,6 @@
 | 本文 | 总清单。A1–A6 已落地；B 章有意偏离保持 |
 | `scheduled-spike-detection-plan.md` | 预警产品口径，仍是 SSOT |
 | `scheduled-alert-best-practices-comparison.md` | 竞品对照；千问办公与已落地项已写入 |
+| `grounding-verify-alignment.md` | 事后核验（CoVe / FActScore / 引用溯源 / judge 偏差）的逐步对照与开关 |
 | `project-review.html` §15 / 排障 | 与当前代码一致：立即执行、按通道关键词、测试 43 文件 / 251 例 |
 | `project-review.html` B 章 | 有意偏离，本次不改表 |

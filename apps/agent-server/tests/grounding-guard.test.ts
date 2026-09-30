@@ -3,11 +3,16 @@
 // 设计口径见 src/grounding.ts 头注释。
 import { test, expect } from "vitest";
 import {
+  buildClaimExtractPrompt,
   buildGroundedFallbackSystem,
+  buildSupportPrompt,
   buildVerifyHint,
+  CLAIM_EXTRACT_SYSTEM,
   DATA_NEED_SYSTEM,
+  parseClaimExtraction,
   parseDataNeed,
   buildVerifyPrompt,
+  SUPPORT_SYSTEM,
   consensusUnsupported,
   decideGrounding,
   GROUNDING_HINT,
@@ -183,6 +188,49 @@ test("[J] consensusUnsupported：多数票认定才作废，N=1 退化为单次�
   expect(consensusUnsupported([["X", "X"], ["X"]])).toEqual(["X"]);
   // 3 票中只出现 1 次的被丢弃
   expect(consensusUnsupported([["X"], ["Y"], ["Y"]])).toEqual(["Y"]);
+});
+
+// ---- 两阶段核验（对齐 CoVe：验证环节看不到草稿）----
+
+test("[L] parseClaimExtraction：只认数组，解析失败返回 null（= 抽取不可用，调用方不阻断）", () => {
+  expect(parseClaimExtraction('{"claims":["共 30 条"],"sources":["mcp__x__y"]}')).toEqual({
+    claims: ["共 30 条"],
+    sources: ["mcp__x__y"],
+  });
+  // 无断言是合法结果（本轮没有可核验的东西），不是不可用。
+  expect(parseClaimExtraction('{"claims":[],"sources":[]}')).toEqual({ claims: [], sources: [] });
+  // 缺 sources 不该让整次抽取报废。
+  expect(parseClaimExtraction('{"claims":["A"]}')).toEqual({ claims: ["A"], sources: [] });
+  // 围栏与前后缀容忍（和核验判定同一套稳健解析）。
+  expect(parseClaimExtraction('结果：\n```json\n{"claims":["A"]}\n```')!.claims).toEqual(["A"]);
+  expect(parseClaimExtraction("")).toBeNull();
+  expect(parseClaimExtraction("抱歉我做不到")).toBeNull();
+  expect(parseClaimExtraction('{"claims":')).toBeNull();
+  expect(parseClaimExtraction('{"claims":"不是数组"}')).toBeNull();
+});
+
+test("[M] 两阶段的输入边界：抽取只看回答，判定不回传回答（CoVe 的独立性）", () => {
+  const draft = "数据核对完毕。共 30 条。以下为说明细节 MARKER-DRAFT-ONLY。";
+  // 阶段一：只给回答，不给证据——抽取不该被证据带偏。
+  const extract = buildClaimExtractPrompt(draft);
+  expect(extract).toContain(draft);
+  expect(extract).not.toContain("【来源");
+
+  // 阶段二：只给「证据 + 断言」，绝不回传原回答全文。
+  const support = buildSupportPrompt({
+    question: "查一下数量",
+    evidence: "【来源 fs_read】\n共 3 条",
+    claims: ["共 30 条"],
+  });
+  expect(support).toContain("共 30 条"); // 断言本身必须在
+  expect(support).toContain("【来源 fs_read】"); // 证据必须在
+  expect(support).toContain("查一下数量"); // 对照基准必须在
+  expect(support).not.toContain("MARKER-DRAFT-ONLY"); // 回归锚点：草稿正文不得进入判定环节
+  // 两个阶段的口径都写死为「只输出一个 JSON」，避免核验器变成第二个自由写手。
+  expect(CLAIM_EXTRACT_SYSTEM).toContain("仅输出一个 JSON 对象");
+  expect(SUPPORT_SYSTEM).toContain("仅输出一个 JSON 对象");
+  expect(CLAIM_EXTRACT_SYSTEM).toContain("宁可多抽");
+  expect(SUPPORT_SYSTEM).not.toContain("回答里"); // 判定环节没有「回答」，只有断言
 });
 
 test("[K] consensusUnsupported：任一票不可用（null）→ 整体不可用，不阻断", () => {

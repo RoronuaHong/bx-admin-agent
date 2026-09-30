@@ -222,6 +222,11 @@ export interface VerifyResult {
   unsupported: string[] | null;
   /** 回答里声称但证据中不存在的来源标识；`null` = 该字段不可用。 */
   unknownSources: string[] | null;
+  /**
+   * 回答里声称的**标识形态**来源（工具名 / 服务器标识，两阶段模式下由抽取环节产出）。
+   * 存在性由服务端做集合比对（见 `crossCheckSources`）——核验器只负责抽，不负责判存在。
+   */
+  claimedSources?: string[];
 }
 
 /**
@@ -260,6 +265,84 @@ function asStringList(value: unknown, cap: number): string[] | null {
 /** 向后兼容的窄接口：只要「无支持断言」时用这个。 */
 export function parseUnsupportedClaims(raw: string): string[] | null {
   return parseVerifyResult(raw).unsupported;
+}
+
+// ───────────────────────── 两阶段核验（对齐 CoVe 的「独立验证」） ─────────────────────────
+// 一步式核验是「把问题 + 证据 + 回答一起喂进去，问哪些断言没支持」：模型全程看着**自己刚写的草稿**
+// 做判断，这正是自我确认偏差最大的形态——CoVe 的关键不是「多问一遍」，而是验证环节**看不到草稿**。
+// 拆成两段后：
+//   ①抽取：只给回答 → 拆成原子事实断言（FActScore 的 atomic fact 分解），并顺手记下回答声称的来源标识；
+//   ②判定：只给「证据 + 断言清单」，**不回传原回答** → 逐条判有没有支持。
+// 代价：多一次非流式模型调用（仅收束时、且有证据时才跑）；`GROUNDING_VERIFY_STAGES=single` 可退回一步式。
+
+/** 阶段一（抽取）：只做分解，不判对错；宁可多抽，漏抽就永远不会被核验。 */
+export const CLAIM_EXTRACT_SYSTEM = [
+  "你是断言抽取器，只做一件事：把下面这段回答里的**事实性断言**逐条拆出来。",
+  "口径：",
+  "1. 只抽具体事实（名称、数字、日期、标识、归属或关系、事件细节等）；寒暄、承诺、建议、纯推理与创作不抽。",
+  "2. 每条自成一个可核对的最小断言，保留原文里的关键取值（数字/名称不要改成泛指）。",
+  "3. 宁可多抽：拆不清就拆细一点。抽取环节漏掉的断言永远不会进入核验。",
+  "4. 另外把回答里提到的**标识形态**的来源（工具名 / 服务器标识，如 mcp__x__y）收进 sources；" +
+    "证据标签式的自然语言描述不要填。",
+  "输出：仅输出一个 JSON 对象，形如 {\"claims\":[\"断言\"],\"sources\":[\"来源标识\"]}；没有任何事实断言时输出 {\"claims\":[],\"sources\":[]}。",
+  "除该 JSON 外不要输出任何其它内容（不要解释、不要围栏、不要前后缀）。",
+].join("\n");
+
+/** 阶段一的输入：只有回答。刻意不给证据、不给原问题——抽取不该被证据带偏。 */
+export function buildClaimExtractPrompt(answer: string): string {
+  return ["待抽取的回答：", answer].join("\n");
+}
+
+/**
+ * 解析阶段一的结果；解析失败返回 `null`（= 抽取不可用）。
+ * 与核验判定区分开：抽不出断言是「这一轮没有可核验的东西」，不是「核验失败」，
+ * 调用方按「全部有支持」处理（不阻断），不要因为抽不出就拦住回答。
+ */
+export function parseClaimExtraction(raw: string): { claims: string[]; sources: string[] } | null {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const claims = asStringList((parsed as { claims?: unknown }).claims, MAX_UNSUPPORTED_CLAIMS * 2);
+  if (claims === null) return null;
+  return { claims, sources: asStringList((parsed as { sources?: unknown }).sources, MAX_UNSUPPORTED_CLAIMS) || [] };
+}
+
+/**
+ * 阶段二（判定）：只给「证据 + 断言清单」，不回传原回答 —— 对齐 CoVe 的独立验证。
+ * 口径与一步式核验一致（只判支持性、不评价文风），只是输入里没有草稿可参照。
+ */
+export const SUPPORT_SYSTEM = [
+  "你是断言核验器，只做一件事：逐条核对给定的断言能否在「证据」中找到支持。",
+  "判定口径：",
+  "1. 只判具体事实是否成立（名称、数字、日期、标识、归属或关系等）；不做文风、格式、完整性评价。",
+  "2. 证据里没有出现、或与证据矛盾的内容，一律算「无支持」。",
+  "3. 由证据可推出的等价改写（同义表达、单位换算、四则运算）算「有支持」。",
+  "4. 只对齐给定证据，不引入你自己的知识，也不要替断言补充内容。",
+  "5. 证据每条以「【来源 工具名】」开头，可据此判断由哪个工具返回支撑；不要把来源标签当作断言内容。",
+  "输出：仅输出一个 JSON 对象，形如 {\"unsupported\":[\"逐条摘录无支持的断言\"]}；全部有支持时输出 {\"unsupported\":[]}。",
+  "除该 JSON 外不要输出任何其它内容（不要解释、不要围栏、不要前后缀）。",
+].join("\n");
+
+/** 阶段二的输入：问题（对照基准）+ 证据 + 断言清单。**不含原回答**。 */
+export function buildSupportPrompt(input: { question: string; evidence: string; claims: readonly string[] }): string {
+  return [
+    `用户问题：${input.question}`,
+    "",
+    "证据（外部数据源本轮返回，按先后顺序）：",
+    input.evidence,
+    "",
+    "待逐条核验的断言：",
+    input.claims.map((claim, i) => `${i + 1}. ${claim}`).join("\n"),
+  ].join("\n");
 }
 
 // ───────────────────────── 引用溯源校验（确定性部分） ─────────────────────────
