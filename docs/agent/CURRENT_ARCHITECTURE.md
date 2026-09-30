@@ -36,7 +36,7 @@
 | 工具风险分级 | `risk.ts` | 工具危险度由「工具声明 + 服务端策略」决定，默认 fail-closed；判据来源含 `sql-readonly`；与 `builtins.ts` 的 `BUILTIN_RISK` 联动（如 `request_clarification`=read/workspace、`web_search`=read/workspace、`search_dingtalk_doc`=read/external） |
 | 不可信内容护栏 | `untrusted.ts` | Prompt 注入防护（对齐 OWASP LLM01）：靠**结构隔离**而非词表——清洗不可见/危险控制符、每请求随机 nonce 定界并标注来源、中和伪造闭合标签；不检测自然语言 |
 | SQL 只读闸 | `sql-readonly.ts` | `isReadOnlySql` fail-closed：首词白名单（select/with/show/describe/explain）+ 黑名单词 + 危险构造（`into outfile`/`load_file`/`pg_read_file`/`writable_schema`）；与 Metabase MCP 适配器纵深防御 |
-| 接地门禁 | `grounding.ts` | `enforceGrounding`：本轮「零外部数据证据却以事实正文收束」→ 作废该段 + 回灌纠正；外部数据工具 = `web_search`/`fetch_url`/`search_knowledge`/`mcp__*`，按工具动态开启；角色级 `enforceGrounding` 开关（`roles.ts`） |
+| 接地门禁 | `grounding.ts` | 角色声明或本轮有外部数据源工具（`web_search`/`fetch_url`/`search_knowledge`/`mcp__*`）时开启。零证据且回答含事实断言 → 作废并回灌纠正；没有事实断言则放行 |
 | 确认门 | `confirm.ts` + `toolNeedsConfirm` | 事件流内确认卡，队列在确认等待时暂停 |
 | 运行追踪 | `trace.ts` | run 级 JSONL（runId/会话归属/模型/轮次/token/耗时/状态/错误），是排障、评测基线、成本聚合的地基 |
 | 成本计量 | `cost.ts` | 只读聚合 `trace.ts` 落盘的 run 级记录；tokens 估算，单价 `COST_RATE_<模型ID大写>_PER_1K`，未配置记 `unpricedTokens`（如实显示「未定价」，不编造金额） |

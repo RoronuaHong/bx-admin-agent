@@ -571,7 +571,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td>forced tool_choice 降级</td><td>某些网关不支持 <code>tool_choice:{function:{name}}</code> → 命中 400 后记入 <code>forcedToolChoiceUnsupported</code>，降级 <code>auto</code> 并<strong>记住该端点</strong>，不重复白打</td></tr>
 <tr><td>多模态</td><td><code>vision:"direct"</code> 时把图片挂到<strong>最后一条 user 消息</strong>（<code>models.ts:244 / 538 / 762</code>）；<code>ocr</code> 走另路，<code>none</code> 不传图</td></tr>
 <tr><td>thinking 冲突降级</td><td>开 thinking 的端点拒绝 <code>required</code>+thinking（400）→ 自动降级 auto 重试一次，不让对话断掉</td></tr>
-<tr><td>端点参数学习型自愈</td><td>内部判定型辅助调用（接地护栏分诊 / 诚实兜底）带 <code>temperature:0</code>，但部分端点（kimi 系）<strong>整字段拒收</strong> temperature（任何取值均 400，缺省反而正常），且同样不接受 <code>top_p</code>。首跳被拒 → 记入进程内记忆、后续调用默认省略 <code>temperature</code>、由模型按默认采样重发；自愈仍 400 则<strong>回滚记忆</strong>、按原始报错如实抛出，避免把「按报错措辞做的推测」固化成永久口径（<code>models.ts:temperatureSupported / markTemperatureUnsupported / unmarkTemperatureUnsupported</code>）</td></tr>
+<tr><td>端点参数学习型自愈</td><td>内部判定型辅助调用（接地护栏分诊 / 诚实兜底）可同时带 <code>temperature:0</code> 与 <code>thinking:{type:disabled}</code>。报错<strong>点名</strong>时只去掉该字段并记住；<strong>不点名</strong>（MaaS 拒收请求体）时先去掉 <code>temperature</code>，仍 400 再把两个字段都去掉，与主对话已能通过的请求体一致。某一跳仍失败则<strong>回滚</strong>对应记忆，不把推测固化。端点同样不接受 <code>top_p</code>，故始终不发送。</td></tr>
 <tr><td>瞬时错误退避</td><td>429 / <code>rate.?limit</code> / <code>FreeUsageLimit</code> → 退避重试；<strong>402 / 401008（额度耗尽）视为永久失败，不重试</strong>，直接走候选链下一个模型</td></tr>
 <tr><td>候选链降级</td><td><code>MODEL_PROVIDERS</code> 顺序即候选链：模型级失败（402 / 400 / 超时）一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义），配额失败进冷却表不再优先；<strong>已真正执行过写/删类调用则不再换模型重跑</strong>（防重复副作用）</td></tr>
 </tbody>
@@ -600,7 +600,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>SUBAGENT_MAX_ROUNDS/PARALLEL/RESULT_CHARS</code></td><td class="num">10/3/4000</td><td>子代理独立预算</td></tr>
 <tr><td><code>CONTEXT_SAFETY_RATIO</code></td><td class="num">0.8</td><td>历史占用窗口的安全比例</td></tr>
 <tr><td><code>TOOL_SEARCH_MODE/RATIO/RESULTS</code></td><td>auto / 0.1 / 8</td><td>工具过多时切换 deferred（只留 search_tools 入口）</td></tr>
-<tr><td><code>GROUNDING_GUARD / MAX_RETRIES</code></td><td>on / 1</td><td>接地护栏：要数据却零工具数据的答案作废重来</td></tr>
+<tr><td><code>GROUNDING_GUARD / MAX_RETRIES</code></td><td>on / 1</td><td>接地护栏：零工具数据时，没有事实断言的回答放行；有事实断言才作废重来</td></tr>
 <tr><td><code>GROUNDING_VERIFY / _MAX / _VOTES</code></td><td>on / 1 / 1</td><td><strong>事后核验</strong>（Chain-of-Verification 最小版）：收束后再核一遍是否仍有超出证据的断言；<code>_VOTES&gt;1</code> 走多票裁决（多数认定无支持才作废）</td></tr>
 <tr><td><code>GROUNDING_EVIDENCE_CHARS</code></td><td class="num">12000</td><td>送核验器的证据字符上限——核验本身不能变成新的上下文负担</td></tr>
 <tr><td><code>MAX_TOTAL_TOKENS</code></td><td class="num">0（不限）</td><td>整轮 token 预算：每轮换不同工具、绕开 Doom Loop 却烧完预算时的兜底收束</td></tr>
@@ -617,7 +617,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <div class="card"><h4>③ 伪调用协议护栏 <code>looksLikePseudoToolCall()</code></h4>
 <p class="muted">弱模型爱把工具调用<strong>写成正文文本</strong>（JSON / XML / 方括号 / <code>action:"工具名"</code>）。这里只识别「工具调用写成文本」这一<strong>协议形态</strong>，不做语义分类；命中就丢弃 + 回灌规则。<br/><span class="tag acc">边界</span>业务/闲聊判定一律交模型，服务端不做词形写死。</p></div>
 <div class="card"><h4>④ 接地护栏 <code>grounding.ts</code></h4>
-<p class="muted">「需要真实数据的问题」如果本轮<strong>零工具数据</strong>却出了结论 → 作废文本 + 回灌纠正提示（提示里写明两条路径：去取数 / 本就不需要数据则如实回答，<strong>由模型判定</strong>）。用尽仍无数据 → 走「受约束的诚实兜底」，禁止事实性断言。<br/><span class="tag acc">加强</span>收束后还有一层<strong>事后核验</strong>（<code>GROUNDING_VERIFY</code>，CoV 最小版）：补齐一部分数据后仍可能残留超出证据的断言，这层再核一次；<code>GROUNDING_VERIFY_VOTES&gt;1</code> 时多票裁决，降低核验器自身误判。</p></div>
+<p class="muted">本轮<strong>零工具数据</strong>时先分诊待上屏的回答：没有事实断言（寒暄、职责边界、只说明未给出可核对取值）就<strong>原样放行</strong>。有事实断言才作废并回灌两条路径（去取数 / 本就不需要数据则如实回答，<strong>由模型判定</strong>）。纠正用尽仍有事实断言 → 受约束的诚实兜底；该调用失败才换确定性文案。定时任务只在这句确定性文案上才换 <code>[NO_DATA]</code> 协议行。<br/><span class="tag acc">加强</span>收束后还有一层<strong>事后核验</strong>（<code>GROUNDING_VERIFY</code>，CoV 最小版）：补齐一部分数据后仍可能残留超出证据的断言，这层再核一次；<code>GROUNDING_VERIFY_VOTES&gt;1</code> 时多票裁决，降低核验器自身误判。</p></div>
 <div class="card"><h4>⑤ 跨轮重复：<strong>观察</strong>优先于拦截 <code>repeatCallHint()</code></h4>
 <p class="muted">跨轮出现同签名调用时<strong>不硬拦</strong>，只回灌一条观察提示（第几轮已执行过、若确实需要请换参数或说明为何重复）；硬拦会误伤「用户就是要再查一次」这类合法意图。与 ① 是互补的两层：同轮去重管无信息量的并行重复，跨轮只提示。</p></div>
 <div class="card"><h4>⑥ 预算耗尽也要有结论 <code>wrapUpWith()</code></h4>
@@ -1657,7 +1657,7 @@ src/
 <tr><td><code>round-trace</code></td><td>逐轮 trace 落盘（根因可观测）</td></tr>
 <tr><td><code>wrap-up-cap</code></td><td>轮次耗尽补位收尾（必有结论）</td></tr>
 <tr><td><code>round-cap-14</code> / <code>round-cap-28</code></td><td>交互式轮次预算默认值（历史 14 与现行 28 两口径都钉死，防回退）</td></tr>
-<tr><td><code>temperature-endpoint-learning</code></td><td>端点参数学习型自愈：temperature 整字段被拒 → 记住并省略，自愈无效回滚记忆（防误判固化）</td></tr>
+<tr><td><code>temperature-endpoint-learning</code></td><td>端点参数学习型自愈：temperature 被拒则记住并省略；与关思考同时被一句不点名的 400 拒绝时，两个字段一起去掉；自愈无效则回滚记忆</td></tr>
 <tr><td rowspan="8">交付与流程</td><td><code>export-formats</code></td><td>8 种导出格式的产物正确性</td></tr>
 <tr><td><code>chart-render</code></td><td>图表 spec 渲染</td></tr>
 <tr><td><code>clarification-flow</code></td><td>结构化澄清票据流</td></tr>

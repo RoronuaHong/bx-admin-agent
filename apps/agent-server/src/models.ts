@@ -737,18 +737,13 @@ async function callOpenAi(
       // 自愈无效 → 回滚记忆（同 unmarkTemperatureUnsupported）：别把「按措辞做的推测」固化成永久口径。
       if (!response.ok) unmarkReasoningReplayRequired(model);
     }
-    // 学习型自愈（循环）：端点可能同时拒绝 disabled 思考与 temperature 字段，且报错往往只点名其一。
-    // 原「先思考后温度」的线性顺序有顺序缺陷：温度被识别并去掉、重发仍因 thinking:{type:disabled} 400，
-    // 而 thinking 分支已跳过、此后不再有 healing 入口 → 内部判定型辅助调用（接地护栏分诊 / 诚实兜底）
-    // 永远 400，最终回落确定性兜底文案（问候被回成「没取到数据」，与事实不符、观感也差）。
-    // 改为每轮重发后都重新评估两个字段，直到无 400 或两字段都已尝试过自愈。
+    // 辅助调用可能同时带 temperature:0 与 thinking:{type:disabled}。
+    // 报错点名时只去掉那一个字段；不点名时先去掉 temperature，仍 400 再把两个都去掉
+    // （与主对话已能通过的请求体一致）。某一跳仍失败则回滚对应记忆。
     let healedThinking = false;
     let healedTemp = false;
-    // 报错不点名字段时，先去掉 temperature 仍会留下 thinking:{type:disabled}。
-    // 主对话不带这两个字段、已经能过；辅助调用必须再试一次「两个都去掉」，否则分诊/兜底永远 400，
-    // 正文会被换成「没取到数据」（本轮可能根本没取数）。
     let triedCombined = false;
-    while (!response.ok && (!healedThinking || !healedTemp || !triedCombined)) {
+    while (!response.ok) {
       if (!healedThinking && wantNoThinking(model, opts) && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
         markDisableThinkingUnsupported(model);
         response = await postOnce(alreadyReplaying);

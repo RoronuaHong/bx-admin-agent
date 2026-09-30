@@ -151,8 +151,9 @@ export function planConcurrentBatch<T extends { name: string; argsJson: string }
  * 省掉 N×RTT。上限避免一次打爆上游；需要确认的写操作与交互式调用永不进并发批。
  */
 const MAX_CONCURRENT_CALLS = Math.max(1, Number(process.env.MCP_CONCURRENT_CALLS || 4));
-// 接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：仅对声明 enforceGrounding 的角色生效。
-// GROUNDING_MAX_RETRIES = 允许的纠正次数（作废文本 + 回灌提示让模型补取数据）；用尽后改用确定性拒答。
+// 接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）。
+// 开启条件在 chatStream：角色声明，或本轮挂了外部数据源工具。
+// GROUNDING_MAX_RETRIES = 纠正次数；回答里没有事实断言则放行，用尽且兜底调用失败才换确定性文案。
 const GROUNDING_GUARD = (process.env.GROUNDING_GUARD || "on").toLowerCase() !== "off";
 const GROUNDING_MAX_RETRIES = Math.max(0, Number(process.env.GROUNDING_MAX_RETRIES || 1));
 // 事后核验（Chain-of-Verification 最小版，详见 src/grounding.ts）：补齐「拿到部分数据后仍有超出证据的断言」。
@@ -1289,9 +1290,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           continue;
         }
       }
-      // 运行时校验：接地护栏（防「零数据凭记忆作答」）。声明 enforceGrounding 的角色在一条数据都没
-      // 拿到时不允许以正文结论收束——先作废该段文本 + 回灌纠正提示（两条路径都写明），纠正用尽仍无数据
-      // 则标记 ungrounded，并改用「受约束的诚实兜底」收束（绝不展示可能编造的内容）。
+      // 零证据收束：没有事实断言则放行；有事实断言才作废重试，用尽后走诚实兜底（详见 grounding.ts）。
       const grounding = decideGrounding({
         enforceGrounding: ctx.enforceGrounding,
         enabled: GROUNDING_GUARD,
@@ -1321,9 +1320,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       if (grounding === "block") {
-        // 纠正次数用尽时，上一轮分诊看的是更早的回答。最后这一段可能已经按用户要求
-        // 改成「不需要数据」的回复（例如明确不要调用工具）。再分诊一次：没有事实断言就放行，
-        // 不要改写成「没按阈值下结论」。
+        // 纠正次数用尽前，分诊看的是更早的回答。最后这一段若已没有事实断言，放行，不要换成协议句。
         const lastNeed = await probeNeedsExternalData(ctx.model, userQuestion, outcome.text, ctx.signal);
         if (lastNeed === "no_data") {
           console.log("[chat:grounding] 纠正用尽，但最后一段回答不含需外部数据支撑的断言：放行");
@@ -1332,10 +1329,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           break;
         }
         ungrounded = true;
-        // 丢弃本轮未接地的正文（不上屏），改为一次「受约束的诚实兜底」（禁止任何事实性断言）：
-        // 不能直接回固定话术——固定话术无法区分「本轮本来就不需要数据」与「需要数据但没取到」，
-        // 会把「没有取得任何数据源返回的数据」当成结论告诉用户（与事实不符）。
-        // 注：前者已由上面的分诊放行（NO_DATA 直接上屏），走到这里的都是「需要数据但确实没取到」。
+        // 没有事实断言的已在上面放行。这里只剩「需要数据但没取到」：用受约束兜底，不用固定话术冒充取数失败。
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         const honest = await honestFallbackWith(ctx.model, userQuestion, getRole(ctx.namespace).label, ctx.signal);
         const finalHonest = honest || UNGROUNDED_REPLY;
@@ -2266,9 +2260,9 @@ export async function* chatStream(
     /** 点名调用也拒绝，并把拒绝写进本期工具记录（定时运行用；交互式不传）。 */
     denyBuiltinTools?: string[];
     /**
-     * 定时运行被接地护栏拦住时的收束口径。
-     * alert：正文改成 [NO_DATA] 协议行。report：一句「没有写结论」，由调度器记失败。
-     * 不传 = 交互对话，仍走诚实兜底。
+     * 定时运行被接地护栏拦住、且诚实兜底没有写出正文时才用。
+     * alert 换 [NO_DATA] 协议行；report 换「没有写结论」，由调度器记失败。
+     * 没有事实断言的回答已在分诊放行，不会走到这里。不传 = 交互对话。
      */
     unattendedConclusion?: "alert" | "report";
   } = {},
@@ -2334,8 +2328,6 @@ export async function* chatStream(
   // 角色级首轮强制工具调用：仅 forceToolCall=true 的角色（如 movie）首轮 tool_choice=required，逼模型先调工具；
   // 通用角色不设置该字段 → undefined → streamCall 内恒为 auto，行为不变。
   const roleForceToolCall = conversation?.agentId ? getRole(conversation.agentId).forceToolCall : undefined;
-  // 角色级接地护栏：仅 enforceGrounding=true 的角色（如 movie）在「零工具数据」时不许收束（见 src/grounding.ts）；
-  // 通用角色不设置该字段 → undefined → 不参与本护栏，行为不变。
   const roleEnforceGrounding = conversation?.agentId ? getRole(conversation.agentId).enforceGrounding : undefined;
   // 内置工具与本对话勾了哪些 MCP 无关，始终注入（见上方 mcpEnabled 注释）。
   // omitBuiltinTools：任务级收窄（预警跑禁止出图/导出，避免截断后估数再画图的脏产物）。
@@ -2616,13 +2608,10 @@ export async function* chatStream(
 
   // 角色身份护栏：兜底纠正模型把自身错认为底层大模型的自报（如「我是 Kimi」），
   // 确定性改写短自报句，长回答交提示词层处理（详见 src/role-guard.ts）。
-  // 接地护栏兜底：纠正用尽仍未取得任何工具数据的角色，正文已被换成「受约束的诚实兜底」文本
-  // （只允许说明职责边界 / 如实说没取到 / 请用户补充，禁止事实性断言）；该文本缺失时才回落确定性文案。
-  // 宁如实说取不到，也不把可能凭记忆编造的内容展示给用户（详见 src/grounding.ts）。
+  // 没有事实断言的回答已在分诊放行。走到这里且 ungrounded 时，正文已是诚实兜底或确定性文案。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
-  // 定时运行被接地护栏拦住、且诚实兜底也没写出可用正文时，才换协议句。
-  // 兜底已经说明「这次不用数据 / 没取到」时保留它，避免盖成指令里没有的「阈值」。
+  // 协议句只替换确定性文案。兜底已经写出的话保留。
   const cannedApology = !guarded || guarded === UNGROUNDED_REPLY;
   const unattendedLine =
     ungrounded && cannedApology && opts.unattendedConclusion === "alert"
