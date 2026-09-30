@@ -599,7 +599,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>MODEL_CALL_RETRIES</code></td><td class="num">2</td><td>单次模型调用的瞬时重试</td></tr>
 <tr><td><code>SUBAGENT_MAX_ROUNDS/PARALLEL/RESULT_CHARS</code></td><td class="num">10/3/4000</td><td>子代理独立预算</td></tr>
 <tr><td><code>CONTEXT_SAFETY_RATIO</code></td><td class="num">0.8</td><td>历史占用窗口的安全比例</td></tr>
-<tr><td><code>TOOL_SEARCH_MODE/RATIO/RESULTS</code></td><td>auto / 0.1 / 8</td><td>工具过多时切换 deferred（只留 search_tools 入口）</td></tr>
+<tr><td><code>TOOL_SEARCH_MODE/RATIO/RESULTS</code></td><td>auto / 0.1 / 8</td><td>工具过多时 deferred：预载最多 5 个与本轮问题相关的 schema，其余走 search_tools；直接点名已知工具则补上说明再执行</td></tr>
 <tr><td><code>GROUNDING_GUARD / MAX_RETRIES</code></td><td>on / 1</td><td>接地护栏：零工具数据时，没有事实断言的回答放行；有事实断言才作废重来</td></tr>
 <tr><td><code>GROUNDING_VERIFY / _MAX / _VOTES</code></td><td>on / 1 / 1</td><td><strong>事后核验</strong>（Chain-of-Verification 最小版）：收束后再核一遍是否仍有超出证据的断言；<code>_VOTES&gt;1</code> 走多票裁决（多数认定无支持才作废）</td></tr>
 <tr><td><code>GROUNDING_EVIDENCE_CHARS</code></td><td class="num">12000</td><td>送核验器的证据字符上限——核验本身不能变成新的上下文负担</td></tr>
@@ -772,7 +772,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 </div>
 <div class="card">
 <h4>工具选择策略 <code>TOOL_SEARCH_MODE</code></h4>
-<p><code>auto</code>：工具定义超过窗口 10% 就切 deferred——只留 <code>search_tools</code> 入口，模型按需检索。<br/><span class="tag danger">红线</span>必须保持 <code>auto</code>，改成 <code>off</code> 会让所有角色永远 eager 注入，改变通用大模型行为。movie 角色的 eager 走 per-role 的 <code>forceEagerTools</code>，不污染通用角色。</p>
+<p><code>auto</code>：工具定义超过窗口 10% 就切 deferred。本轮问题点名或命中的工具预载最多 5 份参数说明，其余再 <code>search_tools</code>；模型直接调用已知但未预载的工具时补上说明并执行。<br/><span class="tag danger">红线</span>必须保持 <code>auto</code>，改成 <code>off</code> 会让所有角色永远 eager 注入，改变通用大模型行为。movie 角色的 eager 走 per-role 的 <code>forceEagerTools</code>，不污染通用角色。</p>
 </div>
 <div class="card">
 <h4>两段式系统提示</h4>
@@ -1241,14 +1241,14 @@ src/
 
 <div class="kp-card" tabindex="0" role="button">
   <div class="kp-h"><b>Deferred 工具检索</b><span class="tag warn">⚠️ 有坑</span></div>
-  <p class="kp-1">工具过多时只留 search_tools 入口（<code>TOOL_SEARCH_MODE=auto</code>）</p>
+  <p class="kp-1">工具过多时预载少量相关 schema，其余再检索（<code>TOOL_SEARCH_MODE=auto</code>）</p>
   <div class="kp-detail" hidden>
     <dl>
-      <dt>业界常见做法</dt><dd>工具数量爆炸时按需加载（deferred / tool search），避免工具 schema 吃掉大量上下文。</dd>
-      <dt>本项目做法</dt><dd>工具定义超窗口比例（<code>TOOL_SEARCH_RATIO=0.1</code>）才切 deferred；<code>TOOL_SEARCH_MODE</code> 必须保持 <code>auto</code>。</dd>
-      <dt>判定</dt><dd>⚠️ 做法正确但<strong>有已知副作用</strong>：弱模型不会主动检索就直接凭记忆作答 → 编造。</dd>
-      <dt>偏离说明</dt><dd>因此对强依赖工具的角色（movie）单独开了 <code>forceEagerTools</code> 走 per-role 强制全量注入，而不是全局改成 <code>off</code>——全局改会改变通用大模型的行为。<code>TOOL_SEARCH_MODE=off</code> 是红线。</dd>
-      <dt>何时改回去</dt><dd>当主用模型足够可靠地会主动 <code>search_tools</code> 时，可取消 per-role 例外。</dd>
+      <dt>业界常见做法</dt><dd>工具数量爆炸时按需加载，并保留 3～5 个与当前问题相关的工具不延迟；模型直接点名时补上 schema 再执行，而不是拒绝。</dd>
+      <dt>本项目做法</dt><dd>工具定义超窗口比例（<code>TOOL_SEARCH_RATIO=0.1</code>）才切 deferred，并预载最多 5 个；<code>TOOL_SEARCH_MODE</code> 必须保持 <code>auto</code>。一次工具都没调用却声称取不到，接地分诊判为还没取数。</dd>
+      <dt>判定</dt><dd>⚠️ movie 仍单独全量注入：21 个工具、弱模型不会主动检索时会凭记忆编造。</dd>
+      <dt>偏离说明</dt><dd>movie 走 per-role <code>forceEagerTools</code>，不把全局改成 <code>off</code>。<code>TOOL_SEARCH_MODE=off</code> 是红线。281 个 Zoho 工具不全量注入。</dd>
+      <dt>何时改回去</dt><dd>当主用模型足够可靠地会主动 <code>search_tools</code> 时，可取消 movie 的 per-role 例外。</dd>
     </dl>
   </div>
 </div>
@@ -1599,7 +1599,7 @@ src/
 <tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16）。<strong>2026-09-30 补了 <code>.github/workflows/ci.yml</code></strong>：跑类型检查 + 全量单测（带 mongo service）——它跑的是<strong>测试</strong>，不是评测门禁；护栏行为仍由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 并接进同一 workflow，把 read/write 场景接进定时回归</td></tr>
 <tr><td>权限与多租户</td><td>owner cookie 非认证</td><td>若要对外，补真实登录 + 服务端 session</td></tr>
 <tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>权限过滤仍缺</strong></td><td>先补权限过滤；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
-<tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合 + <strong>2026-09-30 起有前端页面</strong>（<code>/trace</code>：run 列表 + 汇总卡片，含接地纠正 / 事后核验 / 未取证三列）</td><td>Prometheus 指标 / 跨进程任务队列 / llm-tool 分层 span</td></tr>
+<tr><td>可观测</td><td>JSONL（run 级 + <strong>轮级</strong>）+ HTTP 端点 + CLI 聚合 + <strong>2026-09-30 起有前端页面</strong>（<code>/trace</code>：run 列表 + 汇总卡片，含接地纠正 / 事后核验 / 未取证三列）</td><td>跨进程任务队列 / llm-tool 分层 span（<strong>Prometheus 指标已于 2026-09-30 补上</strong>：<code>GET /chat/metrics</code> 文本格式，owner 隔离）</td></tr>
 <tr><td>技能治理</td><td>静态 SKILL.md</td><td>按项目/角色定制，加载成本度量</td></tr>
 </tbody>
 </table>
@@ -1709,7 +1709,7 @@ src/
 <tr><td>提示词管理</td><td>外置托管 + A/B</td><td>内联 TS + SKILL.md 随代码版本</td><td>提示词是行为代码：必须过评审、必须能随代码回滚</td><td>非工程角色需参与迭代或要做线上 A/B</td></tr>
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
 <tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
-<tr><td>工具检索策略</td><td>统一按需检索（deferred），工具 schema 不占上下文</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>，但对 movie 这类强依赖工具的角色开 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据</td><td>主用模型能稳定主动检索时取消 per-role 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
+<tr><td>工具检索策略</td><td>按需检索，并保留少量相关工具的 schema</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>：超窗口 10% 后预载最多 5 个，直接点名则补上说明再执行；movie 仍 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据。Zoho 281 个工具不全量注入</td><td>主用模型能稳定主动检索时取消 movie 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
 <tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（43 文件 / 251 例）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>

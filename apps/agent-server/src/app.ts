@@ -61,6 +61,7 @@ import {
 } from "./chat-tasks.js";
 import { fsList, fsRead, fsRemoveConversation, fsResolve, fsStat, mimeOf } from "./fs-store.js";
 import { getRelease, listRunTraces, newRunId, appendRunTrace, type RunStatus, type RunTrace } from "./trace.js";
+import { buildMetrics } from "./metrics.js";
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import {
@@ -664,6 +665,19 @@ export function createApp() {
     const conversationId = c.req.query("conversationId") || undefined;
     const runs = listRunTraces({ ownerKey: c.get("owner"), conversationId, limit });
     return c.json({ release: getRelease(), runs });
+  });
+
+  // ---- Prometheus 指标（§可观测）：纯只读聚合，不新建数据源 ----
+  // 与 trace / cost / audit 同口径：HTTP 侧只暴露本 owner 的指标，全局视角走 CLI 直读 JSONL。
+  // 文本格式（不是 OTLP）：单机规模下先给一个能被抓的端点，缺的是 llm/tool 分层 span，不是导出格式。
+  app.get("/chat/metrics", (c) => {
+    const owner = c.get("owner");
+    const days = Math.max(1, Math.min(90, Number(c.req.query("days")) || 7));
+    const from = Date.now() - days * 86400_000;
+    const runs = listRunTraces({ ownerKey: owner, limit: 200 }).filter((run) => run.at >= from);
+    const audit = listAuditEvents({ ownerKey: owner, limit: 1000 }).filter((event) => event.at >= from);
+    c.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+    return c.body(buildMetrics({ runs, audit, release: getRelease() }));
   });
 
   // ---- 成本计量（§12 最小版）：按日 / 模型聚合 + 预算告警；未配单价只计 token，不编造金额 ----
