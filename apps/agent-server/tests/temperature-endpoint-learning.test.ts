@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { callAgent, temperatureSupported } from "../src/models.js";
+import { callAgent, disableThinkingSupported, temperatureSupported } from "../src/models.js";
 import { config } from "../src/config.js";
 import type { ModelEntry } from "../src/config.js";
 
@@ -125,5 +125,67 @@ describe("temperature 端点学习：拒收 → 记住 → 后续调用天然省
     // 主对话不设温度 → 永远不带该字段（判定型参数只属于辅助调用）
     await callAgent(makeModel("probe-temp-main"), [{ role: "user", content: "hi" }], [], undefined, undefined, {});
     expect(bodies[1]!.temperature).toBeUndefined();
+  });
+
+  it("报错不点名字段、且同时带了关思考：去掉 temperature 仍失败后，再去掉两个字段重发", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    // 实测 kimi 辅助调用：temperature 与 thinking:{type:disabled} 任一在场都是同一句 MaaS 400，不点名字段。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { body?: string }) => {
+        const body = init?.body ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+        bodies.push(body || {});
+        const thinking = body?.thinking as { type?: string } | undefined;
+        const rejected = body && ("temperature" in body || thinking?.type === "disabled");
+        return rejected ? new Response(MAAS_REJECTED, { status: 400 }) : sse();
+      }),
+    );
+
+    const model = makeModel("probe-temp-and-thinking");
+    const res = await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, {
+      temperature: 0,
+      disableThinking: true,
+    });
+
+    expect(res.text).toBe("CHAT");
+    expect(bodies.length).toBeGreaterThanOrEqual(3);
+    expect(bodies[0]!.temperature).toBe(0);
+    expect((bodies[0]!.thinking as { type?: string }).type).toBe("disabled");
+    const passed = bodies[bodies.length - 1]!;
+    expect(passed.temperature).toBeUndefined();
+    expect(passed.thinking).toBeUndefined();
+    expect(temperatureSupported(model)).toBe(false);
+    expect(disableThinkingSupported(model)).toBe(false);
+
+    bodies.length = 0;
+    const second = await callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, {
+      temperature: 0,
+      disableThinking: true,
+    });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!.temperature).toBeUndefined();
+    expect(bodies[0]!.thinking).toBeUndefined();
+    expect(second.text).toBe("CHAT");
+  });
+
+  it("两个字段都去掉仍失败 → 两份记忆都回滚", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls += 1;
+        return new Response(MAAS_REJECTED, { status: 400 });
+      }),
+    );
+    const model = makeModel("probe-temp-and-thinking-rollback");
+    await expect(
+      callAgent(model, [{ role: "user", content: "hi" }], [], undefined, undefined, {
+        temperature: 0,
+        disableThinking: true,
+      }),
+    ).rejects.toThrow(/400/);
+    expect(calls).toBe(3);
+    expect(temperatureSupported(model)).toBe(true);
+    expect(disableThinkingSupported(model)).toBe(true);
   });
 });

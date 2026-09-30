@@ -744,7 +744,11 @@ async function callOpenAi(
     // 改为每轮重发后都重新评估两个字段，直到无 400 或两字段都已尝试过自愈。
     let healedThinking = false;
     let healedTemp = false;
-    while (!response.ok && (!healedThinking || !healedTemp)) {
+    // 报错不点名字段时，先去掉 temperature 仍会留下 thinking:{type:disabled}。
+    // 主对话不带这两个字段、已经能过；辅助调用必须再试一次「两个都去掉」，否则分诊/兜底永远 400，
+    // 正文会被换成「没取到数据」（本轮可能根本没取数）。
+    let triedCombined = false;
+    while (!response.ok && (!healedThinking || !healedTemp || !triedCombined)) {
       if (!healedThinking && wantNoThinking(model, opts) && disableThinkingSupported(model) && isThinkingDisabledRejected(detail)) {
         markDisableThinkingUnsupported(model);
         response = await postOnce(alreadyReplaying);
@@ -760,6 +764,25 @@ async function callOpenAi(
         detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
         if (!response.ok) unmarkTemperatureUnsupported(model);
         healedTemp = true;
+        continue;
+      }
+      if (
+        !triedCombined &&
+        wantNoThinking(model, opts) &&
+        opts.temperature === 0 &&
+        healedTemp &&
+        response.status === 400 &&
+        isTempZeroRejected(detail)
+      ) {
+        triedCombined = true;
+        markDisableThinkingUnsupported(model);
+        markTemperatureUnsupported(model);
+        response = await postOnce(alreadyReplaying);
+        detail = response.ok ? "" : (await response.text().catch(() => "")).slice(0, 500);
+        if (!response.ok) {
+          unmarkDisableThinkingUnsupported(model);
+          unmarkTemperatureUnsupported(model);
+        }
         continue;
       }
       break;
