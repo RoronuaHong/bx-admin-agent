@@ -242,7 +242,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-09-30） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；§15 已按当前工作区刷新）</p>
+  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-02） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -266,7 +266,7 @@
 </div>
 <div class="note">引用的行号基于当前工作区快照；代码会变，行号会漂，<strong>函数名是稳定锚点</strong>，先搜函数名再看行号。</div>
 <div class="card">
-<details><summary><b>本次「对齐 + 查缺补漏」订正记录（12 项 + 2026-09-29 补充 7 项 + 2026-09-30 预警 1 项 · 均已并入正文，点开只看历史）</b></summary>
+<details><summary><b>本次「对齐 + 查缺补漏」订正记录（12 项 + 2026-09-29 补充 7 项 + 2026-09-30 预警 1 项 + 2026-10-02 分页计数、体量与行号 3 项 · 均已并入正文，点开只看历史）</b></summary>
 <table>
 <thead><tr><th>订正项</th><th>旧说法 / 缺口</th><th>按当前代码更正为</th></tr></thead>
 <tbody>
@@ -289,6 +289,9 @@
 <tr><td>本轮·测试规模</td><td>38 文件 / 约 210 例</td><td>40 文件 / 219 例；新增 <code>schedule-runs</code>、<code>temperature-endpoint-learning</code> 两组回归（A3 已列）</td></tr>
 <tr><td>本轮·数据预警（2026-09-30）</td><td>§15 只写「专属对话 + 通知」</td><td>补齐用途 <code>purpose</code>（report/alert）、<code>notifyPolicy=on_alert</code>、结论协议 <code>[SPIKE]/[NORMAL]/[NO_DATA]</code>、冷静期 / 恢复、<strong>先测后跑</strong>（气泡「设为数据预警」）、预警硬摘 <code>render_chart</code>/<code>export_data</code>、预警轮次默认 12、长跑按跑完时刻推进 <code>nextRunAt</code>；同日补上立即执行 / 事件唤醒、定时运行拒绝无人值守工具、删除任务保留结果会话。方案见 <code>docs/scheduled-spike-detection-plan.md</code></td></tr>
 <tr><td>本轮·测试规模（2026-09-30）</td><td>40 文件 / 219 例</td><td>43 文件 / 251 例。新增 <code>schedule-alert</code>、<code>zoho-list-compact</code>、<code>tool-choice-learning</code> 等；全量 <code>vitest run</code> 已通过</td></tr>
+<tr><td>本轮·分页计数（2026-10-02）</td><td>文档写「去重不拦递增翻页」；无总数列表只能缩短窗口或换数据源。模型自己逐页累加会丢页，子代理轮次不够当翻页器</td><td>§7 补全：<code>count_list_by_time</code> 在服务端翻完并只回小时计数；<code>run_tool_code</code> 把其它汇总留在子进程；<code>list-page-gate.ts</code> 每个列表工具一轮只放行第一页（换筛选也拒绝）。去重与熔断仍不看语义。详见 §7「分页列表」、§12、§15、§23、A3</td></tr>
+<tr><td>本轮·体量（2026-10-02）</td><td>§2 / A3 仍是 2026-09-29～30 的行数与 43 文件 / 251 例</td><td>按源文件总行数重计：app 1798 / chat 2904 / builtins 1936。测试按 <code>it</code>/<code>test</code> 调用计为 54 文件 / 304 例。历史行号仍以函数名为准</td></tr>
+<tr><td>本轮·行号与前端（2026-10-02）</td><td><code>chatStream</code> 仍写 2151；ChatPage 仍写约 10560 行 / 380KB；§8 工具 spec 行号是插入分页工具之前的</td><td><code>chatStream</code> 在 <code>chat.ts:2504</code>。护栏常量约在 73–359 行。§8 spec 行号按当前 <code>builtins.ts</code> 重对。ChatPage 11853 行 / 458KB；前端 <code>src</code> 26 个文件，另有 <code>/trace</code></td></tr>
 </tbody>
 </table>
 </details>
@@ -345,32 +348,35 @@
 d:\Code\bx-admin-agent
 ├─ apps/
 │  ├─ agent-server/            服务端（本文 80% 内容）
-│  │  ├─ src/                  主源码（顶层 35 个 .ts，含子目录共 44）
+│  │  ├─ src/                  主源码（顶层 40 个 .ts，含子目录共 50；2026-10-02）
 │  │  │  ├─ index.ts           启动装配
-│  │  │  ├─ app.ts             HTTP 路由（1608 行）
-│  │  │  ├─ chat.ts            对话主循环（2528 行）★核心
-│  │  │  ├─ builtins.ts        内置工具定义与执行（1891 行）★核心
-│  │  │  ├─ models.ts          模型适配与调用（877 行）
-│  │  │  ├─ conversations.ts   会话持久化（785 行）
-│  │  │  ├─ schedules.ts       定时任务（~506 行）
-│  │  │  ├─ schedule-alert.ts  预警标记 / on_alert（~117 行）
-│  │  │  ├─ web-search.ts      联网搜索（378 行）
-│  │  │  ├─ fs-store.ts        会话工作区虚拟文件系统（456 行）
-│  │  │  ├─ chat-tasks.ts      异步任务注册表（469 行）
-│  │  │  ├─ system-prompt.ts   系统提示词装配（257 行）
+│  │  │  ├─ app.ts             HTTP 路由（1798 行）
+│  │  │  ├─ chat.ts            对话主循环（2904 行）★核心
+│  │  │  ├─ builtins.ts        内置工具定义与执行（1936 行）★核心
+│  │  │  ├─ models.ts          模型适配与调用（825 行）
+│  │  │  ├─ conversations.ts   会话持久化（723 行）
+│  │  │  ├─ schedules.ts       定时任务（629 行）
+│  │  │  ├─ schedule-alert.ts  预警标记 / on_alert（203 行）
+│  │  │  ├─ list-count.ts      分页列表的服务端小时计数（611 行）
+│  │  │  ├─ list-page-gate.ts  直接翻页闸门（40 行）
+│  │  │  ├─ tool-code.ts       代码里调用只读工具，只回聚合输出（276 行）
+│  │  │  ├─ web-search.ts      联网搜索（362 行）
+│  │  │  ├─ fs-store.ts        会话工作区虚拟文件系统（420 行）
+│  │  │  ├─ chat-tasks.ts      异步任务注册表（413 行）
+│  │  │  ├─ system-prompt.ts   系统提示词装配（293 行）
 │  │  │  ├─ mcp/{config,hub}.ts                MCP 配置与连接
 │  │  │  ├─ rag/{store,parsers,embedding}.ts   知识库：存储 / 解析 / 向量
 │  │  │  ├─ movie/profile.ts · notify/{channels,deliver}.ts · tools/dingtalk-doc.ts
-│  │  │  └─ 其余 24 个顶层模块：skills / memory / trace / cost / audit / risk / confirm /
+│  │  │  └─ 其余 25 个顶层模块：skills / memory / trace / cost / audit / risk / confirm /
 │  │  │     session / owner / roles / config / grounding / history / task-store / uploads /
 │  │  │     report / schedule-service / sql-readonly / untrusted / role-guard / rate-limit …
 │  │  ├─ skills/               7 个技能目录（SKILL.md）
 │  │  ├─ assets/fonts/         PDF 中文渲染字体 Noto Sans SC
-│  │  ├─ scripts/ tests/        脚本 7 个 + vitest 套件 43 文件 / 251 例（见 A2/A3）
+│  │  ├─ scripts/ tests/        脚本见 A2 + vitest 套件 54 文件 / 304 例（见 A3，2026-10-02）
 │  │  └─ .data/                运行时产物（gitignore）
-│  └─ web/src/                 前端（25 个文件，ChatPage.vue 约 10560 行 / 380KB）
+│  └─ web/src/                 前端（26 个文件，ChatPage.vue 11853 行 / 458KB）
 ├─ packages/shared/            共享类型（ChatEvent、ArtifactSpec、TodoItem…）
-├─ docs/                       设计文档 18 篇 + agent/ 22 篇 + knowledge/ 本地知识库
+├─ docs/                       根目录 22 个 md + agent/ 24 篇 + knowledge/ 本地知识库
 ├─ pnpm-workspace.yaml         monorepo 配置
 └─ ecosystem.dev.config.cjs    PM2 配置（进程名 agent-server-dev，端口 8787）
 </pre>
@@ -379,19 +385,21 @@ d:\Code\bx-admin-agent
 <table>
 <thead><tr><th>文件</th><th>行数</th><th>职责一句话</th></tr></thead>
 <tbody>
-<tr><td><code>app.ts</code></td><td class="num">1608</td><td>全部 HTTP 端点与中间件</td></tr>
-<tr><td><code>builtins.ts</code></td><td class="num">1891</td><td>内置工具 schema 定义 + 执行分派</td></tr>
-<tr><td><code>chat.ts</code></td><td class="num">2528</td><td>对话主循环：模型调用 / 工具循环 / 子代理 / 护栏 / 事件产出</td></tr>
-<tr><td><code>models.ts</code></td><td class="num">877</td><td>多模型适配、流式 tool_calls 拼接、重试降级、端点参数自愈</td></tr>
-<tr><td><code>conversations.ts</code></td><td class="num">785</td><td>会话与消息落库（Mongo / 内存双模）</td></tr>
-<tr><td><code>chat-tasks.ts</code></td><td class="num">469</td><td>任务注册表、断线续传、共性：执行与推送解耦</td></tr>
-<tr><td><code>schedules.ts</code></td><td class="num">~506</td><td>cron 定时 + 锁 / tick + 每期会话 runs + 跑完推进 nextRunAt</td></tr>
-<tr><td><code>schedule-alert.ts</code></td><td class="num">~117</td><td>预警标记 / on_alert 投递决策 / 冷静期 / SCHEDULE_ALERT_GUIDE</td></tr>
-<tr><td><code>schedule-service.ts</code></td><td class="num">~267</td><td>创建校验层（HTTP 与 manage_schedule 共用）</td></tr>
-<tr><td><code>fs-store.ts</code></td><td class="num">456</td><td>每会话独立虚拟文件系统（读/写/grep/glob/edit）</td></tr>
-<tr><td><code>system-prompt.ts</code></td><td class="num">257</td><td>系统提示词组装与角色人设注入</td></tr>
-<tr><td><code>report.ts</code></td><td class="num">497</td><td>HTML 报告合成（图表烘焙成内联 SVG，零外链）</td></tr>
-<tr><td><code>ChatPage.vue</code></td><td class="num">≈10560（380KB）</td><td>整个聊天界面：流消费、渲染、交互全在一处</td></tr>
+<tr><td><code>app.ts</code></td><td class="num">1798</td><td>全部 HTTP 端点与中间件</td></tr>
+<tr><td><code>chat.ts</code></td><td class="num">2904</td><td>对话主循环：模型调用 / 工具循环 / 子代理 / 护栏 / 事件产出</td></tr>
+<tr><td><code>builtins.ts</code></td><td class="num">1936</td><td>内置工具 schema 定义 + 执行分派</td></tr>
+<tr><td><code>models.ts</code></td><td class="num">825</td><td>多模型适配、流式 tool_calls 拼接、重试降级、端点参数自愈</td></tr>
+<tr><td><code>conversations.ts</code></td><td class="num">723</td><td>会话与消息落库（Mongo / 内存双模）</td></tr>
+<tr><td><code>list-count.ts</code></td><td class="num">611</td><td>分页列表的服务端小时计数</td></tr>
+<tr><td><code>schedules.ts</code></td><td class="num">629</td><td>cron 定时 + 锁 / tick + 每期会话 runs + 跑完推进 nextRunAt</td></tr>
+<tr><td><code>schedule-alert.ts</code></td><td class="num">203</td><td>预警标记 / on_alert 投递决策 / 冷静期 / SCHEDULE_ALERT_GUIDE</td></tr>
+<tr><td><code>schedule-service.ts</code></td><td class="num">276</td><td>创建校验层（HTTP 与 manage_schedule 共用）</td></tr>
+<tr><td><code>fs-store.ts</code></td><td class="num">420</td><td>每会话独立虚拟文件系统（读/写/grep/glob/edit）</td></tr>
+<tr><td><code>system-prompt.ts</code></td><td class="num">293</td><td>系统提示词组装与角色人设注入</td></tr>
+<tr><td><code>tool-code.ts</code></td><td class="num">276</td><td>代码里调用只读工具，只把聚合输出交回模型</td></tr>
+<tr><td><code>report.ts</code></td><td class="num">475</td><td>HTML 报告合成（图表烘焙成内联 SVG，零外链）</td></tr>
+<tr><td><code>chat-tasks.ts</code></td><td class="num">413</td><td>任务注册表、断线续传、共性：执行与推送解耦</td></tr>
+<tr><td><code>ChatPage.vue</code></td><td class="num">11853（458KB）</td><td>整个聊天界面：流消费、渲染、交互全在一处</td></tr>
 </tbody>
 </table>
 <div class="note"><strong>知识点</strong>：ChatPage.vue 体量大是有意取舍——对话 UI 的状态高度耦合（事件、滚动、折叠态、渲染），拆组件会带来跨组件同步成本；但长期看「流解析 / 事件归一化」应抽成 composable。</div>
@@ -404,15 +412,15 @@ d:\Code\bx-admin-agent
 
 <h3 id="s4">3.1 时序总图</h3>
 <div class="flow">
-  <div class="step"><div class="t">① 浏览器 POST /chat/stream</div><div class="d">带 text / conversationId / agentId；会话中间件解析 cookie 与 owner</div><div class="f">app.ts:919 · app.ts:573</div></div>
+  <div class="step"><div class="t">① 浏览器 POST /chat/stream</div><div class="d">带 text / conversationId / agentId；会话中间件解析 cookie 与 owner</div><div class="f">app.ts:1062 · 会话中间件 app.ts:657</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">② 创建后台任务 RunningTask</div><div class="d">taskId / 事件缓冲 / AbortController / settled 标记；<b>响应头返回 X-Chat-Task-Id</b></div><div class="f">chat-tasks.ts · app.ts:991</div></div>
+  <div class="step"><div class="t">② 创建后台任务 RunningTask</div><div class="d">taskId / 事件缓冲 / AbortController / settled 标记；<b>响应头返回 X-Chat-Task-Id</b></div><div class="f">chat-tasks.ts · app.ts:1134</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">③ 后台消费者驱动 chatStream</div><div class="d">`void (async () => { for await (const ev of chatStream(...)) buffer.push(ev) })()`——<b>与 HTTP 连接解耦</b>，断开也照跑</div><div class="f">app.ts · chat.ts:2151 chatStream</div></div>
+  <div class="step"><div class="t">③ 后台消费者驱动 chatStream</div><div class="d">`void (async () => { for await (const ev of chatStream(...)) buffer.push(ev) })()`——<b>与 HTTP 连接解耦</b>，断开也照跑</div><div class="f">app.ts · chat.ts:2504 chatStream</div></div>
   <div class="arrow">▼</div>
   <div class="step"><div class="t">④ SSE 连接只是「订阅者」</div><div class="d">100ms 轮询追新事件并写给客户端；send 抛错即静默退出，不影响后台任务</div><div class="f">app.ts</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">⑤ 执行链路（chatStream 内部）</div><div class="d">上下文装配 → 系统提示 → 调模型 → 有 tool_calls 则执行工具 → 把结果回灌 → 再调模型 …… 直到无工具调用或触护栏</div><div class="f">chat.ts:2151</div></div>
+  <div class="step"><div class="t">⑤ 执行链路（chatStream 内部）</div><div class="d">上下文装配 → 系统提示 → 调模型 → 有 tool_calls 则执行工具 → 把结果回灌 → 再调模型 …… 直到无工具调用或触护栏</div><div class="f">chat.ts:2504</div></div>
   <div class="arrow">▼</div>
   <div class="step"><div class="t">⑥ 每一步产出事件</div><div class="d">text_delta / thinking / tool_call / tool_result / chart / artifact / todos / usage / done（序列单调 seq）</div><div class="f">packages/shared/src/index.ts:109-239</div></div>
   <div class="arrow">▼</div>
@@ -426,7 +434,7 @@ d:\Code\bx-admin-agent
 
 <h3>chatStream 内部：一次「工具循环」的骨架</h3>
 <pre>
-<b>chatStream(...)</b>  (chat.ts:2151)
+<b>chatStream(...)</b>  (chat.ts:2504)
 ├─ 加载会话 / 角色 / 技能 / MCP 启用集 / 历史
 ├─ buildStaticGuide(session)        → 静态提示（<i>prompt cache 友好，放 system 首位</i>）
 ├─ assembleContext(history, budget) → 历史组装：prune → 预算超限才 LLM 摘要（水位线增量）
@@ -439,7 +447,7 @@ d:\Code\bx-admin-agent
 │   │    ├─ grounding 护栏：要数据的题却零工具数据 → 作废文本 + 回灌纠正提示
 │   │    └─ 通过 → 收束
 │   ├─ 伪调用协议护栏：looksLikePseudoToolCall(text) → 丢弃 + 回灌规则
-│   └─ 执行工具（含写操作确认 / 去重 / 熔断 / 结果预算治理）
+│   └─ 执行工具（含写操作确认 / 去重 / 熔断 / 列表翻页闸门 / 结果预算治理）
 │        └─ 结果回灌 turns → 下一轮
 └─ finally：发 usage + done，落库
 </pre>
@@ -489,7 +497,7 @@ for (id of listEnabledMcpServers()) connect(id)   <i>// 启动自动重连</i>
 SIGINT/SIGTERM → interruptOwnRunningTasks() + disconnectAll() + exit(0)
 </pre>
 
-<h3>中间件顺序 <span class="kv">src/app.ts:548-590</span></h3>
+<h3>中间件顺序 <span class="kv">src/app.ts:632-664</span></h3>
 <table>
 <thead><tr><th>顺序</th><th>中间件</th><th>作用与坑</th></tr></thead>
 <tbody>
@@ -533,7 +541,7 @@ export function <b>resolveOwner</b>(c: Context): string {
 </pre>
 </div>
 </div>
-<h4>限流 <code>rate-limit.ts</code> / <code>app.ts:116-119</code>（常量）· <code>app.ts:958-968</code>（stream 内判定）</h4>
+<h4>限流 <code>rate-limit.ts</code> / <code>app.ts:142-149</code>（常量）· <code>app.ts:1103-1109</code>（stream 内判定）</h4>
 <table>
 <thead><tr><th>项</th><th>默认值</th><th>说明</th></tr></thead>
 <tbody>
@@ -547,7 +555,7 @@ export function <b>resolveOwner</b>(c: Context): string {
 
 <!-- ===================== 6 ===================== -->
 <section id="s8">
-<h2 class="sec">6 · 模型适配层 <span class="kv">src/models.ts (877 行)</span></h2>
+<h2 class="sec">6 · 模型适配层 <span class="kv">src/models.ts（825 行，2026-10-02）</span></h2>
 <p>一切模型差异都收口在这里：上层只管要「文本 + tool_calls 流」。</p>
 <h4>模型注册表 <span class="kv">src/config.ts</span></h4>
 <pre>
@@ -569,7 +577,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td>多 key 池</td><td><code>apiKeys</code> 数组，<code>models.ts:185</code> 按 round-robin 取 key，遇 429/5xx 自动切下一个——绕开单 key 限流</td></tr>
 <tr><td>流式 tool_calls 拼接</td><td>OpenAI 的 tool_calls 是<strong>按 index 增量</strong>发的 JSON 片段（arguments 一串字符一点点来），必须按 index 累积再整体 parse</td></tr>
 <tr><td>forced tool_choice 降级</td><td>某些网关不支持 <code>tool_choice:{function:{name}}</code> → 命中 400 后记入 <code>forcedToolChoiceUnsupported</code>，降级 <code>auto</code> 并<strong>记住该端点</strong>，不重复白打</td></tr>
-<tr><td>多模态</td><td><code>vision:"direct"</code> 时把图片挂到<strong>最后一条 user 消息</strong>（<code>models.ts:244 / 538 / 762</code>）；<code>ocr</code> 走另路，<code>none</code> 不传图</td></tr>
+<tr><td>多模态</td><td><code>vision:"direct"</code> 时把图片挂到<strong>最后一条 user 消息</strong>（<code>models.ts:244 / 622 / 899</code>）；<code>ocr</code> 走另路，<code>none</code> 不传图</td></tr>
 <tr><td>thinking 冲突降级</td><td>开 thinking 的端点拒绝 <code>required</code>+thinking（400）→ 自动降级 auto 重试一次，不让对话断掉</td></tr>
 <tr><td>端点参数学习型自愈</td><td>内部判定型辅助调用（接地护栏分诊 / 诚实兜底）可同时带 <code>temperature:0</code> 与 <code>thinking:{type:disabled}</code>。报错<strong>点名</strong>时只去掉该字段并记住；<strong>不点名</strong>（MaaS 拒收请求体）时先去掉 <code>temperature</code>，仍 400 再把两个字段都去掉，与主对话已能通过的请求体一致。某一跳仍失败则<strong>回滚</strong>对应记忆，不把推测固化。端点同样不接受 <code>top_p</code>，故始终不发送。</td></tr>
 <tr><td>瞬时错误退避</td><td>429 / <code>rate.?limit</code> / <code>FreeUsageLimit</code> → 退避重试；<strong>402 / 401008（额度耗尽）视为永久失败，不重试</strong>，直接走候选链下一个模型</td></tr>
@@ -584,7 +592,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <h2 class="sec">7 · 工具循环与护栏（项目的心脏）</h2>
 <p>工具循环是 Agent 与「只会聊天的机器人」的分界线，也是最容易失控的地方。这里用一串<strong>显式常量</strong>把行为钉死。</p>
 
-<h3>护栏常量一览 <span class="kv">src/chat.ts:62-291</span></h3>
+<h3>护栏常量一览 <span class="kv">src/chat.ts:73-359</span></h3>
 <table>
 <thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
 <tbody>
@@ -607,11 +615,21 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>WRAP_UP_NARRATION_CHARS</code></td><td class="num">6000</td><td>轮次耗尽<strong>补位收尾</strong>时，带去给收尾模型的过程记录尾部长度</td></tr>
 </tbody>
 </table>
+<p class="muted">分页计数不在上面这张 <code>chat.ts</code> 表里，常量在 <code>list-count.ts</code> / <code>tool-code.ts</code>：</p>
+<table>
+<thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
+<tbody>
+<tr><td><code>LIST_COUNT_PAGE_LIMIT</code></td><td class="num">100（上限 500）</td><td>通用单页条数。Zoho <code>getConversationsList</code> 再封顶 99</td></tr>
+<tr><td><code>LIST_COUNT_DEFAULT_PAGES</code> / <code>MAX</code></td><td class="num">250 / 400</td><td>一次计数最多翻多少页；调用方的 <code>maxPages</code> 不能超过硬顶</td></tr>
+<tr><td><code>TOOL_CODE_MAX_CALLS</code></td><td class="num">400</td><td><code>run_tool_code</code> 里最多调用多少次只读工具</td></tr>
+<tr><td><code>run_tool_code</code> 超时</td><td class="num">180s，上限 600s</td><td>到点杀子进程；再等 1.5s 收尾。stdout 截断到 12000 字符</td></tr>
+</tbody>
+</table>
 
 <h3>六条关键护栏的实现意图</h3>
 <div class="grid g2">
 <div class="card"><h4>① 同轮去重 vs 跨轮熔断</h4>
-<p class="muted">去重：比较 <code>name|argsJson</code> 全等签名，只执行第一个，其余回灌提示「已合并，需要更多数据请基于分页信息再调」。<br/>熔断：跨轮签名相同累积到阈值 → 强制收束。<br/><strong>两者都不理解语义</strong>，纯协议层，所以不会误伤「正确递增分页」的调用。</p></div>
+<p class="muted">去重：比较 <code>name|argsJson</code> 全等签名，只执行第一个，其余回灌「本轮已执行过相同调用」。<br/>熔断：跨轮签名相同累积到阈值 → 强制收束。<br/><strong>这两条都不理解语义</strong>，所以 page 1 与 page 2 不会被当成重复调用。<br/>另一条是 <code>list-page-gate.ts</code>：每个列表工具本轮只放行一次第一页（只认 index / offset / page / cursor 这些页码形状，不认业务词）。跨页计数走 <code>count_list_by_time</code>，其它汇总走 <code>run_tool_code</code>。按 id 取详情不拦。</p></div>
 <div class="card"><h4>② 结果治理 <code>governToolResults()</code></h4>
 <p class="muted">超预算时把较早结果替换成占位文案；可被 <code>TOOL_RESULT_PROTECT_PATTERNS</code> 保护的结果不清理。另一条路是 <code>offloadToolResult()</code>：把大结果写进工作区文件 <code>results/&lt;callId&gt;_&lt;tool&gt;.txt</code>，模型可 <code>fs_read</code> 取回。</p></div>
 <div class="card"><h4>③ 伪调用协议护栏 <code>looksLikePseudoToolCall()</code></h4>
@@ -623,37 +641,73 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <div class="card"><h4>⑥ 预算耗尽也要有结论 <code>wrapUpWith()</code></h4>
 <p class="muted">交互式对话打满 <code>MAX_TOOL_ROUNDS</code> 后，各轮过程叙述会被拼成半截话（实测停在「重新写入：」这种悬空半句）。这里用<strong>同模型、无工具、非流式</strong>再调一次，把「用户原始请求 + 过程记录尾部 <code>WRAP_UP_NARRATION_CHARS</code>」交给它产出收束结论；停在半截动作上要如实交代「未完成」。<br/><span class="tag acc">两层</span>与无人值守任务的预防式 <code>forceWrapUp</code> 互补，共同保证「预算总有结论」。</p></div>
 </div>
-<div class="good"><strong>知识点（对齐业界）</strong>：这六条分别对应 Cursor / Claude Code 的 <em>dedup + doom loop + context offload + no-evidence guard</em>，外加 Anthropic《Effective context engineering for AI agents》里的两条 —— <em>让模型「看见」自己的重复行为（观察提示而非硬拦）</em> 与 <em>任何退出路径都要产出可用结论（补位收尾）</em>。共识是：<strong>护栏做在协议层（可预测、可观测），语义判定交给模型</strong>；一旦护栏里塞了业务正则，加一个场景就要改一次代码。<br/><span class="tag warn">反面教训</span>「硬拦」看起来更省事，但会同时误伤合法意图；对重复行为优先给模型<strong>反馈</strong>，把裁决权留给模型。</div>
+<div class="good"><strong>知识点（对齐业界）</strong>：去重、熔断、卸载、接地护栏对应 Cursor / Claude Code 的 <em>dedup + doom loop + context offload + no-evidence guard</em>。重复调用优先给模型看见，而不是按业务词硬拦。<br/>分页是例外：跨页计数是传输问题，不是推理问题（模型在上下文里逐页累加，准确率极低）。所以客户端硬拦直接翻页（Anthropic programmatic tool calling：<em>allowed_callers</em> 只是引导），由 <code>count_list_by_time</code> 在服务端翻完。这道闸门只看页码字段，不写业务正则。</div>
+
+<h3>分页列表：计数在服务端做完</h3>
+<p>接口只返回分页明细、又要按小时判断有没有超过阈值时，<strong>不能让模型当翻页器</strong>。每一页明细进上下文再累加，跨页状态会丢（公开测量里这种 inline 计数准确率约 0–7%）。把肥 JSON 卸到工作区文件也解决不了「谁来翻下一页」。子代理独立上下文、轮次只有 10，适合探结构，不适合翻一百多页。</p>
+<p>对齐 Anthropic programmatic tool calling：一串工具往返收成一次调用，循环留在 harness 或代码里，模型只看聚合结果。提示词里的 <em>allowed_callers</em> 只是引导，客户端仍要硬拦直接翻页。</p>
+<table>
+<thead><tr><th>要做的事</th><th>怎么做</th><th>模型看见什么</th></tr></thead>
+<tbody>
+<tr><td>确认字段名</td><td>每个列表工具本轮<strong>直接调用一次第一页</strong></td><td>压瘦后的短标量；还有下一页时，提示放在结果最前面</td></tr>
+<tr><td>按整点小时计数、和阈值比</td><td>一次 <code>count_list_by_time</code>（<code>list-count.ts</code>）</td><td>首行 <code>complete</code>，以及完整时的小时计数。不完整时不给各小时数字</td></tr>
+<tr><td>小时桶以外的汇总（国家、状态等）</td><td><code>run_tool_code</code>（<code>tool-code.ts</code>）：Node <code>callTool</code> / Python <code>call_tool</code></td><td>只有 <code>console.log</code> / <code>print</code> 打出来的聚合。零次成功的只读调用不能当成事实</td></tr>
+</tbody>
+</table>
+<p><code>run_script</code> 的进程里没有 MCP，不能拿来翻页。写工具、再套一层 <code>run_tool_code</code>、<code>task</code>、<code>manage_schedule</code> 从代码里调用会被拒绝。</p>
+<h4>翻页闸门 <code>list-page-gate.ts</code></h4>
+<ul>
+<li>只认页码形状，不认工具名，也不认业务词：<code>index</code> / <code>offset</code> / <code>skip</code> 的正整数、<code>page</code> 大于 1、非空的不透明游标。布尔 <code>skip</code>、<code>page: "home"</code>、当时间筛选用的 <code>after</code> 不算页码。</li>
+<li>离开第一页直接拒绝。每个列表工具本轮只放行一次第一页；<strong>换时间窗口或筛选再取一页也拒绝</strong>，避免用切片代替翻页。占位在 <code>await</code> 之前，同一批并发请求里只有第一页能通过。</li>
+<li>按 id 取详情不拦。第一页调用失败会放开占位，同一参数可以再试。响应还标明有下一页时，即使这次没带页码，也会占住这个工具。</li>
+<li><code>count_list_by_time</code> 和 <code>run_tool_code</code> 不走这道闸门，它们自己在服务端或子进程里翻。</li>
+</ul>
+<h4>服务端怎么翻 <code>countPagedList</code></h4>
+<ul>
+<li>列表数组认 <code>data</code> / <code>items</code> / <code>results</code> / <code>records</code> / <code>rows</code> 等，也可以用 <code>rowsField</code> 指定。元素不是对象则整页失败，不当成空的完整结果。</li>
+<li>结束条件认 <code>more_data_available</code> / <code>has_more</code> / <code>hasMore</code>，或响应里的不透明 <code>next_cursor</code>。链接和路径形式的 <code>next</code> 不写进请求的 <code>cursor</code>。</li>
+<li>下一页沿用 payload 里已经在用的 <code>index</code> / <code>offset</code> / <code>page</code> / 游标，写在 <code>query_params</code>、<code>pagination</code>、<code>paging</code> 或 <code>params</code>，否则写在顶层。</li>
+<li>时间字段支持 Unix 毫秒、秒和 ISO，也支持点路径（如 <code>visitor.created_at</code>）。小时桶用 IANA 时区；个别 ICU 把午夜印成「24 点」时进位到下一天 00:00。<code>above</code> 是严格大于。</li>
+<li>缺 id、缺可用时间、翻到页数上限、游标不前进、空页却仍标记有下一页：<code>complete: false</code>。这时不回 <code>unique</code>、区间和各小时计数，避免被引用成「没有超过阈值」。接口失败且一行都没入账才是 <code>ok: false</code>；有行但不完整仍是 <code>ok: true</code>，否则接地护栏会把如实说明换成零证据兜底。</li>
+<li>页大小被接口拒绝时只减半重试一次。<code>rate limit</code> 不走这条。默认最多 250 页，硬顶 400。通用单页 100 条（环境变量可调，上限 500）。</li>
+<li>已知接口适配只留两处，不写进别的工具：Zoho <code>getConversationsList</code> 单页最多 99；没写排序时补 <code>sort_by=in_time</code>、<code>sort_order=asc</code>（offset 翻页没有稳定顺序会漏行或重复）。</li>
+<li>完整且有小时桶时，工作区落 <code>results/hour-counts-*.tsv</code>，文件头是 <code># complete: true</code>。</li>
+</ul>
+<p>两条都登记为 <strong>read / external</strong>：子代理可以调用；只读失败后仍允许换模型重跑。系统提示第 13 条、子代理提示、技能 <code>business-data-query</code> 第 4 步、预警指引 <code>SCHEDULE_ALERT_GUIDE</code> 说的是同一件事，因为这几处读者互相看不见。</p>
+<p class="muted">回归：<code>tests/list-count.test.ts</code>、<code>tests/list-page-gate.test.ts</code>、<code>tests/zoho-list-compact.test.ts</code>。方案口径同时写在 <code>docs/scheduled-spike-detection-plan.md</code> 与 <code>docs/scheduled-alert-best-practices-comparison.md</code>。</p>
 
 <h3>子代理 <code>task</code> 工具</h3>
 <p>父代理可 <code>task</code> 派生子代理：<strong>独立上下文 + 最小工具集</strong>，结果裁剪到 <code>SUBAGENT_RESULT_CHARS</code> 后回灌父上下文；并行上限 <code>SUBAGENT_MAX_PARALLEL</code>，可单独取消（<code>POST /chat/subagent/:conversationId/:subagentId/cancel</code>）。用于「派一个子代理去探 schema，只把结论带回来」这类上下文隔离场景。</p>
+<p>子代理<strong>不是翻页器</strong>：轮次上限 10，而且 <code>run_script</code> / <code>run_command</code> 对它是拒绝的。跨页计数直接调 <code>count_list_by_time</code>；其它汇总用 <code>run_tool_code</code>。翻页闸门在子代理自己的循环里同样生效。</p>
 </section>
 
 <!-- ===================== 8 ===================== -->
 <section id="s10">
-<h2 class="sec">8 · 内置工具清单 <span class="kv">src/builtins.ts · 26 个 spec（deferred 模式另加 search_tools = 27，与 BUILTIN_RISK 登记 27 条双份一致）</span></h2>
+<h2 class="sec">8 · 内置工具清单 <span class="kv">src/builtins.ts · 含 count_list_by_time / run_tool_code</span></h2>
 <p>内置工具<strong>始终注入</strong>（本机能力，不依赖用户勾选连接器）；勾选只决定外部 MCP。</p>
 <table>
 <thead><tr><th>工具</th><th>用途</th><th>实现落点</th></tr></thead>
 <tbody>
-<tr><td><code>fs_write / fs_read / fs_edit / fs_glob / fs_grep / fs_ls / fs_delete</code></td><td>会话级虚拟文件系统：写 / 读 / 精确替换 / 全局匹配 / 正则检索 / 列目录 / 删除（删除走确认）</td><td><code>fs-store.ts</code> · spec <code>builtins.ts:396-506</code></td></tr>
-<tr><td><code>write_todos</code></td><td>任务计划（产出 todos 事件）</td><td><code>builtins.ts:510</code></td></tr>
-<tr><td><code>task</code></td><td>派生子代理（独立上下文 + 最小工具集）</td><td><code>builtins.ts:533</code> · <code>chat.ts</code> 子代理运行时</td></tr>
-<tr><td><code>run_command</code> / <code>run_script</code></td><td>命令执行 / 脚本执行（统一解码与输出截断护栏）</td><td><code>builtins.ts:554 / 572</code></td></tr>
-<tr><td><code>image_gen</code></td><td>生成图片（PNG 落工作区，需 <code>IMAGE_GEN_*</code> 配置）</td><td><code>builtins.ts:588</code></td></tr>
-<tr><td><code>search_dingtalk_doc</code></td><td>外部文档源检索（只读；未配凭证时返回配置指引而非报错）</td><td><code>builtins.ts:602</code></td></tr>
-<tr><td><code>request_clarification</code></td><td><strong>结构化澄清</strong>（带选项，不是散文追问）</td><td><code>builtins.ts:614</code> / 执行分派 <code>1595</code></td></tr>
-<tr><td><code>save_memory / recall_memory</code></td><td>长期记忆读写（跨会话）</td><td><code>builtins.ts:643 / 654</code> · <code>memory.ts</code>（<code>.data/memory.json</code>）</td></tr>
-<tr><td><code>read_skill</code></td><td>按需加载技能正文</td><td><code>builtins.ts:658</code> · <code>skills.ts</code></td></tr>
-<tr><td><code>render_chart</code></td><td>出图（chart 事件；数据必须来自工具，禁止编造）</td><td><code>builtins.ts:667</code> · 前端 <code>ChartCard.vue</code> 绘制</td></tr>
-<tr><td><code>export_data</code></td><td>导出 xlsx / csv / json / md / docx / pdf / html / txt（报告式可只带叙述 + 图表）</td><td><code>builtins.ts:706</code> / 执行分派 <code>1664</code> + <code>fs-store.ts</code></td></tr>
-<tr><td><code>search_knowledge / knowledge_sources</code></td><td>本地知识库检索 / 列来源</td><td><code>builtins.ts:762 / 775</code> · <code>src/rag/store.ts</code></td></tr>
-<tr><td><code>web_search / fetch_url</code></td><td>联网搜索与网页抓取</td><td><code>builtins.ts:810 / 824</code> · <code>web-search.ts</code></td></tr>
-<tr><td><code>list_schedules / manage_schedule</code></td><td>定时任务查看与增删改（HTTP 端点共用同一实现）</td><td><code>builtins.ts:413 / 420</code> · <code>schedules.ts</code></td></tr>
-<tr><td><code>record_watched_movies</code></td><td>观影画像记录（角色专用）</td><td><code>builtins.ts:779</code> · <code>movie/profile.ts</code></td></tr>
+<tr><td><code>fs_write / fs_read / fs_edit / fs_glob / fs_grep / fs_ls / fs_delete</code></td><td>会话级虚拟文件系统：写 / 读 / 精确替换 / 全局匹配 / 正则检索 / 列目录 / 删除（删除走确认）</td><td><code>fs-store.ts</code> · spec <code>builtins.ts:429-519</code></td></tr>
+<tr><td><code>list_schedules / manage_schedule</code></td><td>定时任务查看与增删改（HTTP 端点共用同一实现）</td><td><code>builtins.ts:446 / 453</code> · <code>schedules.ts</code></td></tr>
+<tr><td><code>write_todos</code></td><td>任务计划（产出 todos 事件）</td><td><code>builtins.ts:546</code></td></tr>
+<tr><td><code>task</code></td><td>派生子代理（独立上下文 + 最小工具集）</td><td><code>builtins.ts:569</code> · <code>chat.ts</code> 子代理运行时</td></tr>
+<tr><td><code>count_list_by_time</code></td><td>分页列表在服务端翻完，按整点小时计数，只把计数交回对话。<code>complete: false</code> 不能当成是否超阈值</td><td><code>list-count.ts</code> · spec <code>builtins.ts:591</code></td></tr>
+<tr><td><code>run_tool_code</code></td><td>在代码里调用只读工具，明细留在子进程，只回打印出的聚合结果。小时桶以外的汇总用它</td><td><code>tool-code.ts</code> · spec <code>builtins.ts:620</code></td></tr>
+<tr><td><code>run_command</code> / <code>run_script</code></td><td>命令执行 / 脚本执行（统一解码与输出截断护栏）。脚本进程调不到 MCP</td><td><code>builtins.ts:636 / 654</code></td></tr>
+<tr><td><code>image_gen</code></td><td>生成图片（PNG 落工作区，需 <code>IMAGE_GEN_*</code> 配置）</td><td><code>builtins.ts:671</code></td></tr>
+<tr><td><code>search_dingtalk_doc</code></td><td>外部文档源检索（只读；未配凭证时返回配置指引而非报错）</td><td><code>builtins.ts:685</code></td></tr>
+<tr><td><code>request_clarification</code></td><td><strong>结构化澄清</strong>（带选项，不是散文追问）</td><td>spec <code>builtins.ts:697</code> · 执行 <code>1703</code></td></tr>
+<tr><td><code>save_memory / recall_memory</code></td><td>长期记忆读写（跨会话）</td><td><code>builtins.ts:726 / 736</code> · <code>memory.ts</code>（<code>.data/memory.json</code>）</td></tr>
+<tr><td><code>read_skill</code></td><td>按需加载技能正文</td><td><code>builtins.ts:741</code> · <code>skills.ts</code></td></tr>
+<tr><td><code>render_chart</code></td><td>出图（chart 事件；数据必须来自工具，禁止编造）</td><td><code>builtins.ts:750</code> · 前端 <code>ChartCard.vue</code> 绘制</td></tr>
+<tr><td><code>export_data</code></td><td>导出 xlsx / csv / json / md / docx / pdf / html / txt（报告式可只带叙述 + 图表）</td><td>spec <code>builtins.ts:789</code> · 执行 <code>1772</code> · <code>fs-store.ts</code></td></tr>
+<tr><td><code>search_knowledge / knowledge_sources</code></td><td>本地知识库检索 / 列来源</td><td><code>builtins.ts:845 / 857</code> · <code>src/rag/store.ts</code></td></tr>
+<tr><td><code>record_watched_movies</code></td><td>观影画像记录（角色专用）</td><td><code>builtins.ts:862</code> · <code>movie/profile.ts</code></td></tr>
+<tr><td><code>web_search / fetch_url</code></td><td>联网搜索与网页抓取</td><td><code>builtins.ts:893 / 907</code> · <code>web-search.ts</code></td></tr>
 </tbody>
 </table>
-<div class="note"><strong>知识点</strong>：每个内置工具必须在 <code>BUILTIN_RISK</code> 登记风险级别，<code>index.ts</code> 启动时 <code>assertBuiltinRiskCoverage()</code> 校验覆盖，漏登记<strong>拒绝启动</strong>——把「忘了标风险」变成不可绕过的错误，而不是线上惊喜。<br/><strong>三个数字别互相改</strong>：风险登记 <strong>27 条</strong>（26 个 spec 工具 + <code>search_tools</code>）；<code>builtinToolSpecs()</code> 常态产出 <strong>26 个</strong>（deferred 模式下才追加 <code>search_tools</code>）；<strong>执行分发 25 个</strong>走 <code>execBuiltin</code> 的 switch，<code>task</code> 与 <code>search_tools</code> 在 <code>chat.ts</code> 循环内处理。</div>
+<div class="note"><strong>知识点</strong>：每个内置工具必须在 <code>BUILTIN_RISK</code> 登记风险级别，<code>index.ts</code> 启动时 <code>assertBuiltinRiskCoverage()</code> 校验覆盖，漏登记<strong>拒绝启动</strong>。<code>count_list_by_time</code> 与 <code>run_tool_code</code> 都是 read / external：子代理可以调用，只读失败后仍允许换模型重跑。<code>task</code> 与 <code>search_tools</code> 在 <code>chat.ts</code> 循环内处理，不进 <code>execBuiltin</code>。</div>
 </section>
 
 <!-- ===================== 9 ===================== -->
@@ -744,7 +798,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <div class="good"><strong>知识点</strong>：为什么不接「通用代码执行让模型自己写脚本导出」？因为<strong>格式正确性由服务端保证</strong>是最短路径：模型给行列数据，格式、编码、中文字体由服务端兜住，弱模型也不会产出坏文件。<br/>PDF 必内嵌 CJK 字体，否则中文渲染成空白——字体缺失时<strong>如实报错并引导改用 docx/html</strong>，而不是产出「看起来正常但中文全白」的坏产物。这就是「诚实失败优于坏交付」。</div>
 <div class="note">多表（sheets）只有 xlsx / docx / pdf 支持，其余格式散成多文件语义更差。导出后前端收到 <code>artifact</code> 事件渲染下载卡片；实体在服务端，<strong>刷新不丢</strong>（只存 spec，按 path 重绘）。</div>
 
-<h3>HTML 报告的「烘焙」<span class="kv">src/report.ts (497 行)</span></h3>
+<h3>HTML 报告的「烘焙」<span class="kv">src/report.ts（475 行，2026-10-02）</span></h3>
 <p>导出 <code>html</code> 时不是让模型手写页面，而是服务端合成：<code>builtins.ts:14</code> 引入 <code>buildHtmlReport / chartSvgs / chartFallbackTables / REPORT_CSS</code>。</p>
 <ul>
 <li><strong>图表烘焙成内联 SVG</strong>：<code>isSvgChart()</code> 判断类型能否出图（line / area / column / bar / pie / scatter / histogram），不能的由 <code>chartDataMatrix()</code> 回落成表格——图出不来也不会留空白块</li>
@@ -787,11 +841,15 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <p>收尾调用<strong>复用同一系统提示的稳定前缀</strong>（<code>WRAP_UP_HINT</code>），不额外污染 prompt cache。<br/>机制见 <strong>§7 ⑥</strong>，实践对照见 <strong>§23「预算耗尽必有结论」</strong>——此处只记这一个与上下文工程相关的增量。</p>
 </div>
 <div class="card">
+<h4>分页明细不进上下文</h4>
+<p>肥列表先压成短标量（嵌套字段保留点路径，如 <code>visitor.country_code</code>）。跨页计数不把每一页回灌给模型，只回 <code>count_list_by_time</code> 的计数，或 <code>run_tool_code</code> 打印出的聚合。还有下一页时，提示写在结果<strong>头部</strong>，避免被 12KB 截断切掉。<br/>机制见 <strong>§7「分页列表」</strong>。卸载到文件解决不了「谁来翻页」。</p>
+</div>
+<div class="card">
 <h4>重复行为的两层分工</h4>
 <p>跨轮同签名<strong>只回灌</strong> <code>repeatCallHint()</code>，不阻断执行；真正的硬护栏是同轮去重与跨轮 Doom Loop 熔断。<br/>机制见 <strong>§7 ⑤</strong>，对照见 <strong>§23「重复行为：反馈 &gt; 硬拦」</strong>。<br/><span class="tag warn">为什么</span>上下文工程的取向是<strong>让模型看见自己的行为</strong>，而不是替它做决定。</p>
 </div>
 </div>
-<div class="bad"><strong>历史坑</strong>：曾经在护栏里塞过「问候句式 / 功能词 / 中文参数键」的正则来识别闲聊与伪调用，结果把模型的自由发挥空间压死。现在的纪律是：<strong>服务端只做协议形态判断（工具调用写成文本），语义判定（业务 vs 闲聊 vs 意图）100% 交模型</strong>。</div>
+<div class="bad"><strong>历史坑</strong>：曾经在护栏里塞过「问候句式 / 功能词 / 中文参数键」的正则来识别闲聊与伪调用，结果把模型的自由发挥空间压死。现在的纪律是：<strong>服务端只做协议形态判断（工具调用写成文本），语义判定（业务 vs 闲聊 vs 意图）100% 交模型</strong>。分页是另一件事：闸门只看页码字段有没有离开第一页，不判断「这次查询像不像翻页」。</div>
 </section>
 
 <!-- ===================== 13 ===================== -->
@@ -809,7 +867,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <div class="note"><strong>为什么要 per-role 强制 eager？</strong>弱模型在 deferred 模式下不会主动 <code>search_tools</code>，于是凭训练记忆作答 → 编造「数据来源：TMDb」这种看似可信的假数据。movie 角色工具数少（21）且强依赖工具，所以单独开 eager + 首轮强制工具 + 接地护栏。这个改动<strong>不影响通用角色</strong>，因为走的是 role 级字段。</div>
 
 <h3>技能 <code>skills/</code> · <code>skills.ts</code></h3>
-<p>7 个技能目录：<code>business-data-query</code>（业务取数）、<code>chart-visualization</code>、<code>metric-caliber-check</code>、<code>movie</code>、<code>pdf</code>、<code>schema-probe</code>、<code>web-research</code>。</p>
+<p>7 个技能目录：<code>business-data-query</code>（业务取数；第 4 步要求分页小时计数走 <code>count_list_by_time</code>，不要逐页翻或换筛选再取）、<code>chart-visualization</code>、<code>metric-caliber-check</code>、<code>movie</code>、<code>pdf</code>、<code>schema-probe</code>、<code>web-research</code>。</p>
 <ul>
 <li>每个技能一个 <code>SKILL.md</code>，frontmatter 含 <code>name / description / default</code></li>
 <li><code>default: true</code> 的技能<strong>不在面板列出</strong>（隐藏展示），但索引渲染、<code>read_skill</code> 加载路径、校验白名单<strong>保留全量</strong>——「不显示」≠「不存在」</li>
@@ -822,7 +880,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 
 <!-- ===================== 14 ===================== -->
 <section id="s16">
-<h2 class="sec">14 · 异步任务与断线续传 <span class="kv">src/chat-tasks.ts (469 行)</span></h2>
+<h2 class="sec">14 · 异步任务与断线续传 <span class="kv">src/chat-tasks.ts（413 行，2026-10-02）</span></h2>
 <table>
 <thead><tr><th>机制</th><th>实现</th></tr></thead>
 <tbody>
@@ -844,7 +902,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
 <div class="flow">
   <div class="step"><div class="t">① 创建</div><div class="d"><code>POST /chat/schedules</code>（与 <code>manage_schedule</code> 共用 <code>createScheduleTask</code>）：cron / onceAt + 指令 + 角色 + MCP；可选 <code>purpose</code>（report/alert）、<code>notifyPolicy</code>（always/on_alert）、<code>runMode</code></div><div class="f">app.ts / schedule-service.ts / schedules.ts</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">② 用途分流</div><div class="d"><strong>周期报告</strong>：默认每期新会话、每期都推、可出图；轮次预算 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（默认 28）。<strong>数据预警</strong>：默认同一会话、仅异常推、运行时追加 <code>SCHEDULE_ALERT_GUIDE</code>、硬摘 <code>render_chart</code>/<code>export_data</code>、轮次默认 <strong>12</strong>（<code>MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS</code>）</div><div class="f">schedule-alert.ts / app.ts deliverScheduleResult</div></div>
+  <div class="step"><div class="t">② 用途分流</div><div class="d"><strong>周期报告</strong>：默认每期新会话、每期都推、可出图；轮次预算 <code>SCHEDULE_MAX_TOOL_ROUNDS</code>（默认 28）。<strong>数据预警</strong>：默认同一会话、仅异常推、运行时追加 <code>SCHEDULE_ALERT_GUIDE</code>、硬摘 <code>render_chart</code>/<code>export_data</code>、轮次默认 <strong>12</strong>（<code>MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS</code>）。列表没有总数时用 <code>count_list_by_time</code>；<code>complete: false</code> 按 <code>[NO_DATA]</code>，不用半截页估算</div><div class="f">schedule-alert.ts / app.ts deliverScheduleResult / list-count.ts</div></div>
   <div class="arrow">▼</div>
   <div class="step"><div class="t">③ 先测后跑（预警主路径）</div><div class="d">对齐 ChatGPT Automations：先在普通对话试跑至结论首行出现 <code>[NORMAL]</code>/<code>[SPIKE]</code>/<code>[NO_DATA]</code>，再点气泡「设为数据预警」（或表单「从对话带入」）——指令与当前 MCP 启用集写入表单，不必空表单猜工具名</div><div class="f">ChatPage.vue · docs/scheduled-spike-detection-plan.md</div></div>
   <div class="arrow">▼</div>
@@ -989,21 +1047,23 @@ API: ingest / listSources(namespace) / removeSource / clearAll / stats / search(
 /movie      MoviePage       观影助手：面向消费者的独立形态（<b>无侧栏/无工具菜单</b>，保留轻量模型选择器）
 /support    ChatPage(props) 客服助手：<b>复用通用聊天引擎</b>，props 注入 agentId 做会话分槽
                             专属人设在服务端 roles.ts，前端只透传
+/trace      TracePage       运行记录查看
 /:pathMatch(.*)*  → 重定向 /
 </pre>
 <h4>文件地图</h4>
 <pre>
 src/
 ├─ pages/
-│  ├─ ChatPage.vue      <b>≈380KB（约 10560 行）</b>：整个聊天界面（流消费 + 渲染 + 交互）
+│  ├─ ChatPage.vue      <b>458KB（11853 行）</b>：整个聊天界面（流消费 + 渲染 + 交互）
 │  ├─ MoviePage.vue     59KB：观影助手页（独立的人设 UI）
-│  └─ PortalPage.vue    9KB：门户入口
+│  ├─ PortalPage.vue    10KB：门户入口
+│  └─ TracePage.vue     8KB：运行记录（<code>/trace</code>）
 ├─ components/
 │  ├─ ChartCard.vue     29KB：图表渲染（含 G2 系图表）
 │  ├─ ModelSelect.vue   18KB：模型选择
 │  ├─ UiSelect.vue / UiLocaleSelect.vue / ThemeToggle.vue / ToolsSearch.vue
 │  └─ PromptBox.vue / BackToTop.vue
-├─ api.ts               30KB：后端接口封装
+├─ api.ts               34KB：后端接口封装
 ├─ chat-richtext.ts     10KB：Markdown → 富文本渲染
 ├─ md-tables.ts         3KB：表格识别与渲染
 ├─ composables/             useSelectPanel.ts（下拉定位 / 键盘可达）
@@ -1203,8 +1263,9 @@ src/
       <dt>业界常见做法</dt><dd>把「完全相同的调用」视为无信息量行为并合并/拒绝；对跨轮重复签到-like 行为设阈值熔断（「doom loop」一词即来自此）。</dd>
       <dt>本项目做法</dt><dd>签名只用 <code>name|argsJson</code>：同轮相同只执行第一个；跨轮累积到 <code>DOOM_LOOP_MAX_ROUNDS=3</code> 强制收束。</dd>
       <dt>判定</dt><dd>✅ 与最佳实践一致。</dd>
-      <dt>为什么重要</dt><dd>签名<strong>不含语义</strong>，所以「page 1→2→3 正确递增」不会被误伤——这是纯协议层护栏才做得到的。</dd>
-      <dt>何时改回去</dt><dd>无需改。护栏里一旦加入「看起来像分页」的判断，就开始误伤了。</dd>
+      <dt>为什么重要</dt><dd>签名<strong>不含语义</strong>，所以 page 1 和 page 2 不会被去重或熔断当成同一次调用。</dd>
+      <dt>和翻页闸门的分工</dt><dd>递增翻页不由去重处理。<code>list-page-gate.ts</code> 另拦：每个列表工具一轮只放行第一页，换筛选再取也拒绝。计数用 <code>count_list_by_time</code>。不要把页码判断塞进去重签名。</dd>
+      <dt>何时改回去</dt><dd>去重保持纯签名。若翻页闸门开始拦截按 id 取详情，改闸门的页码判定，而不是把「看起来像分页」写回去重里。</dd>
     </dl>
   </div>
 </div>
@@ -1215,7 +1276,7 @@ src/
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界常见做法</dt><dd>检索增强场景要求答案可溯源；无证据应降级为「不知道」，而不是生成合理数字。Agent 领域把这条叫 anti-hallucination guard。</dd>
-      <dt>本项目做法</dt><dd><code>grounding.ts</code>：本轮零工具数据却产出结论 → 作废文本 + 回灌纠正提示（给模型两条路径：去取数 / 本就不需要数据则如实回答，<strong>由模型判定</strong>）；用尽仍无数据则走受约束兜底，禁止事实性断言。</dd>
+      <dt>本项目做法</dt><dd><code>grounding.ts</code>：本轮零工具数据却产出结论 → 作废文本 + 回灌纠正提示（给模型两条路径：去取数 / 本就不需要数据则如实回答，<strong>由模型判定</strong>）；用尽仍无数据则走受约束兜底，禁止事实性断言。<code>count_list_by_time</code> 与 <code>run_tool_code</code> 算外部证据；<code>ok: false</code> 不算。有行但不完整仍是 <code>ok: true</code>，避免如实说明「没数完」被换成零证据兜底。</dd>
       <dt>判定</dt><dd>✅ 与最佳实践一致，且比「硬性要求必须调工具」更灵活（允许模型判断本题本就不需要数据）。</dd>
       <dt>为什么重要</dt><dd>Agent 最贵的错误不是报错，而是「看起来很合理的假数据」。</dd>
       <dt>事后核验（加强）</dt><dd>补齐部分数据后仍可能残留超出证据的断言，因此收束后再走一层 <code>GROUNDING_VERIFY</code>（Chain-of-Verification 最小版）：把证据裁到 <code>GROUNDING_EVIDENCE_CHARS</code> 内交核验器，发现越界断言即作废；<code>GROUNDING_VERIFY_VOTES&gt;1</code> 时多票裁决，避免核验器自身误判把正确答案废掉。</dd>
@@ -1259,10 +1320,24 @@ src/
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界常见做法</dt><dd>Deep Agents 的 subagent：把「探查大量原始结构」的工作隔离出去，只把结论带回主上下文。</dd>
-      <dt>本项目做法</dt><dd><code>task</code> 工具派生子代理：独立上下文、最小工具集、结果裁剪到 4000 字符、并行上限 3、可单独取消。</dd>
-      <dt>判定</dt><dd>✅ 与最佳实践一致。</dd>
-      <dt>为什么重要</dt><dd>避免把一次性探索的原始结构永久占用主上下文。</dd>
-      <dt>何时改回去</dt><dd>无需改。</dd>
+      <dt>本项目做法</dt><dd><code>task</code> 工具派生子代理：独立上下文、最小工具集、结果裁剪到 4000 字符、并行上限 3、可单独取消。轮次上限 10，不拿来翻页；跨页计数用 <code>count_list_by_time</code>。</dd>
+      <dt>判定</dt><dd>✅ 与最佳实践一致。子代理是上下文隔离，不是分页传输。</dd>
+      <dt>为什么重要</dt><dd>避免把一次性探索的原始结构永久占用主上下文。用子代理逐页拉列表，轮次不够，而且会把明细又灌回主对话。</dd>
+      <dt>何时改回去</dt><dd>无需改。不要靠加大 <code>SUBAGENT_MAX_ROUNDS</code> 来翻完一个长列表。</dd>
+    </dl>
+  </div>
+</div>
+
+<div class="kp-card" tabindex="0" role="button">
+  <div class="kp-h"><b>分页是传输，不是推理</b><span class="tag ok">✅</span></div>
+  <p class="kp-1">服务端翻完页，模型只拿计数</p>
+  <div class="kp-detail" hidden>
+    <dl>
+      <dt>业界常见做法</dt><dd>大结果卸载解决不了跨页累加。Anthropic programmatic tool calling 把一串工具往返收成一次调用，循环留在代码里；并写明 <em>allowed_callers</em> 只是引导，客户端仍要拦住直接调用。Truto 一类做法是整库统计走 spool，不让模型在「下一页」上循环。</dd>
+      <dt>本项目做法</dt><dd>确认字段：每个列表工具一轮只直接取第一页。<code>count_list_by_time</code> 按小时翻完，<code>complete: false</code> 不回各小时数字。<code>run_tool_code</code> 做其它汇总，明细不出子进程。<code>list-page-gate.ts</code> 硬拦第二页和换筛选再取。只认页码字段。</dd>
+      <dt>判定</dt><dd>✅ 与上述做法一致。Zoho 会话列表另有两处接口限制（单页 99、缺省 <code>in_time</code> 升序），不写进其它工具。</dd>
+      <dt>为什么重要</dt><dd>模型在上下文里逐页累加，公开测量准确率约 0–7%。半截扫描若还带回峰值，会被说成「没有超过阈值」。</dd>
+      <dt>何时改回去</dt><dd>不要把页码判断并进去重或熔断。若闸门拦了按 id 取详情，收紧页码判定，而不是放行直接翻页。</dd>
     </dl>
   </div>
 </div>
@@ -1437,7 +1512,7 @@ src/
 
 <div class="kp-card" tabindex="0" role="button">
   <div class="kp-h"><b>前端单文件 ChatPage.vue</b><span class="tag warn">⚠️ 已知欠账</span></div>
-  <p class="kp-1">≈380KB / 约 10560 行：流解析、状态、渲染、交互都在一处</p>
+  <p class="kp-1">458KB / 11853 行：流解析、状态、渲染、交互都在一处</p>
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界最佳实践</dt><dd>按职责拆分：流解析 / 状态管理 / 渲染组件各自独立，便于测试与并行开发。</dd>
@@ -1455,7 +1530,7 @@ src/
   <div class="kp-detail" hidden>
     <dl>
       <dt>业界最佳实践</dt><dd>复杂编排用成熟框架（LangGraph / Vercel AI SDK）省轮子，状态和重试模型化。</dd>
-      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环，护栏由 <strong>39 个显式常量</strong>控制（集中在 <code>chat.ts:62-291</code>，§7 表按 17 组归类），行为可预测可观测。</dd>
+      <dt>本项目做法</dt><dd><code>chat.ts</code> 自建 while 循环。行为护栏是文件前部的显式常量（约 73–359 行，§7 表）；分页计数的常量在 <code>list-count.ts</code> 与 <code>tool-code.ts</code>。</dd>
       <dt>判定</dt><dd>⚠️ 有意偏离。</dd>
       <dt>偏离原因</dt><dd>护栏细节必须在自己手里：降级触发点、熔断阈值、结果治理都是本项目的核心资产，抽象到框架后调试与调参成本骤增；同时避免额外依赖。</dd>
       <dt>何时改回去</dt><dd>当编排复杂度真的需要「图」来表达（多分支长期运行工作流）时再评估；在此之前自研循环的确定性更值钱。</dd>
@@ -1595,7 +1670,7 @@ src/
 <table>
 <thead><tr><th>方向</th><th>现状缺口</th><th>建议</th></tr></thead>
 <tbody>
-<tr><td>前端分层</td><td>ChatPage.vue ≈380KB / 约 10560 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
+<tr><td>前端分层</td><td>ChatPage.vue 458KB / 11853 行</td><td>抽出 <code>useChatStream</code>（流解析/续传）、<code>useBubbles</code>（状态），UI 组件化</td></tr>
 <tr><td>评测体系</td><td>评测层（<code>eval:core</code> / CI workflow）已随 analytics 拆分从本仓库清理（2026-09-16）。<strong>2026-09-30 补了 <code>.github/workflows/ci.yml</code></strong>：跑类型检查 + 全量单测（带 mongo service）——它跑的是<strong>测试</strong>，不是评测门禁；护栏行为仍由 vitest 套件本地钉死（见 A3）</td><td>若恢复端到端回归，重建轻量零依赖 gate 并接进同一 workflow，把 read/write 场景接进定时回归</td></tr>
 <tr><td>权限与多租户</td><td>owner cookie 非认证</td><td>若要对外，补真实登录 + 服务端 session</td></tr>
 <tr><td>知识库</td><td>已支持 md5 增量入库 + 按 mtime/size 失效；<strong>2026-09-30 补上文档级权限过滤</strong>：<code>RagDoc.acl</code>（owners / roles，缺省 = 公开），检索与列来源在召回前过滤（不是召回后隐藏，避免不可见内容影响排序）</td><td>入库端按来源打 ACL 的策略（谁能给文档标权限）；数据量到阈值（chunk &gt; 5~10 万）再上 Qdrant</td></tr>
@@ -1632,10 +1707,11 @@ src/
 <tr><td><code>inspect-grounding.mjs</code></td><td>接地护栏<strong>观测 CLI</strong>（只读）：聚合 <code>runs-*.jsonl</code> 的 <code>ungroundedRate</code> / <code>retryRate</code> / <code>verifyRate</code>，判断护栏在没在退化</td></tr>
 <tr><td><code>_grounding-e2e-probe.mjs</code></td><td>接地护栏 e2e 探针（临时）：发一句无数据需求的问候，验证不被误判为「未接地」而拦截</td></tr>
 <tr><td><code>order-mock-mcp.mjs</code></td><td>自建<strong>示例数据源</strong> MCP（stdio，全内存 mock）：客服助手取数与工单创建闭环的演示源，接真实后端只改 <code>MCP_BUILTIN_SERVERS</code> 条目、工具契约不变</td></tr>
+<tr><td>未列入上表的 <code>_</code> 探针</td><td>同目录还有临时探针（<code>_grounding-debug.mjs</code>、<code>_grounding-probe-multi.mjs</code>、<code>_grounding-verify-live.mjs</code>、<code>_span-check.mjs</code>），不作为常驻脚本</td></tr>
 </tbody>
 </table>
 
-<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（43 个测试文件 / 251 个用例，<code>pnpm test</code> = vitest run，2026-09-30 全绿）</span></h3>
+<h3>A3 · 测试 <span class="kv">apps/agent-server/tests（54 个测试文件 / 304 个 <code>it</code>/<code>test</code>，2026-10-02 按源码计；全绿以 <code>pnpm test</code> 为准）</span></h3>
 <p>测试文件名几乎就是「护栏清单」——每一条都对应一个曾出过事或必须钉死的行为：</p>
 <table>
 <thead><tr><th>分组</th><th>用例</th><th>钉住什么</th></tr></thead>
@@ -1679,7 +1755,9 @@ src/
 <tr><td><code>rag-namespace-fallback</code></td><td>RAG 命名空间回落（隔离方向不破）</td></tr>
 <tr><td><code>rag-store-invalidate</code></td><td>索引按 mtime + size 失效，不返回已删源</td></tr>
 <tr><td><code>schedule-runs</code></td><td>每期会话（runMode）/ 运行记录 runs[] / 未读计数 / 保留上限；删除任务保留结果会话</td></tr>
-<tr><td><code>zoho-list-compact</code></td><td>过宽的列表结果先压紧再交给模型</td></tr>
+<tr><td><code>zoho-list-compact</code></td><td>肥列表压成短标量（嵌套字段保留点路径）；还有下一页时提示在结果头部。不限 Zoho 工具名</td></tr>
+<tr><td><code>list-count</code></td><td>服务端翻页计数：小时桶、游标与 page、空页、缺 id/时间、不完整报告不给峰值、页大小被拒减半重试一次、Zoho 页大小与排序适配</td></tr>
+<tr><td><code>list-page-gate</code></td><td>每个列表工具一轮只放行第一页；换筛选、改字段顺序、非页码的 <code>skip</code>/<code>page</code> 名字；代码里只回聚合、没调用工具不能当成事实</td></tr>
 <tr><td><code>tool-choice-learning</code></td><td>端点拒绝强制工具通道后记住，自愈无效则撤回</td></tr>
 </tbody>
 </table>
@@ -1710,7 +1788,7 @@ src/
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
 <tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
 <tr><td>工具检索策略</td><td>按需检索，并保留少量相关工具的 schema</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>：超窗口 10% 后预载最多 5 个，直接点名则补上说明再执行；movie 仍 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据。Zoho 281 个工具不全量注入</td><td>主用模型能稳定主动检索时取消 movie 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
-<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（43 文件 / 251 例）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
+<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（54 文件 / 304 例，2026-10-02）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>

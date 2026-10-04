@@ -39,6 +39,7 @@ const EXTERNAL_DATA_BUILTINS = new Set([
   "search_knowledge",
   "knowledge_sources",
   "count_list_by_time",
+  "run_tool_code",
 ]);
 
 /** 单个工具名是否属于外部数据源。 */

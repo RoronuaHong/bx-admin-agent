@@ -357,7 +357,9 @@ export async function fetchPage(rawUrl: string): Promise<FetchOutcome> {
       raw += decoder.decode(value, { stream: true });
       if (bytes >= MAX_PAGE_BYTES) {
         truncated = true;
-        await reader.cancel().catch(() => undefined);
+        await reader.cancel().catch((err) => {
+          console.debug(`[web-search] reader 取消收尾异常：${String((err as Error)?.message || err)}`);
+        });
         break;
       }
     }

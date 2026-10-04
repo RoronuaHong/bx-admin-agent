@@ -3,9 +3,10 @@
 // 真正执行复用对话任务的底座（startTask / consumeTask / 结果回投），不另起一套执行器。
 // 定时运行没有 HTTP 订阅者 → 收束后自动走「结果回投」落进对话消息快照，用户回来就能看到。
 import { Cron } from "croner";
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection } from "mongodb";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
+import { getMongoClient, MONGO_DB_NAME } from "./db.js";
 import {
   alertNextRunAt,
   type AlertMarker,
@@ -14,8 +15,6 @@ import {
   type SchedulePurpose,
 } from "./schedule-alert.js";
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
-const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
 const COLL = "chat_schedules";
 
 /** 投递触发条件：只列「要推的状态」，未列的一律不推（跳过永远不推）。 */
@@ -163,18 +162,13 @@ const SCHEDULE_TICK_MS = 30_000;
  */
 const SKIP_RETRY_GRACE_MS = Math.max(1, Number(process.env.SCHEDULE_SKIP_RETRY_MINUTES) || 10) * 60_000;
 
-// ---- Mongo 单例（独立小集合；失败降级内存，与 conversations 同策略）----
-let clientPromise: Promise<MongoClient> | null = null;
+// ---- Mongo 连接（单例见 ./db.ts；失败降级内存，与 conversations 同策略）----
 async function getColl(): Promise<Collection<ChatSchedule> | null> {
   try {
-    if (!clientPromise) {
-      clientPromise = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 3000 }).connect();
-    }
-    const client = await clientPromise;
-    const db: Db = client.db(MONGO_DB);
+    const client = await getMongoClient();
+    const db = client.db(MONGO_DB_NAME);
     return db.collection<ChatSchedule>(COLL);
   } catch {
-    clientPromise = null;
     return null;
   }
 }
@@ -193,7 +187,9 @@ async function getLockColl(): Promise<Collection<ScheduleLockDoc> | null> {
   const coll = await getColl();
   if (!coll) return null;
   const lock = coll.db.collection<ScheduleLockDoc>("schedule_locks");
-  await lock.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
+  await lock.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }).catch((e) => {
+    console.warn(`[schedules] 调度锁 TTL 索引创建失败，锁可能不自动释放导致死锁：${String((e as Error)?.message || e)}`);
+  });
   return lock;
 }
 async function tryAcquireScheduleLock(id: string, owner: string): Promise<boolean> {
@@ -215,7 +211,9 @@ async function tryAcquireScheduleLock(id: string, owner: string): Promise<boolea
 async function releaseScheduleLock(id: string, owner: string): Promise<void> {
   const lock = await getLockColl();
   if (!lock) return;
-  await lock.deleteOne({ _id: id, owner }).catch(() => {});
+  await lock.deleteOne({ _id: id, owner }).catch((e) => {
+    console.warn(`[schedules] 调度锁释放失败，需等 TTL 自动过期：${String((e as Error)?.message || e)}`);
+  });
 }
 const memory = new Map<string, ChatSchedule>();
 
@@ -567,7 +565,9 @@ export async function schedulerTick(
       outcome = "error";
       note = String((err as Error)?.message || err).slice(0, 200);
     } finally {
-      await releaseScheduleLock(schedule.id, lockOwner).catch(() => {});
+      await releaseScheduleLock(schedule.id, lockOwner).catch((e) => {
+        console.warn(`[schedules] 调度锁释放失败，下一轮调度要等 TTL 过期：${String((e as Error)?.message || e)}`);
+      });
     }
     // 写回前**重新读一次**：runner 内部可能已经写入了 runs / unreadRuns / conversationId
     // （「每期新会话」的实现就写在 runner 里）。沿用 runner 执行前的快照整体写回会把这些字段

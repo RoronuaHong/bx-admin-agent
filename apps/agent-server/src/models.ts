@@ -316,7 +316,7 @@ async function callAnthropic(
   const isStream = (response.headers.get("content-type") || "").includes("text/event-stream");
   if (!isStream) {
     // 网关不支持流式：按整包 JSON 解析（保持原有语义）。
-    const bodyResult = (await response.json().catch(() => null)) as {
+    const bodyResult = (await response.json().catch((e) => { console.warn(`[models] 模型非流式响应体非合法 JSON：${String((e as Error)?.message || e)}`); return null; })) as {
       content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
     } | null;
     if (!response.ok) {

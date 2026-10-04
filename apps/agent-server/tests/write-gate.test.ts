@@ -53,7 +53,7 @@ test("[E] 子代理可执行范围按作用域判定：工作区写放行，需�
     expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
   }
   // 只读照常放行。分页计数也是只读：子代理必须能直接跑，不能再被脚本闸门挡住。
-  for (const name of ["fs_read", "fs_ls", "count_list_by_time"]) {
+  for (const name of ["fs_read", "fs_ls", "count_list_by_time", "run_tool_code"]) {
     expect(subagentMayExecute(resolveToolRisk(name), false), name).toBe(true);
     expect(verdictNeedsConfirm(resolveToolRisk(name)), name).toBe(false);
   }

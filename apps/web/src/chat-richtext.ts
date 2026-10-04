@@ -176,9 +176,9 @@ function foldAgentBlocks(html: string, locale: UiLocale): string {
 const mdCache = new Map<string, string>();
 
 export function renderChatMarkdown(text: string, locale: UiLocale = "zh"): string {
-  const base = text.length > 240 ? `${text.length}:${text.slice(0, 120)}:${text.slice(-80)}` : text;
-  // 缓存键带上语言：同一段正文在不同语言下折叠块标题不同。
-  const key = `${locale}\u0000${base}`;
+  // 以全文为键：截断首尾会忽略中间内容，导致「长度相等 + 首尾相同但中间不同」两段文本命中同一键、返回陈旧渲染。
+  // 缓存上限 80 项，键长无所谓；带上语言：同一段正文在不同语言下折叠块标题不同。
+  const key = `${locale}\u0000${text}`;
   const hit = mdCache.get(key);
   if (hit) return hit;
   const raw = md.render(repairTables(text))

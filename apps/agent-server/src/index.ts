@@ -35,10 +35,15 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       .finally(() => process.exit(0));
   });
 }
-serve({ fetch: app.fetch, port: config.port }, () => {
+serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () => {
   const models = listModels();
   const summary = models.length ? models.map((m) => `${m.id}:${m.provider}/${m.name}`).join(", ") : "(none)";
-  console.log(`agent-server http://localhost:${config.port} models=[${summary}]`);
+  console.log(`agent-server http://${config.host}:${config.port} models=[${summary}]`);
+  if (config.host === "0.0.0.0" || config.host === "::") {
+    console.warn(
+      "[安全] 正在监听全部网卡：MCP 服务器管理与通知通道端点无鉴权，局域网内可任意改写 MCP 配置（含 stdio 命令）。确认需要再这样部署。",
+    );
+  }
   if (!defaultModel()) {
     console.warn("[警告] 未配置任何模型（MODEL_PROVIDERS），聊天将提示未配置。");
   }

@@ -6,10 +6,9 @@
 //
 // 历史沿革：原「个性化推荐管线」（离线预计算 + 缓存 + 5 个 HTTP 端点 + 前端推荐面板 + 豆瓣 MCP）已于 2026-09-18 整体移除，
 // 画像随之只保留「口味记录」用途——唯一写入口是内置工具 `record_watched_movies`（builtins.ts）。
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection } from "mongodb";
+import { getMongoClient, MONGO_DB_NAME } from "../db.js";
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
-const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
 const COLL = "movie_profiles";
 
 /** 观看历史条目（来源：对话中被识别的片）。 */
@@ -42,18 +41,13 @@ export interface MovieProfile {
 const MAX_HISTORY = 200;
 const MAX_FEEDBACK = 200;
 
-// ---- Mongo 单例（独立小集合；失败降级内存）----
-let clientPromise: Promise<MongoClient> | null = null;
+// ---- Mongo 连接（单例见 ../db.ts；失败降级内存）----
 async function getColl(): Promise<Collection<MovieProfile> | null> {
   try {
-    if (!clientPromise) {
-      clientPromise = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 3000 }).connect();
-    }
-    const client = await clientPromise;
-    const db: Db = client.db(MONGO_DB);
+    const client = await getMongoClient();
+    const db = client.db(MONGO_DB_NAME);
     return db.collection<MovieProfile>(COLL);
   } catch {
-    clientPromise = null;
     return null;
   }
 }

@@ -4,6 +4,7 @@
 // 勾选状态只决定外部数据面（MCP）——见 chat.ts 顶部的 toolMode 说明。schema token 计入预算公式。
 import { existsSync, mkdirSync } from "node:fs";
 import { exec as nodeExec } from "node:child_process";
+import { tmpdir } from "node:os";
 import type { ExecOptionsWithBufferEncoding } from "node:child_process";
 import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,9 +31,11 @@ import {
   formatCountReport,
   LIST_COUNT_DEFAULT_PAGES,
   mcpToolParts,
+  pageLimitForTool,
   prepareListArgs,
   type CountListReport,
 } from "./list-count.js";
+import { runToolCode } from "./tool-code.js";
 
 export const BUILTIN_SERVER = "builtin";
 
@@ -87,6 +90,12 @@ export const BUILTIN_RISK: Record<
     level: "read",
     scope: "external",
     reason: "分页拉取外部列表并在服务端按时间计数（只读，明细不进上下文）",
+  },
+  // 代码里调只读工具：循环在子进程，明细不回灌。登记为 read，子代理和换模型重跑都能用。
+  run_tool_code: {
+    level: "read",
+    scope: "external",
+    reason: "在代码里调用只读工具并只回传聚合输出（明细不进上下文）",
   },
   // 定时任务（§17）：拆成「只读列举」与「变更管理」两个工具，而不是一个带 action 的多面工具——
   // risk.ts 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别，
@@ -243,6 +252,11 @@ export function assertBuiltinRiskCoverage(): void {
   if (missing.length) {
     throw new Error(`内置工具缺少风险登记（BUILTIN_RISK）：${missing.join("、")}`);
   }
+}
+
+/** 对话循环注入的只读工具桥。run_tool_code 通过它调用 MCP / 内置只读工具，明细不回灌模型。 */
+export interface BuiltinHooks {
+  callTool: (name: string, args: Record<string, unknown>) => Promise<{ ok: boolean; text: string }>;
 }
 
 /** 单个内置工具的执行结果；`todos` 存在时由 chat 循环负责持久化并发 todos 事件。 */
@@ -557,7 +571,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "把一个独立子任务委派给子代理执行：子代理有自己独立的上下文和工具，执行完后只回传结论摘要。" +
         "适合：会产生大量中间数据的查询（主对话只拿结论）、可并行的多个独立子任务、多步骤小任务。" +
         "不适合一步就能完成的简单查询（直接调用工具更快）。" +
-        "分页列表的跨页计数不要委派，直接用 count_list_by_time。" +
+        "分页列表的跨页计数不要委派，直接用 count_list_by_time。小时桶以外的汇总用 run_tool_code，不要委派翻页。" +
         "注意：子代理看不到当前对话内容，description 必须自带全部背景。",
       {
         type: "object",
@@ -579,24 +593,44 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "把只返回分页明细的列表工具在服务端翻完，按整点小时计数，只把计数交回对话。" +
         "用户要跨页统计（某一小时有没有超过 N、按小时的新开始条数）时用本工具一次完成。" +
         "不要自己逐页调列表工具，也不要把翻页委派给子代理。" +
-        "payload 放列表工具本来的参数（时间窗口、筛选、排序），不要自己循环 index。" +
-        "分页字段写在 query_params.index / query_params.limit；没有 query_params 时写在顶层 index / limit。单页最多 99 条。" +
-        "返回首行 complete 为 false 表示没翻完，不能据此判断是否超过阈值。timeZone 用 IANA 名（默认 UTC）；above 是严格大于。",
+        "payload 放列表工具本来的参数（时间窗口、筛选、排序），不要自己循环翻页。" +
+        "服务端沿用 payload 里已有的 index、offset、page 或 cursor；没有时写入 index 与 limit。" +
+        "列表数组认 data、items、results、records、rows 等常见字段，也可以用 rowsField 指定。" +
+        "结束条件认 more_data_available、has_more 或 next_cursor。单页条数有上限，调用方不用自己改页码。" +
+        "返回首行 complete 为 false 表示没翻完，不能据此判断是否超过阈值。timeZone 用 IANA 名（默认 UTC）；above 是严格大于。" +
+        "小时桶以外的汇总不要自己翻页，用 run_tool_code。",
       {
         type: "object",
         properties: {
-          tool: jsonType("string", "MCP 工具全名，如 mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList"),
+          tool: jsonType("string", "MCP 工具全名"),
           payload: {
             type: "object",
-            description: "该列表工具的调用参数（含时间窗口）。服务端会写入 index/limit 并翻页，不要在这里循环。",
+            description: "该列表工具的调用参数（含时间窗口）。服务端会接着写分页字段并翻页，不要在这里循环。",
           },
-          timeField: jsonType("string", "每行上的开始时间字段，毫秒时间戳（默认 start_time；没有时再看 in_time）"),
-          idField: jsonType("string", "去重用的 id 字段（默认 id）"),
+          rowsField: jsonType("string", "列表数组的字段名。不传则自动识别 data、items、results、records、rows"),
+          timeField: jsonType("string", "每行上的时间字段，Unix 毫秒、秒或 ISO 时间（默认 start_time）。支持点路径，如 visitor.created_at"),
+          idField: jsonType("string", "去重用的 id 字段（默认 id）。支持点路径"),
           timeZone: jsonType("string", "小时桶的 IANA 时区（默认 UTC）"),
           above: jsonType("number", "只列出计数严格大于该值的小时；不传则只给峰值"),
           maxPages: jsonType("number", `最多翻多少页（默认 ${LIST_COUNT_DEFAULT_PAGES}）`),
         },
         required: ["tool", "payload"],
+      },
+    ),
+    spec(
+      "run_tool_code",
+      "在代码里调用只读工具，只把打印出来的聚合结果交回对话。中间页留在代码进程里，不进上下文。" +
+        "适合小时桶覆盖不了的汇总（按国家、按状态等）。按小时是否超过阈值优先用 count_list_by_time，不要在代码里自己翻页。" +
+        "Node 里直接 await callTool(工具全名, 参数对象)；Python 里用 call_tool(工具全名, 参数对象)。不要写 import。" +
+        "只能调用只读工具。run_script 调不到 MCP，不要用它翻页。请用 print 或 console.log 打出最终数字，不要打印明细。",
+      {
+        type: "object",
+        properties: {
+          language: jsonType("string", "node / js / javascript 或 python / py"),
+          code: jsonType("string", "脚本正文。Node 使用全局 callTool；Python 使用 call_tool。只打印聚合结果。"),
+          timeoutMs: jsonType("number", "超时毫秒数（默认 180000，上限 600000）"),
+        },
+        required: ["code"],
       },
     ),
     spec(
@@ -619,7 +653,8 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "run_script",
-      "在工作区沙箱内执行一段脚本（如 Python / Node / Shell），用于受控的代码执行、跑测试、处理数据。" +
+      "在工作区沙箱内执行一段脚本（如 Python / Node / Shell），用于受控的代码执行、跑测试、处理已经落盘的数据。" +
+        "脚本进程调不到 MCP 或其它工具。要在代码里调只读工具，用 run_tool_code。" +
         "shell 类语言直接交给系统 shell 执行（与 run_command 同护栏：超时 / 体积上限 / 工作区沙箱）；python/node 会先写入工作区再调用解释器。" +
         "只执行用户明确要求的脚本；不要在脚本里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
         "超时（默认 120s）会被判为失败；需要交互输入的脚本会立即失败。",
@@ -1376,6 +1411,7 @@ export async function execBuiltin(
   namespace = "generic",
   ownerKey?: string,
   signal?: AbortSignal,
+  hooks?: BuiltinHooks,
 ): Promise<BuiltinOutcome | null> {
   const args = safeJsonParse(argsJson);
   switch (name) {
@@ -1529,6 +1565,28 @@ export async function execBuiltin(
         text: files.map((file) => `${file.path}（${file.bytes} 字节）`).join("\n"),
       };
     }
+    case "run_tool_code": {
+      if (!hooks?.callTool) return { ok: false, text: "run_tool_code 只能在对话循环里执行" };
+      const code = str(args, "code");
+      const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || 180_000, 1_000), 600_000);
+      const cwd = conversationFsRoot(conversationId);
+      try {
+        mkdirSync(cwd, { recursive: true });
+      } catch (err) {
+        console.warn(`[builtins] 代码工作目录不可用，退回系统临时目录：${String((err as Error)?.message || err)}`);
+      }
+      // 工作目录不可用时退回临时目录，**不要退回 process.cwd()**——那是服务端目录，
+      // 相对路径读写（含 .env 这类凭据文件）会直接落到里面。
+      const safeCwd = existsSync(cwd) ? cwd : tmpdir();
+      return runToolCode({
+        language: str(args, "language"),
+        code,
+        cwd: safeCwd,
+        timeoutMs,
+        signal,
+        callTool: hooks.callTool,
+      });
+    }
     case "run_command": {
       const command = str(args, "command").trim();
       if (!command) return { ok: false, text: "run_command 需要 command" };
@@ -1538,10 +1596,10 @@ export async function execBuiltin(
       // 表现为「所有命令都失败」，与「环境无 shell」难以区分。先确保目录存在。
       try {
         mkdirSync(cwd, { recursive: true });
-      } catch {
-        // 忽略：下面用 existsSync 兜底判断。
+      } catch (err) {
+        console.warn(`[builtins] 工作区目录不可用，命令将在系统临时目录执行：${String((err as Error)?.message || err)}`);
       }
-      const safeCwd = existsSync(cwd) ? cwd : process.cwd();
+      const safeCwd = existsSync(cwd) ? cwd : tmpdir();
       const out = await runShell(command, { cwd: safeCwd, timeoutMs });
       return out;
     }
@@ -1555,10 +1613,10 @@ export async function execBuiltin(
       const cwd = conversationFsRoot(conversationId);
       try {
         mkdirSync(cwd, { recursive: true });
-      } catch {
-        /* 忽略：下面用 existsSync 兜底 */
+      } catch (err) {
+        console.warn(`[builtins] 工作区目录不可用，脚本将在系统临时目录执行：${String((err as Error)?.message || err)}`);
       }
-      const safeCwd = existsSync(cwd) ? cwd : process.cwd();
+      const safeCwd = existsSync(cwd) ? cwd : tmpdir();
       // shell 类语言直接交给系统 shell 执行（与 run_command 同底座，复用超时 / 体积护栏）。
       if (language === "shell" || language === "bash" || language === "sh") {
         return runShell(code, { cwd: safeCwd, timeoutMs });
@@ -1606,13 +1664,6 @@ export async function execBuiltin(
         if (item.b64_json) bytes = Buffer.from(item.b64_json, "base64");
         else if (item.url) bytes = Buffer.from(await (await fetch(item.url)).arrayBuffer());
         else return { ok: false, text: "image_gen 返回格式无法解析（既无 b64_json 也无 url）" };
-        const cwd = conversationFsRoot(conversationId);
-        try {
-          mkdirSync(cwd, { recursive: true });
-        } catch {
-          /* 忽略 */
-        }
-        const safeCwd = existsSync(cwd) ? cwd : process.cwd();
         const fileName = `image_${Date.now()}.png`;
         const written = fsWriteBinary(conversationId, fileName, bytes);
         if ("error" in written) return { ok: false, text: `图片写入失败：${written.error}` };
@@ -1900,7 +1951,9 @@ export async function execBuiltin(
     case "write_todos": {
       const result = normalizeTodos(args.todos);
       if ("error" in result) return { ok: false, text: `计划写入失败：${result.error}` };
-      await setConversationTodos(conversationId, result.todos).catch(() => undefined);
+      await setConversationTodos(conversationId, result.todos).catch((err) => {
+        console.warn(`[builtins] write_todos 落库失败（前端可能已回显但库未写入）：${String((err as Error)?.message || err)}`);
+      });
       const done = result.todos.filter((item) => item.status === "completed").length;
       return {
         ok: true,
@@ -1969,12 +2022,15 @@ export async function execBuiltin(
           )
         : (rawArgs as Record<string, unknown>);
       const base = prepareListArgs(toolName, withDefaults);
+      const rowsField = str(args, "rowsField").trim();
       const report = await countPagedList(
         {
           arguments: base,
           timeField: str(args, "timeField").trim() || "start_time",
           idField: str(args, "idField").trim() || "id",
           timeZone: str(args, "timeZone").trim() || "UTC",
+          ...(rowsField ? { rowsField } : {}),
+          pageLimit: pageLimitForTool(toolName),
           ...(above != null ? { above } : {}),
           maxPages: Number(args.maxPages) || LIST_COUNT_DEFAULT_PAGES,
         },

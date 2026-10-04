@@ -91,6 +91,12 @@ export function defaultModel(): ModelEntry | null {
 
 export const config = {
   port: Number(process.env.PORT || 8787),
+  /**
+   * 监听地址。默认只听本机：MCP 服务器管理与通知通道这两组全局配置端点目前无鉴权
+   * （会话中间件只挂在 /chat/*），暴露在局域网等于把「改 MCP 配置 → spawn 任意命令」对外开放。
+   * 确实需要从其它设备访问时显式设 HOST=0.0.0.0，并自行承担上述风险。
+   */
+  host: process.env.HOST || "127.0.0.1",
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
   sessionTtlMs: Number(process.env.SESSION_TTL_MS || 8 * 60 * 60 * 1000),
   /** 单次回复输出上限（token）。上下文预算会为它预留空间，故必须与实际请求值一致。 */

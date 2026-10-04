@@ -6,7 +6,9 @@ import {
   formatCountReport,
   hourBucketLabel,
   mcpToolParts,
+  LIST_COUNT_PAGE_LIMIT,
   pageArgs,
+  pageLimitForTool,
   prepareListArgs,
   type PageFetchResult,
 } from "../src/list-count.js";
@@ -50,6 +52,9 @@ test("翻页写在 query_params，不改调用方原始参数", () => {
   const top = pageArgs({ from_time: 1 }, 0, 99);
   expect(top.index).toBe(0);
   expect(top.limit).toBe(99);
+  const nested = pageArgs({ params: { offset: 0, q: "a" } }, 10, 20);
+  expect(nested.params).toMatchObject({ offset: 10, limit: 20, q: "a" });
+  expect(nested).not.toHaveProperty("index");
 });
 
 test("跨页去重后按小时计数，并列出超过阈值的小时", async () => {
@@ -140,12 +145,13 @@ test("缺少时间或 id、重复页、接口错误都标成不完整", async ()
   expect(repeatedLastPage.unique).toBe(1);
 
   const failed = await countPagedList(request(), async () => ({
-    text: JSON.stringify({ error: { message: "limit invalid" } }),
+    text: JSON.stringify({ error: { message: "upstream down" } }),
     isError: true,
   }));
   expect(failed.ok).toBe(false);
   expect(failed.complete).toBe(false);
-  expect(failed.reason).toContain("limit invalid");
+  expect(failed.reason).toContain("upstream down");
+  expect(failed.pages).toBe(1);
 });
 
 test("空窗口是完整的零，取消和非法时区不装成零结果", async () => {
@@ -162,6 +168,142 @@ test("空窗口是完整的零，取消和非法时区不装成零结果", async
   const tz = await countPagedList(request({ timeZone: "Not/AZone" }), async () => page([], false));
   expect(tz.ok).toBe(false);
   expect(tz.reason).toContain("无法识别的时区");
+});
+
+test("游标和 page 翻页不依赖 Zoho 的 data / index", async () => {
+  const cursors: unknown[] = [];
+  const byCursor = await countPagedList(
+    request({ arguments: { cursor: "", status: "open" }, timeField: "created_at" }),
+    async (args) => {
+      cursors.push(args.cursor);
+      expect(args).not.toHaveProperty("index");
+      if (!args.cursor) {
+        return {
+          text: JSON.stringify({
+            items: [{ id: "a", created_at: new Date(FROM).toISOString() }],
+            has_more: true,
+            next_cursor: "p2",
+          }),
+          isError: false,
+        };
+      }
+      return {
+        text: JSON.stringify({
+          items: [{ id: "b", created_at: new Date(FROM + 3_600_000).toISOString() }],
+          has_more: false,
+        }),
+        isError: false,
+      };
+    },
+  );
+  expect(cursors).toEqual(["", "p2"]);
+  expect(byCursor.complete).toBe(true);
+  expect(byCursor.unique).toBe(2);
+  expect(byCursor.hours.map((item) => item.hour)).toEqual(["2026-09-16 07:00", "2026-09-16 08:00"]);
+
+  const pages: unknown[] = [];
+  const byPage = await countPagedList(request({ arguments: { page: 1, per_page: 2, filter: "x" } }), async (args) => {
+    pages.push(args.page);
+    expect(args.per_page).toBe(LIST_COUNT_PAGE_LIMIT);
+    if (args.page === 1) {
+      return { text: JSON.stringify({ results: [row("a", FROM), row("b", FROM)], has_more: true }), isError: false };
+    }
+    return { text: JSON.stringify({ results: [row("c", FROM + 3_600_000)], has_more: false }), isError: false };
+  });
+  expect(pages).toEqual([1, 2]);
+  expect(byPage.complete).toBe(true);
+  expect(byPage.unique).toBe(3);
+
+  let seq = 0;
+  const stuck = await countPagedList(request({ arguments: { page_token: "" } }), async () => {
+    seq += 1;
+    return {
+      text: JSON.stringify({ records: [row(`n${seq}`, FROM)], has_more: true, next_page_token: "same" }),
+      isError: false,
+    };
+  });
+  expect(stuck.complete).toBe(false);
+  expect(stuck.reason).toContain("游标未变化");
+
+  const missing = await countPagedList(request({ arguments: { q: "x" } }), async () => ({
+    text: JSON.stringify({ total: 1 }),
+    isError: false,
+  }));
+  expect(missing.complete).toBe(false);
+  expect(missing.reason).toContain("没有列表数组");
+});
+
+test("空页不装成翻完，点路径能取到时间，页大小被拒时缩小重试", async () => {
+  const cursors: unknown[] = [];
+  const followed = await countPagedList(request({ arguments: { cursor: "" } }), async (args) => {
+    cursors.push(args.cursor);
+    if (!args.cursor) {
+      return { text: JSON.stringify({ data: [], has_more: true, next_cursor: "p2" }), isError: false };
+    }
+    return page([row("a", FROM)], false);
+  });
+  expect(cursors).toEqual(["", "p2"]);
+  expect(followed.complete).toBe(true);
+  expect(followed.unique).toBe(1);
+
+  const stalled = await countPagedList(request(), async () => ({
+    text: JSON.stringify({ data: [], has_more: true }),
+    isError: false,
+  }));
+  expect(stalled.complete).toBe(false);
+  expect(stalled.reason).toContain("空页");
+
+  const primitives = await countPagedList(request(), async () => ({
+    text: JSON.stringify({ data: ["a", "b"] }),
+    isError: false,
+  }));
+  expect(primitives.complete).toBe(false);
+  expect(primitives.reason).toContain("不是对象");
+
+  const nested = await countPagedList(
+    request({ timeField: "visitor.created_at", idField: "visitor.id" }),
+    async () => ({
+      text: JSON.stringify({
+        items: [{ visitor: { id: "v1", created_at: new Date(FROM).toISOString() } }],
+        has_more: false,
+      }),
+      isError: false,
+    }),
+  );
+  expect(nested.complete).toBe(true);
+  expect(nested.unique).toBe(1);
+  expect(nested.hours).toEqual([{ hour: "2026-09-16 07:00", count: 1 }]);
+
+  const sizes: number[] = [];
+  const recovered = await countPagedList(request({ pageLimit: 100 }), async (args) => {
+    const sent = (args.query_params as { limit: number }).limit;
+    sizes.push(sent);
+    if (sizes.length === 1) {
+      return { text: JSON.stringify({ error: { message: "limit invalid" } }), isError: true };
+    }
+    return page([row("a", FROM)], false);
+  });
+  expect(sizes[0]).toBe(100);
+  expect(sizes[1]).toBe(50);
+  expect(recovered.complete).toBe(true);
+  expect(recovered.unique).toBe(1);
+
+  const linked = await countPagedList(request({ arguments: { from_time: 1 } }), async (args) => {
+    expect(args).not.toHaveProperty("cursor");
+    return {
+      text: JSON.stringify({ data: [row("a", FROM)], next: "https://example.test/page2" }),
+      isError: false,
+    };
+  });
+  expect(linked.pages).toBe(1);
+  expect(linked.complete).toBe(true);
+  expect(linked.unique).toBe(1);
+});
+
+test("会话列表页大小封顶 99，其它列表用通用页大小", () => {
+  const generic = pageLimitForTool("mcp__crm__listDeals");
+  expect(generic).toBe(LIST_COUNT_PAGE_LIMIT);
+  expect(pageLimitForTool("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList")).toBe(Math.min(99, generic));
 });
 
 test("会话列表缺省按开始时间升序，已写排序则不覆盖", () => {

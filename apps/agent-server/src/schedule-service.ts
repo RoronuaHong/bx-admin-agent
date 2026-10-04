@@ -235,10 +235,14 @@ export async function createScheduleTask(input: CreateScheduleInput): Promise<Cr
       ...(sourceAgentId ? { agentId: sourceAgentId } : {}),
     });
     // 补标归属：任务 id 现在才有。有了它，删任务时能认出并清理本任务产出的会话。
-    await markConversationSchedule(conversation.id, schedule.id).catch(() => undefined);
+    await markConversationSchedule(conversation.id, schedule.id).catch((e) => {
+      console.warn(`[schedule-service] 任务归属标记失败，删除任务时可能无法清理其产出会话：${String((e as Error)?.message || e)}`);
+    });
     return { ok: true, schedule, conversation: { id: conversation.id } };
   } catch (err) {
-    await deleteConversation(conversation.id).catch(() => undefined);
+    await deleteConversation(conversation.id).catch((e) => {
+      console.warn(`[schedule-service] 任务创建失败，回收会话也失败，可能留下孤儿会话：${String((e as Error)?.message || e)}`);
+    });
     throw err;
   }
 }
@@ -271,7 +275,9 @@ export async function recordScheduleRun(
   });
   const dropped = prev.filter((r) => !runs.some((k) => k.conversationId === r.conversationId));
   for (const gone of dropped) {
-    await patchConversation(gone.conversationId, { archived: true }).catch(() => undefined);
+    await patchConversation(gone.conversationId, { archived: true }).catch((e) => {
+      console.warn(`[schedule-service] 任务清理时归档孤儿会话失败：${String((e as Error)?.message || e)}`);
+    });
   }
   await patchSchedule(base.id, base.ownerKey, {
     conversationId,

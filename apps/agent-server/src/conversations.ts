@@ -4,14 +4,13 @@
 //  - MongoClient 单例懒连接；失败降级进程内存 Map。
 //  - 单一集合 chat_conversations（本机单用户，无归属隔离）。
 
-import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
+import { type Collection, type Db, type ObjectId } from "mongodb";
 import type { ArtifactSpec, ChartSpec, TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 import { defaultMcpServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
+import { getMongoClient, MONGO_DB_NAME } from "./db.js";
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
-const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
 const COLL = "chat_conversations";
 
 export interface StoredMessage {
@@ -125,32 +124,7 @@ interface ConversationDoc {
   summaryCovered?: number;
 }
 
-// ---- Mongo 单例 ----
-let clientPromise: Promise<MongoClient> | null = null;
-let lastConnectFail = 0;
-const CONNECT_RETRY_COOLDOWN = 30_000;
-
-function getClient(): Promise<MongoClient> {
-  if (clientPromise) return clientPromise;
-  if (Date.now() - lastConnectFail < CONNECT_RETRY_COOLDOWN) {
-    return Promise.reject(new Error("MongoDB 连接冷却中（上次失败 30s 内）"));
-  }
-  const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 3000 });
-  clientPromise = client
-    .connect()
-    .then((c) => {
-      console.log(`[conversations] MongoDB 已连接 ${MONGO_URI}/${MONGO_DB}`);
-      return c;
-    })
-    .catch((err) => {
-      clientPromise = null;
-      lastConnectFail = Date.now();
-      console.warn(`[conversations] MongoDB 连接失败，降级内存存储：${String(err?.message || err)}`);
-      throw err;
-    });
-  return clientPromise;
-}
-
+// ---- Mongo 连接（单例见 ./db.ts）----
 let indexEnsured = false;
 
 /**
@@ -170,8 +144,8 @@ async function ensureIndexes(coll: Collection<ConversationDoc>): Promise<void> {
 
 async function getColl(): Promise<Collection<ConversationDoc> | null> {
   try {
-    const client = await getClient();
-    const db: Db = client.db(MONGO_DB);
+    const client = await getMongoClient();
+    const db: Db = client.db(MONGO_DB_NAME);
     const coll = db.collection<ConversationDoc>(COLL);
     await ensureIndexes(coll);
     return coll;
@@ -359,7 +333,9 @@ export async function markConversationSchedule(id: string, scheduleId: string): 
     if (doc) doc.scheduleId = scheduleId;
     return;
   }
-  await coll.updateOne({ id }, { $set: { scheduleId } }).catch(() => undefined);
+  await coll.updateOne({ id }, { $set: { scheduleId } }).catch((e) => {
+    console.warn(`[conversations] 会话绑定任务标记写入失败：${String((e as Error)?.message || e)}`);
+  });
 }
 
 export async function upsertMessages(input: {

@@ -42,7 +42,7 @@
 | **ChatGPT Monitoring** | 指令 + 频率 + meaningful 才推 | 用途=预警 + `on_alert` + 标记协议 |
 | **ChatGPT Automations** | 先测后跑 | 气泡「设为数据预警」/ 表单「从对话带入」 |
 | **Datadog 常识** | 检测频率 ≠ 通知频率；冷静期 | `alertState` + 30m 冷静期 + 2×NORMAL 恢复 |
-| **自研踩坑** | 列表截断 → 估数出图 | `SCHEDULE_ALERT_GUIDE` + 硬摘 `render_chart`/`export_data` + 列表压缩 |
+| **自研踩坑** | 列表截断 → 估数出图；模型自己逐页累加会丢页 | `SCHEDULE_ALERT_GUIDE` + 硬摘 `render_chart`/`export_data` + 列表压缩。跨页小时计数走 `count_list_by_time`（`complete: false` 即 `[NO_DATA]`）。每个列表工具一轮只放行第一页 |
 
 不学：把 metric / scope / window / threshold / cooldown 全铺成一级表单字段。
 
@@ -84,7 +84,8 @@
 | `schedule-alert.ts` | 标记、投递决策、冷静期、`SCHEDULE_ALERT_GUIDE` |
 | `schedules.ts` | 持久化 / 锁 / tick；跑完后推进下一拍 |
 | `app.ts` | 预警指引 + 摘图/导出 + 轮次上限 12；定时运行同时摘掉 `manage_schedule` |
-| `chat.ts` | `omitBuiltinTools`；列表结果压缩 / 截断提示 |
+| `chat.ts` | `omitBuiltinTools`；列表结果压缩 / 截断提示；直接翻页闸门 | 
+| `list-count.ts` / `list-page-gate.ts` | 服务端按小时翻页计数；每个列表工具本轮只放行一次第一页 |
 | `builtins.ts` | `manage_schedule` 支持 `purpose` / `notifyPolicy`；文案提示先测后跑 |
 | `ChatPage.vue` | 用途 / 频率 / 通知；「设为数据预警」「从对话带入」 |
 
@@ -94,9 +95,9 @@
 
 ```
 检查印度对话量是否暴涨（时区 Asia/Kolkata）：
-- 最近 60 分钟总量（短窗口；优先聚合/计数）
+- 最近 60 分钟总量（短窗口）。列表没有总数时用 count_list_by_time 一次取回，不要逐页翻
 - 超过 300 → 异常；否则正常
-- 取不到完整计数就说取不到，不要猜
+- 返回 complete: false，或取不到完整计数，就说取不到，不要猜
 用 bi / SalesIQ；dimension 如 country_code=IN，口径前后一致。
 ```
 
@@ -113,6 +114,7 @@
 | 定时运行不能自己暂停/删除任务；暂停或删除后收尾不写回 | ✅ 2026-09-30 |
 | P3 动态节奏 / 事件唤醒 | ✅ 2026-09-30。告警中下一拍收到间隔的一半（不低于 5 分钟），不改 cron；`POST /chat/schedules/:id/wake` 带原因多跑一期 |
 | 无人值守结论协议按**状态**判定 | ✅ 2026-09-30。取证失败时预警正文必带 `[NO_DATA]`、报告按 `ungrounded` 记未产出结论；回归 `tests/schedule-unattended-conclusion.test.ts` |
+| 无总数列表的跨页计数 | ✅ 2026-10-01。`count_list_by_time` 在服务端翻完，只回小时计数；`complete: false` 不给各小时数字。直接翻第二页或换筛选再取，由 `list-page-gate.ts` 拒绝。其它汇总用 `run_tool_code` |
 | 不做：阈值一级表单化 | — |
 
 ---

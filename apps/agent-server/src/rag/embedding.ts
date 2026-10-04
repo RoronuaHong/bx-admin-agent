@@ -53,7 +53,7 @@ export async function embedTexts(texts: string[]): Promise<EmbeddingResult[]> {
     body: JSON.stringify({ model: cfg.model, input: texts }),
     signal: AbortSignal.timeout(cfg.timeoutMs),
   });
-  const body = (await response.json().catch(() => null)) as {
+  const body = (await response.json().catch((e) => { console.warn(`[rag/embedding] 向量化接口返回非合法 JSON：${String((e as Error)?.message || e)}`); return null; })) as {
     data?: Array<{ embedding: number[] }>;
   } | null;
   if (!response.ok) {

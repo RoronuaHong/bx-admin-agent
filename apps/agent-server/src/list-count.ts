@@ -7,10 +7,26 @@
  * 把一串工具往返收成一次调用；Truto：整库统计走 spool，不要让模型在「下一页」上循环）。
  */
 
+/** 通用页大小。Zoho 会话列表另有 99 的上限，见 pageLimitForTool。 */
 export const LIST_COUNT_PAGE_LIMIT = Math.min(
-  99,
-  Math.max(1, Number(process.env.LIST_COUNT_PAGE_LIMIT) || 99),
+  500,
+  Math.max(1, Number(process.env.LIST_COUNT_PAGE_LIMIT) || 100),
 );
+
+const ROW_ARRAY_KEYS = ["data", "items", "results", "records", "rows", "list", "conversations", "value", "entries"];
+const MORE_BOOL_KEYS = ["more_data_available", "has_more", "hasMore", "more"];
+const NEXT_CURSOR_KEYS = ["next_cursor", "nextCursor", "next_page_token", "nextPageToken", "next"];
+const REQUEST_CURSOR_KEYS = ["cursor", "page_token", "pageToken", "starting_after", "continuation", "continuation_token", "next_cursor"];
+const OFFSET_KEYS = ["index", "offset", "skip"] as const;
+const LIMIT_KEYS = ["limit", "page_size", "pageSize", "per_page", "perPage"];
+const PAGING_CONTAINER_KEYS = ["query_params", "pagination", "paging", "params"] as const;
+const LIST_ARG_KEYS = new Set<string>([...REQUEST_CURSOR_KEYS, ...OFFSET_KEYS, ...LIMIT_KEYS, "page"]);
+
+/** 已知列表的页大小上限。其余工具用通用页大小，不把某一家的 99 写进所有请求。 */
+export function pageLimitForTool(toolName: string): number {
+  if (/getConversationsList/i.test(toolName)) return Math.min(99, LIST_COUNT_PAGE_LIMIT);
+  return LIST_COUNT_PAGE_LIMIT;
+}
 export const LIST_COUNT_DEFAULT_PAGES = Math.max(1, Number(process.env.LIST_COUNT_DEFAULT_PAGES) || 250);
 export const LIST_COUNT_MAX_PAGES = Math.max(
   LIST_COUNT_DEFAULT_PAGES,
@@ -32,6 +48,10 @@ export interface CountListRequest {
   timeField: string;
   idField: string;
   timeZone: string;
+  /** 列表数组的字段名。不传则按 data / items / results 等常见名字自动识别。 */
+  rowsField?: string;
+  /** 单页条数。不传则用通用页大小。 */
+  pageLimit?: number;
   above?: number;
   maxPages: number;
 }
@@ -99,32 +119,152 @@ export function hourBucketLabel(ms: number, timeZone: string): string {
   return calendarHourLabel(pick("year"), pick("month"), pick("day"), pick("hour"));
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function pagingNodes(obj: Record<string, unknown>): Record<string, unknown>[] {
+  const out = [obj];
+  for (const key of PAGING_CONTAINER_KEYS) {
+    const child = asRecord(obj[key]);
+    if (child) out.push(child);
+  }
+  return out;
+}
+
+function responseNodes(obj: Record<string, unknown>): Record<string, unknown>[] {
+  const out = [obj];
+  for (const key of ["pagination", "paging", "meta", "page_info", "pageInfo"] as const) {
+    const child = asRecord(obj[key]);
+    if (child) out.push(child);
+  }
+  return out;
+}
+
+function readArgs(argsJson: string): Record<string, unknown> | null {
+  try {
+    return asRecord(JSON.parse(argsJson));
+  } catch {
+    return null;
+  }
+}
+
+function numericPageValue(value: unknown): number | null {
+  if (typeof value === "boolean" || value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+/** 已经不是第一页：offset/index/skip > 0、page > 1，或带了非空游标。布尔 skip、页面名字不算。 */
+export function listPagingOffset(argsJson: string): number {
+  const obj = readArgs(argsJson);
+  if (!obj) return 0;
+  for (const node of pagingNodes(obj)) {
+    for (const key of OFFSET_KEYS) {
+      const n = numericPageValue(node[key]);
+      if (n != null && n > 0) return n;
+    }
+    const page = numericPageValue(node.page);
+    if (page != null && page > 1) return page;
+    for (const key of REQUEST_CURSOR_KEYS) {
+      if (opaqueCursor(node[key])) return 1;
+      const n = numericPageValue(node[key]);
+      if (n != null && n > 0) return n;
+    }
+  }
+  return 0;
+}
+
+function pagingField(key: string, value: unknown): boolean {
+  if (!LIST_ARG_KEYS.has(key)) return false;
+  if (key === "page") return numericPageValue(value) != null;
+  if ((OFFSET_KEYS as readonly string[]).includes(key)) return numericPageValue(value) != null || value == null || value === "";
+  return true;
+}
+
+/** 参数里带了分页字段（含第一页的 limit / page / index）。没有这些字段的读取不拦。 */
+export function looksLikeListPage(argsJson: string): boolean {
+  const obj = readArgs(argsJson);
+  if (!obj) return false;
+  for (const node of pagingNodes(obj)) {
+    for (const [key, value] of Object.entries(node)) if (pagingField(key, value)) return true;
+  }
+  return false;
+}
+
+/** 键顺序固定，避免同一筛选换个字段顺序就绕过闸门。只剥掉分页容器里的页码。 */
+function canonicalize(value: unknown, stripPaging: boolean): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item, false));
+  const rec = asRecord(value);
+  if (!rec) return value;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(rec).sort()) {
+    if (stripPaging && LIST_ARG_KEYS.has(key)) continue;
+    const childStrip = stripPaging && (PAGING_CONTAINER_KEYS as readonly string[]).includes(key);
+    out[key] = canonicalize(rec[key], childStrip);
+  }
+  return out;
+}
+
+/** 去掉页码后的筛选签名。同一列表工具是否已探过，另见 listToolProbeKey。 */
+export function listProbeKey(toolName: string, argsJson: string): string {
+  const obj = readArgs(argsJson);
+  if (!obj) return `${toolName}\0${argsJson}`;
+  return `${toolName}\0${JSON.stringify(canonicalize(obj, true))}`;
+}
+
+export function listToolProbeKey(toolName: string): string {
+  return `tool\0${toolName}`;
+}
+
 /**
- * 会话列表不带排序时，offset 翻页会漏行或重复。只给已知的列表工具补开始时间升序，
- * 调用方已经写了 sort_by / sort_order 则不覆盖。
+ * 已知接口的稳定排序。offset 翻页在无序结果上会漏行或重复。
+ * 只补这一家会话列表；其它工具不写入它不认识的 sort 字段。
  */
 export function prepareListArgs(toolName: string, args: Record<string, unknown>): Record<string, unknown> {
   const copy = structuredClone(args);
   if (!/getConversationsList/i.test(toolName)) return copy;
-  const query = copy.query_params;
-  if (!query || typeof query !== "object" || Array.isArray(query)) return copy;
-  const params = query as Record<string, unknown>;
-  if (params.sort_by == null || String(params.sort_by).trim() === "") params.sort_by = "in_time";
-  if (params.sort_order == null || String(params.sort_order).trim() === "") params.sort_order = "asc";
+  const query = asRecord(copy.query_params);
+  if (!query) return copy;
+  if (query.sort_by == null || String(query.sort_by).trim() === "") query.sort_by = "in_time";
+  if (query.sort_order == null || String(query.sort_order).trim() === "") query.sort_order = "asc";
   return copy;
 }
 
-export function pageArgs(base: Record<string, unknown>, index: number, limit: number): Record<string, unknown> {
+function writeLimit(container: Record<string, unknown>, limit: number): void {
+  const key = LIMIT_KEYS.find((name) => name in container) || "limit";
+  container[key] = limit;
+}
+
+/**
+ * 沿用调用方已经在用的分页字段：游标、page，或 index/offset/skip。
+ * 分页对象写在 query_params / pagination / paging / params，否则写在顶层。
+ */
+export function pageArgs(
+  base: Record<string, unknown>,
+  index: number,
+  limit: number,
+  cursor?: string,
+  pageNo?: number,
+): Record<string, unknown> {
   const args = structuredClone(base);
-  const query = args.query_params;
-  if (query && typeof query === "object" && !Array.isArray(query)) {
-    const params = query as Record<string, unknown>;
-    params.index = index;
-    params.limit = limit;
+  const container = pagingNodes(args).find((node) => node !== args) || args;
+  const hasCursorKey = REQUEST_CURSOR_KEYS.some((key) => key in container);
+  const hasOffsetKey = OFFSET_KEYS.some((key) => key in container);
+  writeLimit(container, limit);
+  if (cursor || (hasCursorKey && !hasOffsetKey)) {
+    const key = REQUEST_CURSOR_KEYS.find((name) => name in container) || "cursor";
+    if (cursor) container[key] = cursor;
     return args;
   }
-  args.index = index;
-  args.limit = limit;
+  if ("page" in container && !hasOffsetKey) {
+    container.page = pageNo ?? Math.floor(index / Math.max(limit, 1)) + 1;
+    return args;
+  }
+  const offsetKey = OFFSET_KEYS.find((key) => key in container) || "index";
+  container[offsetKey] = index;
   return args;
 }
 
@@ -134,18 +274,126 @@ function asMillis(n: number): number | null {
   return n < 1e11 ? Math.round(n * 1000) : n;
 }
 
+function valueAt(row: Record<string, unknown>, field: string): unknown {
+  if (!field.includes(".")) return row[field];
+  let cur: unknown = row;
+  for (const part of field.split(".")) {
+    const rec = asRecord(cur);
+    if (!rec) return undefined;
+    cur = rec[part];
+  }
+  return cur;
+}
+
+function readId(row: Record<string, unknown>, field: string): string {
+  const raw = valueAt(row, field);
+  if (typeof raw === "string" || typeof raw === "number") return String(raw).trim();
+  return "";
+}
+
 function readTime(row: Record<string, unknown>, field: string): number | null {
-  const raw = row[field] ?? (field === "start_time" ? row.in_time : undefined);
+  const raw = valueAt(row, field);
   if (typeof raw === "number") return asMillis(raw);
-  if (typeof raw === "string" && raw.trim()) return asMillis(Number(raw));
-  return null;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const text = raw.trim();
+  if (/^\d+(\.\d+)?$/.test(text)) return asMillis(Number(text));
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function objectRows(value: unknown): { rows: Array<Record<string, unknown>> } | { error: string } | null {
+  if (!Array.isArray(value)) return null;
+  const rows: Array<Record<string, unknown>> = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { error: "列表元素不是对象" };
+    rows.push(item as Record<string, unknown>);
+  }
+  return { rows };
+}
+
+export function extractListRows(
+  obj: Record<string, unknown>,
+  rowsField?: string,
+): { rows: Array<Record<string, unknown>>; key: string } | { error: string } {
+  const named = takeRows(rowsField ? obj[rowsField] : undefined, rowsField);
+  if (named) return named;
+  for (const key of ROW_ARRAY_KEYS) {
+    if (!Array.isArray(obj[key])) continue;
+    const read = objectRows(obj[key]);
+    if (!read) continue;
+    if ("error" in read) return read;
+    return { rows: read.rows, key };
+  }
+  const arrays = Object.entries(obj).filter(([, value]) => Array.isArray(value));
+  if (arrays.length === 1) {
+    const read = objectRows(arrays[0]![1]);
+    if (!read) return { error: "返回里没有列表数组" };
+    if ("error" in read) return read;
+    return { rows: read.rows, key: arrays[0]![0] };
+  }
+  return { error: "返回里没有列表数组" };
+}
+
+function takeRows(value: unknown, field: string | undefined): { rows: Array<Record<string, unknown>>; key: string } | { error: string } | null {
+  if (!field) return null;
+  const read = objectRows(value);
+  if (!read) return { error: `返回里没有 ${field} 数组` };
+  if ("error" in read) return read;
+  return { rows: read.rows, key: field };
+}
+
+function pageSizeRejected(message: string): boolean {
+  return /limit invalid|invalid limit|page size|page_size|per_page|max(?:imum)? limit/i.test(message);
+}
+
+function explicitMore(obj: Record<string, unknown>): boolean | undefined {
+  for (const node of responseNodes(obj)) {
+    for (const key of MORE_BOOL_KEYS) {
+      if (typeof node[key] === "boolean") return node[key] as boolean;
+    }
+  }
+  return undefined;
+}
+
+/** 只接受不透明页码。链接和路径留给接口自己解释，不能写进 cursor 字段。 */
+function opaqueCursor(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || text.startsWith("/") || text.includes("?") || /^[a-z][a-z0-9+.-]*:/i.test(text)) return null;
+  return text;
+}
+
+function nextCursorOf(obj: Record<string, unknown>): string | undefined {
+  for (const node of responseNodes(obj)) {
+    for (const key of NEXT_CURSOR_KEYS) {
+      const cursor = opaqueCursor(node[key]);
+      if (cursor) return cursor;
+    }
+  }
+  return undefined;
+}
+
+/** 响应还表明后面有页。认布尔标记和下一页游标，不认工具名。 */
+export function listResponseHasMore(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return /"(more_data_available|has_more|hasMore)"\s*:\s*true/.test(text);
+  }
+  const obj = asRecord(parsed);
+  if (!obj) return false;
+  const flag = explicitMore(obj);
+  if (flag != null) return flag;
+  return Boolean(nextCursorOf(obj));
 }
 
 function parsePage(
   text: string,
   isError: boolean,
   limit: number,
-): { rows: Array<Record<string, unknown>>; more: boolean; error?: string } {
+  rowsField?: string,
+): { rows: Array<Record<string, unknown>>; more: boolean; nextCursor?: string; error?: string } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -153,10 +401,8 @@ function parsePage(
     const head = text.replace(/\s+/g, " ").trim().slice(0, 180);
     return { rows: [], more: false, error: isError ? head || "列表工具调用失败" : `返回不是 JSON：${head}` };
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { rows: [], more: false, error: "返回不是对象" };
-  }
-  const obj = parsed as Record<string, unknown>;
+  const obj = asRecord(parsed);
+  if (!obj) return { rows: [], more: false, error: "返回不是对象" };
   if (obj.error != null) {
     const err = obj.error;
     const message =
@@ -168,10 +414,12 @@ function parsePage(
   if (isError) {
     return { rows: [], more: false, error: text.replace(/\s+/g, " ").trim().slice(0, 180) || "列表工具调用失败" };
   }
-  if (!Array.isArray(obj.data)) return { rows: [], more: false, error: "返回里没有 data 数组" };
-  const rows = obj.data.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object");
-  const more = typeof obj.more_data_available === "boolean" ? obj.more_data_available : rows.length >= limit;
-  return { rows, more };
+  const extracted = extractListRows(obj, rowsField);
+  if ("error" in extracted) return { rows: [], more: false, error: extracted.error };
+  const flag = explicitMore(obj);
+  const nextCursor = nextCursorOf(obj);
+  const more = flag != null ? flag : Boolean(nextCursor) || extracted.rows.length >= limit;
+  return { rows: extracted.rows, more, ...(nextCursor ? { nextCursor } : {}) };
 }
 
 export async function countPagedList(
@@ -186,7 +434,7 @@ export async function countPagedList(
   if (request.above != null && !Number.isFinite(request.above)) {
     return emptyReport(request, false, "above 必须是数字", false);
   }
-  const limit = LIST_COUNT_PAGE_LIMIT;
+  let limit = Math.min(LIST_COUNT_PAGE_LIMIT, Math.max(1, Math.floor(request.pageLimit || LIST_COUNT_PAGE_LIMIT)));
   const maxPages = Math.min(LIST_COUNT_MAX_PAGES, Math.max(1, Math.floor(request.maxPages) || LIST_COUNT_DEFAULT_PAGES));
   const seen = new Set<string>();
   const buckets = new Map<string, number>();
@@ -195,6 +443,9 @@ export async function countPagedList(
   let skippedTime = 0;
   let missingId = 0;
   let index = 0;
+  let pageNo = 1;
+  let cursor: string | undefined;
+  let shrunkLimit = false;
   let complete = false;
   let reason = "";
 
@@ -203,22 +454,35 @@ export async function countPagedList(
       reason = "已取消";
       break;
     }
-    const fetched = await fetchPage(pageArgs(request.arguments, index, limit));
+    const fetched = await fetchPage(pageArgs(request.arguments, index, limit, cursor, pageNo));
     pages += 1;
-    const page = parsePage(fetched.text, fetched.isError, limit);
+    const page = parsePage(fetched.text, fetched.isError, limit, request.rowsField);
     if (page.error) {
+      if (!shrunkLimit && pages === 1 && limit > 20 && pageSizeRejected(page.error)) {
+        shrunkLimit = true;
+        limit = Math.max(20, Math.floor(limit / 2));
+        pages = 0;
+        continue;
+      }
       reason = page.error;
       break;
     }
     if (!page.rows.length) {
-      complete = true;
-      reason = "已翻到末页";
+      if (!page.more) {
+        complete = true;
+        reason = "已翻到末页";
+      } else if (page.nextCursor && page.nextCursor !== cursor) {
+        cursor = page.nextCursor;
+        continue;
+      } else {
+        reason = "分页没有推进（空页但仍标记有下一页）";
+      }
       break;
     }
     let fresh = 0;
     for (const row of page.rows) {
       rawRows += 1;
-      const id = String(row[request.idField] ?? "").trim();
+      const id = readId(row, request.idField);
       if (!id) {
         missingId += 1;
         fresh += 1;
@@ -244,7 +508,16 @@ export async function countPagedList(
       }
       break;
     }
-    index += page.rows.length;
+    if (page.nextCursor) {
+      if (cursor === page.nextCursor) {
+        reason = "分页没有推进（游标未变化）";
+        break;
+      }
+      cursor = page.nextCursor;
+    } else {
+      index += page.rows.length;
+      pageNo += 1;
+    }
     if (!page.more) {
       complete = true;
       reason = "已翻到末页";

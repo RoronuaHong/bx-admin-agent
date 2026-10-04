@@ -148,7 +148,12 @@ export async function assembleContext(input: AssembleInput): Promise<AssembleRes
       .join("\n\n")
       .slice(0, COMPACT_INPUT_CHARS);
     const prompt = summary ? `已有摘要：\n${summary}\n\n新增对话：\n${body}` : body;
-    const next = await input.compact(SUMMARIZE_PROMPT + prompt).catch(() => "");
+    const next = await input
+      .compact(SUMMARIZE_PROMPT + prompt)
+      .catch((err) => {
+        console.warn(`[history] 摘要压缩失败，回退不压缩：${String((err as Error)?.message || err)}`);
+        return "";
+      });
     if (!next || !next.trim()) return false;
     let next2 = next.trim();
     if (next2.length > SUMMARY_MAX_CHARS) next2 = `${next2.slice(0, SUMMARY_MAX_CHARS)}…（摘要已截断）`;

@@ -253,6 +253,53 @@ export interface GrepHit {
 /** 单行回显上限：命中行可能极长，截断避免把上下文撑爆。 */
 const GREP_LINE_CHARS = 200;
 
+// 单次 fsGrep 的硬预算：即便漏过下面的启发式，也保证单次调用最多占用这么久（再长就截断返回）。
+const FS_GREP_BUDGET_MS = 2000;
+
+/**
+ * 识别「嵌套量词」正则：一个组内部含可变量词（* + {m,}），而该组本身又被量化。
+ * 这类模式在长行上会指数级回溯、卡死事件循环（ReDoS）——模型输出可被 prompt 注入操控，属不可信输入。
+ * 固定量词 {n}、可选 ? 不计入。
+ *
+ * 判定只认「量词紧跟着一个含量词的组」这一种形态：同一层里先后出现的多个量词
+ * （`a+b+`、`\d+\.\d+`、`^\s*#+\s+(.*)$`）是线性匹配的常用写法，绝不能当成灾难性回溯拒掉。
+ * 组关闭时把「含量词」向上传递一层，`((a+)b)+` 这类套了两层的写法也照样拦。
+ */
+export function isCatastrophicPattern(src: string): boolean {
+  // 先去掉转义字符，再做括号配对扫描。
+  const s = src.replace(/\\[.+*?(){}[\]|^$]/g, "");
+  const stack: boolean[] = [false]; // 每层组：内部是否已含可变量词
+  let pendingGroupQuant = false; // 刚关闭的组内部含量词（其后紧跟量词即命中）
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (c === "(") {
+      stack.push(false);
+      pendingGroupQuant = false;
+    } else if (c === ")") {
+      const inner = stack.pop() ?? false;
+      if (inner && stack.length) stack[stack.length - 1] = true;
+      pendingGroupQuant = inner;
+    } else if (c === "*" || c === "+") {
+      if (pendingGroupQuant) return true;
+      stack[stack.length - 1] = true;
+      pendingGroupQuant = false;
+    } else if (c === "{") {
+      // 仅 {m,}（开放量词）危险；{m} / {m,n} 有限次，不构成指数回溯。
+      const m = /^\{(\d+)(?:,(\d*))?\}?/.exec(s.slice(i));
+      if (m) {
+        const open = m[2] !== undefined && m[2] === "";
+        if (open && pendingGroupQuant) return true;
+        if (open) stack[stack.length - 1] = true;
+        i += m[0].length - 1;
+      }
+      pendingGroupQuant = false;
+    } else if (c !== "|" && c !== "^" && c !== "$" && c !== "?") {
+      pendingGroupQuant = false;
+    }
+  }
+  return false;
+}
+
 /**
  * 内容检索（限工作区内）。三种模式：
  * - files：只回命中文件名（默认 200 个封顶）
@@ -270,6 +317,10 @@ export function fsGrep(
   const raw = String(pattern || "");
   if (!raw.trim()) return { error: "缺少检索模式" };
   if (raw.length > 200) return { error: "检索模式过长（上限 200 字符）" };
+  // ReDoS 护栏：拒绝明显的嵌套量词（如 (a+)+、(.*)*），避免长行上指数级回溯卡死事件循环。
+  if (isCatastrophicPattern(raw)) {
+    return { error: "检索模式含嵌套量词，易导致回溯卡死；请改用更简单的正则（避免 (x+)+ 这类写法）" };
+  }
   let re: RegExp;
   try {
     re = new RegExp(raw);
@@ -288,7 +339,12 @@ export function fsGrep(
   const hits: GrepHit[] = [];
   const counts: Array<{ path: string; count: number }> = [];
   let truncated = false;
+  const startedAt = Date.now(); // 单次预算上限（防御性兜底，双重保险于嵌套量词启发式）
   for (const file of candidates) {
+    if (Date.now() - startedAt > FS_GREP_BUDGET_MS) {
+      truncated = true;
+      break;
+    }
     const target = safePath(conversationId, file.path);
     if (!target) continue;
     let text: string;
@@ -301,6 +357,10 @@ export function fsGrep(
     let count = 0;
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i += 1) {
+      if (Date.now() - startedAt > FS_GREP_BUDGET_MS) {
+        truncated = true;
+        break;
+      }
       const line = lines[i]!;
       if (!re.test(line)) continue;
       count += 1;

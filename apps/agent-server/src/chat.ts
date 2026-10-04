@@ -7,7 +7,10 @@
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
-import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS } from "./builtins.js";
+import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
+import { admitDirectListCall, releaseDirectListCall, rememberDirectListPage } from "./list-page-gate.js";
+import { extractListRows, listResponseHasMore } from "./list-count.js";
+import { toolCodeDenied } from "./tool-code.js";
 import { buildUnattendedConclusion, unattendedToolDenial } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
@@ -908,52 +911,67 @@ function truncateResult(text: string, maxChars = MAX_TOOL_RESULT_CHARS): string 
   return `${kept}\n…（结果已截断，原始长度 ${text.length} 字符；计数/告警勿用截断片估算，请缩字段或 limit 后重取，否则标 [NO_DATA]）`;
 }
 
+const DROP_LIST_KEY = /(message|text|html|body|content|description|avatar|image|token|secret)/i;
+
+function isShortScalar(value: unknown): boolean {
+  if (typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 80;
+}
+
+/** 留下短标量，丢掉嵌套大对象和长文本。嵌套字段保留点路径，避免被当成顶层字段。 */
+function slimListRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const put = (key: string, value: unknown) => {
+    if (out[key] == null) out[key] = value;
+  };
+  for (const [key, value] of Object.entries(row)) {
+    if (DROP_LIST_KEY.test(key)) continue;
+    if (isShortScalar(value)) {
+      put(key, value);
+      continue;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+      if (DROP_LIST_KEY.test(childKey) || !isShortScalar(childValue)) continue;
+      put(`${key}.${childKey}`, childValue);
+    }
+  }
+  return out;
+}
+
 /**
- * Zoho SalesIQ 等列表接口常返回「整段访客/消息」肥 JSON（单行数 KB），
- * 默认 12KB 截断后模型只能看到 2～3 条 → 估数/空转。预警取数只需 id + 时间 + 国家码。
- * 能解析则压成瘦列表；解析失败原样返回。
+ * 分页列表明细经常是肥 JSON，12KB 截断后模型只能看到开头几条。
+ * 能认出列表数组就压成短标量；认不出或压完没变短则原样返回。
  */
-export function compactFatListToolResult(toolName: string, text: string): string {
-  if (!/getConversationsList/i.test(toolName || "")) return text;
+export function compactFatListToolResult(_toolName: string, text: string): string {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(text) as {
-      object?: string;
-      more_data_available?: boolean;
-      data?: Array<Record<string, unknown>>;
-      url?: string;
-    };
-    if (!Array.isArray(parsed.data)) return text;
-    const slim = {
-      url: parsed.url,
-      object: parsed.object || "list",
-      more_data_available: Boolean(parsed.more_data_available),
-      count: parsed.data.length,
-      data: parsed.data.map((row) => {
-        const visitor = (row.visitor && typeof row.visitor === "object"
-          ? (row.visitor as Record<string, unknown>)
-          : null);
-        return {
-          id: row.id ?? null,
-          start_time: row.start_time ?? null,
-          country_code: visitor?.country_code ?? null,
-        };
-      }),
-    };
-    return JSON.stringify(slim);
+    parsed = JSON.parse(text);
   } catch {
     return text;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return text;
+  const obj = parsed as Record<string, unknown>;
+  const extracted = extractListRows(obj);
+  if ("error" in extracted || extracted.rows.length === 0) return text;
+  const next = {
+    ...obj,
+    [extracted.key]: extracted.rows.map(slimListRow),
+    count: extracted.rows.length,
+  };
+  const slim = JSON.stringify(next);
+  return slim.length < text.length ? slim : text;
 }
 
 /**
  * 列表还有下一页时，把「不要自己翻页」放在结果最前面。
  * 截断从尾部切，提示留在头部才不会被 12KB 上限切掉。
  */
-export function withListCountHint(toolName: string, text: string): string {
-  if (!/getConversationsList/i.test(toolName || "")) return text;
-  if (!/"more_data_available"\s*:\s*true/.test(text)) return text;
+export function withListCountHint(_toolName: string, text: string): string {
+  if (!listResponseHasMore(text)) return text;
   return (
-    "（跨页计数不要继续翻本列表：改调 count_list_by_time，由服务端翻完并只回小时计数。" +
+    "（跨页计数不要继续翻本列表，也不要换筛选再取一页：改调 count_list_by_time，由服务端翻完并只回小时计数。" +
     "这一页不能用来估算总数或是否超阈值。）\n" +
     text
   );
@@ -1317,6 +1335,31 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let sideEffects = 0;
   // 循环护栏：同轮去重集合（每轮重置）+ 跨轮 Doom Loop 检测器。
   const executedSigs = new Set<string>();
+  // 模型直接翻列表：每个列表工具本轮只放行第一页。代码桥和 count_list_by_time 不走这条。
+  const directListSeen = new Set<string>();
+  const callToolFromCode = async (name: string, args: Record<string, unknown>) => {
+    const denied = toolCodeDenied(name);
+    if (denied) return { ok: false, text: denied };
+    const verdict = resolveToolRisk(name, ctx.grantServers, args);
+    if (verdict.level !== "read" || verdict.deny || verdictNeedsConfirm(verdict)) {
+      return { ok: false, text: `代码里只能调用只读且免确认的工具（${name}：${verdict.reason}）` };
+    }
+    const argsJson = JSON.stringify(args ?? {});
+    const builtin = await execBuiltin(
+      name,
+      argsJson,
+      ctx.conversationId,
+      ctx.namespace,
+      ctx.ownerKey,
+      ctx.signal,
+      codeHooks,
+    );
+    if (builtin) return { ok: builtin.ok, text: builtin.text };
+    hydrateDeferred(name);
+    const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
+    return { ok: !result.isError, text: result.text };
+  };
+  const codeHooks: BuiltinHooks = { callTool: (name, args) => callToolFromCode(name, args) };
   let roundExecuted: string[] = [];
   // 跨轮重复调用软提示的依据：签名 → 首次**成功执行**的轮次（失败后的重试不算重复）。
   const executedSigRounds = new Map<string, number>();
@@ -1671,7 +1714,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (ctx.deniedBuiltins?.has(c.name)) {
         return { ok: false, rawText: unattendedToolDenial(c.name), executed: false };
       }
-      const builtin = await execBuiltin(c.name, c.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey, ctx.signal);
+      const builtin = await execBuiltin(
+        c.name,
+        c.argsJson,
+        ctx.conversationId,
+        ctx.namespace,
+        ctx.ownerKey,
+        ctx.signal,
+        codeHooks,
+      );
       if (builtin) {
         return {
           ok: builtin.ok,
@@ -1682,8 +1733,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
+      const refused = admitDirectListCall(c.name, c.argsJson, directListSeen);
+      if (refused) return { ok: false, rawText: refused, executed: false };
       hydrateDeferred(c.name);
       const result = await callMcpTool(c.name, mcpArgs(c.name, c.argsJson), ctx.signal);
+      if (result.isError) releaseDirectListCall(c.name, c.argsJson, directListSeen);
+      else rememberDirectListPage(c.name, c.argsJson, result.text, directListSeen);
       return { ok: !result.isError, rawText: result.text, executed: true };
     };
     while (index < calls.length) {
@@ -2034,7 +2089,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       const toolStart = Date.now();
       executedSigs.add(sig);
       roundExecuted.push(sig);
-      const builtin = await execBuiltin(call.name, call.argsJson, ctx.conversationId, ctx.namespace, ctx.ownerKey, ctx.signal);
+      const builtin = await execBuiltin(
+        call.name,
+        call.argsJson,
+        ctx.conversationId,
+        ctx.namespace,
+        ctx.ownerKey,
+        ctx.signal,
+        codeHooks,
+      );
       // executed=false 表示并未真正执行（定时运行拒绝等）——不计入失败熔断。
       let executed = true;
       if (builtin) {
@@ -2080,10 +2143,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           rawText = buildClarifyAck(answer, builtin.clarification.options);
         }
       } else {
-        hydrateDeferred(call.name);
-        const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
-        ok = !result.isError;
-        rawText = result.text;
+        const refused = admitDirectListCall(call.name, call.argsJson, directListSeen);
+        if (refused) {
+          ok = false;
+          rawText = refused;
+          executed = false;
+        } else {
+          hydrateDeferred(call.name);
+          const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
+          ok = !result.isError;
+          rawText = result.text;
+          if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
+          else rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
+        }
       }
       // 副作用计数：真正执行过、且级别非只读的调用。只读（read）不计——换模型重跑只读调用没有副作用，
       // 不该被「已产生副作用就不能切候选」的护栏拦住（见 chatStream 候选循环的说明）。
@@ -2393,14 +2465,24 @@ async function* runSubagentBatch(
   let settled = 0;
   const runOne = async (index: number): Promise<void> => {
     const call = batch[index]!;
-    const gen = runSubagent(call, ctx, call.id);
-    let n = await gen.next();
-    while (!n.done) {
-      queue.push(n.value);
-      n = await gen.next();
+    try {
+      const gen = runSubagent(call, ctx, call.id);
+      let n = await gen.next();
+      while (!n.done) {
+        queue.push(n.value);
+        n = await gen.next();
+      }
+      results[index] = n.value;
+    } catch (err) {
+      // 子代理在产出任何事件之前就抛错时，这里接不住的话 worker promise 直接 reject、
+      // settled 永远到不了 batch.length —— 下面的轮询会无限转下去，整条请求挂死；
+      // 且 results[index] 留空会让交接时的 result.id 读空指针。故在此兜底成一条失败交接。
+      const text = `子代理启动失败：${String((err as Error)?.message || err)}`;
+      results[index] = { id: call.id, args: call.argsJson, ok: false, text, toolCalls: 0 };
+      queue.push({ type: "subagent_end", id: call.id, ok: false, status: "error", text });
+    } finally {
+      settled += 1;
     }
-    results[index] = n.value;
-    settled += 1;
   };
   const workers: Promise<void>[] = [];
   for (let i = 0; i < Math.min(SUBAGENT_MAX_PARALLEL, batch.length); i++) {
@@ -2654,7 +2736,9 @@ export async function* chatStream(
     totalTokens = estimateTokensOf(turns.map((turn) => turn.content)) + estimateTokens(assembled.summary);
     // 摘要只在确实发生压缩时写回（水位线单调前移，下一轮增量扩展）。
     if (assembled.usage.compacted) {
-      await setConversationSummary(conversationId, assembled.summary, assembled.summaryCovered).catch(() => undefined);
+      await setConversationSummary(conversationId, assembled.summary, assembled.summaryCovered).catch((e) => {
+        console.warn(`[chat:history] 摘要写回失败，下一轮会重复压缩：${String((e as Error)?.message || e)}`);
+      });
     }
     // 系统提示两段式：稳定前缀（角色守则 + skills 索引，可被 prompt cache 命中）
     // + 动态后缀（长期记忆 / 历史摘要 / 回复语言）。
@@ -2790,7 +2874,9 @@ export async function* chatStream(
       await appendContext(
         conversationId,
         [{ role: "user", text: userText }, { role: "assistant", text: text.trim() }],
-      ).catch(() => undefined);
+      ).catch((e) => {
+        console.warn(`[chat] 中断轮上下文写回失败，下一轮模型看不到这一轮：${String((e as Error)?.message || e)}`);
+      });
     } else if (text.trim()) {
       // 模型调用中途失败：保留已生成的中间结论，避免整轮成果丢失（如限流前已产出的部分答案），
       // 并附中断说明。仅当完全无产出时才退回纯错误提示。

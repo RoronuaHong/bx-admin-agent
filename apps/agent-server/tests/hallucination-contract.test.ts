@@ -43,6 +43,7 @@ test("[1] 外部数据源判定：MCP 工具 / 联网检索 / 知识库检索算
   expect(isExternalDataSourceTool("fetch_url")).toBe(true);
   expect(isExternalDataSourceTool("search_knowledge")).toBe(true);
   expect(isExternalDataSourceTool("count_list_by_time")).toBe(true);
+  expect(isExternalDataSourceTool("run_tool_code")).toBe(true);
   // 工作区与记账类工具读的是模型自己写的东西 / 不构成外部事实来源 → 不算。
   // 把它们算进来会让「只挂了工作区工具」的轮次也进零证据拦截，等于禁止模型用自身知识作答。
   for (const name of ["fs_read", "fs_write", "fs_grep", "write_todos", "search_tools", "task", ""]) {

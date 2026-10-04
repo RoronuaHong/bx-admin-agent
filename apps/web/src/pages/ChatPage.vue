@@ -4986,6 +4986,13 @@ onBeforeUnmount(() => {
     clearTimeout(skeletonTimer);
     skeletonTimer = null;
   }
+  // 后台守望计时器：组件卸载后仍跑会持有响应式对象、滞留实例（最长 15 分钟），必须清掉。
+  for (const t of bgWatch.values()) clearInterval(t);
+  bgWatch.clear();
+  if (doneToastTimer) {
+    clearTimeout(doneToastTimer);
+    doneToastTimer = null;
+  }
 });
 </script>
 

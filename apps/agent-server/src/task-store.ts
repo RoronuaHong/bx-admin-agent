@@ -11,11 +11,10 @@
 //
 // 降级口径与 `conversations.ts` 一致：连不上 Mongo 就退回进程内存（行为退化为「重启即丢」），
 // 持久化失败只告警、绝不阻断主流程。
-import { MongoClient, type Collection, type Db } from "mongodb";
+import { type Collection, type Db } from "mongodb";
 import type { ChatEvent } from "@bx/shared";
+import { getMongoClient, MONGO_DB_NAME } from "./db.js";
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
-const MONGO_DB = process.env.MONGO_DB_NAME || "bx_agent";
 const COLL = "chat_tasks";
 
 /** 单任务保留的事件条数上限：超出丢最旧的（只影响「很晚才回来的重连」能看到的历史长度）。 */
@@ -49,36 +48,15 @@ export interface TaskRecord {
   expiresAt: Date;
 }
 
-// ---- Mongo 单例（与 conversations.ts 同一套懒连接 + 失败冷却）----
-let clientPromise: Promise<MongoClient> | null = null;
-let lastConnectFail = 0;
-const CONNECT_RETRY_COOLDOWN = 30_000;
 /** 集合是否已就绪（避免每次写入都试连接；失败则退回内存并告警一次）。 */
 let mongoReady = false;
 let warnedFallback = false;
 
-function getClient(): Promise<MongoClient> {
-  if (clientPromise) return clientPromise;
-  if (Date.now() - lastConnectFail < CONNECT_RETRY_COOLDOWN) {
-    return Promise.reject(new Error("MongoDB 连接冷却中（上次失败 30s 内）"));
-  }
-  const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 3000 });
-  clientPromise = client
-    .connect()
-    .then((c) => c)
-    .catch((err) => {
-      clientPromise = null;
-      lastConnectFail = Date.now();
-      throw err;
-    });
-  return clientPromise;
-}
-
 async function getColl(): Promise<Collection<TaskRecord> | null> {
   if (!mongoReady) return null;
   try {
-    const client = await getClient();
-    const db: Db = client.db(MONGO_DB);
+    const client = await getMongoClient();
+    const db: Db = client.db(MONGO_DB_NAME);
     return db.collection<TaskRecord>(COLL);
   } catch {
     return null;
@@ -105,14 +83,18 @@ function memSweep(): void {
  */
 export async function initTaskStore(): Promise<boolean> {
   try {
-    const client = await getClient();
-    const coll = client.db(MONGO_DB).collection<TaskRecord>(COLL);
+    const client = await getMongoClient();
+    const coll = client.db(MONGO_DB_NAME).collection<TaskRecord>(COLL);
     // TTL：留档过期由 Mongo 自动清理，不需要额外的清扫任务。
-    await coll.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => undefined);
+    await coll.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch((e) => {
+      console.warn(`[task-store] 留档 TTL 索引创建失败，过期留档不会被自动清理（Mongo 内存膨胀）：${String((e as Error)?.message || e)}`);
+    });
     // 恢复扫描要按「状态 + 心跳」找僵尸任务。
-    await coll.createIndex({ status: 1, updatedAt: 1 }).catch(() => undefined);
+    await coll.createIndex({ status: 1, updatedAt: 1 }).catch((e) => {
+      console.warn(`[task-store] 僵尸任务扫描索引创建失败，重启恢复可能漏扫：${String((e as Error)?.message || e)}`);
+    });
     mongoReady = true;
-    console.log(`[task-store] MongoDB 已连接，任务留档启用（${MONGO_URI}/${MONGO_DB}.${COLL}，TTL ${Math.round(TASK_DB_RETAIN_MS / 1000)}s）`);
+    console.log(`[task-store] MongoDB 已连接，任务留档启用（${MONGO_DB_NAME}.${COLL}，TTL ${Math.round(TASK_DB_RETAIN_MS / 1000)}s）`);
     return true;
   } catch (err) {
     mongoReady = false;

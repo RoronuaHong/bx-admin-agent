@@ -63,6 +63,7 @@ test("[H] 动态段带当前 Unix 毫秒，工具纪律要求按参数说明筛�
   const { stable, dynamic } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
   expect(stable).toContain("不要写进参数");
   expect(stable).toContain("count_list_by_time");
+  expect(stable).toContain("run_tool_code");
   expect(stable).toContain("不要自己逐页翻列表");
   expect(dynamic).toContain("Unix 毫秒");
   expect(renderNowClock(1_790_000_000_000)).toContain("1790000000000");
