@@ -73,6 +73,7 @@ import {
 import { buildMetrics } from "./metrics.js";
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
+import { checkAdminToken } from "./admin-gate.js";
 import {
   garbledTextReason,
   getSchedule,
@@ -141,6 +142,13 @@ const MAX_INPUT_LEN = Math.max(1, Number(process.env.CHAT_MAX_INPUT_LEN || 8000)
 // 入口限流（0 = 关闭）：每 owner 每分钟发起对话次数 + 每 owner 并发运行中的对话任务数。
 const RATE_STREAM_PER_MIN = Math.max(0, Number(process.env.RATE_LIMIT_STREAM_PER_MIN ?? 20));
 const RATE_CONCURRENT_PER_OWNER = Math.max(0, Number(process.env.RATE_LIMIT_CONCURRENT_PER_OWNER ?? 3));
+/**
+ * 全局配置端点（`/chat/*` 之外）的保护。
+ * `AGENT_ADMIN_TOKEN` 未配置 = 不启用（默认，等同改动前的行为）；配置后这些端点必须带
+ * `x-admin-token`。配套限流（0 = 关闭）压住「reload 反复 spawn 子进程」这类昂贵操作。
+ */
+const ADMIN_TOKEN = String(process.env.AGENT_ADMIN_TOKEN || "").trim();
+const RATE_ADMIN_PER_MIN = Math.max(0, Number(process.env.RATE_LIMIT_ADMIN_PER_MIN ?? 30));
 /**
  * 定时任务（无人值守）的工具轮次预算，默认比交互式宽一倍：
  * 监测类任务要「翻 schema → 找表 → 反复取数 → 出图 → 写结论」，14 轮常常在出结论前就被截断，
@@ -650,6 +658,37 @@ export function createApp() {
     c.header("X-Content-Type-Options", "nosniff");
     c.header("X-Frame-Options", "DENY");
     c.header("Referrer-Policy", "no-referrer");
+  });
+
+  /**
+   * 全局配置端点的准入：`/chat/*` 之外的路由默认没有身份，配了 AGENT_ADMIN_TOKEN 就必须带头部令牌。
+   * 判据刻意放在 request path 上而不是路由分组里——这两组端点散落在各处，漏注册就等于没保护。
+   * 未配置令牌时整段恒等放行，与改动前完全一致。
+   */
+  app.use("*", async (c, next) => {
+    const path = c.req.path;
+    // /health 留给进程探活，不带令牌也要能查。
+    if (path === "/health" || path.startsWith("/chat/")) return next();
+    const gate = checkAdminToken({ token: ADMIN_TOKEN, provided: c.req.header("x-admin-token") });
+    if (!gate.ok) {
+      return errorJson(
+        c,
+        401,
+        gate.reason === "missing" ? "ADMIN_TOKEN_REQUIRED" : "ADMIN_TOKEN_INVALID",
+        gate.reason === "missing"
+          ? "该端点需要 x-admin-token 头"
+          : "x-admin-token 不正确",
+      );
+    }
+    if (RATE_ADMIN_PER_MIN > 0) {
+      const actor = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "local";
+      const rate = hitRateLimit(`admin:${actor}`, RATE_ADMIN_PER_MIN);
+      if (!rate.allowed) {
+        c.header("Retry-After", String(rate.retryAfterSec));
+        return errorJson(c, 429, "ADMIN_RATE_LIMITED", `操作太频繁，请 ${rate.retryAfterSec} 秒后再试`);
+      }
+    }
+    await next();
   });
 
   // 会话中间件（仅 chat 域）：统一解析匿名 cookie 会话 + 设备 owner（轻量归属隔离），
