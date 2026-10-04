@@ -13,8 +13,8 @@
     "@antv/g2": "^5.4.8",
     "@antv/g6": "^5.1.1",
     "@bx/shared": "workspace:*",
-    "dompurify": "^3.4.13",
-    "markdown-it": "^15.0.0",
+    "dompurify": "^3.4.16",
+    "markdown-it": "^14.1.0",
     "pinyin-pro": "^3.29.2",
     "vue": "^3.5.18",
     "vue-router": "^4.5.1"

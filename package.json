@@ -8,6 +8,7 @@
     "dev:web": "pnpm --filter @bx/web dev",
     "build": "pnpm --filter @bx/web build",
     "test": "pnpm --filter @bx/agent-server test",
-    "type-check": "pnpm --filter @bx/web type-check && pnpm --filter @bx/agent-server exec tsc --noEmit"
+    "type-check": "pnpm --filter @bx/web type-check && pnpm --filter @bx/agent-server exec tsc --noEmit",
+    "audit": "pnpm audit --registry=https://registry.npmjs.org"
   }
 }

@@ -625,6 +625,15 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>run_tool_code</code> 超时</td><td class="num">180s，上限 600s</td><td>到点杀子进程；再等 1.5s 收尾。stdout 截断到 12000 字符</td></tr>
 </tbody>
 </table>
+<p class="muted">部署与暴露面（<code>config.ts</code> / <code>app.ts</code>，2026-10-04）：</p>
+<table>
+<thead><tr><th>常量</th><th>默认</th><th>管什么</th></tr></thead>
+<tbody>
+<tr><td><code>HOST</code></td><td><code>127.0.0.1</code></td><td>监听地址。原先不指定 hostname 实际监听 <code>0.0.0.0</code>；改成默认只听本机，全网卡监听时启动打印告警</td></tr>
+<tr><td><code>AGENT_ADMIN_TOKEN</code></td><td>空（不启用）</td><td><code>/chat/*</code> 之外的全局端点（MCP 服务器管理 / 通知通道）要求 <code>x-admin-token</code> 头。未配置恒等放行，配了才启用</td></tr>
+<tr><td><code>RATE_LIMIT_ADMIN_PER_MIN</code></td><td class="num">30（0 关闭）</td><td>上述端点的限流，按来源 IP 计，带 <code>Retry-After</code>。压住反复 <code>reload</code> 不断 spawn</td></tr>
+</tbody>
+</table>
 
 <h3>六条关键护栏的实现意图</h3>
 <div class="grid g2">

@@ -7,3 +7,15 @@ allowBuilds:
 
 onlyBuiltDependencies:
   - esbuild
+
+# 依赖漏洞修复覆盖（pnpm 11 起不再读 package.json 的 pnpm.overrides）。
+# 只写传递依赖：lodash 走 mammoth > argparse，uuid / bl / fast-csv 走 exceljs。
+# 直接依赖（hono / dompurify / markdown-it）在各自 package.json 里升版本，不走覆盖。
+overrides:
+  # hono：MCP SDK 与 @hono/node-server 各自带一份旧副本（4.13.5 前有多条中危），统一抬到已修复版本。
+  hono: ^4.13.7
+  lodash: ^4.17.24
+  uuid: ^11.1.1
+  bl: ^4.0.3
+  fast-csv: ^4.3.6
+  "@fast-csv/parse": ^4.3.6
