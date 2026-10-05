@@ -175,6 +175,23 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 
 ---
 
+### 11.1 成本硬配额（OWASP LLM04 模型 DoS / LLM10）
+
+`cost.ts` 的预算**只告警不拦截**——真超预算时钱已经花出去了才在报告里看到一行红字。这里补拦截层：
+
+- 默认关闭（`COST_HARD_QUOTA` 未配 = 只告警），与改动前行为完全一致。
+- 开启后按**当日累计 token** 拒绝新的对话运行；**不掐在途运行**（半途掐断比超预算更糟：钱照花还丢结果）。
+- 拒绝落审计 `quota_exceeded`。
+- 局限：进程内计数，多实例部署是**每实例**的额度，需入口层或共享存储兜底（§15）。
+
+### 11.2 进程级指标（可观测）
+
+`GET /metrics` 输出 Prometheus 文本格式，零新依赖。与已有的 `/chat/metrics`（**按 owner 的历史聚合**，每次现扫 JSONL，看趋势）分工：这里看**当下**的速率与错误率，进程重启即清零。
+
+指标：`bx_agent_runs_total`、`bx_agent_llm_calls_total`、`bx_agent_llm_duration_ms`、`bx_agent_tool_calls_total`、`bx_agent_tool_duration_ms`、`bx_agent_tokens_total`、`bx_agent_rounds`、`bx_agent_http_requests_total`。
+
+注意：本路径不在 admin-gate 的豁免里——配了 `AGENT_ADMIN_TOKEN` 后抓取需带 `x-admin-token`；默认只听 `127.0.0.1`，本机抓取不受影响。
+
 ## 12. 凭据与密钥
 
 - 服务端密钥在 `.env`（已 gitignore，不进仓库）；`.data/mcp-servers.json` 中的 MCP 凭据**落盘时脱敏**（只返回键名）。
@@ -215,9 +232,10 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
 | 通用 PII / 出站 DLP | ❌ 未做 | 只做凭据形态打码（`src/redact.ts`），身份证/手机号等通用 PII 未过滤 |
 | SBOM + MCP 服务器来源校验 | ❌ 未做 | 依赖审计已有（非阻断 CI）；SBOM 未生成，MCP 服务器只校验命令白名单不校验来源 |
-| 进程级 metrics / OTLP 导出 | ❌ 未做 | 只有拉取式聚合端点；span 已挂 `gen_ai.*` 标准属性但无导出器 |
+| 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
+| OTLP 导出 | ❌ 未做 | span 已挂 `gen_ai.*` 标准属性名，但无 OTLP 导出器 |
 | 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
-| 成本硬配额 | 🟡 只告警 | `DAILY_TOKEN_BUDGET`/`RUN_TOKEN_BUDGET` 只产生 `budgetAlerts`，不拦截请求 |
+| 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。多实例时为**每实例**计数，需入口层兜底 |
 | 行为异常检测 | ❌ 未做 | 有完整留痕（trace/audit），无基线比对与异常告警 |
 
 ---
@@ -237,6 +255,8 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | 出站凭据打码（ASI05 / LLM06） | `src/redact.ts`、`src/chat.ts`（最终回答） |
 | 长期记忆防投毒（ASI04） | `src/memory.ts`（清洗）、`src/builtins.ts` + `src/audit.ts`（`memory_write`） |
 | OTel GenAI 语义属性（可观测互操作） | `src/trace.ts`（`SpanTrace.attrs`）、`src/chat.ts`（llm / tool span） |
+| 成本硬配额 | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts`（`quota_exceeded`） |
+| 进程级指标 | `src/process-metrics.ts`、`src/app.ts`（`GET /metrics`）、`src/chat.ts`（打点） |
 | 只读工具桥 | `src/tool-code.ts`（`toolCodeDenied`、`DENIED`） |
 | Prompt 注入定界 | `src/untrusted.ts` |
 | MCP 原生 SQL 只读闸 | `src/risk.ts`、`src/sql-readonly.ts` |

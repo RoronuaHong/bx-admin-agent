@@ -17,6 +17,7 @@ import { ensureSession, SESSION_COOKIE, touchSession, type Session } from "./ses
 import { resolveOwner } from "./owner.js";
 import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
+import { incCounter, renderPrometheus } from "./process-metrics.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -688,6 +689,15 @@ export function createApp() {
     // 所有 API 响应都不进浏览器/代理缓存：聊天、配置、审计、trace 都含私有数据，
     // no-store 杜绝「返回/前进」把上一个人的对话或令牌结果带出来（SSE 自身已设 no-cache）。
     c.header("Cache-Control", "no-store");
+    // 进程级指标：HTTP 层只记「方法 + 状态码」，不含路径（路径基数无界，会撑爆指标基数）。
+    try {
+      incCounter("bx_agent_http_requests_total", "HTTP 请求数（按方法与状态码）", {
+        method: c.req.method,
+        status: c.res.status,
+      });
+    } catch {
+      /* 指标打点不能影响响应 */
+    }
   });
 
   /**
@@ -739,6 +749,18 @@ export function createApp() {
   }
 
   app.get("/health", (c) => c.json({ ok: true, release: getRelease() }));
+
+  // ---- 进程级指标（P1 可观测）：Prometheus 抓取用的标准路径 ----
+  // 与 `/chat/metrics` 分工不同：后者是**按 owner 的历史聚合**（每次请求现扫 JSONL，看趋势）；
+  // 这里是**进程内实时计数**（模型/工具/运行/HTTP 打点累加，看当下的速率与错误率），
+  // 进程重启即清零——趋势看那边，实时看这边。
+  // 注意：本路径不在 admin-gate 的豁免里，配了 AGENT_ADMIN_TOKEN 后抓取需带 x-admin-token
+  // （与其它全局端点同口径；默认只听 127.0.0.1，本机抓取不受影响）。
+  app.get("/metrics", (c) => {
+    c.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+    c.header("Cache-Control", "no-store");
+    return c.body(renderPrometheus());
+  });
 
   // ---- 运行追踪（§10 最小版）：按 owner 过滤的 run 级查询（全局视角留给 CLI 直读 JSONL）----
   app.get("/chat/trace/runs", (c) => {

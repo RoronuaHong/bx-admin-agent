@@ -18,6 +18,7 @@ export type AuditDecision =
   | "subagent_refused" // 子代理尝试非只读操作被立即拒绝
   | "clarify_deferred" // 待澄清期间被冻结暂缓的非只读调用（未执行、未产生副作用）
   | "memory_write" // 长期记忆写入（OWASP ASI04 记忆投毒：留痕才能回溯是谁/哪次会话写进去的）
+  | "quota_exceeded" // 成本硬配额用尽，新运行被拒（OWASP LLM04 / LLM10）
   | "ownership_mismatch"; // 确认应答与当前会话不匹配
 
 export interface AuditEvent {

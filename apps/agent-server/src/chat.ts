@@ -67,6 +67,8 @@ import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 import { appendRoundTrace, appendSpanTrace } from "./trace.js";
 import { redactSecrets, countSecretHits } from "./redact.js";
+import { incCounter, observeSummary } from "./process-metrics.js";
+import { addDailyTokens, quotaState } from "./quota.js";
 import { readFileSync } from "node:fs";
 import { fsImportFile } from "./fs-store.js";
 
@@ -1477,6 +1479,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             "gen_ai.conversation.id": ctx.conversationId,
           },
         });
+        // 进程级指标（P1 可观测）：每次模型尝试一行，计数 + 耗时，供 Prometheus 抓取。
+        incCounter("bx_agent_llm_calls_total", "模型调用次数（按结果）", {
+          status: outcome.failure ? "error" : "ok",
+        });
+        observeSummary(
+          "bx_agent_llm_duration_ms",
+          "模型调用耗时（毫秒）",
+          { status: outcome.failure ? "error" : "ok" },
+          Math.max(0, Date.now() - llmStart),
+        );
       }
       if (!outcome.failure) {
         // 空回合（既无正文、也无工具调用、连思考都没有）不是「模型表示没有内容」，而是上游抖动：
@@ -2226,6 +2238,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             "gen_ai.conversation.id": ctx.conversationId,
           },
         });
+        incCounter("bx_agent_tool_calls_total", "工具调用次数（按结果）", {
+          status: executed && ok ? "ok" : "error",
+        });
+        observeSummary(
+          "bx_agent_tool_duration_ms",
+          "工具执行耗时（毫秒）",
+          { status: executed && ok ? "ok" : "error" },
+          Math.max(0, Date.now() - toolStart),
+        );
       }
     }
     // 每轮结束治理一次：给下一轮模型调用留出预算（超预算的大结果卸载到工作区）。
@@ -2565,6 +2586,27 @@ export async function* chatStream(
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string; runId?: string },
 ): AsyncGenerator<ChatEvent> {
+  // 成本硬配额（P1 / OWASP LLM04 模型 DoS）：开启后当日累计 token 达预算即拒绝**新的**运行。
+  // 只挡入口、不掐在途运行——半途掐断比超预算更糟（钱照花，还丢结果）。
+  const quota = quotaState();
+  if (!quota.allowed) {
+    console.warn(`[chat:quota] 当日 token 预算已用尽（${quota.used}/${quota.budget}），拒绝本次运行`);
+    appendAudit({
+      decision: "quota_exceeded",
+      conversationId,
+      ...(opts.ownerKey ? { ownerKey: opts.ownerKey } : {}),
+      tool: "chat",
+      level: "read",
+      reason: `daily token ${quota.used}/${quota.budget}`,
+    });
+    yield {
+      type: "error",
+      error: { code: "QUOTA_EXCEEDED", defaultMessage: "今日 token 预算已用尽" },
+      message: `今日 token 预算已用尽（${quota.used}/${quota.budget}），已停止接受新的对话。可调高 DAILY_TOKEN_BUDGET，或把 COST_HARD_QUOTA 改为非 on（只保留告警）。`,
+    };
+    yield { type: "done" };
+    return;
+  }
   const conversation = await getConversation(conversationId);
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
   const roleDefaultModel = conversation?.agentId ? getRole(conversation.agentId).defaultModel : undefined;
@@ -2856,6 +2898,12 @@ export async function* chatStream(
     modelFallbacks += 1;
     console.log(`[chat:fallback] model ${m.label} failed (${failure.slice(0, 200)}); trying next candidate`);
   }
+
+  // 进程级指标（P1 可观测）+ 成本硬配额累计：一次运行记一行。
+  incCounter("bx_agent_runs_total", "对话运行次数（按结果）", { status: failure ? "error" : "ok" });
+  incCounter("bx_agent_tokens_total", "运行累计 token", {}, Math.max(0, totalTokens));
+  observeSummary("bx_agent_rounds", "每次运行的工具轮数", {}, rounds);
+  addDailyTokens(totalTokens);
 
   const usage: ChatEvent = {
     type: "usage",

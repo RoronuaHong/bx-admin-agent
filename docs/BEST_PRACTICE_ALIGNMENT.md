@@ -71,12 +71,12 @@
 | --- | --- | --- |
 | 追踪 Trace | ✅ | run / round / span 三层，runId 关联审计，逐轮落盘 |
 | 评测 Eval | 🟡 | 有 G1–G7 测试闸门；**无在线评测 / 无人值守评测** |
-| 成本 Cost | 🟡 | 有聚合 + 预算告警 + 钉钉推送；**配额只告警不强制** |
+| 成本 Cost | 🟡 | 有聚合 + 预算告警 + 钉钉推送；**本轮新增可开启的硬配额**（`COST_HARD_QUOTA=on`，默认仍只告警） |
 | 安全 Security | 🟡 | 见 §2/§3；核心控制齐备，identity/sandbox/DLP 有缺口 |
 | 身份 Identity | ❌ | 匿名 cookie + 设备 owner；无登录/租户/NHI 治理 |
 | 异步 Async | ✅ | 执行与推送解耦、断线落库、专属会话回投、定时任务 |
 | 版本 Version | ✅ | release（git sha）贯穿 trace/eval 基线 |
-| 可观测 Observability | 🟡 | 有 TracePage + 端点；缺 metrics、缺 OTel 导出、缺行为检测 |
+| 可观测 Observability | 🟡 | 有 TracePage + 端点；**本轮新增进程级 `GET /metrics`**；仍缺 OTLP 导出与行为检测 |
 
 ---
 
@@ -87,7 +87,7 @@
 | 1 | 提示词注入检测 | 用分类器/规则检测注入 | 只做结构化定界，**不做检测** | ✅ 有意：检测必然退化为业务词写死，违反最高红线；以定界+只读桥+确认替代 |
 | 2 | Trace 格式 | OTel 语义约定 + OTLP | 自研 JSONL（**本轮已挂 `gen_ai.*` 标准属性**） | 🟡 部分有意：零依赖优先；属性名已对齐，导出器待补 |
 | 3 | 评测形态 | 在线/持续评测闭环 | 测试闸门（G1–G7） | 🟡 有意：评测层已随 analytics 拆分清理，现以测试承担回归 |
-| 4 | 成本治理 | 硬配额（超限拒绝） | 只告警不拦截 | 🟡 部分：免费链波动大，硬拦会误伤；建议改为**可开启**的硬配额 |
+| 4 | 成本治理 | 硬配额（超限拒绝） | 默认只告警；`COST_HARD_QUOTA=on` 时**可开启硬配额**（本轮补齐） | 🟡 部分：默认仍是告警（免费链波动大，默认硬拦会误伤），开启后 fail-closed |
 | 5 | MCP 白名单 | 默认启用工具 allowlist | 默认关闭（`MCP_ALLOWED_COMMANDS` 未配=放行） | ✅ 有意：单机开发机需自由加 MCP；生产部署清单要求显式配置 |
 | 6 | 子进程沙箱 | OS 级容器隔离 | 无沙箱，靠「环境白名单+超时+并发上限+只读桥」 | 🟡 无意（成本/平台限制），已在 `SECURITY.md` §8.4 诚实标注 |
 
@@ -96,9 +96,7 @@
 | 优先级 | 缺口 | 对应最佳实践 | 说明 |
 | --- | --- | --- | --- |
 | **P1** | 登录/租户 + NHI 生命周期治理 | ASI03 | 多端接入前置项；当前靠匿名 owner 最小权限 |
-| **P1** | 成本/token **硬配额**（可开关） | LLM04 / LLM10 | 现只有告警；建议 `COST_HARD_QUOTA=on` 时超限拒答 |
-| **P1** | 进程级 metrics（Prometheus） | OTel / ASI09 | 现只有拉取式聚合端点 |
-| **P1** | 在线/持续评测闭环 | OTel「遥测作为评测反馈回路」 | 现为测试闸门 |
+| **P1** | 在线/持续评测闭环 | OTel「遥测作为评测反馈回路」 | 现为测试闸门（G1–G7） |
 | **P2** | SBOM + MCP 服务器来源校验 | LLM05 / ASI06 | 依赖审计已有，SBOM 未做 |
 | **P2** | 通用 PII / 出站 DLP | LLM06 / ASI05 | 现只做凭据形态打码 |
 | **P2** | 按任务（per-run）工具 allowlist | LLM08 / ASI02 | 现全局工具集 |
@@ -118,6 +116,8 @@
 | ASI05 / LLM06 数据泄露 | 出站凭据打码（只认形态明确的凭据，保留类型标记） | `src/redact.ts`、`src/chat.ts`（最终回答落库前） |
 | ASI04 记忆投毒 | 写入前清洗控制符（保留 `\t\n\r`）+ 写入落审计 `memory_write` | `src/memory.ts`、`src/builtins.ts`、`src/audit.ts` |
 | ASI09 / OTel 互操作 | span 挂 `gen_ai.*` 标准属性（格式自有、语义标准） | `src/trace.ts`、`src/chat.ts` |
+| **P1 成本硬配额** | `COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET`：当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded` | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts` |
+| **P1 进程级 metrics** | `GET /metrics` 输出 Prometheus 文本格式；模型调用 / 工具调用 / 运行 / HTTP 四类打点，零新依赖 | `src/process-metrics.ts`、`src/app.ts`、`src/chat.ts` |
 
 ---
 
@@ -181,3 +181,43 @@ Tests  8 passed (8)
 | --- | --- |
 | 记忆写入审计 + 控制符清洗 | `addMemory` 落盘路径绑定 `.data/memory.json`，造实例会污染用户真实长期记忆；本次**仅代码审阅 + 类型检查 + 全量回归**。补测需先给 `memory.ts` 加可注入的存储目录 |
 | 出站脱敏的**真实模型作答**路径 | 依赖模型产出含凭据的文本；模型 402 期间无法构造，已以纯函数多形态实例覆盖 |
+
+### 9.7 实例六：真实服务端 `/metrics`（进程级指标）
+
+重启后实测（先抓一次基线，再跑一次 chat，再抓一次）：
+
+```
+1) GET /metrics status = 200 | content-type = text/plain; version=0.0.4; charset=utf-8
+3) 再次抓取 /metrics：
+     bx_agent_llm_calls_total{status="error"} 10      ← 模型 402，如实记为 error
+     bx_agent_llm_calls_total{status="ok"} 1
+     bx_agent_llm_duration_ms_count{status="error"} 10
+     bx_agent_rounds_count 1
+     bx_agent_runs_total{status="ok"} 1
+     bx_agent_tokens_total 2
+PASS：进程级指标已随运行累加
+```
+
+恢复常态实例后再连抓两次：
+
+```
+bx_agent_http_requests_total{method="GET",status="200"} 2
+```
+
+> 说明：HTTP 计数在响应中间件里、handler 之后打点，所以**本次抓取看到的是之前的请求数**（第一次抓取为空属预期，不是缺陷）。
+
+### 9.8 实例七：真实服务端成本硬配额
+
+以 `COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET=1` **单实例**启动（先停掉 pm2 常态实例，避免定时任务分布式锁冲突），全新实例连跑两次对话：
+
+```
+第 1 次: 放行
+第 2 次: 被拦截（QUOTA_EXCEEDED）
+PASS：配额在第 1 次累计后拦截了第 2 次
+```
+
+语义确认：只挡「已达预算之后的**新**运行」，**不掐在途运行**（半途掐断比超预算更糟）。验证后已杀掉临时实例、恢复 pm2 常态实例（`/health` 200）。
+
+> ⚠️ 事故与修复：本轮 `write_to_file` 直接覆盖了**已被 git 跟踪**的 `src/metrics.ts`（`8eff5e4` 提交的 `buildMetrics`，供 `/chat/metrics` 使用），
+> 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。
+> **教训：新建文件前必须先确认目标路径未被跟踪**（`git ls-files --error-unmatch <path>`）。
