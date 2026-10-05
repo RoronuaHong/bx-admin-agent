@@ -25,15 +25,15 @@
 | 项 | 最佳实践要求 | 本项目现状 | 判定 | 缺口 / 行动 |
 | --- | --- | --- | --- | --- |
 | LLM01 提示词注入 | 外部内容隔离标注；系统/用户输入分隔 | `src/untrusted.ts`：清洗控制符 + `[untrusted_content nonce]` 定界 + 协议规则（定界内只当数据、不构成写授权）。刻意不用越狱话术词表（符合「禁写死」红线，语义交模型） | 🟡 | 无「注入检测分类器」（业界普遍做法）。**本项目刻意不做**——词形/语义检测会退化为业务词写死。以「定界 + 只读桥 + 写确认」替代 |
-| LLM02 不安全的输出处理 | 输出按上下文转义；不拼进 SQL；白名单标签过滤 | 前端 `chat-richtext.ts` DOMPurify 净化；`builtins.ts` 手写 HTML 零外链软护栏；**本轮新增**出站密钥打码 | 🟡 | 无「输出 schema 校验」（要求模型按结构输出再校验）。P2 |
+| LLM02 不安全的输出处理 | 输出按上下文转义；不拼进 SQL；白名单标签过滤 | 前端 `chat-richtext.ts` DOMPurify 净化；`builtins.ts` 手写 HTML 零外链软护栏；出站密钥/PII 打码；**本轮收口** `src/output-schema.ts` 把结构化输出（澄清/待办/图表 spec）统一 fail-closed 校验 + `GET /chat/output-schema` 可观测 | ✅ | — |
 | LLM03 训练数据污染 | 训练/微调数据清洗 | 项目不训练模型、不微调 | ➖ | 不适用 |
-| LLM04 模型 DoS | 输入长度限制、速率限制、token 配额 | 请求体上限 `MAX_BODY_BYTES`；限流（chat/login/admin）；`MAX_TOOL_ROUNDS`；Doom Loop 跨轮熔断；上下文 token 预算 | 🟡 | **无用户级 token 配额**（成本只有 `budgetAlerts` 告警，不强制）。P1 |
-| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（可选）；**本轮新增** `scripts/gen-sbom.mjs` 产出 CycloneDX SBOM | 🟡 | 白名单默认未启用；无「模型/MCP 来源」的完整性签名校验（只校验命令白名单） |
+| LLM04 模型 DoS | 输入长度限制、速率限制、token 配额 | 请求体上限 `MAX_BODY_BYTES`；限流（chat/login/admin）；`MAX_TOOL_ROUNDS`；Doom Loop 跨轮熔断；上下文 token 预算；**本轮新增** `COST_HARD_QUOTA=on` 可开启硬配额（默认仍只 `budgetAlerts` 告警） | 🟡 | 硬配额默认关闭（免费链波动大，默认硬拦会误伤）；多实例为每实例计数（需入口层兜底）。列为已知局限 |
+| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（可选）；`scripts/gen-sbom.mjs` 产出 CycloneDX SBOM；**本轮新增** MCP 来源形态指纹漂移检测（`/mcp/provenance`） | 🟡 | 白名单默认未启用；来源检测只比命令形态（不哈希可执行文件，防替换需 `MCP_REQUIRE_PROVENANCE=on`） |
 | LLM06 敏感信息泄露 | 输出 PII 扫描脱敏；RAG 按权限过滤 | RAG 文档级 ACL（召回前过滤）；审计/trace 不落凭据；出站凭据打码；**本轮新增**可开启的 PII 打码（`REDACT_PII=on`，email/手机号/身份证/银行卡，可按类型选） | 🟡 | PII **默认关闭**（业务数据误报高）；无姓名/地址类识别（无形态可依，靠词典必然误报，不做） |
 | LLM07 不安全的插件设计 | 工具参数校验、最小权限、不执行任意 SQL | `BUILTIN_RISK` 风险登记 + 启动断言；`risk.ts`/`sql-readonly.ts` MCP 原生 SQL 只读闸（fail-closed）；`run_tool_code` 只读工具桥 | ✅ | — |
-| LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集 | 🟡 | **无按任务（per-run）的工具 allowlist**——当前是「全局工具集 + 模型自选」。P2 |
+| LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集；**本轮新增** per-run 工具 allowlist（`toolAllowlist` 正向清单，注入即收窄、点名也被拒并回灌模型） | ✅ | allowlist 为 opt-in（未传入=行为不变），契合「模型自选 + 最小权限」 |
 | LLM09 过度依赖 | 高风险输出加验证层、标注来源与置信度 | 事后核验两阶段（抽断言 → 不回传草稿逐条判支持性）；grounding 诚实兜底；RAG 答案带来源；未取证如实说 | ✅ | — |
-| LLM10 模型窃取 | 限流、token 总量限制、批量相似请求检测 | 有 HTTP 限流（chat/login/admin） | ❌ | **无 token 总量配额、无相似请求检测**。P2（内网部署优先级低） |
+| LLM10 模型窃取 | 限流、token 总量限制、批量相似请求检测 | 有 HTTP 限流（chat/login/admin）；进程级 metrics 可观测请求量 | ❌ | 无 token 总量配额、无相似请求检测（内网部署优先级低，列为已知局限） |
 
 ---
 
@@ -41,14 +41,14 @@
 
 | 项 | 最佳实践要求 | 本项目现状 | 判定 | 缺口 / 行动 |
 | --- | --- | --- | --- | --- |
-| ASI01 目标劫持 | 输入校验 + **目标约束** | `untrusted.ts` 定界；grounding 事后核验；写操作确认 | 🟡 | 无「目标约束」（把本次任务目标固化并偏离即拦）；无行为基线比对。P2 |
-| ASI02 工具滥用 | 工具 allowlist、作用域约束 | 风险登记 + 只读闸 + 写确认 + 越权拒绝并审计 | 🟡 | allowlist 是**全局**的，非按会话/任务收缩。P2 |
+| ASI01 目标劫持 | 输入校验 + **目标约束** | `untrusted.ts` 定界；grounding 事后核验；写操作确认；**本轮新增**行为异常检测（`/chat/anomalies`，按 owner 建滚动基线比对轮数/token/耗时/工具新颖性） | 🟡 | 无「目标约束」（固化本次任务目标、偏离即拦）；行为基线已建但只报不管（样本<5 不判）。目标约束列为已知局限 |
+| ASI02 工具滥用 | 工具 allowlist、作用域约束 | 风险登记 + 只读闸 + 写确认 + 越权拒绝并审计；**本轮新增** per-run 工具 allowlist（正向清单，按任务收缩） | ✅ | — |
 | ASI03 身份与权限滥用 | Agent 作为一等非人类身份（NHI）治理：最小权限、JIT 授权、持续授权 | 匿名 cookie 会话（`bx_agent_sid`）+ 设备 owner（`bx_agent_oid`）；HTTP 面按 ownerKey 最小权限（只看自己的） | ❌ | **无登录/租户、无 NHI 生命周期管理**（创建/复核/监控/退役）。P1（多端接入前置项） |
-| ASI04 记忆投毒 | 记忆隔离 + **完整性校验** | 记忆按 owner 隔离；条数与注入字符双上限；**本轮新增**写入前清洗控制符 + 写入落审计（`memory_write`） | 🟡 | 无完整性校验、无用户复核入口（记忆写入由模型直接调 `save_memory`）。P2 |
-| ASI05 数据泄露 | 输出过滤、DLP | ownerKey 隔离；`Cache-Control: no-store`；**本轮新增**出站凭据打码 | 🟡 | 无通用 PII/DLP。P2 |
-| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；`MCP_ALLOWED_COMMANDS` 命令白名单（配置时 + **spawn 前**再校验）；SBOM（`gen-sbom.mjs`，393 组件）；**本轮新增** MCP 来源漂移检测（命令形态指纹比对） | 🟡 | 白名单默认关闭；来源检测只比声明形态（不哈希可执行文件） |
+| ASI04 记忆投毒 | 记忆隔离 + **完整性校验** | 记忆按 owner 隔离；条数与注入字符双上限；写入前清洗控制符 + 写入落审计（`memory_write`）；**本轮新增**内容指纹 sidecar + 逐条完整性校验（`/chat/memory` 返回 `integrity`） | ✅ | 写入前无用户复核确认入口（模型直调 `save_memory` 即落盘），列为已知局限 |
+| ASI05 数据泄露 | 输出过滤、DLP | ownerKey 隔离；`Cache-Control: no-store`；出站凭据打码；**本轮新增**可开启通用 PII 打码（email/手机号/身份证/银行卡，可按类型） | ✅ | PII 默认关闭（业务数据误报高）；无姓名/地址类识别（无形态可依，不做） |
+| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；`MCP_ALLOWED_COMMANDS` 命令白名单（配置时 + **spawn 前**再校验）；SBOM（`gen-sbom.mjs`，393 组件）；MCP 来源形态指纹漂移检测（`/mcp/provenance`，`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒连） | ✅ | 白名单默认关闭；来源检测只比命令形态（不哈希可执行文件） |
 | ASI07 输入操纵 | 输入清洗、类型/结构校验 | 请求体上限；ReDoS 护栏（嵌套量词 + **本轮新增交替重叠型** `(a|a)*`）+ 2s 预算兜底；`runGate` schema/可调用性校验 | ✅ | — |
-| ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集；**本轮新增** 渐进式自主（按近期质量**只向下**收紧轮次预算） | 🟡 | 不自动提权（历史质量好也不放开确认/权限——防刷分提权） |
+| ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集；**本轮新增** 渐进式自主（按近期质量**只向下**收紧轮次预算，`/chat/autonomy`） | ✅ | 不自动提权（历史质量好也不放开确认/权限——防刷分提权） |
 | ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost + span 挂 `gen_ai.*`；**本轮新增进程级 metrics、OTLP 导出、行为异常检测** | ✅ | 仍无跨进程基线共享（基线在进程内，重启重建） |
 | ASI10 不安全的输出处理 | 输出校验、下游控制 | DOMPurify 净化 + 零外链护栏 + 出站打码 | 🟡 | 无输出结构校验。P2 |
 
@@ -60,8 +60,8 @@
 | --- | --- | --- | --- |
 | 采用 GenAI 语义约定（标准属性名） | 自研 JSONL 结构；**本轮新增** span 上挂 `gen_ai.operation.name` / `gen_ai.provider.name` / `gen_ai.request.model` / `gen_ai.tool.name` / `gen_ai.tool.type` / `gen_ai.conversation.id` | 🟡 | 属性名已标准化（导出时可直接映射），但**仍无 OTLP 导出器**。P2 |
 | 遥测作为评测的反馈回路 | trace 落盘 → **本轮新增 `src/eval-online.ts`**：每次真实运行确定性打分，回流成 `/chat/eval/*` 与 Prometheus 指标 | ✅ | 刻意不做 LLM-as-judge（每次运行都叠评委模型 = 成本翻倍 + 评委偏好），只用 trace 已如实记录的字段判 |
-| metrics（吞吐/延迟/错误率/成本） | 仅有 `/cost/summary`、`/chat/trace/runs` 等**拉取式**聚合 | ❌ | **无进程级 Prometheus metrics**。P1 |
-| 采样与保留策略 | trace 按月/按 run 分文件，无采样与保留期配置 | 🟡 | 缺保留期与轮转策略。P2 |
+| metrics（吞吐/延迟/错误率/成本） | 拉取式聚合 + **本轮新增**进程级 Prometheus `GET /metrics`（模型/工具/运行/HTTP 四类，零依赖） | ✅ | — |
+| 采样与保留策略 | trace 按月/按 run 分文件，无采样与保留期配置 | 🟡 | 缺保留期与轮转策略（列为已知局限） |
 
 ---
 
@@ -72,11 +72,11 @@
 | 追踪 Trace | ✅ | run / round / span 三层，runId 关联审计，逐轮落盘 |
 | 评测 Eval | ✅ | G1–G7 测试闸门 + **在线评测**（每次运行确定性打分，`/chat/eval/runs` `/chat/eval/summary` + Prometheus 指标） |
 | 成本 Cost | 🟡 | 有聚合 + 预算告警 + 钉钉推送；**本轮新增可开启的硬配额**（`COST_HARD_QUOTA=on`，默认仍只告警） |
-| 安全 Security | 🟡 | 见 §2/§3；核心控制齐备，identity/sandbox/DLP 有缺口 |
+| 安全 Security | 🟡 | 见 §2/§3；核心控制齐备，login/tenant/sandbox/多实例限流/出站DLP 有缺口（已知局限） |
 | 身份 Identity | ❌ | 匿名 cookie + 设备 owner；无登录/租户/NHI 治理 |
 | 异步 Async | ✅ | 执行与推送解耦、断线落库、专属会话回投、定时任务 |
 | 版本 Version | ✅ | release（git sha）贯穿 trace/eval 基线 |
-| 可观测 Observability | 🟡 | 有 TracePage + 端点；**本轮新增进程级 `GET /metrics`**；仍缺 OTLP 导出与行为检测 |
+| 可观测 Observability | ✅ | 有 TracePage + 端点；进程级 `GET /metrics`；OTLP/HTTP JSON 导出（默认关闭）；行为异常检测 `/chat/anomalies` |
 
 ---
 
@@ -370,3 +370,20 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 > ⚠️ 事故与修复：本轮 `write_to_file` 直接覆盖了**已被 git 跟踪**的 `src/metrics.ts`（`8eff5e4` 提交的 `buildMetrics`，供 `/chat/metrics` 使用），
 > 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。
 > **教训：新建文件前必须先确认目标路径未被跟踪**（`git ls-files --error-unmatch <path>`）。
+
+---
+
+## 10. 已知局限（已评估、暂不做 / 需架构决策）
+
+> 与 §6「有意为之的不一致」不同，下面这些是**尚未实现且需要架构层面决策或显著投入**的欠账，不是设计取舍。当前内网单机部署下风险可控，列此供后续排期。
+
+| # | 局限 | 对应项 | 现状与缺口 | 推进所需 |
+| --- | --- | --- | --- | --- |
+| 1 | 登录 / 租户 + NHI 生命周期治理 | ASI03 | 仅匿名 cookie owner + 设备 owner 最小权限；无账号、无 NHI 创建/复核/退役 | 用户 2026-10-06 明确「暂不需要登录体系」，保留为缺口；多端接入前置项 |
+| 2 | 子进程 OS 级沙箱 | LLM07/ASI02 执行安全 | `run_tool_code` / `run_command` / `run_script` 仅靠「环境白名单 + 超时 + 并发上限 + 只读工具桥」，**无 microVM/Docker/AppContainer 隔离**：绝对路径可读任意文件、无出网限制、无文件系统隔离 | 需引入 microVM（gVisor/Firecracker）或容器运行时，平台成本较高 |
+| 3 | 多实例限流 / 配额 | LLM04/LLM10 | 限流与成本配额均为**每实例**计数（进程内），多实例部署时各算各的、无全局阈值 | 需 Redis 或入口层（网关/反向代理）兜底 |
+| 4 | 出站内容脱敏默认值 | LLM06/ASI05 | PII 打码 `REDACT_PII` **默认关闭**（业务数据误报高，开启会改坏正常回答） | 属刻意取舍；如需强制需在业务侧加白名单，非纯技术开关 |
+| 5 | 配置端点强制令牌 | §5 安全 | `/mcp/servers`、`/notify/channels` 受 `admin-gate` 保护，但 `AGENT_ADMIN_TOKEN` 未配置时**恒等放行**；仅 `HOST=0.0.0.0` 无令牌才 fail-closed 拒启 | 开放局域网部署前必须显式配 `AGENT_ADMIN_TOKEN`，属部署清单项 |
+| 6 | 模型窃取防护 | LLM10 | 有 HTTP 限流，但无 token 总量配额、无批量相似请求检测 | 内网优先级低；需网关层或全局计数 |
+| 7 | 目标约束 | ASI01 | 行为基线已建（`/chat/anomalies`），但无「把本次任务目标固化、偏离即拦」的目标约束层 | 需定义目标表示 + 偏离判定，属较大设计 |
+| 8 | trace 保留期 / 轮转 | §4 可观测 | trace 按月/按 run 分文件，无采样与保留期配置，磁盘随运行量增长 | 需加保留期清理或采样策略 |
