@@ -3,8 +3,9 @@
 // 复用 deep-agent-live 的 mock 手法：本地 mock OpenAI SSE 服务驱动真实 runLoop。
 import { test, expect, beforeAll, afterAll } from "vitest";
 import http from "node:http";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 process.env.MONGO_URI = "mongodb://127.0.0.1:1";
 process.env.MODEL_PROVIDERS = "mock";
@@ -50,8 +51,15 @@ const server = http.createServer(async (req, res) => {
 let chatStream: (typeof import("../src/chat.js"))["chatStream"];
 let createConversation: (typeof import("../src/conversations.js"))["createConversation"];
 let fsRemoveConversation: (typeof import("../src/fs-store.js"))["fsRemoveConversation"];
+let setTraceDir: (dir?: string) => void = () => {};
+// 落盘目录指向临时目录：测试产物不写进真实 .data/traces（真实目录会被测试文件堆满，
+// 保留期清理还会把它们当孤儿删掉，真实排障数据与测试数据混在一起无法分辨）。
+let traceDir = "";
 
 beforeAll(async () => {
+  traceDir = mkdtempSync(join(tmpdir(), "trace-rounds-"));
+  ({ setTraceDirForTest: setTraceDir } = await import("../src/trace.js"));
+  setTraceDir(traceDir);
   await new Promise<void>((resolve) => server.listen(PORT, "127.0.0.1", resolve));
   ({ chatStream } = await import("../src/chat.js"));
   ({ createConversation } = await import("../src/conversations.js"));
@@ -59,11 +67,8 @@ beforeAll(async () => {
 });
 afterAll(() => {
   server.close();
-  try {
-    unlinkSync(resolve(process.cwd(), ".data", "traces", `rounds-${RUN_ID}.jsonl`));
-  } catch {
-    /* 已清理或不存在 */
-  }
+  setTraceDir(); // 还原默认目录，避免影响同进程内其它用例
+  if (traceDir) rmSync(traceDir, { recursive: true, force: true });
 });
 
 test("每轮工具循环都落一条逐轮 trace（按 runId 分文件）", async () => {
@@ -76,7 +81,7 @@ test("每轮工具循环都落一条逐轮 trace（按 runId 分文件）", asyn
   }
   fsRemoveConversation("verify-rounds");
 
-  const file = resolve(process.cwd(), ".data", "traces", `rounds-${RUN_ID}.jsonl`);
+  const file = resolve(traceDir, `rounds-${RUN_ID}.jsonl`);
   expect(existsSync(file), "应落盘 rounds-<runId>.jsonl").toBe(true);
   const lines = readFileSync(file, "utf-8").split("\n").filter(Boolean);
   expect(lines.length, "至少每轮一行").toBeGreaterThanOrEqual(1);

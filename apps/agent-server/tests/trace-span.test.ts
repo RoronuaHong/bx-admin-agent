@@ -1,9 +1,24 @@
 // span 级追踪（llm / tool 分层，src/trace.ts）：
 // run 级说「这次运行怎么样」，轮级说「每轮做了什么」，都回答不了「时间花在哪一次调用上」。
 // 这里覆盖：按 runId 分文件 append-only、按时间正序读回、以及归属校验用的 run 回查。
-import { test, expect } from "vitest";
+import { test, expect, beforeAll, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
-import { appendSpanTrace, findRunTrace, listSpanTraces } from "../src/trace.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { appendSpanTrace, findRunTrace, listSpanTraces, setTraceDirForTest } from "../src/trace.js";
+
+// 落盘目录指向临时目录：测试产物不写进真实 .data/traces（否则真实目录被测试文件堆满，
+// 保留期清理还会把它们当孤儿删掉，真实排障数据与测试数据混在一起无法分辨）。
+let dir = "";
+beforeAll(() => {
+  dir = mkdtempSync(join(tmpdir(), "trace-span-"));
+  setTraceDirForTest(dir);
+});
+afterAll(() => {
+  setTraceDirForTest();
+  if (dir) rmSync(dir, { recursive: true, force: true });
+});
 
 test("span 按 runId 分文件落盘，读回保持写入顺序（调用链要看顺序）", () => {
   const runId = `run_span_${randomUUID()}`;

@@ -3,14 +3,28 @@
 // 是「看得见每一次运行」的地基——排障、评测基线、成本聚合都从这里起步。
 // 状态统计取自任务事件缓冲（usage / model / error 事件），零侵入模型循环。
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-/** trace 落盘目录（成本聚合消费同一份 JSONL）。 */
-export const TRACE_DIR = resolve(__dirname, "..", ".data", "traces");
+/** trace 落盘目录默认值（成本聚合消费同一份 JSONL）。 */
+export const TRACE_DIR_DEFAULT = resolve(__dirname, "..", ".data", "traces");
+/**
+ * 当前生效的落盘目录。默认值单独拆出是为了**测试隔离**：
+ * 测试若写真实目录，runs/rounds/spans 会被测试数据堆满，保留期清理还会把它们当孤儿删掉，
+ * 既污染真实排障数据、也让「清理是否正常」无法判断。测试用 setTraceDirForTest 指向临时目录。
+ */
+let activeDir = TRACE_DIR_DEFAULT;
+/** 当前生效的 trace 落盘目录。 */
+export function getTraceDir(): string {
+  return activeDir;
+}
+/** 仅测试用：把落盘目录指向临时目录；传 undefined / 空白则还原为默认值。 */
+export function setTraceDirForTest(dir?: string): void {
+  activeDir = dir?.trim() || TRACE_DIR_DEFAULT;
+}
 
 export type RunStatus = "success" | "failed" | "cancelled";
 
@@ -71,13 +85,13 @@ export function newRunId(): string {
 function monthFile(at: number): string {
   const d = new Date(at);
   const ym = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
-  return resolve(TRACE_DIR, `runs-${ym}.jsonl`);
+  return resolve(activeDir, `runs-${ym}.jsonl`);
 }
 
 /** 追加一条 run 级追踪；append-only，失败仅告警不抛错（best-effort，不阻断对话）。 */
 export function appendRunTrace(trace: RunTrace): void {
   try {
-    mkdirSync(TRACE_DIR, { recursive: true });
+    mkdirSync(activeDir, { recursive: true });
     appendFileSync(monthFile(trace.at), `${JSON.stringify(trace)}\n`, "utf-8");
   } catch (err) {
     console.warn(`[trace] 写入失败：${String((err as Error)?.message || err)}`);
@@ -105,13 +119,13 @@ export interface RoundTrace {
 }
 
 function roundFile(runId: string): string {
-  return resolve(TRACE_DIR, `rounds-${runId}.jsonl`);
+  return resolve(activeDir, `rounds-${runId}.jsonl`);
 }
 
 /** 追加一条逐轮快照；best-effort，失败仅告警不抛错（不阻断对话）。 */
 export function appendRoundTrace(entry: RoundTrace): void {
   try {
-    mkdirSync(TRACE_DIR, { recursive: true });
+    mkdirSync(activeDir, { recursive: true });
     appendFileSync(roundFile(entry.runId), `${JSON.stringify(entry)}\n`, "utf-8");
   } catch (err) {
     console.warn(`[trace] 逐轮写入失败：${String((err as Error)?.message || err)}`);
@@ -148,13 +162,13 @@ export interface SpanTrace {
 }
 
 function spanFile(runId: string): string {
-  return resolve(TRACE_DIR, `spans-${runId}.jsonl`);
+  return resolve(activeDir, `spans-${runId}.jsonl`);
 }
 
 /** 追加一条 span；best-effort，失败仅告警不抛错（不阻断对话）。 */
 export function appendSpanTrace(entry: SpanTrace): void {
   try {
-    mkdirSync(TRACE_DIR, { recursive: true });
+    mkdirSync(activeDir, { recursive: true });
     appendFileSync(spanFile(entry.runId), `${JSON.stringify(entry)}\n`, "utf-8");
   } catch (err) {
     console.warn(`[trace] span 写入失败：${String((err as Error)?.message || err)}`);
@@ -189,15 +203,15 @@ export function listSpanTraces(runId: string, limit = 200): SpanTrace[] {
  */
 export function findRunTrace(runId: string): RunTrace | undefined {
   const id = String(runId || "").trim();
-  if (!id || !existsSync(TRACE_DIR)) return undefined;
-  const files = readdirSync(TRACE_DIR)
+  if (!id || !existsSync(activeDir)) return undefined;
+  const files = readdirSync(activeDir)
     .filter((name) => /^runs-\d{6}\.jsonl$/.test(name))
     .sort()
     .reverse();
   for (const file of files) {
     let lines: string[] = [];
     try {
-      lines = readFileSync(resolve(TRACE_DIR, file), "utf-8").split("\n").reverse();
+      lines = readFileSync(resolve(activeDir, file), "utf-8").split("\n").reverse();
     } catch {
       continue;
     }
@@ -223,9 +237,9 @@ export interface RunTraceFilter {
 /** 只读查询：按时间倒序返回最近 N 条（ownerKey 过滤在读取侧做，与审计同口径）。 */
 export function listRunTraces(filter: RunTraceFilter = {}): RunTrace[] {
   const limit = Math.max(1, Math.min(200, Math.floor(Number(filter.limit)) || 50));
-  if (!existsSync(TRACE_DIR)) return [];
+  if (!existsSync(activeDir)) return [];
   const out: RunTrace[] = [];
-  const files = readdirSync(TRACE_DIR)
+  const files = readdirSync(activeDir)
     .filter((name) => /^runs-\d{6}\.jsonl$/.test(name))
     .sort()
     .reverse();
@@ -233,7 +247,7 @@ export function listRunTraces(filter: RunTraceFilter = {}): RunTrace[] {
     if (out.length >= limit) break;
     let lines: string[] = [];
     try {
-      lines = readFileSync(resolve(TRACE_DIR, file), "utf-8").split("\n").reverse();
+      lines = readFileSync(resolve(activeDir, file), "utf-8").split("\n").reverse();
     } catch {
       continue;
     }
@@ -269,19 +283,31 @@ export const TRACE_RETENTION_MS_DEFAULT = 30 * 24 * 60 * 60 * 1000;
 export interface TraceCleanupResult {
   /** 因超出保留期被裁剪掉的过期 run 条数（整月删除的文件不计逐条）。 */
   expiredRuns: number;
-  /** 被删除的文件数（整月 runs 文件 + 孤立/过期的 rounds-/spans- 文件）。 */
+  /** 被删除的文件数（整月 runs 文件 + 孤立/过期的 rounds-/spans- 文件 + 旧格式遗留文件）。 */
   deletedFiles: number;
+  /** 其中属于旧格式遗留（`<uuid>.jsonl`，无读取方）被回收的文件数。 */
+  legacyFiles: number;
 }
+
+/**
+ * 旧格式遗留文件：`<uuid>.jsonl`（一个 span 一行、runId 即文件名）。
+ * 这是早期「每 span 一个文件」写法留下的，当前代码已无任何读取方
+ * （cost / listRunTraces / listSpanTraces 一律只认 `runs-\d{6}` 与 `spans-<runId>` 精确路径），
+ * 但它们仍实打实占着磁盘，故一并按 mtime 回收。
+ */
+const LEGACY_SPAN_FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
 
 /**
  * 清理超出保留期的 trace 文件（幂等，可重复调用）：
  * - `runs-YYYYMM.jsonl`：整月早于保留期起点的整文件删除；否则逐行裁剪（`at`<cutoff 的 run 删除、
  *   其余保留），同时收集「仍在保留期内的 runId」用于判断 rounds-/spans- 是否孤立。
  * - `rounds-<runId>.jsonl` / `spans-<runId>.jsonl`：runId 不在有效集合内即删除（过期或孤儿）。
- * 损坏的 run 行保留不删（宁可留痕，避免误删）；保留期关闭（<=0）或目录不存在时直接返回零值。
+ * - 旧格式 `<uuid>.jsonl`：无读取方，按文件 mtime 过期即删。
+ * 损坏的 run 行保留不删（宁可留痕，避免误删）；**不匹配上述任一形态的文件一律不动**
+ * （如 analytics 子系统的 analytics-standalone.jsonl）；保留期关闭（<=0）或目录不存在时返回零值。
  */
-export function cleanupTraceDir(dir: string = TRACE_DIR, retentionMs = getTraceRetentionMs()): TraceCleanupResult {
-  const result: TraceCleanupResult = { expiredRuns: 0, deletedFiles: 0 };
+export function cleanupTraceDir(dir: string = activeDir, retentionMs = getTraceRetentionMs()): TraceCleanupResult {
+  const result: TraceCleanupResult = { expiredRuns: 0, deletedFiles: 0, legacyFiles: 0 };
   if (retentionMs <= 0 || !existsSync(dir)) return result;
   const cutoff = Date.now() - retentionMs;
   const cutoffYm = `${new Date(cutoff).getFullYear()}${String(new Date(cutoff).getMonth() + 1).padStart(2, "0")}`;
@@ -329,6 +355,19 @@ export function cleanupTraceDir(dir: string = TRACE_DIR, retentionMs = getTraceR
       try { unlinkSync(resolve(dir, name)); result.deletedFiles++; } catch { /* 忽略 */ }
     }
   }
+  // 旧格式遗留（每 span 一文件、无读取方）：按 mtime 过期即删。stat 失败就跳过，绝不误删。
+  for (const name of names) {
+    if (!LEGACY_SPAN_FILE_RE.test(name)) continue;
+    const full = resolve(dir, name);
+    try {
+      if (statSync(full).mtimeMs >= cutoff) continue;
+      unlinkSync(full);
+      result.legacyFiles++;
+      result.deletedFiles++;
+    } catch {
+      /* 忽略 */
+    }
+  }
   return result;
 }
 
@@ -339,7 +378,7 @@ export function startTraceRetentionSweeper(): void {
     try {
       const r = cleanupTraceDir();
       if (r.deletedFiles || r.expiredRuns) {
-        console.log(`[trace] 启动清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}`);
+        console.log(`[trace] 启动清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}（含旧格式遗留 ${r.legacyFiles}）`);
       }
     } catch (err) {
       console.warn(`[trace] 启动清理失败：${String((err as Error)?.message || err)}`);
@@ -349,7 +388,7 @@ export function startTraceRetentionSweeper(): void {
     try {
       const r = cleanupTraceDir();
       if (r.deletedFiles || r.expiredRuns) {
-        console.log(`[trace] 周期清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}`);
+        console.log(`[trace] 周期清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}（含旧格式遗留 ${r.legacyFiles}）`);
       }
     } catch (err) {
       console.warn(`[trace] 周期清理失败：${String((err as Error)?.message || err)}`);

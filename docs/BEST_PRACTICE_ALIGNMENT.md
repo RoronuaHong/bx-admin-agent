@@ -380,6 +380,19 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 - `rounds-<runId>.jsonl` / `spans-<runId>.jsonl`：runId 不在「本轮仍在保留期内」的集合即删——过期 run 的明细，
   以及**孤儿**明细文件（对应 run 记录早已不存在）一并回收，避免明细文件比 run 活得久。
 - 损坏的 run 行**保留不删**（宁可留痕，不误删证据）；`TRACE_RETENTION_DAYS` 未配=30 天，配 `<=0`=关闭清理（不启用扫描器）。
+- **旧格式遗留**（`<uuid>.jsonl`，早期「每 span 一文件」写法）：当前代码**无任何读取方**
+  （`cost.ts` / `listRunTraces` / `listSpanTraces` 一律只认 `runs-\d{6}` 与 `spans-<runId>` 精确路径），
+  但实打实占磁盘，故按 mtime 一并回收。**不匹配任何已知形态的文件一律不动**（如 analytics 的
+  `analytics-standalone.jsonl`），避免误伤别的子系统。
+
+> **实例验证（真实目录，已备份可回滚）**：3178 文件 / 4.28MB → 2834 文件 / 3.56MB，
+> 回收 344 文件（其中旧格式遗留 264 + 孤立明细 80），`expiredRuns=0`（两个月度文件都在保留期内）。
+> 核对：analytics 文件未动、遗留文件剩余 2684 且最早为 09/07（正好是 30 天边界）——mtime 判定精确。
+
+> ⚠️ 顺带发现并修复的真实缺陷：`trace-span.test.ts` / `round-trace.test.ts` 一直往**生产** `.data/traces`
+> 写文件（`spans-run_span_*`、`rounds-run_unit_rounds`），此前每跑一次测试就堆一批，
+> 既污染真实排障数据、又会被保留期清理当孤儿删掉。已加 `setTraceDirForTest()` 把测试落盘重定向到临时目录；
+> 验证方式很直接——跑完全量测试后真实目录文件数 **3178 → 3178 零变化**（修复前必然增长）。
 
 > 残留：仍无**采样**（全量落盘）。高频部署下磁盘减量要靠缩短保留期而非采样；真要采样需先定「哪些 run 可丢」
 > 的口径（排障/评测/成本三类的保留需求不同），属设计决策，未做。

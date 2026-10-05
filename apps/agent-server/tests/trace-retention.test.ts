@@ -2,7 +2,7 @@
 // 落盘随运行量增长，需按 TRACE_RETENTION_DAYS（默认 30 天）回收过期 run / rounds / spans 文件。
 // 用临时目录隔离，直接验证 cleanupTraceDir 的裁剪与孤立文件回收语义。
 import { test, expect } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupTraceDir, getTraceRetentionMs } from "../src/trace.js";
@@ -23,7 +23,7 @@ test("保留期关闭（<=0）时不清理", () => {
   try {
     writeFileSync(join(dir, "runs-202001.jsonl"), runLine("r1", 1) + "\n");
     const r = cleanupTraceDir(dir, 0);
-    expect(r).toEqual({ expiredRuns: 0, deletedFiles: 0 });
+    expect(r).toEqual({ expiredRuns: 0, deletedFiles: 0, legacyFiles: 0 });
     expect(existsSync(join(dir, "runs-202001.jsonl"))).toBe(true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -110,5 +110,44 @@ test("getTraceRetentionMs：默认 30 天，环境变量按天覆盖，<=0 关�
   } finally {
     if (prev === undefined) delete process.env.TRACE_RETENTION_DAYS;
     else process.env.TRACE_RETENTION_DAYS = prev;
+  }
+});
+
+test("旧格式遗留 <uuid>.jsonl：过期按 mtime 回收，在期的保留", () => {
+  const dir = tmp();
+  try {
+    const old = join(dir, "00075f7f-6b98-4813-8fb2-d9bb247ac251.jsonl");
+    const fresh = join(dir, "001ad457-3785-499e-9b1b-aac345061215.jsonl");
+    writeFileSync(old, "{}\n");
+    writeFileSync(fresh, "{}\n");
+    // 把 old 的 mtime 推到保留期之外（60 天前），fresh 保持当下。
+    const past = new Date(Date.now() - 60 * DAY);
+    utimesSync(old, past, past);
+    const r = cleanupTraceDir(dir, 30 * DAY);
+    expect(r.legacyFiles).toBe(1);
+    expect(r.deletedFiles).toBe(1);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("不匹配任何已知形态的文件一律不动（如 analytics 子系统的 standalone 文件）", () => {
+  const dir = tmp();
+  try {
+    const keep = join(dir, "analytics-standalone.jsonl");
+    const notes = join(dir, "notes.json");
+    writeFileSync(keep, "{}\n");
+    writeFileSync(notes, "{}\n");
+    const past = new Date(Date.now() - 365 * DAY);
+    utimesSync(keep, past, past);
+    utimesSync(notes, past, past);
+    const r = cleanupTraceDir(dir, 1 * DAY);
+    expect(r.legacyFiles).toBe(0);
+    expect(existsSync(keep)).toBe(true);
+    expect(existsSync(notes)).toBe(true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

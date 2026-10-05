@@ -4,7 +4,7 @@
 // unpricedTokens，如实显示"未定价"，绝不编造金额。
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { TRACE_DIR, type RunTrace } from "./trace.js";
+import { getTraceDir, type RunTrace } from "./trace.js";
 
 export interface CostBucket {
   runs: number;
@@ -38,8 +38,9 @@ function addTo(bucket: CostBucket, run: RunTrace, tokens: number): void {
 }
 
 function monthFilesInRange(from: number, to: number): string[] {
-  if (!existsSync(TRACE_DIR)) return [];
-  return readdirSync(TRACE_DIR)
+  const dir = getTraceDir();
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
     .filter((name) => /^runs-\d{6}\.jsonl$/.test(name))
     .sort()
     .reverse()
@@ -65,7 +66,7 @@ export function summarizeCost(filter: { ownerKey?: string; days?: number } = {})
   for (const file of monthFilesInRange(from.getTime(), now)) {
     let lines: string[] = [];
     try {
-      lines = readFileSync(resolve(TRACE_DIR, file), "utf-8").split("\n");
+      lines = readFileSync(resolve(getTraceDir(), file), "utf-8").split("\n");
     } catch {
       continue;
     }
