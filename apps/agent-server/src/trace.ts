@@ -3,7 +3,7 @@
 // 是「看得见每一次运行」的地基——排障、评测基线、成本聚合都从这里起步。
 // 状态统计取自任务事件缓冲（usage / model / error 事件），零侵入模型循环。
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -251,4 +251,109 @@ export function listRunTraces(filter: RunTraceFilter = {}): RunTrace[] {
     }
   }
   return out;
+}
+
+// ---- 保留期清理（§10 #8）：trace 落盘随运行量增长，需保留期回收，默认 30 天 ----
+
+/** 保留期（毫秒）。可通过 `TRACE_RETENTION_DAYS` 配置天数；未配置=默认 30 天；<=0=不清理。 */
+export function getTraceRetentionMs(): number {
+  const raw = (process.env.TRACE_RETENTION_DAYS || "").trim();
+  if (!raw) return TRACE_RETENTION_MS_DEFAULT;
+  const days = Number(raw);
+  if (!Number.isFinite(days) || days <= 0) return 0;
+  return Math.round(days * 24 * 60 * 60 * 1000);
+}
+
+export const TRACE_RETENTION_MS_DEFAULT = 30 * 24 * 60 * 60 * 1000;
+
+export interface TraceCleanupResult {
+  /** 因超出保留期被裁剪掉的过期 run 条数（整月删除的文件不计逐条）。 */
+  expiredRuns: number;
+  /** 被删除的文件数（整月 runs 文件 + 孤立/过期的 rounds-/spans- 文件）。 */
+  deletedFiles: number;
+}
+
+/**
+ * 清理超出保留期的 trace 文件（幂等，可重复调用）：
+ * - `runs-YYYYMM.jsonl`：整月早于保留期起点的整文件删除；否则逐行裁剪（`at`<cutoff 的 run 删除、
+ *   其余保留），同时收集「仍在保留期内的 runId」用于判断 rounds-/spans- 是否孤立。
+ * - `rounds-<runId>.jsonl` / `spans-<runId>.jsonl`：runId 不在有效集合内即删除（过期或孤儿）。
+ * 损坏的 run 行保留不删（宁可留痕，避免误删）；保留期关闭（<=0）或目录不存在时直接返回零值。
+ */
+export function cleanupTraceDir(dir: string = TRACE_DIR, retentionMs = getTraceRetentionMs()): TraceCleanupResult {
+  const result: TraceCleanupResult = { expiredRuns: 0, deletedFiles: 0 };
+  if (retentionMs <= 0 || !existsSync(dir)) return result;
+  const cutoff = Date.now() - retentionMs;
+  const cutoffYm = `${new Date(cutoff).getFullYear()}${String(new Date(cutoff).getMonth() + 1).padStart(2, "0")}`;
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return result;
+  }
+  const activeRunIds = new Set<string>();
+  for (const name of names) {
+    const m = /^runs-(\d{6})\.jsonl$/.exec(name);
+    if (!m) continue;
+    const ym = m[1];
+    const full = resolve(dir, name);
+    if (ym < cutoffYm) {
+      // 整月早于保留期起点：该月所有 run 都过期，整文件删除（不逐条统计）。
+      try { unlinkSync(full); result.deletedFiles++; } catch { /* 忽略 */ }
+      continue;
+    }
+    let content: string;
+    try { content = readFileSync(full, "utf-8"); } catch { continue; }
+    const kept: string[] = [];
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      let run: RunTrace | undefined;
+      try { run = JSON.parse(line) as RunTrace; } catch { kept.push(line); continue; }
+      if (typeof run.at === "number" && run.at >= cutoff) {
+        if (run.runId) activeRunIds.add(run.runId);
+        kept.push(line);
+      } else {
+        result.expiredRuns++;
+      }
+    }
+    if (kept.length === 0) {
+      try { unlinkSync(full); result.deletedFiles++; } catch { /* 忽略 */ }
+    } else {
+      try { writeFileSync(full, kept.join("\n") + "\n", "utf-8"); } catch { /* 忽略 */ }
+    }
+  }
+  for (const name of names) {
+    const pm = /^(rounds|spans)-(.+)\.jsonl$/.exec(name);
+    if (!pm) continue;
+    if (!activeRunIds.has(pm[2])) {
+      try { unlinkSync(resolve(dir, name)); result.deletedFiles++; } catch { /* 忽略 */ }
+    }
+  }
+  return result;
+}
+
+/** 启动周期清理：启动时跑一次，之后每天一次（不阻止进程退出）。保留期关闭（<=0）时不启用。 */
+export function startTraceRetentionSweeper(): void {
+  if (getTraceRetentionMs() <= 0) return;
+  void Promise.resolve().then(() => {
+    try {
+      const r = cleanupTraceDir();
+      if (r.deletedFiles || r.expiredRuns) {
+        console.log(`[trace] 启动清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}`);
+      }
+    } catch (err) {
+      console.warn(`[trace] 启动清理失败：${String((err as Error)?.message || err)}`);
+    }
+  });
+  const timer = setInterval(() => {
+    try {
+      const r = cleanupTraceDir();
+      if (r.deletedFiles || r.expiredRuns) {
+        console.log(`[trace] 周期清理：过期 run=${r.expiredRuns} 删除文件=${r.deletedFiles}`);
+      }
+    } catch (err) {
+      console.warn(`[trace] 周期清理失败：${String((err as Error)?.message || err)}`);
+    }
+  }, 24 * 60 * 60 * 1000);
+  timer.unref?.();
 }

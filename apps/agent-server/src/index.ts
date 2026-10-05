@@ -12,6 +12,7 @@ import {
   startTaskRetentionSweeper,
   startTaskWatchdog,
 } from "./chat-tasks.js";
+import { startTraceRetentionSweeper } from "./trace.js";
 import { initTaskStore } from "./task-store.js";
 
 // 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
@@ -61,6 +62,9 @@ serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () => {
   }
   // 周期回收空闲 MCP 连接（stdio 子进程不常驻），下次用到时自动重连。
   startIdleSweeper();
+  // trace 保留期清理（§10 #8）：超出 TRACE_RETENTION_DAYS（默认 30 天）的 run/rounds/spans 落盘回收，
+  // 避免磁盘随运行量无限增长；保留期关闭时不启用。
+  startTraceRetentionSweeper();
   // 周期回收「已收束任务的事件留档」（断线续传的取数窗口，过期即释放内存）。
   startTaskRetentionSweeper();
   // 无进展看门狗：服务端判定「这一轮还活着吗」——长时间没有任何实质事件就主动收口，

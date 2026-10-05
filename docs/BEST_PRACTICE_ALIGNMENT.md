@@ -61,7 +61,7 @@
 | 采用 GenAI 语义约定（标准属性名） | 自研 JSONL 结构；**本轮新增** span 上挂 `gen_ai.operation.name` / `gen_ai.provider.name` / `gen_ai.request.model` / `gen_ai.tool.name` / `gen_ai.tool.type` / `gen_ai.conversation.id` | 🟡 | 属性名已标准化（导出时可直接映射），但**仍无 OTLP 导出器**。P2 |
 | 遥测作为评测的反馈回路 | trace 落盘 → **本轮新增 `src/eval-online.ts`**：每次真实运行确定性打分，回流成 `/chat/eval/*` 与 Prometheus 指标 | ✅ | 刻意不做 LLM-as-judge（每次运行都叠评委模型 = 成本翻倍 + 评委偏好），只用 trace 已如实记录的字段判 |
 | metrics（吞吐/延迟/错误率/成本） | 拉取式聚合 + **本轮新增**进程级 Prometheus `GET /metrics`（模型/工具/运行/HTTP 四类，零依赖） | ✅ | — |
-| 采样与保留策略 | trace 按月/按 run 分文件，无采样与保留期配置 | 🟡 | 缺保留期与轮转策略（列为已知局限） |
+| 采样与保留策略 | trace 按月/按 run 分文件；**本轮新增**保留期清理（`TRACE_RETENTION_DAYS`，默认 30 天，启动 + 每日回收过期 run/rounds/spans） | 🟡 | 保留期已实现；仍**无采样**（全量落盘，高频场景磁盘增长靠保留期兜底而非采样减量） |
 
 ---
 
@@ -371,6 +371,19 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 > 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。
 > **教训：新建文件前必须先确认目标路径未被跟踪**（`git ls-files --error-unmatch <path>`）。
 
+### 9.16 实例十三：trace 保留期清理（§10 局限收口）
+
+`trace.ts` 新增 `cleanupTraceDir(dir, retentionMs)` 与 `startTraceRetentionSweeper()`，`index.ts` 启动时挂一次 +
+每 24h（`unref`，不阻止进程退出）。策略对齐 OTel「采样与保留策略」中**保留期**那一半：
+
+- `runs-YYYYMM.jsonl`：**整月**早于保留期起点的直接删文件；跨月的则逐行裁剪（`at`<cutoff 的 run 丢弃，其余保留）。
+- `rounds-<runId>.jsonl` / `spans-<runId>.jsonl`：runId 不在「本轮仍在保留期内」的集合即删——过期 run 的明细，
+  以及**孤儿**明细文件（对应 run 记录早已不存在）一并回收，避免明细文件比 run 活得久。
+- 损坏的 run 行**保留不删**（宁可留痕，不误删证据）；`TRACE_RETENTION_DAYS` 未配=30 天，配 `<=0`=关闭清理（不启用扫描器）。
+
+> 残留：仍无**采样**（全量落盘）。高频部署下磁盘减量要靠缩短保留期而非采样；真要采样需先定「哪些 run 可丢」
+> 的口径（排障/评测/成本三类的保留需求不同），属设计决策，未做。
+
 ---
 
 ## 10. 已知局限（已评估、暂不做 / 需架构决策）
@@ -386,4 +399,6 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 | 5 | 配置端点强制令牌 | §5 安全 | `/mcp/servers`、`/notify/channels` 受 `admin-gate` 保护，但 `AGENT_ADMIN_TOKEN` 未配置时**恒等放行**；仅 `HOST=0.0.0.0` 无令牌才 fail-closed 拒启 | 开放局域网部署前必须显式配 `AGENT_ADMIN_TOKEN`，属部署清单项 |
 | 6 | 模型窃取防护 | LLM10 | 有 HTTP 限流，但无 token 总量配额、无批量相似请求检测 | 内网优先级低；需网关层或全局计数 |
 | 7 | 目标约束 | ASI01 | 行为基线已建（`/chat/anomalies`），但无「把本次任务目标固化、偏离即拦」的目标约束层 | 需定义目标表示 + 偏离判定，属较大设计 |
-| 8 | trace 保留期 / 轮转 | §4 可观测 | trace 按月/按 run 分文件，无采样与保留期配置，磁盘随运行量增长 | 需加保留期清理或采样策略 |
+
+> 原第 8 项「trace 保留期 / 轮转」已在本轮补齐（`TRACE_RETENTION_DAYS` + 启动/每日清理），不再列为局限；
+> 残留的只有**采样**（全量落盘，未做采样减量），已在 §4「采样与保留策略」行标注。
