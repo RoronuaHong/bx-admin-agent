@@ -18,6 +18,7 @@ import { resolveOwner } from "./owner.js";
 import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
 import { incCounter, renderPrometheus } from "./process-metrics.js";
+import { listRunEvals, recordRunEval, summarizeEval } from "./eval-online.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -291,9 +292,18 @@ async function consumeTask(
   // run 级追踪（§10 最小版）：每次任务收束落一行 JSONL。
   // model 只认 chatStream 旁路 sink 的**实际服务模型**：长 run 起始 model 事件被缓冲裁剪也不受影响，
   // 未真正发起模型调用的 run（如 0ms 校验失败）sink 为空 → model 留空，不臆造配置模型。
-  appendRunTrace(
-    buildRunTrace(task, runId, status, opts.sessionId, opts.ownerKey, traceMeta.servedModel),
+  const runTrace = buildRunTrace(
+    task,
+    runId,
+    status,
+    opts.sessionId,
+    opts.ownerKey,
+    traceMeta.servedModel,
   );
+  appendRunTrace(runTrace);
+  // 在线评测闭环（P1）：trace 不只是留档，回流成质量分数。
+  // 纯确定性打分、不调模型（每次运行都跑，再叠评委模型等于成本翻倍）。
+  recordRunEval(runTrace);
   // 结果回投：仅在客户端已断开时做（订阅者在线时由前端负责 UI 消息持久化，避免双写竞态）。
   if (!task.live) {
     outcomePersisted = await persistTaskOutcome(task).catch(() => false);
@@ -794,6 +804,18 @@ export function createApp() {
     const audit = listAuditEvents({ ownerKey: owner, limit: 1000 }).filter((event) => event.at >= from);
     c.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     return c.body(buildMetrics({ runs, audit, release: getRelease() }));
+  });
+
+  // ---- 在线评测（P1）：把遥测回流成质量信号 ----
+  // 与 trace / cost / audit 同口径：HTTP 侧只暴露本 owner 的，全局视角走 CLI 直读 JSONL。
+  app.get("/chat/eval/runs", (c) => {
+    const limit = Number(c.req.query("limit")) || 100;
+    return c.json({ release: getRelease(), evals: listRunEvals({ ownerKey: c.get("owner"), limit }) });
+  });
+
+  app.get("/chat/eval/summary", (c) => {
+    const days = Number(c.req.query("days")) || 7;
+    return c.json({ release: getRelease(), summary: summarizeEval({ ownerKey: c.get("owner"), days }) });
   });
 
   // ---- 成本计量（§12 最小版）：按日 / 模型聚合 + 预算告警；未配单价只计 token，不编造金额 ----

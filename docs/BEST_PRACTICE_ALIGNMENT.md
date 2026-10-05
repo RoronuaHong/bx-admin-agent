@@ -59,7 +59,7 @@
 | 最佳实践 | 现状 | 判定 | 行动 |
 | --- | --- | --- | --- |
 | 采用 GenAI 语义约定（标准属性名） | 自研 JSONL 结构；**本轮新增** span 上挂 `gen_ai.operation.name` / `gen_ai.provider.name` / `gen_ai.request.model` / `gen_ai.tool.name` / `gen_ai.tool.type` / `gen_ai.conversation.id` | 🟡 | 属性名已标准化（导出时可直接映射），但**仍无 OTLP 导出器**。P2 |
-| 遥测作为评测的反馈回路 | trace 落盘；评测闸门现为 `tests/grounding-guard.test.ts`（G1–G7，随 `pnpm test` 跑） | 🟡 | **无在线/持续评测**（离线评测脚本 `eval-*` 已于 2026-09 清理）。P1 |
+| 遥测作为评测的反馈回路 | trace 落盘 → **本轮新增 `src/eval-online.ts`**：每次真实运行确定性打分，回流成 `/chat/eval/*` 与 Prometheus 指标 | ✅ | 刻意不做 LLM-as-judge（每次运行都叠评委模型 = 成本翻倍 + 评委偏好），只用 trace 已如实记录的字段判 |
 | metrics（吞吐/延迟/错误率/成本） | 仅有 `/cost/summary`、`/chat/trace/runs` 等**拉取式**聚合 | ❌ | **无进程级 Prometheus metrics**。P1 |
 | 采样与保留策略 | trace 按月/按 run 分文件，无采样与保留期配置 | 🟡 | 缺保留期与轮转策略。P2 |
 
@@ -70,7 +70,7 @@
 | 维度 | 判定 | 说明 |
 | --- | --- | --- |
 | 追踪 Trace | ✅ | run / round / span 三层，runId 关联审计，逐轮落盘 |
-| 评测 Eval | 🟡 | 有 G1–G7 测试闸门；**无在线评测 / 无人值守评测** |
+| 评测 Eval | ✅ | G1–G7 测试闸门 + **在线评测**（每次运行确定性打分，`/chat/eval/runs` `/chat/eval/summary` + Prometheus 指标） |
 | 成本 Cost | 🟡 | 有聚合 + 预算告警 + 钉钉推送；**本轮新增可开启的硬配额**（`COST_HARD_QUOTA=on`，默认仍只告警） |
 | 安全 Security | 🟡 | 见 §2/§3；核心控制齐备，identity/sandbox/DLP 有缺口 |
 | 身份 Identity | ❌ | 匿名 cookie + 设备 owner；无登录/租户/NHI 治理 |
@@ -96,7 +96,7 @@
 | 优先级 | 缺口 | 对应最佳实践 | 说明 |
 | --- | --- | --- | --- |
 | **P1** | 登录/租户 + NHI 生命周期治理 | ASI03 | 多端接入前置项；当前靠匿名 owner 最小权限 |
-| **P1** | 在线/持续评测闭环 | OTel「遥测作为评测反馈回路」 | 现为测试闸门（G1–G7） |
+| ~~**P1**~~ | ~~在线/持续评测闭环~~ | OTel「遥测作为评测反馈回路」 | ✅ **本轮已补齐**（`src/eval-online.ts`）。剩余：登录/租户与 NHI 治理——**用户 2026-10-06 明确暂不需要登录体系**，保留为已知缺口 |
 | **P2** | SBOM + MCP 服务器来源校验 | LLM05 / ASI06 | 依赖审计已有，SBOM 未做 |
 | **P2** | 通用 PII / 出站 DLP | LLM06 / ASI05 | 现只做凭据形态打码 |
 | **P2** | 按任务（per-run）工具 allowlist | LLM08 / ASI02 | 现全局工具集 |
@@ -118,6 +118,7 @@
 | ASI09 / OTel 互操作 | span 挂 `gen_ai.*` 标准属性（格式自有、语义标准） | `src/trace.ts`、`src/chat.ts` |
 | **P1 成本硬配额** | `COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET`：当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded` | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts` |
 | **P1 进程级 metrics** | `GET /metrics` 输出 Prometheus 文本格式；模型调用 / 工具调用 / 运行 / HTTP 四类打点，零新依赖 | `src/process-metrics.ts`、`src/app.ts`、`src/chat.ts` |
+| **P1 在线评测闭环** | 每次真实运行**确定性打分**（收束 / 取证 / 轮数 / token / 耗时 / 稳定性 / 纠正七维），落 `.data/eval` JSONL，回流成 `bx_agent_eval_*` 指标与 `/chat/eval/runs`、`/chat/eval/summary`。**不调模型做评委** | `src/eval-online.ts`、`src/app.ts` |
 
 ---
 
@@ -217,6 +218,32 @@ PASS：配额在第 1 次累计后拦截了第 2 次
 ```
 
 语义确认：只挡「已达预算之后的**新**运行」，**不掐在途运行**（半途掐断比超预算更糟）。验证后已杀掉临时实例、恢复 pm2 常态实例（`/health` 200）。
+
+### 9.9 实例八：真实服务端在线评测闭环
+
+重启后跑一次真实对话，再查评测端点与指标：
+
+```
+1) 跑完一次 chat
+2) GET /chat/eval/runs status=200 条数=1
+     degraded score=0.857 failed=[stability] model=step5
+3) GET /chat/eval/summary status=200
+     {"runs":1,"avgScore":0.857,"good":0,"degraded":1,"poor":0,
+      "axisFailures":[{"axis":"stability","count":1}],"qualityDegraded":false}
+4) /metrics 中的评测指标：
+     bx_agent_eval_runs_total{verdict="degraded"} 1
+     bx_agent_eval_score_count 1
+     bx_agent_eval_score_sum 0.8571428571428571
+PASS：在线评测已随真实运行落盘并打点
+```
+
+`stability` 被判未达标是**如实**的：本轮所有模型 402，主流程连续切换候选模型（`modelFallbacks` 超阈值）。
+这正是在线评测要抓的信号——「模型侧不稳导致的劣质运行」现在能被度量，而不只是事后翻日志。
+
+### 9.10 关于 P1 收尾
+
+四项 P1（登录/租户、成本硬配额、进程级 metrics、在线评测）中，**后三项已补齐**；
+登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂时不需要登录体系」，保留为已知缺口（见 §7）。
 
 > ⚠️ 事故与修复：本轮 `write_to_file` 直接覆盖了**已被 git 跟踪**的 `src/metrics.ts`（`8eff5e4` 提交的 `buildMetrics`，供 `/chat/metrics` 使用），
 > 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。

@@ -326,6 +326,7 @@ runId 由 `app.ts` 经 `traceMeta.runId` 透传，使「重复探查 / 预算耗
 配套运行时护栏（被门禁度量，仅对声明 `enforceGrounding` 的角色生效，设计见 `docs/movie-safety-policy.md` §3）：`src/grounding.ts` 的「零证据不得收束」+「事后断言核验（CoV 最小版）」+「多票裁决（可选，降核验器误判）」+「证据来源标注」。
 **G1–G6 旧 harness 未恢复（按「不乱加乱改」主动放弃）**：历史实现 `eval-core.mjs` G1–G6 + `eval-trace-gate.mjs` 是为**分析时代契约**写的，备份在 `.data/trash-20260916/code/scripts`；它依赖的角色/消息/ownerKey 模型与当前瘦身后的 chat-agent/roles/MCP 契约已不一致，原样恢复约 2000 行属大改且易冲突。**其意图已被新门禁 + 代码护栏更便宜地覆盖**：G1/G2（路由/期望工具）已进 G7 门禁；G3（伪调用拦截）由 `chat.ts` 运行时守卫 `looksLikePseudoToolCall` 覆盖；G4（预算/轮次）= G7-D；G5（流程收束）/ G6（短路直答拦截）= G7-A + 代码护栏。
 **补齐建议**：若后续确需「跨模型横评 + 历史基线 + CI 卡点」，应**新建**一套贴合当前契约的轻量评测（复用现有 gate 脚本与 run trace），而非复活旧 harness；评测依赖 trace 数据，顺序上排在第 10 章之后。
+**在线评测闭环（2026-10-06 已落地，`src/eval-online.ts`）**：补上「线上真实运行的质量是在变好还是变坏」这一环——每次 run 收束时按**七维确定性打分**（收束 / 取证 / 轮数 / token / 耗时 / 稳定性 / 纠正），落 `.data/eval/eval-YYYYMM.jsonl`，并回流成 `bx_agent_eval_*` 进程指标与 `GET /chat/eval/runs`、`GET /chat/eval/summary`（均 ownerKey 隔离）。**刻意不引入 LLM-as-judge**：在线评测跑在每一次真实运行上，再叠一次评委模型等于成本翻倍并引入评委偏好；只判 trace 已如实记录的字段，判不了的维度不入分母（诚实优先）。阈值走 `EVAL_MAX_ROUNDS` / `EVAL_MAX_TOKENS` / `EVAL_MAX_DURATION_MS` / `EVAL_MAX_MODEL_FALLBACKS` / `EVAL_MAX_MODEL_RETRIES` / `EVAL_MAX_GROUNDING_RETRIES` / `EVAL_DEGRADE_RATIO`。缺口清单见 `docs/BEST_PRACTICE_ALIGNMENT.md`。
 
 ---
 
