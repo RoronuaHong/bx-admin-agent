@@ -20,6 +20,8 @@ import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
 import { incCounter, renderPrometheus } from "./process-metrics.js";
 import { listRunEvals, recordRunEval, summarizeEval } from "./eval-online.js";
 import { exportRunOtlp } from "./otlp.js";
+import { listAnomalies, observeRun } from "./anomaly.js";
+import { verifyMemoryIntegrity } from "./memory.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -307,6 +309,8 @@ async function consumeTask(
   recordRunEval(runTrace);
   // OTLP 导出（P2，可选）：发了就忘，不进主链路；未配端点时直接返回（零行为变化）。
   void exportRunOtlp(runTrace).catch(() => false);
+  // 行为异常检测（P2）：与基线比对，只报不管（误报代价远小于「护栏自己把服务搞挂」）。
+  observeRun(runTrace);
   // 结果回投：仅在客户端已断开时做（订阅者在线时由前端负责 UI 消息持久化，避免双写竞态）。
   if (!task.live) {
     outcomePersisted = await persistTaskOutcome(task).catch(() => false);
@@ -819,6 +823,12 @@ export function createApp() {
   app.get("/chat/eval/summary", (c) => {
     const days = Number(c.req.query("days")) || 7;
     return c.json({ release: getRelease(), summary: summarizeEval({ ownerKey: c.get("owner"), days }) });
+  });
+
+  // 行为异常（P2 / ASI09）：最近被判异常的运行。样本不足时不判（基线 counts 可见）。
+  app.get("/chat/anomalies", (c) => {
+    const limit = Number(c.req.query("limit")) || 50;
+    return c.json({ release: getRelease(), anomalies: listAnomalies(c.get("owner"), limit) });
   });
 
   // ---- 成本计量（§12 最小版）：按日 / 模型聚合 + 预算告警；未配单价只计 token，不编造金额 ----
@@ -1392,7 +1402,11 @@ export function createApp() {
   });
 
   // ---- 长期记忆（跨对话注入的小体积事实，持久化在 .data/memory.json；按 owner 隔离）----
-  app.get("/chat/memory", (c) => c.json({ memory: listMemory(c.get("owner")) }));
+  // 附带完整性校验结果（ASI04）：记忆会被无条件拼进每一轮系统提示，
+  // 被带外篡改必须能被看见。只报不管——改数据留给用户决定。
+  app.get("/chat/memory", (c) =>
+    c.json({ memory: listMemory(c.get("owner")), integrity: verifyMemoryIntegrity() }),
+  );
 
   app.post("/chat/memory", async (c) => {
     const body = await readJson<{ text?: string }>(c);

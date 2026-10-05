@@ -49,7 +49,7 @@
 | ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；**本轮新增** `MCP_ALLOWED_COMMANDS` stdio 命令白名单（配置时校验 + **spawn 前再校验**，fail-closed 落在执行点） | 🟡 | 白名单默认关闭；无 SBOM、无 MCP 服务器来源校验。P2 |
 | ASI07 输入操纵 | 输入清洗、类型/结构校验 | 请求体上限；ReDoS 护栏（嵌套量词 + **本轮新增交替重叠型** `(a|a)*`）+ 2s 预算兜底；`runGate` schema/可调用性校验 | ✅ | — |
 | ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集 | 🟡 | **无渐进式自主分级**（不以历史成功率提升权限）；不可逆操作未强制人工（靠风险等级触发确认，已接近）。P2 |
-| ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost；**本轮新增** span 挂 OTel GenAI 标准属性 `gen_ai.*` | 🟡 | **格式自研、无 OTLP 导出**；无进程级 metrics（Prometheus）；**无行为异常检测**。P1（metrics）/P2（行为检测） |
+| ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost + span 挂 `gen_ai.*`；**本轮新增进程级 metrics、OTLP 导出、行为异常检测** | ✅ | 仍无跨进程基线共享（基线在进程内，重启重建） |
 | ASI10 不安全的输出处理 | 输出校验、下游控制 | DOMPurify 净化 + 零外链护栏 + 出站打码 | 🟡 | 无输出结构校验。P2 |
 
 ---
@@ -100,8 +100,8 @@
 | ~~**P2**~~ | ~~SBOM~~ | LLM05 / ASI06 | ✅ **本轮已补齐**：`scripts/gen-sbom.mjs`（CycloneDX 1.5，生产依赖），实测 393 组件 / 0 未知许可证。剩余：MCP 服务器来源校验 |
 | ~~**P2**~~ | ~~通用 PII / 出站 DLP~~ | LLM06 / ASI05 | ✅ **本轮已补齐**（可开启）。剩余：姓名/地址类不做（无形态可依，词典必然误报） |
 | **P2** | 按任务（per-run）工具 allowlist | LLM08 / ASI02 | 现全局工具集 |
-| **P2** | 记忆完整性校验 + 用户复核 | ASI04 | 现有隔离+清洗+审计，缺复核入口 |
-| **P2** | 行为异常检测 | ASI09 | 现有留痕，无基线比对 |
+| ~~**P2**~~ | ~~记忆完整性校验~~ | ASI04 | ✅ **本轮已补齐**：内容指纹 sidecar + 逐条校验（`/chat/memory` 返回 `integrity`）。剩余：写入前用户复核确认 |
+| ~~**P2**~~ | ~~行为异常检测~~ | ASI09 | ✅ **本轮已补齐**：`src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串），`/chat/anomalies`。**样本不足不判**（防冷启动误报） |
 | ~~**P2**~~ | ~~OTLP 导出器~~ | OTel | ✅ **本轮已补齐**：`src/otlp.ts`，OTLP/HTTP JSON 编码，默认关闭（`OTEL_EXPORTER_OTLP_ENDPOINT` 未配则不发请求） |
 | **P2** | 渐进式自主分级 | ASI08 | 现靠固定风险等级触发确认 |
 | **P2** | 输出结构（schema）校验 | LLM02 / ASI10 | 现只有净化与外链护栏 |
@@ -122,6 +122,9 @@
 | **P2 OTLP 导出** | `src/otlp.ts`：run/span 转 OTLP/HTTP **JSON** 编码推给 Collector；traceId/spanId 由 runId 稳定派生可去重；默认关闭、发了就忘、不阻断对话 | `src/otlp.ts`、`src/app.ts` |
 | **P2 通用 PII 出站打码** | `REDACT_PII=on`（可按 `REDACT_PII_TYPES` 只开某几类）：email / 手机号 / 身份证 / 银行卡；**默认关闭**（业务数据误报高）。凭据打码不受此开关影响 | `src/redact.ts`、`src/chat.ts`（`redactSensitive`） |
 | **P2 SBOM** | `scripts/gen-sbom.mjs`：复用 `pnpm licenses list --prod --json` 的**已安装**清单产出 CycloneDX 1.5（只生产依赖），零新依赖 | `scripts/gen-sbom.mjs` |
+| **P2 行为异常检测** | 按 owner 建滚动基线（近 50 次），比对轮数/token/耗时突增、工具新颖性、未取证成串；**样本 <5 不判**；只报不管 | `src/anomaly.ts`、`src/app.ts` |
+| **P2 记忆完整性校验** | 内容指纹 sidecar（`memory.digest.json`）+ 逐条校验；诚实区分 `match`/`mismatch`/`missing`；只告警不擅自改写 | `src/memory.ts`、`src/app.ts`（`/chat/memory` 返回 `integrity`） |
+| **回归修复：记忆清洗正则** | 第七轮引入的清洗正则缺 `u` 标志，`\uE0000-\uE007F` 被解析成「`0` 到 `\uE007`」巨大区间 → **几乎匹配所有字符，会把整条记忆抹空**。已改 `\u{...}` + `u` 标志，并抽出可测纯函数 `sanitizeMemoryText` | `src/memory.ts`、`tests/anomaly-memory.test.ts` |
 
 ---
 
@@ -275,7 +278,45 @@ SBOM 已生成：D:\Code\bx-admin-agent\.data\sbom.cdx.json
 > 坑：`pnpm` 在 Windows 是 `.cmd` 垫片，`execFileSync("pnpm")` 会 ENOENT，
 > 而 `execFileSync("pnpm.cmd")` 在 Node 22 下又报 EINVAL——最终走 `cmd /c pnpm.cmd`。
 
-### 9.11 关于 P1 收尾
+### 9.11 实例十：行为异常检测 + 记忆完整性（真实服务端）
+
+```
+1) GET /chat/memory status = 200
+   integrity = {"ok":true,"count":3,"baseline":"missing","issues":[]}
+   PASS  integrity.baseline 取值合法（诚实区分「没基线」与「对不上」）
+   PASS  memory 仍是数组（结构与改动前一致）
+2) GET /chat/anomalies status = 200 条数 = 0
+3) 跑完一次对话后的异常检测指标：
+     bx_agent_anomaly_runs_total{anomalous="no"} 1
+   PASS  observeRun 已在真实运行上打点
+```
+
+`baseline: "missing"` 是**如实**的：升级后还没有经由服务写入过记忆，摘要文件尚未生成——
+这不算篡改，只有 `mismatch` 才是。`anomalies` 为 0 也符合设计：**基线样本 <5 不判**，
+避免冷启动第一次运行就被自己的空基线判成异常。
+
+### 9.12 ⚠️ 本轮发现并修复的真实回归（记忆清洗正则）
+
+写完整性校验的单测时，一条「501 个 x 应判超长」的断言失败，报的却是「含控制符」。
+根因：**第七轮引入的记忆清洗正则缺 `u` 标志**：
+
+```
+[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200B-\u200F\u202A-\u202E\uFE00-\uFE0F\uE0000-\uE007F]
+                                                                                    ^^^^^^^^^^^^^^
+不加 u 时 \uE0000 被解析成 \uE000 + 字面量 "0"，于是 \uE0000-\uE007F 变成
+「从字符 '0'(0x30) 到 \uE007(0xE007)」的巨大区间 —— 几乎匹配所有字符。
+```
+
+后果：`addMemory()` 的清洗会把**整条记忆抹空**（`text` 变空 → 返回 null → 记忆存不进去）。
+第七轮只做了代码审阅没造实例，正是当时 §9.6 里诚实标注的「未做实例验证」项，果然在那里翻了车。
+
+修复：改用 `\u{E0000}-\u{E007F}` + `u` 标志，并抽出纯函数 `sanitizeMemoryText()` 便于单测；
+新增断言「中文 / 英文 / 单号 / 数字等正常文本清洗后必须原样保留」。
+
+> 教训：**清洗类（白名单反向 = 去字符）的正则必须有一条「正常文本不被改动」的断言**，
+> 只测「坏字符被去掉」会漏掉正则写错导致的大面积误伤。
+
+### 9.13 关于 P1 收尾
 
 四项 P1（登录/租户、成本硬配额、进程级 metrics、在线评测）中，**后三项已补齐**；
 登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂时不需要登录体系」，保留为已知缺口（见 §7）。

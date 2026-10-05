@@ -152,7 +152,12 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 - **写入前清洗**：`addMemory` 剥离控制符（NUL、零宽、双向覆盖、变体选择符、Tag 块；保留 `\t\n\r`），防止伪造提示结构。
 - **写入留痕**：`save_memory` 落审计事件 `memory_write`（谁 / 哪次会话 / 内容摘要前 60 字），污染后可回溯。
 - **隔离与上限**：按 `ownerKey` 隔离；条数上限 + 注入字符总上限双约束。
-- 已知边界：无完整性校验、无用户复核入口（写入由模型直接调工具），见 §15。
+- **完整性校验**（本轮新增）：`memory.digest.json` 存内容指纹（与顺序无关），
+  每次由服务写入后刷新；`/chat/memory` 返回 `integrity`，诚实区分三种状态：
+  `match`（一致）/ `mismatch`（**对不上，疑似带外篡改**）/ `missing`（没有基线，不算篡改）。
+  另有逐条校验：空内容、含控制符/不可见字符、超长度。
+- **只报不管**：发现异常只告警并暴露，不擅自改写用户数据（改数据留给用户决定）。
+- 已知边界：写入**没有用户复核确认**（模型可直接调 `save_memory`），但已有查看/删除端点与前端面板；见 §15。
 
 ## 9. Prompt 注入防护
 
@@ -243,7 +248,7 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
 | 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
 | 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。多实例时为**每实例**计数，需入口层兜底 |
-| 行为异常检测 | ❌ 未做 | 有完整留痕（trace/audit），无基线比对与异常告警 |
+| 行为异常检测 | ✅ 已做 | `src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串）；**样本 <5 不判**、只报不管。局限：基线在进程内，重启重建，多实例不共享 |
 
 ---
 
@@ -267,6 +272,8 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | OTLP 导出（可选） | `src/otlp.ts`、`src/app.ts`（run 收束时触发） |
 | 出站 PII 打码（可选） | `src/redact.ts`（`redactPii` / `redactSensitive`）、`src/chat.ts` |
 | SBOM | `scripts/gen-sbom.mjs` |
+| 行为异常检测 | `src/anomaly.ts`、`src/app.ts`（`GET /chat/anomalies`） |
+| 记忆完整性校验 | `src/memory.ts`（`canonicalDigest` / `validateMemoryItems` / `verifyMemoryIntegrity`）、`src/app.ts` |
 | 只读工具桥 | `src/tool-code.ts`（`toolCodeDenied`、`DENIED`） |
 | Prompt 注入定界 | `src/untrusted.ts` |
 | MCP 原生 SQL 只读闸 | `src/risk.ts`、`src/sql-readonly.ts` |
