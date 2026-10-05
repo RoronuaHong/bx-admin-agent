@@ -40,11 +40,23 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # 服务端类型检查（前端 vue-tsc 对巨型单文件 SFC 结果不稳定，暂不进 CI 的判定口径）。
+      # 判定口径：服务端类型检查 + 全量单测。
       - name: Type check (agent-server)
         run: pnpm --filter @bx/agent-server exec tsc --noEmit
+
+      # 前端类型检查**不进判定**：vue-tsc 对该仓库的巨型单文件 SFC 结果不稳定
+      # （同一份代码两次跑可能报不同的错）。放进流水线是为了让回归可见，失败只报警不阻断。
+      - name: Type check (web, non-blocking)
+        continue-on-error: true
+        run: pnpm --filter @bx/web type-check
 
       - name: Unit tests (agent-server)
         run: pnpm --filter @bx/agent-server test
         env:
           MONGO_URI: mongodb://127.0.0.1:27017
+
+      # 依赖漏洞扫描同样只报警不阻断：新 advisory 随时可能出现，不能让外部数据库的变化
+      # 把一次正常的改动卡住。必须显式指定 registry——默认镜像源没有 audit 端点。
+      - name: Dependency audit (non-blocking)
+        continue-on-error: true
+        run: pnpm audit --prod --registry=https://registry.npmjs.org
