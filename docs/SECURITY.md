@@ -97,6 +97,16 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 
 识别写意图 → 发 `confirmation_required` 事件 → 等用户应答（区分「拒绝」与「超时」）→ 才执行。确认请求本身零副作用。三处接线：工具节点、主 fallback、catch 兜底。
 
+**「完全访问」与「硬拒」是两件事（2026-10-06 修订）**：
+
+- `conversation.fullAccess` 缺省为 `true`（开箱即完全授权，对齐 CodeBuddy「完全访问模式」）。它**只跳过确认卡**，
+  因为闸门过密会制造确认疲劳、用户退化成橡皮图章（论证见 `risk.ts` `verdictNeedsConfirm` 注释）。逐项弹卡可用
+  前端「关闭完全访问」按对话关闭，`support` 角色即默认关闭。
+- **`deny`（硬拒）不受 `fullAccess` 影响**（`risk.ts` 的 `isHardDenied`，签名里没有 `fullAccess`）。两个来源：
+  `MCP_UNKNOWN_TOOLS=deny`（运维显式策略）与 `source=sql-readonly`（原生 SQL 非只读查询）。
+  此前 `chat.ts` 写的是 `verdict.deny && !ctx.fullAccess`，等于**运维显式写下的安全策略被默认开启的开关静默覆盖**，
+  且 SQL 只读闸在默认配置下只剩 MCP 适配器一层。现已修正，回归锚点 `tests/risk-hard-deny.test.ts`。
+
 ### 8.3 子进程执行：`run_tool_code` / `run_command` / `run_script`
 
 这三类会**在服务器上起子进程**（`run_tool_code` 用 `spawn` 跑 Node/Python 解释器；`run_command`/`run_script` 用 `exec` 跑 shell / 解释器）。多重约束：

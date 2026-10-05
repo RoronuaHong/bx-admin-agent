@@ -51,7 +51,18 @@
 >
 > **不因完全访问而失效**：子代理范围闸（`chat.ts:1657`）、澄清期冻结（`1680`）、失败熔断、接地门禁、SQL 只读闸、不可信内容护栏、归属守卫、限流与审计留痕均照常生效（`chat.ts:991`）。
 >
-> **已知特性（记录在案，本次刻意不改）**：运维显式配置的 `MCP_UNKNOWN_TOOLS=deny` 也会被 `fullAccess` 覆盖——即"显式策略被默认开启的开关静默覆盖"。若将来要收紧，最小且无争议的改法是让 `deny` 不受 `fullAccess` 影响（只动这一处，确认卡跳过逻辑保持不变）。
+> **硬拒（`deny`）已不受 `fullAccess` 影响（2026-10-06 已修）**：此前 chat.ts 写的是 `verdict.deny && !ctx.fullAccess`，
+> 而 `fullAccess` 缺省为 true，于是硬拒在**默认配置下从不生效**——运维显式配置的 `MCP_UNKNOWN_TOOLS=deny`
+> 被默认开关静默覆盖；`source=sql-readonly` 的原生 SQL 非只读硬拒同样被跳过，使「适配器粗筛 + 服务端硬拒」
+> 这道纵深防御默认只剩适配器一层。现抽出 `risk.ts` 的 `isHardDenied(v)`（**签名里没有 fullAccess**，
+> 结构上就不可能被完全访问豁免），chat.ts 改为 `if (isHardDenied(verdict))`。
+>
+> **未收紧的部分（刻意保持）**：确认卡跳过逻辑一行未动——`verdictNeedsConfirm` 仍只看级别，
+> 是否弹卡仍由 `fullAccess` 决定。理由：确认疲劳（`risk.ts:198-204`）针对的是「要不要问人」，
+> 而 `deny` 是「按运维写下的策略根本不该执行」，两者性质不同。完全访问的便利性原样保留。
+>
+> 回归锚点 `tests/risk-hard-deny.test.ts`：真值表 + `MCP_UNKNOWN_TOOLS` 三档口径 +
+> **接线断言**（读 chat.ts 源码，硬拒调用行内不得出现 `fullAccess`——因为结构保证证伪不了「有人加回去」）。
 
 ## 4. 工具与数据接入
 

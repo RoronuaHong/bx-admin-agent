@@ -184,13 +184,34 @@ export function isNativeSqlRejected(
   return !(isReadOnlySql(args?.query) || isReadOnlySql(args?.sql));
 }
 
-/** 第 8 条：unknown 且服务器在授权名单里 → 降为 read。 */
+/**
+ * 第 8 条：unknown 且服务器在授权名单里 → 降为 read。 */
 function applyGrant(verdict: RiskVerdict, grantServers?: ReadonlySet<string>): RiskVerdict {
   if (verdict.unknown && !verdict.deny && verdict.serverId && grantServers?.has(verdict.serverId)) {
     return { ...verdict, level: "read", reason: `${verdict.reason}；本对话已授权该服务器按只读处理`, source: "grant" };
   }
   return verdict;
 }
+
+/**
+ * 是否**硬拒**本次调用（不进入确认流程、不受 `fullAccess` 影响）。
+ *
+ * 2026-10-06 修订。此前 chat.ts 写的是 `verdict.deny && !ctx.fullAccess`，而 `fullAccess` 缺省为 true
+ * （开箱即完全授权），于是 `deny` 在**默认配置下从不生效**——这造成两个真实后果：
+ * 1. 运维显式配置的 `MCP_UNKNOWN_TOOLS=deny` 被默认开启的开关**静默覆盖**，形同失效；
+ * 2. `source=sql-readonly` 的原生 SQL 非只读硬拒同样被跳过，「适配器粗筛 + 服务端硬拒」这道
+ *    纵深防御在默认配置下**只剩适配器一层**（MCP 适配器 `scripts/metabase-mcp.mjs` 仍会拦写 SQL，
+ *    故数据库不会被改，但少了一层）。
+ *
+ * 为什么这次收紧不违反「完全访问」的产品决策：确认疲劳（`verdictNeedsConfirm` 那个口径）针对的是
+ * **人审确认**——问多了用户会退化成橡皮图章。而 `deny` 不是「要不要问」，是「按运维写下的安全策略
+ * 根本不该执行」；让显式配置失效本就说不通。故本次只把 `deny` 移出 `fullAccess` 的作用域，
+ * **确认卡跳过逻辑一行未动**（完全访问的便利性完全保留）。
+ */
+export function isHardDenied(v: RiskVerdict): boolean {
+  return v.deny === true;
+}
+
 
 /**
  * 该次调用是否需要用户确认（deny 由调用方先行拒绝，不走本判定）。

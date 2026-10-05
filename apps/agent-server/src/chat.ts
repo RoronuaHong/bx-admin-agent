@@ -29,7 +29,7 @@ import {
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
 import { getServer } from "./mcp/config.js";
 import { annotateMcpToolSpec, applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
-import { resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
+import { isHardDenied, resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
 import { getRole } from "./roles.js";
@@ -2034,9 +2034,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
         continue;
       }
-      // 未声明工具按 MCP_UNKNOWN_TOOLS=deny 的口径直接拒绝；原生 SQL 工具的非只读查询也走此处。
-      // 完全访问模式下跳过该硬拒（用户已明确授权，缺省即完全访问）。
-      if (verdict.deny && !ctx.fullAccess) {
+      // 硬拒：**不受 fullAccess 影响**（见 risk.ts isHardDenied 的修订说明）。
+      // 「完全访问」跳过的是确认卡（人审确认，避免确认疲劳），不是运维显式写下的安全策略：
+      //  · MCP_UNKNOWN_TOOLS=deny —— 未声明操作级别的工具按配置直接拒；
+      //  · source=sql-readonly —— 原生 SQL 的非只读查询硬拒（与 MCP 适配器那道构成纵深防御）。
+      // 二者在 fullAccess 缺省 true 时若也跟着跳过，等于「运维显式配置被默认开关静默覆盖」。
+      if (isHardDenied(verdict)) {
         ok = false;
         rawText = verdict.reason
           ? `工具 ${call.name} 被安全闸门拒绝：${verdict.reason}`
