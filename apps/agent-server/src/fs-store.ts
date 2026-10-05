@@ -265,36 +265,92 @@ const FS_GREP_BUDGET_MS = 2000;
  * （`a+b+`、`\d+\.\d+`、`^\s*#+\s+(.*)$`）是线性匹配的常用写法，绝不能当成灾难性回溯拒掉。
  * 组关闭时把「含量词」向上传递一层，`((a+)b)+` 这类套了两层的写法也照样拦。
  */
+/**
+ * 两组分支是否「可重叠匹配」——重叠正是交替组被量化后产生指数回溯（ReDoS）的根源：
+ * - 任一分支可匹配空串（a* / a? / {0,} / 空分支）或含 `.*` `.+`（可匹配任意串）；
+ * - 或任一分支是另一分支的前缀（剥离量词字符后比较，避免 `a+` 与 `ab` 误判为无重叠）。
+ * 安全情形（`(a|b)*`、`(abc|abd)*`）不命中：分支互斥、无重叠。
+ */
+function branchesOverlap(branches: string[]): boolean {
+  const norm = branches.map((b) => b.trim());
+  const emptyCapable = (b: string) => b === "" || /[*?]/.test(b) || /\{0(,0?)?\}/.test(b);
+  const universal = (b: string) => /\.\*|\.\+/.test(b);
+  if (norm.some(emptyCapable) || norm.some(universal)) return true;
+  const stripped = norm.map((b) => b.replace(/[+*?]/g, "").replace(/\{\d+(?:,\d*)?\}/g, ""));
+  for (let i = 0; i < stripped.length; i++) {
+    for (let j = 0; j < stripped.length; j++) {
+      if (i === j) continue;
+      if (stripped[i] && stripped[j].startsWith(stripped[i])) return true;
+    }
+  }
+  return false;
+}
+
 export function isCatastrophicPattern(src: string): boolean {
   // 先去掉转义字符，再做括号配对扫描。
   const s = src.replace(/\\[.+*?(){}[\]|^$]/g, "");
-  const stack: boolean[] = [false]; // 每层组：内部是否已含可变量词
-  let pendingGroupQuant = false; // 刚关闭的组内部含量词（其后紧跟量词即命中）
+  interface Group {
+    innerQuant: boolean; // 内部是否已含可变量词
+    hasAlt: boolean; // 是否含顶层 | 交替
+    branches: string[]; // 交替各分支原文（用于重叠判定）
+    cur: string;
+  }
+  const stack: Group[] = [{ innerQuant: false, hasAlt: false, branches: [], cur: "" }];
+  // 最近一次关闭的组：若该组内部含量词或被量化后含可重叠交替，即命中灾难性回溯。
+  let lastClosed: { innerQuant: boolean; hasAlt: boolean; branches: string[] } | null = null;
   for (let i = 0; i < s.length; i++) {
     const c = s[i]!;
     if (c === "(") {
-      stack.push(false);
-      pendingGroupQuant = false;
+      lastClosed = null;
+      stack.push({ innerQuant: false, hasAlt: false, branches: [], cur: "" });
     } else if (c === ")") {
-      const inner = stack.pop() ?? false;
-      if (inner && stack.length) stack[stack.length - 1] = true;
-      pendingGroupQuant = inner;
+      const g = stack.pop();
+      if (!g) continue;
+      g.branches.push(g.cur);
+      const top = stack[stack.length - 1];
+      if (top) {
+        if (g.innerQuant) top.innerQuant = true;
+        if (g.hasAlt) top.hasAlt = true;
+      }
+      lastClosed = { innerQuant: g.innerQuant, hasAlt: g.hasAlt, branches: g.branches };
     } else if (c === "*" || c === "+") {
-      if (pendingGroupQuant) return true;
-      stack[stack.length - 1] = true;
-      pendingGroupQuant = false;
+      // 无界量词：其后紧跟的若是「含量词的组」或「含可重叠交替的组」，即指数回溯。
+      if (lastClosed && (lastClosed.innerQuant || (lastClosed.hasAlt && branchesOverlap(lastClosed.branches)))) {
+        return true;
+      }
+      lastClosed = null;
+      const top = stack[stack.length - 1];
+      if (top) {
+        top.innerQuant = true;
+        top.cur += c;
+      }
     } else if (c === "{") {
       // 仅 {m,}（开放量词）危险；{m} / {m,n} 有限次，不构成指数回溯。
       const m = /^\{(\d+)(?:,(\d*))?\}?/.exec(s.slice(i));
       if (m) {
         const open = m[2] !== undefined && m[2] === "";
-        if (open && pendingGroupQuant) return true;
-        if (open) stack[stack.length - 1] = true;
+        if (open) {
+          if (lastClosed && (lastClosed.innerQuant || (lastClosed.hasAlt && branchesOverlap(lastClosed.branches)))) {
+            return true;
+          }
+        }
+        lastClosed = null;
+        const top = stack[stack.length - 1];
+        if (open && top) top.innerQuant = true;
         i += m[0].length - 1;
       }
-      pendingGroupQuant = false;
-    } else if (c !== "|" && c !== "^" && c !== "$" && c !== "?") {
-      pendingGroupQuant = false;
+    } else if (c === "|") {
+      lastClosed = null;
+      const top = stack[stack.length - 1];
+      if (top) {
+        top.hasAlt = true;
+        top.branches.push(top.cur);
+        top.cur = "";
+      }
+    } else {
+      lastClosed = null;
+      const top = stack[stack.length - 1];
+      if (top) top.cur += c;
     }
   }
   return false;

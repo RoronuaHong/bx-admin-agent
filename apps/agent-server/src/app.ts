@@ -685,6 +685,9 @@ export function createApp() {
     c.header("X-Frame-Options", "DENY");
     c.header("Referrer-Policy", "no-referrer");
     c.header("X-Permitted-Cross-Domain-Policies", "none");
+    // 所有 API 响应都不进浏览器/代理缓存：聊天、配置、审计、trace 都含私有数据，
+    // no-store 杜绝「返回/前进」把上一个人的对话或令牌结果带出来（SSE 自身已设 no-cache）。
+    c.header("Cache-Control", "no-store");
   });
 
   /**

@@ -7,7 +7,20 @@ import { isCatastrophicPattern } from "../src/fs-store.js";
  */
 describe("fsGrep 正则护栏", () => {
   it("拦住嵌套/指数回溯写法", () => {
-    for (const pattern of ["(a+)+", "(.*)*", "(a*)*b", "(\\w+\\s?)+", "(a+b)+", "((a+)b)+", "(a+){2,}"]) {
+    for (const pattern of [
+      "(a+)+",
+      "(.*)*",
+      "(a*)*b",
+      "(\\w+\\s?)+",
+      "(a+b)+",
+      "((a+)b)+",
+      "(a+){2,}",
+      // 交替重叠型：分支可重叠匹配 + 整体被量化 → 指数回溯（旧版漏判，只靠 2s 预算兜底）
+      "(a|a)*",
+      "(.*|a)*",
+      "(a|ab)*",
+      "(a?|b)*",
+    ]) {
       expect(isCatastrophicPattern(pattern), pattern).toBe(true);
     }
   });

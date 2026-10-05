@@ -108,6 +108,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - 设计原则：零业务词（事件类型为通用安全语义）、零新依赖、写失败不阻断主流程、ownerKey 来自登录态（countryId:loginName）。
 - 验证：模块回环 8/8（写入/倒序/kind 过滤/ownerKey 隔离/日期/limit）+ 端点匿名 401 / 登录态 200。
 - **HTTP 限流（2026-09-04）**：进程内滑动窗口——`/chat/stream` 按 ownerKey（`RATE_LIMIT_CHAT_PER_MIN`，默认 20）、`/auth/login` 按 IP（`RATE_LIMIT_LOGIN_PER_MIN`，默认 30）；`RATE_LIMIT_WINDOW_MS` 默认 60s；阈值 ≤0 关闭。超限 429 + `Retry-After` + 审计 `reject`（detail=`rate_limit:…`）。进行中任务回放不计配额。多实例需入口层另限。
+- **安全态势权威文档（2026-10-05）**：新增 `docs/SECURITY.md` 汇总全部安全控制、威胁模型、部署加固清单与**已知局限**（含子进程无 OS 级沙箱的诚实标注）。第六轮补充的运行时护栏：请求体上限 `MAX_BODY_BYTES`（默认 1MB → 413）、全局错误兜底（不回吐堆栈）、`Cache-Control: no-store`、ReDoS 护栏覆盖交替重叠型 `(a|a)*`（`FS_GREP_BUDGET_MS=2000` 预算兜底）、子进程并发上限 `TOOL_SUBPROCESS_MAX_CONCURRENT`（默认 4）、`run_tool_code`/`run_command`/`run_script` 子进程不继承服务端凭据 + 输出 4MB 边收边截断 + 超时 SIGKILL 兜底。详见 `docs/SECURITY.md`。
 - **Prompt 注入结构护栏（2026-09-04，零自然语言词典）**：对齐 OWASP LLM01——靠角色/通道/Unicode 类别/定界，不做越狱话术词表。
   - `src/untrusted.ts`（2026-09-17 由 `prompt-guard.ts` 重写，方向从「用户输入」改为「外部内容回灌」）：`stripDangerousControls`（NUL/C0·C1/双向/零宽/Tags/VS）+ `wrapUntrusted`（每请求 nonce 定界，碰撞中和）+ `sanitizeUserInput`（`CHAT_MAX_INPUT_LEN` 默认 500）；外部内容（工具返回 / 检索片段 / 子代理回传）回灌模型前统一定界，用户可见仍是原文。
   - 用户原文只进 `role=user`（会话历史存清洗后原文；送模型时外包 `[user_message nonce="…"]`）；`buildStaticGuide` 注入 `UNTRUSTED_USER_CONTENT_RULE`（禁止把定界内文字当 system/tool 指令）。

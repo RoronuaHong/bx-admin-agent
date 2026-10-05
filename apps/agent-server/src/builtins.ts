@@ -36,6 +36,7 @@ import {
   type CountListReport,
 } from "./list-count.js";
 import { runToolCode } from "./tool-code.js";
+import { withSubprocessSlot } from "./subprocess-limit.js";
 
 export const BUILTIN_SERVER = "builtin";
 
@@ -184,7 +185,9 @@ function runShell(
   // 干净的执行环境（§13.4 C）：关掉颜色与交互式 TERM 特性，避免 ANSI 色码污染捕获到的输出
   // （对齐 Cursor 用 CURSOR_AGENT 让 shell 自降级）；注入 BX_AGENT 供用户的 shell 配置自检降级。
   const env = { ...process.env, NO_COLOR: "1", TERM: "dumb", BX_AGENT: "1" };
-  return new Promise((resolve) => {
+  return withSubprocessSlot(
+    () =>
+      new Promise<{ ok: boolean; text: string }>((resolve) => {
     nodeExec(
       command,
       {
@@ -241,7 +244,8 @@ function runShell(
         });
       },
     );
-  });
+    }),
+  );
 }
 
 /** 启动断言：内置工具漏登记级别时直接抛错（在启动即暴露，而不是运行时静默放行）。 */

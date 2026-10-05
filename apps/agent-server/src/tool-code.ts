@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { withSubprocessSlot } from "./subprocess-limit.js";
 
 function capOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -242,6 +243,8 @@ export async function runToolCode(opts: {
   writeFileSync(scriptPath, body, "utf8");
 
   const command = python ? "python" : "node";
+  // 占用一个子进程并发槽：防止模型（或被注入的代码）同时拉起大量解释器把服务端资源打爆。
+  return await withSubprocessSlot(async () => {
   const child = spawn(command, [scriptPath], {
     cwd: opts.cwd,
     windowsHide: true,
@@ -318,6 +321,7 @@ export async function runToolCode(opts: {
     return { ok: false, text: `代码没有成功调用只读工具，输出不能当作事实。\n${output}` };
   }
   return { ok: true, text: output || "（代码没有输出。请用 print / console.log 打出聚合结果）" };
+  });
 }
 
 function closeToolServer(server: Server, sockets: Set<Socket>): Promise<void> {
