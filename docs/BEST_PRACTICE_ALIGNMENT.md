@@ -105,7 +105,7 @@
 | ~~**P2**~~ | ~~OTLP 导出器~~ | OTel | ✅ **本轮已补齐**：`src/otlp.ts`，OTLP/HTTP JSON 编码，默认关闭（`OTEL_EXPORTER_OTLP_ENDPOINT` 未配则不发请求） |
 | ~~**P2**~~ | ~~渐进式自主分级~~ | ASI08 | ✅ **本轮已补齐**：`src/autonomy.ts` 按近期质量**只向下收紧**轮次预算（`/chat/autonomy`）；不自动提权 |
 | ~~**P2**~~ | ~~MCP 服务器来源校验~~ | ASI06 | ✅ **本轮已补齐**：`src/mcp/provenance.ts` 比对命令形态指纹，漂移告警（`/mcp/provenance`） |
-| **P2** | 输出结构（schema）校验 | LLM02 / ASI10 | 现只有净化与外链护栏；artifact（图表/表格）有后端校验但非统一出口 |
+| ~~**P2**~~ | ~~输出结构（schema）校验~~ | LLM02 / ASI10 | ✅ **本轮已补齐**：`src/output-schema.ts` 把澄清/待办/图表 spec 校验统一收口，边界 fail-closed，`GET /chat/output-schema` 可观测 |
 
 ---
 
@@ -129,6 +129,7 @@
 | **P2 per-run 工具 allowlist** | 新增正向清单 `toolAllowlist`（内置工具名）：写入即收窄，清单外工具既不注入、点名调用也拒绝并把拒绝回灌模型（静默丢弃会触发 Doom Loop） | `src/chat.ts`（opts + 两处执行闸门） |
 | **P2 渐进式自主分级** | 按近期质量推导 `level`（0–2），**只向下**收窄轮次预算；绝不因表现好自动放开确认/权限（防刷分提权） | `src/autonomy.ts`、`src/chat.ts`、`src/app.ts`（`/chat/autonomy`） |
 | **P2 MCP 来源漂移检测** | 记各服务器命令形态指纹（command/args/cwd），再登记时比对；漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝连接） | `src/mcp/provenance.ts`、`src/app.ts`（`/mcp/provenance`） |
+| **P2 统一输出 schema 校验** | `src/output-schema.ts` 把散落的澄清/待办/图表 spec 校验收口为单一模块；每个结构化输出 fail-closed（畸形即拒绝并回灌模型），`GET /chat/output-schema` 暴露登记清单 | `src/output-schema.ts`、`src/builtins.ts`、`src/app.ts`（`/chat/output-schema`） |
 
 ---
 
@@ -348,7 +349,23 @@ SBOM 已生成：D:\Code\bx-admin-agent\.data\sbom.cdx.json
 
 - P1 四项：登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂不需要登录体系」保留为缺口；
   其余三项（成本硬配额、进程级 metrics、在线评测）已补齐。
-- P2 八项：本轮补齐「per-run 工具 allowlist / 渐进式自主 / MCP 来源校验」后，仅剩 **输出结构（schema）校验** 一项。
+- P2 八项：本轮补齐「per-run 工具 allowlist / 渐进式自主 / MCP 来源校验 / 统一输出 schema 校验」后，**全部完成**。
+
+### 9.15 实例十二：统一输出 schema 校验（真实服务端）
+
+```
+GET /chat/output-schema → 200
+schemas: request_clarification:true, write_todos:true, render_chart:true, export_data.charts:false
+```
+
+四个结构化输出的 schema 全部登记、可被运维核对：工具产出类（澄清 / 待办 / 图表）为 `strict:true`
+（fail-closed——畸形即拒绝并回灌模型重试，绝不把坏结构交付前端）；导出内嵌图表为 `strict:false`
+（宽松过滤，不合规图表安静丢弃、不拖垮整次导出）。该清单与 `src/output-schema.ts` 的 `OUTPUT_SCHEMAS`
+同源，新增结构化输出时一处登记即同时获得「校验 + 可观测」。
+
+> 该层是把原本散落在 `builtins.ts` 的 `normalizeClarification` / `normalizeTodos` / `isChartSpecLike` /
+> render_chart 内联判断**收口**为统一模块，行为完全不变（含弱模型双重编码宽容解析、可选字段宽松），
+> 只是从「散落函数」变成「单一可审计、可观测的出口」。单测 21 例覆盖各输出合法/非法分支。
 
 > ⚠️ 事故与修复：本轮 `write_to_file` 直接覆盖了**已被 git 跟踪**的 `src/metrics.ts`（`8eff5e4` 提交的 `buildMetrics`，供 `/chat/metrics` 使用），
 > 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。

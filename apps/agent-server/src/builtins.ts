@@ -9,11 +9,27 @@ import type { ExecOptionsWithBufferEncoding } from "node:child_process";
 import { dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactSpec, ChartSpec, ClarifyOption, TodoItem } from "@bx/shared";
-import { CHART_TYPES as SHARED_CHART_TYPES, GRAPH_CHART_TYPES as SHARED_GRAPH_CHART_TYPES } from "@bx/shared";
 import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinary, mimeOf, conversationFsRoot } from "./fs-store.js";
+// 图表类型清单改由统一的输出 schema 校验层持有（与校验逻辑同源，避免后端放行、前端按统计图画的漂移）。
+export { CHART_TYPES, GRAPH_CHART_TYPES } from "./output-schema.js";
 import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS, type ReportKpi } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
+import {
+  MAX_CLARIFY_DESC,
+  MAX_CLARIFY_FIELD,
+  MAX_CLARIFY_LABEL,
+  MAX_CLARIFY_OPTIONS,
+  MAX_CLARIFY_QUESTION,
+  MAX_CLARIFY_WHY,
+  MAX_TODO_CHARS,
+  MAX_TODOS,
+  TODO_STATUSES,
+  isChartSpecLike,
+  validateChartArgs,
+  validateClarification,
+  validateTodos,
+} from "./output-schema.js";
 import { createScheduleTask } from "./schedule-service.js";
 import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
 import { pickNotifyPolicy, pickPurpose } from "./schedule-alert.js";
@@ -328,17 +344,6 @@ export function externalRefHint(content: string): string {
   );
 }
 
-const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
-const MAX_TODOS = 20;
-const MAX_TODO_CHARS = 200;
-
-const MAX_CLARIFY_OPTIONS = 6;
-const MAX_CLARIFY_QUESTION = 300;
-const MAX_CLARIFY_LABEL = 80;
-const MAX_CLARIFY_DESC = 200;
-const MAX_CLARIFY_FIELD = 60;
-const MAX_CLARIFY_WHY = 200;
-
 /**
  * 导出产物的形态与限制（内置工具 `export_data`）。
  * 这里刻意只做「数据 → 文件」的确定性转换，不接通用代码执行：模型给行数据，格式由服务端保证，
@@ -380,28 +385,6 @@ function spec(name: string, description: string, parameters: Record<string, unkn
 }
 
 const jsonType = (type: string, description: string) => ({ type, description });
-
-/** render_chart 支持的图表族（前端据此映射到 G2 / G6）：清单在 @bx/shared，与前端分流同源。 */
-export const CHART_TYPES = new Set<string>(SHARED_CHART_TYPES);
-
-/** 图形类（走 G6 而非 G2）：同样取自共享清单，避免「后端放行、前端按统计图画」的漂移。 */
-const GRAPH_CHART_TYPES = new Set<string>(SHARED_GRAPH_CHART_TYPES);
-
-/**
- * 模型传来的图表是否真能渲染（入参侧收紧，而不是断言成 ChartSpec 交给渲染层去撞）。
- * 为什么要在入口判：报告渲染按「行对象数组」取键名（`Object.keys(row)`），行里混入
- * `null` / 标量会直接抛错，把一次本可成功的导出打断；图形类的 data 则是一个
- * `{nodes,edges}` / `{name,children}` 对象，形态完全不同，不能用同一把尺子量。
- * 判不通过的图表被跳过（图表是装饰，不是导出的主体），不让脏数据拖垮整个文件。
- */
-function isChartSpecLike(v: unknown): v is ChartSpec {
-  if (!v || typeof v !== "object") return false;
-  const o = v as Record<string, unknown>;
-  if (typeof o.chartType !== "string") return false;
-  if (GRAPH_CHART_TYPES.has(o.chartType)) return !!o.data && typeof o.data === "object" && !Array.isArray(o.data);
-  if (!CHART_TYPES.has(o.chartType)) return false;
-  return Array.isArray(o.data) && o.data.every((row) => !!row && typeof row === "object");
-}
 
 /**
  * 工具检索（按需加载模式的入口：对齐 Claude Code 的 ToolSearch 与 Anthropic「Code execution with MCP」
@@ -931,53 +914,6 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
 function str(args: Record<string, unknown>, key: string): string {
   const value = args[key];
   return typeof value === "string" ? value : "";
-}
-
-/** 归一化 write_todos 入参；非法返回错误文本。 */
-function normalizeTodos(raw: unknown): { todos: TodoItem[] } | { error: string } {
-  if (!Array.isArray(raw)) return { error: "todos 必须为数组" };
-  if (raw.length > MAX_TODOS) return { error: `计划条数过多（${raw.length}，上限 ${MAX_TODOS}）` };
-  const todos: TodoItem[] = [];
-  for (const item of raw) {
-    const entry = (item || {}) as { content?: unknown; status?: unknown };
-    const content = String(entry.content || "").trim().slice(0, MAX_TODO_CHARS);
-    const status = String(entry.status || "pending");
-    if (!content) return { error: "每条计划都需要 content" };
-    if (!TODO_STATUSES.has(status)) return { error: `非法状态：${status}` };
-    todos.push({ content, status: status as TodoItem["status"] });
-  }
-  return { todos };
-}
-
-/** 归一化 request_clarification 入参；非法返回错误文本。 */
-function normalizeClarification(
-  raw: Record<string, unknown>,
-): { clarification: NonNullable<BuiltinOutcome["clarification"]> } | { error: string } {
-  const question = String(raw.question || "").trim().slice(0, MAX_CLARIFY_QUESTION);
-  if (!question) return { error: "request_clarification 需要 question" };
-  if (!Array.isArray(raw.options) || raw.options.length < 2) {
-    return { error: "options 至少需要 2 个选项（不足 2 个请直接按最合理的理解执行，不要提问）" };
-  }
-  const options: ClarifyOption[] = [];
-  for (const item of raw.options.slice(0, MAX_CLARIFY_OPTIONS)) {
-    const entry = (item && typeof item === "object" ? item : {}) as { label?: unknown; description?: unknown };
-    const label = String(entry.label || "").trim().slice(0, MAX_CLARIFY_LABEL);
-    if (!label) continue;
-    const description = String(entry.description || "").trim().slice(0, MAX_CLARIFY_DESC);
-    options.push({ label, ...(description ? { description } : {}) });
-  }
-  if (options.length < 2) return { error: "options 至少需要 2 个带 label 的有效选项" };
-  // 澄清契约字段可选：缺失不算错误（弱模型漏填时不该把整次澄清判失败）。
-  const missingField = String(raw.missing_field || "").trim().slice(0, MAX_CLARIFY_FIELD);
-  const whyItMatters = String(raw.why_it_matters || "").trim().slice(0, MAX_CLARIFY_WHY);
-  return {
-    clarification: {
-      question,
-      options,
-      ...(missingField ? { missingField } : {}),
-      ...(whyItMatters ? { whyItMatters } : {}),
-    },
-  };
 }
 
 /** 扩展名归一：把同一产物的别名映射到标准格式（`.xls → xlsx`、`.htm → html`）。 */
@@ -1712,10 +1648,10 @@ export async function execBuiltin(
       return { ok: true, text: items.map((item) => `- ${item.text}`).join("\n") };
     }
     case "request_clarification": {
-      const result = normalizeClarification(args);
-      if ("error" in result) return { ok: false, text: `澄清失败：${result.error}` };
+      const result = validateClarification(args);
+      if (!result.ok) return { ok: false, text: `澄清失败：${result.error}` };
       // 真正的挂起由 chat 循环完成（要下发事件并等待用户应答）。
-      return { ok: true, text: "", clarification: result.clarification };
+      return { ok: true, text: "", clarification: result.value };
     }
     case "read_skill": {
       const content = readSkill(str(args, "name"));
@@ -1723,13 +1659,10 @@ export async function execBuiltin(
       return { ok: true, text: content };
     }
     case "render_chart": {
-      const chartType = String(args.chartType ?? args.type ?? "").trim().toLowerCase();
-      if (!CHART_TYPES.has(chartType)) {
-        return {
-          ok: false,
-          text: `不支持的图表类型：${chartType || "(空)"}。支持：${[...CHART_TYPES].join("、")}`,
-        };
-      }
+      // 统一输出 schema 校验：chartType 受支持 + data 形态正确（fail-closed，非法即回灌模型）。
+      const chartCheck = validateChartArgs(args);
+      if (!chartCheck.ok) return { ok: false, text: chartCheck.error };
+      const { chartType, data: validatedData } = chartCheck.value;
       // 模型偶尔把结构化参数当 JSON 字符串传（双重编码）：宽容解析，省掉一轮无谓重试。
       const asJson = (v: unknown): unknown => {
         if (typeof v !== "string") return v;
@@ -1739,34 +1672,8 @@ export async function execBuiltin(
           return v;
         }
       };
-      const rawData = asJson(args.data);
-      if (GRAPH_CHART_TYPES.has(chartType)) {
-        // 图形类：接受 {nodes,...} 或层级 {name,children}。
-        // 注意数组的 typeof 也是 "object"，必须显式排除——否则 [1,2] 会一路走到前端才抛错降级成表格。
-        if (typeof rawData !== "object" || rawData === null || Array.isArray(rawData)) {
-          return {
-            ok: false,
-            text: "render_chart（图形类）需要 data 为 {nodes,edges} 或 {name,children} 结构（不能是数组）",
-          };
-        }
-        const g = rawData as Record<string, unknown>;
-        if (!Array.isArray(g.nodes) && !Array.isArray(g.children)) {
-          return {
-            ok: false,
-            text: "render_chart（图形类）的 data 需要含 nodes 数组（关系/流程）或 children 数组（层级/树）",
-          };
-        }
-      } else if (!Array.isArray(rawData)) {
-        return { ok: false, text: "render_chart（统计图）需要 data 为行对象数组（真实数据，禁止编造）" };
-      } else if (rawData.some((r) => typeof r !== "object" || r === null || Array.isArray(r))) {
-        // 纯数字数组（[1,2,3]）画不出图：G2 要靠字段名取 x/y，静默空白比明确回告更糟。
-        return {
-          ok: false,
-          text: 'render_chart（统计图）的 data 必须是「行对象」数组（如 [{"name":"A","value":1}]），纯数字数组无法确定坐标字段',
-        };
-      }
       const MAX_ROWS = 5000;
-      const data = Array.isArray(rawData) ? rawData.slice(0, MAX_ROWS) : rawData;
+      const data = Array.isArray(validatedData) ? validatedData.slice(0, MAX_ROWS) : validatedData;
       const title = str(args, "title") || undefined;
       const encRaw = asJson(args.encode);
       const optRaw = asJson(args.options);
@@ -1964,16 +1871,16 @@ export async function execBuiltin(
       return { ok: true, text: `${head}\n\n${page.text}${tail}` };
     }
     case "write_todos": {
-      const result = normalizeTodos(args.todos);
-      if ("error" in result) return { ok: false, text: `计划写入失败：${result.error}` };
-      await setConversationTodos(conversationId, result.todos).catch((err) => {
+      const result = validateTodos(args.todos);
+      if (!result.ok) return { ok: false, text: `计划写入失败：${result.error}` };
+      await setConversationTodos(conversationId, result.value).catch((err) => {
         console.warn(`[builtins] write_todos 落库失败（前端可能已回显但库未写入）：${String((err as Error)?.message || err)}`);
       });
-      const done = result.todos.filter((item) => item.status === "completed").length;
+      const done = result.value.filter((item) => item.status === "completed").length;
       return {
         ok: true,
-        text: `计划已更新：共 ${result.todos.length} 步，已完成 ${done}。`,
-        todos: result.todos,
+        text: `计划已更新：共 ${result.value.length} 步，已完成 ${done}。`,
+        todos: result.value,
       };
     }
     case "record_watched_movies": {

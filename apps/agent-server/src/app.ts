@@ -24,6 +24,7 @@ import { listAnomalies, observeRun } from "./anomaly.js";
 import { verifyMemoryIntegrity } from "./memory.js";
 import { autonomyFor } from "./autonomy.js";
 import { verifyProvenance, provenanceBlocked } from "./mcp/provenance.js";
+import { OUTPUT_SCHEMAS } from "./output-schema.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -843,6 +844,11 @@ export function createApp() {
 
   // MCP 服务器来源校验（P2 / ASI06）：命令形态是否与其首次登记一致（疑似被替换）。
   app.get("/mcp/provenance", (c) => c.json(verifyProvenance()));
+
+  // 统一输出 schema 校验（P2 / LLM02·ASI10）：登记所有结构化输出的 schema 与其校验规则，
+  // 供运维核对「哪些模型产出被收口校验、是否 fail-closed」。校验逻辑本身在 src/output-schema.ts，
+  // 在工具执行边界对畸形结构 fail-closed（拒绝并回灌模型），此处只暴露清单。
+  app.get("/chat/output-schema", (c) => c.json({ schemas: OUTPUT_SCHEMAS }));
 
   // ---- 成本计量（§12 最小版）：按日 / 模型聚合 + 预算告警；未配单价只计 token，不编造金额 ----
   app.get("/chat/cost/summary", (c) => {

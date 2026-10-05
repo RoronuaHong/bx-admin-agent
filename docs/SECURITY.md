@@ -182,6 +182,19 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 - 每次读取配置都比对——形态变了即 `changed` 并告警（疑似被替换），`MCP_REQUIRE_PROVENANCE=on` 下还会拒绝连接（fail-closed）。
 - **只比声明形态**（不哈希可执行文件内容）：成本低、能抓绝大多数「被换掉」情形；真正的内容级校验需额外机制。
 
+### 8.11 统一输出 schema 校验（OWASP LLM02 / ASI10）
+
+模型不只是产出自由文本，还会产出**结构化子输出**：澄清卡片（`request_clarification`）、任务计划（`write_todos`）、图表 spec（`render_chart`）、导出报告里内嵌的图表（`export_data.charts`）。这些会被渲染成卡片 / 清单 / 图表或喂给下游（报告合成）——一旦结构非法，要么前端渲染崩、要么脏数据静默混入导出文件。
+
+`src/output-schema.ts` 把这些散落的校验**收口为统一模块**：
+
+- 每个结构化输出一个校验函数，统一 `ValidationResult` 形态（成功带 value，失败带 error 文本）。
+- **边界 fail-closed**：畸形即返回错误文本、回灌给模型让它重试，**绝不把坏结构交付前端 / 下游**。非法澄清（缺 question、选项不足 2 个）、非法待办（非数组、超上限、未知 status）、非法图表（类型不支持、统计图 data 非行对象数组、图形类 data 非 `{nodes,edges}`）全部被拦。
+- **只校验结构、不校验语义**（选项是否真能区分、图表数据是否真相关交给模型）；**可选字段宽松**（澄清的契约字段缺失不报错，弱模型漏填不该整次判失败）。
+- 统一 `OUTPUT_SCHEMAS` 登记清单，`GET /chat/output-schema` 可观测（哪些输出被收口、是否 fail-closed、校验规则）。新增结构化输出时一处登记即同时获得校验 + 可观测。
+
+> 这是把原本散落在 `builtins.ts` 的 `normalizeClarification` / `normalizeTodos` / `isChartSpecLike` / render_chart 内联判断**重构**到单一模块，行为完全不变，只是可审计、可观测。自由文本回答另有 `chat-richtext.ts` 的 DOMPurify 净化 + 零外链护栏覆盖（§8.3）。
+
 ## 9. Prompt 注入防护
 
 外部内容（工具返回 / 检索片段 / 子代理回传）回灌模型前，由 `src/untrusted.ts` **结构化定界**（非越狱话术词表，语义仍 100% 交模型，符合「禁写死」红线）：
@@ -268,9 +281,10 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 通用 PII / 出站 DLP | 🟡 可开启 | `REDACT_PII=on` 后打码 email/手机号/身份证/银行卡；**默认关闭**（业务数据误报高）。姓名/地址类不做（无形态可依） |
 | SBOM | ✅ 已做 | `scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（生产依赖，393 组件） |
 | MCP 服务器来源校验 | 🟡 声明形态漂移检测 | `src/mcp/provenance.ts` 比对 command/args/cwd 指纹，漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝）；不哈希可执行文件内容 |
+| 统一输出 schema 校验 | ✅ 已做 | `src/output-schema.ts` 收口澄清/待办/图表 spec 校验，边界 fail-closed，`GET /chat/output-schema` 可观测；自由文本另有 DOMPurify 净化 |
 | 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
 | OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
-| 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
+| 在线/持续评测闭环 | ✅ 已做 | `src/eval-online.ts` 每次真实运行确定性打分（七维），落 JSONL + 指标 + `/chat/eval/runs`、`/chat/eval/summary`；**不做 LLM-as-judge** |
 | 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。多实例时为**每实例**计数，需入口层兜底 |
 | 行为异常检测 | ✅ 已做 | `src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串）；**样本 <5 不判**、只报不管。局限：基线在进程内，重启重建，多实例不共享 |
 
@@ -296,6 +310,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | per-run 工具 allowlist | `src/chat.ts`（opts `toolAllowlist` + 两处执行闸门） |
 | 渐进式自主分级 | `src/autonomy.ts`、`src/chat.ts`（轮次预算）、`src/app.ts`（`GET /chat/autonomy`） |
 | MCP 来源漂移检测 | `src/mcp/provenance.ts`、`src/app.ts`（`GET /mcp/provenance`） |
+| 统一输出 schema 校验 | `src/output-schema.ts`、`src/builtins.ts`、`src/app.ts`（`GET /chat/output-schema`） |
 | OTLP 导出（可选） | `src/otlp.ts`、`src/app.ts`（run 收束时触发） |
 | 出站 PII 打码（可选） | `src/redact.ts`（`redactPii` / `redactSensitive`）、`src/chat.ts` |
 | SBOM | `scripts/gen-sbom.mjs` |
