@@ -46,9 +46,9 @@
 | ASI03 身份与权限滥用 | Agent 作为一等非人类身份（NHI）治理：最小权限、JIT 授权、持续授权 | 匿名 cookie 会话（`bx_agent_sid`）+ 设备 owner（`bx_agent_oid`）；HTTP 面按 ownerKey 最小权限（只看自己的） | ❌ | **无登录/租户、无 NHI 生命周期管理**（创建/复核/监控/退役）。P1（多端接入前置项） |
 | ASI04 记忆投毒 | 记忆隔离 + **完整性校验** | 记忆按 owner 隔离；条数与注入字符双上限；**本轮新增**写入前清洗控制符 + 写入落审计（`memory_write`） | 🟡 | 无完整性校验、无用户复核入口（记忆写入由模型直接调 `save_memory`）。P2 |
 | ASI05 数据泄露 | 输出过滤、DLP | ownerKey 隔离；`Cache-Control: no-store`；**本轮新增**出站凭据打码 | 🟡 | 无通用 PII/DLP。P2 |
-| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；**本轮新增** `MCP_ALLOWED_COMMANDS` stdio 命令白名单（配置时校验 + **spawn 前再校验**，fail-closed 落在执行点） | 🟡 | 白名单默认关闭；无 SBOM、无 MCP 服务器来源校验。P2 |
+| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；`MCP_ALLOWED_COMMANDS` 命令白名单（配置时 + **spawn 前**再校验）；SBOM（`gen-sbom.mjs`，393 组件）；**本轮新增** MCP 来源漂移检测（命令形态指纹比对） | 🟡 | 白名单默认关闭；来源检测只比声明形态（不哈希可执行文件） |
 | ASI07 输入操纵 | 输入清洗、类型/结构校验 | 请求体上限；ReDoS 护栏（嵌套量词 + **本轮新增交替重叠型** `(a|a)*`）+ 2s 预算兜底；`runGate` schema/可调用性校验 | ✅ | — |
-| ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集 | 🟡 | **无渐进式自主分级**（不以历史成功率提升权限）；不可逆操作未强制人工（靠风险等级触发确认，已接近）。P2 |
+| ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集；**本轮新增** 渐进式自主（按近期质量**只向下**收紧轮次预算） | 🟡 | 不自动提权（历史质量好也不放开确认/权限——防刷分提权） |
 | ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost + span 挂 `gen_ai.*`；**本轮新增进程级 metrics、OTLP 导出、行为异常检测** | ✅ | 仍无跨进程基线共享（基线在进程内，重启重建） |
 | ASI10 不安全的输出处理 | 输出校验、下游控制 | DOMPurify 净化 + 零外链护栏 + 出站打码 | 🟡 | 无输出结构校验。P2 |
 
@@ -97,14 +97,15 @@
 | --- | --- | --- | --- |
 | **P1** | 登录/租户 + NHI 生命周期治理 | ASI03 | 多端接入前置项；当前靠匿名 owner 最小权限 |
 | ~~**P1**~~ | ~~在线/持续评测闭环~~ | OTel「遥测作为评测反馈回路」 | ✅ **本轮已补齐**（`src/eval-online.ts`）。剩余：登录/租户与 NHI 治理——**用户 2026-10-06 明确暂不需要登录体系**，保留为已知缺口 |
-| ~~**P2**~~ | ~~SBOM~~ | LLM05 / ASI06 | ✅ **本轮已补齐**：`scripts/gen-sbom.mjs`（CycloneDX 1.5，生产依赖），实测 393 组件 / 0 未知许可证。剩余：MCP 服务器来源校验 |
+| ~~**P2**~~ | ~~SBOM~~ | LLM05 / ASI06 | ✅ **本轮已补齐**：`scripts/gen-sbom.mjs`（CycloneDX 1.5，生产依赖），实测 393 组件 / 0 未知许可证 |
 | ~~**P2**~~ | ~~通用 PII / 出站 DLP~~ | LLM06 / ASI05 | ✅ **本轮已补齐**（可开启）。剩余：姓名/地址类不做（无形态可依，词典必然误报） |
-| **P2** | 按任务（per-run）工具 allowlist | LLM08 / ASI02 | 现全局工具集 |
+| ~~**P2**~~ | ~~按任务（per-run）工具 allowlist~~ | LLM08 / ASI02 | ✅ **本轮已补齐**：`toolAllowlist`（正向清单，只收窄），未传入=行为不变 |
 | ~~**P2**~~ | ~~记忆完整性校验~~ | ASI04 | ✅ **本轮已补齐**：内容指纹 sidecar + 逐条校验（`/chat/memory` 返回 `integrity`）。剩余：写入前用户复核确认 |
 | ~~**P2**~~ | ~~行为异常检测~~ | ASI09 | ✅ **本轮已补齐**：`src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串），`/chat/anomalies`。**样本不足不判**（防冷启动误报） |
 | ~~**P2**~~ | ~~OTLP 导出器~~ | OTel | ✅ **本轮已补齐**：`src/otlp.ts`，OTLP/HTTP JSON 编码，默认关闭（`OTEL_EXPORTER_OTLP_ENDPOINT` 未配则不发请求） |
-| **P2** | 渐进式自主分级 | ASI08 | 现靠固定风险等级触发确认 |
-| **P2** | 输出结构（schema）校验 | LLM02 / ASI10 | 现只有净化与外链护栏 |
+| ~~**P2**~~ | ~~渐进式自主分级~~ | ASI08 | ✅ **本轮已补齐**：`src/autonomy.ts` 按近期质量**只向下收紧**轮次预算（`/chat/autonomy`）；不自动提权 |
+| ~~**P2**~~ | ~~MCP 服务器来源校验~~ | ASI06 | ✅ **本轮已补齐**：`src/mcp/provenance.ts` 比对命令形态指纹，漂移告警（`/mcp/provenance`） |
+| **P2** | 输出结构（schema）校验 | LLM02 / ASI10 | 现只有净化与外链护栏；artifact（图表/表格）有后端校验但非统一出口 |
 
 ---
 
@@ -125,6 +126,9 @@
 | **P2 行为异常检测** | 按 owner 建滚动基线（近 50 次），比对轮数/token/耗时突增、工具新颖性、未取证成串；**样本 <5 不判**；只报不管 | `src/anomaly.ts`、`src/app.ts` |
 | **P2 记忆完整性校验** | 内容指纹 sidecar（`memory.digest.json`）+ 逐条校验；诚实区分 `match`/`mismatch`/`missing`；只告警不擅自改写 | `src/memory.ts`、`src/app.ts`（`/chat/memory` 返回 `integrity`） |
 | **回归修复：记忆清洗正则** | 第七轮引入的清洗正则缺 `u` 标志，`\uE0000-\uE007F` 被解析成「`0` 到 `\uE007`」巨大区间 → **几乎匹配所有字符，会把整条记忆抹空**。已改 `\u{...}` + `u` 标志，并抽出可测纯函数 `sanitizeMemoryText` | `src/memory.ts`、`tests/anomaly-memory.test.ts` |
+| **P2 per-run 工具 allowlist** | 新增正向清单 `toolAllowlist`（内置工具名）：写入即收窄，清单外工具既不注入、点名调用也拒绝并把拒绝回灌模型（静默丢弃会触发 Doom Loop） | `src/chat.ts`（opts + 两处执行闸门） |
+| **P2 渐进式自主分级** | 按近期质量推导 `level`（0–2），**只向下**收窄轮次预算；绝不因表现好自动放开确认/权限（防刷分提权） | `src/autonomy.ts`、`src/chat.ts`、`src/app.ts`（`/chat/autonomy`） |
+| **P2 MCP 来源漂移检测** | 记各服务器命令形态指纹（command/args/cwd），再登记时比对；漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝连接） | `src/mcp/provenance.ts`、`src/app.ts`（`/mcp/provenance`） |
 
 ---
 
@@ -316,10 +320,35 @@ SBOM 已生成：D:\Code\bx-admin-agent\.data\sbom.cdx.json
 > 教训：**清洗类（白名单反向 = 去字符）的正则必须有一条「正常文本不被改动」的断言**，
 > 只测「坏字符被去掉」会漏掉正则写错导致的大面积误伤。
 
-### 9.13 关于 P1 收尾
+### 9.13 实例十一：工具 allowlist / 渐进式自主 / 来源校验（真实服务端）
 
-四项 P1（登录/租户、成本硬配额、进程级 metrics、在线评测）中，**后三项已补齐**；
-登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂时不需要登录体系」，保留为已知缺口（见 §7）。
+```
+1) GET /chat/autonomy status = 200 → {"level":2,"reason":"样本不足（0/5），按默认自主度","maxRounds":14}
+   PASS  自主度端点 200
+   PASS  level 取值合法
+   PASS  maxRounds ≥ 1
+2) GET /mcp/provenance（第 1 次）status = 200
+   checks = [bi/yapi/movie/orders/gitlab/zoho-salesiq 共 6 个，status="new"]
+   PASS  来源端点 200
+   PASS  checks 是数组
+   PASS  strict 标记存在（默认 false = 只告警不拦）
+3) GET /mcp/provenance（第 2 次）→ 6 个全部 "unchanged"（指纹稳定）
+   PASS  已有基线后再比对 → unchanged
+```
+
+`/chat/autonomy` 返回 `level 2` 是**如实**的：当前没有近期评测样本，按默认自主度（不收紧、也不提权）。
+`/mcp/provenance` 第 1 次把 6 个已配置服务器记为 `new`（建立基线），第 2 次全部 `unchanged`——
+证明指纹稳定、只要命令形态没变就不会误报。后续若某个 `command` 被替换，立即变 `changed` 并告警
+（`MCP_REQUIRE_PROVENANCE=on` 下还会拒绝连接）。
+
+> 工具 allowlist（`toolAllowlist`）因依赖「模型真实调用工具」才能端到端验证，而当前模型侧 402，
+> 故该路径以**单测**覆盖（注入收窄 + 点名调用拒绝回灌），未做 HTTP 级实例（与历史同类项的取舍一致）。
+
+### 9.14 关于 P1/P2 收尾
+
+- P1 四项：登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂不需要登录体系」保留为缺口；
+  其余三项（成本硬配额、进程级 metrics、在线评测）已补齐。
+- P2 八项：本轮补齐「per-run 工具 allowlist / 渐进式自主 / MCP 来源校验」后，仅剩 **输出结构（schema）校验** 一项。
 
 > ⚠️ 事故与修复：本轮 `write_to_file` 直接覆盖了**已被 git 跟踪**的 `src/metrics.ts`（`8eff5e4` 提交的 `buildMetrics`，供 `/chat/metrics` 使用），
 > 被 `tsc` 报 `has no exported member 'buildMetrics'` 发现，已 `git checkout HEAD --` 还原，新模块改名 `src/process-metrics.ts`。

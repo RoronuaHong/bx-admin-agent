@@ -22,6 +22,8 @@ import { listRunEvals, recordRunEval, summarizeEval } from "./eval-online.js";
 import { exportRunOtlp } from "./otlp.js";
 import { listAnomalies, observeRun } from "./anomaly.js";
 import { verifyMemoryIntegrity } from "./memory.js";
+import { autonomyFor } from "./autonomy.js";
+import { verifyProvenance, provenanceBlocked } from "./mcp/provenance.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -830,6 +832,17 @@ export function createApp() {
     const limit = Number(c.req.query("limit")) || 50;
     return c.json({ release: getRelease(), anomalies: listAnomalies(c.get("owner"), limit) });
   });
+
+  // 渐进式自主（P2 / ASI08）：展示当前自主度与收紧原因。只向下收紧，不放开权限。
+  app.get("/chat/autonomy", (c) =>
+    c.json({
+      release: getRelease(),
+      autonomy: autonomyFor(c.get("owner"), Number(process.env.MCP_MAX_TOOL_ROUNDS || 14)),
+    }),
+  );
+
+  // MCP 服务器来源校验（P2 / ASI06）：命令形态是否与其首次登记一致（疑似被替换）。
+  app.get("/mcp/provenance", (c) => c.json(verifyProvenance()));
 
   // ---- 成本计量（§12 最小版）：按日 / 模型聚合 + 预算告警；未配单价只计 token，不编造金额 ----
   app.get("/chat/cost/summary", (c) => {

@@ -159,6 +159,29 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 - **只报不管**：发现异常只告警并暴露，不擅自改写用户数据（改数据留给用户决定）。
 - 已知边界：写入**没有用户复核确认**（模型可直接调 `save_memory`），但已有查看/删除端点与前端面板；见 §15。
 
+### 8.8 最小权限工具集（OWASP LLM08 过度自主 / ASI02 工具滥用）
+
+默认所有内置工具都注入本轮（见 §8.3 注释）。两种收窄方式：
+
+- **反向剔除** `omitBuiltinTools`：划掉几个（如预警跑摘掉 `render_chart`/`export_data`）。
+- **正向 allowlist** `toolAllowlist`（本轮新增）：只给明确清单。**未传 = 不收窄**（与改动前一致）。
+  清单外工具既不注入，模型点名调用也**拒绝并把拒绝回灌模型**——静默丢弃会让模型以为工具坏了反复重试（Doom Loop）。
+- 定时任务已有 `mcpServers`/`mcpAllowlist`/`denyBuiltinTools`：任务级工具集以任务自身配置为准，不与对话勾选取并集（避免越权放大）。
+
+### 8.9 渐进式自主分级（OWASP ASI08）
+
+`src/autonomy.ts` 按 owner 的近期评测质量推导 `level`（0–2），**只向下收紧**轮次预算：劣质占比高 → 减到 4 轮、中等 → 8 轮，正常 → 不收紧。
+
+**刻意不实现「 earned trust escalation 」**：不因为历史表现好就自动放开确认或权限。理由——本项目的在线评测是确定性规则分，攻击者只要让运行「看起来干净」（少调工具、少纠正）就能刷高；用它**提权**等于给了攻击者一条路径。收窄则只会更保守。放开权限必须由人决策（改配置 / 改角色）。`GET /chat/autonomy` 可查看当前自主度与原因。
+
+### 8.10 MCP 服务器来源校验（OWASP ASI06）
+
+stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`，§8.5）能挡「不在名单里的命令」，但挡不住「名单里的命令本身被换掉」。`src/mcp/provenance.ts` 补**来源漂移检测**：
+
+- 记各服务器首次登记时的命令形态指纹（command / args / cwd 的 sha256）。
+- 每次读取配置都比对——形态变了即 `changed` 并告警（疑似被替换），`MCP_REQUIRE_PROVENANCE=on` 下还会拒绝连接（fail-closed）。
+- **只比声明形态**（不哈希可执行文件内容）：成本低、能抓绝大多数「被换掉」情形；真正的内容级校验需额外机制。
+
 ## 9. Prompt 注入防护
 
 外部内容（工具返回 / 检索片段 / 子代理回传）回灌模型前，由 `src/untrusted.ts` **结构化定界**（非越狱话术词表，语义仍 100% 交模型，符合「禁写死」红线）：
@@ -243,7 +266,8 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | 配置端点强制令牌 | 🟡 默认不强制 | 需显式配 `AGENT_ADMIN_TOKEN` 才启用；默认单机信任 |
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
 | 通用 PII / 出站 DLP | 🟡 可开启 | `REDACT_PII=on` 后打码 email/手机号/身份证/银行卡；**默认关闭**（业务数据误报高）。姓名/地址类不做（无形态可依） |
-| SBOM | ✅ 已做 | `scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（生产依赖，393 组件）。剩余：MCP 服务器**来源**校验未做 |
+| SBOM | ✅ 已做 | `scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（生产依赖，393 组件） |
+| MCP 服务器来源校验 | 🟡 声明形态漂移检测 | `src/mcp/provenance.ts` 比对 command/args/cwd 指纹，漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝）；不哈希可执行文件内容 |
 | 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
 | OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
 | 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
@@ -269,6 +293,9 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | OTel GenAI 语义属性（可观测互操作） | `src/trace.ts`（`SpanTrace.attrs`）、`src/chat.ts`（llm / tool span） |
 | 成本硬配额 | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts`（`quota_exceeded`） |
 | 进程级指标 | `src/process-metrics.ts`、`src/app.ts`（`GET /metrics`）、`src/chat.ts`（打点） |
+| per-run 工具 allowlist | `src/chat.ts`（opts `toolAllowlist` + 两处执行闸门） |
+| 渐进式自主分级 | `src/autonomy.ts`、`src/chat.ts`（轮次预算）、`src/app.ts`（`GET /chat/autonomy`） |
+| MCP 来源漂移检测 | `src/mcp/provenance.ts`、`src/app.ts`（`GET /mcp/provenance`） |
 | OTLP 导出（可选） | `src/otlp.ts`、`src/app.ts`（run 收束时触发） |
 | 出站 PII 打码（可选） | `src/redact.ts`（`redactPii` / `redactSensitive`）、`src/chat.ts` |
 | SBOM | `scripts/gen-sbom.mjs` |

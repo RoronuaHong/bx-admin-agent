@@ -67,6 +67,7 @@ import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 import { appendRoundTrace, appendSpanTrace } from "./trace.js";
 import { redactSensitive, countSecretHits } from "./redact.js";
+import { autonomyFor } from "./autonomy.js";
 import { incCounter, observeSummary } from "./process-metrics.js";
 import { addDailyTokens, quotaState } from "./quota.js";
 import { readFileSync } from "node:fs";
@@ -1270,6 +1271,8 @@ interface LoopContext {
   enforceGrounding?: boolean;
   /** 定时运行拒绝执行的内置工具。模型仍可能点名调用，拒绝结果记入本期工具记录。 */
   deniedBuiltins?: ReadonlySet<string>;
+  /** 本次运行的正向工具允许清单；存在时，清单外的内置工具既不注入、点名调用也拒绝。 */
+  allowBuiltins?: ReadonlySet<string>;
 }
 
 interface LoopOutcome {
@@ -1735,6 +1738,15 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (ctx.deniedBuiltins?.has(c.name)) {
         return { ok: false, rawText: unattendedToolDenial(c.name), executed: false };
       }
+      // 正向允许清单：清单外的工具点名调用也拒绝，且**把拒绝回灌模型**——
+      // 静默丢弃会让模型以为工具坏了而反复重试（Doom Loop）。
+      if (ctx.allowBuiltins && !ctx.allowBuiltins.has(c.name)) {
+        return {
+          ok: false,
+          rawText: `本次运行未授权该工具（工具允许清单已收窄）：${c.name}`,
+          executed: false,
+        };
+      }
       const builtin = await execBuiltin(
         c.name,
         c.argsJson,
@@ -2104,6 +2116,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（定时运行拒绝）" });
+        continue;
+      }
+      if (ctx.allowBuiltins && !ctx.allowBuiltins.has(call.name)) {
+        ok = false;
+        rawText = `本次运行未授权该工具（工具允许清单已收窄）：${call.name}`;
+        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
+        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（不在允许清单）" });
         continue;
       }
       // 内置工具优先（fs_* / write_todos / read_skill）；其余走 MCP 通道。
@@ -2577,6 +2597,13 @@ export async function* chatStream(
     /** 点名调用也拒绝，并把拒绝写进本期工具记录（定时运行用；交互式不传）。 */
     denyBuiltinTools?: string[];
     /**
+     * 本次运行的**正向**内置工具允许清单（OWASP LLM08 过度自主 / ASI02 工具滥用）。
+     * 与 `omitBuiltinTools`（反向剔除）互补：反向只能「划掉几个」，正向才能表达
+     * 「这次就只给这几个」。不传 = 不收窄（与改动前一致）。
+     * 语义是**只收窄**：清单外的工具既不注入、点名调用也拒绝（拒绝结果回灌模型，不静默丢弃）。
+     */
+    toolAllowlist?: string[];
+    /**
      * 定时运行被接地护栏拦住、且诚实兜底没有写出正文时才用。
      * alert 换 [NO_DATA] 协议行；report 换「没有写结论」，由调度器记失败。
      * 没有事实断言的回答已在分诊放行，不会走到这里。不传 = 交互对话。
@@ -2675,7 +2702,23 @@ export async function* chatStream(
   const deniedBuiltins = new Set(
     (opts.denyBuiltinTools || []).map((name) => String(name || "").trim()).filter(Boolean),
   );
-  const builtinSpecs = builtinToolSpecs({ toolSearch }).filter((spec) => !omitBuiltins.has(spec.name));
+  // 正向允许清单（P2）：只把清单内的内置工具注入本轮——「这次就只给这几个」才是最小权限，
+  // 反向剔除（omit）只能划掉几个，剩下的仍然全开。
+  const allowBuiltins = opts.toolAllowlist?.length
+    ? new Set(opts.toolAllowlist.map((name) => String(name || "").trim()).filter(Boolean))
+    : null;
+  const builtinSpecs = builtinToolSpecs({ toolSearch }).filter(
+    (spec) => !omitBuiltins.has(spec.name) && (!allowBuiltins || allowBuiltins.has(spec.name)),
+  );
+  // 渐进式自主（P2 / ASI08）：按近期质量**只向下收紧**轮次预算。
+  // 不实现「表现好就自动放开确认/权限」——在线评测是规则分，可被「少调工具」刷高，
+  // 用它提权等于给攻击者一条路径；收窄则只会更保守。放开权限必须由人决策。
+  const baseRounds = opts.maxRounds && opts.maxRounds > 0 ? Math.floor(opts.maxRounds) : MAX_TOOL_ROUNDS;
+  const autonomy = autonomyFor(opts.ownerKey, baseRounds);
+  if (autonomy.level < 2) {
+    console.log(`[chat:autonomy] 自主度降至 ${autonomy.level}（${autonomy.reason}），轮次预算 ${baseRounds} → ${autonomy.maxRounds}`);
+  }
+
   // 按需加载时仍预载本轮点名或检索命中的少量工具（不全量注入 281 份说明）。
   const prefetched = toolSearch
     ? prefetchDeferredTools(collected.tools, userText, Math.min(PREFETCH_TOOL_LIMIT, MCP_MAX_TOOLS))
@@ -2844,7 +2887,7 @@ export async function* chatStream(
           fullAccess: conversation?.fullAccess ?? true,
           sessionId: opts.sessionId,
           // 调用方给了预算就用它（无人值守的定时任务比交互式宽），否则走全局默认。
-          maxRounds: opts.maxRounds && opts.maxRounds > 0 ? Math.floor(opts.maxRounds) : MAX_TOOL_ROUNDS,
+          maxRounds: autonomy.maxRounds,
           ...(opts.forceWrapUp ? { forceWrapUp: true } : {}),
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
@@ -2853,6 +2896,7 @@ export async function* chatStream(
           runId: traceMeta?.runId,
           system: systemPrompt,
           ...(deniedBuiltins.size ? { deniedBuiltins } : {}),
+          ...(allowBuiltins?.size ? { allowBuiltins } : {}),
         },
         turns,
       );
