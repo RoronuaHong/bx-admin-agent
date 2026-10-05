@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { withSubprocessSlot } from "./subprocess-limit.js";
+import { nodeFsGuardSource, pyFsGuardSource } from "./tool-code-fs-guard.js";
 
 function capOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -54,6 +55,7 @@ const ENV_ALLOW = new Set([
   "pythonutf8",
   "pythonpath",
   "node_path",
+  "tool_code_fs_allow",
 ]);
 
 /** 服务端环境 → 子进程环境（只留白名单里的键，再补上桥接用的变量）。 */
@@ -237,8 +239,8 @@ export async function runToolCode(opts: {
   const clientPath = join(scratch, clientName);
   writeFileSync(clientPath, python ? PY_CLIENT : NODE_CLIENT, "utf8");
   const body = python
-    ? `import sys\nsys.path.insert(0, ${JSON.stringify(scratch)})\nfrom _bx_tool import call_tool\n${opts.code}`
-    : `import { callTool } from ${JSON.stringify(pathToFileURL(clientPath).href)};\nglobalThis.callTool = callTool;\nawait (async () => {\n${opts.code}\n})();\n`;
+    ? `import sys\nsys.path.insert(0, ${JSON.stringify(scratch)})\nfrom _bx_tool import call_tool\n${pyFsGuardSource()}\n${opts.code}`
+    : `${nodeFsGuardSource()}\nimport { callTool } from ${JSON.stringify(pathToFileURL(clientPath).href)};\nglobalThis.callTool = callTool;\nawait (async () => {\n${opts.code}\n})();\n`;
   const scriptPath = join(scratch, scriptName);
   writeFileSync(scriptPath, body, "utf8");
 

@@ -406,7 +406,7 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 | # | 局限 | 对应项 | 现状与缺口 | 推进所需 |
 | --- | --- | --- | --- | --- |
 | 1 | 登录 / 租户 + NHI 生命周期治理 | ASI03 | 仅匿名 cookie owner + 设备 owner 最小权限；无账号、无 NHI 创建/复核/退役 | 用户 2026-10-06 明确「暂不需要登录体系」，保留为缺口；多端接入前置项 |
-| 2 | 子进程 OS 级沙箱 | LLM07/ASI02 执行安全 | `run_tool_code` / `run_command` / `run_script` 仅靠「环境白名单 + 超时 + 并发上限 + 只读工具桥」，**无 microVM/Docker/AppContainer 隔离**：绝对路径可读任意文件、无出网限制、无文件系统隔离 | 需引入 microVM（gVisor/Firecracker）或容器运行时，平台成本较高 |
+| 2 | 子进程 OS 级沙箱 | LLM07/ASI02 执行安全 | `run_tool_code` / `run_command` / `run_script` 仅靠「环境白名单 + **凭据文件读取守卫** + 超时 + 并发上限 + 只读工具桥」，**无 microVM/Docker/AppContainer 隔离**：绝对路径可读任意**非凭据**文件、无出网限制、无文件系统隔离；守卫是拒绝清单，可被 `child_process` 绕过 | 需引入 microVM（gVisor/Firecracker）或容器运行时，平台成本较高 |
 | 3 | 多实例限流 / 配额 | LLM04/LLM10 | 限流与成本配额均为**每实例**计数（进程内），多实例部署时各算各的、无全局阈值 | 需 Redis 或入口层（网关/反向代理）兜底 |
 | 4 | 出站内容脱敏默认值 | LLM06/ASI05 | PII 打码 `REDACT_PII` **默认关闭**（业务数据误报高，开启会改坏正常回答） | 属刻意取舍；如需强制需在业务侧加白名单，非纯技术开关 |
 | 5 | 配置端点强制令牌 | §5 安全 | `/mcp/servers`、`/notify/channels` 受 `admin-gate` 保护，但 `AGENT_ADMIN_TOKEN` 未配置时**恒等放行**；仅 `HOST=0.0.0.0` 无令牌才 fail-closed 拒启 | 开放局域网部署前必须显式配 `AGENT_ADMIN_TOKEN`，属部署清单项 |
