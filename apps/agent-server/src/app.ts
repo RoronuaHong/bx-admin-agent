@@ -622,19 +622,34 @@ function resolveModelSource(baseUrl: string, provider: string): string {
 
 export function createApp() {
   const app = new Hono();
+
+  // 全局兜底错误处理：任何 handler 抛出的未捕获异常都收敛成统一的 JSON 错误，
+  // 不把内部堆栈/路径泄漏给客户端（信息泄露），同时服务端留痕便于排查。
+  app.onError((err, c) => {
+    console.error(`[http] 未捕获异常 ${c.req.method} ${c.req.path}:`, err);
+    return errorJson(c, 500, "INTERNAL_ERROR", "服务端内部错误，详情见服务端日志");
+  });
+
+  // 请求体上限（0 = 关闭）：拒绝超大 Content-Length，挡住「声明一个巨型 body」的 OOM/DoS 向量。
+  // 仅看 Content-Length —— chunked 不带长度头的极端情况留给 Hono 自身缓冲上限，本服务都是小 JSON。
+  const MAX_BODY_BYTES = Math.max(0, Number(process.env.MAX_BODY_BYTES || 1_048_576));
   // CORS 来源：以配置 webOrigin 为主，额外允许 CHAT_CORS_ORIGINS（逗号分隔）与本地开发端口。
+  // credentials: true 下必须给具体来源、绝不能是 "*"（否则浏览器直接拒绝带凭据的请求）。
+  // 先 filter(Boolean) 去掉未配置的 webOrigin 等空项，避免把 "undefined" 当成一个来源。
   const corsOrigins = Array.from(
-    new Set([
-      config.webOrigin,
-      ...(process.env.CHAT_CORS_ORIGINS || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://127.0.0.1:5173",
-      "http://127.0.0.1:5174",
-    ]),
+    new Set(
+      [
+        config.webOrigin,
+        ...(process.env.CHAT_CORS_ORIGINS || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+      ].filter(Boolean),
+    ),
   );
 
   app.use(
@@ -652,12 +667,24 @@ export function createApp() {
     console.log(`[http] ${c.req.method} ${c.req.path} ${c.res.status} ${Date.now() - start}ms`);
   });
 
+  // 请求体上限守卫：声明超大 Content-Length 直接 413，不让后续解析把内存撑爆。
+  app.use("*", async (c, next) => {
+    if (MAX_BODY_BYTES > 0) {
+      const len = Number(c.req.header("content-length"));
+      if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
+        return errorJson(c, 413, "PAYLOAD_TOO_LARGE", `请求体过大（上限 ${MAX_BODY_BYTES} 字节）`);
+      }
+    }
+    await next();
+  });
+
   // 基础安全响应头（内联实现，避免额外依赖）。
   app.use("*", async (c, next) => {
     await next();
     c.header("X-Content-Type-Options", "nosniff");
     c.header("X-Frame-Options", "DENY");
     c.header("Referrer-Policy", "no-referrer");
+    c.header("X-Permitted-Cross-Domain-Policies", "none");
   });
 
   /**

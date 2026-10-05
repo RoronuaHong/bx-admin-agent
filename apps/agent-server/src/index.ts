@@ -25,6 +25,18 @@ if ((process.env.SUBAGENT_ALLOW_WRITE || "off").toLowerCase() === "on") {
 
 const app = createApp();
 
+// 安全启动闸门：公开监听 + 没有管理令牌 = 把「改 MCP 配置 → spawn 任意命令」向局域网放行，
+// 等于未鉴权远程代码执行。宁可拒绝启动，也不让这种配置悄悄跑起来（fail-closed）。
+const adminToken = (process.env.AGENT_ADMIN_TOKEN || "").trim();
+if ((config.host === "0.0.0.0" || config.host === "::") && !adminToken) {
+  console.error(
+    "[安全] 拒绝启动：HOST=0.0.0.0 会监听全部网卡，但 AGENT_ADMIN_TOKEN 未配置。" +
+      "MCP 服务器管理与通知通道端点无鉴权，局域网内任意主机都能改写 MCP 配置（含 stdio 命令）。" +
+      "若要公开部署，请先设置 AGENT_ADMIN_TOKEN（并在请求里带 x-admin-token 头）。",
+  );
+  process.exit(1);
+}
+
 // 进程退出前：先把自己还在跑的任务标成 interrupted（状态写实，晚到的重连据此如实收口），
 // 再断开全部 MCP 连接（stdio 子进程随之回收）。pm2 的 kill_timeout 很短，故两件事都只做最少的必要动作。
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
