@@ -140,7 +140,10 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 - 不做宽泛的「像密码」启发式——业务数据上误报率极高，会把正常回答改坏。
 - 打码时打一条 `console.warn`，留痕但不落原文。
 - 这是**最后一道**防线：真正的防线是「子进程不继承服务端凭据」（§8.3）与「凭据不入日志/trace」（§12）。
-- 已知边界：无通用 PII/DLP（身份证、手机号等），见 §15。
+- **PII（可选）**：`REDACT_PII=on` 后追加打码 email / 手机号 / 身份证 / 银行卡，可按 `REDACT_PII_TYPES` 只开某几类。
+  默认**关闭**——订单号像卡号、编号像身份证，默认开启会把正常回答改坏；
+  姓名/地址这类**无形态可依**的不做（只能靠词典，误报不可控，也不符合「禁写死」红线）。
+  凭据打码不受此开关影响（形态明确、误报极低，总是打码）。
 
 ### 8.7 长期记忆防投毒（OWASP ASI04）
 
@@ -205,6 +208,10 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 - `pnpm audit` 在本机默认 registry（npmmirror）不可用（无安全公告端点），必须用：`pnpm audit --registry=https://registry.npmjs.org`（已写入根 `package.json` 的 `audit` 脚本）。
 - 传递依赖覆盖写在 `pnpm-workspace.yaml` 的 `overrides:`（pnpm 11 起不再读取 `package.json` 的 `pnpm.overrides`）。
 - 关键修复历史：hono（parseBody 无界嵌套 / 查询串解析 / jsx 未转义 XSS）、dompurify（afterSanitize 游离子树事件处理器 DOM XSS）、markdown-it 15.0.0 的 linkify 二次复杂度（回退 14.x）。
+- **SBOM（OWASP LLM05 / ASI06）**：`node scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（默认 `.data/sbom.cdx.json`）。
+  复用 `pnpm licenses list --prod --json` 的**已安装**清单（真实版本 + 许可证，比读声明范围更接近事实），
+  只收生产依赖，零新依赖。出事时能立刻回答「我们受不受影响」，而不是临时翻 `node_modules`。
+  实测 393 组件 / 0 未知许可证。许可证表达式（如 `MIT OR Apache-2.0`）原样保留为 `name`，不拆分（拆分需要 SPDX 解析器）。
 
 ---
 
@@ -230,10 +237,10 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | 出站内容（模型回复）脱敏 | ❌ 未做 | 回复中的敏感字段未自动脱敏 |
 | 配置端点强制令牌 | 🟡 默认不强制 | 需显式配 `AGENT_ADMIN_TOKEN` 才启用；默认单机信任 |
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
-| 通用 PII / 出站 DLP | ❌ 未做 | 只做凭据形态打码（`src/redact.ts`），身份证/手机号等通用 PII 未过滤 |
-| SBOM + MCP 服务器来源校验 | ❌ 未做 | 依赖审计已有（非阻断 CI）；SBOM 未生成，MCP 服务器只校验命令白名单不校验来源 |
+| 通用 PII / 出站 DLP | 🟡 可开启 | `REDACT_PII=on` 后打码 email/手机号/身份证/银行卡；**默认关闭**（业务数据误报高）。姓名/地址类不做（无形态可依） |
+| SBOM | ✅ 已做 | `scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（生产依赖，393 组件）。剩余：MCP 服务器**来源**校验未做 |
 | 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
-| OTLP 导出 | ❌ 未做 | span 已挂 `gen_ai.*` 标准属性名，但无 OTLP 导出器 |
+| OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
 | 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
 | 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。多实例时为**每实例**计数，需入口层兜底 |
 | 行为异常检测 | ❌ 未做 | 有完整留痕（trace/audit），无基线比对与异常告警 |
@@ -257,6 +264,9 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 | OTel GenAI 语义属性（可观测互操作） | `src/trace.ts`（`SpanTrace.attrs`）、`src/chat.ts`（llm / tool span） |
 | 成本硬配额 | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts`（`quota_exceeded`） |
 | 进程级指标 | `src/process-metrics.ts`、`src/app.ts`（`GET /metrics`）、`src/chat.ts`（打点） |
+| OTLP 导出（可选） | `src/otlp.ts`、`src/app.ts`（run 收束时触发） |
+| 出站 PII 打码（可选） | `src/redact.ts`（`redactPii` / `redactSensitive`）、`src/chat.ts` |
+| SBOM | `scripts/gen-sbom.mjs` |
 | 只读工具桥 | `src/tool-code.ts`（`toolCodeDenied`、`DENIED`） |
 | Prompt 注入定界 | `src/untrusted.ts` |
 | MCP 原生 SQL 只读闸 | `src/risk.ts`、`src/sql-readonly.ts` |

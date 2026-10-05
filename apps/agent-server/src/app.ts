@@ -19,6 +19,7 @@ import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
 import { incCounter, renderPrometheus } from "./process-metrics.js";
 import { listRunEvals, recordRunEval, summarizeEval } from "./eval-online.js";
+import { exportRunOtlp } from "./otlp.js";
 import {
   addConversationReadGrant,
   clearContext,
@@ -304,6 +305,8 @@ async function consumeTask(
   // 在线评测闭环（P1）：trace 不只是留档，回流成质量分数。
   // 纯确定性打分、不调模型（每次运行都跑，再叠评委模型等于成本翻倍）。
   recordRunEval(runTrace);
+  // OTLP 导出（P2，可选）：发了就忘，不进主链路；未配端点时直接返回（零行为变化）。
+  void exportRunOtlp(runTrace).catch(() => false);
   // 结果回投：仅在客户端已断开时做（订阅者在线时由前端负责 UI 消息持久化，避免双写竞态）。
   if (!task.live) {
     outcomePersisted = await persistTaskOutcome(task).catch(() => false);

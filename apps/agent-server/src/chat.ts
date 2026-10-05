@@ -66,7 +66,7 @@ import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 import { appendRoundTrace, appendSpanTrace } from "./trace.js";
-import { redactSecrets, countSecretHits } from "./redact.js";
+import { redactSensitive, countSecretHits } from "./redact.js";
 import { incCounter, observeSummary } from "./process-metrics.js";
 import { addDailyTokens, quotaState } from "./quota.js";
 import { readFileSync } from "node:fs";
@@ -2971,7 +2971,7 @@ export async function* chatStream(
   const rawFinalText =
     buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: guarded }) ||
     (ungrounded ? UNGROUNDED_REPLY : "");
-  const finalText = redactSecrets(rawFinalText);
+  const finalText = redactSensitive(rawFinalText);
   if (finalText !== rawFinalText) {
     console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(rawFinalText)} 处`);
   }

@@ -28,8 +28,8 @@
 | LLM02 不安全的输出处理 | 输出按上下文转义；不拼进 SQL；白名单标签过滤 | 前端 `chat-richtext.ts` DOMPurify 净化；`builtins.ts` 手写 HTML 零外链软护栏；**本轮新增**出站密钥打码 | 🟡 | 无「输出 schema 校验」（要求模型按结构输出再校验）。P2 |
 | LLM03 训练数据污染 | 训练/微调数据清洗 | 项目不训练模型、不微调 | ➖ | 不适用 |
 | LLM04 模型 DoS | 输入长度限制、速率限制、token 配额 | 请求体上限 `MAX_BODY_BYTES`；限流（chat/login/admin）；`MAX_TOOL_ROUNDS`；Doom Loop 跨轮熔断；上下文 token 预算 | 🟡 | **无用户级 token 配额**（成本只有 `budgetAlerts` 告警，不强制）。P1 |
-| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit`（显式 registry）进非阻断 CI；`pnpm-workspace.yaml` overrides 修传递依赖；子进程不继承服务端凭据；**本轮新增** MCP stdio 命令白名单（可选） | 🟡 | **无 SBOM**；MCP 白名单默认未启用（单机开发机体验优先）。P2 |
-| LLM06 敏感信息泄露 | 输出 PII 扫描脱敏；RAG 按权限过滤 | RAG 文档级 ACL（`rag/store.ts` `visibleTo`，召回前过滤）；审计/trace 不落凭据；**本轮新增**出站凭据打码 | 🟡 | **无通用 PII 检测/出站 DLP**（只做凭据形态，业务数据上误报高）。P2 |
+| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（可选）；**本轮新增** `scripts/gen-sbom.mjs` 产出 CycloneDX SBOM | 🟡 | 白名单默认未启用；无「模型/MCP 来源」的完整性签名校验（只校验命令白名单） |
+| LLM06 敏感信息泄露 | 输出 PII 扫描脱敏；RAG 按权限过滤 | RAG 文档级 ACL（召回前过滤）；审计/trace 不落凭据；出站凭据打码；**本轮新增**可开启的 PII 打码（`REDACT_PII=on`，email/手机号/身份证/银行卡，可按类型选） | 🟡 | PII **默认关闭**（业务数据误报高）；无姓名/地址类识别（无形态可依，靠词典必然误报，不做） |
 | LLM07 不安全的插件设计 | 工具参数校验、最小权限、不执行任意 SQL | `BUILTIN_RISK` 风险登记 + 启动断言；`risk.ts`/`sql-readonly.ts` MCP 原生 SQL 只读闸（fail-closed）；`run_tool_code` 只读工具桥 | ✅ | — |
 | LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集 | 🟡 | **无按任务（per-run）的工具 allowlist**——当前是「全局工具集 + 模型自选」。P2 |
 | LLM09 过度依赖 | 高风险输出加验证层、标注来源与置信度 | 事后核验两阶段（抽断言 → 不回传草稿逐条判支持性）；grounding 诚实兜底；RAG 答案带来源；未取证如实说 | ✅ | — |
@@ -97,12 +97,12 @@
 | --- | --- | --- | --- |
 | **P1** | 登录/租户 + NHI 生命周期治理 | ASI03 | 多端接入前置项；当前靠匿名 owner 最小权限 |
 | ~~**P1**~~ | ~~在线/持续评测闭环~~ | OTel「遥测作为评测反馈回路」 | ✅ **本轮已补齐**（`src/eval-online.ts`）。剩余：登录/租户与 NHI 治理——**用户 2026-10-06 明确暂不需要登录体系**，保留为已知缺口 |
-| **P2** | SBOM + MCP 服务器来源校验 | LLM05 / ASI06 | 依赖审计已有，SBOM 未做 |
-| **P2** | 通用 PII / 出站 DLP | LLM06 / ASI05 | 现只做凭据形态打码 |
+| ~~**P2**~~ | ~~SBOM~~ | LLM05 / ASI06 | ✅ **本轮已补齐**：`scripts/gen-sbom.mjs`（CycloneDX 1.5，生产依赖），实测 393 组件 / 0 未知许可证。剩余：MCP 服务器来源校验 |
+| ~~**P2**~~ | ~~通用 PII / 出站 DLP~~ | LLM06 / ASI05 | ✅ **本轮已补齐**（可开启）。剩余：姓名/地址类不做（无形态可依，词典必然误报） |
 | **P2** | 按任务（per-run）工具 allowlist | LLM08 / ASI02 | 现全局工具集 |
 | **P2** | 记忆完整性校验 + 用户复核 | ASI04 | 现有隔离+清洗+审计，缺复核入口 |
 | **P2** | 行为异常检测 | ASI09 | 现有留痕，无基线比对 |
-| **P2** | OTLP 导出器 | OTel | 属性名已对齐，待接导出 |
+| ~~**P2**~~ | ~~OTLP 导出器~~ | OTel | ✅ **本轮已补齐**：`src/otlp.ts`，OTLP/HTTP JSON 编码，默认关闭（`OTEL_EXPORTER_OTLP_ENDPOINT` 未配则不发请求） |
 | **P2** | 渐进式自主分级 | ASI08 | 现靠固定风险等级触发确认 |
 | **P2** | 输出结构（schema）校验 | LLM02 / ASI10 | 现只有净化与外链护栏 |
 
@@ -119,6 +119,9 @@
 | **P1 成本硬配额** | `COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET`：当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded` | `src/quota.ts`、`src/chat.ts`（入口）、`src/audit.ts` |
 | **P1 进程级 metrics** | `GET /metrics` 输出 Prometheus 文本格式；模型调用 / 工具调用 / 运行 / HTTP 四类打点，零新依赖 | `src/process-metrics.ts`、`src/app.ts`、`src/chat.ts` |
 | **P1 在线评测闭环** | 每次真实运行**确定性打分**（收束 / 取证 / 轮数 / token / 耗时 / 稳定性 / 纠正七维），落 `.data/eval` JSONL，回流成 `bx_agent_eval_*` 指标与 `/chat/eval/runs`、`/chat/eval/summary`。**不调模型做评委** | `src/eval-online.ts`、`src/app.ts` |
+| **P2 OTLP 导出** | `src/otlp.ts`：run/span 转 OTLP/HTTP **JSON** 编码推给 Collector；traceId/spanId 由 runId 稳定派生可去重；默认关闭、发了就忘、不阻断对话 | `src/otlp.ts`、`src/app.ts` |
+| **P2 通用 PII 出站打码** | `REDACT_PII=on`（可按 `REDACT_PII_TYPES` 只开某几类）：email / 手机号 / 身份证 / 银行卡；**默认关闭**（业务数据误报高）。凭据打码不受此开关影响 | `src/redact.ts`、`src/chat.ts`（`redactSensitive`） |
+| **P2 SBOM** | `scripts/gen-sbom.mjs`：复用 `pnpm licenses list --prod --json` 的**已安装**清单产出 CycloneDX 1.5（只生产依赖），零新依赖 | `scripts/gen-sbom.mjs` |
 
 ---
 
@@ -240,7 +243,39 @@ PASS：在线评测已随真实运行落盘并打点
 `stability` 被判未达标是**如实**的：本轮所有模型 402，主流程连续切换候选模型（`modelFallbacks` 超阈值）。
 这正是在线评测要抓的信号——「模型侧不稳导致的劣质运行」现在能被度量，而不只是事后翻日志。
 
-### 9.10 关于 P1 收尾
+### 9.10 实例九：OTLP 导出 + PII + SBOM（真实模块 / 真实收集器）
+
+**OTLP**：脚本内起一个真实 HTTP 收集器（`127.0.0.1:14318/v1/traces`），用**真实 span 文件里的 runId** 调 `exportRunOtlp`：
+
+```
+收集器已启动 http://127.0.0.1:14318/v1/traces
+PASS  找到真实 span 文件（80 个）
+PASS  解析出真实 runId：run_unit_rounds
+PASS  exportRunOtlp 返回成功
+PASS  收集器收到 1 个 trace 请求
+PASS  payload 含父 span + 子 span（169 个）
+PASS  traceId 为 32 hex
+PASS  子 span 的 parentSpanId 指向父 span（成链）
+PASS  父 span 带 run 级属性 bx_agent.status
+PASS  子 span 带 gen_ai.* 标准属性（可观测互操作）
+```
+
+**PII**（真实模块，开/关两种环境，17 项全 PASS）：默认关闭时 PII 不动、凭据照常打码；
+开启后 email/手机号打码；`REDACT_PII_TYPES=email` 只打 email（**大小写归一**后生效——
+初版因类型名大写而输入小写被静默过滤，是单测抓出来的）。
+
+**SBOM**：`node scripts/gen-sbom.mjs` →
+
+```
+SBOM 已生成：D:\Code\bx-admin-agent\.data\sbom.cdx.json
+组件数（生产依赖）：393
+许可证未知：0
+```
+
+> 坑：`pnpm` 在 Windows 是 `.cmd` 垫片，`execFileSync("pnpm")` 会 ENOENT，
+> 而 `execFileSync("pnpm.cmd")` 在 Node 22 下又报 EINVAL——最终走 `cmd /c pnpm.cmd`。
+
+### 9.11 关于 P1 收尾
 
 四项 P1（登录/租户、成本硬配额、进程级 metrics、在线评测）中，**后三项已补齐**；
 登录/租户与 NHI 治理（ASI03）经用户 2026-10-06 明确「暂时不需要登录体系」，保留为已知缺口（见 §7）。
