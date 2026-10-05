@@ -21,6 +21,7 @@ import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
 import { search as ragSearch, listSources as ragSources } from "./rag/store.js";
 import { addMemory, listMemory } from "./memory.js";
+import { appendAudit } from "./audit.js";
 import { addHistory, setFeedback } from "./movie/profile.js";
 import { fetchPage, readWebSearchConfig, webSearch } from "./web-search.js";
 import { callMcpTool } from "./mcp/hub.js";
@@ -1693,6 +1694,16 @@ export async function execBuiltin(
       if (!ownerKey) return { ok: false, text: "无法记录长期记忆：缺少用户标识" };
       const item = addMemory(text, ownerKey);
       if (!item) return { ok: false, text: "未能记录（内容为空或超过长度上限）" };
+      // OWASP ASI04 记忆投毒：长期记忆会被无条件拼进后续每一轮的系统提示，
+      // 「谁/哪次会话/写了什么」必须留痕——污染一次能影响之后很久的每一轮决策。
+      appendAudit({
+        decision: "memory_write",
+        conversationId,
+        ...(ownerKey ? { ownerKey } : {}),
+        tool: "save_memory",
+        level: "write",
+        argsSummary: [{ key: "text", value: item.text.slice(0, 60) }],
+      });
       return { ok: true, text: `已记住：${item.text}` };
     }
     case "recall_memory": {

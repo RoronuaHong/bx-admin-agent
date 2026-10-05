@@ -157,6 +157,7 @@
 - **配套限流**：`RATE_LIMIT_ADMIN_PER_MIN`（默认 30/分钟，0 = 关闭），按来源 IP 计，压住「反复 `reload` 不断 spawn 子进程」这类昂贵操作。
 - 验收方式：临时带 `AGENT_ADMIN_TOKEN` 起一次服务端实测状态码（`/health` 200 无需令牌；`/mcp/servers` 无令牌 401、错令牌 401、正确 200；`/chat/*` 不受影响），再恢复常态确认「未配令牌 → 行为与改动前一致」。**不要同时起第二个实例验证**——定时任务共享 MongoDB 分布式锁，第二个进程可能真的把某个 schedule 跑起来。
 - **运行时安全护栏（权威文档 `docs/SECURITY.md`）**：请求体上限 `MAX_BODY_BYTES`（默认 1MB，超 `Content-Length` 直接 `413`，挡 OOM/DoS）；全局错误兜底（未捕获异常收敛成统一 JSON，不回吐堆栈）；`Cache-Control: no-store`（所有 API 响应不进缓存）；ReDoS 护栏已覆盖交替重叠型 `(a|a)*`（`isCatastrophicPattern` + `FS_GREP_BUDGET_MS=2000` 预算兜底，仍放行 `a+b+`/`\d+\.\d+` 等顺序量词）；子进程并发上限 `TOOL_SUBPROCESS_MAX_CONCURRENT`（默认 4，进程内信号量防 fork-bomb / 资源耗尽）；`run_tool_code` / `run_command` / `run_script` 子进程**不继承服务端凭据**（环境白名单）+ 输出 `STREAM_CAPTURE_MAX=4MB` 边收边截断 + 超时先 `SIGTERM` 后 `SIGKILL` 兜底。**已知局限（诚实标注）**：当前子进程**无 OS 级沙箱**——绝对路径可读任意文件、无出网限制、无文件系统隔离；真正隔离需 microVM / Docker / AppContainer，列为后续工作（见 SECURITY.md §8.4 / §15）。
+- **最佳实践对齐矩阵（2026-10-05 新增 `docs/BEST_PRACTICE_ALIGNMENT.md`）**：逐条对照 **OWASP LLM Top 10（2025）**、**OWASP Agentic Top 10（2026，ASI01–ASI10）**、**OpenTelemetry GenAI 语义约定**与**生产就绪八维**，给出 ✅/🟡/❌ 判定，并拆出「与最佳实践**不一致**的地方」与「**未实现**清单（P1/P2）」两份清单。第七轮据此补齐：MCP stdio 命令白名单（ASI06）、出站凭据打码（ASI05/LLM06）、记忆写入清洗与审计（ASI04）、span 挂 `gen_ai.*` 标准属性（ASI09/可观测互操作）。
 
 缺失：❌ 登录与租户（多端接入前置项，方案 B）、❌ 多实例限流（需 Redis）、❌ 出站内容（模型回复）脱敏、❌ 配置端点在开放局域网时的强制鉴权（需显式配 `AGENT_ADMIN_TOKEN` 才启用，默认不强制）。
 **补齐建议**：确认票据已绑定会话（P0-4）；上游 429 退避已有（模型调用瞬时重试）。

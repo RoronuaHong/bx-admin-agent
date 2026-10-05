@@ -82,9 +82,41 @@ let fileCacheSize = 0;
 /** 内置服务器（由环境变量提供，不落盘）。 */
 let builtinCache: McpServerConfig[] | null = null;
 
+/**
+ * stdio 命令白名单（可选，`MCP_ALLOWED_COMMANDS`，逗号分隔）。
+ *
+ * 对齐 OWASP ASI06 供应链：stdio 传输会 `spawn` 任意命令，**加了管理员令牌也挡不住**
+ * 「有权限的人/被注入的流程新增一个恶意 MCP 服务器」——那正是供应链攻击的形态。
+ * 配了本变量后，不在名单里的命令一律拒绝（fail-closed）；
+ * 未配置 = 不启用，保持现状（单机开发机可自由加 MCP）。
+ */
+/** 每次调用现读环境变量（便于测试，也允许运维改了变量即时生效）。 */
+function allowedCommands(): string[] {
+  return (process.env.MCP_ALLOWED_COMMANDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 纯函数：stdio 命令是否被允许。未配白名单时恒等放行（向后兼容）。
+ * 比对同时认「完整路径」与「去掉路径后的可执行名」，避免 `npx` 与 `/usr/bin/npx` 两种写法不一致。
+ */
+export function isAllowedMcpCommand(command: string): boolean {
+  const allowed = allowedCommands();
+  if (!allowed.length) return true;
+  const cmd = String(command || "").trim();
+  if (!cmd) return false;
+  const base = cmd.replace(/\\/g, "/").split("/").pop() || cmd;
+  return allowed.some((item) => item === cmd || item === base);
+}
+
 export function validateServerInput(input: Partial<McpServerConfig>): string | null {
   const id = String(input.id || "").trim();
   if (!id) return "缺少 id";
+  if (input.transport === "stdio" && !isAllowedMcpCommand(String(input.command || ""))) {
+    return `stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）：${String(input.command || "")}`;
+  }
   if (!ID_RE.test(id)) return "id 仅允许字母、数字、下划线、短横线（1-32 字符）";
   if (input.transport === "stdio" && !String(input.command || "").trim()) return "stdio 传输必须提供 command";
   if (input.transport === "http" && !String(input.url || "").trim()) return "http 传输必须提供 url";

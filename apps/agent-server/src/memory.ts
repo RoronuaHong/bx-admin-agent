@@ -60,7 +60,14 @@ function persist(list: MemoryItem[]): void {
 }
 
 export function addMemory(raw: string, ownerKey?: string): MemoryItem | null {
-  const text = String(raw || "").trim().slice(0, MAX_TEXT_LEN);
+  // 记忆投毒（OWASP ASI04）的第一道防线是「存进来的东西先过一遍」：
+  // 控制符（NUL / 零宽 / 双向覆盖 / 变体选择符）能伪造提示结构、在注入时改变语义，
+  // 而记忆会被无条件拼进后续每一轮的系统提示——污染一次影响很久。保留 \t \n \r。
+  const text = String(raw || "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200B-\u200F\u202A-\u202E\uFE00-\uFE0F\uE0000-\uE007F]/g, "")
+    .trim()
+    .slice(0, MAX_TEXT_LEN);
   if (!text) return null;
   const list = loadAll().slice();
   if (list.some((item) => item.text === text)) return list.find((item) => item.text === text) || null;

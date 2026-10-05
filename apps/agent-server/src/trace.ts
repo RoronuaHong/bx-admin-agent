@@ -139,6 +139,12 @@ export interface SpanTrace {
   tokens?: number;
   /** 失败原因（截断，不落原文）。 */
   error?: string;
+  /**
+   * 对齐 OpenTelemetry GenAI 语义约定的属性名（可观测互操作性）。
+   * 自带 trace 结构之外再挂一份标准属性（`gen_ai.*`），日后导出到 OTel 后端或与其它
+   * 可观测系统对齐时无需改数据结构——格式自有、语义标准。
+   */
+  attrs?: Record<string, string | number | boolean>;
 }
 
 function spanFile(runId: string): string {

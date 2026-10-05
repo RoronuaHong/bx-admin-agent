@@ -124,6 +124,33 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 
 ---
 
+### 8.5 MCP 服务器供应链（OWASP ASI06）
+
+stdio 传输会 `spawn` 任意命令——**加了管理员令牌也挡不住**「有权限的人/被注入的流程新增一个恶意 MCP 服务器」，那正是供应链攻击的形态。
+
+- `MCP_ALLOWED_COMMANDS`（逗号分隔，可选）：配置后，stdio 命令必须命中名单（同时认完整路径与可执行名，如 `npx` 与 `/usr/bin/npx`）。
+- **两处校验**：配置时（`validateServerInput`）+ **真正 spawn 前**（`hub.ts` `buildTransport`）。第二处是必须的——配置时校验挡不住「白名单启用前就已落盘」的旧服务器，而 spawn 才是实际的代码执行点，fail-closed 必须落在执行点。
+- 未配置 = 不启用，保持现状（单机开发机需自由加 MCP）；生产部署清单要求显式配置（见 §14）。
+
+### 8.6 出站凭据打码（OWASP ASI05 / LLM06）
+
+Agent 会读文件、读环境、调外部系统——回答里若带了读到的密钥，就是一次凭据外带。`src/redact.ts` 在**最终回答落库与下发前**做最后一道过滤：
+
+- 只认**形态明确**的凭据（`sk-`、`AKIA`、`glpat-`、`ghp_`、`xox*-`、`Bearer`、PEM 私钥块、JWT），打码为 `[REDACTED:<TYPE>]`（保留类型标记，不静默消失）。
+- 不做宽泛的「像密码」启发式——业务数据上误报率极高，会把正常回答改坏。
+- 打码时打一条 `console.warn`，留痕但不落原文。
+- 这是**最后一道**防线：真正的防线是「子进程不继承服务端凭据」（§8.3）与「凭据不入日志/trace」（§12）。
+- 已知边界：无通用 PII/DLP（身份证、手机号等），见 §15。
+
+### 8.7 长期记忆防投毒（OWASP ASI04）
+
+记忆会被无条件拼进后续每一轮的**系统提示**——污染一次能影响之后很久的每一轮决策。
+
+- **写入前清洗**：`addMemory` 剥离控制符（NUL、零宽、双向覆盖、变体选择符、Tag 块；保留 `\t\n\r`），防止伪造提示结构。
+- **写入留痕**：`save_memory` 落审计事件 `memory_write`（谁 / 哪次会话 / 内容摘要前 60 字），污染后可回溯。
+- **隔离与上限**：按 `ownerKey` 隔离；条数上限 + 注入字符总上限双约束。
+- 已知边界：无完整性校验、无用户复核入口（写入由模型直接调工具），见 §15。
+
 ## 9. Prompt 注入防护
 
 外部内容（工具返回 / 检索片段 / 子代理回传）回灌模型前，由 `src/untrusted.ts` **结构化定界**（非越狱话术词表，语义仍 100% 交模型，符合「禁写死」红线）：
@@ -186,6 +213,12 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | 出站内容（模型回复）脱敏 | ❌ 未做 | 回复中的敏感字段未自动脱敏 |
 | 配置端点强制令牌 | 🟡 默认不强制 | 需显式配 `AGENT_ADMIN_TOKEN` 才启用；默认单机信任 |
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
+| 通用 PII / 出站 DLP | ❌ 未做 | 只做凭据形态打码（`src/redact.ts`），身份证/手机号等通用 PII 未过滤 |
+| SBOM + MCP 服务器来源校验 | ❌ 未做 | 依赖审计已有（非阻断 CI）；SBOM 未生成，MCP 服务器只校验命令白名单不校验来源 |
+| 进程级 metrics / OTLP 导出 | ❌ 未做 | 只有拉取式聚合端点；span 已挂 `gen_ai.*` 标准属性但无导出器 |
+| 在线/持续评测闭环 | ❌ 未做 | 现为测试闸门（G1–G7），无在线评测 |
+| 成本硬配额 | 🟡 只告警 | `DAILY_TOKEN_BUDGET`/`RUN_TOKEN_BUDGET` 只产生 `budgetAlerts`，不拦截请求 |
+| 行为异常检测 | ❌ 未做 | 有完整留痕（trace/audit），无基线比对与异常告警 |
 
 ---
 
@@ -200,6 +233,10 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | ReDoS 护栏 | `src/fs-store.ts`（`isCatastrophicPattern`、`FS_GREP_BUDGET_MS`） |
 | 内置工具风险登记 | `src/builtins.ts`（`BUILTIN_RISK`、`assertBuiltinRiskCoverage`） |
 | 子进程约束（环境/输出/超时/并发上限） | `src/tool-code.ts`、`src/subprocess-limit.ts`、`src/builtins.ts`（`runShell`） |
+| MCP stdio 命令白名单（ASI06） | `src/mcp/config.ts`（`isAllowedMcpCommand`）、`src/mcp/hub.ts`（`buildTransport`） |
+| 出站凭据打码（ASI05 / LLM06） | `src/redact.ts`、`src/chat.ts`（最终回答） |
+| 长期记忆防投毒（ASI04） | `src/memory.ts`（清洗）、`src/builtins.ts` + `src/audit.ts`（`memory_write`） |
+| OTel GenAI 语义属性（可观测互操作） | `src/trace.ts`（`SpanTrace.attrs`）、`src/chat.ts`（llm / tool span） |
 | 只读工具桥 | `src/tool-code.ts`（`toolCodeDenied`、`DENIED`） |
 | Prompt 注入定界 | `src/untrusted.ts` |
 | MCP 原生 SQL 只读闸 | `src/risk.ts`、`src/sql-readonly.ts` |

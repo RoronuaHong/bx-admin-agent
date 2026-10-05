@@ -7,7 +7,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { getServer, loadServers, type McpServerConfig } from "./config.js";
+import { getServer, isAllowedMcpCommand, loadServers, type McpServerConfig } from "./config.js";
 
 export interface McpToolInfo {
   /** 注入模型的工具名（含命名空间） */
@@ -85,6 +85,11 @@ function timeoutOf(cfg: McpServerConfig): number {
 
 function buildTransport(cfg: McpServerConfig) {
   if (cfg.transport === "stdio") {
+    // 真正 spawn 前再查一次白名单（ASI06）：配置时校验挡不住「白名单启用前就已落盘」的旧服务器，
+    // 而这里的 spawn 才是实际的代码执行点——fail-closed 必须落在执行点。
+    if (!isAllowedMcpCommand(cfg.command || "")) {
+      throw new Error(`MCP 服务器 ${cfg.id} 的 stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）`);
+    }
     return new StdioClientTransport({
       command: cfg.command || "",
       args: cfg.args || [],

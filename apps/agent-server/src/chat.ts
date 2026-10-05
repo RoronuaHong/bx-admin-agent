@@ -66,6 +66,7 @@ import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
 import { assembleContext } from "./history.js";
 import { appendRoundTrace, appendSpanTrace } from "./trace.js";
+import { redactSecrets, countSecretHits } from "./redact.js";
 import { readFileSync } from "node:fs";
 import { fsImportFile } from "./fs-store.js";
 
@@ -1467,6 +1468,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           durationMs: Math.max(0, Date.now() - llmStart),
           ok: !outcome.failure,
           ...(outcome.failure ? { error: outcome.failure.slice(0, 200) } : {}),
+          // 挂一份 OTel GenAI 语义约定的标准属性名：格式自有、语义标准，
+          // 日后接 OTel 后端或与其它可观测系统对齐时不必改数据结构。
+          attrs: {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": ctx.model.provider,
+            "gen_ai.request.model": ctx.model.name || ctx.model.id,
+            "gen_ai.conversation.id": ctx.conversationId,
+          },
         });
       }
       if (!outcome.failure) {
@@ -2211,6 +2220,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           name: call.name,
           durationMs: Math.max(0, Date.now() - toolStart),
           ok: executed && ok,
+          attrs: {
+            "gen_ai.tool.name": call.name,
+            "gen_ai.tool.type": "function",
+            "gen_ai.conversation.id": ctx.conversationId,
+          },
         });
       }
     }
@@ -2904,9 +2918,15 @@ export async function* chatStream(
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
   // 无人值守（定时任务）且最终没取到可核对的数据时，正文按协议结论化（预警 = [NO_DATA] 首行标记）。
   // 按状态判定，不比对措辞：这段是模型写的诚实兜底，措辞每期都可能不同。
-  const finalText =
+  // 出站最后一道过滤（OWASP ASI05 / LLM06）：Agent 会读文件、读环境、调外部系统，
+  // 回答里若带了读到的密钥形态内容，打码后再给用户与落库（真正的防线是子进程不继承凭据）。
+  const rawFinalText =
     buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: guarded }) ||
     (ungrounded ? UNGROUNDED_REPLY : "");
+  const finalText = redactSecrets(rawFinalText);
+  if (finalText !== rawFinalText) {
+    console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(rawFinalText)} 处`);
+  }
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },
