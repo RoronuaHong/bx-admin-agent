@@ -33,7 +33,7 @@
 | LLM07 不安全的插件设计 | 工具参数校验、最小权限、不执行任意 SQL | `BUILTIN_RISK` 风险登记 + 启动断言；`risk.ts`/`sql-readonly.ts` MCP 原生 SQL 只读闸（fail-closed）；`run_tool_code` 只读工具桥 | ✅ | — |
 | LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集；**本轮新增** per-run 工具 allowlist（`toolAllowlist` 正向清单，注入即收窄、点名也被拒并回灌模型） | ✅ | allowlist 为 opt-in（未传入=行为不变），契合「模型自选 + 最小权限」 |
 | LLM09 过度依赖 | 高风险输出加验证层、标注来源与置信度 | 事后核验两阶段（抽断言 → 不回传草稿逐条判支持性）；grounding 诚实兜底；RAG 答案带来源；未取证如实说 | ✅ | — |
-| LLM10 模型窃取 | 限流、token 总量限制、批量相似请求检测 | 有 HTTP 限流（chat/login/admin）；进程级 metrics 可观测请求量 | ❌ | 无 token 总量配额、无相似请求检测（内网部署优先级低，列为已知局限） |
+| LLM10 模型窃取 | 限流、token 总量限制、批量相似请求检测 | 有 HTTP 限流（chat/login/admin）；进程级 metrics 可观测请求量；**token 总量配额**（`COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET` 全局池 + **本轮新增** `DAILY_TOKEN_BUDGET_PER_OWNER` 每 owner 池，防单用户烧光共享预算把其他人全挡住） | 🟡 | 配额**默认关闭**（免费链波动大，默认硬拦会误伤）且为**每实例**计数（多实例需入口层兜底）；仍**无批量相似请求检测** |
 
 ---
 
@@ -410,7 +410,7 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 | 3 | 多实例限流 / 配额 | LLM04/LLM10 | 限流与成本配额均为**每实例**计数（进程内），多实例部署时各算各的、无全局阈值 | 需 Redis 或入口层（网关/反向代理）兜底 |
 | 4 | 出站内容脱敏默认值 | LLM06/ASI05 | PII 打码 `REDACT_PII` **默认关闭**（业务数据误报高，开启会改坏正常回答） | 属刻意取舍；如需强制需在业务侧加白名单，非纯技术开关 |
 | 5 | 配置端点强制令牌 | §5 安全 | `/mcp/servers`、`/notify/channels` 受 `admin-gate` 保护，但 `AGENT_ADMIN_TOKEN` 未配置时**恒等放行**；仅 `HOST=0.0.0.0` 无令牌才 fail-closed 拒启 | 开放局域网部署前必须显式配 `AGENT_ADMIN_TOKEN`，属部署清单项 |
-| 6 | 模型窃取防护 | LLM10 | 有 HTTP 限流，但无 token 总量配额、无批量相似请求检测 | 内网优先级低；需网关层或全局计数 |
+| 6 | 模型窃取防护 | LLM10 | 有 HTTP 限流与 **token 总量配额**（全局池 + 每 owner 池双层，默认关闭、每实例计数）；仍**无批量相似请求检测** | 相似请求检测内网优先级低；全局配额计数需 Redis 或入口层兜底 |
 | 7 | 目标约束 | ASI01 | 行为基线已建（`/chat/anomalies`），但无「把本次任务目标固化、偏离即拦」的目标约束层 | 需定义目标表示 + 偏离判定，属较大设计 |
 
 > 原第 8 项「trace 保留期 / 轮转」已在本轮补齐（`TRACE_RETENTION_DAYS` + 启动/每日清理），不再列为局限；

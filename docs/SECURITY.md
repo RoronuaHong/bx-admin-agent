@@ -285,7 +285,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
 | OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
 | 在线/持续评测闭环 | ✅ 已做 | `src/eval-online.ts` 每次真实运行确定性打分（七维），落 JSONL + 指标 + `/chat/eval/runs`、`/chat/eval/summary`；**不做 LLM-as-judge** |
-| 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。多实例时为**每实例**计数，需入口层兜底 |
+| 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。**双层**：全局池（守钱包）+ `DAILY_TOKEN_BUDGET_PER_OWNER` 每 owner 池（守公平，避免单用户烧光共享预算把其他人全挡住），两层都未配即不拦截。多实例时为**每实例**计数，需入口层兜底；owner 跟踪表按 `QUOTA_MAX_TRACKED_OWNERS`（默认 1000）有界淘汰 |
 | 行为异常检测 | ✅ 已做 | `src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串）；**样本 <5 不判**、只报不管。局限：基线在进程内，重启重建，多实例不共享 |
 | trace 保留期 / 遗留回收 | ✅ 已做 | `TRACE_RETENTION_DAYS`（默认 30 天，启动 + 每 24h）回收过期 run/rounds/spans 明细、孤儿子文件、以及旧格式遗留（`<uuid>.jsonl`，当前无读取方）。损坏行**保留不删**（宁可留痕不误删证据）；不匹配任何已知形态的文件（如 analytics 的 `analytics-standalone.jsonl`）**一律不动** |
 

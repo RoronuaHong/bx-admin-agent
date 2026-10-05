@@ -2613,23 +2613,28 @@ export async function* chatStream(
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string; runId?: string },
 ): AsyncGenerator<ChatEvent> {
-  // 成本硬配额（P1 / OWASP LLM04 模型 DoS）：开启后当日累计 token 达预算即拒绝**新的**运行。
+  // 成本硬配额（P1 / OWASP LLM04 模型 DoS / LLM10 模型窃取）：开启后当日累计 token 达预算即拒绝**新的**运行。
   // 只挡入口、不掐在途运行——半途掐断比超预算更糟（钱照花，还丢结果）。
-  const quota = quotaState();
+  // 双层：全局池（守钱包）+ 该 owner 的池（守公平，避免单个用户烧光共享预算把其他人全挡住）。
+  const quota = quotaState(opts.ownerKey);
   if (!quota.allowed) {
-    console.warn(`[chat:quota] 当日 token 预算已用尽（${quota.used}/${quota.budget}），拒绝本次运行`);
+    const byOwner = quota.blockedBy === "owner";
+    const used = byOwner ? quota.ownerUsed : quota.used;
+    const budget = byOwner ? quota.ownerBudget : quota.budget;
+    const knob = byOwner ? "DAILY_TOKEN_BUDGET_PER_OWNER" : "DAILY_TOKEN_BUDGET";
+    console.warn(`[chat:quota] ${byOwner ? "本人" : "全局"}当日 token 预算已用尽（${used}/${budget}），拒绝本次运行`);
     appendAudit({
       decision: "quota_exceeded",
       conversationId,
       ...(opts.ownerKey ? { ownerKey: opts.ownerKey } : {}),
       tool: "chat",
       level: "read",
-      reason: `daily token ${quota.used}/${quota.budget}`,
+      reason: `${byOwner ? "owner" : "global"} daily token ${used}/${budget}`,
     });
     yield {
       type: "error",
       error: { code: "QUOTA_EXCEEDED", defaultMessage: "今日 token 预算已用尽" },
-      message: `今日 token 预算已用尽（${quota.used}/${quota.budget}），已停止接受新的对话。可调高 DAILY_TOKEN_BUDGET，或把 COST_HARD_QUOTA 改为非 on（只保留告警）。`,
+      message: `${byOwner ? "你今日的" : "今日"} token 预算已用尽（${used}/${budget}），已停止接受新的对话。可调高 ${knob}，或把 COST_HARD_QUOTA 改为非 on（只保留告警）。`,
     };
     yield { type: "done" };
     return;
@@ -2947,7 +2952,7 @@ export async function* chatStream(
   incCounter("bx_agent_runs_total", "对话运行次数（按结果）", { status: failure ? "error" : "ok" });
   incCounter("bx_agent_tokens_total", "运行累计 token", {}, Math.max(0, totalTokens));
   observeSummary("bx_agent_rounds", "每次运行的工具轮数", {}, rounds);
-  addDailyTokens(totalTokens);
+  addDailyTokens(totalTokens, opts.ownerKey);
 
   const usage: ChatEvent = {
     type: "usage",
