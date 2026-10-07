@@ -41,7 +41,13 @@ function dayKey(d: Date): string {
 
 let currentDay = dayKey(new Date());
 let usedToday = 0;
-/** ownerKey -> 当日 token。Map 保序，便于超上限时淘汰最早插入的（当日最久没再来的）。 */
+/**
+ * ownerKey -> 当日 token。
+ * Map 保序，淘汰时取「最久未活跃」的那个——但 JS Map 对**已存在**的 key 调 `set` **不会**把它移到末尾，
+ * 所以每次累加前必须先 `delete` 再 `set` 刷新位置（见 addDailyTokens）。
+ * 否则淘汰的永远是「当天最早出现的 owner」：高频老用户被淘汰 → 累计清零 → 回来重新拿满预算，
+ * 正好绕过每 owner 层要防的「单用户持续烧预算」。
+ */
 const ownerUsed = new Map<string, number>();
 
 function rolloverIfNeeded(): void {
@@ -64,11 +70,16 @@ export function addDailyTokens(tokens: number, ownerKey?: string): void {
   const key = (ownerKey || "").trim();
   if (!key) return;
   if (!ownerUsed.has(key) && ownerUsed.size >= maxTrackedOwners()) {
-    // 超出跟踪上限：淘汰最早插入的一个，保证 Map 有界（全局计数不受影响，兜底仍有效）。
+    // 超出跟踪上限：淘汰「最久未活跃」的一个，保证 Map 有界（全局计数不受影响，兜底仍有效）。
     const oldest = ownerUsed.keys().next();
     if (!oldest.done) ownerUsed.delete(oldest.value);
   }
-  ownerUsed.set(key, (ownerUsed.get(key) || 0) + tokens);
+  const prev = ownerUsed.get(key) || 0;
+  // 先 delete 再 set：把该 owner 刷新到 Map 末尾。JS Map 对已存在 key 的 set 不改插入序，
+  // 少了这一步淘汰的就不是「最久未活跃」而是「最早出现」——高频用户被淘汰 → 累计清零 →
+  // 重新拿满预算，恰好绕过每 owner 层要防的「单用户持续烧预算」（负控制已验证：去掉这行测试变红）。
+  ownerUsed.delete(key);
+  ownerUsed.set(key, prev + tokens);
 }
 
 export interface QuotaState {

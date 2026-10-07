@@ -3,13 +3,15 @@
 // 这里既测纯函数判定，也**真起一次子进程**验证：凭据文件读不到、工作区文件照常读、工具桥不受影响。
 import { test, expect } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DENY_CODE,
   DENY_MESSAGE,
   guardSourceLooksIntact,
   isDeniedToolCodePath,
-  nodeFsGuardSource,
+  nodeFsGuardPreloadSource,
   parseFsAllow,
   pyFsGuardSource,
 } from "../src/tool-code-fs-guard.js";
@@ -56,12 +58,13 @@ test("纯函数：TOOL_CODE_FS_ALLOW 提供精确逃逸口", () => {
   expect(isDeniedToolCodePath("/home/u/.ssh/id_rsa", ["id_rsa"])).toBe(false);
   // 未列入的仍然拒
   expect(isDeniedToolCodePath("/etc/.env", ["id_rsa"])).toBe(true);
-  // 片段放行（如整个业务配置目录）
-  expect(isDeniedToolCodePath("D:/Code/bx-film-admin-in2/.env", ["bx-film-admin-in2"])).toBe(false);
+  // 路径片段放行必须**含 /** —— 否则 `TOOL_CODE_FS_ALLOW=.` 会让任何路径都命中而全局关停守卫。
+  expect(isDeniedToolCodePath("D:/Code/bx-film-admin-in2/.env", ["d:/code/bx-film-admin-in2/"])).toBe(false);
+  expect(isDeniedToolCodePath("D:/Code/bx-film-admin-in2/.env", ["bx-film-admin-in2"])).toBe(true);
 });
 
 test("两侧守卫源码结构完整（防注入静默失效）", () => {
-  const node = nodeFsGuardSource();
+  const node = nodeFsGuardPreloadSource();
   const py = pyFsGuardSource();
   expect(guardSourceLooksIntact(node)).toBe(true);
   expect(guardSourceLooksIntact(py)).toBe(true);
@@ -71,6 +74,150 @@ test("两侧守卫源码结构完整（防注入静默失效）", () => {
   // 不得残留模板占位
   expect(node).not.toContain("${JSON");
   expect(py).not.toContain("${JSON");
+});
+
+// ---- 三份实现一致性 ----
+// 判定逻辑在三个地方各写了一份：TS 谓词（isDeniedToolCodePath）、注入的 JS 副本、注入的 Python 副本。
+// TS 那份在 src 里没有调用点，若只测它就等于测了不生效的实现。这里把**注入源码真正跑起来**，
+// 用同一张用例表逐条比对，任何一份漂移都会红。
+const TABLE = [
+  ".env",
+  "/etc/app/.env.local",
+  "D:\\Code\\app\\.env",
+  "C:/certs/server.pem",
+  "C:/certs/server.key",
+  "C:/certs/store.p12",
+  "/home/u/.ssh/id_rsa",
+  "C:/Users/u/.aws/credentials",
+  "C:/Users/u/.docker/config.json",
+  "C:/Users/u/.npmrc",
+  "src/env.ts",
+  "docs/environment.md",
+  "data/users.csv",
+] as const;
+
+test("三份实现一致（node 侧注入源码真跑一遍，与 TS 谓词逐条比对）", async () => {
+  const src = nodeFsGuardPreloadSource();
+  const pre = mkdtempSync(join(tmpdir(), "bx-consist-"));
+  const prePath = join(pre, "_bx_guard.cjs");
+  const probePath = join(pre, "probe.mjs");
+  writeFileSync(prePath, src, "utf8");
+  // 直接复用注入源码里挂到 globalThis 的判定函数（它就是子进程里真正生效的那份）。
+  writeFileSync(
+    probePath,
+    `const out = ${JSON.stringify(TABLE)}.map((p) => (globalThis.__bx_denied(p) ? 1 : 0));\nconsole.log(JSON.stringify(out));\n`,
+    "utf8",
+  );
+  try {
+    const raw = execFileSync(process.execPath, ["--require", prePath, probePath], { encoding: "utf-8" });
+    const got = JSON.parse(raw.trim().split("\n").filter(Boolean).pop() || "[]") as number[];
+    const want = TABLE.map((p) => (isDeniedToolCodePath(p) ? 1 : 0));
+    expect(got.length).toBe(want.length);
+    expect(got).toEqual(want);
+    // 表里必须同时含「应拒」与「应放行」，否则这条用例本身没有区分力。
+    expect(want.some((v) => v === 1)).toBe(true);
+    expect(want.some((v) => v === 0)).toBe(true);
+  } finally {
+    rmSync(pre, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// ---- Python 侧副本一致性（与 node 侧对称的钉）----
+// 判定逻辑在 TS / JS 注入副本 / Python 注入副本三处各写一份。node 侧已由上方用例钉住，
+// 这里补 Python 副本：直接复用注入源码里定义的 `__bx_denied`（即子进程真正生效的那份），
+// 对整张用例表逐条判定，与 TS 谓词比对。任何一份漂移都会红。
+test("三份实现一致（python 侧注入源码真跑一遍，与 TS 谓词逐条比对）", () => {
+  const src = pyFsGuardSource();
+  const py = mkdtempSync(join(tmpdir(), "bx-consist-py-"));
+  try {
+    const srcPath = join(py, "_bx_guard.py");
+    const tablePath = join(py, "table.json");
+    const probePath = join(py, "probe.py");
+    writeFileSync(srcPath, src, "utf8");
+    writeFileSync(tablePath, JSON.stringify(TABLE), "utf8");
+    writeFileSync(
+      probePath,
+      `${src}\nimport json\nwith open(${JSON.stringify(tablePath)}) as f:\n    tbl = json.load(f)\nprint(json.dumps([1 if __bx_denied(p) else 0 for p in tbl]))\n`,
+      "utf8",
+    );
+    let raw: string;
+    try {
+      raw = execFileSync("python", [probePath], { encoding: "utf-8" });
+    } catch {
+      // Python 未安装：跳过（与下方真实子进程用例一致，不因环境缺失判红）。
+      return;
+    }
+    const got = JSON.parse(raw.trim().split("\n").filter(Boolean).pop() || "[]") as number[];
+    const want = TABLE.map((p) => (isDeniedToolCodePath(p) ? 1 : 0));
+    expect(got.length).toBe(want.length);
+    expect(got).toEqual(want);
+    expect(want.some((v) => v === 1)).toBe(true);
+    expect(want.some((v) => v === 0)).toBe(true);
+  } finally {
+    rmSync(py, { recursive: true, force: true });
+  }
+}, 30_000);
+
+// ---- 绕道回归（这些是审计实测可达的通道，必须钉住）----
+test("绕道：node:fs 命名导出解构（ESM 快照）也被拦", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "bx-bypass-ns-"));
+  try {
+    writeFileSync(join(cwd, ".env"), "API_KEY=sk-leak\n", "utf8");
+    const r = await runToolCode({
+      language: "node",
+      code: [
+        // B1 绕过点：过去这样拿到的是未包装的原函数
+        'const { readFileSync } = await import("node:fs");',
+        'try { readFileSync(".env", "utf8"); console.log("ns=LEAKED"); } catch (e) { console.log("ns=" + (e.code || "err")); }',
+        'const ns = await import("node:fs");',
+        'try { ns.readFileSync(".env", "utf8"); console.log("nsdot=LEAKED"); } catch (e) { console.log("nsdot=" + (e.code || "err")); }',
+      ].join("\n"),
+      cwd,
+      timeoutMs: 20_000,
+      callTool: async () => ({ ok: true, text: "x" }),
+    });
+    expect(r.text).toContain(`ns=${DENY_CODE}`);
+    expect(r.text).toContain(`nsdot=${DENY_CODE}`);
+    expect(r.text).not.toContain("LEAKED");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 40_000);
+
+test("绕道：回调式 fs.readFile / copyFileSync / openAsBlob 也被拦", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "bx-bypass-cb-"));
+  try {
+    writeFileSync(join(cwd, ".env"), "API_KEY=sk-leak\n", "utf8");
+    const r = await runToolCode({
+      language: "node",
+      code: [
+        'const fs = (await import("node:fs")).default;',
+        'const out = [];',
+        'try { fs.readFile(".env", "utf8", () => {}); out.push("cb=LEAKED"); } catch (e) { out.push("cb=" + (e.code || "err")); }',
+        'try { fs.copyFileSync(".env", "copy.txt"); out.push("copy=LEAKED"); } catch (e) { out.push("copy=" + (e.code || "err")); }',
+        'if (typeof fs.openAsBlob === "function") { try { fs.openAsBlob(".env"); out.push("blob=LEAKED"); } catch (e) { out.push("blob=" + (e.code || "err")); } }',
+        'console.log(out.join(" | "));',
+      ].join("\n"),
+      cwd,
+      timeoutMs: 20_000,
+      callTool: async () => ({ ok: true, text: "x" }),
+    });
+    expect(r.text).toContain(`cb=${DENY_CODE}`);
+    expect(r.text).toContain(`copy=${DENY_CODE}`);
+    expect(r.text).not.toContain("LEAKED");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 40_000);
+
+test("绕道：TOOL_CODE_FS_ALLOW=. 不得把守卫全局关停（放行粒度修复）", () => {
+  // 子串包含会让几乎任何路径都命中 "."；修复后裸 basename 只做相等匹配。
+  expect(isDeniedToolCodePath("D:/app/.env", ["."])).toBe(true);
+  expect(isDeniedToolCodePath("D:/app/.env", ["env"])).toBe(true);
+  // basename 相等才放行
+  expect(isDeniedToolCodePath("D:/app/.env", [".env"])).toBe(false);
+  // 含 / 的片段才走路径包含
+  expect(isDeniedToolCodePath("D:/proj/.env", ["d:/proj/"])).toBe(false);
 });
 
 test("真实子进程（node）：工作区文件照常读，凭据文件被拒，工具桥仍可用", async () => {
@@ -174,9 +321,47 @@ test("真实子进程（node）：TOOL_CODE_FS_ALLOW 可精确放行（误伤时
 
 test("守卫提示文案两侧一致（排障时能对上）", () => {
   const head = DENY_MESSAGE.slice(0, 12);
-  expect(nodeFsGuardSource()).toContain(head);
+  expect(nodeFsGuardPreloadSource()).toContain(head);
   expect(pyFsGuardSource()).toContain(head);
   // 两侧都必须给出可识别的错误标记
-  expect(nodeFsGuardSource()).toContain("BX_FS_GUARD_DENIED");
+  expect(nodeFsGuardPreloadSource()).toContain(DENY_CODE);
   expect(pyFsGuardSource()).toContain("PermissionError");
 });
+
+// Python 侧此前**零**真实子进程覆盖（只有字符串断言），而它恰恰是最容易被一行绕过的那一侧：
+// 只包 builtins.open 时 io.open 不受约束，而 pathlib.Path.read_text() 内部正是走 io.open。
+test("python 侧真实子进程：builtins.open / io.open / pathlib / os.open 均被拦", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "bx-py-"));
+  try {
+    writeFileSync(join(cwd, ".env"), "API_KEY=sk-leak\n", "utf8");
+    const envPath = join(cwd, ".env");
+    const r = await runToolCode({
+      language: "python",
+      code: [
+        "import io, os",
+        "from pathlib import Path",
+        "out = []",
+        `try:\n    open(${JSON.stringify(envPath)}).read()\n    out.append("builtins=LEAKED")\nexcept Exception as e:\n    out.append("builtins=blocked")`,
+        `try:\n    io.open(${JSON.stringify(envPath)}).read()\n    out.append("io=LEAKED")\nexcept Exception as e:\n    out.append("io=blocked")`,
+        `try:\n    Path(${JSON.stringify(envPath)}).read_text()\n    out.append("pathlib=LEAKED")\nexcept Exception as e:\n    out.append("pathlib=blocked")`,
+        `try:\n    os.open(${JSON.stringify(envPath)}, os.O_RDONLY)\n    out.append("osopen=LEAKED")\nexcept Exception as e:\n    out.append("osopen=blocked")`,
+        'print(" | ".join(out))',
+      ].join("\n"),
+      cwd,
+      timeoutMs: 25_000,
+      callTool: async () => ({ ok: true, text: "x" }),
+    });
+    // Python 未安装时跳过（不因环境缺失把用例判红）。
+    if (r.text.includes("找不到解释器")) {
+      expect(true).toBe(true);
+      return;
+    }
+    expect(r.text).toContain("builtins=blocked");
+    expect(r.text).toContain("io=blocked");
+    expect(r.text).toContain("pathlib=blocked");
+    expect(r.text).toContain("osopen=blocked");
+    expect(r.text).not.toContain("LEAKED");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 45_000);

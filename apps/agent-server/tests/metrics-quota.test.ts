@@ -163,7 +163,7 @@ describe("成本硬配额：每 owner 层", () => {
     expect(quotaState().ownerUsed).toBe(0);
   });
 
-  it("跨天清空 owner 计数（与全局池同步重置）", () => {
+  it("setDailyTokensForTest 重置 owner 计数（与全局池同步清零；自动跨天 rollover 由 quotaState/addDailyTokens 触发，不在此测）", () => {
     setDailyTokensForTest(0, "A", 900);
     expect(quotaState("A").ownerUsed).toBe(900);
     // 模拟跨天：把计数置 0 即等价于 rollover 后状态
@@ -181,5 +181,23 @@ describe("成本硬配额：每 owner 层", () => {
     expect(quotaState("o1").ownerUsed).toBe(0);
     expect(quotaState("o5").ownerUsed).toBe(10);
     expect(quotaState().used).toBe(50);
+  });
+
+  it("淘汰的是「最久未活跃」而非「最早出现」——活跃用户不能被淘汰（否则配额被绕过）", () => {
+    process.env.QUOTA_MAX_TRACKED_OWNERS = "3";
+    setDailyTokensForTest(0);
+    // o1 先出现，但持续活跃（每次都刷新位置）；o2/o3 只出现一次后就不再来。
+    addDailyTokens(10, "o1");
+    addDailyTokens(10, "o2");
+    addDailyTokens(10, "o3");
+    addDailyTokens(10, "o1"); // o1 再次活跃 → 应刷新到队尾
+    addDailyTokens(10, "o1");
+    // 此时插入序应为 o2, o3, o1（o1 最活跃在末尾）。再来一个 o4 触发淘汰 → 应淘汰 o2。
+    addDailyTokens(10, "o4");
+    expect(trackedOwnerCountForTest()).toBe(3);
+    // 关键：活跃用户 o1 必须还在，累计正确（若被淘汰则清零，等于重新拿满预算绕过限额）。
+    expect(quotaState("o1").ownerUsed).toBe(30);
+    // 最久未活跃的 o2 被淘汰。
+    expect(quotaState("o2").ownerUsed).toBe(0);
   });
 });

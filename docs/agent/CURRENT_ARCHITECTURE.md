@@ -43,15 +43,15 @@
 
 > **完全访问模式（`fullAccess`）的姿态说明（已逐行核实源码；属既定产品决策，维持现状，仅记录在案）**
 >
-> `fullAccess` **缺省为 true（开箱即完全授权）**：`conversations.ts:94-99` 定义"缺省按 true 处理"；新建会话写死 `fullAccess: true`(277)，`$setOnInsert` 同样带 `fullAccess: true`(302)；运行期取值 `conversation?.fullAccess ?? true`（`chat.ts:2376`）。
+> `fullAccess` **缺省为 true（开箱即完全授权）**：`conversations.ts:259` 定义 `input.fullAccess ?? getRole(input.agentId).defaultFullAccess ?? true`；运行期取值 `conversation?.fullAccess ?? true`（`chat.ts:2895`）。（早期版本在新建会话处写死 `true`，现已改为角色默认优先，未配置角色默认仍 true。）
 >
-> 完全访问下**跳过两道闸**：`chat.ts:1668` 的 `deny` 硬拒与 `chat.ts:1694` 的二次确认卡均带 `&& !ctx.fullAccess`；`chat.ts:991` 注释直言"deny（如未知工具=deny）在完全访问下也放行"。即开箱状态下，破坏性操作与未声明工具**均不弹确认卡、直接执行**。
+> 完全访问下**跳过一道闸（仅确认卡）**：`chat.ts:2068` 的二次确认卡带 `&& !ctx.fullAccess`；`chat.ts:1253` 注释据此说明。即开箱状态下，destructive 级操作**不弹确认卡、直接执行**（既定决策，见下文论证）。**注意：硬拒（deny）不在此列**——见下方「已修」段，deny 自 2026-10-06 起不受 fullAccess 影响。
 >
 > **这是既定决策而非缺陷**（对齐 CodeBuddy「完全访问模式」）：`risk.ts:198-204` 论证"闸门过密会制造确认疲劳，用户退化成橡皮图章，反而降低整体安全性"。可按对话关闭——`patchConversation` 支持该字段（`conversations.ts:437`），设 `false` 即恢复逐项确认。
 >
-> **不因完全访问而失效**：子代理范围闸（`chat.ts:1657`）、澄清期冻结（`1680`）、失败熔断、接地门禁、SQL 只读闸、不可信内容护栏、归属守卫、限流与审计留痕均照常生效（`chat.ts:991`）。
+> **不因完全访问而失效**：子代理范围闸（`chat.ts:2028`）、澄清期冻结（`2055`）、失败熔断、接地门禁、SQL 只读闸、不可信内容护栏、归属守卫、限流与审计留痕均照常生效（`chat.ts:1253`）。
 >
-> **硬拒（`deny`）已不受 `fullAccess` 影响（2026-10-06 已修）**：此前 chat.ts 写的是 `verdict.deny && !ctx.fullAccess`，
+> **硬拒（`deny`）已不受 `fullAccess` 影响（2026-10-06 已修，现于 `chat.ts:2042`）**：此前 chat.ts 写的是 `verdict.deny && !ctx.fullAccess`，
 > 而 `fullAccess` 缺省为 true，于是硬拒在**默认配置下从不生效**——运维显式配置的 `MCP_UNKNOWN_TOOLS=deny`
 > 被默认开关静默覆盖；`source=sql-readonly` 的原生 SQL 非只读硬拒同样被跳过，使「适配器粗筛 + 服务端硬拒」
 > 这道纵深防御默认只剩适配器一层。现抽出 `risk.ts` 的 `isHardDenied(v)`（**签名里没有 fullAccess**，

@@ -46,7 +46,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 - **会话标识**：匿名 cookie `bx_agent_sid`（会话 TTL）+ 设备 owner cookie `bx_agent_oid`（1 年，跨会话稳定归属）。
 - **配置端点**：`AGENT_ADMIN_TOKEN` 未配时恒等放行；配置后所有非 chat/health 端点须带 `x-admin-token`。
 - **最小权限（HTTP 面）**：`GET /cost/summary`、`GET /audit/list`、`GET /chat/trace/*` 强制 `ownerKey` 过滤——用户只能看自己的；全局视角只走 CLI / 管理端。他人或不存在的资源统一返回 `404`，不泄漏存在性。
-- **审计留痕**：越权拒绝、写确认请求与结论（granted/denied/timeout）、工具调用决策均写入 append-only JSONL，与 trace 经 `runId` 关联。
+- **审计留痕**：越权拒绝、写确认请求与结论（confirmed/denied/timeout/grant_read/ownership_mismatch/subagent_refused/clarify_deferred/memory_write/quota_exceeded/allowed）、工具调用决策均写入 append-only JSONL，与 trace 经 `runId` 关联（实际决策类型见 `src/audit.ts`）。
 
 ---
 
@@ -95,7 +95,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 
 ### 8.2 写操作二次确认
 
-识别写意图 → 发 `confirmation_required` 事件 → 等用户应答（区分「拒绝」与「超时」）→ 才执行。确认请求本身零副作用。三处接线：工具节点、主 fallback、catch 兜底。
+识别写意图 → 发 `confirmation_required` 事件 → 等用户应答（区分「拒绝」与「超时」）→ 才执行。确认请求本身零副作用。单一接线点：`chat.ts:2070` 的 `requestConfirmation`（`confirm.ts:58` 定义），所有写意图经此一处发出。
 
 **「完全访问」与「硬拒」是两件事（2026-10-06 修订）**：
 
@@ -116,7 +116,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | 环境白名单（不继承服务端凭据） | `ENV_ALLOW` | 子进程只拿到跑起来必需的环境变量（`PATH`/`TEMP`/locale 等）。**不继承** `process.env` 全量——否则把 `MONGO_URI`、各家 API key 交给「模型写的、可被注入操控」的代码，配上不受限出网即凭据外带 |
 | 输出边收边截断 | `STREAM_CAPTURE_MAX = 4MB` | 收集中超过上限即停止累加并标注，避免「疯狂 `print`」在收齐前先把内存打爆 |
 | 展示截断 | `OUTPUT_MAX = 12KB` | 回给模型的输出保头尾截断 |
-| 超时 + 强杀兜底 | 由调用方传 `timeoutMs`；超时后先 `SIGTERM`，1.5s 仍未退出升级 `SIGKILL` | 不留孤儿进程继续跑 |
+| 超时 + 强杀兜底 | run_tool_code：超时先 `SIGTERM`，1.5s 未退出升级 `SIGKILL`；run_command/run_script 走 `exec` 的 `timeout`（仅 `SIGTERM`，无 SIGKILL 升级） | 不留孤儿进程（run_tool_code 路径有 SIGKILL 兜底） |
 | **并发上限** | `TOOL_SUBPROCESS_MAX_CONCURRENT = 4` | 进程内信号量，把「同时在跑的子进程数」收敛到上限，多出排队。防 fork-bomb / 资源耗尽（恶意或 bug 代码瞬间拉起大量解释器） |
 | 工具调用上限 | `TOOL_CODE_MAX_CALLS = 400` | `run_tool_code` 经只读桥调工具的调用次数上限 |
 | 只读工具桥 | `run_tool_code` 只能调 `read` 级工具 | 桥接服务端工具时强制 `verdict.level === "read"` 且免确认；MCP 写工具进不来 |
@@ -165,7 +165,7 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 - **写入留痕**：`save_memory` 落审计事件 `memory_write`（谁 / 哪次会话 / 内容摘要前 60 字），污染后可回溯。
 - **隔离与上限**：按 `ownerKey` 隔离；条数上限 + 注入字符总上限双约束。
 - **完整性校验**（本轮新增）：`memory.digest.json` 存内容指纹（与顺序无关），
-  每次由服务写入后刷新；`/chat/memory` 返回 `integrity`，诚实区分三种状态：
+  每次由服务写入后刷新；`/chat/memory` 返回 `integrity.baseline`，诚实区分三种状态：
   `match`（一致）/ `mismatch`（**对不上，疑似带外篡改**）/ `missing`（没有基线，不算篡改）。
   另有逐条校验：空内容、含控制符/不可见字符、超长度。
 - **只报不管**：发现异常只告警并暴露，不擅自改写用户数据（改数据留给用户决定）。
@@ -173,7 +173,7 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 
 ### 8.8 最小权限工具集（OWASP LLM08 过度自主 / ASI02 工具滥用）
 
-默认所有内置工具都注入本轮（见 §8.3 注释）。两种收窄方式：
+默认所有内置工具都注入本轮（§8.8 提供收窄方式）。两种收窄方式：
 
 - **反向剔除** `omitBuiltinTools`：划掉几个（如预警跑摘掉 `render_chart`/`export_data`）。
 - **正向 allowlist** `toolAllowlist`（本轮新增）：只给明确清单。**未传 = 不收窄**（与改动前一致）。
@@ -225,9 +225,9 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 
 ## 11. 审计与可观测
 
-- `src/audit.ts`：append-only JSONL（按月分文件），事件类型 `reject` / `confirm_request` / `confirm_result` / `prompt_guard`，与 trace 经 `runId` 关联。查看入口：`GET /audit/list`（ownerKey 隔离）+ `scripts/inspect-audit.mjs`（全局）。
+- `src/audit.ts`：append-only JSONL（按月分文件），事件类型 `allowed` / `confirmed` / `denied` / `timeout` / `grant_read` / `subagent_refused` / `clarify_deferred` / `memory_write` / `quota_exceeded` / `ownership_mismatch`，与 trace 经 `runId` 关联。查看入口：`GET /audit/list`（ownerKey 隔离）+ `scripts/inspect-audit.mjs`（全局）。
 - 审计告警节流（避免正常点「不同意」刷屏）：同「归属 + 工具」在窗口内累计到阈值才推第一条，带累计条数；`AUDIT_ALERT_THROTTLE=off` 退回逐条。
-- trace：`GET /chat/trace/runs`、`/chat/trace/run/:id`、`/chat/trace/spans`（均 ownerKey 隔离，查不到/不属于自己统一 404）。
+- trace：`GET /chat/trace/runs`、`/chat/trace/spans`（均 ownerKey 隔离，查不到/不属于自己统一 404）。
 
 ---
 

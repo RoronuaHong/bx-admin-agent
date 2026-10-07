@@ -11,12 +11,10 @@ process.env.MONGO_URI = "mongodb://127.0.0.1:1";
 process.env.MODEL_PROVIDERS = "mock";
 process.env.MODEL_MOCK_PROVIDER = "openai";
 process.env.MODEL_MOCK_NAME = "mock";
-process.env.MODEL_MOCK_BASE_URL = "http://127.0.0.1:8795/v1";
 process.env.MODEL_MOCK_API_KEY = "x";
 process.env.MODEL_MOCK_CONTEXT_WINDOW = "128000";
 process.env.MCP_MAX_TOOL_ROUNDS = "3";
 
-const PORT = 8795;
 const RUN_ID = "run_unit_rounds";
 let stepN = 0;
 
@@ -60,7 +58,12 @@ beforeAll(async () => {
   traceDir = mkdtempSync(join(tmpdir(), "trace-rounds-"));
   ({ setTraceDirForTest: setTraceDir } = await import("../src/trace.js"));
   setTraceDir(traceDir);
-  await new Promise<void>((resolve) => server.listen(PORT, "127.0.0.1", resolve));
+  // 用动态端口（listen(0)）：固定 8795 会与 8791-8799 段的其它测试文件争用，被占用时 listen 回调
+  // 永不触发、beforeAll 卡到 25s 超时（报超时而非 EADDRINUSE，难排查）。
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  process.env.MODEL_MOCK_BASE_URL = `http://127.0.0.1:${port}/v1`;
   ({ chatStream } = await import("../src/chat.js"));
   ({ createConversation } = await import("../src/conversations.js"));
   ({ fsRemoveConversation } = await import("../src/fs-store.js"));

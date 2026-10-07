@@ -50,7 +50,7 @@
 | ASI07 输入操纵 | 输入清洗、类型/结构校验 | 请求体上限；ReDoS 护栏（嵌套量词 + **本轮新增交替重叠型** `(a|a)*`）+ 2s 预算兜底；`runGate` schema/可调用性校验 | ✅ | — |
 | ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集；**本轮新增** 渐进式自主（按近期质量**只向下**收紧轮次预算，`/chat/autonomy`） | ✅ | 不自动提权（历史质量好也不放开确认/权限——防刷分提权） |
 | ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost + span 挂 `gen_ai.*`；**本轮新增进程级 metrics、OTLP 导出、行为异常检测** | ✅ | 仍无跨进程基线共享（基线在进程内，重启重建） |
-| ASI10 不安全的输出处理 | 输出校验、下游控制 | DOMPurify 净化 + 零外链护栏 + 出站打码 | 🟡 | 无输出结构校验。P2 |
+| ASI10 不安全的输出处理 | 输出校验、下游控制 | DOMPurify 净化 + 零外链护栏 + 出站打码 + **输出结构校验**（`src/output-schema.ts`：澄清/待办/图表 spec 统一收口、边界 fail-closed，`GET /chat/output-schema` 可观测） | ✅ | — |
 
 ---
 
@@ -58,7 +58,7 @@
 
 | 最佳实践 | 现状 | 判定 | 行动 |
 | --- | --- | --- | --- |
-| 采用 GenAI 语义约定（标准属性名） | 自研 JSONL 结构；**本轮新增** span 上挂 `gen_ai.operation.name` / `gen_ai.provider.name` / `gen_ai.request.model` / `gen_ai.tool.name` / `gen_ai.tool.type` / `gen_ai.conversation.id` | 🟡 | 属性名已标准化（导出时可直接映射），但**仍无 OTLP 导出器**。P2 |
+| 采用 GenAI 语义约定（标准属性名） | 自研 JSONL 结构；**已补齐** span 上挂 `gen_ai.operation.name` / `gen_ai.provider.name` / `gen_ai.request.model` / `gen_ai.tool.name` / `gen_ai.tool.type` / `gen_ai.conversation.id`；**OTLP/HTTP JSON 导出器已补齐**（`src/otlp.ts`，默认关闭） | ✅ | — |
 | 遥测作为评测的反馈回路 | trace 落盘 → **本轮新增 `src/eval-online.ts`**：每次真实运行确定性打分，回流成 `/chat/eval/*` 与 Prometheus 指标 | ✅ | 刻意不做 LLM-as-judge（每次运行都叠评委模型 = 成本翻倍 + 评委偏好），只用 trace 已如实记录的字段判 |
 | metrics（吞吐/延迟/错误率/成本） | 拉取式聚合 + **本轮新增**进程级 Prometheus `GET /metrics`（模型/工具/运行/HTTP 四类，零依赖） | ✅ | — |
 | 采样与保留策略 | trace 按月/按 run 分文件；**本轮新增**保留期清理（`TRACE_RETENTION_DAYS`，默认 30 天，启动 + 每日回收过期 run/rounds/spans） | 🟡 | 保留期已实现；仍**无采样**（全量落盘，高频场景磁盘增长靠保留期兜底而非采样减量） |

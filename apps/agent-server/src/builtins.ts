@@ -52,7 +52,7 @@ import {
   prepareListArgs,
   type CountListReport,
 } from "./list-count.js";
-import { runToolCode } from "./tool-code.js";
+import { runToolCode, toolCodeEnv } from "./tool-code.js";
 import { withSubprocessSlot } from "./subprocess-limit.js";
 
 export const BUILTIN_SERVER = "builtin";
@@ -201,7 +201,9 @@ function runShell(
 ): Promise<{ ok: boolean; text: string }> {
   // 干净的执行环境（§13.4 C）：关掉颜色与交互式 TERM 特性，避免 ANSI 色码污染捕获到的输出
   // （对齐 Cursor 用 CURSOR_AGENT 让 shell 自降级）；注入 BX_AGENT 供用户的 shell 配置自检降级。
-  const env = { ...process.env, NO_COLOR: "1", TERM: "dumb", BX_AGENT: "1" };
+  // 子进程**只拿白名单环境**（见 toolCodeEnv）：不把服务端完整环境（数据库 URI、各家 API key 等）
+  // 透传给模型/注入可操控的 shell——否则一条 `type .env` 即可把凭据外带（与 run_tool_code 同护栏）。
+  const env = toolCodeEnv({ NO_COLOR: "1", TERM: "dumb", BX_AGENT: "1" });
   return withSubprocessSlot(
     () =>
       new Promise<{ ok: boolean; text: string }>((resolve) => {

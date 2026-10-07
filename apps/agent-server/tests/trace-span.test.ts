@@ -41,7 +41,7 @@ test("不存在的 runId 返回空数组（不是报错）", () => {
   expect(findRunTrace("")).toBeUndefined();
 });
 
-test("llm span 记录失败原因（截断后落盘，便于看是不是模型侧抖动）", () => {
+test("llm span 记录失败原因（保留错误文本，便于看是不是模型侧抖动）", () => {
   const runId = `run_span_${randomUUID()}`;
   const long = "x".repeat(500);
   appendSpanTrace({ runId, at: 1, kind: "llm", name: "m1", durationMs: 10, ok: false, error: long.slice(0, 200) });

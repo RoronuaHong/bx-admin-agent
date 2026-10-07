@@ -335,7 +335,17 @@ export function cleanupTraceDir(dir: string = activeDir, retentionMs = getTraceR
       if (!line.trim()) continue;
       let run: RunTrace | undefined;
       try { run = JSON.parse(line) as RunTrace; } catch { kept.push(line); continue; }
-      if (typeof run.at === "number" && run.at >= cutoff) {
+      // 单行内容为 null / 数组 / 原始值等非对象时：JSON.parse 成功但后续 `run.at` 会抛 TypeError，
+      // 若不加防护会让整月文件的清理循环中断（外层 try 只包了 parse）。按「宁可留痕」口径原样保留。
+      if (!run || typeof run !== "object") { kept.push(line); continue; }
+      // 可解析但 `at` 缺失/非数字 = 年龄未知。按「宁可留痕」口径保留（与不可解析行同一待遇），
+      // 不静默删除——这类行不会干扰判定，删了反而丢失排障证据。
+      if (typeof run.at !== "number" || !Number.isFinite(run.at)) {
+        if (run.runId) activeRunIds.add(run.runId);
+        kept.push(line);
+        continue;
+      }
+      if (run.at >= cutoff) {
         if (run.runId) activeRunIds.add(run.runId);
         kept.push(line);
       } else {
@@ -351,8 +361,19 @@ export function cleanupTraceDir(dir: string = activeDir, retentionMs = getTraceR
   for (const name of names) {
     const pm = /^(rounds|spans)-(.+)\.jsonl$/.exec(name);
     if (!pm) continue;
-    if (!activeRunIds.has(pm[2])) {
-      try { unlinkSync(resolve(dir, name)); result.deletedFiles++; } catch { /* 忽略 */ }
+    if (activeRunIds.has(pm[2])) continue;
+    const full = resolve(dir, name);
+    try {
+      // mtime 兜底：**在途运行**的明细是运行中就写的，而 run 记录要等运行结束才落盘
+      // （app.ts 在 chatStream 之后才 appendRunTrace）。清理恰好发生在两者之间时，
+      // 这份明细的 runId 还没进 activeRunIds，会被误判成孤儿删掉——
+      // 表现为 /chat/trace/runs 能看到这次 run，但 spans 端点返回空，且原因不可见。
+      // 文件还很新（在保留期内）就先不删，留到下一轮清理再判。
+      if (statSync(full).mtimeMs >= cutoff) continue;
+      unlinkSync(full);
+      result.deletedFiles++;
+    } catch {
+      /* 忽略 */
     }
   }
   // 旧格式遗留（每 span 一文件、无读取方）：按 mtime 过期即删。stat 失败就跳过，绝不误删。

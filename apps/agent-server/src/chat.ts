@@ -1250,7 +1250,7 @@ interface LoopContext {
   /**
    * 完全访问（conversation.fullAccess）：true = 写/破坏性/外部操作**不**逐项弹确认卡，直接执行
    * （对齐 CodeBuddy「完全访问模式」）。缺省按 true 处理（开箱即完全授权）。
-   * 仅影响「人审确认」：clarify 挂起、失败熔断等安全流程不因此失效；deny（如未知工具=deny）在完全访问下也放行。
+   * 仅影响「人审确认」的便利性：clarify 挂起、失败熔断等安全流程不因此失效；deny（如未知工具=deny）**也不受** fullAccess 影响——即使完全访问开启，硬拒照常生效（不再被默认开关静默覆盖）。
    */
   fullAccess: boolean;
   /** 发起请求的会话 id：确认票据与它绑定（跨会话应答会被拒绝）。 */
@@ -2928,7 +2928,10 @@ export async function* chatStream(
     groundingRetries = loop.groundingRetries || 0;
     groundingVerifications = loop.groundingVerifications || 0;
     ungrounded = loop.ungrounded || false;
-    costTokens = loop.spentTokens || 0;
+    // 跨候选**累加**：切换模型时前一个候选已真实消耗的 token 不能丢。
+    // 原实现是赋值，切一次就丢一份，配额只计入最后一个候选的量——
+    // 配额是成本护栏，少扣是方向性错误（实测 modelFallbacks 可达 3，实际花费可能是计入值的 2-4 倍）。
+    costTokens += loop.spentTokens || 0;
     if (!outcome.failure) {
       // 成功必须清掉前序候选残留的 failure：否则第一个模型的 402 会阴魂不散地
       // 给成功结果拼上「⚠️ 生成中断」尾巴（实测 kimi26 402 → 后续候选成功仍带中断提示）。
@@ -2953,13 +2956,15 @@ export async function* chatStream(
 
   // 进程级指标（P1 可观测）+ 成本硬配额累计：一次运行记一行。
   incCounter("bx_agent_runs_total", "对话运行次数（按结果）", { status: failure ? "error" : "ok" });
-  incCounter("bx_agent_tokens_total", "运行累计 token", {}, Math.max(0, totalTokens));
+  incCounter("bx_agent_tokens_total", "运行累计 token", {}, Math.max(0, costTokens > 0 ? costTokens : totalTokens));
   observeSummary("bx_agent_rounds", "每次运行的工具轮数", {}, rounds);
-  addDailyTokens(totalTokens, opts.ownerKey);
+  // 配额按**实际模型消耗**计（costTokens 已跨候选累加）；拿不到真实用量（0）时回落
+  // 上下文估算 totalTokens，保持与原行为一致，避免改成「完全不扣」。
+  addDailyTokens(costTokens > 0 ? costTokens : totalTokens, opts.ownerKey);
 
   const usage: ChatEvent = {
     type: "usage",
-    tokens: totalTokens,
+    tokens: costTokens > 0 ? costTokens : totalTokens,
     budget,
     window: usedWindow,
     turns: turnsCount,

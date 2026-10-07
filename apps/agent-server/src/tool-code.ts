@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { withSubprocessSlot } from "./subprocess-limit.js";
-import { nodeFsGuardSource, pyFsGuardSource } from "./tool-code-fs-guard.js";
+import { guardSourceLooksIntact, nodeFsGuardPreloadSource, pyFsGuardSource } from "./tool-code-fs-guard.js";
 
 function capOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -240,14 +240,30 @@ export async function runToolCode(opts: {
   writeFileSync(clientPath, python ? PY_CLIENT : NODE_CLIENT, "utf8");
   const body = python
     ? `import sys\nsys.path.insert(0, ${JSON.stringify(scratch)})\nfrom _bx_tool import call_tool\n${pyFsGuardSource()}\n${opts.code}`
-    : `${nodeFsGuardSource()}\nimport { callTool } from ${JSON.stringify(pathToFileURL(clientPath).href)};\nglobalThis.callTool = callTool;\nawait (async () => {\n${opts.code}\n})();\n`;
+    : `import { callTool } from ${JSON.stringify(pathToFileURL(clientPath).href)};\nglobalThis.callTool = callTool;\nawait (async () => {\n${opts.code}\n})();\n`;
   const scriptPath = join(scratch, scriptName);
   writeFileSync(scriptPath, body, "utf8");
+
+  // Node 侧守卫走 **--require 预加载**：node:fs 的 ESM 命名导出是求值期快照，
+  // 若只在用户代码里打补丁，`const { readFileSync } = await import("node:fs")` 拿到的是原函数。
+  // 预加载先于一切 import 执行，快照捕获到的就是补丁后的函数（实测六条通道全拦）。
+  let args: string[] = [scriptPath];
+  const guardSrc = python ? pyFsGuardSource() : nodeFsGuardPreloadSource();
+  if (!python) {
+    const preloadPath = join(scratch, "_bx_guard.cjs");
+    writeFileSync(preloadPath, guardSrc, "utf8");
+    args = ["--require", preloadPath, scriptPath];
+  }
+  // 自检进入生产路径：注入源码每次现生成，一旦结构被改坏（少了判定体）要能立刻看见，
+  // 而不是让它安静失效——否则守卫形同虚设而日志毫无异常。
+  if (!guardSourceLooksIntact(guardSrc)) {
+    console.warn(`[tool-code] 凭据文件守卫源码结构校验失败，本次执行不受该守卫保护（${python ? "python" : "node"}）`);
+  }
 
   const command = python ? "python" : "node";
   // 占用一个子进程并发槽：防止模型（或被注入的代码）同时拉起大量解释器把服务端资源打爆。
   return await withSubprocessSlot(async () => {
-  const child = spawn(command, [scriptPath], {
+  const child = spawn(command, args, {
     cwd: opts.cwd,
     windowsHide: true,
     env: toolCodeEnv({
