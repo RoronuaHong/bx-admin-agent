@@ -99,12 +99,14 @@ export interface ChatSchedule {
    * 任务用途：表单「周期报告 / 数据预警」；引擎以 notifyPolicy 为准，purpose 便于列表展示与回填。
    */
   purpose?: SchedulePurpose;
-  /** 预警冷静期 / 恢复状态（调度器回写；前端不可改）。 */
+  /** 预警是否仍在告警中，以及恢复计数（调度器回写；前端不可改）。 */
   alertState?: ScheduleAlertState;
   /** 最近一期预警结论标记（调度器回写；侧栏健康态用；报告型任务通常没有）。 */
   lastMarker?: AlertMarker;
   /** 投递文案语言（建任务时由前端写入；缺省中文）。 */
   locale?: string;
+  /** 建任务时从来源对话带上的 IANA 时区。每期运行的小时分桶用它。 */
+  timeZone?: string;
   /** 最近一次投递结果（前端显示「上次推送」用；不含任何凭据）。 */
   lastDelivery?: { at: number; ok: boolean; sent: number; error?: string };
   enabled: boolean;
@@ -208,6 +210,43 @@ async function tryAcquireScheduleLock(id: string, owner: string): Promise<boolea
     return false;
   }
 }
+/** 锁的 owner 形如 `主机名-pid-随机串`。认不出本机 pid 时返回 null（别的机器的锁不动）。 */
+export function scheduleLockPid(owner: string, host = hostname()): number | null {
+  const prefix = `${host}-`;
+  if (!owner.startsWith(prefix)) return null;
+  const pid = Number(owner.slice(prefix.length).split("-")[0]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** pid 还在就返回 true。EPERM 表示进程在、只是没权限发信号，不能当成已死。 */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * 进程被重启或杀掉时，调度锁要等 30 分钟 TTL 才过期，这期间到点的任务会一直被静默跳过。
+ * 启动时清掉「owner 是本机、但那个 pid 已经不在」的锁。
+ */
+export async function releaseDeadScheduleLocks(): Promise<number> {
+  const lock = await getLockColl();
+  if (!lock) return 0;
+  const docs = await lock.find({}).toArray();
+  let released = 0;
+  for (const doc of docs) {
+    const pid = scheduleLockPid(String(doc.owner || ""));
+    if (pid === null || pid === process.pid || isProcessAlive(pid)) continue;
+    const gone = await lock.deleteOne({ _id: doc._id, owner: doc.owner });
+    if (gone.deletedCount) released += 1;
+  }
+  if (released) console.warn(`[scheduler] 已释放 ${released} 把失效调度锁（原进程已退出）`);
+  return released;
+}
+
 async function releaseScheduleLock(id: string, owner: string): Promise<void> {
   const lock = await getLockColl();
   if (!lock) return;
@@ -301,6 +340,7 @@ export async function createSchedule(input: {
   notifyPolicy?: ScheduleNotifyPolicy;
   purpose?: SchedulePurpose;
   locale?: string;
+  timeZone?: string;
   /** 每期结果的落点（缺省 "new"）。 */
   runMode?: ScheduleRunMode;
   /** 建任务时的 Agent 角色（每期建会话继承）。 */
@@ -324,6 +364,7 @@ export async function createSchedule(input: {
     ...(input.notifyPolicy ? { notifyPolicy: input.notifyPolicy } : {}),
     ...(input.purpose ? { purpose: input.purpose } : {}),
     ...(input.locale ? { locale: input.locale } : {}),
+    ...(input.timeZone ? { timeZone: input.timeZone } : {}),
     // 落点**总是显式落库**（缺省写 "new"）：把默认值留在「读的时候补」会让库里出现
     // 「没写 = 新会话」和「写了 = 新会话」两种形态，排查时得多推一层。
     runMode: input.runMode === "same" ? "same" : "new",
@@ -388,6 +429,29 @@ export interface SchedulePatch {
   lastDelivery?: ChatSchedule["lastDelivery"];
   /** 显式覆盖下次触发时刻（运维 / 测试用）。 */
   nextRunAt?: number;
+}
+
+/**
+ * 会话被删除时，把任务运行记录里指向它的条目清掉（一致性修复）：
+ * 之前只删会话不动 runs[]，侧栏任务组会留下「幽灵运行记录」——点了才提示会话已不存在。
+ * unreadRuns 按被删条数同步下调（下限 0）：用户主动删结果 = 已读过/不要了，角标不该继续指向不存在的期。
+ * schedule.conversationId 不动：它指向的会话删了会由下一次运行自动重建（前端已有对应提示文案）。
+ */
+export async function pruneRunsOfConversation(ownerKey: string, conversationId: string): Promise<number> {
+  if (!conversationId) return 0;
+  let removed = 0;
+  for (const s of await listSchedules(ownerKey)) {
+    const runs = s.runs || [];
+    const kept = runs.filter((r) => r.conversationId !== conversationId);
+    if (kept.length === runs.length) continue;
+    const gone = runs.length - kept.length;
+    removed += gone;
+    await patchSchedule(s.id, ownerKey, {
+      runs: kept,
+      unreadRuns: Math.max(0, (s.unreadRuns || 0) - gone),
+    });
+  }
+  return removed;
 }
 
 export async function patchSchedule(
@@ -532,7 +596,10 @@ export async function schedulerTick(
     if (due === undefined || due > now) continue;
     // 跨实例互斥：同一日程同一时刻只由一个进程触发；抢不到锁的交给其它实例或下一 tick。
     const lockOwner = `${hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-    if (!(await tryAcquireScheduleLock(schedule.id, lockOwner))) continue;
+    if (!(await tryAcquireScheduleLock(schedule.id, lockOwner))) {
+      console.warn(`[scheduler] ${schedule.id} 调度锁被占用，本拍跳过`);
+      continue;
+    }
     triggered += 1;
     let outcome: "success" | "failed" | "cancelled" | "skipped" | "error" = "skipped";
     let note = "";
@@ -688,6 +755,9 @@ export function startScheduleLoop(
       });
   };
   kickSchedule = run;
+  void releaseDeadScheduleLocks()
+    .catch((err) => console.warn(`[scheduler] 清理失效锁失败：${String((err as Error)?.message || err)}`))
+    .finally(() => run());
   const timer = setInterval(run, intervalMs);
   timer.unref();
   return timer;

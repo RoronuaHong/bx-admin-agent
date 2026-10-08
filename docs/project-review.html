@@ -242,7 +242,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-02） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7）</p>
+  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-08） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7；含 2026-10-08：MCP 生产命令白名单与来源指纹，见 §9）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -254,6 +254,7 @@
   </div>
   <p style="margin-top:10px"><span class="tag ok">✓ 本轮已修复</span> MCP 配置文件缓存按 <strong>mtime + size</strong> 失效（<code>src/mcp/config.ts</code>），详见 §9 与 B 章；回归测试 <code>tests/mcp-config-hotreload.test.ts</code> 5 例全绿。</p>
   <p style="margin-top:6px"><span class="tag acc">✓ 本轮对齐</span> 护栏与上下文工程已补到<strong>六条</strong>（新增「跨轮重复只给观察提示」「预算耗尽补位收尾」），并对齐 Anthropic《Effective context engineering for AI agents》——见 §7 / §12 / §16 / §23；客服助手与 <code>orders</code> 示例数据源已补入 §13 / A1。</p>
+  <p style="margin-top:6px"><span class="tag acc">✓ 2026-10-08</span> MCP 供应链与范围：开发环境不配 <code>MCP_ALLOWED_COMMANDS</code> 仍放行；<code>NODE_ENV=production</code> 且未配则拒绝 stdio 连接。来源严格模式默认关闭，建连不检查；打开 <code>MCP_REQUIRE_PROVENANCE=on</code> 后，stdio 与 HTTP 在建连前比对命令、url、请求头哈希和本地脚本内容。不上多进程 Agent 集群。详见 §9，操作口径以 <code>docs/mcp-guide.md</code> §10 为准。</p>
 </header>
 
 <!-- ===================== 0 ===================== -->
@@ -632,6 +633,8 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>HOST</code></td><td><code>127.0.0.1</code></td><td>监听地址。原先不指定 hostname 实际监听 <code>0.0.0.0</code>；改成默认只听本机，全网卡监听时启动打印告警</td></tr>
 <tr><td><code>AGENT_ADMIN_TOKEN</code></td><td>空（不启用）</td><td><code>/chat/*</code> 之外的全局端点（MCP 服务器管理 / 通知通道）要求 <code>x-admin-token</code> 头。未配置恒等放行，配了才启用</td></tr>
 <tr><td><code>RATE_LIMIT_ADMIN_PER_MIN</code></td><td class="num">30（0 关闭）</td><td>上述端点的限流，按来源 IP 计，带 <code>Retry-After</code>。压住反复 <code>reload</code> 不断 spawn</td></tr>
+<tr><td><code>MCP_ALLOWED_COMMANDS</code></td><td>未配 = 开发放行</td><td>stdio 命令白名单（认命令名，也认完整路径）。<code>NODE_ENV=production</code> 且未配时拒绝 stdio 连接，错误记在连接上，不把进程卡在「连接中」</td></tr>
+<tr><td><code>MCP_REQUIRE_PROVENANCE</code></td><td>未配 = 建连不检查</td><td>打开后，建连前比对命令、HTTP <code>url</code>、请求头哈希、本地脚本（<code>.js/.mjs/.cjs/.ts</code>）内容。不一致拒绝这次连接。不哈希 <code>node</code>/<code>npx</code> 本体。请求头原文不写入基线</td></tr>
 </tbody>
 </table>
 
@@ -659,7 +662,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <thead><tr><th>要做的事</th><th>怎么做</th><th>模型看见什么</th></tr></thead>
 <tbody>
 <tr><td>确认字段名</td><td>每个列表工具本轮<strong>直接调用一次第一页</strong></td><td>压瘦后的短标量；还有下一页时，提示放在结果最前面</td></tr>
-<tr><td>按整点小时计数、和阈值比</td><td>一次 <code>count_list_by_time</code>（<code>list-count.ts</code>）</td><td>首行 <code>complete</code>，以及完整时的小时计数。不完整时不给各小时数字</td></tr>
+<tr><td>按整点小时计数、和阈值比</td><td>一次 <code>count_list_by_time</code>（<code>list-count.ts</code>）</td><td>首行 <code>complete</code>，以及完整时的小时计数。小时标签用调用里的 <code>timeZone</code>；不传则用浏览器上报的用户时区（未上报才是 UTC）。不完整时不给各小时数字</td></tr>
 <tr><td>小时桶以外的汇总（国家、状态等）</td><td><code>run_tool_code</code>（<code>tool-code.ts</code>）：Node <code>callTool</code> / Python <code>call_tool</code></td><td>只有 <code>console.log</code> / <code>print</code> 打出来的聚合。零次成功的只读调用不能当成事实</td></tr>
 </tbody>
 </table>
@@ -701,7 +704,7 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <tr><td><code>list_schedules / manage_schedule</code></td><td>定时任务查看与增删改（HTTP 端点共用同一实现）</td><td><code>builtins.ts:446 / 453</code> · <code>schedules.ts</code></td></tr>
 <tr><td><code>write_todos</code></td><td>任务计划（产出 todos 事件）</td><td><code>builtins.ts:546</code></td></tr>
 <tr><td><code>task</code></td><td>派生子代理（独立上下文 + 最小工具集）</td><td><code>builtins.ts:569</code> · <code>chat.ts</code> 子代理运行时</td></tr>
-<tr><td><code>count_list_by_time</code></td><td>分页列表在服务端翻完，按整点小时计数，只把计数交回对话。<code>complete: false</code> 不能当成是否超阈值</td><td><code>list-count.ts</code> · spec <code>builtins.ts:591</code></td></tr>
+<tr><td><code>count_list_by_time</code></td><td>分页列表在服务端翻完，按整点小时计数，只把计数交回对话。时区来自浏览器 IANA 名（<code>Asia/Shanghai</code> 等），不从界面语言猜测；模型没传 <code>timeZone</code> 时用这个时区。<code>complete: false</code> 不能当成是否超阈值</td><td><code>list-count.ts</code> · spec <code>builtins.ts</code></td></tr>
 <tr><td><code>run_tool_code</code></td><td>在代码里调用只读工具，明细留在子进程，只回打印出的聚合结果。小时桶以外的汇总用它</td><td><code>tool-code.ts</code> · spec <code>builtins.ts:620</code></td></tr>
 <tr><td><code>run_command</code> / <code>run_script</code></td><td>命令执行 / 脚本执行（统一解码与输出截断护栏）。脚本进程调不到 MCP</td><td><code>builtins.ts:636 / 654</code></td></tr>
 <tr><td><code>image_gen</code></td><td>生成图片（PNG 落工作区，需 <code>IMAGE_GEN_*</code> 配置）</td><td><code>builtins.ts:671</code></td></tr>
@@ -736,6 +739,8 @@ NVIDIA_API_KEYS=<b>多 key 池</b>     端点含 integrate.api.nvidia.com 时启
 <div class="good"><strong>已修复（2026-09-23）</strong>：<code>config.ts</code> 的<strong>进程内 <code>fileCache</code></strong> 过去只在「自己写过」（<code>upsert/delete</code>）时才刷新，导致<strong>进程外改文件不生效</strong>——最痛的表现是「换了 token 却一直 401：直连 API 200、独立起 MCP 进程也 <code>authenticated:true</code>，唯独对话里失败」。<br/><strong>修法</strong>：与 <code>rag/store.ts</code> 同一口径 —— <strong>按文件 <code>mtime</code> 失效</strong>，且失效键是 <strong><code>mtime + size</code></strong>（2026-09-24 加固：只按 mtime 会漏掉同一毫秒内的连续改写）；<code>persist()</code> 写回后同步 mtime/size（避免把自己刚写的文件误判为外部变更）；文件被删也能感知（不再返回已删除的 server）。<br/><strong>回归测试</strong>：<code>tests/mcp-config-hotreload.test.ts</code>（5 例全绿：首次读取 / 外部改写立即生效 / 内容未变不重复解析 / 文件删除后不再返回 / 同毫秒改写也被感知）。</div>
 <div class="note"><strong>仍然建议</strong>（与修复不冲突）：改凭据走 <code>POST /mcp/servers</code> 或在 web 端抽屉保存，再 <code>POST /mcp/servers/&lt;id&gt;/reload</code>——这样能立刻拉起新的 stdio 子进程，不必等下一次读取触发。<code>PUT /chat/mcp/servers</code> 只改「对话级启用集」，不写凭据。</div>
 <div class="note">MCP 的 stdio 子进程 stderr 会被转发成 <code>[mcp:&lt;id&gt;]</code> 日志（stdout 被协议帧占用，不接出来就是日志黑洞）。排查 MCP 问题先看这行日志。</div>
+<div class="good"><strong>供应链（2026-10-08）</strong>：开发环境（含 PM2 的 <code>NODE_ENV=development</code>，以及未设置 <code>NODE_ENV</code> 的 <code>pnpm dev</code>）不配 <code>MCP_ALLOWED_COMMANDS</code> 时，stdio 仍放行，现有 BI / YApi / 观影连接不受影响。<code>NODE_ENV=production</code> 且未配白名单时，stdio 在 <code>transportRefusal</code> 被拒绝，失败写入连接的 <code>error</code>。<code>MCP_REQUIRE_PROVENANCE</code> 默认关闭：建连不读基线。只有 <code>GET /mcp/provenance</code> 会比对并告警；这时仅脚本内容变化会更新基线，命令、<code>url</code>、请求头变化保留旧基线。打开严格模式后，stdio 与 HTTP 都在建连前检查。指纹含 command / args / cwd、HTTP url、请求头哈希、本地脚本内容。旧基线还没有后两项时，命令没变就补记，不算漂移。操作口径以 <code>docs/mcp-guide.md</code> §10 与 <code>docs/SECURITY.md</code> §8.5、§8.10 为准。</div>
+<div class="note"><strong>不上 Agent 集群。</strong> 领域继续用角色 + 技能 + MCP。<code>task</code> 只做同一次运行里的上下文隔离。没有外部 Agent 要按协议调用本服务时，不接 A2A。见 <code>docs/agent/CURRENT_ARCHITECTURE.md</code> 文首。</div>
 </section>
 
 <!-- ===================== 10 ===================== -->
@@ -921,7 +926,7 @@ BINARY_EXTS      = .xlsx .xls .pdf .docx .zip
   <div class="arrow">▼</div>
   <div class="step"><div class="t">⑥ 运行记录与未读</div><div class="d"><code>runs[]</code>（近 <code>MAX_RUNS_PER_SCHEDULE</code>，默认 50）+ <code>unreadRuns</code>；预警期可记 <code>marker</code>；写回前重读防并发覆盖</div><div class="f">schedules.ts:prependRun</div></div>
   <div class="arrow">▼</div>
-  <div class="step"><div class="t">⑦ 通知</div><div class="d"><code>always</code>：成功/失败都推。<code>on_alert</code>：失败仍推；成功只认首行标记——<code>[SPIKE]</code> 推（冷静期 30m 内去重）、<code>[NORMAL]</code> 静默（曾告警且连续 2 期 → 推恢复）、<code>[NO_DATA]</code> 不推。通道 <code>.data/notify-channels.json</code>，关键词按通道配置（不满足则 HTTP 200 + 业务错误）。钉钉一律 markdown：去掉工具轨迹，避开下划线和协议方括号</div><div class="f">schedule-alert.ts / notify/{channels,deliver}.ts</div></div>
+  <div class="step"><div class="t">⑦ 通知</div><div class="d"><code>always</code>：成功/失败都推。<code>on_alert</code>：失败仍推；成功只认首行标记——<code>[SPIKE]</code> 每期都推、<code>[NORMAL]</code> 静默（曾告警且连续 2 期 → 推恢复）、<code>[NO_DATA]</code> 不推。通道 <code>.data/notify-channels.json</code>，关键词按通道配置（不满足则 HTTP 200 + 业务错误）。钉钉一律 markdown：去掉工具轨迹。群消息把协议标记写成中文标识（异常 / 正常 / 警告），不把 complete、raw 这类字段名原样发出</div><div class="f">schedule-alert.ts / notify/{channels,deliver}.ts</div></div>
 </div>
 <h3>创建期校验 <span class="kv">src/schedule-service.ts</span></h3>
 <p><code>createScheduleTask()</code> 是 <code>POST /chat/schedules</code> 与内置工具 <code>manage_schedule</code> 的<strong>共用校验层</strong>：</p>
@@ -1175,6 +1180,7 @@ src/
 <li><code>MONGO_URI</code>（<strong>缺失则降级进程内存 → 重启即丢</strong>）</li>
 <li><code>AGENT_DATA_DIR</code>（仅测试/特殊部署覆盖 <code>.data</code> 位置，默认不变）</li>
 <li><code>MCP_BUILTIN_SERVERS</code>（内置 MCP 服务器 JSON 数组）</li>
+<li><code>MCP_ALLOWED_COMMANDS</code>（生产必配；开发不配则放行）· <code>MCP_REQUIRE_PROVENANCE</code>（默认关，建连不检查）</li>
 <li><code>MCP_MAX_TOOLS / MCP_MAX_TOOL_ROUNDS / MCP_MAX_TOTAL_TOKENS</code></li>
 <li><code>TOOL_SEARCH_MODE</code>（红线：<strong>保持 auto</strong>）</li>
 <li><code>GROUNDING_GUARD / GROUNDING_MAX_RETRIES</code>；<code>GROUNDING_VERIFY / _MAX / _VOTES</code>（事后核验与多票裁决）</li>
@@ -1330,7 +1336,7 @@ src/
     <dl>
       <dt>业界常见做法</dt><dd>Deep Agents 的 subagent：把「探查大量原始结构」的工作隔离出去，只把结论带回主上下文。</dd>
       <dt>本项目做法</dt><dd><code>task</code> 工具派生子代理：独立上下文、最小工具集、结果裁剪到 4000 字符、并行上限 3、可单独取消。轮次上限 10，不拿来翻页；跨页计数用 <code>count_list_by_time</code>。</dd>
-      <dt>判定</dt><dd>✅ 与最佳实践一致。子代理是上下文隔离，不是分页传输。</dd>
+      <dt>判定</dt><dd>✅ 与最佳实践一致。子代理是同一次运行里的上下文隔离，不是分页传输，也不是常驻多进程集群。</dd>
       <dt>为什么重要</dt><dd>避免把一次性探索的原始结构永久占用主上下文。用子代理逐页拉列表，轮次不够，而且会把明细又灌回主对话。</dd>
       <dt>何时改回去</dt><dd>无需改。不要靠加大 <code>SUBAGENT_MAX_ROUNDS</code> 来翻完一个长列表。</dd>
     </dl>
@@ -1787,21 +1793,24 @@ src/
 <table>
 <thead><tr><th>项</th><th>最佳实践</th><th>本项目做法</th><th>为什么现在不做</th><th>触发改造的条件</th></tr></thead>
 <tbody>
-<tr><td>检索存储</td><td>专用向量库（Qdrant 等）</td><td>文件索引 + 向量缓存 + RRF（<strong>无权限过滤</strong>）</td><td>数据量小，暴力扫描毫秒级；引入服务收益为负。<strong>权限过滤是已知缺口</strong>，不是权衡掉的选择（见 §26）</td><td>chunk &gt; 5~10 万 / 多实例并发写 / 增量同步常态化；<strong>权限过滤应优先于迁库</strong></td></tr>
+<tr><td>检索存储</td><td>专用向量库（Qdrant 等）</td><td>文件索引 + 向量缓存 + RRF。文档级 ACL 已在召回前过滤（<code>RagDoc.acl</code>，缺省公开，见 §26）</td><td>数据量小，暴力扫描毫秒级；引入服务收益为负</td><td>chunk &gt; 5~10 万 / 多实例并发写 / 增量同步常态化</td></tr>
 <tr><td>身份认证</td><td>登录体系（OIDC / SSO）</td><td>设备 owner cookie</td><td>内网自用，登录 = 引入用户体系与运维负担</td><td><strong>对外暴露或多租户之前必须补</strong></td></tr>
 <tr><td>前端架构</td><td>组件化 + 状态分层</td><td>单文件 ChatPage.vue</td><td>状态高耦合，拆分会引入同步成本（属欠账非取舍）</td><td>下个迭代就应抽 <code>useChatStream</code> / <code>useBubbles</code></td></tr>
 <tr><td>编排框架</td><td>LangGraph / AI SDK</td><td>自建 while 循环 + 显式常量</td><td>护栏细节必须在自己手里，可预测可观测，且零依赖</td><td>工作流复杂到需要「图」表达时再评估</td></tr>
-<tr><td>可观测</td><td>OTel + Prometheus/Jaeger</td><td>JSONL + HTTP + CLI；<strong>run 级 + 轮级两层</strong>，无 llm / tool 分层 span</td><td>单机规模零依赖落地最快，职责已分离（trace 轮转 / audit 长留 / cost 聚合）</td><td>需要告警 / 多实例聚合 / 前端可视化，或需要 <strong>llm / tool 分层 span</strong> 时</td></tr>
+<tr><td>可观测</td><td>OTel + Prometheus/Jaeger</td><td>JSONL + HTTP + CLI。run / 轮 / llm·tool span 已有（<code>SpanTrace</code>，可挂 <code>gen_ai.*</code>）。OTLP 导出默认关闭</td><td>单机规模零依赖落地最快。跨进程基线与采样仍缺</td><td>需要多实例聚合，或要把 OTLP 默认打开时</td></tr>
 <tr><td>异步任务</td><td>外部队列（Redis/Temporal）</td><td>进程内 Map + 恢复 + 看门狗；<strong>任务级</strong>可续传（事件重放 + 结果落库），<strong>轮次级断点恢复仍缺</strong></td><td>单实例；已有恢复逻辑解决最疼的永久转圈</td><td>多实例部署 / 需重试与优先级 / 需要进程重启后从<strong>某一轮</strong>续跑</td></tr>
 <tr><td>提示词管理</td><td>外置托管 + A/B</td><td>内联 TS + SKILL.md 随代码版本</td><td>提示词是行为代码：必须过评审、必须能随代码回滚</td><td>非工程角色需参与迭代或要做线上 A/B</td></tr>
 <tr><td>i18n</td><td>vue-i18n + 资源文件</td><td><code>tx()</code> 内联四语</td><td>语言少文案短，可读性 + 零依赖更划算</td><td>语言 &gt; 4 种或需外部译员维护</td></tr>
 <tr><td>技能治理</td><td>按项目 / 角色定制技能集，并度量加载成本</td><td>7 个静态 <code>SKILL.md</code>；<code>default:true</code> 的隐藏展示但保留全量索引，按 <code>read_skill</code> 按需加载</td><td>技能数量少，静态目录够用；先保证「不显示 ≠ 不存在」这条不破</td><td>技能数明显增长 / 需要按角色裁剪上下文 / 需要度量加载成本时（见 §26）</td></tr>
 <tr><td>工具检索策略</td><td>按需检索，并保留少量相关工具的 schema</td><td>全局 <code>TOOL_SEARCH_MODE=auto</code>：超窗口 10% 后预载最多 5 个，直接点名则补上说明再执行；movie 仍 per-role <code>forceEagerTools</code></td><td>弱模型不会主动 <code>search_tools</code>，凭训练记忆作答 → 编造「数据来源：TMDb」这类看似可信的假数据。Zoho 281 个工具不全量注入</td><td>主用模型能稳定主动检索时取消 movie 例外；<strong><code>TOOL_SEARCH_MODE=off</code> 是红线</strong>（见 §23「Deferred 工具检索」）</td></tr>
-<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td>（已清理）<code>eval:core</code> + CI workflow 曾在本仓库，2026-09-16 随 analytics 拆分整体迁出；当前护栏由 vitest 套件（54 文件 / 304 例，2026-10-02）本地钉死，无 CI 门禁</td><td>评测域随 analytics 拆分迁走后，本仓库暂无独立 CI runner；vitest 零依赖可本地全量跑</td><td>本仓库重新接入 CI runner、或评测层迁回/另建时，先恢复零依赖层 gate（见 §26）</td></tr>
+<tr><td>评测门禁</td><td>关键场景端到端用例进 CI 作为合并 gate</td><td><code>eval:core</code> 已随 analytics 拆分迁出（2026-09-16）。<code>.github/workflows/ci.yml</code> 跑类型检查和 vitest（见 §26），这是测试门禁，不是评测门禁</td><td>评测域迁走后，本仓库没有独立的端到端评测层</td><td>评测层迁回或另建时，把零依赖 gate 接进同一 workflow</td></tr>
+<tr><td>MCP 命令白名单</td><td>供应链默认收紧，未声明命令不 spawn</td><td>开发未配 <code>MCP_ALLOWED_COMMANDS</code> 则放行。<code>NODE_ENV=production</code> 未配则拒绝 stdio 连接</td><td>本机开发要能临时加服务器。生产清单要求显式配置</td><td>开发机也要收紧时，把白名单写进开发环境，而不是改掉生产这条</td></tr>
+<tr><td>MCP 来源严格模式</td><td>插件内容或端点被换掉就拒绝连接</td><td>默认关闭：建连不检查。打开 <code>GET /mcp/provenance</code> 才比对告警。<code>MCP_REQUIRE_PROVENANCE=on</code> 时建连拒绝。指纹含命令、url、请求头哈希、本地脚本；不哈希 <code>node</code>/<code>npx</code> 本体</td><td>开发时改脚本若默认拒绝，会把每次保存都当成供应链事件</td><td>生产部署打开严格模式。见 <code>docs/mcp-guide.md</code> §10</td></tr>
+<tr><td>子进程沙箱</td><td>OS 级容器隔离</td><td>无沙箱。靠命令白名单、超时、并发上限、只读桥。MCP stdio 仍继承服务端环境，以便适配器读到 <code>BI_API_KEY</code></td><td>Windows 开发机上做 microVM 成本高</td><td>部署到不受信任网络之前。见 <code>docs/SECURITY.md</code> §8.4</td></tr>
 <tr style="opacity:.75"><td>MCP 配置热更新 <span class="tag ok">已修复</span></td><td>按 mtime + size 感知外部改动</td><td>（原）进程内 fileCache，仅自己写时刷新</td><td><strong>🐞 曾是缺陷不是取舍</strong>——同项目 RAG 索引已用 mtime 失效，此处没有</td><td>✅ 已修：fileCache 按 <strong>mtime + size</strong> 失效（2026-09-24 加固）+ 5 例回归测试（保留此行以记录教训）</td></tr>
 </tbody>
 </table>
-<div class="bad"><strong>读这份表的方法</strong>：前 <strong>11 项</strong>是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）——其中「前端架构」一格实际是<strong>欠账</strong>（明知该拆而没拆，§23 卡片同样标「已知欠账」）；「检索存储」「异步任务」「可观测」三格里各自嵌过一条<strong>已知缺口</strong>（无权限过滤 / 无轮次级断点恢复 / 无 llm-tool 分层 span），它们是**待补的功能**而非取舍——其中「权限过滤」与「llm-tool 分层 span」已于 2026-09-30 补上（<code>rag/store.ts</code> 的 <code>acl</code> + <code>visibleTo</code>；<code>trace.ts</code> 的 <code>SpanTrace</code> + <code>GET /chat/trace/spans</code>），只剩轮次级断点恢复未做。最后一行是<strong>曾为缺陷、现已修复</strong>的项，保留只为记录教训。把三者分开写，是为了避免把 bug 包装成架构决策。</div>
+<div class="bad"><strong>读这份表的方法</strong>：除最后一行外都是<strong>有意识的选择</strong>（可以辩论，但理由明确、触发条件明确）。「前端架构」是欠账。「异步任务」里还缺轮次级断点恢复。文档级权限过滤和 llm / tool span 已在 2026-09-30 补上，不再算缺口。2026-10-08 补了三行：开发环境命令白名单默认放开、来源严格模式默认关闭、没有 OS 沙箱。最后一行是<strong>曾为缺陷、现已修复</strong>的项，保留只为记录教训。</div>
 </section>
 
 <hr />

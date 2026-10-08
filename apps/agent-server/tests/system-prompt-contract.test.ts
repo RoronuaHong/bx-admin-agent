@@ -63,10 +63,16 @@ test("[H] 动态段带当前 Unix 毫秒，工具纪律要求按参数说明筛�
   const { stable, dynamic } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
   expect(stable).toContain("不要写进参数");
   expect(stable).toContain("count_list_by_time");
+  expect(stable).toContain("不要改标成 UTC");
   expect(stable).toContain("run_tool_code");
   expect(stable).toContain("不要自己逐页翻列表");
   expect(dynamic).toContain("Unix 毫秒");
+  expect(dynamic).toContain("用户时区未上报");
   expect(renderNowClock(1_790_000_000_000)).toContain("1790000000000");
+  const local = renderNowClock(1_790_000_000_000, "Asia/Shanghai");
+  expect(local).toContain("用户时区：Asia/Shanghai");
+  expect(local).toContain("2026-09-21 22:13:20");
+  expect(local).not.toContain("用户时区未上报");
 });
 
 test("[F] 观影人设写清「何时该调工具 / 何时不该调工具」（对齐工具描述与系统提示的分工）", () => {

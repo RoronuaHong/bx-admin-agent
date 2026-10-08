@@ -140,7 +140,7 @@ async function readNdjson(body: ReadableStream<Uint8Array>, onEvent: (event: Cha
  */
 export async function streamChat(
   text: string,
-  opts: { conversationId?: string; model?: string; images?: string[]; attachments?: string[]; agentId?: string },
+  opts: { conversationId?: string; model?: string; images?: string[]; attachments?: string[]; agentId?: string; timeZone?: string },
   onEvent: (event: ChatEvent) => void,
   signal?: AbortSignal,
   onStart?: (info: { taskId?: string }) => void,
@@ -222,6 +222,8 @@ export interface StoredMessage {
   id?: string | number;
   role: "user" | "assistant";
   text: string;
+  /** 这条消息出现的时刻（毫秒）。只用于气泡上的时间，不参与模型上下文。 */
+  at?: number;
   images?: { id: string; name: string }[];
   /**
    * 扩展思考（reasoning）文本：支持思考的模型才有，仅作展示、不回灌模型上下文。
@@ -382,6 +384,8 @@ export interface ChatPreferences {
   convSortMode: ConvSortMode;
   /** 侧栏「显示归档」开关（归档对话默认收起，打开后拉进列表）。 */
   showArchived: boolean;
+  /** 浏览器 IANA 时区。空 = 还没上报。 */
+  timeZone: string;
   /** 非 0 = 客户端已完成过偏好同步（据此跳过旧 localStorage 的一次性迁移）。 */
   migratedAt: number;
 }
@@ -393,6 +397,7 @@ function toPreferences(data: Partial<ChatPreferences>): ChatPreferences {
     locale: data.locale || "",
     convSortMode: data.convSortMode === "manual" ? "manual" : "recent",
     showArchived: data.showArchived === true,
+    timeZone: data.timeZone || "",
     migratedAt: data.migratedAt || 0,
   };
 }
@@ -407,6 +412,7 @@ export async function saveChatPreferences(patch: {
   locale?: string;
   convSortMode?: ConvSortMode;
   showArchived?: boolean;
+  timeZone?: string;
 }): Promise<ChatPreferences> {
   const data = (await jsonFetch("/agent/chat/preferences", {
     method: "PUT",
@@ -691,7 +697,7 @@ export interface ScheduleDto {
   notifyPolicy?: ScheduleNotifyPolicy;
   /** 用途：report / alert。 */
   purpose?: SchedulePurpose;
-  /** 预警冷静期 / 恢复状态（只读）。 */
+  /** 预警是否仍在告警中，以及恢复计数（只读）。 */
   alertState?: ScheduleAlertState;
   /** 最近一期预警结论标记（只读）。 */
   lastMarker?: AlertMarker;

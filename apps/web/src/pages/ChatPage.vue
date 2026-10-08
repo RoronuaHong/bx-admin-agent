@@ -1560,6 +1560,8 @@ interface Bubble {
   id: number;
   role: "user" | "assistant";
   text: string;
+  /** 这条气泡出现的时刻（毫秒）。旧快照没有这个字段时不显示。 */
+  at?: number;
   images?: Array<{ id: string; name: string }>;
   streaming?: boolean;
   error?: string;
@@ -2027,6 +2029,15 @@ function resetComposerSize() {
 
 /** 设备默认语言（来自 `GET /chat/preferences`；对话未显式设置 locale 时兜底）。 */
 const deviceLocale = ref<UiLocale>(detectDefaultLocale());
+
+/** 浏览器 IANA 时区。非法或取不到时不传，服务端保持 UTC 并在回答里标明。 */
+function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+}
 /** 设置类操作的失败提示（乐观更新回滚后告诉用户，避免"点了没反应"）。 */
 const settingsError = ref("");
 
@@ -2371,6 +2382,7 @@ function toStored(list: Bubble[]): StoredMessage[] {
     .map((b) => ({
       role: b.role,
       text: b.text,
+      ...(b.at ? { at: b.at } : {}),
       images: b.images,
       // 推理面板相关字段一并落库：刷新后从后端快照恢复，思考过程 / 工具步骤 / 任务规划不丢。
       ...(b.thinking ? { thinking: b.thinking } : {}),
@@ -2420,10 +2432,12 @@ function selectConversation(conv: ConversationDto) {
   // 打开的是某一期的结果 → 该任务的未读清零（放在选中之后：即便清零请求失败也不影响阅读）。
   clearTaskUnread(conv.id);
   // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
+  const times = messageTimes(conv.messages || [], conv.createdAt, conv.updatedAt);
   if (!state.bubbles.length) {
-    state.bubbles = (conv.messages || []).map((m) => ({
+    state.bubbles = (conv.messages || []).map((m, i) => ({
       id: ++seq,
       role: m.role,
+      at: times[i],
       text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
       images: m.images,
       // 推理面板相关字段恢复（与 toStored 对称）：思考过程 / 工具步骤 / 任务规划。
@@ -2439,6 +2453,10 @@ function selectConversation(conv: ConversationDto) {
       // 下载卡片恢复（与 toStored 对称）：刷新后由卡片按 spec 重绘。
       ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
     }));
+  } else if (state.bubbles.length === times.length) {
+    state.bubbles.forEach((bubble, index) => {
+      if (!bubble.at) bubble.at = times[index];
+    });
   }
   // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
   state.settings.modelId = conv.model || "";
@@ -2946,6 +2964,17 @@ async function removeConversation(id: string) {
   }
 }
 
+/** 服务端落库删除并立即刷新任务列表：任务 runs[] 里指向该会话的运行记录由服务端同步清理，
+ *  刷一次任务，幽灵运行记录当场消失（不刷则等 20s 轮询兜底）。 */
+async function deleteConversationOnServer(id: string) {
+  try {
+    await apiDeleteConversation(id);
+    await loadTasks();
+  } catch {
+    /* 删除失败不打断交互；任务列表交给轮询兜底 */
+  }
+}
+
 /** 把上一笔待删会话真正落库（新删除到来 / 撤销窗口结束 / 离开页面时调用），避免删除被无限推迟。 */
 function flushPendingDelete() {
   if (undoDeleteTimer) {
@@ -2954,7 +2983,7 @@ function flushPendingDelete() {
   }
   const pending = undoDelete.value;
   undoDelete.value = null;
-  if (pending) void apiDeleteConversation(pending.conv.id).catch(() => undefined);
+  if (pending) void deleteConversationOnServer(pending.conv.id);
 }
 
 /** 登记一笔待删会话并启动撤销倒计时。 */
@@ -2965,7 +2994,7 @@ function scheduleUndoDelete(conv: ConversationDto, index: number, wasCurrent: bo
     undoDeleteTimer = null;
     const pending = undoDelete.value;
     undoDelete.value = null;
-    if (pending) void apiDeleteConversation(pending.conv.id).catch(() => undefined);
+    if (pending) void deleteConversationOnServer(pending.conv.id);
   }, UNDO_DELETE_MS);
 }
 
@@ -3305,6 +3334,7 @@ async function closeOtherConversations(keepId: string) {
     }
   }
   conversations.value = conversations.value.filter((c) => c.id === keepId);
+  void loadTasks(); // 批量删除也会清掉对应任务的运行记录，刷一次任务列表保持一致
   if (currentId.value !== keepId) {
     const keep = conversations.value[0];
     if (keep) selectConversation(keep);
@@ -3391,6 +3421,7 @@ async function pickFiles(event: Event) {
     state.bubbles.push({
       id: ++seq,
       role: "assistant",
+      at: Date.now(),
       text: localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("上传失败", "Upload failed", "Falha no upload", "अपलोड विफल")),
     });
   }
@@ -3754,9 +3785,11 @@ async function runTurn(
     await enqueueMessage(convId, text, imageIds, docIds);
     return;
   }
+  const sentAt = Date.now();
   state.bubbles.push({
     id: ++seq,
     role: "user",
+    at: sentAt,
     text,
     images: thumbnails || imageIds.map((id) => ({ id, name: id })),
   });
@@ -3765,6 +3798,7 @@ async function runTurn(
   const reply = reactive<Bubble>({
     id: ++seq,
     role: "assistant",
+    at: sentAt,
     text: "",
     streaming: true,
     steps: [],
@@ -3792,7 +3826,7 @@ async function runTurn(
     await streamChat(
       text,
       // conversationId 显式带上：不依赖服务端的活跃对话回退（多标签页时会串）；agentId 供服务端按角色分流。
-      { conversationId: convId, model: chosenModel || undefined, images: imageIds, attachments: docIds, agentId: AGENT_ID },
+      { conversationId: convId, model: chosenModel || undefined, images: imageIds, attachments: docIds, agentId: AGENT_ID, timeZone: browserTimeZone() },
       (event) => applyChatEvent(run, event),
       controller.signal,
       // 任务 id 在响应头到达时立刻记下（流中途断开就拿不到返回值了），续传时带回去防跨轮串流。
@@ -3990,6 +4024,7 @@ async function attachRunningTask(convId: string): Promise<void> {
   const reply = reactive<Bubble>({
     id: ++seq,
     role: "assistant",
+    at: Date.now(),
     text: "",
     streaming: true,
     steps: [],
@@ -4799,6 +4834,27 @@ function bubbleBody(b: Bubble): string {
   return b.text;
 }
 
+/**
+ * 预警结论协议标记识别（服务端 schedule-alert.ts 的 [SPIKE]/[NORMAL]/[NO_DATA] 首行协议）：
+ * 标记是给引擎判定钉钉推送用的机器语言，直接当正文渲染会露出裸的 [NORMAL] 一行（用户观感=「机器暗语」）。
+ * 这里把首行标记从正文中拆出，模板渲染成状态徽章 + 正文；原始文本不动（复制/导出/推送协议保持原样）。
+ * 匹配口径与服务端 parseAlertMarker 对齐：标记后接行尾**或**空白（允许「[NORMAL] 计数 30」同行带摘要）。
+ */
+function alertMarkerInfo(b: Bubble): { marker: string; body: string } | null {
+  if (b.role !== "assistant" || !b.text) return null;
+  const body = bubbleBody(b);
+  const m = body.match(/^\[(SPIKE|NORMAL|NO_DATA)\](?:[ \t]*\r?\n|[ \t]|$)/i);
+  if (!m) return null;
+  return { marker: m[1]!.toUpperCase(), body: body.slice(m[0].length).trimStart() };
+}
+
+/** 预警徽章的人话文案（协议标记 → 中/英/葡/印地）。 */
+function alertChipText(marker: string): string {
+  if (marker === "SPIKE") return tx("异常", "Alert", "Alerta", "अलर्ट");
+  if (marker === "NORMAL") return tx("正常", "Normal", "Normal", "सामान्य");
+  return tx("无数据", "No data", "Sem dados", "कोई डेटा नहीं");
+}
+
 /** 复制气泡文本（assistant 复制原始 markdown，user 复制纯文本），带瞬时反馈。 */
 const copyToast = ref("");
 let copyToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4891,7 +4947,68 @@ async function migrateLocalPrefs(prefs: ChatPreferences) {
   }
 }
 
+const nowClock = ref("");
+const nowZone = ref("");
+let nowClockTimer = 0;
+
+/** 旧消息没有逐条时间：按对话的创建、更新时刻，把每一轮摊到这段时间上。已有的时间保持不动。 */
+function messageTimes(
+  messages: Array<{ role: string; at?: number }>,
+  createdAt?: number,
+  updatedAt?: number,
+): number[] {
+  const count = messages.length;
+  if (!count) return [];
+  const start = createdAt || updatedAt || Date.now();
+  const end = Math.max(updatedAt || start, start);
+  const turnOf: number[] = [];
+  let turn = -1;
+  for (const message of messages) {
+    if (message.role === "user" || turn < 0) turn += 1;
+    turnOf.push(turn);
+  }
+  const turns = turn + 1;
+  const atOfTurn = (index: number) => (turns <= 1 ? end : Math.round(start + ((end - start) * index) / (turns - 1)));
+  return messages.map((message, index) => message.at || atOfTurn(turnOf[index] ?? 0));
+}
+
+function bubbleTimeText(at: number): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(at));
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  const hour = pick("hour") === "24" ? "00" : pick("hour");
+  return `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}:${pick("second")}`;
+}
+
+function refreshNowClock() {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  nowZone.value = zone;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: zone || undefined,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date());
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  const hour = pick("hour") === "24" ? "00" : pick("hour");
+  nowClock.value = `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}:${pick("second")}`;
+}
+
+refreshNowClock();
+
 onMounted(async () => {
+  nowClockTimer = window.setInterval(refreshNowClock, 1000);
   // 移动端抽屉：Esc 关闭（桌面端无抽屉、此监听无害）。
   window.addEventListener("keydown", onSidebarEsc);
   models.value = await fetchModels().catch(() => []);
@@ -4933,6 +5050,10 @@ onMounted(async () => {
     sortMode.value = prefs.convSortMode;
     showArchived.value = prefs.showArchived;
     initialConversationId = prefs.activeConversationId;
+    const zone = browserTimeZone();
+    if (zone && zone !== prefs.timeZone) {
+      void saveChatPreferences({ timeZone: zone }).catch(() => undefined);
+    }
     await migrateLocalPrefs(prefs);
   }
 
@@ -4962,6 +5083,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (nowClockTimer) window.clearInterval(nowClockTimer);
   stopTasksPoll();
   window.removeEventListener("keydown", onSidebarEsc);
   window.removeEventListener("mousedown", onOutsideTools);
@@ -5071,11 +5193,6 @@ onBeforeUnmount(() => {
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6" /></svg>
             </span>
           </button>
-          <div v-if="taskSectionOpen && taskGroups.length" class="run-filter" role="group" :aria-label="tx('按结果筛选', 'Filter runs', 'Filtrar execuções', 'रन फ़िल्टर')">
-            <button type="button" :class="{ active: runStatusFilter === 'all' }" :aria-pressed="runStatusFilter === 'all'" @click="runStatusFilter = 'all'">{{ tx("全部", "All", "Todas", "सभी") }}</button>
-            <button type="button" :class="{ active: runStatusFilter === 'success' }" :aria-pressed="runStatusFilter === 'success'" @click="runStatusFilter = 'success'">{{ tx("成功", "Success", "Sucesso", "सफल") }}</button>
-            <button type="button" :class="{ active: runStatusFilter === 'failed' }" :aria-pressed="runStatusFilter === 'failed'" @click="runStatusFilter = 'failed'">{{ tx("失败", "Failed", "Falhou", "विफल") }}</button>
-          </div>
           <div v-if="taskSectionOpen && !taskGroups.length" class="task-groups-empty">
             {{ tx("还没有定时任务，点上方「新建」即可创建", "No tasks yet — click “New” above", "Nenhuma tarefa ainda — clique em “Novo” acima", "अभी कोई कार्य नहीं — ऊपर “नया” पर क्लिक करें") }}
           </div>
@@ -5105,12 +5222,15 @@ onBeforeUnmount(() => {
                   <span class="task-group__title" :title="taskCardTip(g.schedule)">{{ g.schedule.name || g.schedule.prompt }}</span>
                   <span class="task-group__health" :title="taskCardTip(g.schedule)">{{ taskHealthShort(g.schedule) }}</span>
                 </span>
-                <span
+                <!-- 未读角标可点击：打开最新一期（打开会话即清零），不用再找入口（2026-10-08 用户反馈「点不掉」）。 -->
+                <button
                   v-if="g.schedule.unreadRuns"
+                  type="button"
                   class="task-group__unread"
-                  :title="tx('有新的运行结果', 'New run results', 'Novos resultados de execução', 'नए रन परिणाम')"
-                  :aria-label="tx('有新的运行结果', 'New run results', 'Novos resultados de execução', 'नए रन परिणाम')"
-                >{{ g.schedule.unreadRuns }}</span>
+                  :title="tx('有新的运行结果，点击查看', 'New run results — click to view', 'Novos resultados — clique para ver', 'नए रन परिणाम — देखने के लिए क्लिक करें')"
+                  :aria-label="tx('打开最新一期运行结果', 'Open latest run result', 'Abrir o resultado mais recente', 'नवीनतम रन परिणाम खोलें')"
+                  @click.stop="openTaskConversation(g.schedule)"
+                >{{ g.schedule.unreadRuns }}</button>
                 <span class="task-group__next">{{ taskRightShort(g.schedule) }}</span>
                 <button
                   class="task-group__open"
@@ -6215,6 +6335,7 @@ onBeforeUnmount(() => {
         >
           <span class="hamburger__bar" aria-hidden="true"></span>
         </button>
+        <time class="now-clock" :datetime="nowClock" :title="nowZone">{{ nowClock }}</time>
         <div class="top-actions">
           <ModelSelect v-model="modelId" :models="models" />
           <span v-if="false" ref="resRoot" class="mcp-box">
@@ -6323,11 +6444,6 @@ onBeforeUnmount(() => {
           <span class="task-page__title">{{ tx("定时任务", "Scheduled tasks", "Tarefas agendadas", "अनुसूचित कार्य") }}</span>
           <span v-if="taskGroups.length" class="task-page__count">({{ taskGroups.length }})</span>
           <div class="task-page__actions">
-            <div class="run-filter" role="group" :aria-label="tx('按结果筛选', 'Filter runs', 'Filtrar execuções', 'रन फ़िल्टर')">
-              <button type="button" :class="{ active: runStatusFilter === 'all' }" :aria-pressed="runStatusFilter === 'all'" @click="runStatusFilter = 'all'">{{ tx("全部", "All", "Todas", "सभी") }}</button>
-              <button type="button" :class="{ active: runStatusFilter === 'success' }" :aria-pressed="runStatusFilter === 'success'" @click="runStatusFilter = 'success'">{{ tx("成功", "Success", "Sucesso", "सफल") }}</button>
-              <button type="button" :class="{ active: runStatusFilter === 'failed' }" :aria-pressed="runStatusFilter === 'failed'" @click="runStatusFilter = 'failed'">{{ tx("失败", "Failed", "Falhou", "विफल") }}</button>
-            </div>
             <button class="primary-btn" type="button" @click="openTaskForm()">
               <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                 <path d="M12 5v14M5 12h14" />
@@ -6369,11 +6485,15 @@ onBeforeUnmount(() => {
                   {{ tx("结果回到", "Results to", "Resultado em", "परिणाम यहाँ") }}：{{ taskConvText(g.schedule) }}
                 </span>
               </div>
-              <span
+              <!-- 与侧栏角标同口径：点击直接打开最新一期（打开即清零）。 -->
+              <button
                 v-if="g.schedule.unreadRuns"
+                type="button"
                 class="task-page__unread"
-                :title="tx('有新的运行结果', 'New run results', 'Novos resultados de execução', 'नए रन परिणाम')"
-              >{{ g.schedule.unreadRuns }}</span>
+                :title="tx('有新的运行结果，点击查看', 'New run results — click to view', 'Novos resultados — clique para ver', 'नए रन परिणाम — देखने के लिए क्लिक करें')"
+                :aria-label="tx('打开最新一期运行结果', 'Open latest run result', 'Abrir o resultado mais recente', 'नवीनतम रन परिणाम खोलें')"
+                @click.stop="openTaskConversation(g.schedule)"
+              >{{ g.schedule.unreadRuns }}</button>
               <span class="task-page__status" :class="{ paused: !g.schedule.enabled }">
                 {{ g.schedule.enabled ? tx("启用中", "Active", "Ativa", "सक्रिय") : tx("已暂停", "Paused", "Pausada", "रुका हुआ") }}
               </span>
@@ -6654,7 +6774,14 @@ onBeforeUnmount(() => {
             <template v-else>
               <!-- 流式 loading 态完全交给推理面板（正在规划/思考中/步骤/子代理），
                    答案气泡在出正文前保持空，避免与推理面板重复出现「思考中」指示。 -->
-              <div v-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b), uiLocale)"></div>
+              <template v-if="b.text && alertMarkerInfo(b)">
+                <!-- 预警协议标记渲染成状态徽章，正文在徽章下继续；原始文本不动，复制/导出仍是协议原文。 -->
+                <span class="alert-chip" :class="`alert-chip--${alertMarkerInfo(b)!.marker.toLowerCase()}`">{{
+                  alertChipText(alertMarkerInfo(b)!.marker)
+                }}</span>
+                <div v-if="alertMarkerInfo(b)!.body" class="md" v-html="renderChatMarkdown(alertMarkerInfo(b)!.body, uiLocale)"></div>
+              </template>
+              <div v-else-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b), uiLocale)"></div>
             </template>
             <!-- 图表卡片（render_chart 产出）：必须挂在气泡内容层——放进可折叠的推理面板会被默认折叠态
                  的 display:none 隐藏，容器量到 0×0、图表完全不可见。一张一个卡片，逐张渲染、不互相覆盖。 -->
@@ -6691,6 +6818,7 @@ onBeforeUnmount(() => {
             <div v-if="b.error" class="err">{{ b.error }}</div>
             <div v-if="b.usage" class="usage-line">{{ usageText(b.usage) }}</div>
           </div>
+            <time v-if="b.at" class="bubble-time" :datetime="new Date(b.at).toISOString()">{{ bubbleTimeText(b.at) }}</time>
             <div class="bubble-actions">
             <button
               v-if="b.role === 'user'"
@@ -7745,33 +7873,6 @@ onBeforeUnmount(() => {
   gap: 10px;
 }
 
-.run-filter {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin: 6px 8px 2px;
-}
-
-.task-page__actions .run-filter {
-  margin: 0;
-}
-
-.run-filter button {
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 12px;
-  line-height: 18px;
-  cursor: pointer;
-}
-
-.run-filter button.active {
-  color: var(--text);
-  border-color: var(--text);
-}
-
 .task-page__run-empty {
   margin: 0;
   padding: 4px 8px 8px;
@@ -7862,13 +7963,16 @@ onBeforeUnmount(() => {
   min-width: 18px;
   height: 18px;
   padding: 0 5px;
+  border: 0;
   border-radius: 9px;
   background: var(--danger);
   color: var(--panel);
+  font-family: inherit;
   font-size: 11px;
   font-weight: 600;
   line-height: 18px;
   text-align: center;
+  cursor: pointer;
 }
 
 .task-page__status {
@@ -8989,18 +9093,22 @@ onBeforeUnmount(() => {
   line-height: 1.2;
 }
 
-/* 未读角标：与 ChatGPT「Scheduled 视图当收件箱」同口径——有新结果要一眼看见。 */
+/* 未读角标：与 ChatGPT「Scheduled 视图当收件箱」同口径——有新结果要一眼看见。
+   现在是 <button>（点击打开最新一期并清零），重置按钮默认样式 + 手型光标。 */
 .task-group__unread {
   flex: none;
   min-width: 16px;
   padding: 0 5px;
+  border: 0;
   border-radius: 999px;
   background: var(--accent, #4f7cff);
   color: #fff;
+  font-family: inherit;
   font-size: 10px;
   font-weight: 700;
   line-height: 16px;
   text-align: center;
+  cursor: pointer;
 }
 
 .task-group__next {
@@ -9391,6 +9499,14 @@ onBeforeUnmount(() => {
 .brand {
   font-family: var(--font-display);
   font-size: 17px;
+}
+
+.now-clock {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .top-actions {
@@ -10927,6 +11043,15 @@ button.step-head:disabled {
 /* 气泡 + 其下方操作栏绑成一组：宽度随气泡收缩，操作栏右对齐到气泡右侧，
    故按钮始终落在「气泡下方的右侧」，而非整屏最右。
    布局为流式全宽（.row 不限宽），这里 100% 只防超长内容撑破行。 */
+.bubble-time {
+  margin: 4px 6px 0;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .bubble-wrap {
   display: flex;
   flex-direction: column;
@@ -10975,6 +11100,34 @@ button.step-head:disabled {
 .plain {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 预警结论徽章：引擎协议标记（[SPIKE]/[NORMAL]/[NO_DATA]）的人话化渲染——
+   绿=正常（不推送）、红=异常（已推送钉钉）、灰=无数据（不推送）。 */
+.alert-chip {
+  display: inline-block;
+  margin: 2px 0 8px;
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  letter-spacing: 0.3px;
+}
+
+.alert-chip--normal {
+  background: #16a34a;
+  color: #fff;
+}
+
+.alert-chip--spike {
+  background: var(--danger, #e5484d);
+  color: #fff;
+}
+
+.alert-chip--no_data {
+  background: var(--muted, #8a8f98);
+  color: #fff;
 }
 
 /* 助手消息正文容器：长无空格串（URL/JSON/代码残留）允许断词，避免横向溢出气泡。 */

@@ -1,6 +1,6 @@
 // 审计告警节流（dedup + throttle，src/audit.ts）：
 // 「拒绝一次就推一条」会把用户正常点不同意变成刷屏；真正值得告警的是同一来源短时间反复被拒。
-// 口径与定时任务告警一致：窗口内累计到阈值才推 → 推完进冷静期 → 冷静期内只累计 → 期后有新增再推汇总。
+// 审计告警自己节流：窗口内累计到阈值才推 → 推完进冷静期 → 冷静期内只累计 → 期后有新增再推汇总。
 import { test, expect } from "vitest";
 import { decideAuditAlert } from "../src/audit.js";
 

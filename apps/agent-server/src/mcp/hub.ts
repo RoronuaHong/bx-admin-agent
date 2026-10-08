@@ -7,7 +7,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { getServer, isAllowedMcpCommand, loadServers, type McpServerConfig } from "./config.js";
+import { getServer, isAllowedMcpCommand, mcpAllowlistRequired, loadServers, type McpServerConfig } from "./config.js";
+import { provenanceBlocked } from "./provenance.js";
 
 export interface McpToolInfo {
   /** 注入模型的工具名（含命名空间） */
@@ -83,13 +84,26 @@ function timeoutOf(cfg: McpServerConfig): number {
   return cfg.timeoutMs && cfg.timeoutMs > 0 ? cfg.timeoutMs : DEFAULT_TIMEOUT_MS;
 }
 
+function transportRefusal(cfg: McpServerConfig): string | null {
+  if (cfg.transport === "stdio" && !isAllowedMcpCommand(cfg.command || "")) {
+    const why =
+      mcpAllowlistRequired() && !(process.env.MCP_ALLOWED_COMMANDS || "").trim()
+        ? "生产环境必须配置 MCP_ALLOWED_COMMANDS"
+        : "stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）";
+    return `MCP 服务器 ${cfg.id} 的 ${why}`;
+  }
+  if (provenanceBlocked(cfg.id)) {
+    return `MCP 服务器 ${cfg.id} 的来源与已登记基线不一致，已拒绝连接`;
+  }
+  return null;
+}
+
 function buildTransport(cfg: McpServerConfig) {
+  const refused = transportRefusal(cfg);
+  if (refused) throw new Error(refused);
   if (cfg.transport === "stdio") {
     // 真正 spawn 前再查一次白名单（ASI06）：配置时校验挡不住「白名单启用前就已落盘」的旧服务器，
     // 而这里的 spawn 才是实际的代码执行点——fail-closed 必须落在执行点。
-    if (!isAllowedMcpCommand(cfg.command || "")) {
-      throw new Error(`MCP 服务器 ${cfg.id} 的 stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）`);
-    }
     return new StdioClientTransport({
       command: cfg.command || "",
       args: cfg.args || [],
@@ -154,7 +168,15 @@ async function openConnection(cfg: McpServerConfig): Promise<Conn | null> {
     busy: 0,
   };
   conns.set(cfg.id, conn);
-  const transport = buildTransport(cfg);
+  let transport: StdioClientTransport | StreamableHTTPClientTransport;
+  try {
+    transport = buildTransport(cfg);
+  } catch (err) {
+    conn.error = String((err as Error)?.message || err);
+    conn.connecting = false;
+    console.warn(`[mcp:hub] connect failed ${cfg.id}: ${conn.error}`);
+    return conn;
+  }
   // stdio 子进程的 stderr 是 MCP server 唯一的日志通道（stdout 被协议帧占用）：不接出来就是日志黑洞，
   // 适配器侧的超时/报错在服务端日志里完全看不到。这里转发并加前缀、截断，避免刷屏。
   if (transport instanceof StdioClientTransport) {

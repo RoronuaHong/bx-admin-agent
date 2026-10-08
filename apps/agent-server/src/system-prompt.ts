@@ -6,6 +6,7 @@ import type { TodoItem } from "@bx/shared";
 import { renderMemory } from "./memory.js";
 import { renderEnabledSkills, renderSkillIndex } from "./skills.js";
 import { UNTRUSTED_CONTENT_RULE } from "./untrusted.js";
+import { normalizeTimeZone } from "./list-count.js";
 import { getRole } from "./roles.js";
 
 /**
@@ -87,7 +88,8 @@ const TOOLING_RULES = [
     "不要声称「导出失败 / 未生成」而实际产物卡片已生成，也不要声称「工具已用尽 / 已达上限」而实际调用远未触顶。" +
     "不确定某产物是否成功，就如实说「已为你生成 / 已尝试」，不要编造与事实相反的结论；做不到的事明说做不到，不把已做成的事说成没做成。",
   "12. 查询参数只使用该工具参数说明里有的字段。用户要按某个字段筛选、但参数说明里没有这个查询参数时，不要写进参数，取回结果后再按该字段筛选计数。" +
-    "相对时间（最近 N 分钟、今天）按动态段里的当前时间换算成参数要求的格式，不要用记忆里的年份。",
+    "相对时间（最近 N 分钟、今天）按动态段里的当前时间换算成参数要求的格式，不要用记忆里的年份。" +
+    "面向用户的钟点用动态段里的用户时区。count_list_by_time 返回的小时标签已经是 timezone 那一行的时区，照它写，不要改标成 UTC。",
   "13. 分页列表要做跨页计数、按小时分桶或和阈值比较时，调用 count_list_by_time 一次取回计数。" +
     "不要自己逐页翻列表，也不要把翻页委派给子代理。每个列表工具本轮只放行一次第一页，换筛选或继续翻 index、offset、page、cursor 都会被拒绝。" +
     "小时桶以外的汇总用 run_tool_code：在代码里调用只读工具，只把聚合结果打印出来；run_script 调不到这些工具。" +
@@ -243,6 +245,8 @@ export interface SystemPromptInput {
   enabledSkills?: string[] | null;
   /** Agent 角色（领域适配指南模式 B）：决定稳定前缀的人设与 skill 索引可见性。缺省 = generic。 */
   role?: string | null;
+  /** 浏览器上报的 IANA 时区。空 = 未上报，时钟明确写默认 UTC。 */
+  timeZone?: string | null;
 }
 
 const LOCALE_DIRECTIVES: Record<string, string> = {
@@ -263,10 +267,39 @@ export interface SystemPrompt {
   dynamic: string;
 }
 
-/** 当前时刻（动态段）：相对时间窗口必须按它换算，不能用模型记忆里的年份。 */
-export function renderNowClock(at = Date.now()): string {
+/** 用户时区下的本地钟面（不含时区缩写，避免 CST 歧义）。 */
+function formatLocalClock(ms: number, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(ms));
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  const hour = pick("hour") === "24" ? "00" : pick("hour");
+  return `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}:${pick("second")}`;
+}
+
+/**
+ * 当前时刻（动态段）：绝对时刻用 UTC 的 ISO，面向用户的钟点用浏览器上报的 IANA 时区。
+ * 未上报时写明默认 UTC，不从语言猜测时区。
+ */
+export function renderNowClock(at = Date.now(), timeZone?: string | null): string {
   const ms = Math.floor(at);
-  return `当前时间：${new Date(ms).toISOString()}（Unix 毫秒 ${ms}）。相对时间按这个时刻换算。`;
+  const instant = `${new Date(ms).toISOString()}（Unix 毫秒 ${ms}）`;
+  const zone = normalizeTimeZone(timeZone);
+  if (!zone) {
+    return `当前时间：${instant}。用户时区未上报，小时分桶默认 UTC，回答里的钟点必须标明 UTC。相对时间按这个时刻换算。`;
+  }
+  return (
+    `当前时间：${instant}。用户时区：${zone}（本地钟 ${formatLocalClock(ms, zone)}）。` +
+    `面向用户的日期和钟点用 ${zone}，并写明这个时区名。调用 count_list_by_time 时把 timeZone 设成 ${zone}；不传则服务端按这个时区分桶。` +
+    "工具返回的小时标签已经是 timezone 行上的时区，回答照抄，不要改标成 UTC。相对时间按这个时刻换算。"
+  );
 }
 
 export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
@@ -284,7 +317,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
     renderTodos(input.todos || []),
     renderEnabledSkills(input.enabledSkills),
     languageDirective(input.locale),
-    renderNowClock(),
+    renderNowClock(Date.now(), input.timeZone),
   ].filter((part) => part && part.trim());
   return {
     stable: stableParts.join("\n\n"),

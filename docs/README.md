@@ -28,7 +28,7 @@
 
 ### [mcp-guide.md](./mcp-guide.md)
 - **定位**：MCP 连接与内置服务器的**权威口径**（其它 MCP 文档与它冲突时以本文为准）。
-- **覆盖**：入口 UI（输入框「＋」工具菜单 → 连接器）· 传输（stdio / Streamable HTTP）· `MCP_BUILTIN_SERVERS` 配置 · `toolRisks` 工具级风险覆盖 · §11 验证脚本 → 现行回归入口总表。
+- **覆盖**：入口 UI（输入框「＋」工具菜单 → 连接器）· 传输（stdio / Streamable HTTP）· `MCP_BUILTIN_SERVERS` 配置 · `toolRisks` 工具级风险覆盖 · §10 生产部署检查表（命令白名单、来源指纹）· §11 验证脚本 → 现行回归入口总表。
 - **现行落点**：`mcp/config.ts`（文件+内置服务器，`mtime+size` 失效）· `mcp/hub.ts` · `scripts/metabase-mcp.mjs` · `scripts/yapi-mcp.mjs`。
 - **状态**：✅ 现行。
 - **注意**：内置工具（fs_* / write_todos / task / read_skill / search_tools / render_chart 等）**始终注入**——「一个都不勾」只表示不接外部数据源，不是纯直连。
@@ -81,7 +81,7 @@
 ### [domain-adaptation-guide.md](./domain-adaptation-guide.md)
 - **定位**：规范性指南——如何在不动引擎的前提下把通用 Agent 改造成垂直领域 Agent（以观影助手为例）。
 - **状态**：✅ 现行（弱代码耦合，属「怎么做」而非「现状记录」）。
-- **注意**：§10 提到的 `scripts/_role-check.mjs` / `_movie-e2e.mjs` 等**大多已移除，不要照抄脚本命令**；替代回归总表见 `mcp-guide.md` §11。
+- **注意**：§10 提到的 `scripts/_role-check.mjs` / `_movie-e2e.mjs` 等**大多已移除，不要照抄脚本命令**；替代回归总表见 `mcp-guide.md` §11。新领域做到哪一步停，以该指南文首四步为准。不上集群见 `docs/agent/CURRENT_ARCHITECTURE.md` 文首。
 
 ### [movie-mobile-ui-plan.md](./movie-mobile-ui-plan.md)
 - **定位**：影视移动端 UI 方案。
@@ -118,7 +118,7 @@
 
 ### [project-review.html](./project-review.html)
 - **定位**：项目整体复盘（业界做法 → 本项目做法 → 是否最佳实践 → 偏离原因 → 何时改回）。
-- **状态**：🗂 快照；**2026-09-28 已刷新到 master @ `d9db377`**。**2026-10-02** §7 已补全分页计数（`count_list_by_time` / `run_tool_code` / `list-page-gate.ts`），并改了 §8、§12、§13、§15、§23、A3。不再写「不拦递增分页」或「26 个 spec」。其余叙述性段落仍是较早快照，只作背景。
+- **状态**：🗂 快照；**2026-09-28 已刷新到 master @ `d9db377`**。**2026-10-02** §7 已补全分页计数。**2026-10-08** §9、部署常量表、环境变量清单与 B 章已对齐 MCP 命令白名单、来源指纹，以及「不上 Agent 集群」。其余叙述性段落仍是较早快照，只作背景。
 - **注意**：其中「MCP 配置缓存：按 mtime 失效、4 例全绿」已过时——现为 `mtime + size`、5 例（见 `artifact-delivery-plan.md` §14）。
 
 ---

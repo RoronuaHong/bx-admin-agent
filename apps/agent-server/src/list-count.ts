@@ -82,6 +82,23 @@ export function mcpToolParts(name: string): { serverId: string; tool: string } |
   return { serverId: parts[1]!, tool: parts.slice(2).join("__") };
 }
 
+/** 合法 IANA 时区原样返回，否则 null。不从语言猜测时区。 */
+export function normalizeTimeZone(raw: unknown): string | null {
+  const timeZone = typeof raw === "string" ? raw.trim() : "";
+  if (!timeZone || timeZone.length > 64) return null;
+  return timeZoneError(timeZone) ? null : timeZone;
+}
+
+/**
+ * 小时桶时区：模型显式传入的优先（包括 UTC）；没传才用用户时区；都没有才是 UTC。
+ * 非法的显式值原样留下，交给 countPagedList 报错，避免悄悄改成另一个时区。
+ */
+export function resolveCountTimeZone(requested: string, fallback?: string | null): string {
+  const explicit = requested.trim();
+  if (explicit) return explicit;
+  return normalizeTimeZone(fallback) || "UTC";
+}
+
 export function timeZoneError(timeZone: string): string | null {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
@@ -601,6 +618,7 @@ export function formatCountReport(report: CountListReport): string {
     `raw_rows: ${report.rawRows}`,
     `unique: ${report.unique}`,
     `timezone: ${report.timeZone}`,
+    `labels: 上列小时已按 ${report.timeZone} 标注。回答里照这个时区写，不要改成别的时区。`,
   );
   if (report.minHour && report.maxHour) lines.push(`range: ${report.minHour} .. ${report.maxHour}`);
   if (report.above != null) {

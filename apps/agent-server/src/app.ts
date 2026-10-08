@@ -14,6 +14,7 @@ import {
   type McpServerConfig,
 } from "./mcp/config.js";
 import { ensureSession, SESSION_COOKIE, touchSession, type Session } from "./session.js";
+import { normalizeTimeZone } from "./list-count.js";
 import { resolveOwner } from "./owner.js";
 import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
@@ -23,7 +24,7 @@ import { exportRunOtlp } from "./otlp.js";
 import { listAnomalies, observeRun } from "./anomaly.js";
 import { verifyMemoryIntegrity } from "./memory.js";
 import { autonomyFor } from "./autonomy.js";
-import { verifyProvenance, provenanceBlocked } from "./mcp/provenance.js";
+import { verifyProvenance } from "./mcp/provenance.js";
 import { OUTPUT_SCHEMAS } from "./output-schema.js";
 import {
   addConversationReadGrant,
@@ -88,6 +89,7 @@ import {
   kickScheduleLoop,
   listSchedules,
   patchSchedule,
+  pruneRunsOfConversation,
   registerActiveScheduleRun,
   requestScheduleRun,
   startScheduleLoop,
@@ -264,6 +266,8 @@ async function consumeTask(
     denyBuiltinTools?: string[];
     /** 无人值守结论协议：本轮没取到可核对的数据时，正文按 alert / report 协议结论化（定时运行用）。 */
     unattendedConclusion?: "alert" | "report";
+    /** 浏览器上报的 IANA 时区。 */
+    timeZone?: string;
   },
 ): Promise<void> {
   const runId = newRunId();
@@ -502,15 +506,18 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     if (event.type === "thinking_delta") thinking += event.text;
     else if (event.type === "todos") todos = event.todos;
   }
+  const postedAt = Date.now();
   const messages = [
     ...((doc?.messages || []) as StoredMessage[]),
     {
       role: "user" as const,
       text: task.userText,
+      at: postedAt,
     },
     {
       role: "assistant" as const,
       text: finalText,
+      at: postedAt,
       ...(thinking ? { thinking } : {}),
       ...(todos?.length ? { todos } : {}),
       ...(steps.length ? { steps } : {}),
@@ -528,7 +535,7 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
  * 调用方要等它写完再算下一拍：这里的回写是整份文档，不能和调度器的 nextRunAt 交错。
  *
  * `notifyPolicy=on_alert`（docs/scheduled-spike-detection-plan.md）：
- * 失败仍推；成功则按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] + 冷静期决定是否推。
+ * 失败仍推；成功则按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] 决定是否推。SPIKE 每期都推。
  */
 async function deliverScheduleResult(
   schedule: ChatSchedule,
@@ -557,7 +564,7 @@ async function deliverScheduleResult(
       });
       alertStatePatch = decision.nextState;
       if (decision.kind === "skip") {
-        // 正常 / 无数据 / 冷静期内：不推，但仍回写标记与冷静期状态，侧栏才能显示「已检查」。
+        // 正常 / 无数据：不推，但仍回写标记与告警状态，侧栏才能显示「已检查」。
         await patchSchedule(schedule.id, schedule.ownerKey, {
           alertState: decision.nextState,
           ...(marker ? { lastMarker: marker } : {}),
@@ -1206,7 +1213,7 @@ export function createApp() {
   // 收束后结果回投进对话消息快照，重连可用 GET /chat/task/events 续传。
   app.post("/chat/stream", async (c) => {
     try {
-      const body = await readJson<{ text?: string; model?: string; images?: string[]; attachments?: string[]; conversationId?: string; agentId?: string }>(c);
+      const body = await readJson<{ text?: string; model?: string; images?: string[]; attachments?: string[]; conversationId?: string; agentId?: string; timeZone?: string }>(c);
       const text = String(body.text || "").trim().slice(0, MAX_INPUT_LEN);
       if (!text) return errorJson(c, 400, "CHAT_EMPTY_INPUT", "请输入内容");
       if (body.agentId !== undefined && body.agentId !== "" && !hasRole(body.agentId)) {
@@ -1254,6 +1261,11 @@ export function createApp() {
         return errorJson(c, 429, "CHAT_CONCURRENT_LIMITED", `同时运行的对话数已达上限（${RATE_CONCURRENT_PER_OWNER}），请稍候`);
       }
       const task = startTask({ conversationId, userText: text, ownerKey: owner });
+      const timeZone = normalizeTimeZone(body.timeZone) || normalizeTimeZone(session.preferences?.timeZone);
+      if (timeZone && session.preferences?.timeZone !== timeZone) {
+        session.preferences = { ...(session.preferences || {}), timeZone };
+        touchSession(session);
+      }
       void consumeTask(task, {
         model: typeof body.model === "string" ? body.model : undefined,
         images: Array.isArray(body.images) ? body.images.filter((x): x is string => typeof x === "string") : [],
@@ -1262,6 +1274,7 @@ export function createApp() {
           : [],
         sessionId: session.id,
         ownerKey: owner,
+        ...(timeZone ? { timeZone } : {}),
       });
 
       const stream = streamNdjson(async (send) => {
@@ -1504,6 +1517,8 @@ export function createApp() {
     cancelTask(id); // 解耦后必须先中止后台任务：否则任务收束时的 upsert 会「复活」已删对话
     await deleteConversation(id);
     fsRemoveConversation(id); // 级联清理该对话的虚拟工作区
+    // 运行记录一致性：清掉任务 runs[] 里指向该会话的条目，免得侧栏留「幽灵运行记录」。
+    await pruneRunsOfConversation(c.get("owner"), id).catch(() => undefined);
     // 删掉的正好是活跃对话时清空指针，避免回退到一个已不存在的 id。
     const session = c.get("session") as Session;
     if (session.activeConversationId === id) {
@@ -1688,6 +1703,7 @@ export function createApp() {
       showArchived: session.preferences?.showArchived === true,
       // 客户端据此判断是否需要跑「旧的 localStorage 一次性迁移」。
       migratedAt: session.preferences?.migratedAt || 0,
+      timeZone: session.preferences?.timeZone || "",
     };
   }
 
@@ -1703,6 +1719,7 @@ export function createApp() {
       locale?: string;
       convSortMode?: string;
       showArchived?: boolean;
+      timeZone?: string;
     }>(c);
     const session = c.get("session") as Session;
     // 归属守卫：活跃对话指针不允许指向别人的对话（否则后续不带 conversationId 的请求会串台）。
@@ -1718,6 +1735,8 @@ export function createApp() {
     if (typeof body.locale === "string") prefs.locale = body.locale;
     if (body.convSortMode === "recent" || body.convSortMode === "manual") prefs.convSortMode = body.convSortMode;
     if (typeof body.showArchived === "boolean") prefs.showArchived = body.showArchived;
+    const timeZone = normalizeTimeZone(body.timeZone);
+    if (timeZone) prefs.timeZone = timeZone;
     // 首次成功写偏好 = 客户端已把（可能来自旧 localStorage 的）偏好交到后端，迁移完成。
     if (!prefs.migratedAt) prefs.migratedAt = Date.now();
     session.preferences = prefs;
@@ -1827,6 +1846,7 @@ export function createApp() {
         omitBuiltinTools: deniedTools,
         denyBuiltinTools: deniedTools,
         unattendedConclusion: isAlertRun ? "alert" : "report",
+        ...(schedule.timeZone ? { timeZone: schedule.timeZone } : {}),
       });
     } finally {
       unregisterActiveScheduleRun(schedule.id);

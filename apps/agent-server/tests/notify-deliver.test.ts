@@ -153,7 +153,8 @@ test("[F2] IM 正文去掉工具轨迹，并躲开钉钉把下划线/方括号�
     '- mcp__zoho {"fields":"country_code"} → 92690 字符',
   ].join("\n");
   const out = formatForIm(md, "zh");
-  expect(out).toContain("【NORMAL】");
+  expect(out).toContain("正常");
+  expect(out).not.toContain("NORMAL");
   expect(out).toContain("country＿code=IN");
   expect(out).not.toContain("[本轮已执行的工具]");
   expect(out).not.toContain("92690");
@@ -266,6 +267,31 @@ test("[J] 通道校验：只放行已知机器人域名（SSRF 出口必须堵�
   }
 });
 
+test("[M0] 群消息用中文标识，不把工具字段和协议标记原样发出", () => {
+  const out = formatForIm(
+    [
+      "[SPIKE]",
+      "计数结果（工具返回）：complete:true，raw_rows 32 / unique 32",
+      "小时桶（工具标注时区 Asia/Shanghai）：14:00 → 30",
+      "阈值 above 10，over_count 1",
+      "钉钉群推送：无法确认能否直接发到钉钉群",
+      "[NORMAL] 未破线",
+      "[NO_DATA]",
+    ].join("\n"),
+    "zh",
+  );
+  expect(out.startsWith("<font color=#E5484D>🔴 异常</font>")).toBe(true);
+  expect(out).toContain("计数完整");
+  expect(out).toContain("原始条数 32");
+  expect(out).toContain("去重条数 32");
+  expect(out).toContain("（上海）");
+  expect(out).toContain("超过 10");
+  expect(out).toContain("破线桶数 1");
+  expect(out).toContain("<font color=#2F9E44>🟢 正常</font> 未破线");
+  expect(out).toContain("<font color=#F5C518>🟡 警告</font>");
+  expect(out).not.toMatch(/SPIKE|NORMAL|NO_DATA|complete|raw_rows|unique|above|over_count|钉钉群/);
+});
+
 test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单个换行粘成一行）", () => {
   const msg = buildScheduleDelivery({
     name: "印度对话量",
@@ -278,13 +304,13 @@ test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单�
     durationMs: 8_000,
     at: Date.parse("2026-09-30T03:01:14Z"),
   });
-  expect(msg.body.startsWith("【SPIKE】")).toBe(true);
-  expect(msg.body.indexOf("【SPIKE】")).toBeLessThan(msg.body.indexOf("任务：印度对话量"));
-  expect(msg.body).toContain("\n\n任务：印度对话量");
-  expect(msg.body).toContain("\n\n状态：预警");
+  expect(msg.body.startsWith("# **任务：印度对话量**")).toBe(true);
+  expect(msg.body).not.toContain("SPIKE");
+  expect(msg.body.indexOf("任务：印度对话量")).toBeLessThan(msg.body.indexOf("🔴 异常"));
+  expect(msg.body).toContain("\n\n状态：<font color=#E5484D>🔴 异常</font>");
   expect(msg.body).toContain("\n\n触发：手动执行");
   expect(msg.body).toContain("\n\n耗时：8 秒");
-  expect(msg.title).toBe("印度对话量 · 预警");
+  expect(msg.title).toBe("印度对话量 · 异常");
 });
 
 test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定时任务」", () => {
@@ -297,6 +323,6 @@ test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定�
     locale: "zh",
   });
   expect(msg.title.startsWith("定时任务")).toBe(true);
-  expect(msg.body).toContain("任务：定时任务");
+  expect(msg.body.startsWith("# **任务：定时任务**")).toBe(true);
   expect(msg.body).not.toContain("????");
 });

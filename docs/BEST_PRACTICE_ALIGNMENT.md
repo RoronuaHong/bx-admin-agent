@@ -28,7 +28,7 @@
 | LLM02 不安全的输出处理 | 输出按上下文转义；不拼进 SQL；白名单标签过滤 | 前端 `chat-richtext.ts` DOMPurify 净化；`builtins.ts` 手写 HTML 零外链软护栏；出站密钥/PII 打码；**本轮收口** `src/output-schema.ts` 把结构化输出（澄清/待办/图表 spec）统一 fail-closed 校验 + `GET /chat/output-schema` 可观测 | ✅ | — |
 | LLM03 训练数据污染 | 训练/微调数据清洗 | 项目不训练模型、不微调 | ➖ | 不适用 |
 | LLM04 模型 DoS | 输入长度限制、速率限制、token 配额 | 请求体上限 `MAX_BODY_BYTES`；限流（chat/login/admin）；`MAX_TOOL_ROUNDS`；Doom Loop 跨轮熔断；上下文 token 预算；**本轮新增** `COST_HARD_QUOTA=on` 可开启硬配额（默认仍只 `budgetAlerts` 告警） | 🟡 | 硬配额默认关闭（免费链波动大，默认硬拦会误伤）；多实例为每实例计数（需入口层兜底）。列为已知局限 |
-| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（可选）；`scripts/gen-sbom.mjs` 产出 CycloneDX SBOM；**本轮新增** MCP 来源形态指纹漂移检测（`/mcp/provenance`） | 🟡 | 白名单默认未启用；来源检测只比命令形态（不哈希可执行文件，防替换需 `MCP_REQUIRE_PROVENANCE=on`） |
+| LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（`NODE_ENV=production` 未配则拒绝连接）；来源指纹含命令、HTTP `url`、请求头哈希、本地脚本内容 | 🟡 | 开发环境白名单仍放行；未开 `MCP_REQUIRE_PROVENANCE` 时建连不拦；不哈希 `node`/`npx` 本体；子进程仍无 OS 沙箱 |
 | LLM06 敏感信息泄露 | 输出 PII 扫描脱敏；RAG 按权限过滤 | RAG 文档级 ACL（召回前过滤）；审计/trace 不落凭据；出站凭据打码；**本轮新增**可开启的 PII 打码（`REDACT_PII=on`，email/手机号/身份证/银行卡，可按类型选） | 🟡 | PII **默认关闭**（业务数据误报高）；无姓名/地址类识别（无形态可依，靠词典必然误报，不做） |
 | LLM07 不安全的插件设计 | 工具参数校验、最小权限、不执行任意 SQL | `BUILTIN_RISK` 风险登记 + 启动断言；`risk.ts`/`sql-readonly.ts` MCP 原生 SQL 只读闸（fail-closed）；`run_tool_code` 只读工具桥 | ✅ | — |
 | LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集；**本轮新增** per-run 工具 allowlist（`toolAllowlist` 正向清单，注入即收窄、点名也被拒并回灌模型） | ✅ | allowlist 为 opt-in（未传入=行为不变），契合「模型自选 + 最小权限」 |
@@ -46,7 +46,7 @@
 | ASI03 身份与权限滥用 | Agent 作为一等非人类身份（NHI）治理：最小权限、JIT 授权、持续授权 | 匿名 cookie 会话（`bx_agent_sid`）+ 设备 owner（`bx_agent_oid`）；HTTP 面按 ownerKey 最小权限（只看自己的） | ❌ | **无登录/租户、无 NHI 生命周期管理**（创建/复核/监控/退役）。P1（多端接入前置项） |
 | ASI04 记忆投毒 | 记忆隔离 + **完整性校验** | 记忆按 owner 隔离；条数与注入字符双上限；写入前清洗控制符 + 写入落审计（`memory_write`）；**本轮新增**内容指纹 sidecar + 逐条完整性校验（`/chat/memory` 返回 `integrity`） | ✅ | 写入前无用户复核确认入口（模型直调 `save_memory` 即落盘），列为已知局限 |
 | ASI05 数据泄露 | 输出过滤、DLP | ownerKey 隔离；`Cache-Control: no-store`；出站凭据打码；**本轮新增**可开启通用 PII 打码（email/手机号/身份证/银行卡，可按类型） | ✅ | PII 默认关闭（业务数据误报高）；无姓名/地址类识别（无形态可依，不做） |
-| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；`MCP_ALLOWED_COMMANDS` 命令白名单（配置时 + **spawn 前**再校验）；SBOM（`gen-sbom.mjs`，393 组件）；MCP 来源形态指纹漂移检测（`/mcp/provenance`，`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒连） | ✅ | 白名单默认关闭；来源检测只比命令形态（不哈希可执行文件） |
+| ASI06 供应链 | MCP/插件完整性校验、SBOM、依赖审计 | 依赖审计（非阻断 CI）；`MCP_ALLOWED_COMMANDS`（配置时 + 建连前；`NODE_ENV=production` 未配则拒绝 stdio）；SBOM；来源指纹含 command/args/cwd、HTTP `url`、请求头哈希、本地脚本内容。`MCP_REQUIRE_PROVENANCE=on` 时建连拒绝；未开时只有 `GET /mcp/provenance` 比对告警 | 🟡 | 不哈希 `node`/`npx` 本体；无 OS 级沙箱 |
 | ASI07 输入操纵 | 输入清洗、类型/结构校验 | 请求体上限；ReDoS 护栏（嵌套量词 + **本轮新增交替重叠型** `(a|a)*`）+ 2s 预算兜底；`runGate` schema/可调用性校验 | ✅ | — |
 | ASI08 过度自主 | 渐进式自主、不可逆操作人工批准 | 写操作二次确认（三态 granted/denied/timeout）；`MAX_TOOL_ROUNDS`；Doom Loop 熔断；子代理受限工具集；**本轮新增** 渐进式自主（按近期质量**只向下**收紧轮次预算，`/chat/autonomy`） | ✅ | 不自动提权（历史质量好也不放开确认/权限——防刷分提权） |
 | ASI09 日志与监控不足 | 全面遥测 + 审计 + 行为检测 | trace（run / round / span 三层）+ audit（append-only）+ cost + span 挂 `gen_ai.*`；**本轮新增进程级 metrics、OTLP 导出、行为异常检测** | ✅ | 仍无跨进程基线共享（基线在进程内，重启重建） |
@@ -88,7 +88,7 @@
 | 2 | Trace 格式 | OTel 语义约定 + OTLP | 自研 JSONL（**本轮已挂 `gen_ai.*` 标准属性**） | 🟡 部分有意：零依赖优先；属性名已对齐，导出器待补 |
 | 3 | 评测形态 | 在线/持续评测闭环 | 测试闸门（G1–G7） | 🟡 有意：评测层已随 analytics 拆分清理，现以测试承担回归 |
 | 4 | 成本治理 | 硬配额（超限拒绝） | 默认只告警；`COST_HARD_QUOTA=on` 时**可开启硬配额**（本轮补齐） | 🟡 部分：默认仍是告警（免费链波动大，默认硬拦会误伤），开启后 fail-closed |
-| 5 | MCP 白名单 | 默认启用工具 allowlist | 默认关闭（`MCP_ALLOWED_COMMANDS` 未配=放行） | ✅ 有意：单机开发机需自由加 MCP；生产部署清单要求显式配置 |
+| 5 | MCP 白名单 | 默认启用工具 allowlist | 开发未配 = 放行；`NODE_ENV=production` 未配 = 拒绝 stdio | ✅ 有意：单机开发放行；生产进程强制白名单 |
 | 6 | 子进程沙箱 | OS 级容器隔离 | 无沙箱，靠「环境白名单+超时+并发上限+只读桥」 | 🟡 无意（成本/平台限制），已在 `SECURITY.md` §8.4 诚实标注 |
 
 ## 7. 汇总二：**未实现**清单（按优先级）
@@ -104,7 +104,7 @@
 | ~~**P2**~~ | ~~行为异常检测~~ | ASI09 | ✅ **本轮已补齐**：`src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串），`/chat/anomalies`。**样本不足不判**（防冷启动误报） |
 | ~~**P2**~~ | ~~OTLP 导出器~~ | OTel | ✅ **本轮已补齐**：`src/otlp.ts`，OTLP/HTTP JSON 编码，默认关闭（`OTEL_EXPORTER_OTLP_ENDPOINT` 未配则不发请求） |
 | ~~**P2**~~ | ~~渐进式自主分级~~ | ASI08 | ✅ **本轮已补齐**：`src/autonomy.ts` 按近期质量**只向下收紧**轮次预算（`/chat/autonomy`）；不自动提权 |
-| ~~**P2**~~ | ~~MCP 服务器来源校验~~ | ASI06 | ✅ **本轮已补齐**：`src/mcp/provenance.ts` 比对命令形态指纹，漂移告警（`/mcp/provenance`） |
+| ~~**P2**~~ | ~~MCP 服务器来源校验~~ | ASI06 | ✅ **2026-10-05 已补齐命令形态**。2026-10-08 现行指纹另含本地脚本、HTTP `url`、请求头哈希，见 §3 ASI06 |
 | ~~**P2**~~ | ~~输出结构（schema）校验~~ | LLM02 / ASI10 | ✅ **本轮已补齐**：`src/output-schema.ts` 把澄清/待办/图表 spec 校验统一收口，边界 fail-closed，`GET /chat/output-schema` 可观测 |
 
 ---
@@ -128,7 +128,7 @@
 | **回归修复：记忆清洗正则** | 第七轮引入的清洗正则缺 `u` 标志，`\uE0000-\uE007F` 被解析成「`0` 到 `\uE007`」巨大区间 → **几乎匹配所有字符，会把整条记忆抹空**。已改 `\u{...}` + `u` 标志，并抽出可测纯函数 `sanitizeMemoryText` | `src/memory.ts`、`tests/anomaly-memory.test.ts` |
 | **P2 per-run 工具 allowlist** | 新增正向清单 `toolAllowlist`（内置工具名）：写入即收窄，清单外工具既不注入、点名调用也拒绝并把拒绝回灌模型（静默丢弃会触发 Doom Loop） | `src/chat.ts`（opts + 两处执行闸门） |
 | **P2 渐进式自主分级** | 按近期质量推导 `level`（0–2），**只向下**收窄轮次预算；绝不因表现好自动放开确认/权限（防刷分提权） | `src/autonomy.ts`、`src/chat.ts`、`src/app.ts`（`/chat/autonomy`） |
-| **P2 MCP 来源漂移检测** | 记各服务器命令形态指纹（command/args/cwd），再登记时比对；漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝连接） | `src/mcp/provenance.ts`、`src/app.ts`（`/mcp/provenance`） |
+| **P2 MCP 来源漂移检测** | 2026-10-05：命令形态指纹（command/args/cwd）。现行范围以 §3 ASI06 为准（另含脚本内容、HTTP `url`、请求头哈希；严格模式在建连时拒绝） | `src/mcp/provenance.ts`、`src/mcp/hub.ts`、`src/app.ts`（`/mcp/provenance`） |
 | **P2 统一输出 schema 校验** | `src/output-schema.ts` 把散落的澄清/待办/图表 spec 校验收口为单一模块；每个结构化输出 fail-closed（畸形即拒绝并回灌模型），`GET /chat/output-schema` 暴露登记清单 | `src/output-schema.ts`、`src/builtins.ts`、`src/app.ts`（`/chat/output-schema`） |
 
 ---
@@ -159,7 +159,7 @@ Tests  8 passed (8)
 `node --import tsx .tmp/bp-gap-verify.mjs` → **20/20 PASS**，含：
 
 - 脱敏：`sk-*`、`AKIA*`、`glpat-*`、`ghp_*` 四类凭据命中即打码且原文不残留；PEM 私钥整块替换为 `[REDACTED:PRIVATE_KEY]`；`countSecretHits` 计数=2；`共 20 条` / `单价 12.50 元` / `订单号 A20261005001` **不误伤**。
-- MCP 白名单：未配 `MCP_ALLOWED_COMMANDS` → `npx` 放行、`validateServerInput` 通过（**现状不变**）；配 `npx,node` 后 → `cmd` 被拒（配置时报错「stdio 命令不在白名单内」）、`/usr/bin/node` 放行（认完整路径）、空命令被拒。
+- MCP 白名单：未配 `MCP_ALLOWED_COMMANDS` → `npx` 放行、`validateServerInput` 通过（**这是 2026-10-05 当时的开发默认**）；配 `npx,node` 后 → `cmd` 被拒（配置时报错「stdio 命令不在白名单内」）、`/usr/bin/node` 放行（认完整路径）、空命令被拒。2026-10-08 起 `NODE_ENV=production` 且未配白名单时 stdio 改为拒绝，开发环境仍放行。
 
 ### 9.4 实例四：真实服务端 HTTP 实例
 
@@ -168,7 +168,7 @@ Tests  8 passed (8)
 | 检查 | 结果 |
 | --- | --- |
 | `GET /health` | `200`，`Cache-Control: no-store`（第六轮护栏在位） |
-| `GET /mcp/servers` | `200`（未配令牌恒等放行；**白名单默认关闭，未误伤已配置的 MCP 服务器**） |
+| `GET /mcp/servers` | `200`（当时未配管理员令牌，恒等放行；命令白名单未启用，未误伤已配置的 MCP 服务器。2026-10-08 起仅 `NODE_ENV=production` 且未配 `MCP_ALLOWED_COMMANDS` 时拒绝 stdio） |
 | `POST /mcp/servers` 1.2MB body | `413`（请求体上限生效） |
 
 ### 9.5 实例五：真实 Chat 实例（遥测落地）
@@ -332,15 +332,14 @@ SBOM 已生成：D:\Code\bx-admin-agent\.data\sbom.cdx.json
    checks = [bi/yapi/movie/orders/gitlab/zoho-salesiq 共 6 个，status="new"]
    PASS  来源端点 200
    PASS  checks 是数组
-   PASS  strict 标记存在（默认 false = 只告警不拦）
+   PASS  strict 标记存在（当时把 false 记成「只告警不拦」；现行是未开严格模式时建连不检查，只有打开该接口才比对）
 3) GET /mcp/provenance（第 2 次）→ 6 个全部 "unchanged"（指纹稳定）
    PASS  已有基线后再比对 → unchanged
 ```
 
 `/chat/autonomy` 返回 `level 2` 是**如实**的：当前没有近期评测样本，按默认自主度（不收紧、也不提权）。
-`/mcp/provenance` 第 1 次把 6 个已配置服务器记为 `new`（建立基线），第 2 次全部 `unchanged`——
-证明指纹稳定、只要命令形态没变就不会误报。后续若某个 `command` 被替换，立即变 `changed` 并告警
-（`MCP_REQUIRE_PROVENANCE=on` 下还会拒绝连接）。
+`/mcp/provenance` 第 1 次把 6 个已配置服务器记为 `new`（建立基线），第 2 次全部 `unchanged`。
+这是 **2026-10-05** 的记录，当时指纹只有命令形态。2026-10-08 起指纹还含本地脚本内容、HTTP `url` 和请求头哈希。未开 `MCP_REQUIRE_PROVENANCE` 时，建连不检查；打开该接口才会比对。严格模式在建连时拒绝不一致的新连接。
 
 > 工具 allowlist（`toolAllowlist`）因依赖「模型真实调用工具」才能端到端验证，而当前模型侧 402，
 > 故该路径以**单测**覆盖（注入收窄 + 点名调用拒绝回灌），未做 HTTP 级实例（与历史同类项的取舍一致）。
@@ -406,7 +405,7 @@ schemas: request_clarification:true, write_todos:true, render_chart:true, export
 | # | 局限 | 对应项 | 现状与缺口 | 推进所需 |
 | --- | --- | --- | --- | --- |
 | 1 | 登录 / 租户 + NHI 生命周期治理 | ASI03 | 仅匿名 cookie owner + 设备 owner 最小权限；无账号、无 NHI 创建/复核/退役 | 用户 2026-10-06 明确「暂不需要登录体系」，保留为缺口；多端接入前置项 |
-| 2 | 子进程 OS 级沙箱 | LLM07/ASI02 执行安全 | `run_tool_code` / `run_command` / `run_script` 仅靠「环境白名单 + **凭据文件读取守卫** + 超时 + 并发上限 + 只读工具桥」，**无 microVM/Docker/AppContainer 隔离**：绝对路径可读任意**非凭据**文件、无出网限制、无文件系统隔离；守卫是拒绝清单，可被 `child_process` 绕过 | 需引入 microVM（gVisor/Firecracker）或容器运行时，平台成本较高 |
+| 2 | 子进程 OS 级沙箱 | LLM07/ASI02 执行安全 | `run_tool_code` / `run_command` / `run_script` 仅靠「环境白名单 + **凭据文件读取守卫** + **child_process 命令执行守卫（模块级打补丁封死 ESM 命名导入 / require / createRequire / 动态 import()）** + 超时 + 并发上限 + 只读工具桥」，**无 microVM/Docker/AppContainer 隔离**：绝对路径可读任意**非凭据**文件、无出网限制、无文件系统隔离；命令执行已被模块级守卫封死，但原生插件 / `process.binding` / Python `from subprocess import Popen` 重绑定仍可绕过 | 需引入 microVM（gVisor/Firecracker）或容器运行时，平台成本较高 |
 | 3 | 多实例限流 / 配额 | LLM04/LLM10 | 限流与成本配额均为**每实例**计数（进程内），多实例部署时各算各的、无全局阈值 | 需 Redis 或入口层（网关/反向代理）兜底 |
 | 4 | 出站内容脱敏默认值 | LLM06/ASI05 | PII 打码 `REDACT_PII` **默认关闭**（业务数据误报高，开启会改坏正常回答） | 属刻意取舍；如需强制需在业务侧加白名单，非纯技术开关 |
 | 5 | 配置端点强制令牌 | §5 安全 | `/mcp/servers`、`/notify/channels` 受 `admin-gate` 保护，但 `AGENT_ADMIN_TOKEN` 未配置时**恒等放行**；仅 `HOST=0.0.0.0` 无令牌才 fail-closed 拒启 | 开放局域网部署前必须显式配 `AGENT_ADMIN_TOKEN`，属部署清单项 |

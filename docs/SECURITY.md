@@ -121,13 +121,14 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | 工具调用上限 | `TOOL_CODE_MAX_CALLS = 400` | `run_tool_code` 经只读桥调工具的调用次数上限 |
 | 只读工具桥 | `run_tool_code` 只能调 `read` 级工具 | 桥接服务端工具时强制 `verdict.level === "read"` 且免确认；MCP 写工具进不来 |
 | **凭据文件读取守卫** | `src/tool-code-fs-guard.ts`，默认开启 | 拦 `.env` / 私钥（`*.pem` `*.key` `*.p12` …）/ 云凭据目录（`.ssh` `.aws` `.docker` …）等**形态明确**的凭据文件读取。Node 侧前置补丁 `fs`（含 `promises` 与 `createReadStream`），Python 侧包装 `builtins.open`。逃逸口 `TOOL_CODE_FS_ALLOW`。**这不是沙箱**，见 §8.4 |
+| **命令执行守卫**（child_process） | `src/tool-code-fs-guard.ts`，默认开启 | Node 侧在 `--require` 预加载里把 `node:child_process` 的 exec/spawn 家族（exec / execSync / execFile / spawn / spawnSync / fork）**在模块层打补丁抛错**——无论 ESM 命名导入 / `require` / `createRequire` / 动态 `import()` 拿到的都是补丁后函数（与上方 fs 守卫同一「模块求值期快照」机制）；Python 侧包装 `subprocess`（Popen/run/call/check_output…）/ `os.system` / `os.popen`。封死「模型代码 `import { execSync } from "node:child_process"` 直接执行任意命令、绕过只读工具桥」这条路径（审计第 2 项：Node ESM 命名导入绕过 permission model）。**不是沙箱**：原生插件 / `process.binding` / Python `from subprocess import Popen` 这类把名字绑到局部变量的写法仍可绕过 |
 
 ### 8.4 已知局限（诚实标注，非已修复）
 
 > ⚠️ 当前子进程**没有 OS 级沙箱**。上述约束是「数量 / 环境 / 输出 / 读取」维度的护栏，**不提供隔离**：
 >
 > - **绝对路径可读任意文件（已收窄但未根治）**：子进程仍能用绝对路径读服务器上的任意**非凭据**文件（含其它项目源码、业务数据）。凭据文件（`.env` / 私钥 / 云凭据）已由 §8.3 的读取守卫拦下，但那是**拒绝清单**，不是隔离。
-> - **守卫可被绕过**：用 `child_process` 再拉一个干净的 node/python 进程、或用原生插件 / `process.binding`，都不受此拦截。守卫挡住的是 prompt 注入场景下**最直接**的那一步（让模型去读 `.env`），挡不住决心明确的绕过。
+> - **守卫可被绕过（部分已收窄）**：`node:child_process` 的 exec/spawn 家族已在 §8.3 被模块级打补丁封死（ESM 命名导入 / `require` / `createRequire` / 动态 `import()` 均拿不到可用函数），命令执行这道被堵上；但仍可被原生插件 / `process.binding` / Python `from subprocess import Popen` 这类把名字绑到局部变量的写法绕过。守卫挡住的是 prompt 注入场景下**最直接**的那几步（让模型去读 `.env`、去 `execSync` 跑命令），挡不住决心明确的绕过。
 > - **无出网限制**：子进程可连外部网络（凭据外带的真正出口）。
 > - **无文件系统隔离**：`cwd` 默认在工作区，但代码可 `../` 越界写。
 > - **无进程数硬上限（OS 层）**：`TOOL_SUBPROCESS_MAX_CONCURRENT` 是进程内信号量，多实例/多 worker 不共享。
@@ -141,8 +142,8 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 stdio 传输会 `spawn` 任意命令——**加了管理员令牌也挡不住**「有权限的人/被注入的流程新增一个恶意 MCP 服务器」，那正是供应链攻击的形态。
 
 - `MCP_ALLOWED_COMMANDS`（逗号分隔，可选）：配置后，stdio 命令必须命中名单（同时认完整路径与可执行名，如 `npx` 与 `/usr/bin/npx`）。
-- **两处校验**：配置时（`validateServerInput`）+ **真正 spawn 前**（`hub.ts` `buildTransport`）。第二处是必须的——配置时校验挡不住「白名单启用前就已落盘」的旧服务器，而 spawn 才是实际的代码执行点，fail-closed 必须落在执行点。
-- 未配置 = 不启用，保持现状（单机开发机需自由加 MCP）；生产部署清单要求显式配置（见 §14）。
+- **两处校验**：配置时（`validateServerInput`）+ 建连时（`hub.ts` `transportRefusal`，在 `buildTransport` 里、真正 spawn 之前）。第二处挡的是「白名单启用前就已落盘」的旧服务器。拒绝记在连接的 `error` 上，避免半成品一直停在连接中。
+- 未配置时：开发环境放行。`NODE_ENV=production` 未配则拒绝全部 stdio（配置校验与 spawn 前都生效）。生产清单见 §14。
 
 ### 8.6 出站凭据打码（OWASP ASI05 / LLM06）
 
@@ -190,9 +191,11 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 
 stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`，§8.5）能挡「不在名单里的命令」，但挡不住「名单里的命令本身被换掉」。`src/mcp/provenance.ts` 补**来源漂移检测**：
 
-- 记各服务器首次登记时的命令形态指纹（command / args / cwd 的 sha256）。
-- 每次读取配置都比对——形态变了即 `changed` 并告警（疑似被替换），`MCP_REQUIRE_PROVENANCE=on` 下还会拒绝连接（fail-closed）。
-- **只比声明形态**（不哈希可执行文件内容）：成本低、能抓绝大多数「被换掉」情形；真正的内容级校验需额外机制。
+- 指纹含命令形态（command / args / cwd）、HTTP 的 `url`、请求头哈希（不落鉴权原文），以及参数里本地脚本（`.js` / `.mjs` / `.cjs` / `.ts`，最多读 1MB）的内容哈希。
+- **未开严格模式时，建连不检查、不拦。** `GET /mcp/provenance` 会比对并告警：命令、`url`、请求头变了保留旧基线；仅脚本内容变了则告警后接受新内容。
+- `MCP_REQUIRE_PROVENANCE=on` 时，stdio 与 HTTP 都在 `buildTransport` 里检查。不一致就拒绝这次连接，失败记在连接错误上，不留下「一直连接中」的半成品。
+- 旧基线还没有脚本哈希或 `url` / 请求头时，命令形态没变就补记，不算漂移。
+- 不哈希 `node` / `npx` 可执行文件本身：运行时升级会误报。那一层靠命令白名单。
 
 ### 8.11 统一输出 schema 校验（OWASP LLM02 / ASI10）
 
@@ -276,6 +279,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 - [ ] 定时任务共享 MongoDB 分布式锁——**不要为验证而同时起第二个实例**（会把某个 schedule 真跑起来）。
 - [ ] 改 `.env` / 代码后重启：`pm2 delete agent-server-dev` → 确认 8787 释放 → `pm2 start ecosystem.dev.config.cjs --only agent-server-dev`。
 - [ ] 不信任网络下部署 `run_tool_code`/`run_command`/`run_script` 前，先解决 §8.4 的沙箱缺口。
+- [ ] 生产设置 `NODE_ENV=production`，并配置 `MCP_ALLOWED_COMMANDS`（未配则 stdio MCP 起不来）。需要内容级拒绝时再开 `MCP_REQUIRE_PROVENANCE=on`。
 - [ ] 依赖审计进非阻断 CI；前端类型检查进非阻断 CI（巨型 SFC 结果不稳定）。
 
 ---
@@ -284,7 +288,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
-| 子进程 OS 级沙箱 | ❌ 未做 | 绝对路径可读任意**非凭据**文件 / 无出网限制 / 无文件系统隔离。凭据文件读取已由 §8.3 守卫收窄（拒绝清单，可被 `child_process` 绕过）。需 microVM / Docker / AppContainer |
+| 子进程 OS 级沙箱 | ❌ 未做 | 绝对路径可读任意**非凭据**文件 / 无出网限制 / 无文件系统隔离。凭据文件读取（§8.3）与 `child_process` 命令执行（§8.3）已分别由模块级守卫收窄（均为拒绝清单，原生插件 / 重绑定仍可绕过）。需 microVM / Docker / AppContainer |
 | 登录与多租户 | ❌ 未做 | 当前为匿名 cookie 会话 + 设备 owner；多端接入前置项 |
 | 多实例限流 | ❌ 需 Redis | 当前限流进程内，多副本不共享 |
 | 出站内容（模型回复）脱敏 | ❌ 未做 | 回复中的敏感字段未自动脱敏 |
@@ -292,7 +296,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
 | 通用 PII / 出站 DLP | 🟡 可开启 | `REDACT_PII=on` 后打码 email/手机号/身份证/银行卡；**默认关闭**（业务数据误报高）。姓名/地址类不做（无形态可依） |
 | SBOM | ✅ 已做 | `scripts/gen-sbom.mjs` 产出 CycloneDX 1.5（生产依赖，393 组件） |
-| MCP 服务器来源校验 | 🟡 声明形态漂移检测 | `src/mcp/provenance.ts` 比对 command/args/cwd 指纹，漂移告警（`MCP_REQUIRE_PROVENANCE=on` 可 fail-closed 拒绝）；不哈希可执行文件内容 |
+| MCP 服务器来源校验 | ✅ 形态 + 端点 + 本地脚本 | `src/mcp/provenance.ts` 比对 command/args/cwd、HTTP url、请求头哈希，并哈希本地脚本。stdio 与 HTTP 建连前检查；`MCP_REQUIRE_PROVENANCE=on` 时拒绝新连接。不哈希 `node`/`npx` 本体。生产未配 `MCP_ALLOWED_COMMANDS` 时 stdio 直接拒绝 |
 | 统一输出 schema 校验 | ✅ 已做 | `src/output-schema.ts` 收口澄清/待办/图表 spec 校验，边界 fail-closed，`GET /chat/output-schema` 可观测；自由文本另有 DOMPurify 净化 |
 | 进程级 metrics | ✅ 已做 | `GET /metrics` 输出 Prometheus 文本格式（模型/工具/运行/HTTP 四类打点，零新依赖）；进程重启即清零，趋势看 `/chat/metrics` 的持久聚合 |
 | OTLP 导出 | ✅ 已做（默认关） | `src/otlp.ts`，OTLP/HTTP JSON 编码；未配 `OTEL_EXPORTER_OTLP_ENDPOINT` 则不发请求 |
@@ -322,7 +326,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 进程级指标 | `src/process-metrics.ts`、`src/app.ts`（`GET /metrics`）、`src/chat.ts`（打点） |
 | per-run 工具 allowlist | `src/chat.ts`（opts `toolAllowlist` + 两处执行闸门） |
 | 渐进式自主分级 | `src/autonomy.ts`、`src/chat.ts`（轮次预算）、`src/app.ts`（`GET /chat/autonomy`） |
-| MCP 来源漂移检测 | `src/mcp/provenance.ts`、`src/app.ts`（`GET /mcp/provenance`） |
+| MCP 来源漂移检测 | `src/mcp/provenance.ts`；建连闸门 `src/mcp/hub.ts`（`transportRefusal`）；查询 `src/app.ts`（`GET /mcp/provenance`） |
 | 统一输出 schema 校验 | `src/output-schema.ts`、`src/builtins.ts`、`src/app.ts`（`GET /chat/output-schema`） |
 | OTLP 导出（可选） | `src/otlp.ts`、`src/app.ts`（run 收束时触发） |
 | 出站 PII 打码（可选） | `src/redact.ts`（`redactPii` / `redactSensitive`）、`src/chat.ts` |

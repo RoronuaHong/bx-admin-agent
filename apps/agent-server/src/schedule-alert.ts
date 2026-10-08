@@ -1,6 +1,6 @@
 /**
  * 定时任务「预警 / 仅异常通知」纯逻辑（docs/scheduled-spike-detection-plan.md）。
- * 判定业务阈值在用户指令里；这里只认输出协议标记 + 冷静期状态机——不写死任何业务词。
+ * 判定业务阈值在用户指令里；这里只认输出协议标记与恢复状态——不写死任何业务词。
  */
 export type ScheduleNotifyPolicy = "always" | "on_alert";
 export type SchedulePurpose = "report" | "alert";
@@ -11,17 +11,11 @@ export type AlertMarker = "SPIKE" | "NORMAL" | "NO_DATA";
 export interface ScheduleAlertState {
   /** 当前是否处于告警中（已推过 SPIKE、尚未恢复）。 */
   firing?: boolean;
-  /** 最近一次真正推送 SPIKE 的时刻（冷静期锚点）。 */
+  /** 最近一次真正推送 SPIKE 的时刻。 */
   lastAlertAt?: number;
   /** 告警中连续出现 NORMAL 的期数；满 2 期触发恢复通知。 */
   normalStreak?: number;
 }
-
-/** 冷静期默认 30 分钟（可用 SCHEDULE_ALERT_COOLDOWN_MS 覆盖）。 */
-export const ALERT_COOLDOWN_MS = Math.max(
-  60_000,
-  Number(process.env.SCHEDULE_ALERT_COOLDOWN_MS) || 30 * 60_000,
-);
 
 /**
  * 预警模式专用指引（替代报告型 SCHEDULE_TASK_GUIDE 里「必须出图」那套）。
@@ -42,8 +36,9 @@ export const SCHEDULE_ALERT_GUIDE =
   "   [SPIKE]  — 按用户指令判定为异常 / 破线；\n" +
   "   [NORMAL] — 有完整计数且未破线；\n" +
   "   [NO_DATA] — 取不到数据、结果为空、或计数不完整（不要猜数）。\n" +
-  "2) 第一行之后最多再写 3～5 行：窗口、口径、当前值、阈值。禁止长文推理复述。" +
-  "任务名、状态、触发方式和时间由通知另附，正文不要再写。\n" +
+  "2) 第一行之后最多再写 3～5 行，全部用中文：时间窗口、当前数量、阈值。\n" +
+  "   不要写英文单词或字段名，不要写 complete、raw、unique、above。\n" +
+  "   不要写任务开关、下次执行时间、钉钉或推送通道。任务名、状态和时间由通知另附。\n" +
   "3) **禁止** render_chart、export_data、写报告 HTML、基于截断片段估算/外推。\n" +
   "4) 取数优先短窗口（按用户指令，常见 ≤60 分钟）与**聚合/计数**接口；" +
   "列表没有总数、又要按小时或阈值计数时，调用 count_list_by_time 一次取回，不要逐页翻列表。" +
@@ -102,7 +97,7 @@ export type AlertDeliveryKind = "spike" | "recovered" | "skip";
 
 /**
  * 根据本期标记与任务上的 alertState 决定是否推送，并算出下一期状态。
- * - SPIKE：冷静期外才推；期内只更新会话、不推。
+ * - SPIKE：每期都推。同一条异常持续破线也会再发，不做时间去重。
  * - NORMAL：告警中连续 2 期才推「已恢复」。
  * - NO_DATA / 无标记：不推；NO_DATA 打断恢复计数，但不清除 firing。
  */
@@ -110,23 +105,14 @@ export function decideAlertDelivery(input: {
   marker: AlertMarker | null;
   alertState?: ScheduleAlertState;
   now?: number;
-  cooldownMs?: number;
 }): { kind: AlertDeliveryKind; nextState: ScheduleAlertState } {
   const now = input.now ?? Date.now();
-  const cooldown = input.cooldownMs ?? ALERT_COOLDOWN_MS;
   const prev = input.alertState || {};
   const firing = Boolean(prev.firing);
   const lastAlertAt = prev.lastAlertAt;
   const streak = Math.max(0, Number(prev.normalStreak) || 0);
 
   if (input.marker === "SPIKE") {
-    const inCooldown =
-      firing &&
-      lastAlertAt !== undefined &&
-      now - lastAlertAt < cooldown;
-    if (inCooldown) {
-      return { kind: "skip", nextState: { firing: true, lastAlertAt, normalStreak: 0 } };
-    }
     return {
       kind: "spike",
       nextState: { firing: true, lastAlertAt: now, normalStreak: 0 },

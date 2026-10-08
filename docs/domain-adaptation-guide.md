@@ -3,6 +3,14 @@
 > 配套文档：`agent-infrastructure.md`（通用 Agent 基建检查表，含 M0–M4 成熟度模型与反模式）。
 > 本指南回答一件事：**如何在不破坏现有通用 Agent 的前提下，把它改造成某个垂直领域 Agent（如观影助手），且能共存/切换**。
 > **验证脚本现状（2026-09-22）**：文中（如 §10 进度段）提到的 `scripts/_role-check.mjs` / `_movie-e2e.mjs` 等验证脚本**大多已随 2026-09 的调试脚本清理移除**；现行零依赖回归入口是 `pnpm test`（`apps/agent-server/tests/*.test.ts`，角色相关见 `tests/role-guard.test.ts` / `tests/system-prompt-contract.test.ts`），脚本名 → 替代回归的总表见 `docs/mcp-guide.md` §11。实测结论保留作追溯，但**不要照抄其中的脚本命令**。
+> **做到哪一步停（2026-10-08）**：新领域按下面四步停，能停就停。逐步写法仍以本文后续章节为准。不上集群的范围见 `docs/agent/CURRENT_ARCHITECTURE.md` 文首。
+
+1. **只加 MCP 服务器**（`MCP_BUILTIN_SERVERS` 或 `.data/mcp-servers.json`）。配 `tools` 白名单和 `toolRisks`。测试与生产用不同服务器 id 或不同 URL，不用提示词区分环境。
+2. **加一条技能** `apps/agent-server/skills/<name>/SKILL.md`。流程里有业务词就写 `roles:` 收窄；没有业务词就保持通用。
+3. **角色只在至少有一件不同时才加**（`roles.ts`）：人设边界、新建对话默认 MCP、必须接地（`enforceGrounding`）。门户多一个入口仍是同一进程。
+4. **不为这个领域新建 Agent 进程、路由节点或 A2A。** 进程内需要隔离上下文时用已有的 `task`，边界见 `docs/agent/CURRENT_ARCHITECTURE.md` 的委派小节。
+
+已落地的例子：BI = `bi` MCP + 取数技能；观影 = `movie` MCP + `movie` 技能 + `movie` 角色；客服 = 人设 + 知识库检索，数据源能走 MCP 就走 MCP。
 
 ---
 

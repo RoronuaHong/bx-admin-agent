@@ -245,11 +245,11 @@
 - **图表数据一并投递**：IM 两端都只认文本、渲染不了图，而分析类任务的结论常常只落在 `render_chart` 的图里（只推正文 = 推一句「以上为完整监测结果」）。调度循环从任务事件缓冲取本轮图表（`chartsOfTask`），连同正文一并交给 `buildScheduleDelivery`：行对象数组按「列=值」逐行折（空值不落、超出 `MAX_CHART_ROWS` 如实注明），非表格形态（层级 / 点边结构）原样给紧凑预览、不做猜测式排版；正文总预算在表格 + 图表折完后统一收敛一次，避免叠加超出平台上限被拒收。
 - **接线与旁路**：调度循环在写下一拍之前 **await** 投递。`patchSchedule` 是整份回写，投递还在飞时会把刚算好的 `nextRunAt` 盖掉。投递失败只落 `lastDelivery` + 日志，**不改这一期的成败**。`POST /notify/channels/:id/test` 供配置后自验（平台拒收按 200 + `ok:false` + 平台原因回显，不算 HTTP 错误）。
 - **前端**：`apps/web/src/api.ts` 增 schedules / notify channels 客户端；`ChatPage.vue` 的定时任务面板**从 localStorage 脚手架改为服务端持久化**（rrule → 5 段 cron 转换、一次性任务、任务级 MCP、卡片显示绑定对话 / 上次执行 / 上次投递）。通知通道是全局启用，不再逐任务多选。
-- **数据预警 / 仅异常通知（2026-09-29）**：对齐 ChatGPT Monitoring + Datadog 主路径——表单「用途（报告/预警）+ 每 N 分钟 + 通知策略」；指标/阈值写在指令里。`notifyPolicy=on_alert` 时追加结论协议，投递旁路认 `[SPIKE]`/`[NORMAL]`/`[NO_DATA]` + 冷静期 30 分钟 + 恢复通知。**先测后跑（P2.5）**：对话试跑后「设为数据预警」/「从对话带入」；`manage_schedule` 可带 `purpose`/`notifyPolicy`。详见 `docs/scheduled-spike-detection-plan.md`。
+- **数据预警 / 仅异常通知（2026-09-29）**：对齐 ChatGPT Monitoring + Datadog 主路径——表单「用途（报告/预警）+ 每 N 分钟 + 通知策略」；指标/阈值写在指令里。`notifyPolicy=on_alert` 时追加结论协议，投递旁路认 `[SPIKE]`/`[NORMAL]`/`[NO_DATA]`。`[SPIKE]` 每期都推（2026-10-08 起不再按时间去重），连续 2 期 `[NORMAL]` 才推恢复。**先测后跑（P2.5）**：对话试跑后「设为数据预警」/「从对话带入」；`manage_schedule` 可带 `purpose`/`notifyPolicy`。详见 `docs/scheduled-spike-detection-plan.md`。
 - **2026-09-30**：立即执行 `POST /chat/schedules/:id/run` 与事件唤醒 `POST .../wake` 不改原周期；定时运行拒绝 `manage_schedule` / `fs_delete` / `run_command` / `run_script` / `request_clarification`（预警再拒绝出图与导出）；告警中下一拍收到间隔的一半（不低于 5 分钟），不改已存 cron；删除任务保留结果会话；几乎全是问号的名称或指令拒绝保存。清单见 `docs/best-practice-alignment-review.md`。
 
 验证：`scripts/_async-task-check.mjs` 10/10、`scripts/_cost-schedule-check.mjs` 9/9；投递 `tests/notify-deliver.test.ts`（加签算法、载荷形状、错误码判定、关键词注入、表格折行、工具轨迹剥离、截断、多语状态词、白名单与「后缀包含」绕过）与 `scripts/_notify-schedule-e2e.mjs`（非白名单域名被拒 → 建通道 → 凭据不回显 → 测试发送 → 一次性任务到点真跑一轮 → 结果 markdown 带任务名/状态/`?conv=` 链接 → `lastDelivery` 回写；跑法：服务端临时带 `NOTIFY_ALLOWED_HOSTS=127.0.0.1` + 本地假机器人）。
-仍缺：❌ 跨进程任务队列（多实例）、❌ 进度心跳、❌ 投递重试与去重（当前失败只记 `lastDelivery` 不重试；预警冷静期已覆盖成功态去重）、❌ 结果文件下载链接（本仓库没有 xlsx 导出能力，按钮目前只有「打开对话」）、❌ 通道配置的 owner 级权限（与 MCP 服务器同口径：全局配置，不做权限收窄）。
+仍缺：❌ 跨进程任务队列（多实例）、❌ 进度心跳、❌ 投递失败重试（失败只记 `lastDelivery`）、❌ 结果文件下载链接（本仓库没有 xlsx 导出能力，按钮目前只有「打开对话」）、❌ 通道配置的 owner 级权限（与 MCP 服务器同口径：全局配置，不做权限收窄）。
 
 ---
 

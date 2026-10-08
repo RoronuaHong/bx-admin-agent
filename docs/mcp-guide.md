@@ -292,6 +292,19 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 > 已勾选启用的服务器会在服务启动时自动重连（`src/index.ts`），面板不会再长时间停留在「未连接」。
 
+### 生产部署检查表（2026-10-08）
+
+开发环境不配白名单仍然放行。`NODE_ENV=production` 且未配 `MCP_ALLOWED_COMMANDS` 时，stdio 会被拒绝。依据：OWASP LLM Top 10（2025）LLM05 供应链、Agentic Top 10（2026）ASI06。
+
+| 检查 | 配置 | 开发默认 | 生产 |
+|---|---|---|---|
+| stdio 能拉起哪些命令 | `MCP_ALLOWED_COMMANDS`（逗号分隔；认命令名，也认完整路径） | 未配 = 放行 | `NODE_ENV=production` 且未配时，stdio **直接拒绝**。开发环境仍放行。配了之后只列实际会用的命令，例如 `node,npx` |
+| 命令、端点或脚本被换掉就拒绝 | `MCP_REQUIRE_PROVENANCE=on` | 未配 = 建连不检查、不拦。只有打开 `GET /mcp/provenance` 才会比对并告警；这时仅脚本内容变化会更新基线，命令 / `url` / 请求头变化保留旧基线 | 打开后，stdio 与 HTTP 都在建连前检查。命令、`url`、请求头或本地脚本内容与基线不一致就拒绝这次连接。请求头只保存哈希。不哈希 `node` / `npx` 本体 |
+| 未声明风险的 MCP 工具 | `MCP_UNKNOWN_TOOLS` | `confirm`（弹确认卡） | 交互环境保持 `confirm` 或改为 `deny`。不要设 `allow`。硬拒（`deny`，以及 `sql-readonly` 判定的非只读 SQL）不受「完全访问」豁免 |
+| 数据库账号本身只读 | Metabase / 库侧账号 | 服务端 `sql-readonly` 与适配器各有一层 | 库账号做成只读角色。这一层不在本仓库，见 `docs/text2sql-text2api-plan.md`。SQL 文本闸不能代替账号权限 |
+
+每个服务器再配 `tools`（只注入需要的工具）和 `toolRisks`（读 / 写 / 破坏）。新工具漏了 `toolRisks` 会走未知兜底，交互里每次都弹卡。
+
 ### 内置 BI 服务器（Metabase）的工具清单
 
 `scripts/metabase-mcp.mjs` 把实例 REST API 暴露为 9 个工具，其中除 `run_native_query`（执行任意 SQL）外全部只读并声明 MCP 标准注解 `readOnlyHint`——**声明事实而非放行**：服务端风险判定（`src/risk.ts`）仍以 `toolRisks` 优先。接口形状按**实例自带**的 `GET /api/docs/openapi.json` 核对（当前实例 v0.62.x）：
@@ -434,6 +447,7 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 ## 12. 关联文档
 
+- `docs/agent/CURRENT_ARCHITECTURE.md`：不上 Agent 集群；`task` 只做上下文隔离。
 - `docs/mcp-connect-plan.md`：设计稿（含交互原型、验收标准、实施步骤）。
 - `docs/chart-visualization-plan.md`：图表可视化接入方案（AntV Chart MCP，**路线 1 已实施**：官方出图服务 + `requireConfirm` 数据外发确认；自托管/前端渲染挂账）。
 - `docs/agent-infrastructure.md`：通用 Agent 基建指南，第 3/4/5/14 章对应当前实现与缺口。

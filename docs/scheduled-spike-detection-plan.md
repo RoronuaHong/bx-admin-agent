@@ -1,8 +1,8 @@
 # 定时任务「数据暴涨检测 / 预警」（最佳实践版）
 
-> 状态：**P1～P2.5 已落地**（分钟频率 + 仅异常通知 + 冷静期 / 恢复 + 指令脚手架 + **先测后跑**）。
+> 状态：**P1～P2.5 已落地**（分钟频率 + 仅异常通知 + 恢复 + 指令脚手架 + **先测后跑**）。2026-10-08 起破线不再按时间去重。
 > 入口：http://localhost:5173/chat → 对话试跑 / 定时任务。
-> 对齐：ChatGPT Monitoring +「先测后跑」；Datadog 冷静期常识。竞品对照见 `docs/scheduled-alert-best-practices-comparison.md`；会话落点见 `scheduled-task-sessions-plan.md`；总览见 `agent-infrastructure.md` §8。
+> 对齐：ChatGPT Monitoring +「先测后跑」。破线每期都推，恢复仍要连续 2 期正常。竞品对照见 `docs/scheduled-alert-best-practices-comparison.md`；会话落点见 `scheduled-task-sessions-plan.md`；总览见 `agent-infrastructure.md` §8。
 
 ---
 
@@ -28,7 +28,7 @@
 | 用途：周期报告 / **数据预警** | — |
 | **指令** | 运行时追加 `[SPIKE]` / `[NORMAL]` / `[NO_DATA]` |
 | **频率**（5/10/15/30 分钟） | 每 **10** 分钟 |
-| **通知**：每期都推 / **仅异常时推** | 仅异常；冷静期 **30** 分钟；恢复补一条 |
+| **通知**：每期都推 / **仅异常时推** | 仅异常；`[SPIKE]` 每期都推；连续 2 期 `[NORMAL]` 补一条恢复 |
 | 工具 / 结果落点 | 默认 **同一会话** |
 
 业务阈值（如印度对话量 >300）只写在指令里，不进表单字段。
@@ -41,7 +41,7 @@
 |---|---|---|
 | **ChatGPT Monitoring** | 指令 + 频率 + meaningful 才推 | 用途=预警 + `on_alert` + 标记协议 |
 | **ChatGPT Automations** | 先测后跑 | 气泡「设为数据预警」/ 表单「从对话带入」 |
-| **Datadog 常识** | 检测频率 ≠ 通知频率；冷静期 | `alertState` + 30m 冷静期 + 2×NORMAL 恢复 |
+| **Datadog 常识** | 检测频率 ≠ 通知频率 | 仅异常才推；持续破线每期都发。恢复仍要连续 2 期 `[NORMAL]` |
 | **自研踩坑** | 列表截断 → 估数出图；模型自己逐页累加会丢页 | `SCHEDULE_ALERT_GUIDE` + 硬摘 `render_chart`/`export_data` + 列表压缩。跨页小时计数走 `count_list_by_time`（`complete: false` 即 `[NO_DATA]`）。每个列表工具一轮只放行第一页 |
 
 不学：把 metric / scope / window / threshold / cooldown 全铺成一级表单字段。
@@ -65,7 +65,7 @@
 | `always` | 成功 / 失败都推 |
 | `on_alert` | 失败仍推；成功看首行标记 |
 
-- `[SPIKE]` → 推（冷静期内重复不推）
+- `[SPIKE]` → 每期都推
 - `[NORMAL]` → 静默；曾告警且连续 2 期 → 推「已恢复」
 - `[NO_DATA]` → 不推；保留 firing
 
@@ -81,7 +81,7 @@
 
 | 模块 | 职责 |
 |---|---|
-| `schedule-alert.ts` | 标记、投递决策、冷静期、`SCHEDULE_ALERT_GUIDE` |
+| `schedule-alert.ts` | 标记、投递决策、恢复、`SCHEDULE_ALERT_GUIDE` |
 | `schedules.ts` | 持久化 / 锁 / tick；跑完后推进下一拍 |
 | `app.ts` | 预警指引 + 摘图/导出 + 轮次上限 12；定时运行同时摘掉 `manage_schedule` |
 | `chat.ts` | `omitBuiltinTools`；列表结果压缩 / 截断提示；直接翻页闸门 | 
@@ -107,7 +107,7 @@
 
 | 阶段 | 状态 |
 |---|---|
-| P1 分钟频率 + 仅异常 + 冷静期 / 恢复 | ✅ |
+| P1 分钟频率 + 仅异常 + 恢复（2026-10-08 去掉破线去重） | ✅ |
 | P1.5 预警产物纪律（摘图 / 禁估数 / 轮次） | ✅ |
 | P2 指令脚手架 + 短窗口指引 | ✅ |
 | P2.5 先测后跑（气泡 / 从对话带入；`manage_schedule` 可带预警字段） | ✅ |
@@ -125,6 +125,6 @@
 
 1. 对话试跑 → `[NORMAL]` →「设为数据预警」→ 保存 → 侧栏可见。  
 2. 空白「数据预警」表单：默认 10 分钟 / 仅异常 / 同一会话 + 先测后跑提示。  
-3. NORMAL 不推；SPIKE 推一次；冷静期内再 SPIKE 不推；两期 NORMAL 后恢复。  
+3. NORMAL 不推；每一期 SPIKE 都推；两期 NORMAL 后恢复。  
 4. 单次跑超过一个 cron 间隔后，不应立刻连环触发下一期。
 5. 数据源取不到时：预警这一期的正文首行是 `[NO_DATA]`（运行记录里标记也是 NO_DATA、不推送）；报告这一期记「未产出结论」而不是成功。

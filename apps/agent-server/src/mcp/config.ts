@@ -87,8 +87,8 @@ let builtinCache: McpServerConfig[] | null = null;
  *
  * 对齐 OWASP ASI06 供应链：stdio 传输会 `spawn` 任意命令，**加了管理员令牌也挡不住**
  * 「有权限的人/被注入的流程新增一个恶意 MCP 服务器」——那正是供应链攻击的形态。
- * 配了本变量后，不在名单里的命令一律拒绝（fail-closed）；
- * 未配置 = 不启用，保持现状（单机开发机可自由加 MCP）。
+ * 配了本变量后，不在名单里的命令一律拒绝（fail-closed）。
+ * 未配置时：开发环境放行（单机可自由加 MCP）；`NODE_ENV=production` 必须配置，否则拒绝全部 stdio。
  */
 /** 每次调用现读环境变量（便于测试，也允许运维改了变量即时生效）。 */
 function allowedCommands(): string[] {
@@ -98,13 +98,19 @@ function allowedCommands(): string[] {
     .filter(Boolean);
 }
 
+/** 生产进程未配白名单时不再放行。开发与测试（NODE_ENV 非 production）保持放行。 */
+export function mcpAllowlistRequired(): boolean {
+  return (process.env.NODE_ENV || "").trim() === "production";
+}
+
 /**
- * 纯函数：stdio 命令是否被允许。未配白名单时恒等放行（向后兼容）。
+ * 纯函数：stdio 命令是否被允许。
+ * 未配白名单时，开发环境恒等放行；生产环境拒绝。
  * 比对同时认「完整路径」与「去掉路径后的可执行名」，避免 `npx` 与 `/usr/bin/npx` 两种写法不一致。
  */
 export function isAllowedMcpCommand(command: string): boolean {
   const allowed = allowedCommands();
-  if (!allowed.length) return true;
+  if (!allowed.length) return !mcpAllowlistRequired();
   const cmd = String(command || "").trim();
   if (!cmd) return false;
   const base = cmd.replace(/\\/g, "/").split("/").pop() || cmd;
@@ -115,7 +121,10 @@ export function validateServerInput(input: Partial<McpServerConfig>): string | n
   const id = String(input.id || "").trim();
   if (!id) return "缺少 id";
   if (input.transport === "stdio" && !isAllowedMcpCommand(String(input.command || ""))) {
-    return `stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）：${String(input.command || "")}`;
+    const why = mcpAllowlistRequired() && !allowedCommands().length
+      ? "生产环境必须配置 MCP_ALLOWED_COMMANDS"
+      : `stdio 命令不在白名单内（MCP_ALLOWED_COMMANDS）：${String(input.command || "")}`;
+    return why;
   }
   if (!ID_RE.test(id)) return "id 仅允许字母、数字、下划线、短横线（1-32 字符）";
   if (input.transport === "stdio" && !String(input.command || "").trim()) return "stdio 传输必须提供 command";

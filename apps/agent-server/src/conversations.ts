@@ -17,6 +17,8 @@ export interface StoredMessage {
   id?: string | number;
   role: "user" | "assistant";
   text: string;
+  /** 这条消息出现的时刻（毫秒）。只用于气泡上的时间，不回灌模型。 */
+  at?: number;
   images?: Array<{ id: string; name: string }>;
   /** 该助手消息用到的工具步骤摘要（便于历史还原"它做了什么"）。 */
   steps?: Array<{ name: string; status: string }>;
@@ -73,6 +75,8 @@ interface ConversationDoc {
   skillsEnabled?: string[];
   /** 该对话的界面语言，同时决定回复语言；空 = 客户端默认。 */
   locale?: string;
+  /** 浏览器上报的 IANA 时区。面向用户的钟点和小时分桶用它，不从语言猜测。 */
+  timeZone?: string;
   /** 忙碌期间排队的待发消息。 */
   pendingQueue?: PendingMessage[];
   /** 任务规划（write_todos 全量替换），跨轮持久化、前端可见。 */
@@ -251,6 +255,8 @@ export async function createConversation(input: {
   scheduleId?: string;
   /** 该会话对应的运行时刻（与 scheduleId 配套）。 */
   scheduleRunAt?: number;
+  /** 浏览器上报的 IANA 时区，随任务会话继承。 */
+  timeZone?: string;
 }): Promise<ConversationDoc> {
   const now = Date.now();
   // MCP 默认勾选：显式传入 > 角色默认 > 配置了 defaultEnabled 的服务器。
@@ -272,6 +278,7 @@ export async function createConversation(input: {
     ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
     ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
     ...(input.skillsEnabled?.length ? { skillsEnabled: [...new Set(input.skillsEnabled)] } : {}),
+    ...(input.timeZone ? { timeZone: input.timeZone } : {}),
   };
   const coll = await getColl();
   if (!coll) {
@@ -436,6 +443,8 @@ export interface ConversationPatch {
   mcpServers?: string[];
   skillsEnabled?: string[];
   locale?: string;
+  /** 浏览器上报的 IANA 时区。改它不代表对话有新活动。 */
+  timeZone?: string;
   pendingQueue?: PendingMessage[];
   /** 置顶时间戳；null = 取消置顶。 */
   pinnedAt?: number | null;
@@ -453,7 +462,7 @@ export interface ConversationPatch {
  * 只改变「列表怎么组织」、不代表对话有新活动的字段：
  * 改它们不应刷新 `updatedAt`，否则在「按最近活动排序」下会把该对话弹到列表最前（与用户预期不符）。
  */
-const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled", "fullAccess"]);
+const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled", "fullAccess", "timeZone"]);
 
 /**
  * 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。
@@ -462,7 +471,7 @@ const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted",
  */
 export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
   const set: Record<string, unknown> = {};
-  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
+  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "timeZone", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
   if (!Object.keys(set).length) return getConversation(id);

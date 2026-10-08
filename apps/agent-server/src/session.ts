@@ -44,6 +44,8 @@ export interface SessionPreferences {
    * 前端据此判断「旧的 3 个 localStorage 键是否已迁移」，避免换设备/清缓存后重复迁移。
    */
   migratedAt?: number;
+  /** 浏览器上报的 IANA 时区。设备级，供对话还没写上时区时兜底。 */
+  timeZone?: string;
 }
 
 /**

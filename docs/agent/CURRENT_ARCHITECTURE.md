@@ -3,6 +3,7 @@
 > **版本**：基于 `apps/agent-server/src` 实际代码核对（2026-09-26）。
 > **定位**：本文是 `docs/agent/` 下文档的**当前架构唯一权威**。本目录其余文件均为「PC 后台管理 Agent」历史快照，与当前代码已脱节，请勿照抄。
 > **关联规划**：`docs/deep-agents-plan.md`（D1–D4 实施记录）、`docs/agent-infrastructure.md`（旧基础设施基线，已过时）。
+> **范围**：不上多进程 Agent 集群、不接 A2A。进程内 `task` 只做上下文隔离。新领域顺序见 [`domain-adaptation-guide.md`](../domain-adaptation-guide.md) 文首；生产白名单与脚本来源见 [`mcp-guide.md`](../mcp-guide.md) §10。外部 Agent 不能共用这套设备 cookie、或某个领域要独立扩容时，再单独立项，先做 A2A Server。
 
 ## 0. 一句话
 
@@ -24,6 +25,15 @@
 | D2 | 虚拟文件系统 | `fs-store.ts`（磁盘 backend `.data/fs/<convId>/`，拒绝 `..`/绝对路径/反斜杠，单文件 256KB、每对话 100 文件）；工具结果超预算先卸载为 `results/<callId>.txt` 并留 `fs_read` 指针。工具：`fs_write`/`fs_edit`/`fs_ls`/`fs_read` |
 | D3 | 任务规划 todo | `builtins.ts(write_todos)` + `conversation.todos` + NDJSON `todos` 事件 + 前端计划卡（✓/•/○/×） |
 | D4 | 子 Agent 委派（通用型） | `builtins.ts(task)` + `chat.ts runLoop/runSubagent`：独立上下文（只看 description）+ 最小工具集（剔除 `task`/`write_todos`）+ `SUBAGENT_PROMPT` + 回传摘要（≤4000 字）+ 并行上限 3（worker 池）+ 取消级联（沿用主代理 signal）+ `SUBAGENT_MAX_ROUNDS=10` |
+
+`task` 是同一次运行里的上下文隔离，不是多进程集群（Anthropic《Building effective agents》：上下文互相污染或必须并行、且只需要摘要时才拆子任务）。
+
+| 场景 | 用什么 |
+|---|---|
+| 探陌生库结构、并行几路只读、主对话只要结论 | `task` |
+| 分页列表按小时计数 | `count_list_by_time`。模型或子代理逐页累加会丢页 |
+| 其它只读汇总 | `run_tool_code`。脚本进程里没有 MCP，不能拿来翻 MCP 分页 |
+| 要确认的写操作、删文件、跑命令、改定时任务 | 留在主对话。定时运行会直接拒绝这些工具 |
 
 当前 skills 目录（`apps/agent-server/skills/`）：`business-data-query` / `chart-visualization` / `metric-caliber-check` / `movie` / `pdf` / `schema-probe` / `web-research`。
 

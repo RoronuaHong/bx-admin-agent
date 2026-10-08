@@ -311,7 +311,7 @@ async function send() {
     await streamChat(
       text,
       // conversationId 显式带上 + agentId 供服务端按角色分流；model 走自动解析（auto = 不传则服务端按候选链兜底）。
-      { conversationId: convId, model: chosenModel || undefined, agentId: AGENT_ID },
+      { conversationId: convId, model: chosenModel || undefined, agentId: AGENT_ID, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || undefined },
       (event) => {
         if (event.type === "text_delta") {
           reply.text += event.text;

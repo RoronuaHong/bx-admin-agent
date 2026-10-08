@@ -9,12 +9,12 @@ import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
 import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
 import { admitDirectListCall, releaseDirectListCall, rememberDirectListPage } from "./list-page-gate.js";
-import { extractListRows, listResponseHasMore } from "./list-count.js";
+import { extractListRows, listResponseHasMore, normalizeTimeZone } from "./list-count.js";
 import { toolCodeDenied } from "./tool-code.js";
 import { buildUnattendedConclusion, unattendedToolDenial } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
-import { appendContext, getConversation, setConversationSummary } from "./conversations.js";
+import { appendContext, getConversation, patchConversation, setConversationSummary } from "./conversations.js";
 import { offloadToolResult } from "./fs-store.js";
 import {
   callAgent,
@@ -1257,6 +1257,8 @@ interface LoopContext {
   sessionId?: string;
   /** 发起请求的设备 owner：用于按用户隔离的本地状态（如观影画像），不暴露给模型。 */
   ownerKey?: string;
+  /** 浏览器上报的 IANA 时区。count_list_by_time 没传 timeZone 时用它，不从语言猜测。 */
+  timeZone?: string;
   maxRounds: number;
   /** 无人值守运行（定时任务）：最后一轮不再给工具，强制模型用已经取到的数据收尾写结论。
    *  不填 = 交互式行为不变（没人在等，模型可以一路调工具到预算耗尽）。 */
@@ -1359,6 +1361,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       ctx.ownerKey,
       ctx.signal,
       codeHooks,
+      ctx.timeZone,
     );
     if (builtin) return { ok: builtin.ok, text: builtin.text };
     hydrateDeferred(name);
@@ -1755,6 +1758,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.ownerKey,
         ctx.signal,
         codeHooks,
+        ctx.timeZone,
       );
       if (builtin) {
         return {
@@ -2141,6 +2145,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.ownerKey,
         ctx.signal,
         codeHooks,
+        ctx.timeZone,
       );
       // executed=false 表示并未真正执行（定时运行拒绝等）——不计入失败熔断。
       let executed = true;
@@ -2612,6 +2617,8 @@ export async function* chatStream(
      * 没有事实断言的回答已在分诊放行，不会走到这里。不传 = 交互对话。
      */
     unattendedConclusion?: "alert" | "report";
+    /** 浏览器上报的 IANA 时区。合法时写入本对话，并作为小时分桶的缺省时区。 */
+    timeZone?: string;
   } = {},
   signal?: AbortSignal,
   traceMeta?: { servedModel?: string; runId?: string },
@@ -2643,6 +2650,13 @@ export async function* chatStream(
     return;
   }
   const conversation = await getConversation(conversationId);
+  const timeZone =
+    normalizeTimeZone(opts.timeZone) || normalizeTimeZone(conversation?.timeZone) || undefined;
+  if (timeZone && conversation && conversation.timeZone !== timeZone) {
+    await patchConversation(conversationId, { timeZone }).catch((err) => {
+      console.warn(`[chat] 用户时区写回失败：${String((err as Error)?.message || err)}`);
+    });
+  }
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
   const roleDefaultModel = conversation?.agentId ? getRole(conversation.agentId).defaultModel : undefined;
   const roleModel = roleDefaultModel ? getModel(roleDefaultModel) : undefined;
@@ -2857,6 +2871,7 @@ export async function* chatStream(
       enabledSkills: conversation?.skillsEnabled,
       role: conversation?.agentId,
       ownerKey: opts.ownerKey,
+      timeZone,
     });
     // 聊天里随手贴的文档：解析为文本注入系统提示（本轮临时上下文，不污染持久历史）。
     const attachmentCtx = await buildAttachmentContext(opts.attachments, conversationId);
@@ -2901,6 +2916,7 @@ export async function* chatStream(
           forceToolCall: roleForceToolCall,
           enforceGrounding,
           ownerKey: opts.ownerKey,
+          ...(timeZone ? { timeZone } : {}),
           runId: traceMeta?.runId,
           system: systemPrompt,
           ...(deniedBuiltins.size ? { deniedBuiltins } : {}),

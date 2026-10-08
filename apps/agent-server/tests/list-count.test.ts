@@ -10,6 +10,7 @@ import {
   pageArgs,
   pageLimitForTool,
   prepareListArgs,
+  resolveCountTimeZone,
   type PageFetchResult,
 } from "../src/list-count.js";
 
@@ -335,4 +336,11 @@ test("工具名拆分与未连接的列表工具如实失败", async () => {
   expect(out?.ok).toBe(false);
   expect(out?.text).toContain("complete: false");
   expect(out?.text).toMatch(/未找到|未连接/);
+});
+
+test("没传时区时用用户时区，显式 UTC 不被改写", () => {
+  expect(resolveCountTimeZone("", "Asia/Shanghai")).toBe("Asia/Shanghai");
+  expect(resolveCountTimeZone("UTC", "Asia/Shanghai")).toBe("UTC");
+  expect(resolveCountTimeZone("", "Not/AZone")).toBe("UTC");
+  expect(resolveCountTimeZone("Not/AZone", "Asia/Shanghai")).toBe("Not/AZone");
 });

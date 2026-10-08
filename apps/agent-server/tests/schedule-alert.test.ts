@@ -1,6 +1,5 @@
 import { test, expect } from "vitest";
 import {
-  ALERT_COOLDOWN_MS,
   alertNextRunAt,
   buildUnattendedConclusion,
   decideAlertDelivery,
@@ -11,7 +10,13 @@ import {
   SCHEDULE_UNGROUNDED_REPORT,
   unattendedToolDenial,
 } from "../src/schedule-alert.js";
-import { garbledTextReason, validateTiming } from "../src/schedules.js";
+import { garbledTextReason, scheduleLockPid, validateTiming } from "../src/schedules.js";
+
+test("scheduleLockPid：只认本机 owner 里的 pid", () => {
+  expect(scheduleLockPid("DESKTOP-1-62232-ab12", "DESKTOP-1")).toBe(62232);
+  expect(scheduleLockPid("OTHER-62232-ab12", "DESKTOP-1")).toBeNull();
+  expect(scheduleLockPid("DESKTOP-1-nope-ab12", "DESKTOP-1")).toBeNull();
+});
 
 test("parseAlertMarker：认首行协议标记，忽略正文", () => {
   expect(parseAlertMarker("[SPIKE]\n印度对话量 420")).toBe("SPIKE");
@@ -29,7 +34,7 @@ test("pickNotifyPolicy / pickPurpose", () => {
   expect(pickPurpose("nope")).toBe(undefined);
 });
 
-test("decideAlertDelivery：SPIKE 推一次，冷静期内再 SPIKE 跳过", () => {
+test("decideAlertDelivery：连续 SPIKE 每期都推", () => {
   const t0 = 1_700_000_000_000;
   const first = decideAlertDelivery({ marker: "SPIKE", now: t0 });
   expect(first.kind).toBe("spike");
@@ -39,17 +44,11 @@ test("decideAlertDelivery：SPIKE 推一次，冷静期内再 SPIKE 跳过", () 
   const again = decideAlertDelivery({
     marker: "SPIKE",
     alertState: first.nextState,
-    now: t0 + ALERT_COOLDOWN_MS - 1,
+    now: t0 + 60_000,
   });
-  expect(again.kind).toBe("skip");
-  expect(again.nextState.firing).toBe(true);
-
-  const after = decideAlertDelivery({
-    marker: "SPIKE",
-    alertState: first.nextState,
-    now: t0 + ALERT_COOLDOWN_MS + 1,
-  });
-  expect(after.kind).toBe("spike");
+  expect(again.kind).toBe("spike");
+  expect(again.nextState.lastAlertAt).toBe(t0 + 60_000);
+  expect(again.nextState.normalStreak).toBe(0);
 });
 
 test("decideAlertDelivery：连续 2 期 NORMAL 才恢复；NO_DATA 打断计数", () => {

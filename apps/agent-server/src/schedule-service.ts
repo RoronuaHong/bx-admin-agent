@@ -13,6 +13,7 @@ import {
   markConversationSchedule,
   patchConversation,
 } from "./conversations.js";
+import { normalizeTimeZone } from "./list-count.js";
 import {
   countSchedulesOf,
   createSchedule,
@@ -98,6 +99,7 @@ export async function createTaskConversation(input: {
   scheduleId?: string;
   /** 该对话对应哪一期。 */
   scheduleRunAt?: number;
+  timeZone?: string;
 }) {
   return createConversation({
     id: `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -108,6 +110,7 @@ export async function createTaskConversation(input: {
     ...(input.skillsEnabled?.length ? { skillsEnabled: input.skillsEnabled } : {}),
     ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
     ...(input.scheduleRunAt !== undefined ? { scheduleRunAt: input.scheduleRunAt } : {}),
+    ...(input.timeZone ? { timeZone: input.timeZone } : {}),
   });
 }
 
@@ -129,6 +132,7 @@ export async function createRunConversation(schedule: ChatSchedule, at = Date.no
     ...(mcp?.length ? { mcpServers: mcp } : {}),
     ...(skills?.length ? { skillsEnabled: skills } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(schedule.timeZone ? { timeZone: schedule.timeZone } : {}),
     scheduleId: schedule.id,
     scheduleRunAt: at,
   });
@@ -189,8 +193,9 @@ export async function createScheduleTask(input: CreateScheduleInput): Promise<Cr
     return { ok: false, code: "AGENT_ROLE_UNKNOWN", error: `未知 Agent 角色：${agentId}` };
   }
   const sourceId = String(input.sourceConversationId || "").trim();
-  const sourceAgentId =
-    agentId || (sourceId ? (await getConversation(sourceId))?.agentId : undefined) || undefined;
+  const source = sourceId ? await getConversation(sourceId) : null;
+  const sourceAgentId = agentId || source?.agentId || undefined;
+  const sourceTimeZone = normalizeTimeZone(source?.timeZone);
 
   const taskMcp = knownMcpIds(input.mcpServers);
   const taskSkills = knownSkillDirs(input.skills);
@@ -215,6 +220,7 @@ export async function createScheduleTask(input: CreateScheduleInput): Promise<Cr
     mcpServers: taskMcp,
     ...(taskSkills.length ? { skillsEnabled: taskSkills } : {}),
     ...(sourceAgentId ? { agentId: sourceAgentId } : {}),
+    ...(sourceTimeZone ? { timeZone: sourceTimeZone } : {}),
   });
   try {
     const schedule = await createSchedule({
@@ -230,6 +236,7 @@ export async function createScheduleTask(input: CreateScheduleInput): Promise<Cr
       notifyPolicy,
       purpose,
       ...(input.locale ? { locale: String(input.locale) } : {}),
+      ...(sourceTimeZone ? { timeZone: sourceTimeZone } : {}),
       runMode,
       // 角色落库：每期新建会话要继承它，否则新会话退回 generic、与老会话不在一个入口。
       ...(sourceAgentId ? { agentId: sourceAgentId } : {}),

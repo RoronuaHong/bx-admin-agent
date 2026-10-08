@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { countSecretHits, redactSecrets } from "../src/redact.js";
 import { isAllowedMcpCommand } from "../src/mcp/config.js";
@@ -66,5 +67,30 @@ describe("MCP stdio 命令白名单（ASI06 供应链）", () => {
   it("启用白名单后空命令被拒", () => {
     process.env.MCP_ALLOWED_COMMANDS = "npx";
     expect(isAllowedMcpCommand("")).toBe(false);
+  });
+
+  it("生产环境未配白名单时拒绝 stdio（开发环境仍放行）", () => {
+    const prev = process.env.NODE_ENV;
+    delete process.env.MCP_ALLOWED_COMMANDS;
+    process.env.NODE_ENV = "production";
+    expect(isAllowedMcpCommand("node")).toBe(false);
+    expect(isAllowedMcpCommand("npx")).toBe(false);
+    process.env.MCP_ALLOWED_COMMANDS = "node";
+    expect(isAllowedMcpCommand("node")).toBe(true);
+    expect(isAllowedMcpCommand("cmd")).toBe(false);
+    if (prev === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prev;
+  });
+
+  it("stdio 启动前会查白名单和来源基线，拒绝记在连接错误上", () => {
+    const src = readFileSync(new URL("../src/mcp/hub.ts", import.meta.url), "utf8");
+    const gate = src.slice(src.indexOf("function transportRefusal"), src.indexOf("function buildTransport"));
+    expect(gate).toContain("isAllowedMcpCommand");
+    expect(gate).toContain("provenanceBlocked");
+    const open = src.slice(src.indexOf("async function openConnection"), src.indexOf("export async function connect"));
+    const tryAt = open.indexOf("try {");
+    expect(tryAt).toBeGreaterThan(open.indexOf("conns.set"));
+    expect(open.indexOf("buildTransport")).toBeGreaterThan(tryAt);
+    expect(open.slice(tryAt, open.indexOf("stderr"))).toContain("conn.error");
   });
 });

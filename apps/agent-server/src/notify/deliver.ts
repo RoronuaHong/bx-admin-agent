@@ -93,7 +93,7 @@ const LANGS: Record<DeliveryLang, LangPack> = {
   zh: {
     ok: "成功",
     fail: "失败",
-    alert: "预警",
+    alert: "异常",
     recovered: "已恢复",
     task: "任务",
     unnamed: "定时任务",
@@ -275,19 +275,76 @@ function stripToolTrace(text: string): string {
 }
 
 /**
+ * 对话里的协议标记只给引擎认。群消息用收件人语言的标识：
+ * 异常 = 破线，正常 = 未破线，警告 = 没取到完整计数。
+ */
+const ALERT_MARK_ZH: Record<string, string> = {
+  SPIKE: "异常",
+  NORMAL: "正常",
+  NO_DATA: "警告",
+};
+
+/** 钉钉 markdown 认 `<font color=#RRGGBB>`。圆点是图标，字色跟图标走。 */
+const ALERT_BADGE_ZH: Record<string, string> = {
+  异常: `<font color=#E5484D>🔴 异常</font>`,
+  正常: `<font color=#2F9E44>🟢 正常</font>`,
+  警告: `<font color=#F5C518>🟡 警告</font>`,
+  已恢复: `<font color=#2F9E44>🟢 已恢复</font>`,
+};
+
+export function alertBadgeZh(label: string): string {
+  return ALERT_BADGE_ZH[label] || label;
+}
+
+function presentAlertMarks(text: string, lang: DeliveryLang): string {
+  return text.replace(/\[(SPIKE|NORMAL|NO_DATA)\]/gi, (_, raw: string) => {
+    const key = String(raw).toUpperCase();
+    if (lang === "zh") return alertBadgeZh(ALERT_MARK_ZH[key] || key);
+    return `【${key}】`;
+  });
+}
+
+/**
+ * 群消息不复述工具字段。模型若把 complete / raw_rows 写进结论，这里改成中文；
+ * 关于「能不能发钉钉」的自述整行丢掉——推不推由引擎决定，不是结论的一部分。
+ */
+function polishZhAlert(text: string): string {
+  const replaced = text
+    .replace(/（工具返回）/g, "")
+    .replace(/（工具标注时区\s*Asia\/Shanghai）/g, "（上海）")
+    .replace(/Asia\/Shanghai/g, "上海")
+    .replace(/\bcomplete\s*:\s*true\b/gi, "计数完整")
+    .replace(/\bcomplete\s*:\s*false\b/gi, "计数不完整")
+    .replace(/\braw_rows\b/gi, "原始条数")
+    .replace(/\bunique\b/gi, "去重条数")
+    .replace(/\babove\b/gi, "超过")
+    .replace(/\bover_count\b/gi, "破线桶数")
+    .replace(/\*\/(\d+)/g, "每 $1 分钟");
+  return replaced
+    .split(/\r?\n/)
+    .filter((line) => !/钉钉群|推送能力|无法确认能否直接|群消息发送/.test(line))
+    .join("\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
  * 钉钉 / 飞书 markdown 会把 `_` 当斜体、把 `[词]` 当链接起点。
- * 监控正文里的 `country_code`、`[NORMAL]` 因此整段被吃掉，看起来像乱码。
  * 全角替换只影响 IM 文本，不改对话里的原文。
  */
-function neutralizeImMarkdown(text: string): string {
-  return text
-    .replace(/\[(SPIKE|NORMAL|NO_DATA)\]/gi, "【$1】")
-    .replace(/_/g, "＿");
+function neutralizeImMarkdown(text: string, lang: DeliveryLang): string {
+  const marked = lang === "zh" ? polishZhAlert(presentAlertMarks(text, lang)) : presentAlertMarks(text, lang);
+  return marked.replace(/_/g, "＿");
 }
 
 /** Markdown → IM 文本：去掉工具轨迹、躲开平台 markdown 误解析、表格折行、超长截断。 */
 export function formatForIm(text: string, lang: LangPack | DeliveryLang = "zh"): string {
   const pack = typeof lang === "string" ? LANGS[lang] : lang;
+  const deliveryLang: DeliveryLang =
+    typeof lang === "string"
+      ? lang
+      : ((Object.keys(LANGS) as DeliveryLang[]).find((key) => LANGS[key] === pack) ?? "zh");
   const lines = stripToolTrace(text).split(/\r?\n/);
   const out: string[] = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -303,7 +360,7 @@ export function formatForIm(text: string, lang: LangPack | DeliveryLang = "zh"):
     i -= 1;
     out.push(...tableToLines(block, pack));
   }
-  const merged = neutralizeImMarkdown(out.join("\n").replace(/\n{3,}/g, "\n\n").trim());
+  const merged = neutralizeImMarkdown(out.join("\n").replace(/\n{3,}/g, "\n\n").trim(), deliveryLang);
   if (merged.length <= MAX_BODY_CHARS) return merged;
   return `${merged.slice(0, MAX_BODY_CHARS)}\n\n${pack.truncated}`;
 }
@@ -580,16 +637,17 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
     ? [pack.chartSection(charts.length), ...charts.flatMap((chart) => chartToLines(chart, pack))].join("\n\n")
     : "";
   const conclusion = input.text.trim() ? formatForIm(input.text, pack) : pack.empty;
+  // 任务名放最前，并用一级标题加大（钉钉 markdown 不认 font size，# 是能变大的写法）。
+  const taskHeading = `# **${pack.task}：${name}**`;
   const record = [
-    `${pack.task}：${name}`,
-    `${pack.status}：${statusText}`,
+    `${pack.status}：${lang === "zh" ? alertBadgeZh(statusText) : statusText}`,
     ...(triggerText ? [`${pack.trigger}：${triggerText}`] : []),
     `${pack.at}：${new Date(input.at ?? Date.now()).toLocaleString()}`,
     ...(input.durationMs !== undefined && input.durationMs >= 0
       ? [`${pack.elapsed}：${formatElapsed(input.durationMs, lang)}`]
       : []),
   ];
-  const body = clampBody([conclusion, ...(chartBlock ? [chartBlock] : []), ...record].join("\n\n"), pack);
+  const body = clampBody([taskHeading, conclusion, ...(chartBlock ? [chartBlock] : []), ...record].join("\n\n"), pack);
   const origin = (input.webOrigin || "").trim().replace(/\/+$/, "");
   // 没配 WEB_ORIGIN 就不给按钮：宁可少一个按钮，也不要拼一个点不开的地址。
   const links: DeliveryLink[] = origin
