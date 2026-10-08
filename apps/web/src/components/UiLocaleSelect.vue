@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { getUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 
 const emit = defineEmits<{ change: [UiLocale] }>();
@@ -10,8 +10,28 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 const root = ref<HTMLElement | null>(null);
 const open = ref(false);
 const triggerRef = ref<HTMLButtonElement | null>(null);
+const menuWrap = ref<HTMLElement | null>(null);
 const optionEls = ref<HTMLLIElement[]>([]);
 const currentIndex = ref(0);
+
+// 浮层定位：Teleport 到 body 后用 fixed 坐标，右缘对齐触发按钮（与原 right:0 行为一致）。
+const pos = reactive({ top: 0, right: 0, minWidth: 0 });
+
+function updatePos() {
+  const tr = triggerRef.value?.getBoundingClientRect();
+  const panel = menuWrap.value;
+  if (!tr) return;
+  const w = panel ? panel.offsetWidth : Math.max(tr.width, 160);
+  const h = panel ? panel.offsetHeight : options.value.length * 36 + 12;
+  pos.minWidth = tr.width;
+  // 下方空间不足且上方更宽裕时翻到按钮上方，避免被视口底边裁掉。
+  const spaceBelow = window.innerHeight - tr.bottom;
+  pos.top =
+    spaceBelow < h + 12 && tr.top > spaceBelow ? Math.max(8, tr.top - h - 6) : tr.bottom + 8;
+  // 右缘对齐触发按钮，并夹在视口内（窄屏不溢出左边）。
+  const right = window.innerWidth - tr.right;
+  pos.right = Math.min(Math.max(8, right), window.innerWidth - w - 8);
+}
 
 const options = computed(() => [
   { value: "zh" as UiLocale, label: "中文" },
@@ -81,28 +101,43 @@ function onMenuKeydown(e: KeyboardEvent) {
 }
 
 function onPointerDown(e: MouseEvent) {
-  if (!root.value?.contains(e.target as Node)) open.value = false;
+  // 面板已 Teleport 到 body，不在 root 内，必须同时认触发框与面板两块区域，否则点选项会被误判为外点先关闭。
+  if (!root.value?.contains(e.target as Node) && !menuWrap.value?.contains(e.target as Node)) {
+    open.value = false;
+  }
 }
 
 function onWindowKeydown(e: KeyboardEvent) {
   if (e.key === "Escape" && open.value) closeMenu(true);
 }
 
+// 滚动/缩放时跟随触发按钮，避免浮层与按钮脱节。
+function reposition() {
+  if (open.value) updatePos();
+}
+
 onMounted(() => {
   window.addEventListener("mousedown", onPointerDown);
   window.addEventListener("keydown", onWindowKeydown);
+  window.addEventListener("scroll", reposition, true);
+  window.addEventListener("resize", reposition);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("mousedown", onPointerDown);
   window.removeEventListener("keydown", onWindowKeydown);
+  window.removeEventListener("scroll", reposition, true);
+  window.removeEventListener("resize", reposition);
 });
 
 // 打开后把焦点送到「当前选中项」：键盘用户不必先 Tab 一遍才落到菜单里。
 watch(open, (o) => {
   if (o) {
     syncIndex();
-    nextTick(() => focusOption(currentIndex.value));
+    nextTick(() => {
+      updatePos();
+      focusOption(currentIndex.value);
+    });
   }
 });
 </script>
@@ -122,13 +157,19 @@ watch(open, (o) => {
       <span class="locale-value">{{ currentOption?.label }}</span>
       <span class="locale-caret" aria-hidden="true"></span>
     </button>
-    <div v-if="open" class="locale-menu-wrap">
-      <ul
-        class="locale-menu"
-        role="listbox"
-        :aria-label="tx('界面语言', 'UI language', 'Idioma da interface', 'इंटरफ़ेस भाषा')"
-        @keydown="onMenuKeydown"
+    <Teleport to="body">
+      <div
+        v-if="open"
+        ref="menuWrap"
+        class="locale-menu-wrap"
+        :style="{ top: pos.top + 'px', right: pos.right + 'px', minWidth: pos.minWidth + 'px' }"
       >
+        <ul
+          class="locale-menu"
+          role="listbox"
+          :aria-label="tx('界面语言', 'UI language', 'Idioma da interface', 'इंटरफ़ेस भाषा')"
+          @keydown="onMenuKeydown"
+        >
         <!-- role="option" 直接上 <li>：listbox 的必需子元素是 option，读屏才能报「第几项 / 共几项」。
              roving tabindex：仅当前项可 Tab 进入，方向键在选项间移动（APG listbox 约定）；
              当前选中项用 aria-selected 标出。 -->
@@ -146,8 +187,9 @@ watch(open, (o) => {
           <span class="locale-option__label">{{ item.label }}</span>
           <span v-if="item.value === uiLocale" class="locale-option__check" aria-hidden="true">✓</span>
         </li>
-      </ul>
-    </div>
+        </ul>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -232,12 +274,12 @@ watch(open, (o) => {
   box-shadow: var(--ring);
 }
 
+/* 浮层 Teleport 到 body：fixed 定位 + 高 z-index，脱离任何祖先的层叠上下文/裁剪，
+   不再被头部兄弟面板或页面内容盖住（对齐 UiSelect/ModelSelect 的浮层方案）。
+   top/right/minWidth 由脚本按触发按钮矩形计算（右缘对齐按钮，与原 right:0 行为一致）。 */
 .locale-menu-wrap {
-  position: absolute;
-  top: calc(100% + 8px);
-  right: 0;
-  z-index: 30;
-  min-width: 100%;
+  position: fixed;
+  z-index: 1200;
 }
 
 .locale-menu {
@@ -302,10 +344,8 @@ watch(open, (o) => {
     font-size: 12px;
   }
 
-  /* 保持右缘对齐向左展开：控件通常靠在右侧，改成 left:0 会让菜单向右溢出视口被裁切。 */
+  /* 浮层坐标已由脚本按视口夹紧（right ≥ 8px），这里只兜 max-width 防长标签溢出。 */
   .locale-menu-wrap {
-    right: 0;
-    left: auto;
     max-width: calc(100vw - 24px);
   }
 }
