@@ -94,6 +94,37 @@ export function pickPurpose(value?: unknown): SchedulePurpose | undefined {
   return undefined;
 }
 
+/**
+ * 启动确认文案跟「之后怎么推」走，不跟表单上的用途标签走。
+ * 仅异常策略即使用途写成报告，也不能告诉收件人「之后每期都推」。
+ */
+export function deliveryArmPurpose(input: {
+  purpose?: SchedulePurpose;
+  notifyPolicy?: ScheduleNotifyPolicy;
+}): "report" | "alert" {
+  if (pickNotifyPolicy(input.notifyPolicy) === "on_alert" || input.purpose === "alert") return "alert";
+  return "report";
+}
+
+/**
+ * 这一期要不要附带启动确认。
+ * - 显式 armPending：新建、重新启用，或上一期通道没发出去。
+ * - 旧预警没有这个字段：只要还没确认过就补一次。
+ * - 旧的周期报告已经跑过（有 lastRunAt）不补，避免下一拍被写成「刚启动」。
+ *   从没跑过的仍补，创建后的第一期才不会漏。
+ */
+export function needsArmNotice(input: {
+  armPending?: boolean;
+  armedNotifiedAt?: number | null;
+  notifyPolicy?: unknown;
+  lastRunAt?: number | null;
+}): boolean {
+  if (input.armPending === true) return true;
+  if (input.armedNotifiedAt != null) return false;
+  if (pickNotifyPolicy(input.notifyPolicy) === "on_alert") return true;
+  return input.lastRunAt == null;
+}
+
 export type AlertDeliveryKind = "spike" | "recovered" | "skip" | "started";
 
 /**

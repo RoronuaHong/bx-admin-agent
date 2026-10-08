@@ -66,10 +66,14 @@ interface LangPack {
   fail: string;
   alert: string;
   recovered: string;
-  /** 启用后第一期：不论是否破线都要发，用来确认通道并说明之后怎么推。 */
+  /** 预警启用后第一期：不论是否破线都要发。 */
   started: string;
-  /** 启动确认正文。放在结论前面，不进模型原文（避免被「钉钉」过滤删掉）。 */
+  /** 周期报告创建后的第一期。 */
+  startedReport: string;
+  /** 预警启动确认。放在结论前面，不进模型原文（避免被「钉钉」过滤删掉）。 */
   armedNote: string;
+  /** 周期报告的启动确认：之后每期都推，不能写成「仅异常」。 */
+  armedNoteReport: string;
   task: string;
   /** 任务名本身已不可读时的标题，避免把「??????」再推出去。 */
   unnamed: string;
@@ -100,9 +104,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     alert: "异常",
     recovered: "已恢复",
     started: "预警已启动",
+    startedReport: "任务已启动",
     armedNote:
       "预警已启动。这条消息用来确认通知群能收到。\n\n" +
       "本次检查结果在下面。之后只在异常时推送；正常和无数据不推。连续两期恢复正常会再通知一次。",
+    armedNoteReport:
+      "定时任务已启动。这条消息用来确认通知群能收到。\n\n" +
+      "本次结果在下面。之后每次执行都会推送。",
     task: "任务",
     unnamed: "定时任务",
     status: "状态",
@@ -125,9 +133,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     alert: "Alert",
     recovered: "Recovered",
     started: "Alert armed",
+    startedReport: "Task started",
     armedNote:
       "This alert is now on. This message confirms the notification channel works.\n\n" +
       "The check result is below. Later messages go out only on alert; normal and no-data stay quiet. Two normal checks in a row send one recovery note.",
+    armedNoteReport:
+      "This scheduled task is now on. This message confirms the notification channel works.\n\n" +
+      "This run's result is below. Later runs are pushed every time.",
     task: "Task",
     unnamed: "Scheduled task",
     status: "Status",
@@ -150,9 +162,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     alert: "Alerta",
     recovered: "Recuperado",
     started: "Alerta ativado",
+    startedReport: "Tarefa iniciada",
     armedNote:
       "O alerta está ativo. Esta mensagem confirma que o canal de notificação recebe.\n\n" +
       "O resultado desta verificação está abaixo. Depois disso, só anomalias são enviadas; normal e sem dados ficam em silêncio. Duas verificações normais seguidas enviam uma recuperação.",
+    armedNoteReport:
+      "A tarefa agendada está ativa. Esta mensagem confirma que o canal recebe.\n\n" +
+      "O resultado desta execução está abaixo. As próximas execuções são enviadas sempre.",
     task: "Tarefa",
     unnamed: "Tarefa agendada",
     status: "Status",
@@ -175,9 +191,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     alert: "अलर्ट",
     recovered: "बहाल",
     started: "अलर्ट चालू",
+    startedReport: "कार्य चालू",
     armedNote:
       "अलर्ट चालू हो गया है। यह संदेश पुष्टि करता है कि सूचना चैनल पहुँच रहा है।\n\n" +
       "इस जाँच का परिणाम नीचे है। आगे केवल असामान्य पर सूचना जाएगी; सामान्य और बिना डेटा चुप रहेंगे। लगातार दो सामान्य जाँच पर एक बहाली सूचना जाएगी।",
+    armedNoteReport:
+      "यह निर्धारित कार्य चालू है। यह संदेश पुष्टि करता है कि सूचना चैनल पहुँच रहा है।\n\n" +
+      "इस बार का परिणाम नीचे है। आगे हर बार परिणाम भेजा जाएगा।",
     task: "कार्य",
     unnamed: "अनुसूचित कार्य",
     status: "स्थिति",
@@ -311,6 +331,7 @@ const ALERT_BADGE_ZH: Record<string, string> = {
   警告: `<font color=#F5C518>🟡 警告</font>`,
   已恢复: `<font color=#2F9E44>🟢 已恢复</font>`,
   预警已启动: `<font color=#4F7CFF>🔵 预警已启动</font>`,
+  任务已启动: `<font color=#4F7CFF>🔵 任务已启动</font>`,
 };
 
 export function alertBadgeZh(label: string): string {
@@ -586,6 +607,8 @@ export interface ScheduleDeliveryInput {
   status: "success" | "failed" | "alert" | "recovered" | "started";
   /** 启用后的第一期：正文前附启动说明。破线时状态仍是异常，避免把告警写成普通启动。 */
   armed?: boolean;
+  /** 报告和预警的启动说明不同：报告之后每期都推，预警之后仅异常才推。 */
+  purpose?: "report" | "alert";
   text: string;
   conversationId: string;
   webOrigin?: string;
@@ -639,6 +662,7 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
     return t;
   };
   const name = (readableLabel(input.name) || readableLabel(input.prompt) || pack.unnamed).slice(0, 40);
+  const reportArm = input.purpose === "report";
   const statusText =
     input.status === "failed"
       ? pack.fail
@@ -647,7 +671,9 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
         : input.status === "recovered"
           ? pack.recovered
           : input.status === "started"
-            ? pack.started
+            ? reportArm
+              ? pack.startedReport
+              : pack.started
             : pack.ok;
   const triggerText =
     input.trigger === "manual"
@@ -672,7 +698,8 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
       ? [`${pack.elapsed}：${formatElapsed(input.durationMs, lang)}`]
       : []),
   ];
-  const armedNote = input.armed || input.status === "started" ? pack.armedNote : "";
+  const armedNote =
+    input.armed || input.status === "started" ? (reportArm ? pack.armedNoteReport : pack.armedNote) : "";
   const body = clampBody(
     [taskHeading, ...(armedNote ? [armedNote] : []), conclusion, ...(chartBlock ? [chartBlock] : []), ...record].join("\n\n"),
     pack,

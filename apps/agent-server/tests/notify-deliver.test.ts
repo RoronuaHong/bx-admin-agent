@@ -343,6 +343,20 @@ test("[N] 启动确认：不论本次是否破线，正文都说明已启动，�
   expect(spike.title).toBe("印度客服对话量预警 · 异常");
   expect(spike.body).toContain("预警已启动");
   expect(spike.body).toContain("🔴 异常");
+
+  const report = buildScheduleDelivery({
+    name: "每日巡检",
+    prompt: "巡检",
+    status: "started",
+    purpose: "report",
+    text: "今日观看时长 12 小时",
+    conversationId: "c",
+    locale: "zh",
+  });
+  expect(report.title).toBe("每日巡检 · 任务已启动");
+  expect(report.body).toContain("定时任务已启动");
+  expect(report.body).toContain("之后每次执行都会推送");
+  expect(report.body).not.toContain("只在异常时推送");
 });
 
 test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定时任务」", () => {

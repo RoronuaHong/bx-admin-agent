@@ -54,9 +54,23 @@ afterAll(async () => {
 test("[A] 建任务默认「每期新会话」，专属会话带任务归属标记", async () => {
   const { schedule } = await makeTask("a");
   expect(schedule.runMode).toBe("new");
+  // 周期任务一建好就排队跑一期，启动确认不用干等到下一拍 cron。
+  expect(schedule.runRequestedAt).toBeGreaterThan(0);
+  expect(schedule.armPending).toBe(true);
   const conv = await getConversation(schedule.conversationId);
   // 归属标记是「删任务时只删本任务产出的会话」的依据：没有它只能靠任务侧列表，截断后就认不出来了。
   expect(conv?.scheduleId).toBe(schedule.id);
+});
+
+test("[A2] 一次性任务不提前跑，避免目标时刻之外多执行一次", async () => {
+  const result = await createScheduleTask({
+    ownerKey: owner("a2"),
+    prompt: "到点提醒",
+    name: "一次性提醒",
+    onceAt: Date.now() + 3_600_000,
+  });
+  if (!result.ok) throw new Error(result.error);
+  expect(result.schedule.runRequestedAt).toBeUndefined();
 });
 
 test("[B] 落点可以指定「同一会话」（沿用上下文的场景）", async () => {

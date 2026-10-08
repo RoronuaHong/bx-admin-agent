@@ -19,8 +19,10 @@ import {
   createSchedule,
   deleteSchedule,
   garbledTextReason,
+  kickScheduleLoop,
   listSchedules,
   patchSchedule,
+  requestScheduleRun,
   prependRun,
   MAX_SCHEDULES_PER_OWNER,
   validateTiming,
@@ -245,7 +247,15 @@ export async function createScheduleTask(input: CreateScheduleInput): Promise<Cr
     await markConversationSchedule(conversation.id, schedule.id).catch((e) => {
       console.warn(`[schedule-service] 任务归属标记失败，删除任务时可能无法清理其产出会话：${String((e as Error)?.message || e)}`);
     });
-    return { ok: true, schedule, conversation: { id: conversation.id } };
+    // 周期任务和预警一建好就多跑一期：启动确认要带上本次结果，不能干等下一拍 cron。
+    // 一次性任务不提前跑，否则会在目标时刻之外多执行一次。
+    let saved = schedule;
+    if (input.onceAt === undefined) {
+      const queued = await requestScheduleRun(schedule.id, input.ownerKey);
+      if (queued) saved = queued;
+      kickScheduleLoop();
+    }
+    return { ok: true, schedule: saved, conversation: { id: conversation.id } };
   } catch (err) {
     await deleteConversation(conversation.id).catch((e) => {
       console.warn(`[schedule-service] 任务创建失败，回收会话也失败，可能留下孤儿会话：${String((e as Error)?.message || e)}`);

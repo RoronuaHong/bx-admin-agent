@@ -1476,10 +1476,10 @@ function taskCardTip(t: ScheduleDto): string {
   if (t.notifyPolicy === "on_alert") {
     lines.push(
       tx(
-        "通知：仅异常时推（正常 / 无数据不推）。启用后第一次执行会发启动确认",
-        "Notify: alerts only (normal / no-data stay silent). The first run after enabling sends a start confirmation",
-        "Notificar: só anomalias (normal / sem dados ficam quietos). A primeira execução após ativar envia a confirmação de início",
-        "सूचना: केवल असामान्य (सामान्य / बिना डेटा चुप)। चालू करने के बाद पहली बार एक आरंभ पुष्टि जाती है",
+        "通知：仅异常时推。新建或重新启用后的第一期会发启动确认",
+        "Notify: alerts only. The first run after create or re-enable sends a start confirmation",
+        "Notificar: só anomalias. A primeira execução após criar ou reativar confirma o início",
+        "सूचना: केवल असामान्य। बनाने या फिर चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
       ),
     );
   }
@@ -5638,10 +5638,10 @@ onBeforeUnmount(() => {
                   class="seg seg--inline"
                   role="radiogroup"
                   :title='taskDraft.purpose === "alert" ? tx(
-                    "数据预警：到点检查，仅异常时推送。启用后第一次执行会发启动确认",
-                    "Data alert: check on schedule, notify only on anomaly. The first run after enabling sends a start confirmation",
-                    "Alerta de dados: verifica no horário, notifica só em anomalia. A primeira execução após ativar confirma o início",
-                    "डेटा अलर्ट: शेड्यूल पर जाँच, केवल असामान्य पर सूचित। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
+                    "数据预警：保存后马上检查一次并发启动确认，之后仅异常时推送",
+                    "Data alert: runs once on save and sends a start confirmation, then notifies only on anomaly",
+                    "Alerta de dados: roda uma vez ao salvar e confirma o início, depois só em anomalia",
+                    "डेटा अलर्ट: सहेजते ही एक बार जाँच और आरंभ पुष्टि, फिर केवल असामान्य पर सूचित",
                   ) : tx(
                     "周期报告：到点出报告并推送结果",
                     "Recurring report: produce and push a report on schedule",
@@ -5743,10 +5743,10 @@ onBeforeUnmount(() => {
                   "Só em alerta: silêncio no normal, falhas ainda notificam. A primeira execução após ativar confirma o início",
                   "केवल अलर्ट पर: सामान्य में चुप, विफलता पर भी भेजें। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
                 ) : tx(
-                  "每期都推：成功与失败都推",
-                  "Every run: success and failure both push",
-                  "Cada execução: sucesso e falha ambos enviam",
-                  "हमेशा सूचित: सफल व विफल दोनों भेजें",
+                  "每期都推。新建后马上跑一期，并发一条启动确认",
+                  "Every run. A new task runs once right away and sends a start confirmation",
+                  "Cada execução. Uma tarefa nova roda na hora e confirma o início",
+                  "हर बार भेजें। नया कार्य तुरंत एक बार चलता है और आरंभ पुष्टि भेजता है",
                 )'
               >
                 <span class="task-row__label">{{ tx("通知策略", "Notify policy", "Política de notificação", "सूचना नीति") }}</span>

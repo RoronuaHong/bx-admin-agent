@@ -3,6 +3,8 @@ import {
   alertNextRunAt,
   buildUnattendedConclusion,
   decideAlertDelivery,
+  deliveryArmPurpose,
+  needsArmNotice,
   parseAlertMarker,
   pickNotifyPolicy,
   pickPurpose,
@@ -49,6 +51,18 @@ test("decideAlertDelivery：连续 SPIKE 每期都推", () => {
   expect(again.kind).toBe("spike");
   expect(again.nextState.lastAlertAt).toBe(t0 + 60_000);
   expect(again.nextState.normalStreak).toBe(0);
+});
+
+test("needsArmNotice / deliveryArmPurpose：欠确认才发；文案跟通知策略走", () => {
+  expect(needsArmNotice({ armPending: true, armedNotifiedAt: 1, notifyPolicy: "always", lastRunAt: 1 })).toBe(true);
+  expect(needsArmNotice({ notifyPolicy: "on_alert" })).toBe(true);
+  expect(needsArmNotice({ notifyPolicy: "on_alert", armedNotifiedAt: 5, lastRunAt: 5 })).toBe(false);
+  expect(needsArmNotice({ notifyPolicy: "always", lastRunAt: 5 })).toBe(false);
+  expect(needsArmNotice({ notifyPolicy: "always" })).toBe(true);
+  expect(needsArmNotice({ notifyPolicy: "always", lastRunAt: 5, armPending: true })).toBe(true);
+  expect(deliveryArmPurpose({ purpose: "report", notifyPolicy: "on_alert" })).toBe("alert");
+  expect(deliveryArmPurpose({ purpose: "alert", notifyPolicy: "always" })).toBe("alert");
+  expect(deliveryArmPurpose({ purpose: "report", notifyPolicy: "always" })).toBe("report");
 });
 
 test("decideAlertDelivery：启用后第一期，未破线也要推启动确认；破线仍算异常", () => {
