@@ -54,6 +54,11 @@ export interface CountListRequest {
   pageLimit?: number;
   above?: number;
   maxPages: number;
+  /**
+   * 主时间字段整行都读不出时，改用这个字段归小时。
+   * 会话列表用来接住模型写错的字段名，避免整页被标成不完整。
+   */
+  fallbackTimeField?: string;
 }
 
 export interface CountListReport {
@@ -240,6 +245,50 @@ export function listToolProbeKey(toolName: string): string {
  * 已知接口的稳定排序。offset 翻页在无序结果上会漏行或重复。
  * 只补这一家会话列表；其它工具不写入它不认识的 sort 字段。
  */
+/**
+ * 会话列表的 sort_by=in_time 只保证翻页顺序。行上能归进小时的是 start_time。
+ * 模型常把排序字段抄进 timeField，整页都读不出时间，计数就被标成不完整。
+ */
+export function conversationCountTimeField(toolName: string, timeField: string): string {
+  const field = timeField.trim();
+  if (!/getConversationsList/i.test(toolName)) return field || "start_time";
+  if (!field || field === "in_time") return "start_time";
+  return field;
+}
+
+function withStartTime(value: unknown): unknown {
+  if (typeof value === "string") {
+    const parts = value.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean);
+    if (parts.some((part) => part === "start_time" || part.endsWith(".start_time"))) return value;
+    return [...parts, "start_time"].join(",");
+  }
+  if (Array.isArray(value) && value.every((part) => typeof part === "string")) {
+    if (value.some((part) => part === "start_time" || part.endsWith(".start_time"))) return value;
+    return [...value, "start_time"];
+  }
+  return value;
+}
+
+/**
+ * 会话列表若带了字段投影，必须留下 start_time。
+ * 模型常写成 id,in_time，接口就不再返回开始时间，计数会整页落空。
+ */
+export function ensureConversationStartTime(toolName: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (!/getConversationsList/i.test(toolName)) return args;
+  const walk = (node: Record<string, unknown>) => {
+    for (const [key, value] of Object.entries(node)) {
+      if (/^(fields|field|include|columns)$/i.test(key)) {
+        node[key] = withStartTime(value);
+        continue;
+      }
+      const child = asRecord(value);
+      if (child) walk(child);
+    }
+  };
+  walk(args);
+  return args;
+}
+
 export function prepareListArgs(toolName: string, args: Record<string, unknown>): Record<string, unknown> {
   const copy = structuredClone(args);
   if (!/getConversationsList/i.test(toolName)) return copy;
@@ -508,7 +557,10 @@ export async function countPagedList(
       if (seen.has(id)) continue;
       seen.add(id);
       fresh += 1;
-      const ms = readTime(row, request.timeField);
+      const ms = readTime(row, request.timeField)
+        ?? (request.fallbackTimeField && request.fallbackTimeField !== request.timeField
+          ? readTime(row, request.fallbackTimeField)
+          : null);
       if (ms == null) {
         skippedTime += 1;
         continue;

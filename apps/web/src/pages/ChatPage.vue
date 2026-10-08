@@ -1476,10 +1476,10 @@ function taskCardTip(t: ScheduleDto): string {
   if (t.notifyPolicy === "on_alert") {
     lines.push(
       tx(
-        "通知：仅异常时推（正常 / 无数据不推）",
-        "Notify: alerts only (normal / no-data stay silent)",
-        "Notificar: só anomalias (normal / sem dados ficam quietos)",
-        "सूचना: केवल असामान्य (सामान्य / बिना डेटा चुप)",
+        "通知：仅异常时推（正常 / 无数据不推）。启用后第一次执行会发启动确认",
+        "Notify: alerts only (normal / no-data stay silent). The first run after enabling sends a start confirmation",
+        "Notificar: só anomalias (normal / sem dados ficam quietos). A primeira execução após ativar envia a confirmação de início",
+        "सूचना: केवल असामान्य (सामान्य / बिना डेटा चुप)। चालू करने के बाद पहली बार एक आरंभ पुष्टि जाती है",
       ),
     );
   }
@@ -5638,10 +5638,10 @@ onBeforeUnmount(() => {
                   class="seg seg--inline"
                   role="radiogroup"
                   :title='taskDraft.purpose === "alert" ? tx(
-                    "数据预警：到点检查，仅异常时推送",
-                    "Data alert: check on schedule, notify only on anomaly",
-                    "Alerta de dados: verifica no horário, notifica só em anomalia",
-                    "डेटा अलर्ट: शेड्यूल पर जाँच, केवल असामान्य पर सूचित",
+                    "数据预警：到点检查，仅异常时推送。启用后第一次执行会发启动确认",
+                    "Data alert: check on schedule, notify only on anomaly. The first run after enabling sends a start confirmation",
+                    "Alerta de dados: verifica no horário, notifica só em anomalia. A primeira execução após ativar confirma o início",
+                    "डेटा अलर्ट: शेड्यूल पर जाँच, केवल असामान्य पर सूचित। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
                   ) : tx(
                     "周期报告：到点出报告并推送结果",
                     "Recurring report: produce and push a report on schedule",
@@ -5738,10 +5738,10 @@ onBeforeUnmount(() => {
               <div
                 class="task-row"
                 :title='taskDraft.notifyPolicy === "on_alert" ? tx(
-                  "仅异常时推送：正常期静默，失败仍推",
-                  "On alert only: quiet when normal, failures still push",
-                  "Só em alerta: silêncio no normal, falhas ainda notificam",
-                  "केवल अलर्ट पर: सामान्य में चुप, विफलता पर भी भेजें",
+                  "仅异常时推送：正常期静默，失败仍推。启用后第一次执行会发启动确认",
+                  "On alert only: quiet when normal, failures still push. The first run after enabling sends a start confirmation",
+                  "Só em alerta: silêncio no normal, falhas ainda notificam. A primeira execução após ativar confirma o início",
+                  "केवल अलर्ट पर: सामान्य में चुप, विफलता पर भी भेजें। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
                 ) : tx(
                   "每期都推：成功与失败都推",
                   "Every run: success and failure both push",

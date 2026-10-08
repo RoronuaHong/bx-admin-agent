@@ -42,6 +42,7 @@ export const SCHEDULE_ALERT_GUIDE =
   "3) **禁止** render_chart、export_data、写报告 HTML、基于截断片段估算/外推。\n" +
   "4) 取数优先短窗口（按用户指令，常见 ≤60 分钟）与**聚合/计数**接口；" +
   "列表没有总数、又要按小时或阈值计数时，调用 count_list_by_time 一次取回，不要逐页翻列表。" +
+  "会话列表的小时按开始时间计；排序字段不是每条会话的开始时间，不要拿它当分桶字段。" +
   "小时桶以外的汇总用 run_tool_code，不要用 run_script 翻页。" +
   "参数说明里没有的筛选字段不要写进查询参数。" +
   "若工具结果含「结果已截断」或首行 complete: false（计数不完整），禁止用该片段估算——仍不完整则 [NO_DATA]。\n" +
@@ -93,58 +94,52 @@ export function pickPurpose(value?: unknown): SchedulePurpose | undefined {
   return undefined;
 }
 
-export type AlertDeliveryKind = "spike" | "recovered" | "skip";
+export type AlertDeliveryKind = "spike" | "recovered" | "skip" | "started";
 
 /**
  * 根据本期标记与任务上的 alertState 决定是否推送，并算出下一期状态。
  * - SPIKE：每期都推。同一条异常持续破线也会再发，不做时间去重。
  * - NORMAL：告警中连续 2 期才推「已恢复」。
  * - NO_DATA / 无标记：不推；NO_DATA 打断恢复计数，但不清除 firing。
+ * - arming：启用后还没发过启动确认。本来会跳过的一期改成推「已启动」（不论是否破线）。
+ *   已经是 SPIKE / 恢复的仍用原类型，由通知正文另附「已启动」。
  */
 export function decideAlertDelivery(input: {
   marker: AlertMarker | null;
   alertState?: ScheduleAlertState;
   now?: number;
+  /** 启用后尚未发出启动确认。 */
+  arming?: boolean;
 }): { kind: AlertDeliveryKind; nextState: ScheduleAlertState } {
   const now = input.now ?? Date.now();
   const prev = input.alertState || {};
   const firing = Boolean(prev.firing);
   const lastAlertAt = prev.lastAlertAt;
   const streak = Math.max(0, Number(prev.normalStreak) || 0);
+  const finish = (kind: AlertDeliveryKind, nextState: ScheduleAlertState) =>
+    input.arming && kind === "skip" ? { kind: "started" as const, nextState } : { kind, nextState };
 
   if (input.marker === "SPIKE") {
-    return {
-      kind: "spike",
-      nextState: { firing: true, lastAlertAt: now, normalStreak: 0 },
-    };
+    return finish("spike", { firing: true, lastAlertAt: now, normalStreak: 0 });
   }
 
   if (input.marker === "NORMAL") {
     if (!firing) {
-      return { kind: "skip", nextState: { firing: false, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: 0 } };
+      return finish("skip", { firing: false, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: 0 });
     }
     const nextStreak = streak + 1;
     if (nextStreak >= 2) {
-      return {
-        kind: "recovered",
-        nextState: { firing: false, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: 0 },
-      };
+      return finish("recovered", { firing: false, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: 0 });
     }
-    return {
-      kind: "skip",
-      nextState: { firing: true, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: nextStreak },
-    };
+    return finish("skip", { firing: true, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: nextStreak });
   }
 
   // NO_DATA 或无法识别：不推；打断恢复计数，保留 firing。
-  return {
-    kind: "skip",
-    nextState: {
-      ...(firing ? { firing: true } : { firing: false }),
-      ...(lastAlertAt !== undefined ? { lastAlertAt } : {}),
-      normalStreak: 0,
-    },
-  };
+  return finish("skip", {
+    ...(firing ? { firing: true } : { firing: false }),
+    ...(lastAlertAt !== undefined ? { lastAlertAt } : {}),
+    normalStreak: 0,
+  });
 }
 
 /** 破线后加密检查的下限（5 分钟）。引擎自己算，不改用户存的 cron，也不交给模型改。 */

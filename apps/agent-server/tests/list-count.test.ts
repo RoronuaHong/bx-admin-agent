@@ -2,6 +2,8 @@ import { test, expect } from "vitest";
 import { execBuiltin } from "../src/builtins.js";
 import {
   calendarHourLabel,
+  conversationCountTimeField,
+  ensureConversationStartTime,
   countPagedList,
   formatCountReport,
   hourBucketLabel,
@@ -305,6 +307,35 @@ test("会话列表页大小封顶 99，其它列表用通用页大小", () => {
   const generic = pageLimitForTool("mcp__crm__listDeals");
   expect(generic).toBe(LIST_COUNT_PAGE_LIMIT);
   expect(pageLimitForTool("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList")).toBe(Math.min(99, generic));
+});
+
+test("会话列表把 in_time 改成 start_time 再分桶，其它字段保持原样", () => {
+  const tool = "mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList";
+  expect(conversationCountTimeField(tool, "in_time")).toBe("start_time");
+  expect(conversationCountTimeField(tool, "")).toBe("start_time");
+  expect(conversationCountTimeField(tool, "end_time")).toBe("end_time");
+  expect(conversationCountTimeField("mcp__other__list", "in_time")).toBe("in_time");
+  expect(conversationCountTimeField("mcp__other__list", "")).toBe("start_time");
+});
+
+test("会话列表的字段投影必须带上 start_time，否则按 in_time 取回的行无法分桶", async () => {
+  const tool = "mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList";
+  const projected = ensureConversationStartTime(tool, {
+    query_params: { fields: "id,in_time,status", from_time: 1 },
+  });
+  expect((projected.query_params as { fields: string }).fields).toBe("id,in_time,status,start_time");
+  const listed = ensureConversationStartTime(tool, { fields: ["id", "in_time"] });
+  expect(listed.fields).toEqual(["id", "in_time", "start_time"]);
+  const kept = ensureConversationStartTime(tool, { query_params: { fields: "id,start_time" } });
+  expect((kept.query_params as { fields: string }).fields).toBe("id,start_time");
+
+  const counted = await countPagedList(
+    request({ timeField: "in_time", fallbackTimeField: "start_time" }),
+    async () => page([row("a", FROM), row("b", FROM + 60_000)], false),
+  );
+  expect(counted.complete).toBe(true);
+  expect(counted.unique).toBe(2);
+  expect(counted.skippedTime).toBe(0);
 });
 
 test("会话列表缺省按开始时间升序，已写排序则不覆盖", () => {

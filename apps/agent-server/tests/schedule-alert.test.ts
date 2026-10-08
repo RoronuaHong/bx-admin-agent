@@ -51,6 +51,26 @@ test("decideAlertDelivery：连续 SPIKE 每期都推", () => {
   expect(again.nextState.normalStreak).toBe(0);
 });
 
+test("decideAlertDelivery：启用后第一期，未破线也要推启动确认；破线仍算异常", () => {
+  const quiet = decideAlertDelivery({ marker: "NORMAL", arming: true });
+  expect(quiet.kind).toBe("started");
+  expect(quiet.nextState.firing).toBe(false);
+
+  const nodata = decideAlertDelivery({ marker: "NO_DATA", arming: true });
+  expect(nodata.kind).toBe("started");
+  expect(nodata.nextState.firing).toBe(false);
+
+  const unmarked = decideAlertDelivery({ marker: null, arming: true });
+  expect(unmarked.kind).toBe("started");
+
+  const spike = decideAlertDelivery({ marker: "SPIKE", arming: true, now: 50 });
+  expect(spike.kind).toBe("spike");
+  expect(spike.nextState.firing).toBe(true);
+
+  const later = decideAlertDelivery({ marker: "NORMAL", alertState: quiet.nextState });
+  expect(later.kind).toBe("skip");
+});
+
 test("decideAlertDelivery：连续 2 期 NORMAL 才恢复；NO_DATA 打断计数", () => {
   const firing = { firing: true, lastAlertAt: 1, normalStreak: 0 };
   const n1 = decideAlertDelivery({ marker: "NORMAL", alertState: firing });

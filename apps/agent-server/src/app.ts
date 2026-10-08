@@ -536,6 +536,8 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
  *
  * `notifyPolicy=on_alert`（docs/scheduled-spike-detection-plan.md）：
  * 失败仍推；成功则按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] 决定是否推。SPIKE 每期都推。
+ * 启用后还没发过启动确认时，这一期不论是否破线都推一条（立即执行或到点启动都算）。
+ * 通道没发出去就不记 armedNotifiedAt，下一期再试。
  */
 async function deliverScheduleResult(
   schedule: ChatSchedule,
@@ -548,9 +550,11 @@ async function deliverScheduleResult(
   if (!notifyOn.includes(status)) return;
 
   const policy: ScheduleNotifyPolicy = pickNotifyPolicy(schedule.notifyPolicy);
-  let deliveryStatus: "success" | "failed" | "alert" | "recovered" = status;
+  let deliveryStatus: "success" | "failed" | "alert" | "recovered" | "started" = status;
   let alertStatePatch: ChatSchedule["alertState"] | undefined;
   let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
+  // 只对「仅异常才推」的预警补启动确认。每期都推的报告本来就会发，不必再写一段启动说明。
+  const arming = policy === "on_alert" && schedule.armedNotifiedAt == null;
 
   if (policy === "on_alert") {
     if (status === "failed") {
@@ -561,6 +565,7 @@ async function deliverScheduleResult(
       const decision = decideAlertDelivery({
         marker,
         alertState: schedule.alertState,
+        arming,
       });
       alertStatePatch = decision.nextState;
       if (decision.kind === "skip") {
@@ -571,7 +576,8 @@ async function deliverScheduleResult(
         });
         return;
       }
-      deliveryStatus = decision.kind === "spike" ? "alert" : "recovered";
+      deliveryStatus =
+        decision.kind === "spike" ? "alert" : decision.kind === "started" ? "started" : "recovered";
     }
   }
 
@@ -602,6 +608,7 @@ async function deliverScheduleResult(
       ...(meta?.trigger ? { trigger: meta.trigger } : {}),
       ...(meta?.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
       ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
+      ...(arming ? { armed: true } : {}),
     }),
   );
   if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
@@ -610,6 +617,8 @@ async function deliverScheduleResult(
     lastDelivery: { at: summary.at, ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) },
     ...(alertStatePatch ? { alertState: alertStatePatch } : {}),
     ...(lastMarker ? { lastMarker } : {}),
+    // 至少一条通道收到才算启动确认已发出；全失败则下期重试，避免群里从未出现「已启动」。
+    ...(arming && summary.sent > 0 ? { armedNotifiedAt: summary.at } : {}),
   });
 }
 

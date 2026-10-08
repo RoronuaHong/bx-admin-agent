@@ -313,6 +313,38 @@ test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单�
   expect(msg.title).toBe("印度对话量 · 异常");
 });
 
+test("[N] 启动确认：不论本次是否破线，正文都说明已启动，以及之后只在异常时推", () => {
+  const normal = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "started",
+    text: "[NORMAL]\n最近 60 分钟 120，阈值 300",
+    conversationId: "c",
+    locale: "zh",
+    trigger: "manual",
+    at: Date.parse("2026-10-08T08:04:06Z"),
+  });
+  expect(normal.title).toBe("印度客服对话量预警 · 预警已启动");
+  expect(normal.body).toContain("预警已启动");
+  expect(normal.body).toContain("之后只在异常时推送");
+  expect(normal.body).toContain("🟢 正常");
+  expect(normal.body.indexOf("预警已启动。")).toBeLessThan(normal.body.indexOf("🟢 正常"));
+  expect(normal.body).toContain("触发：手动执行");
+
+  const spike = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "alert",
+    armed: true,
+    text: "[SPIKE]\n最近 60 分钟 420，阈值 300",
+    conversationId: "c",
+    locale: "zh",
+  });
+  expect(spike.title).toBe("印度客服对话量预警 · 异常");
+  expect(spike.body).toContain("预警已启动");
+  expect(spike.body).toContain("🔴 异常");
+});
+
 test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定时任务」", () => {
   const msg = buildScheduleDelivery({
     name: "??????",

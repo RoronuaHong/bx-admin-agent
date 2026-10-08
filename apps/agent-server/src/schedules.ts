@@ -109,6 +109,11 @@ export interface ChatSchedule {
   timeZone?: string;
   /** 最近一次投递结果（前端显示「上次推送」用；不含任何凭据）。 */
   lastDelivery?: { at: number; ok: boolean; sent: number; error?: string };
+  /**
+   * 预警启动确认已发出的时刻。空 = 启用后还没发过。
+   * 暂停或重新启用会清掉，下一期（立即执行或到点）再发一条，不论是否破线。
+   */
+  armedNotifiedAt?: number;
   enabled: boolean;
   createdAt: number;
   lastRunAt?: number;
@@ -427,6 +432,8 @@ export interface SchedulePatch {
   ownConversation?: boolean;
   /** 本次投递结果（调度器回写用；前端不可改）。 */
   lastDelivery?: ChatSchedule["lastDelivery"];
+  /** 启动确认已发出的时刻（调度器回写；暂停 / 重新启用时清掉）。 */
+  armedNotifiedAt?: number;
   /** 显式覆盖下次触发时刻（运维 / 测试用）。 */
   nextRunAt?: number;
 }
@@ -486,8 +493,13 @@ export async function patchSchedule(
     ...(patch.conversationId ? { conversationId: patch.conversationId } : {}),
     ...(patch.ownConversation !== undefined ? { ownConversation: patch.ownConversation } : {}),
     ...(patch.lastDelivery !== undefined ? { lastDelivery: patch.lastDelivery } : {}),
+    ...(patch.armedNotifiedAt !== undefined ? { armedNotifiedAt: patch.armedNotifiedAt } : {}),
     ...(patch.nextRunAt !== undefined ? { nextRunAt: patch.nextRunAt } : {}),
   };
+  // 暂停或重新启用：下一期再发启动确认。字段必须从库里删掉，留着会让「第一次」永远不再发生。
+  const resetArm =
+    patch.enabled === false || (patch.enabled === true && prev.enabled === false);
+  if (resetArm) delete next.armedNotifiedAt;
   if (switchingToOnce) delete next.cron;
   if (switchingToCron) delete next.onceAt;
   // 时间 / 启停变更 → 重新计算下次触发（显式 nextRunAt 覆盖优先）。
@@ -499,7 +511,10 @@ export async function patchSchedule(
     memory.set(id, next);
     return next;
   }
-  await coll.updateOne({ id }, { $set: next });
+  await coll.updateOne(
+    { id },
+    resetArm ? { $set: next, $unset: { armedNotifiedAt: "" } } : { $set: next },
+  );
   return next;
 }
 
@@ -551,7 +566,7 @@ async function writeSchedule(next: ChatSchedule): Promise<void> {
     memory.set(doc.id, doc);
     return;
   }
-  const { nextRunAt, queuedSince, runRequestedAt, holdNextRunAt, wakeReason, ...rest } = doc;
+  const { nextRunAt, queuedSince, runRequestedAt, holdNextRunAt, wakeReason, armedNotifiedAt, ...rest } = doc;
   // 这些字段「不存在」有语义：有值就 $set，缺值就 $unset 真删。
   // 注意 $set 的载荷必须**按值重新组装**——直接用 rest 会把拆出来的字段一起漏掉。
   const set: Record<string, unknown> = { ...rest };
@@ -566,6 +581,8 @@ async function writeSchedule(next: ChatSchedule): Promise<void> {
   else set.holdNextRunAt = holdNextRunAt;
   if (wakeReason === undefined) unset.wakeReason = "";
   else set.wakeReason = wakeReason;
+  if (armedNotifiedAt === undefined) unset.armedNotifiedAt = "";
+  else set.armedNotifiedAt = armedNotifiedAt;
   await coll.updateOne(
     { id: doc.id },
     Object.keys(unset).length ? { $set: set, $unset: unset } : { $set: set },
@@ -657,6 +674,7 @@ export async function schedulerTick(
       delete paused.runRequestedAt;
       delete paused.holdNextRunAt;
       delete paused.wakeReason;
+      delete paused.armedNotifiedAt;
       await writeSchedule(paused);
       continue;
     }

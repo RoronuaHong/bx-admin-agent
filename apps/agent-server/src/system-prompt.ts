@@ -93,7 +93,8 @@ const TOOLING_RULES = [
   "13. 分页列表要做跨页计数、按小时分桶或和阈值比较时，调用 count_list_by_time 一次取回计数。" +
     "不要自己逐页翻列表，也不要把翻页委派给子代理。每个列表工具本轮只放行一次第一页，换筛选或继续翻 index、offset、page、cursor 都会被拒绝。" +
     "小时桶以外的汇总用 run_tool_code：在代码里调用只读工具，只把聚合结果打印出来；run_script 调不到这些工具。" +
-    "返回首行 complete 为 false（计数不完整）时，如实说没翻完，不要用已看到的页估算总数或是否超阈值。",
+    "返回首行 complete 为 false（计数不完整）时，如实说没翻完，不要用已看到的页估算总数或是否超阈值。" +
+    "Zoho 会话列表的小时字段是 start_time。in_time 只用于排序，不要当作 timeField。",
   "",
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
