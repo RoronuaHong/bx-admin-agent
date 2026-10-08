@@ -2533,7 +2533,10 @@ async function createConvFromDraft(firstText: string): Promise<string> {
     locale: st.settings.locale,
   };
   if (st.settings.modelId) patch.model = st.settings.modelId;
-  if (st.settings.mcpEnabled.length) patch.mcpServers = [...st.settings.mcpEnabled];
+  // 专家自带的数据源跟着角色走，不因草稿里没勾选而被覆盖掉。
+  const mcpEnabled = [...new Set([...boundMcpIds.value, ...st.settings.mcpEnabled])];
+  st.settings.mcpEnabled = mcpEnabled;
+  if (mcpEnabled.length) patch.mcpServers = mcpEnabled;
   if (st.settings.skillsEnabled.length) patch.skillsEnabled = [...st.settings.skillsEnabled];
   // 首条消息紧接着就开跑，服务端按对话文档里的启用集取工具。必须等落库完成再拉列表，
   // 否则 loadMcp 会用新建对话的空启用集把草稿勾选盖掉，这一轮也用不上连接器。
@@ -3559,8 +3562,10 @@ interface TurnRun {
   convId: string;
   reply: Bubble;
   state: ConvState;
-  /** 本轮请求的模型（auto 模式下用于失败黑名单）。 */
+  /** 本轮请求的模型。自动模式传 auto，真正跑起来的模型以服务端 model 事件为准。 */
   chosenModel: string;
+  /** 服务端实际用上的模型（自动模式换过模型之后是换成的那个）。 */
+  servedModel?: string;
   /** 是否收到过终态事件（done / 服务端 error）：没收到就结束的流 = 中断，必须收口。 */
   sawTerminal: boolean;
   /** 已消费到的最后一个事件序号 = 续传游标（服务端据它只回放更新的部分）。 */
@@ -3577,6 +3582,7 @@ interface TurnRun {
  */
 function applyChatEvent(run: TurnRun, event: ChatEvent): void {
   if (typeof event.seq === "number" && event.seq > run.lastSeq) run.lastSeq = event.seq;
+  if (event.type === "model") run.servedModel = event.id;
   const { convId, reply, state } = run;
   if (event.type === "text_delta") {
     reply.text += event.text;
@@ -3729,7 +3735,7 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
     reply.streaming = false;
     openReasoning.delete(reply.id);
     // 本轮成功：记下来实际用到的具体模型，供「自动」模式下次优先复用（哪个能用用哪个）。
-    if (!reply.error) lastGoodModelId.value = run.chosenModel;
+    if (!reply.error) lastGoodModelId.value = run.servedModel || run.chosenModel;
     // 正常收束时理论上不该再有「执行中」的步骤 / 子代理（结果事件可能因缓冲裁剪等缺口没到）：
     // 顺手归一，让「气泡里不留永久转圈的步骤」这条不变量在任何路径上都成立。
     for (const step of reply.steps || []) if (step.status === "running") step.status = "interrupted";
@@ -3811,7 +3817,9 @@ async function runTurn(
   openReasoning.add(reply.id);
   state.sending = true;
   state.error = "";
-  const chosenModel = resolveModel(state.settings.modelId);
+  const selected = state.settings.modelId || MODEL_AUTO_ID;
+  // 自动模式把挑选权交给服务端：402 / 500 会当场换下一个还能用的模型，而不是先钉死一个再失败。
+  const chosenModel = selected === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(selected);
   // 中断句柄存进「该对话自己的」状态：切到别的对话后按停止不会误伤这一条。
   const controller = new AbortController();
   state.controller = controller;
@@ -4270,6 +4278,7 @@ async function loadMcp(convId = currentId.value) {
   if (!convId) {
     const data = await fetchChatMcpServers().catch(() => null);
     if (data) mcpAvailable.value = data.available;
+    void ensureBoundMcp("");
     return;
   }
   const data = await fetchChatMcpServers(convId).catch(() => null);
@@ -4277,6 +4286,7 @@ async function loadMcp(convId = currentId.value) {
   mcpAvailable.value = data.available;
   const state = states.get(convId);
   if (state) state.settings.mcpEnabled = data.enabled;
+  void ensureBoundMcp(convId);
 }
 
 /**
@@ -4300,8 +4310,45 @@ function openMcpPanel(focusSearch = true) {
   void loadMcp();
 }
 
+/** 专家自带的数据源（客服 = 已接好的 SalesIQ）。不在连接器里当普通可选项关掉。 */
+const boundMcpIds = computed(() => (AGENT_ID === "support" ? ["zoho-salesiq"] : []));
+
+function isBoundMcp(id: string): boolean {
+  return boundMcpIds.value.includes(id);
+}
+
+/** 已有对话缺了专家自带源时补上；草稿态只改内存，首条消息创建会话时一并落库。 */
+let bindingBoundMcp = false;
+async function ensureBoundMcp(convId: string) {
+  const bound = boundMcpIds.value.filter((id) => mcpAvailable.value.some((server) => server.id === id));
+  if (!bound.length || bindingBoundMcp) return;
+  const state = convId ? states.get(convId) : current.value;
+  if (!state) return;
+  const missing = bound.filter((id) => !state.settings.mcpEnabled.includes(id));
+  if (!missing.length) return;
+  const next = [...new Set([...state.settings.mcpEnabled, ...missing])];
+  if (!convId) {
+    state.settings.mcpEnabled = next;
+    for (const id of missing) void connectTaskMcp(id);
+    return;
+  }
+  bindingBoundMcp = true;
+  try {
+    const data = await setChatMcpServers(next, convId);
+    const live = states.get(convId);
+    if (live) live.settings.mcpEnabled = data.enabled;
+    mcpAvailable.value = data.available;
+    syncConvLocal(convId, { mcpServers: data.enabled });
+  } catch {
+    /* 补启用失败时不打断对话；连接器面板仍会把这一项标成客服自带 */
+  } finally {
+    bindingBoundMcp = false;
+  }
+}
+
 /** 勾选/取消某个 MCP 服务器（乐观更新 + 失败回滚）。 */
 async function toggleMcp(id: string, on: boolean) {
+  if (!on && isBoundMcp(id)) return;
   const convId = currentId.value;
   const state = current.value;
   const prev = state.settings.mcpEnabled;
@@ -4340,13 +4387,14 @@ async function clearMcpSelection() {
   const convId = currentId.value;
   const state = current.value;
   const prev = state.settings.mcpEnabled;
-  state.settings.mcpEnabled = [];
+  const keep = boundMcpIds.value.filter((id) => mcpAvailable.value.some((server) => server.id === id));
+  state.settings.mcpEnabled = keep;
   mcpExpanded.value = "";
   if (!convId) return;
   mcpBusy.value = true;
   mcpError.value = "";
   try {
-    const data = await setChatMcpServers([], convId);
+    const data = await setChatMcpServers(keep, convId);
     mcpAvailable.value = data.available;
     state.settings.mcpEnabled = data.enabled;
     syncConvLocal(convId, { mcpServers: data.enabled });
@@ -4517,6 +4565,44 @@ const mcpFiltered = computed(() => {
   return mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
 });
 
+const mcpBoundRows = computed(() => mcpFiltered.value.filter((server) => isBoundMcp(server.id)));
+const mcpOptionalRows = computed(() => mcpFiltered.value.filter((server) => !isBoundMcp(server.id)));
+
+const mcpPanelRows = computed(() => {
+  void uiLocale.value;
+  const rows: Array<
+    | { kind: "label"; key: string; text: string }
+    | { kind: "server"; key: string; server: (typeof mcpAvailable.value)[number]; bound: boolean }
+  > = [];
+  if (mcpBoundRows.value.length) {
+    rows.push({
+      kind: "label",
+      key: "bound",
+      text: tx("客服已启用", "Included with support", "Incluído no suporte", "सहायता के साथ शामिल"),
+    });
+    for (const server of mcpBoundRows.value) rows.push({ kind: "server", key: server.id, server, bound: true });
+  }
+  if (mcpOptionalRows.value.length) {
+    if (mcpBoundRows.value.length) {
+      rows.push({
+        kind: "label",
+        key: "optional",
+        text: tx("其他连接器", "Other connectors", "Outros conectores", "अन्य कनेक्टर"),
+      });
+    }
+    for (const server of mcpOptionalRows.value) rows.push({ kind: "server", key: server.id, server, bound: false });
+  }
+  return rows;
+});
+
+/** 取消全部只清可选连接器；专家自带源不在这层。 */
+const canClearOptionalMcp = computed(() => {
+  if (!mcpAvailable.value.length) return enabledMcpCount.value > 0 && !boundMcpIds.value.length;
+  return current.value.settings.mcpEnabled.some(
+    (id) => !isBoundMcp(id) && mcpAvailable.value.some((server) => server.id === id),
+  );
+});
+
 /**
  * 连接器角标只数「当前列表里确实存在」的 id：服务器若被从服务端配置里移除，
  * 对话的启用集里可能残留悬空 id，直接按数组长度算就会出现「面板里一个勾都没有、角标却显示 1」。
@@ -4557,6 +4643,50 @@ const expertOpen = ref(false);
 const expertAgents: AgentEntry[] = AGENTS.filter((a) => a.id !== "movie" && a.id !== "generic");
 // 当前选中的专家（无 = 通用，对齐 CodeBuddy：chip 存在即已选专家，无 chip 即通用）。
 const currentExpert = computed(() => expertAgents.find((a) => a.id === AGENT_ID));
+
+/** 专家空对话的示例问法。点一下就作为第一条消息发出。 */
+const expertStarters = computed(() => {
+  if (AGENT_ID !== "support") return [] as string[];
+  void uiLocale.value;
+  return [
+    tx(
+      "最近 60 分钟，印度的 SalesIQ 会话有多少？",
+      "How many SalesIQ chats from India in the last 60 minutes?",
+      "Quantas conversas do SalesIQ da Índia nos últimos 60 minutos?",
+      "पिछले 60 मिनट में भारत की कितनी SalesIQ बातचीत हुईं?",
+    ),
+    tx(
+      "列出最近打开的会话",
+      "List the most recently opened chats",
+      "Listar as conversas abertas mais recentes",
+      "हाल ही में खुली बातचीत दिखाएँ",
+    ),
+    tx(
+      "考勤制度里，迟到怎么规定？",
+      "What do the attendance rules say about being late?",
+      "O que as regras de ponto dizem sobre atraso?",
+      "उपस्थिति नियमों में देरी के बारे में क्या है?",
+    ),
+  ];
+});
+
+const composerPlaceholder = computed(() =>
+  AGENT_ID === "support"
+    ? tx(
+        "问会话量、某个地区的会话，或公司制度…",
+        "Ask about chat volume, a region's chats, or company policy…",
+        "Pergunte sobre volume de chats, conversas de uma região ou políticas…",
+        "बातचीत की संख्या, किसी क्षेत्र की चैट या कंपनी नीति पूछें…",
+      )
+    : tx("输入消息…", "Type a message…", "Digite uma mensagem…", "संदेश लिखें…"),
+);
+
+function askStarter(text: string) {
+  const state = current.value;
+  if (!state || state.sending) return;
+  state.input = text;
+  void send();
+}
 
 const expertQuery = ref("");
 /**
@@ -6565,6 +6695,22 @@ onBeforeUnmount(() => {
           <div class="boot-skeleton__row boot-skeleton__row--user"></div>
           <div class="boot-skeleton__row boot-skeleton__row--agent boot-skeleton__row--short"></div>
         </div>
+        <div v-else-if="!booting && !current.bubbles.length && currentExpert" class="expert-home">
+          <div class="expert-home__mark" aria-hidden="true">{{ currentExpert.icon }}</div>
+          <h2 class="expert-home__title">{{ agentText(currentExpert.label, uiLocale) }}</h2>
+          <p class="expert-home__desc">{{ agentText(currentExpert.description, uiLocale) }}</p>
+          <div v-if="expertStarters.length" class="expert-home__prompts">
+            <button
+              v-for="prompt in expertStarters"
+              :key="prompt"
+              type="button"
+              class="expert-home__prompt"
+              @click="askStarter(prompt)"
+            >
+              {{ prompt }}
+            </button>
+          </div>
+        </div>
         <div v-else-if="!booting && !current.bubbles.length" class="empty">
           {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
         </div>
@@ -6956,7 +7102,7 @@ onBeforeUnmount(() => {
             :min-height="COMPOSER_BASE"
             :max-height="COMPOSER_AUTO_MAX"
             :pad-top="6"
-            :placeholder="tx('输入消息…', 'Type a message…', 'Digite uma mensagem…', 'संदेश लिखें…')"
+            :placeholder="composerPlaceholder"
             :hint="tx('Enter 发送 · Shift+Enter 换行', 'Enter to send · Shift+Enter for a new line', 'Enter envia · Shift+Enter nova linha', 'भेजने के लिए Enter · नई पंक्ति के लिए Shift+Enter')"
             @input="autoGrow"
             @keydown="onKeydown"
@@ -7144,67 +7290,80 @@ onBeforeUnmount(() => {
                           : tx("没有可选的 MCP 服务器", "No MCP server available", "Nenhum servidor MCP disponível", "कोई MCP सर्वर उपलब्ध नहीं")
                       }}
                     </div>
+                    <template v-for="row in mcpPanelRows" :key="row.key">
+                    <div v-if="row.kind === 'label'" class="tools-section">{{ row.text }}</div>
                     <div
-                      v-for="s in mcpFiltered"
-                      :key="s.id"
+                      v-else
                       class="tools-item"
-                      :class="{ on: current.settings.mcpEnabled.includes(s.id) }"
+                      :class="{ on: row.bound || current.settings.mcpEnabled.includes(row.server.id), 'is-bound': row.bound }"
                     >
                       <button
                         type="button"
                         class="tools-item__main"
                         :disabled="mcpBusy"
-                        @click="toggleMcp(s.id, !current.settings.mcpEnabled.includes(s.id))"
+                        @click="row.bound || toggleMcp(row.server.id, !current.settings.mcpEnabled.includes(row.server.id))"
                       >
-                        <span class="tools-item__icon" :style="iconStyle(s.id)" aria-hidden="true">{{ iconChar(s.label) }}</span>
+                        <span class="tools-item__icon" :style="iconStyle(row.server.id)" aria-hidden="true">{{ iconChar(row.server.label) }}</span>
                         <span class="tools-item__body">
                           <span class="tools-item__name">
-                            {{ s.label }}
-                            <span class="mcp-status" :class="mcpRowState(s).cls">
-                              <span class="mcp-dot" :class="mcpRowState(s).cls"></span>
-                              {{ mcpRowState(s).text }}
+                            {{ row.server.label }}
+                            <span v-if="row.bound" class="tools-item__pin">{{ tx("已启用", "On", "Ativo", "चालू") }}</span>
+                            <span class="mcp-status" :class="mcpRowState(row.server).cls">
+                              <span class="mcp-dot" :class="mcpRowState(row.server).cls"></span>
+                              {{ mcpRowState(row.server).text }}
                             </span>
                           </span>
-                          <span class="tools-item__desc" :title="mcpDescText(s)">{{ mcpDescText(s) }}</span>
-                          <span v-if="mcpExpanded === s.id && s.toolNames.length" class="tools-item__tools">{{ s.toolNames.join("、") }}</span>
+                          <span class="tools-item__desc" :title="row.bound ? tx('客服助手自带，不能在这里关闭', 'Included with the support assistant and cannot be turned off here', 'Incluído no assistente de suporte e não pode ser desligado aqui', 'सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता') : mcpDescText(row.server)">{{ row.bound ? tx("客服助手自带，不能在这里关闭", "Included with the support assistant and cannot be turned off here", "Incluído no assistente de suporte e não pode ser desligado aqui", "सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता") : mcpDescText(row.server) }}</span>
+                          <span v-if="mcpExpanded === row.server.id && row.server.toolNames.length" class="tools-item__tools">{{ row.server.toolNames.join("、") }}</span>
                         </span>
                       </button>
                       <span class="tools-item__check-slot" aria-hidden="true">
-                        <svg v-if="current.settings.mcpEnabled.includes(s.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <svg v-if="!row.bound && current.settings.mcpEnabled.includes(row.server.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                           <path d="m5 12.5 4.5 4.5L19 7.5" />
                         </svg>
                       </span>
                       <span class="tools-item__ops">
                         <button
                           class="mcp-mini"
-                          :class="{ 'is-ghost': !s.toolNames.length }"
+                          :class="{ 'is-ghost': !row.server.toolNames.length }"
                           type="button"
-                          :disabled="!s.toolNames.length"
-                          :tabindex="s.toolNames.length ? undefined : -1"
-                          :title="s.toolNames.length ? tx('工具清单', 'Tool list', 'Lista de ferramentas', 'टूल सूची') : undefined"
-                          :aria-hidden="!s.toolNames.length"
-                          @click.stop="s.toolNames.length && (mcpExpanded = mcpExpanded === s.id ? '' : s.id)"
+                          :disabled="!row.server.toolNames.length"
+                          :tabindex="row.server.toolNames.length ? undefined : -1"
+                          :title="row.server.toolNames.length ? tx('工具清单', 'Tool list', 'Lista de ferramentas', 'टूल सूची') : undefined"
+                          :aria-hidden="!row.server.toolNames.length"
+                          @click.stop="row.server.toolNames.length && (mcpExpanded = mcpExpanded === row.server.id ? '' : row.server.id)"
                         >
-                          {{ mcpExpanded === s.id ? "▴" : "▾" }}
+                          {{ mcpExpanded === row.server.id ? "▴" : "▾" }}
                         </button>
                         <button
                           class="mcp-mini"
                           type="button"
-                          :disabled="mcpBusy || !current.settings.mcpEnabled.includes(s.id)"
+                          :disabled="mcpBusy || !current.settings.mcpEnabled.includes(row.server.id)"
                           :title="tx('重连', 'Reconnect', 'Reconectar', 'पुनः कनेक्ट')"
-                          @click.stop="reconnectMcp(s.id)"
+                          @click.stop="reconnectMcp(row.server.id)"
                         >
                           ⟳
                         </button>
                       </span>
                     </div>
+                    </template>
                   </div>
 
                   <div class="tools-flyout__foot">
+                    <p v-if="boundMcpIds.length" class="flyout-hint">
+                      {{
+                        tx(
+                          "带「已启用」的是客服助手自带的数据源，不能在这里关闭。下面的连接器仍可按需勾选。",
+                          "Items marked On come with the support assistant and cannot be turned off here. Connectors below can still be selected.",
+                          "Itens marcados Ativo vêm com o assistente e não podem ser desligados aqui. Os conectores abaixo ainda podem ser escolhidos.",
+                          "「चालू」 सहायता सहायक के साथ आता है और यहाँ बंद नहीं होता। नीचे के कनेक्टर चुने जा सकते हैं।",
+                        )
+                      }}
+                    </p>
                     <button
                       class="tools-flyout__action"
                       type="button"
-                      :disabled="!enabledMcpCount || mcpBusy"
+                      :disabled="!canClearOptionalMcp || mcpBusy"
                       @click="clearMcpSelection"
                     >
                       {{ tx("取消全部已选连接器", "Deselect all connectors", "Desmarcar todos os conectores", "सभी चयन हटाएँ") }}
@@ -10978,6 +11137,86 @@ button.step-head:disabled {
   margin: auto;
   color: var(--muted);
   font-size: 14px;
+}
+
+.expert-home {
+  margin: auto;
+  width: min(440px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 12px 0 28px;
+}
+
+.expert-home__mark {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  font-size: 26px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+.expert-home__title {
+  margin: 4px 0 0;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.expert-home__desc {
+  margin: 0;
+  max-width: 36em;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.expert-home__prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-top: 10px;
+}
+
+.expert-home__prompt {
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.expert-home__prompt:hover {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+.tools-section {
+  padding: 8px 10px 2px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.tools-item.is-bound .tools-item__main {
+  cursor: default;
+}
+
+.tools-item__pin {
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 /* 对话区首屏骨架：加载期间占位，避免先闪「想聊点什么？」空态再被真实消息覆盖。 */

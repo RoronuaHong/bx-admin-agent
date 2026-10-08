@@ -15,6 +15,7 @@ function summary(over: Partial<EvalSummary>): EvalSummary {
     poor: 0,
     axisFailures: [],
     qualityDegraded: false,
+    behaviorRuns: 0,
     ...over,
   };
 }
@@ -27,16 +28,25 @@ describe("渐进式自主分级（只向下收紧）", () => {
     expect(s.reason).toContain("样本不足");
   });
 
-  it("劣质占比高 → 降为受限（轮次预算收到 4）", () => {
-    const s = autonomyFromSummary(summary({ good: 3, degraded: 3, poor: 5 }), 14);
+  it("未收束或未取证占比高 → 降为受限（轮次预算收到 4）", () => {
+    const s = autonomyFromSummary(summary({ good: 3, degraded: 3, poor: 5, behaviorRuns: 8 }), 14);
     expect(s.level).toBe(0);
     expect(s.maxRounds).toBe(4);
   });
 
-  it("劣质占比中等 → 谨慎（收到 8）", () => {
-    const s = autonomyFromSummary(summary({ good: 6, degraded: 3, poor: 1 }), 14);
+  it("未收束或未取证占比中等 → 谨慎（收到 8）", () => {
+    const s = autonomyFromSummary(summary({ good: 6, degraded: 3, poor: 1, behaviorRuns: 4 }), 14);
     expect(s.level).toBe(1);
     expect(s.maxRounds).toBe(8);
+  });
+
+  it("只是模型切换或检索偏慢 → 不收紧轮次", () => {
+    const s = autonomyFromSummary(
+      summary({ good: 2, degraded: 8, poor: 0, qualityDegraded: true, behaviorRuns: 0 }),
+      28,
+    );
+    expect(s.level).toBe(2);
+    expect(s.maxRounds).toBe(28);
   });
 
   it("质量正常 → 不收紧", () => {

@@ -49,6 +49,9 @@ test("[D] 角色人设只含角色特有内容：不含被下沉到通用层的�
   expect(base).toContain("TMDb");
   expect(base).not.toContain("引用数据时注明来自哪次工具调用");
   expect(getRole("support").basePrompt || "").not.toContain("多步任务先拆解步骤再执行");
+  expect(getRole("support").defaultMcpServers).toEqual(["zoho-salesiq"]);
+  expect(getRole("support").basePrompt || "").toContain("ZohoSalesIQ_getConversationsList");
+  expect(getRole("support").basePrompt || "").toContain("不要调用 order_search");
 });
 
 test("[G] 工具纪律含事实核验条款（有检索工具就先核实；核不到明说可能不准确；不追问外的细节）", () => {

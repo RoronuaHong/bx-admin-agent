@@ -100,6 +100,9 @@ export function scoreRunTrace(rt: RunTrace): RunEvalScore {
   };
 }
 
+/** 会让代理在证据不足或无法收束时继续乱动的维度。成本与通道故障不在此列。 */
+export const BEHAVIOR_AXES = new Set(["converged", "grounded", "correction"]);
+
 function monthFile(at: number): string {
   const d = new Date(at);
   const ym = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -179,8 +182,13 @@ export interface EvalSummary {
   poor: number;
   /** 未达标维度计数：定位「到底是哪个维度在劣化」。 */
   axisFailures: Array<{ axis: string; count: number }>;
-  /** 劣质占比超阈值 → true（供告警/看板判断）。 */
+  /** 劣质占比超阈值 → true（供告警/看板判断）。含成本/稳定性维度，不用于收紧自主度。 */
   qualityDegraded: boolean;
+  /**
+   * 行为失败的运行数：未收束、未取证、或接地纠正过多。
+   * 模型切换、轮次、耗时、token 是成本与通道问题，不计入。自主度只看这个数。
+   */
+  behaviorRuns: number;
 }
 
 /** 只读聚合：一段时间内的质量概览。 */
@@ -193,11 +201,13 @@ export function summarizeEval(filter: EvalFilter & { days?: number } = {}): Eval
   let good = 0;
   let degraded = 0;
   let poor = 0;
+  let behaviorRuns = 0;
   for (const item of items) {
     sum += item.score;
     if (item.verdict === "good") good += 1;
     else if (item.verdict === "degraded") degraded += 1;
     else poor += 1;
+    if (item.failed.some((axis) => BEHAVIOR_AXES.has(axis))) behaviorRuns += 1;
     for (const axis of item.failed) axisMap.set(axis, (axisMap.get(axis) || 0) + 1);
   }
   const badRatio = items.length ? (degraded + poor) / items.length : 0;
@@ -212,5 +222,6 @@ export function summarizeEval(filter: EvalFilter & { days?: number } = {}): Eval
       .map(([axis, count]) => ({ axis, count }))
       .sort((a, b) => b.count - a.count),
     qualityDegraded: items.length >= 5 && badRatio > limit,
+    behaviorRuns,
   };
 }

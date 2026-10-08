@@ -3,6 +3,8 @@
 > 2026-09-28。目标：把客服助手（`support` 角色）的「查订单、跟工单」从**话术引导**升级为**真取数**。
 > 引擎与前端零改动——全部发生在 `.env`（MCP 配置）+ `roles.ts`（角色默认启用）+ 人设（调用约定）三层，
 > 对齐领域适配指南第 2 章「模式 B」。
+>
+> 在线会话（Zoho SalesIQ）不是本文件的订单/工单源。坐席侧查阅与起草见 `support-salesiq-plan.md`。
 
 ## 1. 现状与决策
 
@@ -14,7 +16,7 @@
 | 示例源 | `scripts/order-mock-mcp.mjs`（stdio MCP，内存 mock 数据，进程重启即还原；数据显式标注「示例」） |
 | 工具契约 | `order_search` / `order_get` / `ticket_list` / `ticket_get`（读）+ `ticket_create`（写） |
 | 风险分级 | `.env` `toolRisks`：四个读工具 = `read`（不弹卡）；`ticket_create` = `write`（永远弹确认卡） |
-| 启用范围 | `defaultEnabled:false`（通用对话不勾选）；仅 `roles.ts` support 的 `defaultMcpServers:["orders"]` |
+| 启用范围 | 示例源 `orders` 未作为客服角色的默认 MCP。客服新建对话默认启用已经接好的 `zoho-salesiq`（见 `support-salesiq-plan.md`）。本表的订单契约留到真实订单源接入时再用 |
 | 人设 | `SUPPORT_BASE_PROMPT`「数据源与调用约定」第 1/2 条：业务数据必须调工具、不猜状态；建工单前说明会弹确认 |
 
 ## 2. 接真实系统的三条路线（到时选一，只换配置）

@@ -84,6 +84,7 @@ describe("在线评测：只读聚合", () => {
     expect(s.runs).toBe(0);
     expect(s.avgScore).toBe(0);
     expect(s.qualityDegraded).toBe(false);
+    expect(s.behaviorRuns).toBe(0);
     expect(s.good + s.degraded + s.poor).toBe(0);
   });
 

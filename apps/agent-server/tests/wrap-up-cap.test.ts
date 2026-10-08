@@ -20,6 +20,9 @@ const PORT = 8791;
 let stepN = 0;
 /** 无工具请求的标记：补位收尾的用户内容含「过程记录」（区别于其他无工具调用）。 */
 let sawWrapUpCall = false;
+/** 第二则用例：模型改为读一份已有事实，验证最后一轮综合能看见工具结果。 */
+let evidenceMode = false;
+let synthesisSawFact = false;
 
 type ToolCallArg = { id: string; name: string; args?: unknown };
 
@@ -64,7 +67,22 @@ const server = http.createServer(async (req, res) => {
     if (!body.tools?.length) {
       const last = body.messages?.at(-1)?.content || "";
       if (String(last).includes("过程记录")) sawWrapUpCall = true;
-      res.end(sse([textChunk(WRAP_UP_REPLY)]));
+      if (String(last).includes("CZ3505-FACT")) synthesisSawFact = true;
+      const reply = String(last).includes("已经取到的工具结果")
+        ? "综合结论：广州到福州有直飞 CZ3505-FACT。"
+        : WRAP_UP_REPLY;
+      res.end(sse([textChunk(reply)]));
+      return;
+    }
+    if (evidenceMode) {
+      const step = stepN++;
+      res.end(
+        sse([
+          toolCallChunk([
+            { id: `call_read_${step}`, name: "fs_read", args: { path: "results/fact.txt" } },
+          ]),
+        ]),
+      );
       return;
     }
     // 每轮都调工具（路径各异，避免 Doom Loop 熔断与同轮去重干扰），从不给出综合轮。
@@ -91,12 +109,13 @@ const server = http.createServer(async (req, res) => {
 let chatStream: (typeof import("../src/chat.js"))["chatStream"];
 let createConversation: (typeof import("../src/conversations.js"))["createConversation"];
 let fsRemoveConversation: (typeof import("../src/fs-store.js"))["fsRemoveConversation"];
+let fsWrite: (typeof import("../src/fs-store.js"))["fsWrite"];
 
 beforeAll(async () => {
   await new Promise<void>((resolve) => server.listen(PORT, "127.0.0.1", resolve));
   ({ chatStream } = await import("../src/chat.js"));
   ({ createConversation } = await import("../src/conversations.js"));
-  ({ fsRemoveConversation } = await import("../src/fs-store.js"));
+  ({ fsRemoveConversation, fsWrite } = await import("../src/fs-store.js"));
 });
 
 afterAll(() => {
@@ -119,4 +138,30 @@ test("轮次耗尽无综合轮 → 补位收尾把过程叙述换成结论（而
   expect(final, "最终答案应是补位收尾的结论").toContain("收尾结论");
   // 悬空半句不该出现在最终答案里：mock 的工具轮叙述没有产生任何收尾前的正式文本，
   // 若回归到「累计叙述拼接」，最终答案就不会包含补位收尾的话。
+}, 25000);
+
+test("已有工具证据时最后一轮无工具综合，且综合提示里带上结果原文", async () => {
+  evidenceMode = true;
+  synthesisSawFact = false;
+  sawWrapUpCall = false;
+  const conv = await createConversation({ id: "verify-wrapup-evidence", title: "verify" });
+  (conv as { mcpServers: string[]; model: string }).mcpServers = ["mock"];
+  (conv as { model: string }).model = "mock";
+  fsWrite("verify-wrapup-evidence", "results/fact.txt", "直飞航班 CZ3505-FACT 广州白云 09:15 至福州长乐。");
+
+  const texts: string[] = [];
+  for await (const ev of chatStream(
+    "verify-wrapup-evidence",
+    "广州到福州的直飞航班？",
+    { sessionId: "wrapup-evidence-session" },
+    undefined,
+  )) {
+    if (ev.type === "text") texts.push((ev as { text: string }).text);
+  }
+  fsRemoveConversation("verify-wrapup-evidence");
+  evidenceMode = false;
+
+  expect(synthesisSawFact, "最后一轮综合提示应包含工具读到的事实").toBe(true);
+  expect(sawWrapUpCall, "综合轮已经给出结论时不应再走事后补位").toBe(false);
+  expect(texts.join("")).toContain("综合结论");
 }, 25000);

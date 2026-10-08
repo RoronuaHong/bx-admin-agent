@@ -69,10 +69,10 @@ export const AGENTS: AgentEntry[] = [
       hi: "सहायता सहायक",
     },
     description: {
-      zh: "处理咨询、售后与常见问题：查订单、跟进工单、给出标准解答话术。",
-      en: "Handle inquiries, after-sales and FAQs: look up orders, follow up tickets, give standard answers.",
-      "pt-BR": "Trata dúvidas, pós-venda e perguntas frequentes: consulta pedidos, acompanha tickets, dá respostas padrão.",
-      hi: "पूछताछ, बिक्री-बाद और सामान्य प्रश्न संभालें: ऑर्डर देखें, टिकट ट्रैक करें, मानक उत्तर दें।",
+      zh: "查阅 Zoho SalesIQ 在线会话，并依据企业文档给出标准解答。",
+      en: "Look up Zoho SalesIQ conversations and answer from company documents.",
+      "pt-BR": "Consulta conversas do Zoho SalesIQ e responde com base nos documentos da empresa.",
+      hi: "Zoho SalesIQ की बातचीत देखें और कंपनी दस्तावेज़ों के आधार पर उत्तर दें।",
     },
   },
 ];

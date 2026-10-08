@@ -300,7 +300,7 @@ async function send() {
   controller = new AbortController();
   // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
   // 本页刻意不展示模型信息（终端用户界面），服务端 model 事件仅用于服务端标签跟踪，前端无需消费。
-  const chosenModel = resolveModel(modelId.value);
+  const chosenModel = modelId.value === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(modelId.value);
   /** 本轮是否收到过终态事件（done / 服务端 error）：没收到的流结束 = 连接断了，必须如实收口。 */
   let sawTerminal = false;
   /** 用户是否按了停止（停止不是「中断」，不该报错）。 */

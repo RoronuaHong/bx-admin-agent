@@ -11,6 +11,10 @@
  * 用它来**放开权限**等于给了攻击者一条提权路径。
  * 收窄则相反：刷分失败只会更保守，不会更危险。所以方向选「只收紧不放宽」；
  * 要放开权限必须由人决策（改配置 / 改角色），不由分数自动决定。
+ *
+ * 收紧只看代理自己的行为（没收束、没取证、接地纠正过多）。
+ * 模型 402 切换、检索偏慢、用满轮次预算，是通道和任务复杂度，不是过度自主。
+ * 用它们收紧轮次会形成循环：备用模型一多 → 预算被砍 → 检索做不完 → 更常被判差。
  */
 import { summarizeEval, type EvalSummary } from "./eval-online.js";
 
@@ -36,22 +40,23 @@ export function autonomyFromSummary(summary: EvalSummary, baseRounds: number): A
     // 冷启动没有信号：既不奖励也不惩罚（奖励会被刷分利用，惩罚会误伤）。
     return { level: 2, reason: `样本不足（${summary.runs}/${MIN_RUNS}），按默认自主度`, maxRounds: base };
   }
-  const badRatio = (summary.degraded + summary.poor) / summary.runs;
+  const behaviorRuns = summary.behaviorRuns ?? 0;
+  const badRatio = behaviorRuns / summary.runs;
   if (badRatio > RESTRICT_RATIO) {
     return {
       level: 0,
-      reason: `近期劣质运行占比 ${(badRatio * 100).toFixed(0)}% > ${RESTRICT_RATIO * 100}%`,
+      reason: `近期未收束或未取证的运行占比 ${(badRatio * 100).toFixed(0)}% > ${RESTRICT_RATIO * 100}%`,
       maxRounds: Math.max(1, Math.min(base, 4)),
     };
   }
-  if (summary.qualityDegraded || badRatio > TIGHTEN_RATIO) {
+  if (badRatio > TIGHTEN_RATIO) {
     return {
       level: 1,
-      reason: `近期劣质运行占比 ${(badRatio * 100).toFixed(0)}% > ${TIGHTEN_RATIO * 100}%`,
+      reason: `近期未收束或未取证的运行占比 ${(badRatio * 100).toFixed(0)}% > ${TIGHTEN_RATIO * 100}%`,
       maxRounds: Math.max(1, Math.min(base, 8)),
     };
   }
-  return { level: 2, reason: "近期质量正常", maxRounds: base };
+  return { level: 2, reason: "近期行为正常", maxRounds: base };
 }
 
 /** 读当前 owner 的评测聚合推导自主度；读不到数据时按默认（不降级）。 */

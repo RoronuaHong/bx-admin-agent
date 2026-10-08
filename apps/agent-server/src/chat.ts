@@ -109,14 +109,20 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 实测动因：网关的免费额度是被用完的小池子，某些模型 402（额度耗尽）后短则几小时不会恢复，
 // 而候选链是「注册表顺序」，于是每次对话都要把已经死掉的模型从头打一遍（本次 5 个），
 // 既白付延迟（每个 20-100ms，慢模型更多）也刷满 402 日志噪音，还让「实际服务模型」的判定绕远路。
-// 因此给确定性额度失败加冷却窗口：窗口内该模型不进候选链（用户显式指定的模型除外——
-// 否则「指定模型 + 该模型额度耗尽」会直接失败，而不是诚实地把 402 展示给用户）。
+// 因此给 402 / HTTP 500 加冷却：自动模式把它们排到队尾，先试其余模型。
+// 用户点名的模型仍排第一（点名就要先用它）；冷却名单用尽时仍会回头试，避免直接没模型。
 const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 10 * 60 * 1000);
 const quotaCooldownUntil = new Map<string, number>();
 
 /** 是否属「额度/未开通」类确定性失败（与 models.ts 的 402 判定同口径，不认厂商）。 */
 function isQuotaFailure(failure: string | null): boolean {
   return /401008|402|额度|未开通|余额|quota/i.test(String(failure || ""));
+}
+
+/** 这个模型短时间不会自己好：402 额度，或 HTTP 500。自动模式应立刻换下一个，不要在它身上重试。 */
+export function isModelDownFailure(failure: string | null): boolean {
+  // 只认状态码。正文里的「500」不能算（例如 400 的「max 500」），否则健康模型会被冷却。
+  return isQuotaFailure(failure) || /model http 500\b/i.test(String(failure || ""));
 }
 
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
@@ -361,21 +367,27 @@ async function probeNeedsExternalData(
 
 /** 补位收尾送入的过程叙述上限（字符）：取尾部——越接近终局的过程越关键；防止收尾调用本身变成新的上下文负担。 */
 const WRAP_UP_NARRATION_CHARS = Number(process.env.WRAP_UP_NARRATION_CHARS || 6000);
+/** 收尾时附带的工具结果摘录上限（字符）。从新到旧保留，避免只把「还没搜」的过程叙述交给收尾模型。 */
+const WRAP_UP_EVIDENCE_CHARS = Math.max(1000, Number(process.env.WRAP_UP_EVIDENCE_CHARS || 12_000));
+/** 单条工具结果进摘录的上限，以及摘录条数。条数按「最近成功」滚动，旧的让位给新的。 */
+const WRAP_UP_EVIDENCE_EACH = Math.max(200, Number(process.env.WRAP_UP_EVIDENCE_EACH || 4_000));
+const WRAP_UP_EVIDENCE_KEEP = Math.max(1, Number(process.env.WRAP_UP_EVIDENCE_KEEP || 8));
 
 /**
  * 轮次预算耗尽后的「补位收尾」调用：把累计的过程叙述交回同一个模型，无工具、非流式，产出面向用户的最终结论。
  *
- * 为什么需要它：`forceWrapUp` 是无人值守的**预防式**收尾（最后一轮之前就摘工具）；交互式运行没有这层，
- * 模型可以一路调工具打满轮次预算——此时循环里从未出现「综合轮」，返回值回落到各轮过程叙述的拼接，
- * 实测会停在「我现在去做 X：」这样的悬空半句上（用户等十几分钟拿到的是没写完的计划，且收尾叙述从未
- * 提及已成功落盘的文件）。这里做**事后补救**：不预占工具轮次（区别于 forceWrapUp 的预防式），
- * 只在「整轮跑完仍无综合轮」时多花一次调用，把半截叙述换成结论。
+ * 两层收尾（对齐「最后一轮只作答、不继续调工具」的通用做法）：
+ * - 预防：最后一轮若已经有工具证据，先摘掉工具，让模型在完整上下文里写结论（见 shouldForceSynthesisRound）。
+ * - 补救：预防没接住（最后一轮仍是工具轮、或综合轮为空）时，再打一次无工具调用。
+ *   这次调用必须带上工具结果摘录。只交过程叙述不够——思考类模型把发现写在 reasoning 里，
+ *   工具轮正文经常是空的，收尾模型会如实写成「没有取到数据」。
  * 返回 `null` = 收尾调用不可用（异常 / 空文本），由调用方回落到累计叙述（现状行为）。
  */
 async function wrapUpWith(
   model: ModelEntry,
   question: string,
   narration: string,
+  evidence: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
   try {
@@ -384,14 +396,7 @@ async function wrapUpWith(
       [
         {
           role: "user",
-          content: [
-            `用户原始请求：${question.trim() || "（无文本输入）"}`,
-            "",
-            "以下是本次运行的过程记录（工具已不可再用；记录末尾若停在半截动作上，说明该动作没来得及执行，按未完成如实交代）：",
-            narration.slice(-WRAP_UP_NARRATION_CHARS),
-            "",
-            "请据此写面向用户的最终回复：给结论、交代已完成与未完成的部分；不要预告下一步动作，禁止编造数据。",
-          ].join("\n"),
+          content: buildWrapUpUserContent(question, narration, evidence),
         },
       ],
       [],
@@ -439,15 +444,38 @@ function truncateArgs(raw: string): string {
 }
 
 /**
- * 判定模型调用错误是否「瞬态」（同一模型重试有意义）：限流 / 5xx / 超时 / 中断 / 网络抖动。
- * 额度类（402 / 401008 / 额度不足）与参数 / 鉴权类（400 / 401 / invalid_request）是确定性失败：
- * 同模型重试只会得到同一结果，应直接交给候选链切下一个模型。
- * 注意必须先做确定性排除再跑正向匹配——上游错误 JSON 里顺带的词（如 "source":"gateway"）
- * 会把 402 误判成瞬态，让每个死模型都白打满重试次数（实测 kimi26 额度耗尽即如此）。
+ * 排这一轮要试的模型。
+ * 自动：冷却中的（刚 402 / 500）放到最后，从还能用的开始。用户点名的模型先试它，失败再换。
+ * 一个都不新鲜时仍按原顺序试，避免「全部冷却 → 直接没模型」。
  */
-function isTransientModelError(msg: string | null): boolean {
+export function orderModelCandidates<T extends { id: string }>(
+  all: readonly T[],
+  preferred: T | null,
+  auto: boolean,
+  coolingUntil: ReadonlyMap<string, number> = quotaCooldownUntil,
+  now = Date.now(),
+): T[] {
+  const down = (item: T) => (coolingUntil.get(item.id) || 0) > now;
+  const fresh = all.filter((item) => !down(item));
+  const cooled = all.filter((item) => down(item));
+  if (auto) {
+    const lead = preferred && fresh.some((item) => item.id === preferred.id) ? preferred : fresh[0];
+    const rest = fresh.filter((item) => item.id !== lead?.id);
+    return [...(lead ? [lead] : []), ...rest, ...cooled];
+  }
+  if (!preferred) return [...fresh, ...cooled];
+  const rest = all.filter((item) => item.id !== preferred.id);
+  return [preferred, ...rest.filter((item) => !down(item)), ...rest.filter((item) => down(item))];
+}
+
+/**
+ * 判定模型调用错误是否「瞬态」（同一模型重试有意义）：限流 / 502·503·504 / 超时 / 中断 / 网络抖动。
+ * 402 与 HTTP 500 不重试当前模型，直接交给候选链。400 / 401 同样不重试。
+ * 必须先排除再正向匹配：上游 JSON 里的 "gateway" 会把 402 误判成瞬态。
+ */
+export function isTransientModelError(msg: string | null): boolean {
   if (!msg) return false;
-  if (/(?:model http )?40[012]\b|401008|额度不足|额度已耗尽|permission_error|invalid_request_error|unauthorized/i.test(msg)) {
+  if (/model http 500\b|(?:model http )?40[012]\b|401008|额度不足|额度已耗尽|permission_error|invalid_request_error|unauthorized/i.test(msg)) {
     return false;
   }
   return /(?:429|503|5\d\d|timeout|timed?\s*out|abort|rate\s*limit|freeusagelimit|econn|fetch failed|network|socket|模型服务暂时不可用|gateway)/i.test(
@@ -479,6 +507,110 @@ const WRAP_UP_HINT =
   "本轮已达到工具调用轮次上限，工具不可再用。\n" +
   "请仅基于已经获得的数据，直接给出结论性回答；不要再描述你打算查什么。\n" +
   "若已有数据不足以支撑结论，就如实说明已经查到什么、还缺哪一项，禁止编造数据。";
+
+const WRAP_UP_EVIDENCE_HEADER =
+  "已经取到的工具结果（从新到旧摘录；较早的原文可能已从上下文卸载，以这里为准）。" +
+  "结论只能依据这些结果里实际出现的内容；这里没有的事实不要写成已经查到。";
+
+/**
+ * 最后一轮是否改为无工具综合。
+ * 无人值守（forceWrapUp）保持原行为：最后一轮一律收尾。
+ * 交互式：已经有工具证据时才收尾，避免把最后一轮再花在继续检索上；
+ * 还没有任何证据时保留工具，留给最后一次取数。
+ */
+export function shouldForceSynthesisRound(input: {
+  round: number;
+  maxRounds: number;
+  forceWrapUp: boolean;
+  evidenceCalls: number;
+}): boolean {
+  if (input.maxRounds <= 1 || input.round !== input.maxRounds - 1) return false;
+  return input.forceWrapUp || input.evidenceCalls > 0;
+}
+
+/**
+ * 超长文本保留头尾。抓取页的标题在开头，时刻表、条款、结论经常在后半段；
+ * 只留开头会把后半段的事实切掉。
+ */
+export function clipHeadTail(body: string, limit: number): string {
+  if (body.length <= limit) return body;
+  const marker = "\n…（中间已省略）\n";
+  const room = Math.max(0, limit - marker.length);
+  if (room <= 0) return body.slice(0, limit);
+  const head = Math.ceil(room / 2);
+  const tail = room - head;
+  return `${body.slice(0, head)}${marker}${tail > 0 ? body.slice(-tail) : ""}`;
+}
+
+/** 成功的接地证据滚动进收尾摘录。失败与空结果不记。 */
+export function noteWrapUpEvidence(
+  parts: string[],
+  name: string,
+  raw: string,
+  eachChars = WRAP_UP_EVIDENCE_EACH,
+  keep = WRAP_UP_EVIDENCE_KEEP,
+): void {
+  const body = (raw || "").trim();
+  if (!body || !name) return;
+  const clip = clipHeadTail(body, eachChars);
+  parts.push(`【${name}】\n${clip}`);
+  if (parts.length > keep) parts.splice(0, parts.length - keep);
+}
+
+/** 从新到旧装入上限；装不下的那条保留头尾，更旧的整条丢掉。 */
+export function clipWrapUpEvidence(parts: readonly string[], limitChars = WRAP_UP_EVIDENCE_CHARS): string {
+  if (!parts.length || limitChars <= 0) return "";
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    if (used >= limitChars) break;
+    const part = parts[i] || "";
+    const room = limitChars - used;
+    const piece = part.length > room ? clipHeadTail(part, room) : part;
+    kept.push(piece);
+    used += piece.length + 2;
+  }
+  return kept.reverse().join("\n\n");
+}
+
+/**
+ * 过程叙述 = 工具轮正文 + 思考流。思考类模型的发现经常只在 reasoning 里，正文为空。
+ * 超限取尾部。
+ */
+export function collectWrapUpNarration(
+  assistantText: string,
+  reasoningParts: readonly string[],
+  limitChars = WRAP_UP_NARRATION_CHARS,
+): string {
+  const reasoning = reasoningParts.map((part) => part.trim()).filter(Boolean).join("\n");
+  const combined = [assistantText.trim(), reasoning].filter(Boolean).join("\n");
+  if (!combined) return "";
+  if (combined.length <= limitChars) return combined;
+  return combined.slice(-limitChars);
+}
+
+/** 预防式收尾回灌给模型的用户消息。没有摘录时与原来的 WRAP_UP_HINT 相同。 */
+export function buildSynthesisHint(evidence: string): string {
+  const body = evidence.trim();
+  if (!body) return WRAP_UP_HINT;
+  return `${WRAP_UP_HINT}\n\n${WRAP_UP_EVIDENCE_HEADER}\n${body}`;
+}
+
+/** 事后补位收尾的用户消息。保留「过程记录」标记，并在有摘录时把工具结果放在叙述前面。 */
+export function buildWrapUpUserContent(question: string, narration: string, evidence: string): string {
+  const lines = [`用户原始请求：${question.trim() || "（无文本输入）"}`, ""];
+  const body = evidence.trim();
+  if (body) {
+    lines.push(WRAP_UP_EVIDENCE_HEADER, body, "");
+  }
+  lines.push(
+    "以下是本次运行的过程记录（工具已不可再用；记录末尾若停在半截动作上，说明该动作没来得及执行，按未完成如实交代）：",
+    narration,
+    "",
+    "请据此写面向用户的最终回复：给结论、交代已完成与未完成的部分；不要预告下一步动作，禁止编造数据。",
+  );
+  return lines.join("\n");
+}
 
 /**
  * 运行时答案校验（协议级）：识别「把工具调用写成正文文本」的伪调用。
@@ -1393,6 +1525,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let groundingVerifications = 0;
   const evidence: string[] = [];
   let evidenceChars = 0;
+  // 收尾摘录：与核验证据分开。核验从前往后填满即停，收尾要的是最近几次成功结果
+  // （旧结果常已被卸载成文件指针，综合轮再读不到）。
+  const wrapEvidence: string[] = [];
+  const wrapReasoning: string[] = [];
   /** 本轮证据的**来源集合**（工具名 / 服务器标识）：回答里声称的来源要能与它对上，否则就是编造的引用。 */
   const evidenceSources = new Set<string>();
   /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
@@ -1432,17 +1568,30 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 避免把「让我搜索…」这类过程叙述泄漏进用户可见的答案（对齐 Deep Agents：工具轮的内部
     // 叙述不是答案，答案只看最后一圈综合）。
     let roundText = "";
+    // 最后一轮收尾：无人值守一律摘工具；交互式在已经有证据时同样摘工具。
+    // 否则模型可以一路调工具打满预算，综合轮永远不出现。还没有证据时保留工具，留给最后一次取数。
+    // 提示只压入一次：放进下面的重试循环里，瞬时失败重试会把同一段摘录再塞一遍。
+    const wrapUp = shouldForceSynthesisRound({
+      round,
+      maxRounds: ctx.maxRounds,
+      forceWrapUp: ctx.forceWrapUp === true,
+      evidenceCalls: groundingEvidence,
+    });
+    if (wrapUp && round > 0) {
+      console.log(
+        ctx.forceWrapUp
+          ? "[chat:wrap-up] 无人值守的最后一轮：不收工具，强制收尾出结论"
+          : "[chat:wrap-up] 已有工具证据，最后一轮摘掉工具，按证据写结论",
+      );
+      // 只摘工具不够：模型会把「想调工具」写成一句过程叙述就停下。显式要求收尾，并附上可能已卸载的结果摘录。
+      conversation.push({
+        role: "user",
+        content: buildSynthesisHint(clipWrapUpEvidence(wrapEvidence)),
+      });
+    }
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
     // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
     while (true) {
-      // 无人值守的最后一轮：把工具摘掉，强制模型用已取到的数据写结论。
-      // 否则它可以一路调工具到预算耗尽——这一期报告就只剩过程叙述、没有任何结论。
-      const wrapUp = ctx.forceWrapUp === true && ctx.maxRounds > 1 && round === ctx.maxRounds - 1;
-      if (wrapUp && round > 0) {
-        console.log("[chat:wrap-up] 无人值守的最后一轮：不收工具，强制收尾出结论");
-        // 只摘工具不够：模型会把「想调工具」写成一句过程叙述就停下。显式要求收尾（同 PSEUDO_CALL_HINT 的回灌方式）。
-        conversation.push({ role: "user", content: WRAP_UP_HINT });
-      }
       // 强制工具通道在「没有工具」时无意义（部分网关会直接 400），收尾轮必须一起关掉。
       const llmStart = Date.now();
       const gen = streamCall(
@@ -1518,6 +1667,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       break;
     }
     text += outcome.text;
+    if (outcome.reasoning.trim()) wrapReasoning.push(outcome.reasoning);
     rounds = round + 1;
     if (outcome.failure) {
       failure = outcome.failure;
@@ -1671,6 +1821,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 本轮为「综合轮」（无工具调用、并通过全部纠正后收束）：只有这一轮的正文才是正式回答，
       // 流式下发为回答正文，并记为最终答案（覆盖中间轮的过程叙述）。
+      // 正文为空（思考类模型有时只写 reasoning）不当成答案，留给事后补位按证据重写。
+      if (!outcome.text.trim()) break;
       synthesisText = outcome.text;
       if (roundText) yield { type: "text_delta", text: roundText };
       break;
@@ -1829,6 +1981,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           if (result.ok) {
             groundingEvidence += 1;
             pushEvidence(result.text, "task");
+            noteWrapUpEvidence(wrapEvidence, "task", result.text);
           }
           // 子代理回传同样是不可信数据（它自己读的也都是外部内容）：定界后回灌。
           const wrappedTask = wrapUntrusted(result.text, { kind: "subagent_summary", source: "task" });
@@ -1966,6 +2119,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             if (out.executed && out.ok && isGroundingEvidenceTool(item.call.name)) {
               groundingEvidence += 1;
               pushEvidence(out.rawText, item.call.name);
+              noteWrapUpEvidence(wrapEvidence, item.call.name, out.rawText);
             }
             if (out.todos) yield { type: "todos", todos: out.todos };
             if (out.chart)
@@ -2224,6 +2378,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (executed && ok && isGroundingEvidenceTool(call.name)) {
         groundingEvidence += 1;
         pushEvidence(rawText, call.name);
+        noteWrapUpEvidence(wrapEvidence, call.name, rawText);
       }
       content = prepareToolResultText(call.name, rawText);
       yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
@@ -2309,11 +2464,17 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     }
   }
 
-  // 轮次预算耗尽且从未出现综合轮（模型一路调工具到上限）：把各轮过程叙述的拼接换成一次补位收尾的结论。
-  // 与无人值守的 forceWrapUp（预防式）互补，两层共同保证「预算总有结论」——见 wrapUpWith 注释。
-  if (!synthesisText && !failure && text.trim()) {
+  // 轮次预算耗尽且从未出现综合轮：补一次无工具收尾。叙述带上思考流，并附最近的工具结果摘录。
+  const wrapNarration = collectWrapUpNarration(text, wrapReasoning);
+  if (!synthesisText && !failure && (wrapNarration.trim() || wrapEvidence.length)) {
     console.log("[chat:wrap-up] 轮次预算耗尽且无综合轮，补一次无工具收尾生成结论");
-    const wrapped = await wrapUpWith(ctx.model, userQuestion, text, ctx.signal);
+    const wrapped = await wrapUpWith(
+      ctx.model,
+      userQuestion,
+      wrapNarration,
+      clipWrapUpEvidence(wrapEvidence),
+      ctx.signal,
+    );
     if (wrapped) {
       synthesisText = wrapped;
       spentTokens += estimateTokens(wrapped);
@@ -2658,6 +2819,7 @@ export async function* chatStream(
     });
   }
   // 优先级：请求显式指定 > 对话设置 > 角色默认模型 > 服务端默认。
+  // model=auto（或没传）表示自动：不可用的模型排到队尾，从还能用的开始，直到有一个把这轮做完。
   const roleDefaultModel = conversation?.agentId ? getRole(conversation.agentId).defaultModel : undefined;
   const roleModel = roleDefaultModel ? getModel(roleDefaultModel) : undefined;
   // 角色钉住的模型已从 MODEL_PROVIDERS 移除（下线 / 改 id）时如实告警一次：否则会静默回落到全局默认，
@@ -2667,8 +2829,10 @@ export async function* chatStream(
       `[chat:model] 角色 ${conversation?.agentId} 的默认模型 ${roleDefaultModel} 未在 MODEL_PROVIDERS 中配置，回落到服务端默认模型`,
     );
   }
+  const requestedId = String(opts.model || "").trim();
+  const explicitModel = requestedId && requestedId !== "auto" ? getModel(requestedId) : null;
   const model =
-    getModel(opts.model) || getModel(conversation?.model) || roleModel || defaultModel();
+    explicitModel || getModel(conversation?.model) || roleModel || defaultModel();
   if (!model) {
     yield {
       type: "error",
@@ -2802,18 +2966,14 @@ export async function* chatStream(
   // 预算先算：窗口 − 输出预留 − 工具 schema − 本轮工具结果预算（工具定义也是纯开销）。
   const toolSchemaTokens = specs.length ? estimateTokens(JSON.stringify(specs)) : 0;
 
-  // 候选模型链：选定模型失败（瞬态 / 限流）时按注册表顺序切到下一个可用模型重试（韧性降级）。
-  // 永久错误（4xx / 配额耗尽）不切模型。每段依赖模型的预算 / 上下文装配在循环内基于候选模型重算。
+  // 候选链：一个模型 402 / 500 就换下一个，直到有一个做完，或名单用尽。
+  // 自动（含定时任务没指定模型）：冷却中的不打头。用户点名的模型仍先试它，失败再换。
   const allModels = listModels();
-  // 冷却过滤：只过滤「非用户显式指定」的候选；若除指定模型外全部在冷却中，则照常全量尝试
-  // （宁可多打几次 402，也不能让请求直接无模型可用）。
-  const others = allModels.filter((m) => m.id !== model.id);
-  const fresh = others.filter((m) => (quotaCooldownUntil.get(m.id) || 0) <= Date.now());
-  const cooling = others.filter((m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now());
-  if (cooling.length) {
-    console.log(`[chat:model] 额度冷却中已跳过：${cooling.map((m) => m.id).join(",")}`);
+  const candidates = orderModelCandidates(allModels, model, !explicitModel);
+  const cooling = candidates.filter((m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now());
+  if (cooling.length && cooling.length < candidates.length) {
+    console.log(`[chat:model] 不可用冷却中已后移：${cooling.map((m) => m.id).join(",")}`);
   }
-  const candidates = [model, ...(fresh.length ? fresh : others)];
   let text = "";
   let failure: string | null = null;
   let handles: ToolHandle[] = [];
@@ -2955,7 +3115,7 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
-    if (isQuotaFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + QUOTA_COOLDOWN_MS);
+    if (isModelDownFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + QUOTA_COOLDOWN_MS);
     // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
     // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，

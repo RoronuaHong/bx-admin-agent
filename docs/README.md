@@ -78,6 +78,12 @@
 - **状态**：✅ 现行。
 - **注意**：原 `scripts/_movie-grounding-gate.mjs` 已随调试脚本清理移除，现行回归入口是 `pnpm test`。
 
+### [agent/support-salesiq-plan.md](./agent/support-salesiq-plan.md)
+- **定位**：客服助手接入 Zoho SalesIQ 的现行方案（坐席侧查阅 → 确认后发送）。2026-10-08 写入，**尚未改代码**。
+- **覆盖**：与订单源、对话量预警的边界；工具白名单 / `pathDefaults` / 写闸门；角色人设与验收。
+- **现行落点（方案所指，实施前仍是现状）**：`roles.ts` 的 `support` · `.data/mcp-servers.json` 的 `zoho-salesiq`（目前仅 `ZohoSalesIQ_getConversationsList`）· `src/mcp/path-defaults.ts`。
+- **状态**：🟡 角色已挂上现有 `zoho-salesiq`（2026-10-08）。未新增连接器。单条消息与代发仍未做。订单/工单仍以 `docs/agent/support-data-source-plan.md` 为准；预警仍以 `scheduled-spike-detection-plan.md` 为准。
+
 ### [domain-adaptation-guide.md](./domain-adaptation-guide.md)
 - **定位**：规范性指南——如何在不动引擎的前提下把通用 Agent 改造成垂直领域 Agent（以观影助手为例）。
 - **状态**：✅ 现行（弱代码耦合，属「怎么做」而非「现状记录」）。
