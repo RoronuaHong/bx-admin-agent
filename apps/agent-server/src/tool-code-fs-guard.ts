@@ -20,10 +20,12 @@
  * - Python 侧同时包装 `builtins.open` / `io.open` / `os.open`：只包 `builtins.open` 时
  *   `io.open` 一行即破，而 `pathlib.Path.read_text()` 内部正是走 `io.open`。
  *
- * ⚠️ **它仍然不是沙箱**：`child_process` 再拉一个干净进程、原生插件、`process.binding` 都不受拦截
- * （Python 侧 `os.popen` / `subprocess` 更是直接任意命令执行）。本守卫的价值是挡住 prompt 注入
- * 场景下**最直接**的那一步，真实隔离仍需 OS 级手段。另见 `run_command` / `run_script`：它们
- * 不在本守卫覆盖范围内（那是「用户批准执行任意命令」的语义，属不同信任模型）。
+ * ⚠️ **它仍然不是沙箱**：`node:child_process` 的 exec/spawn 家族已在模块层被打补丁抛错
+ * （ESM 命名导入 / require / createRequire / 动态 import() 均拿不到可用函数），命令执行这道被封死；
+ * 但原生插件、`process.binding`、以及 Python 侧 `from subprocess import Popen` 这类把名字绑到局部变量的
+ * 写法仍不受拦。本守卫的价值是挡住 prompt 注入场景下**最直接**的那几步，真实隔离仍需 OS 级手段
+ * （microVM/Docker/AppContainer）。另见 `run_command` / `run_script`：它们不在本守卫覆盖范围内
+ * （那是「用户批准执行任意命令」的语义，属不同信任模型）。
  */
 
 /** 精确匹配的 basename（小写比较）。形态明确、误报面接近零。 */
@@ -64,6 +66,13 @@ export const DENY_MESSAGE =
 
 /** 统一的错误码（测试与排障据此识别「是守卫拦的」而非普通 ENOENT）。 */
 export const DENY_CODE = "BX_FS_GUARD_DENIED";
+
+/** 命令执行守卫的错误码（run_tool_code 子进程禁止调用 child_process 执行外部命令）。 */
+export const DENY_CHILDPROC_CODE = "BX_CHILDPROC_DENIED";
+
+/** 命令执行守卫的提示（Node / Python 两侧一致，便于排障对得上）。 */
+export const DENY_CHILDPROC_MESSAGE =
+  "run_tool_code 子进程禁止执行外部命令（child_process）。需要调用工具请走 callTool 桥接，由服务端按只读/免确认判定放行。";
 
 function norm(p: string): string {
   return p.split("\\").join("/");
@@ -126,6 +135,8 @@ export function guardPayload(): { basenames: string[]; suffixes: string[]; dirs:
 const NAMES_PAYLOAD = () => JSON.stringify(guardPayload());
 const MSG_PAYLOAD = () => JSON.stringify(DENY_MESSAGE);
 const CODE_PAYLOAD = () => JSON.stringify(DENY_CODE);
+const CP_MSG_PAYLOAD = () => JSON.stringify(DENY_CHILDPROC_MESSAGE);
+const CP_CODE_PAYLOAD = () => JSON.stringify(DENY_CHILDPROC_CODE);
 
 /**
  * Node 侧守卫：**CJS 预加载**（配合 `node --require <本文件> script.mjs`）。
@@ -141,6 +152,8 @@ export function nodeFsGuardPreloadSource(): string {
   var __BX_GUARD = ${NAMES_PAYLOAD()};
   var __BX_MSG = ${MSG_PAYLOAD()};
   var __BX_CODE = ${CODE_PAYLOAD()};
+  var __BX_CP_MSG = ${CP_MSG_PAYLOAD()};
+  var __BX_CP_CODE = ${CP_CODE_PAYLOAD()};
   var __BX_ALLOW = (process.env.TOOL_CODE_FS_ALLOW || "").split(",").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
   function __bx_norm(s) { return String(s).split(__BX_BS).join("/"); }
   function __bx_base(s) { var n = __bx_norm(s).toLowerCase(); var i = n.lastIndexOf("/"); return i >= 0 ? n.slice(i + 1) : n; }
@@ -157,7 +170,9 @@ export function nodeFsGuardPreloadSource(): string {
     var b = __bx_base(raw);
     if (b === ".env" || b.indexOf(".env.") === 0) return true;
     if (__BX_GUARD.basenames.indexOf(b) >= 0) return true;
-    for (var i = 0; i < __BX_GUARD.suffixes.length; i++) { if (b.length > __BX_GUARD.suffixes[i].length && b.lastIndexOf(__BX_GUARD.suffixes[i]) === b.length - __BX_GUARD.suffixes[i].length) return true; }
+    // 用 >= 而非 >：对齐 TS/Python 的 endswith 语义（basename 与后缀**相等**时同样命中）。
+    // 曾用 > 使名为 .pem / .key 的文件在 node 侧被放行、另两侧被拒——三份实现静默漂移的实例。
+    for (var i = 0; i < __BX_GUARD.suffixes.length; i++) { if (b.length >= __BX_GUARD.suffixes[i].length && b.lastIndexOf(__BX_GUARD.suffixes[i]) === b.length - __BX_GUARD.suffixes[i].length) return true; }
     var dirs = __bx_norm(raw).toLowerCase().split("/").slice(0, -1);
     for (var j = 0; j < dirs.length; j++) { if (__BX_GUARD.dirs.indexOf(dirs[j]) >= 0) return true; }
     return false;
@@ -185,6 +200,20 @@ export function nodeFsGuardPreloadSource(): string {
       if (typeof __bx_p[__bx_pn[m]] === "function") __bx_p[__bx_pn[m]] = __bx_wrap(__bx_p[__bx_pn[m]]);
     }
   } catch (e2) {}
+  // ---- run_tool_code 命令执行守卫（纵深防御，非沙箱）----
+  // 模型写在子进程里的代码可 import { execSync } from "node:child_process" 直接执行任意命令，
+  // 完全绕过工具桥接层的 resolveToolRisk 只读/免确认判定——正是审计指出的 ESM 命名导入绕过 permission model。
+  // 在模块层把 child_process 的 exec/spawn 家族打补丁抛错：无论用 ESM 命名导入、require、
+  // createRequire 还是动态 import()，拿到的都是补丁后的函数（与上方 fs 守卫同一机制，ESM 解构也拦得住）。
+  // 工具桥接本身用 node:net，不依赖 child_process，故封死它不影响任何合法用途。
+  try {
+    var __bx_cp = require("node:child_process");
+    var __bx_cp_fns = ["exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork"];
+    var __bx_cp_deny = function () { var e = new Error(__BX_CP_MSG); e.code = __BX_CP_CODE; throw e; };
+    for (var c = 0; c < __bx_cp_fns.length; c++) {
+      if (typeof __bx_cp[__bx_cp_fns[c]] === "function") __bx_cp[__bx_cp_fns[c]] = __bx_cp_deny;
+    }
+  } catch (e3) {}
 })();
 // ---- 凭据文件守卫结束 ----
 `;
@@ -202,6 +231,7 @@ export function pyFsGuardSource(): string {
 import builtins as __bx_builtins, os as __bx_os, io as __bx_io
 __BX_GUARD = ${NAMES_PAYLOAD()}
 __BX_MSG = ${MSG_PAYLOAD()}
+__BX_CP_MSG = ${CP_MSG_PAYLOAD()}
 __BX_ALLOW = [s.strip().lower() for s in (__bx_os.environ.get("TOOL_CODE_FS_ALLOW") or "").split(",") if s.strip()]
 def __bx_denied(p):
     try:
@@ -240,11 +270,34 @@ try:
     __bx_os.open = __bx_guard(__bx_os.open)
 except Exception:
     pass
+# ---- run_tool_code 命令执行守卫（与 node 侧对称）----
+# 模型代码里 import subprocess; subprocess.run(...) 能执行任意命令，绕过工具桥接的只读/免确认判定。
+# 把常见的命令执行入口打补丁抛错（纵深防御，非沙箱）。注意 from subprocess import Popen 这类
+# 把名字绑定到局部变量的写法仍可绕过——真正的隔离仍需 OS 级沙箱（见 docs/SECURITY.md）。
+def __bx_guard_cmd(fn):
+    def _w(*a, **kw):
+        raise PermissionError(__BX_CP_MSG)
+    return _w
+try:
+    import subprocess as __bx_subprocess
+    for __bx_fn in ("Popen", "call", "check_call", "check_output", "run", "getoutput", "getstatusoutput"):
+        if hasattr(__bx_subprocess, __bx_fn):
+            setattr(__bx_subprocess, __bx_fn, __bx_guard_cmd(__bx_fn))
+except Exception:
+    pass
+try:
+    __bx_os.system = __bx_guard_cmd("system")
+    __bx_os.popen = __bx_guard_cmd("popen")
+    for __bx_e in ("execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe"):
+        if hasattr(__bx_os, __bx_e):
+            setattr(__bx_os, __bx_e, __bx_guard_cmd(__bx_e))
+except Exception:
+    pass
 # ---- 凭据文件守卫结束 ----
 `;
 }
 
 /** 自检：注入源码结构完整（防静默失效）。生产路径也会调用一次（见 tool-code.ts）。 */
 export function guardSourceLooksIntact(src: string): boolean {
-  return src.includes(DENY_CODE) || src.includes("__bx_guard");
+  return src.includes(DENY_CODE) || src.includes(DENY_CHILDPROC_CODE) || src.includes("__bx_guard");
 }

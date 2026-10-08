@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DENY_CHILDPROC_CODE,
+  DENY_CHILDPROC_MESSAGE,
   DENY_CODE,
   DENY_MESSAGE,
   guardSourceLooksIntact,
@@ -87,6 +89,12 @@ const TABLE = [
   "C:/certs/server.pem",
   "C:/certs/server.key",
   "C:/certs/store.p12",
+  // 裸后缀：basename **等于**后缀本身。曾暴露 node 侧用 `>` 比较长度导致的漂移——
+  // 该形态下 TS/Python 的 endswith 命中、node 侧的 `b.length > suf.length` 落空，放行。
+  // 保留此样本，任何一份再退化为严格大于就会红。
+  "/etc/certs/.pem",
+  // 反面对照：形似但不构成后缀命中，必须放行（防止把守卫修成过度拦截）。
+  "/etc/certs/.pema",
   "/home/u/.ssh/id_rsa",
   "C:/Users/u/.aws/credentials",
   "C:/Users/u/.docker/config.json",
@@ -326,6 +334,82 @@ test("守卫提示文案两侧一致（排障时能对上）", () => {
   // 两侧都必须给出可识别的错误标记
   expect(nodeFsGuardPreloadSource()).toContain(DENY_CODE);
   expect(pyFsGuardSource()).toContain("PermissionError");
+});
+
+// ---- 命令执行守卫（审计第 2 项：Node ESM 命名导入绕过 permission model）----
+// run_tool_code 子进程里的代码若 `import { execSync } from "node:child_process"` 就能执行任意命令，
+// 绕过工具桥接层的 resolveToolRisk 只读/免确认判定。修复在 --require 预加载里把 child_process 的
+// exec/spawn 家族在模块层打补丁抛错——无论 ESM 命名导入 / 动态 import() / createRequire 都拿不到可用函数。
+test("真实子进程（node）：child_process 各导入形态均被封死，工具桥不受影响", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "bx-cp-"));
+  try {
+    const result = await runToolCode({
+      language: "node",
+      code: [
+        "const out = [];",
+        // ESM 命名导入（审计点名的具体绕过形态）
+        'try { const { execSync } = await import("node:child_process"); execSync("echo hi"); out.push("named=LEAKED"); } catch (e) { out.push("named=" + (e.code || "err")); }',
+        // 动态 import()
+        'try { const cp2 = await import("node:child_process"); cp2.spawnSync("echo", ["hi"]); out.push("dyn=LEAKED"); } catch (e) { out.push("dyn=" + (e.code || "err")); }',
+        // createRequire 再 require（ESM 里 require 不可用，这是真实的等价通道）
+        'try { const { createRequire } = await import("node:module"); const cp3 = createRequire(import.meta.url)("node:child_process"); cp3.exec("echo hi"); out.push("creq=LEAKED"); } catch (e) { out.push("creq=" + (e.code || "err")); }',
+        // 工具桥接完好（证明封的是命令执行，不是把工具用瘫）
+        'try { await callTool("fs_read", { path: "x" }); out.push("tool=OK"); } catch (e) { out.push("tool=ERR:" + e.message); }',
+        'console.log(out.join(" | "));',
+      ].join("\n"),
+      cwd,
+      timeoutMs: 20_000,
+      callTool: async () => ({ ok: true, text: "TOOL-OK" }),
+    });
+    const text = result.text;
+    expect(text).toContain(`named=${DENY_CHILDPROC_CODE}`);
+    expect(text).toContain(`dyn=${DENY_CHILDPROC_CODE}`);
+    expect(text).toContain(`creq=${DENY_CHILDPROC_CODE}`);
+    expect(text).not.toContain("LEAKED");
+    expect(text).toContain("tool=OK");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 40_000);
+
+test("真实子进程（python）：subprocess / os.system / os.popen 被封死", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "bx-py-cp-"));
+  try {
+    const r = await runToolCode({
+      language: "python",
+      code: [
+        "out = []",
+        'try:\n    import subprocess\n    subprocess.run(["echo", "hi"])\n    out.append("run=LEAKED")\nexcept Exception as e:\n    out.append("run=blocked")',
+        'try:\n    import os\n    os.system("echo hi")\n    out.append("system=LEAKED")\nexcept Exception as e:\n    out.append("system=blocked")',
+        'try:\n    import os\n    os.popen("echo hi").read()\n    out.append("popen=LEAKED")\nexcept Exception as e:\n    out.append("popen=blocked")',
+        'print(" | ".join(out))',
+      ].join("\n"),
+      cwd,
+      timeoutMs: 25_000,
+      callTool: async () => ({ ok: true, text: "x" }),
+    });
+    // Python 未安装时跳过（不因环境缺失把用例判红）。
+    if (r.text.includes("找不到解释器")) {
+      expect(true).toBe(true);
+      return;
+    }
+    expect(r.text).toContain("run=blocked");
+    expect(r.text).toContain("system=blocked");
+    expect(r.text).toContain("popen=blocked");
+    expect(r.text).not.toContain("LEAKED");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("两侧源码均含 child_process 守卫（结构自检互补，防该块静默失效）", () => {
+  // Node 侧：拒绝码与提示文案都注入，且被 guardSourceLooksIntact 覆盖
+  expect(nodeFsGuardPreloadSource()).toContain(DENY_CHILDPROC_CODE);
+  expect(nodeFsGuardPreloadSource()).toContain(DENY_CHILDPROC_MESSAGE.slice(0, 12));
+  expect(guardSourceLooksIntact(nodeFsGuardPreloadSource())).toBe(true);
+  // Python 侧：命令执行守卫走 __BX_CP_MSG（提示文案），结构自检经 __bx_guard_cmd 覆盖
+  expect(pyFsGuardSource()).toContain(DENY_CHILDPROC_MESSAGE.slice(0, 12));
+  expect(guardSourceLooksIntact(pyFsGuardSource())).toBe(true);
 });
 
 // Python 侧此前**零**真实子进程覆盖（只有字符串断言），而它恰恰是最容易被一行绕过的那一侧：

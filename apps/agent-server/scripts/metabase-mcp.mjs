@@ -68,35 +68,12 @@ function asList(data) {
   return [];
 }
 
-// ---- 只读 SQL 硬校验（纵深防御，与服务端 src/sql-readonly.ts 口径对齐）----
+// ---- 只读 SQL 硬校验（纵深防御，口径来自单一可信来源 scripts/sql-readonly-common.mjs）----
 // 即便本适配器拿到的是管理员 Key，也只转发只读查询——把「贴只读标签的核武器」风险降到最低。
+// 判定逻辑不再在此内联：直接 import 服务端那一份**唯一**实现，两侧物理共用同一段代码，杜绝漂移。
 // 首词白名单 + 全文黑名单 + 危险构造（写文件 / 读文件 / 改库配置）。fail-closed：不明朗一律拒绝。
 // 局限：这是代码层约束；Key 一旦泄露、攻击者直连 Metabase API 即可绕过。真正的只读边界仍须 DB/账号层 GRANT SELECT。
-const RO_LEADING = ["select", "with", "show", "describe", "desc", "explain"];
-const RO_DENY = /\b(insert|update|delete|drop|alter|create|truncate|merge|replace|upsert|grant|revoke|attach|detach|exec|execute|call|copy|load|set|reset)\b/;
-const RO_DENY_PATTERNS = [/into\s+(out|dump)file/, /load_file\s*\(/, /pg_read_file\s*\(/, /writable_schema/];
-function stripSqlComments(s) {
-  return s.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n\r]*/g, " ");
-}
-/**
- * 是否可安全放行的单条只读查询（脱引号/注释后判定，避免字面量/注释里的关键字被误判）。
- * ⚠️ 口径一致性：服务端另有**权威判定** `src/sql-readonly.ts` 的 `isReadOnlySql`（经 src/risk.ts
- * 在工具抵达 MCP 之前再拦一道）。两处是刻意的纵深防御（适配器粗筛 + 服务端硬拒），
- * 但口径必须一致——修改本函数的白名单/黑名单/多语句规则时，必须同步修改 `src/sql-readonly.ts`。
- */
-function isReadOnlySql(raw) {
-  const sql = stripSqlComments(String(raw ?? ""))
-    .replace(/'[^']*'/g, "''")
-    .replace(/"[^"]*"/g, '""')
-    .replace(/`[^`]*`/g, "``")
-    .trim();
-  if (!sql) return false;
-  const parts = sql.split(";").map((s) => s.trim()).filter(Boolean);
-  if (parts.length !== 1) return false; // 多语句一律拒绝
-  const lower = parts[0].toLowerCase();
-  const first = lower.match(/^[a-z]+/)?.[0] || "";
-  return RO_LEADING.includes(first) && !RO_DENY.test(lower) && !RO_DENY_PATTERNS.some((re) => re.test(lower));
-}
+import { isReadOnlySql } from "./sql-readonly-common.mjs";
 
 // ---- 元数据映射：写查询之前的「取证」基础 ----
 

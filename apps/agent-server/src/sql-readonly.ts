@@ -1,54 +1,8 @@
-// 原生 SQL 只读判定（服务端单一真相，fail-closed）。
-// ⚠️ MCP 适配器侧另有一份同口径实现（scripts/metabase-mcp.mjs 的 isReadOnlySql），
-// 属刻意纵深防御（适配器粗筛 + 服务端硬拒）。本文件是权威口径——改动白名单/黑名单/危险构造时，
-// 必须同步修改 mjs 侧，否则会出现「适配器放行、服务端拒绝」或反之的口径漂移。
-// 首词白名单。
-const LEADING_KEYWORDS = ["select", "with", "show", "describe", "desc", "explain"];
-
-// 命中任一即判否。
-const DENY_KEYWORDS = [
-  "insert", "update", "delete", "drop", "alter", "create", "truncate", "merge", "replace", "upsert",
-  "grant", "revoke", "attach", "detach", "exec", "execute", "call", "copy", "load", "set", "reset",
-];
-
-// 危险构造：首词是 select 也要拒（写文件 / 读文件 / 改库配置）。
-const DENY_PATTERNS = [/into\s+(out|dump)file/, /load_file\s*\(/, /pg_read_file\s*\(/, /writable_schema/];
-
-const DENY_RE = new RegExp("\\b(" + DENY_KEYWORDS.join("|") + ")\\b");
-/** 是否「可安全放行的单条只读查询」。fail-closed：不明朗一律 false。 */
-export function isReadOnlySql(raw: unknown): boolean {
-  if (typeof raw !== "string") return false;
-  // 脱掉字符串/标识符引号（单/双/反引号）再判定：列名或字面量恰好是保留字/含分号时，
-  // 不被误判为写操作或多语句（如 SELECT "update" FROM t）。仍 fail-closed，不明朗一律 false。
-  const sql = stripComments(raw)
-    .replace(/'[^']*'/g, "''")
-    .replace(/"[^"]*"/g, '""')
-    .replace(/`[^`]*`/g, "``")
-    .trim();
-  if (!sql) return false;
-  return check(sql);
-}
-
-/** 单条语句 + 首词白名单 + 全文黑名单。 */
-function check(sql: string): boolean {
-  const parts = sql.split(";").map((s) => s.trim()).filter(Boolean);
-  if (parts.length !== 1) return false;
-  return wordsOk(parts[0]!);
-}
-
-/** 命中黑名单词或危险构造即判否。 */
-function hasDeny(lower: string): boolean {
-  return DENY_RE.test(lower) || DENY_PATTERNS.some((re) => re.test(lower));
-}
-
-/** 首词白名单 + 全文黑名单词 / 危险构造。 */
-function wordsOk(sql: string): boolean {
-  const lower = sql.toLowerCase();
-  const first = lower.match(/^[a-z]+/)?.[0] || "";
-  return LEADING_KEYWORDS.includes(first) && !hasDeny(lower);
-}
-
-/** 去注释：注释里的关键字不参与判定。 */
-function stripComments(sql: string): string {
-  return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n\r]*/g, " ");
-}
+// 原生 SQL 只读判定的服务端入口。
+//
+// **单一可信来源在 scripts/sql-readonly-common.mjs**：本文件只做再导出，逻辑不在这一份里——
+// 避免 TS 侧与 MCP 适配器（scripts/metabase-mcp.mjs）各写一份导致口径漂移。
+// 改白名单 / 黑名单 / 危险构造 / 多语句规则，只改 common 模块（见该文件顶部注释）。
+//
+// 调用方（src/risk.ts）仍按 `source=sql-readonly` 对非只读 SQL 硬拒，与 MCP 适配器那道构成纵深防御。
+export { isReadOnlySql } from "../scripts/sql-readonly-common.mjs";
