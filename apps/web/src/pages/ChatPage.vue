@@ -6780,6 +6780,23 @@ onBeforeUnmount(() => {
                   alertChipText(alertMarkerInfo(b)!.marker)
                 }}</span>
                 <div v-if="alertMarkerInfo(b)!.body" class="md" v-html="renderChatMarkdown(alertMarkerInfo(b)!.body, uiLocale)"></div>
+                <!-- 「先测后跑」的下一步 CTA：挂在试跑结论末尾（内容所属处），是流程推进动作，
+                     不与复制/编辑等气泡工具混排在时间戳行（此前挤在工具行里像误植，2026-10-08 用户反馈）。 -->
+                <div v-if="isLatestAlertMarkerBubble(b)" class="alert-cta">
+                  <button
+                    type="button"
+                    class="alert-cta__btn"
+                    :title="tx('把本轮试跑设为定时数据预警（指令与连接器会带入表单）', 'Turn this check into a scheduled data alert (prompt + connectors go to the form)', 'Transformar esta verificação em alerta agendado (prompt + conectores no formulário)', 'इस जाँच को शेड्यूल्ड डेटा अलर्ट बनाएँ (प्रॉम्प्ट + कनेक्टर फ़ॉर्म में)')"
+                    :aria-label="tx('设为数据预警', 'Set as data alert', 'Definir como alerta', 'डेटा अलर्ट सेट करें')"
+                    @click="openAlertScheduleFromChat(b)"
+                  >
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M12 7v5l3 2" />
+                    </svg>
+                    {{ tx("设为数据预警", "Set as data alert", "Definir como alerta", "डेटा अलर्ट सेट करें") }}
+                  </button>
+                </div>
               </template>
               <div v-else-if="b.text" class="md" v-html="renderChatMarkdown(bubbleBody(b), uiLocale)"></div>
             </template>
@@ -6828,14 +6845,6 @@ onBeforeUnmount(() => {
               :aria-label="tx('编辑', 'Edit', 'Editar', 'संपादित करें')"
               @click="editUserBubble(b)"
             ><span class="flip-x">✎</span></button>
-            <button
-              v-if="isLatestAlertMarkerBubble(b)"
-              type="button"
-              class="bubble-act bubble-act--text"
-              :title="tx('把本轮试跑设为定时数据预警（指令与连接器会带入表单）', 'Turn this check into a scheduled data alert (prompt + connectors go to the form)', 'Transformar esta verificação em alerta agendado (prompt + conectores no formulário)', 'इस जाँच को शेड्यूल्ड डेटा अलर्ट बनाएँ (प्रॉम्प्ट + कनेक्टर फ़ॉर्म में)')"
-              :aria-label="tx('设为数据预警', 'Set as data alert', 'Definir como alerta', 'डेटा अलर्ट सेट करें')"
-              @click="openAlertScheduleFromChat(b)"
-            >{{ tx("设为数据预警", "Set as alert", "Como alerta", "अलर्ट सेट") }}</button>
             <button
               type="button"
               class="bubble-act"
@@ -11130,6 +11139,32 @@ button.step-head:disabled {
   color: #fff;
 }
 
+/* 「设为数据预警」CTA：试跑结论末尾的下一步动作（流程推进型），醒目但轻量——
+   主色描边胶囊 + 时钟图标，与正文拉开间距；不放时间戳工具行（那里只放复制/编辑这类气泡工具）。 */
+.alert-cta {
+  margin: 10px 0 2px;
+}
+
+.alert-cta__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid rgba(79, 124, 255, 0.45);
+  border-radius: 999px;
+  background: rgba(79, 124, 255, 0.08);
+  color: var(--accent, #4f7cff);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.alert-cta__btn:hover {
+  background: rgba(79, 124, 255, 0.16);
+}
+
 /* 助手消息正文容器：长无空格串（URL/JSON/代码残留）允许断词，避免横向溢出气泡。 */
 .md {
   overflow-wrap: anywhere;
@@ -11294,20 +11329,6 @@ button.step-head:disabled {
 .bubble-act:focus-visible {
   color: var(--ink);
   background: var(--fill-soft);
-}
-
-.bubble-act--text {
-  width: auto;
-  padding: 0 8px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--accent, #2563eb);
-  white-space: nowrap;
-}
-.bubble-act--text:hover,
-.bubble-act--text:focus-visible {
-  color: var(--accent, #2563eb);
-  background: color-mix(in srgb, var(--accent, #2563eb) 12%, transparent);
 }
 
 /* 复制成功瞬时提示：浮在输入区上方，不抢占滚动条。 */
