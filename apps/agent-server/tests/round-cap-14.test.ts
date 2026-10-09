@@ -11,6 +11,8 @@ process.env.MODEL_MOCK_BASE_URL = "http://127.0.0.1:8796/v1";
 process.env.MODEL_MOCK_API_KEY = "x";
 process.env.MODEL_MOCK_CONTEXT_WINDOW = "128000";
 process.env.MCP_MAX_TOOL_ROUNDS = "14"; // 旧上限
+// 隔离开发机上 .data/eval 的真实聚合（样本足够时会把自主度降到 8 轮），让本用例只验证上限本身。
+process.env.AUTONOMY_MIN_RUNS = "99999";
 
 const PORT = 8796;
 const TARGET_TOOL_ROUNDS = 16;

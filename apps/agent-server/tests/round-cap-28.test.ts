@@ -14,6 +14,9 @@ process.env.MODEL_MOCK_API_KEY = "x";
 process.env.MODEL_MOCK_CONTEXT_WINDOW = "128000";
 process.env.MCP_MAX_TOOL_ROUNDS = "28"; // 对齐新默认
 
+// 隔离开发机上 .data/eval 的真实聚合（样本足够时会把自主度降到 8 轮），让本用例只验证上限本身。
+process.env.AUTONOMY_MIN_RUNS = "99999";
+
 const PORT = 8797;
 const TARGET_TOOL_ROUNDS = 16; // 任务需要的工具轮数（>14，正好踩在旧上限之上）
 let stepN = 0;
