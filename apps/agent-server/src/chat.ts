@@ -11,7 +11,19 @@ import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSP
 import { admitDirectListCall, releaseDirectListCall, rememberDirectListPage } from "./list-page-gate.js";
 import { extractListRows, listResponseHasMore, normalizeTimeZone } from "./list-count.js";
 import { toolCodeDenied } from "./tool-code.js";
-import { buildUnattendedConclusion, unattendedToolDenial } from "./schedule-alert.js";
+import {
+  type AlertMarker,
+  buildUnattendedConclusion,
+  CONCLUSION_GAP,
+  CONCLUSION_GAP_AFTER_TOOLS,
+  alertAboveFromPrompt,
+  fillCountAbove,
+  markerFromCountText,
+  parseAlertMarker,
+  stampAlertMarker,
+  unattendedToolDenial,
+} from "./schedule-alert.js";
+import { applyScheduleStatus } from "./notify/deliver.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, patchConversation, setConversationSummary } from "./conversations.js";
@@ -119,10 +131,86 @@ function isQuotaFailure(failure: string | null): boolean {
   return /401008|402|额度|未开通|余额|quota/i.test(String(failure || ""));
 }
 
-/** 这个模型短时间不会自己好：402 额度，或 HTTP 500。自动模式应立刻换下一个，不要在它身上重试。 */
+/**
+ * 当日免费额度用尽的 429。除了立刻换模型，还要冷却：短时间内再打同一个模型没有意义。
+ * 其它 429 只换模型、不冷却，下一期还可以再试它。
+ */
+export function isDailyQuotaFailure(failure: string | null): boolean {
+  return /free-models-per-day|freeusagelimit|openrouter_free_tier_daily|free[_ -]?tier.{0,40}daily|当日.{0,12}(额度|限额)|免费额度/i.test(
+    String(failure || ""),
+  );
+}
+
+/** 这个模型短时间不会自己好。自动模式应冷却并换下一个。 */
 export function isModelDownFailure(failure: string | null): boolean {
   // 只认状态码。正文里的「500」不能算（例如 400 的「max 500」），否则健康模型会被冷却。
-  return isQuotaFailure(failure) || /model http 500\b/i.test(String(failure || ""));
+  // 401 / 403 / 404 是这把钥匙或这个模型用不了，冷却。408 / 413 / 422 / 529 可能是这一次请求的问题，不冷却。
+  return (
+    isQuotaFailure(failure) ||
+    isDailyQuotaFailure(failure) ||
+    /model http (401|403|404|500)\b/i.test(String(failure || ""))
+  );
+}
+
+/**
+ * 模型接口的可识别状态码。同一模型不再重试，交给下一个候选。
+ * 全部候选都失败时，对话和钉钉写这个码，不用笼统的「失败」。
+ * 400 参数、401 鉴权、403 无权限、404 模型不存在、408 超时、413 过大、422 无法处理、529 过载，
+ * 与 402 / 429 / 5xx 同一条链。各模型可以有自己的钥匙，所以 401 也换下一个，而不是认定整池都失效。
+ */
+export type ModelAvailabilityStatus =
+  | "400"
+  | "401"
+  | "402"
+  | "403"
+  | "404"
+  | "408"
+  | "413"
+  | "422"
+  | "429"
+  | "500"
+  | "502"
+  | "503"
+  | "504"
+  | "529";
+
+export function modelAvailabilityStatus(failure: string | null): ModelAvailabilityStatus | null {
+  const msg = String(failure || "");
+  const http = msg.match(/model http (400|401|402|403|404|408|413|422|429|500|502|503|504|529)\b/i);
+  if (http) return http[1] as ModelAvailabilityStatus;
+  if (isDailyQuotaFailure(msg)) return "429";
+  if (/模型服务暂时不可用/.test(msg)) return "503";
+  if (isQuotaFailure(msg)) return "402";
+  return null;
+}
+
+/** 写进任务对话和钉钉的一句说明。不带上游原文，避免把一长段 JSON 当成结论。 */
+export function modelAvailabilityNotice(status: ModelAvailabilityStatus): string {
+  const why: Record<ModelAvailabilityStatus, string> = {
+    "400": "请求不被该模型接受",
+    "401": "鉴权失败",
+    "402": "额度或权限不足",
+    "403": "没有调用权限",
+    "404": "模型不存在",
+    "408": "模型服务超时",
+    "413": "请求内容过大",
+    "422": "请求无法处理",
+    "429": "请求过于频繁",
+    "500": "模型服务异常",
+    "502": "网关暂时不可用",
+    "503": "模型服务暂时不可用",
+    "504": "模型服务超时",
+    "529": "模型服务过载",
+  };
+  return `这次没有完成：模型返回 ${status}（${why[status]}）。已尝试更换模型，仍然失败。`;
+}
+
+/**
+ * 预警任务的轮次上限是无人值守预算，不再交给交互自主度下调。
+ * 周期报告和交互对话仍用收紧后的值。
+ */
+export function toolRoundsForRun(baseRounds: number, tightenedRounds: number, alertRun: boolean): number {
+  return alertRun ? baseRounds : tightenedRounds;
 }
 
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
@@ -194,6 +282,11 @@ const GROUNDING_VERIFY_MODEL_ID = String(process.env.GROUNDING_VERIFY_MODEL || "
 // 循环内层瞬时重试：某轮模型调用遇 SSE 断流 / 超时 / 限流等瞬态错误时重试，
 // 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
 const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
+
+/** 没有正文、也没有工具调用。思考类模型常把话只写进 reasoning，这不算已经答完。 */
+export function isBlankAnswerRound(text: string, toolCalls: number): boolean {
+  return !String(text || "").trim() && toolCalls === 0;
+}
 // 成本护栏：单轮对话累计 prompt token 上限（0 = 关闭）。轮次上限之外的第二道成本闸门，
 // 防止「每轮调不同工具、不触发 Doom Loop」时轮次未到但 token 已爆。
 const MAX_TOTAL_TOKENS = Math.max(0, Number(process.env.MCP_MAX_TOTAL_TOKENS || 0));
@@ -369,8 +462,8 @@ async function probeNeedsExternalData(
 const WRAP_UP_NARRATION_CHARS = Number(process.env.WRAP_UP_NARRATION_CHARS || 6000);
 /** 收尾时附带的工具结果摘录上限（字符）。从新到旧保留，避免只把「还没搜」的过程叙述交给收尾模型。 */
 const WRAP_UP_EVIDENCE_CHARS = Math.max(1000, Number(process.env.WRAP_UP_EVIDENCE_CHARS || 12_000));
-/** 单条工具结果进摘录的上限，以及摘录条数。条数按「最近成功」滚动，旧的让位给新的。 */
-const WRAP_UP_EVIDENCE_EACH = Math.max(200, Number(process.env.WRAP_UP_EVIDENCE_EACH || 4_000));
+/** 单条工具结果进摘录的上限。默认与回灌模型的截断上限相同，避免再切一刀把窗口中部的事实切掉。 */
+const WRAP_UP_EVIDENCE_EACH = Math.max(200, Number(process.env.WRAP_UP_EVIDENCE_EACH || 12_000));
 const WRAP_UP_EVIDENCE_KEEP = Math.max(1, Number(process.env.WRAP_UP_EVIDENCE_KEEP || 8));
 
 /**
@@ -383,29 +476,43 @@ const WRAP_UP_EVIDENCE_KEEP = Math.max(1, Number(process.env.WRAP_UP_EVIDENCE_KE
  *   工具轮正文经常是空的，收尾模型会如实写成「没有取到数据」。
  * 返回 `null` = 收尾调用不可用（异常 / 空文本），由调用方回落到累计叙述（现状行为）。
  */
+function wrapUpReady(text: string, conclusion?: "alert" | "report"): boolean {
+  if (!text.trim()) return false;
+  if (conclusion === "alert") return parseAlertMarker(text) != null;
+  return true;
+}
+
 async function wrapUpWith(
   model: ModelEntry,
   question: string,
   narration: string,
   evidence: string,
   signal?: AbortSignal,
+  conclusion?: "alert" | "report",
 ): Promise<string | null> {
-  try {
-    const result = await callAgent(
+  const stable = conclusion === "alert" ? `${WRAP_UP_HINT}\n\n${ALERT_WRAP_PROTOCOL}` : WRAP_UP_HINT;
+  const content = buildWrapUpUserContent(question, narration, evidence);
+  const ask = (extra: string) =>
+    callAgent(
       model,
-      [
-        {
-          role: "user",
-          content: buildWrapUpUserContent(question, narration, evidence),
-        },
-      ],
+      [{ role: "user", content: extra ? `${content}\n\n${extra}` : content }],
       [],
       signal,
       undefined,
-      { systemParts: { stable: WRAP_UP_HINT, dynamic: "" }, disableThinking: true },
+      { systemParts: { stable, dynamic: "" }, disableThinking: true },
     );
-    const t = result.text.trim();
-    return t || null;
+  try {
+    const first = (await ask("")).text.trim();
+    if (wrapUpReady(first, conclusion)) return first;
+    const again = (
+      await ask(
+        conclusion === "alert"
+          ? "上一稿不能用。正文第一行必须单独是 [SPIKE]、[NORMAL] 或 [NO_DATA] 之一，然后再写时间窗口和数量。"
+          : "上一稿没有面向用户的正文。请直接写结论，不要只写思考过程。",
+      )
+    ).text.trim();
+    if (wrapUpReady(again, conclusion)) return again;
+    return again || first || null;
   } catch (err) {
     console.warn(`[chat:wrap-up] 轮次耗尽收尾调用失败，回落过程叙述：${String((err as Error)?.message || err)}`);
     return null;
@@ -445,8 +552,10 @@ function truncateArgs(raw: string): string {
 
 /**
  * 排这一轮要试的模型。
- * 自动：冷却中的（刚 402 / 500）放到最后，从还能用的开始。用户点名的模型先试它，失败再换。
+ * 自动：冷却中的（刚 402 / 500 / 日限额）放到最后，从还能用的开始。用户点名的模型先试它，失败再换。
  * 一个都不新鲜时仍按原顺序试，避免「全部冷却 → 直接没模型」。
+ * 定时运行（skipCooled）：跳过冷却中的模型。自动模式下一个新鲜的都没有就返回空名单，由调用方记失败。
+ * 点名的模型仍试它本身，不把其余冷却模型再走一遍。
  */
 export function orderModelCandidates<T extends { id: string }>(
   all: readonly T[],
@@ -454,10 +563,18 @@ export function orderModelCandidates<T extends { id: string }>(
   auto: boolean,
   coolingUntil: ReadonlyMap<string, number> = quotaCooldownUntil,
   now = Date.now(),
+  skipCooled = false,
 ): T[] {
   const down = (item: T) => (coolingUntil.get(item.id) || 0) > now;
   const fresh = all.filter((item) => !down(item));
   const cooled = all.filter((item) => down(item));
+  if (skipCooled) {
+    if (!auto && preferred) {
+      const others = fresh.filter((item) => item.id !== preferred.id);
+      return [preferred, ...others];
+    }
+    return fresh;
+  }
   if (auto) {
     const lead = preferred && fresh.some((item) => item.id === preferred.id) ? preferred : fresh[0];
     const rest = fresh.filter((item) => item.id !== lead?.id);
@@ -469,12 +586,13 @@ export function orderModelCandidates<T extends { id: string }>(
 }
 
 /**
- * 判定模型调用错误是否「瞬态」（同一模型重试有意义）：限流 / 502·503·504 / 超时 / 中断 / 网络抖动。
- * 402 与 HTTP 500 不重试当前模型，直接交给候选链。400 / 401 同样不重试。
+ * 判定模型调用错误是否「瞬态」（同一模型重试有意义）：超时 / 中断 / 网络抖动。
+ * 400、401、402、403、404、408、413、422、429、500、502、503、504、529 不重试当前模型，直接交给候选链。
  * 必须先排除再正向匹配：上游 JSON 里的 "gateway" 会把 402 误判成瞬态。
  */
 export function isTransientModelError(msg: string | null): boolean {
   if (!msg) return false;
+  if (modelAvailabilityStatus(msg)) return false;
   if (/model http 500\b|(?:model http )?40[012]\b|401008|额度不足|额度已耗尽|permission_error|invalid_request_error|unauthorized/i.test(msg)) {
     return false;
   }
@@ -508,6 +626,20 @@ const WRAP_UP_HINT =
   "请仅基于已经获得的数据，直接给出结论性回答；不要再描述你打算查什么。\n" +
   "若已有数据不足以支撑结论，就如实说明已经查到什么、还缺哪一项，禁止编造数据。";
 
+/** 预警收尾必须带协议标记。收尾调用看不到主循环的任务指引，标记规则要写在这次调用上。 */
+const ALERT_WRAP_PROTOCOL =
+  "这是数据预警检查。正文第一行只能单独写下面三个标记之一：[SPIKE]、[NORMAL]、[NO_DATA]。\n" +
+  "有完整计数且未破线写 [NORMAL]；按用户指令判定破线写 [SPIKE]；没有可用结果或计数不完整写 [NO_DATA]，不要估算。";
+
+const BLANK_SYNTHESIS_HINT =
+  "上一轮没有写出面向用户的正文。请直接写结论，不要只写思考过程。能根据已有结果作答就不要再调用工具。";
+
+/** 工具结果回到上下文后的整合提示：先判断能否作答，缺的才再查。只注入一次。 */
+const INTEGRATE_HINT =
+  "上一轮工具已经返回结果。先根据这些结果整合并判断能不能回答用户。\n" +
+  "能回答就直接给出结论，不要再调用工具。\n" +
+  "只有还缺一项会改变结论的事实时，才再调用工具，并且只补那一项。不要重复已经查过的内容。";
+
 const WRAP_UP_EVIDENCE_HEADER =
   "已经取到的工具结果（从新到旧摘录；较早的原文可能已从上下文卸载，以这里为准）。" +
   "结论只能依据这些结果里实际出现的内容；这里没有的事实不要写成已经查到。";
@@ -529,20 +661,10 @@ export function shouldForceSynthesisRound(input: {
 }
 
 /**
- * 超长文本保留头尾。抓取页的标题在开头，时刻表、条款、结论经常在后半段；
- * 只留开头会把后半段的事实切掉。
+ * 成功的接地证据滚动进收尾摘录和事后核验。失败与空结果不记。
+ * 先收成与模型回灌相同的头部窗口（列表提示在开头，截断从尾部切），再按单条上限保留。
+ * 不对这个窗口做头尾对切：事实经常在窗口中部，对切会把它切掉。
  */
-export function clipHeadTail(body: string, limit: number): string {
-  if (body.length <= limit) return body;
-  const marker = "\n…（中间已省略）\n";
-  const room = Math.max(0, limit - marker.length);
-  if (room <= 0) return body.slice(0, limit);
-  const head = Math.ceil(room / 2);
-  const tail = room - head;
-  return `${body.slice(0, head)}${marker}${tail > 0 ? body.slice(-tail) : ""}`;
-}
-
-/** 成功的接地证据滚动进收尾摘录。失败与空结果不记。 */
 export function noteWrapUpEvidence(
   parts: string[],
   name: string,
@@ -552,12 +674,23 @@ export function noteWrapUpEvidence(
 ): void {
   const body = (raw || "").trim();
   if (!body || !name) return;
-  const clip = clipHeadTail(body, eachChars);
-  parts.push(`【${name}】\n${clip}`);
+  const visible = body.length > MAX_TOOL_RESULT_CHARS ? truncateResult(body, MAX_TOOL_RESULT_CHARS) : body;
+  const clip = visible.length > eachChars ? visible.slice(0, eachChars) : visible;
+  parts.push(`【来源 ${name}】\n${clip}`);
   if (parts.length > keep) parts.splice(0, parts.length - keep);
 }
 
-/** 从新到旧装入上限；装不下的那条保留头尾，更旧的整条丢掉。 */
+/**
+ * 事后核验看到的证据。已保存的定时配置不是工具返回，但回答可以照它写启用状态和频率。
+ * 放在工具摘录前面，避免工具窗口把这句挤掉后，核验把正确的频率判成无支持并作废整段。
+ */
+export function verificationEvidence(scheduleStatusLine: string | undefined, wrapped: string, fallback: string): string {
+  const saved = scheduleStatusLine?.trim() ? `【已保存配置】\n${scheduleStatusLine.trim()}` : "";
+  const body = wrapped.trim() || fallback.trim();
+  return [saved, body].filter(Boolean).join("\n\n");
+}
+
+/** 从新到旧装入上限。装不下的那条留头部（与回灌窗口一致），更旧的整条丢掉。 */
 export function clipWrapUpEvidence(parts: readonly string[], limitChars = WRAP_UP_EVIDENCE_CHARS): string {
   if (!parts.length || limitChars <= 0) return "";
   const kept: string[] = [];
@@ -566,7 +699,7 @@ export function clipWrapUpEvidence(parts: readonly string[], limitChars = WRAP_U
     if (used >= limitChars) break;
     const part = parts[i] || "";
     const room = limitChars - used;
-    const piece = part.length > room ? clipHeadTail(part, room) : part;
+    const piece = part.length > room ? part.slice(0, room) : part;
     kept.push(piece);
     used += piece.length + 2;
   }
@@ -891,20 +1024,23 @@ function isGovernedPlaceholder(content: string): boolean {
 }
 
 /**
- * 本轮工具结果治理：超出预算时从最旧的开始处理，但永远保留最近 TOOL_RESULT_KEEP 组、
+ * 本轮工具结果治理：超出预算时从最旧的开始处理，但永远保留最近 keep 组、
  * 且不处理白名单工具。处理方式（Deep Agents 的 offloading 思路）：
  * 大结果先**卸载到工作区文件**（保留 fs_read 指针，可取回），落盘失败才退化为纯占位符。
+ * keep 至少要盖住刚返回、模型还没整合的那一批，否则并行结果会在下一轮调用前被卸掉。
  */
 export function governToolResults(
   conversation: Turn[],
   conversationId: string,
+  keep = TOOL_RESULT_KEEP,
 ): { cleared: number; offloaded: number } {
   const toolTurns = conversation.filter((turn) => turn.role === "tool");
   if (!toolTurns.length) return { cleared: 0, offloaded: 0 };
+  const retain = Math.max(0, keep);
   let total = estimateTokensOf(toolTurns.map((turn) => turn.content));
   const older = toolTurns.filter(
     (turn, index) =>
-      index < toolTurns.length - TOOL_RESULT_KEEP &&
+      index < toolTurns.length - retain &&
       !isToolResultProtected(turn.name || "") &&
       !isGovernedPlaceholder(turn.content),
   );
@@ -1395,6 +1531,12 @@ interface LoopContext {
   /** 无人值守运行（定时任务）：最后一轮不再给工具，强制模型用已经取到的数据收尾写结论。
    *  不填 = 交互式行为不变（没人在等，模型可以一路调工具到预算耗尽）。 */
   forceWrapUp?: boolean;
+  /** 定时任务的结论协议。预警收尾必须带首行标记，报告不强制。 */
+  unattendedConclusion?: "alert" | "report";
+  /** 预警指令里的破线阈值。计数没传 above 时用它。 */
+  alertAbove?: number | null;
+  /** 已保存的启用状态和频率。事后核验把它算进证据，避免正确的配置句被判成无支持。 */
+  scheduleStatusLine?: string;
   /** 知识库命名空间（按角色隔离）：默认 "generic"，由当前会话角色决定。 */
   namespace: string;
   /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）；仅 "尚无工具结果" 的首轮生效。
@@ -1433,6 +1575,8 @@ interface LoopOutcome {
   groundingVerifications: number;
   /** 纠正后仍未取得数据、最终以确定性拒答收束（true 时调用方须丢弃模型文本）。 */
   ungrounded: boolean;
+  /** 最近一次 count_list_by_time 能确定的协议标记。没有阈值或认不出结果时为 null。 */
+  countMarker: AlertMarker | null;
   /** 累计发送的 prompt token 估算（成本护栏开启时统计）。 */
   spentTokens: number;
 }
@@ -1440,6 +1584,17 @@ interface LoopOutcome {
 /** 工具循环：模型 → tool_calls → 执行（内置 / MCP / 委派）→ 回灌 → 再调用，直到结论或轮次上限。 */
 async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEvent, LoopOutcome> {
   const serverOf = new Map<string, string>(ctx.mcpTools.map((tool) => [tool.name, tool.serverId]));
+  const countArgs = (name: string, argsJson: string): string => {
+    if (name !== "count_list_by_time" || ctx.alertAbove == null) return argsJson;
+    let args: unknown;
+    try {
+      args = JSON.parse(argsJson || "{}");
+    } catch {
+      return argsJson;
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) return argsJson;
+    return JSON.stringify(fillCountAbove(args as Record<string, unknown>, ctx.alertAbove));
+  };
   for (const item of builtinToolSpecs({ toolSearch: ctx.toolSearch })) serverOf.set(item.name, BUILTIN_SERVER);
   // 按需加载模式下 specs 会随检索增长，用局部变量（ctx.specs 只作初始值）。
   let specs = ctx.specs;
@@ -1484,7 +1639,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     if (verdict.level !== "read" || verdict.deny || verdictNeedsConfirm(verdict)) {
       return { ok: false, text: `代码里只能调用只读且免确认的工具（${name}：${verdict.reason}）` };
     }
-    const argsJson = JSON.stringify(args ?? {});
+    const argsJson = countArgs(name, JSON.stringify(args ?? {}));
     const builtin = await execBuiltin(
       name,
       argsJson,
@@ -1521,14 +1676,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let groundingEvidence = 0;
   let groundingRetries = 0;
   let ungrounded = false;
+  let countMarker: AlertMarker | null = null;
   // 事后核验状态：累积证据原文（供核验器对齐）+ 已核验次数。
   let groundingVerifications = 0;
   const evidence: string[] = [];
   let evidenceChars = 0;
-  // 收尾摘录：与核验证据分开。核验从前往后填满即停，收尾要的是最近几次成功结果
-  // （旧结果常已被卸载成文件指针，综合轮再读不到）。
+  // 最近成功结果的摘录：收尾和事后核验都用它。从新到旧，避免核验只看见最早几条检索。
   const wrapEvidence: string[] = [];
   const wrapReasoning: string[] = [];
+  let integrateHinted = false;
+  let blankSynthesisNudged = false;
   /** 本轮证据的**来源集合**（工具名 / 服务器标识）：回答里声称的来源要能与它对上，否则就是编造的引用。 */
   const evidenceSources = new Set<string>();
   /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
@@ -1584,9 +1741,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           : "[chat:wrap-up] 已有工具证据，最后一轮摘掉工具，按证据写结论",
       );
       // 只摘工具不够：模型会把「想调工具」写成一句过程叙述就停下。显式要求收尾，并附上可能已卸载的结果摘录。
+      const synthesisHint = buildSynthesisHint(clipWrapUpEvidence(wrapEvidence));
       conversation.push({
         role: "user",
-        content: buildSynthesisHint(clipWrapUpEvidence(wrapEvidence)),
+        content:
+          ctx.unattendedConclusion === "alert" ? `${synthesisHint}\n\n${ALERT_WRAP_PROTOCOL}` : synthesisHint,
       });
     }
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
@@ -1646,10 +1805,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         );
       }
       if (!outcome.failure) {
-        // 空回合（既无正文、也无工具调用、连思考都没有）不是「模型表示没有内容」，而是上游抖动：
-        // 共享/免费端点上很常见。直接收束会让用户看到空白气泡（同一次提问重发往往就有内容），
-        // 故走同一份瞬时重试预算重试；重试用尽才接受空结果（后续还有伪调用/接地等分支兜底）。
-        const emptyRound = !outcome.text.trim() && !outcome.toolCalls.length && !outcome.reasoning.trim();
+        // 没有正文也没有工具调用，不算答完。思考类模型经常只写 reasoning，正文是空的；
+        // 直接收束就会落成「生成未产出内容」。用同一份重试预算再要一次正文。
+        const emptyRound = isBlankAnswerRound(outcome.text, outcome.toolCalls.length);
         if (emptyRound && callAttempt < MODEL_CALL_RETRIES) {
           callAttempt += 1;
           modelRetries += 1;
@@ -1760,7 +1918,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         })
       ) {
         groundingVerifications += 1;
-        const evidenceText = evidence.join("\n");
+        // 核验看最近的工具窗口，不看「从前往后填满就停」的旧缓冲。
+        // 后者在长检索里只剩开头几条泛结果，会把后来查到的事实判成无支持。
+        const evidenceText = verificationEvidence(
+          ctx.scheduleStatusLine,
+          clipWrapUpEvidence(wrapEvidence, GROUNDING_EVIDENCE_CHARS),
+          evidence.join("\n"),
+        );
         const verifyInput = { question: userQuestion, evidence: evidenceText, answer: outcome.text };
         // 多票裁决：跑 GROUNDING_VERIFY_VOTES 次独立核验，多数票认定无支持才作废（降低核验器自身误判）。
         // 任一票不可用（解析失败 / 调用异常）→ 整体视为「未核验」，不阻断作答（不静默、也不误判）。
@@ -1821,8 +1985,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 本轮为「综合轮」（无工具调用、并通过全部纠正后收束）：只有这一轮的正文才是正式回答，
       // 流式下发为回答正文，并记为最终答案（覆盖中间轮的过程叙述）。
-      // 正文为空（思考类模型有时只写 reasoning）不当成答案，留给事后补位按证据重写。
-      if (!outcome.text.trim()) break;
+      // 正文为空（思考类模型有时只写 reasoning）不当成答案。还有轮次就回灌一次，否则留给事后补位。
+      if (!outcome.text.trim()) {
+        if (!blankSynthesisNudged && round + 1 < ctx.maxRounds) {
+          blankSynthesisNudged = true;
+          conversation.push({ role: "user", content: BLANK_SYNTHESIS_HINT });
+          console.log("[chat:blank] 综合轮没有正文，已要求重写结论");
+          continue;
+        }
+        break;
+      }
       synthesisText = outcome.text;
       if (roundText) yield { type: "text_delta", text: roundText };
       break;
@@ -1831,6 +2003,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 每轮重置同轮去重集合（跨轮允许重新执行，避免误杀「重新取数」等合法重复）。
     executedSigs.clear();
     roundExecuted = [];
+    const toolsBefore = conversation.filter((turn) => turn.role === "tool").length;
 
     // 工具调用轮：把本轮思考一并带上（`reasoning`）——思考类模型在工具循环里要求 assistant 工具调用消息
     // 携带 reasoning_content，缺了会被网关判为非法请求（详见 models.ts 的 reasoningReplayRequired）。
@@ -1904,7 +2077,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       const builtin = await execBuiltin(
         c.name,
-        c.argsJson,
+        countArgs(c.name, c.argsJson),
         ctx.conversationId,
         ctx.namespace,
         ctx.ownerKey,
@@ -2293,7 +2466,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       roundExecuted.push(sig);
       const builtin = await execBuiltin(
         call.name,
-        call.argsJson,
+        countArgs(call.name, call.argsJson),
         ctx.conversationId,
         ctx.namespace,
         ctx.ownerKey,
@@ -2375,6 +2548,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；
       // 记账 / 工作区类内置工具（write_todos、fs_write 等）成功也不算证据。
+      if (executed && call.name === "count_list_by_time") {
+        const next = markerFromCountText(rawText);
+        if (next) countMarker = next;
+      }
       if (executed && ok && isGroundingEvidenceTool(call.name)) {
         groundingEvidence += 1;
         pushEvidence(rawText, call.name);
@@ -2432,8 +2609,25 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         );
       }
     }
-    // 每轮结束治理一次：给下一轮模型调用留出预算（超预算的大结果卸载到工作区）。
-    const governed = governToolResults(conversation, ctx.conversationId);
+    // 每轮结束治理一次：给下一轮整合留出预算。刚返回的这一批必须留下，模型还没读过不能先卸。
+    const freshTools = conversation.filter((turn) => turn.role === "tool").length - toolsBefore;
+    const governed = governToolResults(
+      conversation,
+      ctx.conversationId,
+      Math.max(TOOL_RESULT_KEEP, freshTools),
+    );
+    // 有了证据就提示下一轮先整合。最后一轮会改成无工具收尾，那里不再重复提示。
+    const nextIsSynthesis = shouldForceSynthesisRound({
+      round: round + 1,
+      maxRounds: ctx.maxRounds,
+      forceWrapUp: ctx.forceWrapUp === true,
+      evidenceCalls: groundingEvidence,
+    });
+    if (!integrateHinted && groundingEvidence > 0 && !nextIsSynthesis && round + 1 < ctx.maxRounds) {
+      conversation.push({ role: "user", content: INTEGRATE_HINT });
+      integrateHinted = true;
+      console.log("[chat:integrate] 工具结果已回灌，下一轮先按已有结果整合");
+    }
     clearedToolResults += governed.cleared;
     offloadedToolResults += governed.offloaded;
     // 逐轮追踪（best-effort，不阻断对话）：每轮落一行，使「重复探查 / 预算耗尽 / 熔断」可被复盘（§12.6 疑问①）。
@@ -2474,6 +2668,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       wrapNarration,
       clipWrapUpEvidence(wrapEvidence),
       ctx.signal,
+      ctx.unattendedConclusion,
     );
     if (wrapped) {
       synthesisText = wrapped;
@@ -2499,6 +2694,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     groundingVerifications,
     ungrounded,
     spentTokens,
+    countMarker,
   };
 }
 
@@ -2778,6 +2974,8 @@ export async function* chatStream(
      * 没有事实断言的回答已在分诊放行，不会走到这里。不传 = 交互对话。
      */
     unattendedConclusion?: "alert" | "report";
+    /** 任务指令问了启用/频率时，收束前换成这句已保存配置，不采用模型自己写的频率。 */
+    scheduleStatusLine?: string;
     /** 浏览器上报的 IANA 时区。合法时写入本对话，并作为小时分桶的缺省时区。 */
     timeZone?: string;
   } = {},
@@ -2901,7 +3099,9 @@ export async function* chatStream(
   // 用它提权等于给攻击者一条路径；收窄则只会更保守。放开权限必须由人决策。
   const baseRounds = opts.maxRounds && opts.maxRounds > 0 ? Math.floor(opts.maxRounds) : MAX_TOOL_ROUNDS;
   const autonomy = autonomyFor(opts.ownerKey, baseRounds);
-  if (autonomy.level < 2) {
+  const alertRun = opts.unattendedConclusion === "alert";
+  const toolRounds = toolRoundsForRun(baseRounds, autonomy.maxRounds, alertRun);
+  if (!alertRun && autonomy.level < 2) {
     console.log(`[chat:autonomy] 自主度降至 ${autonomy.level}（${autonomy.reason}），轮次预算 ${baseRounds} → ${autonomy.maxRounds}`);
   }
 
@@ -2966,13 +3166,28 @@ export async function* chatStream(
   // 预算先算：窗口 − 输出预留 − 工具 schema − 本轮工具结果预算（工具定义也是纯开销）。
   const toolSchemaTokens = specs.length ? estimateTokens(JSON.stringify(specs)) : 0;
 
-  // 候选链：一个模型 402 / 500 就换下一个，直到有一个做完，或名单用尽。
+  // 候选链：一个模型 402 / 500 / 日限额就换下一个，直到有一个做完，或名单用尽。
   // 自动（含定时任务没指定模型）：冷却中的不打头。用户点名的模型仍先试它，失败再换。
+  // 定时运行跳过冷却中的模型；一个能用的都没有就记失败，不再把冷却链打一遍。
   const allModels = listModels();
-  const candidates = orderModelCandidates(allModels, model, !explicitModel);
+  const unattended = Boolean(opts.forceWrapUp || opts.unattendedConclusion);
+  const candidates = orderModelCandidates(
+    allModels,
+    model,
+    !explicitModel,
+    quotaCooldownUntil,
+    Date.now(),
+    unattended,
+  );
   const cooling = candidates.filter((m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now());
   if (cooling.length && cooling.length < candidates.length) {
     console.log(`[chat:model] 不可用冷却中已后移：${cooling.map((m) => m.id).join(",")}`);
+  }
+  const skipped = allModels.filter(
+    (m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now() && !candidates.some((c) => c.id === m.id),
+  );
+  if (skipped.length) {
+    console.log(`[chat:model] 定时运行跳过冷却中的模型：${skipped.map((m) => m.id).join(",")}`);
   }
   let text = "";
   let failure: string | null = null;
@@ -2996,9 +3211,13 @@ export async function* chatStream(
   let groundingRetries = 0;
   let groundingVerifications = 0;
   let ungrounded = false;
+  let countMarker: AlertMarker | null = null;
   let costTokens = 0;
   let modelFallbacks = 0;
 
+  if (!candidates.length) {
+    failure = "没有可用模型：定时运行跳过了冷却中的模型";
+  }
   for (const m of candidates) {
     budget = historyBudgetTokens(m, toolSchemaTokens);
     // 上下文装配（history.ts）：窗口 → 无损裁剪 → 超预算时 LLM 摘要（水位线增量）→ 硬丢弃。
@@ -3070,8 +3289,11 @@ export async function* chatStream(
           fullAccess: conversation?.fullAccess ?? true,
           sessionId: opts.sessionId,
           // 调用方给了预算就用它（无人值守的定时任务比交互式宽），否则走全局默认。
-          maxRounds: autonomy.maxRounds,
+          maxRounds: toolRounds,
           ...(opts.forceWrapUp ? { forceWrapUp: true } : {}),
+          ...(opts.unattendedConclusion ? { unattendedConclusion: opts.unattendedConclusion } : {}),
+          ...(opts.unattendedConclusion === "alert" ? { alertAbove: alertAboveFromPrompt(userText) } : {}),
+          ...(opts.scheduleStatusLine ? { scheduleStatusLine: opts.scheduleStatusLine } : {}),
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
           enforceGrounding,
@@ -3104,6 +3326,7 @@ export async function* chatStream(
     groundingRetries = loop.groundingRetries || 0;
     groundingVerifications = loop.groundingVerifications || 0;
     ungrounded = loop.ungrounded || false;
+    countMarker = loop.countMarker ?? null;
     // 跨候选**累加**：切换模型时前一个候选已真实消耗的 token 不能丢。
     // 原实现是赋值，切一次就丢一份，配额只计入最后一个候选的量——
     // 配额是成本护栏，少扣是方向性错误（实测 modelFallbacks 可达 3，实际花费可能是计入值的 2-4 倍）。
@@ -3180,6 +3403,11 @@ export async function* chatStream(
         text: `${text.trim()}\n\n⚠️ 生成因以下原因中断：${failure}（以上为中断前的中间结果，可能不完整）`,
       };
     }
+    const availability = modelAvailabilityStatus(failure);
+    if (!text.trim() && availability) {
+      // 定时任务靠这段正文告知 402 / 500 / 429，不把上游 JSON 写进对话，也不把它当成业务失败去推送。
+      yield { type: "text", text: modelAvailabilityNotice(availability) };
+    }
     if (!text.trim()) {
       yield {
         type: "error",
@@ -3197,13 +3425,20 @@ export async function* chatStream(
   // 没有事实断言的回答已在分诊放行。走到这里且 ungrounded 时，正文已是诚实兜底或确定性文案。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
+  const stamped =
+    opts.unattendedConclusion === "alert" && countMarker ? stampAlertMarker(guarded, countMarker) : guarded;
   // 无人值守（定时任务）且最终没取到可核对的数据时，正文按协议结论化（预警 = [NO_DATA] 首行标记）。
   // 按状态判定，不比对措辞：这段是模型写的诚实兜底，措辞每期都可能不同。
   // 出站最后一道过滤（OWASP ASI05 / LLM06）：Agent 会读文件、读环境、调外部系统，
   // 回答里若带了读到的密钥形态内容，打码后再给用户与落库（真正的防线是子进程不继承凭据）。
-  const rawFinalText =
-    buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: guarded }) ||
+  const concluded =
+    buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: stamped }) ||
     (ungrounded ? UNGROUNDED_REPLY : "");
+  // 工具已返回但正文仍空：不要落成「生成未产出内容」。这句话不是协议结论，调度侧会记失败。
+  const withGap = concluded.trim() || (toolCalls > 0 ? CONCLUSION_GAP_AFTER_TOOLS : CONCLUSION_GAP);
+  const rawFinalText = opts.scheduleStatusLine
+    ? applyScheduleStatus(withGap, opts.scheduleStatusLine)
+    : withGap;
   const finalText = redactSensitive(rawFinalText);
   if (finalText !== rawFinalText) {
     console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(rawFinalText)} 处`);

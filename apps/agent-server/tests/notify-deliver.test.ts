@@ -3,7 +3,16 @@
 import { test, expect } from "vitest";
 import { createHmac } from "node:crypto";
 import {
+  buildScheduleConfigDelivery,
   buildScheduleDelivery,
+  applyScheduleStatus,
+  describeScheduleTiming,
+  formatScheduleListLine,
+  scheduleConfigChanged,
+  scheduleRunFacts,
+  scheduleStatusSentence,
+  taskAsksScheduleStatus,
+  upcomingScheduleRunAt,
   dingtalkSign,
   feishuSign,
   formatForIm,
@@ -192,6 +201,168 @@ test("[H] 结果通知：标题=任务名+状态、正文带时间、按钮带�
   });
   expect(noOrigin.links).toBeUndefined();
   expect(noOrigin.title).toBe("巡检 · 成功");
+});
+
+test("[H4] 保存后的配置通知写明当前参数和任务内容", () => {
+  const msg = buildScheduleConfigDelivery({
+    name: "客服对话量预警",
+    prompt: "【数据预警】\n- 范围：超过 300 的 1 小时会话量",
+    cron: "*/5 * * * *",
+    notifyPolicy: "on_alert",
+    purpose: "alert",
+    runMode: "same",
+    mcpServers: ["salesiq"],
+    locale: "zh",
+    conversationId: "conv_1",
+  });
+  expect(msg.title).toBe("客服对话量预警 · 配置已更新");
+  expect(msg.body).toContain("用途：数据预警");
+  expect(msg.body).toContain("通知：仅异常时推送");
+  expect(msg.body).toContain("频率：每 5 分钟执行一次");
+  expect(msg.body).toContain("结果落点：同一会话");
+  expect(msg.body).toContain("工具：salesiq");
+  expect(msg.body).toContain("超过 300 的 1 小时会话量");
+  expect(describeScheduleTiming({ cron: "0 * * * *" }, "zh")).toBe("每小时执行一次");
+  expect(describeScheduleTiming({ cron: "15 9 * * 1-5" }, "zh")).toBe("15 9 * * 1-5");
+  expect(describeScheduleTiming({ cron: "*/5  *   * * *" }, "zh")).toBe("每 5 分钟执行一次");
+});
+
+test("[H4] 正在执行的这一档不算下次；频率按已保存的 cron 写成中文", () => {
+  const now = Date.parse("2026-10-09T10:31:36+08:00");
+  const due = Date.parse("2026-10-09T10:30:00+08:00");
+  const live = formatScheduleListLine(
+    {
+      id: "live",
+      name: "印度客服对话量预警",
+      prompt: "检查",
+      enabled: true,
+      cron: "*/10 * * * *",
+      nextRunAt: due,
+      lastStatus: "success",
+      locale: "zh",
+    },
+    now,
+  );
+  expect(live).toContain("已启用｜频率：每 10 分钟执行一次");
+  expect(live).toContain("10:40:00");
+  expect(live).not.toContain("10:30:00");
+  expect(live).not.toContain("每 5 分钟");
+  const paused = formatScheduleListLine(
+    {
+      id: "paused",
+      name: "印度客服对话量预警测试",
+      prompt: "检查",
+      enabled: false,
+      cron: "*/5 * * * *",
+      locale: "zh",
+    },
+    now,
+  );
+  expect(paused).toContain("已暂停｜频率：每 5 分钟执行一次");
+  expect(paused).not.toContain("下次");
+  const facts = scheduleRunFacts(
+    { name: "印度客服对话量预警", prompt: "检查", enabled: true, cron: "*/10 * * * *", nextRunAt: due, locale: "zh" },
+    now,
+  );
+  expect(facts).toContain("频率：每 10 分钟执行一次");
+  expect(facts).toContain("10:40:00");
+  expect(facts).not.toContain("每 5 分钟");
+  const sentence = scheduleStatusSentence(
+    { name: "印度客服对话量预警", prompt: "检查", enabled: true, cron: "*/10 * * * *", nextRunAt: due, locale: "zh" },
+    now,
+  );
+  const rewritten = applyScheduleStatus(
+    "[NORMAL]\n- 当前数量：12 条\n- 预警是否启用：无法确认\n- 「印度客服对话量预警」每 5 分钟执行一次",
+    sentence,
+  );
+  expect(rewritten).toContain("当前数量：12 条");
+  expect(rewritten).toContain(sentence);
+  expect(rewritten).not.toContain("无法确认");
+  expect(rewritten).not.toContain("每 5 分钟");
+  expect(taskAsksScheduleStatus("告诉我是否已经启用预警功能了")).toBe(true);
+  expect(taskAsksScheduleStatus("只报当前对话量")).toBe(false);
+  expect(upcomingScheduleRunAt({ enabled: true, cron: "*/10 * * * *", nextRunAt: due }, now)).toBe(
+    Date.parse("2026-10-09T10:40:00+08:00"),
+  );
+
+  const kept = buildScheduleConfigDelivery({
+    name: "巡检",
+    prompt: "失败时不要只写钉钉群\n表达式 */5",
+    cron: "*/10 * * * *",
+    notifyPolicy: "on_alert",
+    purpose: "report",
+    locale: "zh",
+    conversationId: "conv_1",
+  });
+  expect(kept.body).toContain("用途：周期报告");
+  expect(kept.body).toContain("通知：仅异常时推送");
+  expect(kept.body).toContain("不要只写钉钉群");
+  expect(kept.body).toContain("表达式 */5");
+});
+
+test("[H4] 只有配置字段变化才通知；未读数不在比较里", () => {
+  const saved = {
+    name: "巡检",
+    prompt: "检查",
+    cron: "*/10 * * * *",
+    notifyPolicy: "always" as const,
+    purpose: "report" as const,
+    runMode: "new" as const,
+    mcpServers: ["b", "a"],
+  };
+  expect(scheduleConfigChanged(saved, { ...saved, mcpServers: ["a", "b"] })).toBe(false);
+  expect(scheduleConfigChanged(saved, { ...saved, prompt: "检查\n阈值 300" })).toBe(true);
+  expect(scheduleConfigChanged(saved, { ...saved, cron: "*/5 * * * *" })).toBe(true);
+  expect(scheduleConfigChanged(saved, saved)).toBe(false);
+  expect(scheduleConfigChanged(saved, { ...saved, prompt: "检查" })).toBe(false);
+  expect(scheduleConfigChanged(saved, { ...saved, prompt: "检查\r\n" })).toBe(false);
+});
+
+test("[H4] 正在跑的这一档不算下次执行", () => {
+  const now = Date.parse("2026-10-09T02:25:11.059Z");
+  const next = upcomingScheduleRunAt({ enabled: true, cron: "*/5 * * * *", nextRunAt: now - 1000 }, now);
+  expect(next).toBeDefined();
+  expect(next! > now).toBe(true);
+  const facts = scheduleRunFacts(
+    { name: "客服对话量预警", prompt: "检查", enabled: true, cron: "*/5 * * * *", nextRunAt: now - 1000 },
+    now,
+  );
+  expect(facts).toContain("已启用");
+  expect(facts).toContain("每 5 分钟执行一次");
+  expect(facts).toContain("下次执行：");
+  expect(facts).not.toContain("*/5");
+});
+
+test("[H3] 模型都失败时，钉钉状态用状态码，正文写明原因", () => {
+  const msg = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "failed",
+    text: "这次没有完成：模型返回 503（模型服务暂时不可用）。已尝试更换模型，仍然失败。",
+    modelStatus: "503",
+    conversationId: "conv_1",
+    locale: "zh",
+  });
+  expect(msg.title).toBe("印度客服对话量预警 · 503");
+  expect(msg.body).toContain("状态：503");
+  expect(msg.body).toContain("模型服务暂时不可用");
+  expect(msg.body).not.toContain("状态：失败");
+});
+
+test("[H2] 预警执行失败用「检查没有完成」，不用空结论充当业务结果", () => {
+  const msg = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "failed",
+    text: "",
+    checkIncomplete: true,
+    conversationId: "conv_1",
+    locale: "zh",
+  });
+  expect(msg.title).toBe("印度客服对话量预警 · 失败");
+  expect(msg.body).toContain("这次检查没有完成");
+  expect(msg.body).not.toContain("本次未产出内容");
+  expect(msg.body).not.toContain("生成未产出内容");
 });
 
 test("[I] 语言：四语状态词按 locale 前缀选择（认不出的回落中文）", () => {

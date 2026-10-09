@@ -32,6 +32,7 @@ import {
 } from "./output-schema.js";
 import { createScheduleTask } from "./schedule-service.js";
 import { deleteSchedule, listSchedules, patchSchedule } from "./schedules.js";
+import { formatScheduleListLine, SCHEDULE_LIST_FREQUENCY_RULE } from "./notify/deliver.js";
 import { pickNotifyPolicy, pickPurpose } from "./schedule-alert.js";
 import { type ToolSpec, safeJsonParse } from "./models.js";
 import { readSkill } from "./skills.js";
@@ -44,7 +45,7 @@ import { callMcpTool } from "./mcp/hub.js";
 import { getServer } from "./mcp/config.js";
 import { applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
 import {
-  countPagedList,
+  countListWithRetries,
   formatCountReport,
   LIST_COUNT_DEFAULT_PAGES,
   resolveCountTimeZone,
@@ -438,7 +439,9 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "list_schedules",
-      "列出本设备的定时任务（名称 / 启用状态 / 执行时间 / 下次与上次运行结果）。" +
+      "列出本设备的定时任务（名称 / 启用状态 / 频率 / 下次与上次运行结果）。" +
+        "每一行的「频率」是已保存配置的原文。回答执行频率时只准照抄该行，不要把 cron 换算成中文，" +
+        "也不要沿用对话历史里的旧频率，或把另一个任务的频率安过来。" +
         "用户问「我有哪些定时任务」「那个日报任务还在跑吗」时用它；**创建或改动任务前先列一次**，" +
         "避免重复建同一个任务，也用它的 id 去做暂停 / 恢复 / 删除。",
       { type: "object", properties: {}, required: [] },
@@ -1389,15 +1392,7 @@ export async function execBuiltin(
       if (!list.length) return { ok: true, text: "（当前没有定时任务）" };
       return {
         ok: true,
-        text: list
-          .map(
-            (s) =>
-              `- ${s.id}｜${s.name || s.prompt.slice(0, 20)}｜${s.enabled ? "启用" : "已暂停"}` +
-              `｜${s.cron ? `cron: ${s.cron}` : s.onceAt ? `一次性: ${new Date(s.onceAt).toLocaleString("zh-CN")}` : "未设置时间"}` +
-              `${s.nextRunAt ? `｜下次: ${new Date(s.nextRunAt).toLocaleString("zh-CN")}` : ""}` +
-              `${s.lastStatus ? `｜上次: ${s.lastStatus}` : ""}`,
-          )
-          .join("\n"),
+        text: `${list.map((s) => formatScheduleListLine(s)).join("\n")}\n${SCHEDULE_LIST_FREQUENCY_RULE}`,
       };
     }
     case "manage_schedule": {
@@ -1953,7 +1948,7 @@ export async function execBuiltin(
       const base = ensureConversationStartTime(toolName, prepareListArgs(toolName, withDefaults));
       const rowsField = str(args, "rowsField").trim();
       const timeField = conversationCountTimeField(toolName, str(args, "timeField"));
-      const report = await countPagedList(
+      const report = await countListWithRetries(
         {
           arguments: base,
           timeField,
@@ -1978,15 +1973,27 @@ export async function execBuiltin(
   }
 }
 
+/** 每期覆盖这一份。按时间戳另存会在几次预警后写满工作区上限，计数结果里就只剩文件错误。 */
+export const HOUR_COUNT_FILE = "results/hour-counts.tsv";
+
+export function writeHourCountFile(
+  conversationId: string,
+  body: string,
+): { path: string; bytes: number } | { error: string } {
+  for (const item of fsList(conversationId)) {
+    if (/^results\/hour-counts-\d+\.tsv$/.test(item.path)) fsDelete(conversationId, item.path);
+  }
+  return fsWrite(conversationId, HOUR_COUNT_FILE, body);
+}
+
 function attachHourFile(conversationId: string, report: CountListReport): void {
   if (!report.complete || !report.hours.length) return;
-  const file = `results/hour-counts-${Date.now()}.tsv`;
   const body = [
     `# complete: true`,
     "hour\tcount",
     ...report.hours.map((item) => `${item.hour}\t${item.count}`),
   ].join("\n");
-  const written = fsWrite(conversationId, file, `${body}\n`);
+  const written = writeHourCountFile(conversationId, `${body}\n`);
   if ("error" in written) report.fileError = written.error;
   else report.file = written.path;
 }

@@ -48,7 +48,14 @@ import {
   type PendingMessage,
   type StoredMessage,
 } from "./conversations.js";
-import { chatStream, cancelSubagent, cancelSubagentsOfConversation } from "./chat.js";
+import {
+  chatStream,
+  cancelSubagent,
+  cancelSubagentsOfConversation,
+  modelAvailabilityNotice,
+  modelAvailabilityStatus,
+  type ModelAvailabilityStatus,
+} from "./chat.js";
 import { listSelectableSkillMetas, listSkillMetas } from "./skills.js";
 import { hasRole } from "./roles.js";
 import {
@@ -111,13 +118,19 @@ import {
   scheduleConversationTitle,
 } from "./schedule-service.js";
 import {
+  commitAlertFailureNotice,
   decideAlertDelivery,
+  decideAlertFailure,
   deliveryArmPurpose,
   needsArmNotice,
+  CONCLUSION_GAP,
+  CONCLUSION_GAP_AFTER_TOOLS,
   parseAlertMarker,
   pickNotifyPolicy,
   pickPurpose,
   SCHEDULE_ALERT_GUIDE,
+  scheduleFinishedStatus,
+  shouldDeliverScheduleResult,
   type ScheduleNotifyPolicy,
   type SchedulePurpose,
 } from "./schedule-alert.js";
@@ -130,7 +143,15 @@ import {
   validateChannelInput,
   type NotifyChannelInput,
 } from "./notify/channels.js";
-import { buildScheduleDelivery, deliverToChannels } from "./notify/deliver.js";
+import {
+  buildScheduleConfigDelivery,
+  buildScheduleDelivery,
+  deliverToChannels,
+  scheduleConfigChanged,
+  scheduleRunFacts,
+  scheduleStatusSentence,
+  taskAsksScheduleStatus,
+} from "./notify/deliver.js";
 import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 
 const COOKIE = SESSION_COOKIE;
@@ -175,7 +196,7 @@ const SCHEDULE_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.MCP_SCHEDULE_MAX
  * 走系统提示的动态后缀注入（不进用户可见历史，也不污染稳定前缀/不影响 prompt cache）。
  */
 const SCHEDULE_UNATTENDED_DENY =
-  "无人值守不允许调用 fs_delete、run_command、run_script、manage_schedule、request_clarification；若仍调用，会被拒绝并记入本期记录。";
+  "无人值守不允许调用 fs_delete、run_command、run_script、manage_schedule、list_schedules、request_clarification；若仍调用，会被拒绝并记入本期记录。";
 
 const SCHEDULE_TASK_GUIDE =
   "本次是定时任务的新一期运行，请遵守两条：\n" +
@@ -194,6 +215,7 @@ const SCHEDULE_ALERT_TASK_GUIDE =
 /** 定时运行默认拒绝的内置工具。交互式对话不传这份清单。澄清会空等用户，无人值守也不能挂起。 */
 const SCHEDULE_DENIED_BUILTINS = [
   "manage_schedule",
+  "list_schedules",
   "fs_delete",
   "run_command",
   "run_script",
@@ -268,6 +290,8 @@ async function consumeTask(
     denyBuiltinTools?: string[];
     /** 无人值守结论协议：本轮没取到可核对的数据时，正文按 alert / report 协议结论化（定时运行用）。 */
     unattendedConclusion?: "alert" | "report";
+    /** 指令问了启用/频率时附上的已保存配置原句。 */
+    scheduleStatusLine?: string;
     /** 浏览器上报的 IANA 时区。 */
     timeZone?: string;
   },
@@ -480,12 +504,29 @@ function ungroundedOfTask(task: ChatTask): boolean {
   return false;
 }
 
+/** 本期若因 402 / 500 / 429 收束，返回状态码。只认最后一条错误，避免把中途已换掉的模型算成本期结论。 */
+function modelAvailabilityOf(task: ChatTask): ReturnType<typeof modelAvailabilityStatus> {
+  for (let i = task.buffer.length - 1; i >= 0; i--) {
+    const event = task.buffer[i];
+    if (!event || event.type !== "error") continue;
+    return modelAvailabilityStatus(event.message || "");
+  }
+  return null;
+}
+
 /** 把任务收束结果写进对话 UI 消息快照（upsertMessages 是全量替换，需先读后并）。 */
 async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   let finalText = finalTextOf(task).trim();
   const hasToolCalls = task.buffer.some((event) => event.type === "tool_call");
   if (!finalText && !hasToolCalls && task.status === "failed") return false;
-  if (!finalText) finalText = task.status === "cancelled" ? "（已停止生成）" : "（生成未产出内容）";
+  if (!finalText) {
+    finalText =
+      task.status === "cancelled"
+        ? "（已停止生成）"
+        : hasToolCalls
+          ? CONCLUSION_GAP_AFTER_TOOLS
+          : CONCLUSION_GAP;
+  }
   const doc = await getConversation(task.conversationId);
   const resultOk = new Map<string, boolean>();
   for (const event of task.buffer) {
@@ -530,14 +571,49 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   return true;
 }
 
+/** 已启用任务改了配置后立刻推一条。通道失败只记日志，不影响保存。 */
+async function deliverScheduleConfigUpdate(schedule: ChatSchedule): Promise<void> {
+  const channels = loadChannels().filter((channel) => channel.enabled !== false);
+  if (!channels.length) {
+    console.warn(`[scheduler] ${schedule.id} 配置已更新，但没有启用的通知通道`);
+    return;
+  }
+  const summary = await deliverToChannels(
+    channels,
+    buildScheduleConfigDelivery({
+      name: schedule.name,
+      prompt: schedule.prompt,
+      cron: schedule.cron,
+      onceAt: schedule.onceAt,
+      notifyPolicy: schedule.notifyPolicy,
+      purpose: schedule.purpose,
+      runMode: schedule.runMode,
+      mcpServers: schedule.mcpServers,
+      skills: schedule.skills,
+      locale: schedule.locale,
+      conversationId: schedule.conversationId,
+      webOrigin: config.webOrigin,
+      ownerKey: schedule.ownerKey,
+    }),
+  );
+  if (!summary.ok) {
+    const failures = summary.results.filter((r) => !r.ok).map((r) => `${r.label}：${r.error ?? "未知错误"}`);
+    console.warn(`[scheduler] ${schedule.id} 配置更新通知失败：${failures.join("；") || summary.error || "未知错误"}`);
+    return;
+  }
+  console.log(`[scheduler] ${schedule.id} 配置更新已投递 ${summary.sent} 个通道`);
+}
+
 /**
  * 定时任务结果投递（钉钉 / 飞书机器人）。
  * 旁路职责：任何失败只落 lastDelivery + 日志，**不改这一期的成败**——
  * 推送失败与任务本身跑成没跑成是两件事，混在一起会让状态失去诊断价值。
  * 调用方要等它写完再算下一拍：这里的回写是整份文档，不能和调度器的 nextRunAt 交错。
  *
- * `notifyPolicy=on_alert`（docs/scheduled-spike-detection-plan.md）：
- * 失败仍推；成功则按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] 决定是否推。SPIKE 每期都推。
+ * `notifyPolicy=on_alert`（docs/scheduled-alert-failure-notify-plan.md）：
+ * 成功按结论首行 [SPIKE]/[NORMAL]/[NO_DATA] 决定是否推。SPIKE 每期都推。
+ * 没有检查结论（空正文、占位句、认不出协议标记）不推。
+ * 模型接口的 400 / 401 / 402 / 403 / 404 / 408 / 413 / 422 / 429 / 500 / 502 / 503 / 504 / 529 每一期都推，并写明状态码。
  * 还欠启动确认时，这一期不论是否破线都推一条。通道没发出去就保持 armPending，下一期再试。
  */
 async function deliverScheduleResult(
@@ -545,20 +621,51 @@ async function deliverScheduleResult(
   status: "success" | "failed",
   text: string,
   charts: ChartSpec[] = [],
-  meta?: { trigger?: "schedule" | "manual" | "wake"; durationMs?: number; finishedAt?: number },
+  meta?: {
+    trigger?: "schedule" | "manual" | "wake";
+    durationMs?: number;
+    finishedAt?: number;
+    /** 全部候选模型都因该状态码失败。钉钉写明原因，不用笼统的「失败」。 */
+    modelStatus?: ModelAvailabilityStatus;
+  },
 ): Promise<void> {
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
   if (!notifyOn.includes(status)) return;
 
   const policy: ScheduleNotifyPolicy = pickNotifyPolicy(schedule.notifyPolicy);
+  if (
+    !shouldDeliverScheduleResult({
+      status,
+      text,
+      policy,
+      modelStatus: Boolean(meta?.modelStatus),
+    })
+  ) {
+    console.log(`[scheduler] ${schedule.id} 没有结论，不投递`);
+    return;
+  }
   let deliveryStatus: "success" | "failed" | "alert" | "recovered" | "started" = status;
   let alertStatePatch: ChatSchedule["alertState"] | undefined;
   let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
+  let checkIncomplete = false;
   const arming = needsArmNotice(schedule);
+  const finishedAt = meta?.finishedAt ?? Date.now();
 
   if (policy === "on_alert") {
     if (status === "failed") {
+      const failure = decideAlertFailure({
+        alertState: schedule.alertState,
+        now: finishedAt,
+        // 模型状态码错误每一期都通知。60 分钟合并只用于没有状态码的执行失败。
+        force: arming || Boolean(meta?.modelStatus),
+      });
+      alertStatePatch = failure.nextState;
+      if (failure.kind === "skip") {
+        await patchSchedule(schedule.id, schedule.ownerKey, { alertState: failure.nextState });
+        return;
+      }
       deliveryStatus = "failed";
+      checkIncomplete = !meta?.modelStatus && !text.trim();
     } else {
       const marker = parseAlertMarker(text);
       lastMarker = marker;
@@ -585,11 +692,17 @@ async function deliverScheduleResult(
 
   // 通知由「通道启用」开关控制：任务到点跑完即推送所有启用通道（不再逐任务勾选）。
   const channels = loadChannels().filter((channel) => channel.enabled !== false);
+  const failureState = (sent: boolean) =>
+    status === "failed" && policy === "on_alert" && alertStatePatch
+      ? commitAlertFailureNotice(alertStatePatch, schedule.alertState, sent)
+      : alertStatePatch;
+
   if (!channels.length) {
     console.warn(`[scheduler] ${schedule.id} 没有启用的通知通道，跳过投递`);
-    if (alertStatePatch || lastMarker || arming) {
+    const state = failureState(false);
+    if (state || lastMarker || arming) {
       await patchSchedule(schedule.id, schedule.ownerKey, {
-        ...(alertStatePatch ? { alertState: alertStatePatch } : {}),
+        ...(state ? { alertState: state } : {}),
         ...(lastMarker ? { lastMarker } : {}),
         ...(arming ? { armPending: true } : {}),
       });
@@ -612,13 +725,15 @@ async function deliverScheduleResult(
       ...(meta?.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
       ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
       ...(arming ? { armed: true, purpose: deliveryArmPurpose({ purpose: schedule.purpose, notifyPolicy: policy }) } : {}),
+      ...(checkIncomplete ? { checkIncomplete: true } : {}),
+      ...(meta?.modelStatus ? { modelStatus: meta.modelStatus, text: modelAvailabilityNotice(meta.modelStatus) } : {}),
     }),
   );
   if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
   else console.log(`[scheduler] ${schedule.id} 结果已投递 ${summary.sent} 个通道`);
   await patchSchedule(schedule.id, schedule.ownerKey, {
     lastDelivery: { at: summary.at, ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) },
-    ...(alertStatePatch ? { alertState: alertStatePatch } : {}),
+    ...(failureState(summary.sent > 0) ? { alertState: failureState(summary.sent > 0) } : {}),
     ...(lastMarker ? { lastMarker } : {}),
     ...(arming && summary.sent > 0 ? { armedNotifiedAt: summary.at, armPending: false } : {}),
     ...(arming && summary.sent === 0 ? { armPending: true } : {}),
@@ -973,6 +1088,7 @@ export function createApp() {
       const reason = garbledTextReason(body.prompt);
       if (reason) return errorJson(c, 400, "SCHEDULE_INVALID", `任务内容${reason}`);
     }
+    const before = await getSchedule(c.req.param("id"));
     const updated = await patchSchedule(c.req.param("id"), c.get("owner"), {
       ...(body.name !== undefined ? { name: body.name } : {}),
       ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
@@ -990,6 +1106,18 @@ export function createApp() {
       ...(body.unreadRuns !== undefined ? { unreadRuns: Number(body.unreadRuns) || 0 } : {}),
     });
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
+    // 编辑已启用任务的配置后立刻通知群：写明当前名称、用途、通知、频率、落点和任务内容。
+    // 只改未读数或暂停任务不发。发送失败不让保存失败。
+    if (
+      before &&
+      updated.enabled &&
+      before.ownerKey === updated.ownerKey &&
+      scheduleConfigChanged(before, updated)
+    ) {
+      await deliverScheduleConfigUpdate(updated).catch((err) =>
+        console.warn(`[scheduler] ${updated.id} 配置更新通知失败：${String((err as Error)?.message || err)}`),
+      );
+    }
     return c.json({ schedule: updated });
   });
 
@@ -1822,12 +1950,14 @@ export function createApp() {
     // 后续一律用这个 id：重建后本地 schedule 里的旧 id 已过期（投递链接也要跟着新对话走）。
     const conversationId = await ensureRunConversation(schedule, Date.now());
     if (isTaskRunning(conversationId)) return "skipped"; // 兜底：同一会话上已有任务在跑
-    const wake = String(schedule.wakeReason || "").trim();
-    const runTrigger = wake ? "wake" : schedule.runRequestedAt !== undefined ? "manual" : "schedule";
+    // 开跑前再读一次：用户刚改过的频率要以库里的为准，不能用 tick 入口的旧快照。
+    const live = (await getSchedule(schedule.id)) ?? schedule;
+    const wake = String(live.wakeReason || schedule.wakeReason || "").trim();
+    const runTrigger = wake ? "wake" : (live.runRequestedAt ?? schedule.runRequestedAt) !== undefined ? "manual" : "schedule";
     const runStartedAt = Date.now();
     const task = startTask({
       conversationId,
-      userText: wake ? `【事件唤醒】${wake}\n\n${schedule.prompt}` : schedule.prompt,
+      userText: wake ? `【事件唤醒】${wake}\n\n${live.prompt}` : live.prompt,
     });
     // 登记本期的 abort 控制器，供删除任务时即时中断（见 schedules.ts 的 abortActiveScheduleRun）。
     registerActiveScheduleRun(schedule.id, task.abort);
@@ -1837,9 +1967,9 @@ export function createApp() {
     // forceWrapUp 兜底：预算用到最后一轮时摘掉工具，强制它用已取到的数据收尾（不然只会留下一串过程叙述）。
     // taskGuide：每期必须重新取数 + 正文要有可独立阅读的结论（上下文里躺着上期结论时尤其关键）。
     // 预警任务再追加结论协议（[SPIKE]/[NORMAL]/[NO_DATA]），投递旁路只认首行标记。
-    const onAlert = pickNotifyPolicy(schedule.notifyPolicy) === "on_alert";
+    const onAlert = pickNotifyPolicy(live.notifyPolicy) === "on_alert";
     // 预警口径两处来源：显式勾了 on_alert 策略，或任务 purpose 就是 alert。
-    const isAlertRun = onAlert || schedule.purpose === "alert";
+    const isAlertRun = onAlert || live.purpose === "alert";
     // 无人值守默认拒绝改任务、删文件、跑命令/脚本；预警再拒绝出图/导出。
     // 同一份清单两处用：既从工具 schema 里摘掉（模型看不到就不会点），
     // 又在执行层兜底拒绝（模型若仍点名）——拒绝原因会记进本期运行记录。
@@ -1847,18 +1977,19 @@ export function createApp() {
     try {
       await consumeTask(task, {
         ownerKey: schedule.ownerKey,
-        mcpServers: schedule.mcpServers,
+        mcpServers: live.mcpServers,
         // 预警要少轮次：列表截断后容易陷入「再取一页 / 再 parse」空转（实测 30+ 步、数分钟）。
         maxRounds: onAlert
           ? Math.min(SCHEDULE_MAX_TOOL_ROUNDS, Math.max(1, Number(process.env.MCP_SCHEDULE_ALERT_MAX_TOOL_ROUNDS) || 12))
           : SCHEDULE_MAX_TOOL_ROUNDS,
         forceWrapUp: true,
         // 预警：不注入报告型「必须出图」指引；并硬摘 render_chart / export_data。
-        taskGuide: onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE,
+        taskGuide: `${scheduleRunFacts(live, runStartedAt)}\n\n${onAlert ? `${SCHEDULE_ALERT_TASK_GUIDE}\n\n${SCHEDULE_ALERT_GUIDE}` : SCHEDULE_TASK_GUIDE}`,
         omitBuiltinTools: deniedTools,
         denyBuiltinTools: deniedTools,
         unattendedConclusion: isAlertRun ? "alert" : "report",
-        ...(schedule.timeZone ? { timeZone: schedule.timeZone } : {}),
+        ...(taskAsksScheduleStatus(live.prompt) ? { scheduleStatusLine: scheduleStatusSentence(live, runStartedAt) } : {}),
+        ...(live.timeZone ? { timeZone: live.timeZone } : {}),
       });
     } finally {
       unregisterActiveScheduleRun(schedule.id);
@@ -1882,12 +2013,17 @@ export function createApp() {
     // 按文案相等判定会让「没取到数据的一期」被记成成功（还要推一条空壳报告）。
     // 预警例外：正文首行是 [NO_DATA]，属「检查过但没数据」的正常结果，仍记成功，由 marker 决定推不推。
     const ungrounded = ungroundedOfTask(task);
-    const noConclusion = !text || (ungrounded && !isAlertRun);
-    const final = finished === "success" && noConclusion ? "failed" : finished;
-    if (finished === "success" && noConclusion) {
-      console.warn(`[scheduler] ${schedule.id} 本轮无结论文本（疑似轮次预算耗尽或未取到数据），按 failed 记账`);
+    const final = scheduleFinishedStatus({
+      finished,
+      text,
+      ungrounded,
+      alert: isAlertRun,
+    });
+    if (finished === "success" && final === "failed") {
+      console.warn(`[scheduler] ${schedule.id} 本轮没有协议结论，按 failed 记账`);
     }
     const marker = isAlertRun ? parseAlertMarker(text) : null;
+    const availability = modelAvailabilityOf(task);
     const finishedAt = Date.now();
     const runMeta = { trigger: runTrigger as "schedule" | "manual" | "wake", durationMs: finishedAt - runStartedAt };
     // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：
@@ -1896,10 +2032,12 @@ export function createApp() {
     // 投递失败不改这一期的成败，但必须在调度器写下一拍之前写完。
     // patchSchedule 会整份回写：若投递还在飞，调度器刚算好的 nextRunAt / 清掉的立即执行标记会被旧快照盖回去。
     if (final === "success" || final === "failed") {
+      // 全部模型都是 402 / 429 / 500 / 502 / 503 / 504 时，钉钉写明状态码和原因，不用笼统的「失败」。
       // 重建过专属对话时 schedule.conversationId 是旧值，投递链接必须用解析后的 id。
       await deliverScheduleResult({ ...schedule, conversationId }, final, text, charts, {
         ...runMeta,
         finishedAt,
+        ...(final === "failed" && availability ? { modelStatus: availability } : {}),
       }).catch((err) =>
         console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
       );

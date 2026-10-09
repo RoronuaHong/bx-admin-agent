@@ -5868,10 +5868,10 @@ onBeforeUnmount(() => {
               <div
                 class="task-row"
                 :title='taskDraft.notifyPolicy === "on_alert" ? tx(
-                  "仅异常时推送：正常期静默，失败仍推。启用后第一次执行会发启动确认",
-                  "On alert only: quiet when normal, failures still push. The first run after enabling sends a start confirmation",
-                  "Só em alerta: silêncio no normal, falhas ainda notificam. A primeira execução após ativar confirma o início",
-                  "केवल अलर्ट पर: सामान्य में चुप, विफलता पर भी भेजें। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
+                  "仅异常时推送：正常不推，破线每期都推。没写完结论的失败先推一条，满 60 分钟再推。模型接口报错每期写明对应状态码和原因。启用后第一次会发启动确认",
+                  "On alert only: quiet when normal, every breach is pushed. A run with no conclusion notifies once, then again after 60 minutes. A model API error states its status code every run. The first run after enabling sends a start confirmation",
+                  "Só em alerta: silêncio no normal, cada ruptura é enviada. Sem conclusão, avisa uma vez e de novo após 60 minutos. Erro da API do modelo informa o código em cada execução. A primeira após ativar confirma o início",
+                  "केवल अलर्ट पर: सामान्य में चुप, हर उल्लंघन भेजें। बिना निष्कर्ष एक बार, फिर 60 मिनट बाद। मॉडल API त्रुटि हर बार कोड लिखे। चालू करने के बाद पहली बार आरंभ पुष्टि जाती है",
                 ) : tx(
                   "每期都推。新建后马上跑一期，并发一条启动确认",
                   "Every run. A new task runs once right away and sends a start confirmation",

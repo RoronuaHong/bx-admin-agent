@@ -42,7 +42,7 @@
 | **ChatGPT Monitoring** | 指令 + 频率 + meaningful 才推 | 用途=预警 + `on_alert` + 标记协议 |
 | **ChatGPT Automations** | 先测后跑 | 气泡「设为数据预警」/ 表单「从对话带入」 |
 | **Datadog 常识** | 检测频率 ≠ 通知频率 | 仅异常才推；持续破线每期都发。恢复仍要连续 2 期 `[NORMAL]` |
-| **自研踩坑** | 列表截断 → 估数出图；模型自己逐页累加会丢页 | `SCHEDULE_ALERT_GUIDE` + 硬摘 `render_chart`/`export_data` + 列表压缩。跨页小时计数走 `count_list_by_time`（`complete: false` 即 `[NO_DATA]`）。每个列表工具一轮只放行第一页 |
+| **自研踩坑** | 列表截断 → 估数出图；模型自己逐页累加会丢页 | `SCHEDULE_ALERT_GUIDE` + 硬摘 `render_chart`/`export_data` + 列表压缩。跨页小时计数走 `count_list_by_time`（瞬时错误同一页最多 3 次；仍 `complete: false` 即 `[NO_DATA]`）。每个列表工具一轮只放行第一页 |
 
 不学：把 metric / scope / window / threshold / cooldown 全铺成一级表单字段。
 
@@ -63,7 +63,7 @@
 | 策略 | 行为 |
 |---|---|
 | `always` | 成功 / 失败都推 |
-| `on_alert` | 失败仍推；成功看首行标记 |
+| `on_alert` | 成功看首行标记。没有状态码的执行失败进入失败态才推、满 60 分钟再推。模型接口报错每期写明对应状态码。见 `scheduled-alert-failure-notify-plan.md` |
 
 - `[SPIKE]` → 每期都推
 - `[NORMAL]` → 静默；曾告警且连续 2 期 → 推「已恢复」

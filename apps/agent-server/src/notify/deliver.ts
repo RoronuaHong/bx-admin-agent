@@ -7,7 +7,7 @@
 //    因此对外提供「测试发送」端点：配完通道先自己发一条，别等任务到点才发现配错。
 import { createHmac } from "node:crypto";
 import type { NotifyChannel } from "./channels.js";
-import { garbledTextReason } from "../schedules.js";
+import { garbledTextReason, nextRunAtOf } from "../schedules.js";
 
 /** 正文预算（字符）：钉钉 markdown 硬限约 20000 字节、飞书约 30KB，这里留足余量。 */
 const MAX_BODY_CHARS = 3500;
@@ -88,6 +88,8 @@ interface LangPack {
   at: string;
   open: string;
   empty: string;
+  /** 预警检查没跑完时的结论，替代空正文。 */
+  checkIncomplete: string;
   /** 无标题图表的小标题（通用显示词，与业务无关）。 */
   chart: string;
   /** 图表数据区的标题：IM 渲染不了图，这里明确告诉收件人下面是图里的数字。 */
@@ -122,6 +124,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     at: "时间",
     open: "打开对话",
     empty: "（本次未产出内容）",
+  /** 预警检查没跑完：不把空结论当成业务结果。原因留在任务对话里。 */
+  checkIncomplete: "这次检查没有完成，没有下结论。原因在对应的任务对话里。",
     chart: "图表",
     chartSection: (count) => `本次图表数据（${count} 张，图见对话）：`,
     rows: (total, shown) => `（表格共 ${total} 行，此处仅列前 ${shown} 行）`,
@@ -151,6 +155,7 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     at: "Time",
     open: "Open chat",
     empty: "(no output this run)",
+    checkIncomplete: "This check did not finish, so there is no conclusion. The reason is in the task chat.",
     chart: "Chart",
     chartSection: (count) => `Chart data (${count}; charts live in the chat):`,
     rows: (total, shown) => `(table has ${total} rows; showing first ${shown})`,
@@ -180,6 +185,7 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     at: "Hora",
     open: "Abrir conversa",
     empty: "(sem saída nesta execução)",
+    checkIncomplete: "Esta verificação não terminou, por isso não há conclusão. O motivo está na conversa da tarefa.",
     chart: "Gráfico",
     chartSection: (count) => `Dados dos gráficos (${count}; os gráficos ficam na conversa):`,
     rows: (total, shown) => `(tabela com ${total} linhas; mostrando as primeiras ${shown})`,
@@ -209,6 +215,7 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     at: "समय",
     open: "चैट खोलें",
     empty: "(इस बार कोई आउटपुट नहीं)",
+    checkIncomplete: "यह जाँच पूरी नहीं हुई, इसलिए कोई निष्कर्ष नहीं है। कारण कार्य की बातचीत में है।",
     chart: "चार्ट",
     chartSection: (count) => `चार्ट डेटा (${count}; चार्ट चैट में हैं):`,
     rows: (total, shown) => `(तालिका में ${total} पंक्तियाँ; पहली ${shown} दिखाई गईं)`,
@@ -625,6 +632,13 @@ export interface ScheduleDeliveryInput {
   durationMs?: number;
   /** 展示用时间；缺省为组装时刻。测试可传入固定值。 */
   at?: number;
+  /**
+   * 预警执行失败：正文改成「检查没有完成」，不用空结论冒充业务结果。
+   * 周期报告的失败仍用原文。模型状态码错误不用这个，改走 modelStatus。
+   */
+  checkIncomplete?: boolean;
+  /** 全部模型都返回 402 / 429 / 500 / 502 / 503 / 504 时，状态行和标题用状态码，正文用具体原因。 */
+  modelStatus?: string;
 }
 
 /** 耗时写成收件人读得懂的短句。不足 1 秒按 1 秒计，避免推成「0 秒」。 */
@@ -664,7 +678,9 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
   const name = (readableLabel(input.name) || readableLabel(input.prompt) || pack.unnamed).slice(0, 40);
   const reportArm = input.purpose === "report";
   const statusText =
-    input.status === "failed"
+    input.modelStatus
+      ? input.modelStatus
+      : input.status === "failed"
       ? pack.fail
       : input.status === "alert"
         ? pack.alert
@@ -687,7 +703,11 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
   const chartBlock = charts.length
     ? [pack.chartSection(charts.length), ...charts.flatMap((chart) => chartToLines(chart, pack))].join("\n\n")
     : "";
-  const conclusion = input.text.trim() ? formatForIm(input.text, pack) : pack.empty;
+  const conclusion = input.checkIncomplete
+    ? pack.checkIncomplete
+    : input.text.trim()
+      ? formatForIm(input.text, pack)
+      : pack.empty;
   // 任务名放最前，并用一级标题加大（钉钉 markdown 不认 font size，# 是能变大的写法）。
   const taskHeading = `# **${pack.task}：${name}**`;
   const record = [
@@ -717,4 +737,304 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
       ]
     : [];
   return { title: `${name} · ${statusText}`, body, ...(links.length ? { links } : {}) };
+}
+
+/** 编辑保存后推到群里的配置摘要。只写已保存的字段，不解析指令里的业务阈值。 */
+const CONFIG_LABELS: Record<
+  DeliveryLang,
+  {
+    updated: string;
+    purpose: string;
+    alert: string;
+    report: string;
+    notify: string;
+    onAlert: string;
+    always: string;
+    freq: string;
+    sink: string;
+    same: string;
+    fresh: string;
+    tools: string;
+    content: string;
+    unset: string;
+    everyMin: (n: string) => string;
+    hourly: string;
+    once: string;
+  }
+> = {
+  zh: {
+    updated: "配置已更新",
+    purpose: "用途",
+    alert: "数据预警",
+    report: "周期报告",
+    notify: "通知",
+    onAlert: "仅异常时推送",
+    always: "每期都推送",
+    freq: "频率",
+    sink: "结果落点",
+    same: "同一会话",
+    fresh: "每期新会话",
+    tools: "工具",
+    content: "任务内容",
+    unset: "未设置",
+    everyMin: (n) => `每 ${n} 分钟执行一次`,
+    hourly: "每小时执行一次",
+    once: "一次性",
+  },
+  en: {
+    updated: "Settings updated",
+    purpose: "Purpose",
+    alert: "Alert",
+    report: "Report",
+    notify: "Notify",
+    onAlert: "Only on alert",
+    always: "Every run",
+    freq: "Schedule",
+    sink: "Results",
+    same: "Same chat",
+    fresh: "New chat each run",
+    tools: "Tools",
+    content: "Instructions",
+    unset: "Not set",
+    everyMin: (n) => `Every ${n} minutes`,
+    hourly: "Every hour",
+    once: "One time",
+  },
+  pt: {
+    updated: "Configuração atualizada",
+    purpose: "Uso",
+    alert: "Alerta",
+    report: "Relatório",
+    notify: "Aviso",
+    onAlert: "Só em anomalia",
+    always: "Sempre",
+    freq: "Frequência",
+    sink: "Resultados",
+    same: "Mesma conversa",
+    fresh: "Nova conversa",
+    tools: "Ferramentas",
+    content: "Instruções",
+    unset: "Não definido",
+    everyMin: (n) => `A cada ${n} minutos`,
+    hourly: "A cada hora",
+    once: "Uma vez",
+  },
+  hi: {
+    updated: "सेटिंग बदली",
+    purpose: "उद्देश्य",
+    alert: "अलर्ट",
+    report: "रिपोर्ट",
+    notify: "सूचना",
+    onAlert: "केवल असामान्य पर",
+    always: "हर बार",
+    freq: "आवृत्ति",
+    sink: "परिणाम",
+    same: "वही बातचीत",
+    fresh: "हर बार नई बातचीत",
+    tools: "उपकरण",
+    content: "निर्देश",
+    unset: "सेट नहीं",
+    everyMin: (n) => `हर ${n} मिनट`,
+    hourly: "हर घंटे",
+    once: "एक बार",
+  },
+};
+
+export interface ScheduleConfigSnapshot {
+  name?: string;
+  prompt: string;
+  cron?: string;
+  onceAt?: number;
+  notifyPolicy?: string;
+  purpose?: string;
+  runMode?: string;
+  mcpServers?: string[];
+  skills?: string[];
+  locale?: string;
+  conversationId?: string;
+  webOrigin?: string;
+  ownerKey?: string;
+}
+
+function configListKey(values?: string[]): string {
+  return [...(values || [])].map((item) => item.trim()).filter(Boolean).sort().join("\n");
+}
+
+function configScalar(value: unknown): string {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function configText(value: unknown): string {
+  return configScalar(value).replace(/\r\n/g, "\n").trim();
+}
+
+/** 保存前后这些字段有变化才推配置通知。未读数、启用开关、换行符不算。 */
+export function scheduleConfigChanged(prev: ScheduleConfigSnapshot, next: ScheduleConfigSnapshot): boolean {
+  if (configText(prev.name) !== configText(next.name)) return true;
+  if (configText(prev.prompt) !== configText(next.prompt)) return true;
+  if (configScalar(prev.cron) !== configScalar(next.cron)) return true;
+  if (configScalar(prev.onceAt) !== configScalar(next.onceAt)) return true;
+  if (configScalar(prev.notifyPolicy) !== configScalar(next.notifyPolicy)) return true;
+  if (configScalar(prev.purpose) !== configScalar(next.purpose)) return true;
+  if ((prev.runMode || "new") !== (next.runMode || "new")) return true;
+  if (configListKey(prev.mcpServers) !== configListKey(next.mcpServers)) return true;
+  if (configListKey(prev.skills) !== configListKey(next.skills)) return true;
+  return false;
+}
+
+export function describeScheduleTiming(
+  input: { cron?: string; onceAt?: number },
+  lang: DeliveryLang,
+): string {
+  const pack = CONFIG_LABELS[lang];
+  if (input.onceAt) {
+    const when = new Date(input.onceAt).toLocaleString(lang === "zh" ? "zh-CN" : lang, { hour12: false });
+    return `${pack.once} ${when}`;
+  }
+  const cron = String(input.cron || "").trim().replace(/\s+/g, " ");
+  const every = cron.match(/^\*\/(\d+) \* \* \* \*$/);
+  if (every) return pack.everyMin(every[1]!);
+  if (cron === "0 * * * *") return pack.hourly;
+  return cron || pack.unset;
+}
+
+/**
+ * 给模型看的下次执行时刻。
+ * 正在跑的这一期，库里的 nextRunAt 还是「这一档」（跑完才推进）。
+ * 若它已经不晚于 now，按 cron 另算下一档，避免模型把当前这一期说成下次。
+ */
+export function upcomingScheduleRunAt(
+  schedule: { enabled?: boolean; cron?: string; onceAt?: number; nextRunAt?: number },
+  now = Date.now(),
+): number | undefined {
+  if (schedule.enabled === false) return undefined;
+  if (schedule.onceAt !== undefined) return schedule.onceAt > now ? schedule.onceAt : undefined;
+  if (schedule.nextRunAt !== undefined && schedule.nextRunAt > now) return schedule.nextRunAt;
+  const next = nextRunAtOf(schedule, new Date(now));
+  return next !== undefined && next > now ? next : undefined;
+}
+
+function formatRunClock(at: number, lang: DeliveryLang): string {
+  return new Date(at).toLocaleString(lang === "zh" ? "zh-CN" : lang, { hour12: false });
+}
+
+/** list_schedules 的一行。频率是中文原文，不把 cron 交给模型换算。 */
+export function formatScheduleListLine(
+  schedule: {
+    id: string;
+    name?: string;
+    prompt: string;
+    enabled?: boolean;
+    cron?: string;
+    onceAt?: number;
+    nextRunAt?: number;
+    lastStatus?: string;
+    locale?: string;
+  },
+  now = Date.now(),
+): string {
+  const lang = deliveryLangOf(schedule.locale);
+  const freq = describeScheduleTiming(schedule, lang);
+  const name = schedule.name || schedule.prompt.slice(0, 20);
+  const status = schedule.enabled === false ? "已暂停" : "已启用";
+  const nextAt = upcomingScheduleRunAt(schedule, now);
+  return (
+    `- ${schedule.id}｜${name}｜${status}｜频率：${freq}` +
+    (nextAt ? `｜下次：${formatRunClock(nextAt, lang)}` : "") +
+    (schedule.lastStatus ? `｜上次：${schedule.lastStatus}` : "")
+  );
+}
+
+export const SCHEDULE_LIST_FREQUENCY_RULE =
+  "频率和下次执行以每一行的「频率」「下次」为准。禁止把 cron 自行换算成中文，禁止把别的任务的频率安到这一行，禁止沿用对话历史里的旧频率。";
+
+type ScheduleStatusInput = {
+  name?: string;
+  prompt: string;
+  enabled?: boolean;
+  cron?: string;
+  onceAt?: number;
+  nextRunAt?: number;
+  locale?: string;
+};
+
+/** 给用户看的配置原句。来自已保存的任务，不从工具结果或历史回复推断。 */
+export function scheduleStatusSentence(schedule: ScheduleStatusInput, now = Date.now()): string {
+  const lang = deliveryLangOf(schedule.locale);
+  const freq = describeScheduleTiming(schedule, lang);
+  const name = (schedule.name || schedule.prompt.slice(0, 24) || "定时任务").trim();
+  const status = schedule.enabled === false ? "已暂停" : "已启用";
+  const nextAt = upcomingScheduleRunAt(schedule, now);
+  const next = nextAt ? `下次执行：${formatRunClock(nextAt, lang)}。` : "";
+  return `名称：${name}。状态：${status}。频率：${freq}。${next}`;
+}
+
+/** 任务指令在问启用、频率或下次时间时，正文里的那一句由服务端写，不交给模型。 */
+export function taskAsksScheduleStatus(prompt: string): boolean {
+  return /是否启用|是否已经启用|执行频率|多久执行|下次执行|预警功能/.test(prompt);
+}
+
+const SCHEDULE_STATUS_LINE = /预警是否启用|预警功能|每\s*\d+\s*分钟执行/;
+
+/** 去掉模型自己写的启用/频率句，换上已保存配置。模型常写成「无法确认」或沿用旧的 5 分钟。 */
+export function applyScheduleStatus(text: string, sentence: string): string {
+  const kept = String(text || "")
+    .split(/\n/)
+    .filter((line) => !SCHEDULE_STATUS_LINE.test(line));
+  const body = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const line = sentence.trim();
+  if (!line) return body;
+  if (body.includes(line)) return body;
+  return body ? `${body}\n- ${line}` : `- ${line}`;
+}
+
+/** 定时运行注入系统提示的本任务配置。模型照抄，不再从 cron 或历史回复推断。 */
+export function scheduleRunFacts(schedule: ScheduleStatusInput, now = Date.now()): string {
+  return (
+    "本任务当前配置（若指令要求说明是否启用、执行频率或下次时间，不要自己写，也不要写成无法确认；" +
+    "服务端会在正文末尾附上这句。禁止换算 cron，禁止沿用本对话更早回复）：" +
+    scheduleStatusSentence(schedule, now)
+  );
+}
+
+/** 编辑保存后的配置通知。字段之间空行，避免钉钉把换行粘成一行。 */
+export function buildScheduleConfigDelivery(input: ScheduleConfigSnapshot): DeliveryMessage {
+  const lang = deliveryLangOf(input.locale);
+  const pack = LANGS[lang];
+  const labels = CONFIG_LABELS[lang];
+  const name = (String(input.name || "").trim() || String(input.prompt || "").trim() || pack.unnamed).slice(0, 40);
+  // 用途看 purpose。老数据没有 purpose 时才用通知策略回填，避免两个字段互相覆盖。
+  const isAlert = input.purpose ? input.purpose === "alert" : input.notifyPolicy === "on_alert";
+  const lines = [
+    `# **${pack.task}：${name}**`,
+    labels.updated,
+    `${labels.purpose}：${isAlert ? labels.alert : labels.report}`,
+    `${labels.notify}：${input.notifyPolicy === "on_alert" ? labels.onAlert : labels.always}`,
+    `${labels.freq}：${describeScheduleTiming(input, lang)}`,
+    `${labels.sink}：${input.runMode === "same" ? labels.same : labels.fresh}`,
+  ];
+  const tools = [...(input.mcpServers || []), ...(input.skills || [])].map((item) => item.trim()).filter(Boolean);
+  if (tools.length) lines.push(`${labels.tools}：${tools.join("、")}`);
+  // 任务内容是用户原文。不能走结论排版：那会删掉提到钉钉的行，也会把 */5 改写成「每 5 分钟」。
+  const content = String(input.prompt || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .replace(/_/g, "＿");
+  lines.push(`${labels.content}：\n${content || labels.unset}`);
+  const origin = String(input.webOrigin || "").trim().replace(/\/+$/, "");
+  const links: DeliveryLink[] = origin && input.conversationId
+    ? [
+        {
+          title: pack.open,
+          url: `${origin}/chat?conv=${encodeURIComponent(input.conversationId)}${
+            input.ownerKey ? `&owner=${encodeURIComponent(input.ownerKey)}` : ""
+          }`,
+        },
+      ]
+    : [];
+  return {
+    title: `${name} · ${labels.updated}`,
+    body: clampBody(lines.join("\n\n"), pack),
+    ...(links.length ? { links } : {}),
+  };
 }

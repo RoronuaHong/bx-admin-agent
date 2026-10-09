@@ -2,8 +2,8 @@
 // A 删除成功且释放配额 · B 越界/绝对路径被拒 · C 不存在/目录明确报错 ·
 // D 闸门判据：destructive 需确认、子代理不可执行、只读仍放行 · E 已登记进审计集合。
 import { test, expect, afterAll } from "vitest";
-import { execBuiltin, WORKSPACE_FILE_WRITE_TOOLS, BUILTIN_RISK } from "../src/builtins.js";
-import { fsDelete, fsList, fsRemoveConversation } from "../src/fs-store.js";
+import { execBuiltin, HOUR_COUNT_FILE, WORKSPACE_FILE_WRITE_TOOLS, BUILTIN_RISK, writeHourCountFile } from "../src/builtins.js";
+import { fsDelete, fsList, fsRemoveConversation, fsWrite } from "../src/fs-store.js";
 import { verdictNeedsConfirm, subagentMayExecute, type RiskVerdict } from "../src/risk.js";
 
 const CONV = "vitest-fs-delete";
@@ -83,3 +83,23 @@ test("[E] 风险登记与审计口径：走闸门，故不进「免确认靠审�
   expect(WORKSPACE_FILE_WRITE_TOOLS.has("fs_delete")).toBe(false);
   expect(fsDelete(CONV, "nope.md")).toHaveProperty("error");
 });
+
+test("小时计数覆盖固定文件，并清掉已占满上限的时间戳副本", () => {
+  const id = "vitest-hour-counts";
+  try {
+    // 清掉上次运行可能残留的工作区（超时中断等），否则 hour-counts.tsv 已存在会让配额断言失效。
+    fsRemoveConversation(id);
+    for (let i = 0; i < 100; i += 1) {
+      const seeded = fsWrite(id, `results/hour-counts-${i}.tsv`, "hour\tcount\n");
+      expect(seeded).not.toHaveProperty("error");
+    }
+    expect(fsWrite(id, HOUR_COUNT_FILE, "hour\tcount\n")).toHaveProperty("error");
+    const written = writeHourCountFile(id, "hour\tcount\n2026-10-09 13:00\t6\n");
+    expect(written).toMatchObject({ path: HOUR_COUNT_FILE });
+    const left = fsList(id).map((item) => item.path);
+    expect(left).toEqual([HOUR_COUNT_FILE]);
+  } finally {
+    fsRemoveConversation(id);
+  }
+  // Windows 下 100 次写 + 100 次删（每次写入都要重算工作区文件数）远超默认 5s。
+}, 60_000);

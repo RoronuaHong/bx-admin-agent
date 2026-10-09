@@ -2,11 +2,22 @@ import { test, expect } from "vitest";
 import {
   alertNextRunAt,
   buildUnattendedConclusion,
+  ALERT_FAIL_REPEAT_MS,
+  commitAlertFailureNotice,
   decideAlertDelivery,
+  decideAlertFailure,
   deliveryArmPurpose,
   needsArmNotice,
+  CONCLUSION_GAP,
+  CONCLUSION_GAP_AFTER_TOOLS,
+  alertAboveFromPrompt,
+  fillCountAbove,
+  markerFromCountText,
   parseAlertMarker,
+  stampAlertMarker,
   pickNotifyPolicy,
+  scheduleFinishedStatus,
+  shouldDeliverScheduleResult,
   pickPurpose,
   SCHEDULE_UNGROUNDED_ALERT,
   SCHEDULE_UNGROUNDED_REPORT,
@@ -26,6 +37,51 @@ test("parseAlertMarker：认首行协议标记，忽略正文", () => {
   expect(parseAlertMarker("[NO_DATA] 取数失败")).toBe("NO_DATA");
   expect(parseAlertMarker("正常，没有暴涨")).toBe(null);
   expect(parseAlertMarker("")).toBe(null);
+});
+
+test("没有协议结论的预警记失败，有标记的记成功", () => {
+  expect(scheduleFinishedStatus({ finished: "success", text: "", ungrounded: false, alert: true })).toBe("failed");
+  expect(
+    scheduleFinishedStatus({
+      finished: "success",
+      text: CONCLUSION_GAP_AFTER_TOOLS,
+      ungrounded: false,
+      alert: true,
+    }),
+  ).toBe("failed");
+  expect(
+    scheduleFinishedStatus({
+      finished: "success",
+      text: `${CONCLUSION_GAP_AFTER_TOOLS}\n- 名称：客服预警。状态：已启用。频率：每 10 分钟。`,
+      ungrounded: false,
+      alert: true,
+    }),
+  ).toBe("failed");
+  expect(
+    scheduleFinishedStatus({
+      finished: "success",
+      text: "当前数量 12 条，未破线",
+      ungrounded: false,
+      alert: true,
+    }),
+  ).toBe("failed");
+  expect(
+    scheduleFinishedStatus({
+      finished: "success",
+      text: "[NORMAL]\n当前数量 12 条\n- 名称：客服预警。状态：已启用。频率：每 10 分钟。",
+      ungrounded: false,
+      alert: true,
+    }),
+  ).toBe("success");
+  expect(
+    scheduleFinishedStatus({ finished: "success", text: "[NO_DATA]\n没有取到数据", ungrounded: true, alert: true }),
+  ).toBe("success");
+  expect(
+    scheduleFinishedStatus({ finished: "success", text: CONCLUSION_GAP, ungrounded: false, alert: false }),
+  ).toBe("failed");
+  expect(scheduleFinishedStatus({ finished: "cancelled", text: "[NORMAL]", ungrounded: false, alert: true })).toBe(
+    "cancelled",
+  );
 });
 
 test("pickNotifyPolicy / pickPurpose", () => {
@@ -85,6 +141,119 @@ test("decideAlertDelivery：启用后第一期，未破线也要推启动确认�
   expect(later.kind).toBe("skip");
 });
 
+test("计数比较由引擎落标记，不完整时整段换成无数据", () => {
+  expect(markerFromCountText("complete: false\nreason: 输入流无效")).toBe("NO_DATA");
+  expect(markerFromCountText("complete: true\nabove: 300\nover_count: 0\n")).toBe("NORMAL");
+  expect(markerFromCountText("complete: true\nabove: 300\nover_count: 2\n")).toBe("SPIKE");
+  expect(markerFromCountText("complete: true\nunique: 18\n")).toBeNull();
+  const prompt = "超过300的1小时会话量，就要预警\n时间窗口：最近 60 分钟\n超过 300 → 异常";
+  expect(alertAboveFromPrompt(prompt)).toBe(300);
+  expect(alertAboveFromPrompt("最近 60 分钟")).toBeNull();
+  expect(fillCountAbove({ tool: "x" }, 300).above).toBe(300);
+  expect(fillCountAbove({ above: 100 }, 300).above).toBe(100);
+  expect(stampAlertMarker("[NORMAL]\n未破线", "SPIKE")).toMatch(/^\[SPIKE\]/);
+  expect(stampAlertMarker("未破线", "NORMAL")).toMatch(/^\[NORMAL\]\n未破线/);
+  expect(stampAlertMarker("[NORMAL]\n估了 12 条", "NO_DATA")).toBe(SCHEDULE_UNGROUNDED_ALERT);
+});
+
+test("没有结论不投递；有协议标记或模型状态码才投递", () => {
+  expect(
+    shouldDeliverScheduleResult({
+      status: "failed",
+      text: CONCLUSION_GAP_AFTER_TOOLS,
+      policy: "on_alert",
+    }),
+  ).toBe(false);
+  expect(shouldDeliverScheduleResult({ status: "failed", text: "", policy: "on_alert" })).toBe(false);
+  expect(
+    shouldDeliverScheduleResult({
+      status: "failed",
+      text: "工具报错了，但没有首行标记",
+      policy: "on_alert",
+    }),
+  ).toBe(false);
+  expect(
+    shouldDeliverScheduleResult({
+      status: "failed",
+      text: "",
+      policy: "on_alert",
+      modelStatus: true,
+    }),
+  ).toBe(true);
+  expect(
+    shouldDeliverScheduleResult({
+      status: "success",
+      text: "[NORMAL]\n未破线\n- 名称：印度客服对话量预警。状态：已启用。",
+      policy: "on_alert",
+    }),
+  ).toBe(true);
+  expect(
+    shouldDeliverScheduleResult({
+      status: "success",
+      text: "[NO_DATA]\n这次没有取到可核对的数据，没有下结论。",
+      policy: "on_alert",
+    }),
+  ).toBe(true);
+});
+
+test("decideAlertFailure：刚失败推一条，60 分钟内不重复，期满再推；协议标记清除失败态", () => {
+  const t0 = 1_700_000_000_000;
+  const first = decideAlertFailure({ now: t0 });
+  expect(first.kind).toBe("notify");
+  expect(first.nextState.failingSince).toBe(t0);
+  expect(first.nextState.failNotifiedAt).toBe(t0);
+
+  const again = decideAlertFailure({ alertState: first.nextState, now: t0 + 5 * 60_000 });
+  expect(again.kind).toBe("skip");
+  expect(again.nextState.failNotifiedAt).toBe(t0);
+
+  const third = decideAlertFailure({ alertState: again.nextState, now: t0 + 10 * 60_000 });
+  expect(third.kind).toBe("skip");
+
+  const later = decideAlertFailure({
+    alertState: third.nextState,
+    now: t0 + ALERT_FAIL_REPEAT_MS,
+  });
+  expect(later.kind).toBe("notify");
+  expect(later.nextState.failingSince).toBe(t0);
+  expect(later.nextState.failNotifiedAt).toBe(t0 + ALERT_FAIL_REPEAT_MS);
+
+  const quiet = decideAlertDelivery({ marker: "NORMAL", alertState: later.nextState, now: t0 + ALERT_FAIL_REPEAT_MS + 1 });
+  expect(quiet.kind).toBe("skip");
+  expect(quiet.nextState.failingSince).toBeUndefined();
+  expect(quiet.nextState.failNotifiedAt).toBeUndefined();
+
+  const spike = decideAlertDelivery({ marker: "SPIKE", alertState: later.nextState, now: t0 + 1 });
+  expect(spike.kind).toBe("spike");
+  expect(spike.nextState.failingSince).toBeUndefined();
+  const nodata = decideAlertDelivery({ marker: "NO_DATA", alertState: later.nextState });
+  expect(nodata.kind).toBe("skip");
+  expect(nodata.nextState.failingSince).toBeUndefined();
+
+  const reenter = decideAlertFailure({ alertState: quiet.nextState, now: t0 + ALERT_FAIL_REPEAT_MS + 2 });
+  expect(reenter.kind).toBe("notify");
+  expect(reenter.nextState.failingSince).toBe(t0 + ALERT_FAIL_REPEAT_MS + 2);
+});
+
+test("decideAlertFailure：启动确认强制推送，并记成一次失败通知", () => {
+  const t0 = 1_700_000_000_000;
+  const held = decideAlertFailure({
+    now: t0,
+    alertState: { firing: false, failingSince: t0 - 60_000, failNotifiedAt: t0 - 60_000 },
+    force: true,
+  });
+  expect(held.kind).toBe("notify");
+  expect(held.nextState.failingSince).toBe(t0 - 60_000);
+  expect(held.nextState.failNotifiedAt).toBe(t0);
+});
+
+test("commitAlertFailureNotice：没发出去不推进失败通知时刻", () => {
+  const decided = { firing: false as const, failingSince: 10, failNotifiedAt: 20, normalStreak: 0 };
+  expect(commitAlertFailureNotice(decided, undefined, false).failNotifiedAt).toBeUndefined();
+  expect(commitAlertFailureNotice(decided, { failNotifiedAt: 5 }, false).failNotifiedAt).toBe(5);
+  expect(commitAlertFailureNotice(decided, { failNotifiedAt: 5 }, true).failNotifiedAt).toBe(20);
+});
+
 test("decideAlertDelivery：连续 2 期 NORMAL 才恢复；NO_DATA 打断计数", () => {
   const firing = { firing: true, lastAlertAt: 1, normalStreak: 0 };
   const n1 = decideAlertDelivery({ marker: "NORMAL", alertState: firing });
@@ -115,6 +284,8 @@ test("SCHEDULE_ALERT_GUIDE：禁止出图/导出/截断估数，要求首行标�
   expect(SCHEDULE_ALERT_GUIDE).toContain("count_list_by_time");
   expect(SCHEDULE_ALERT_GUIDE).toMatch(/complete: false/);
   expect(SCHEDULE_ALERT_GUIDE).not.toMatch(/图仍要用/);
+  expect(SCHEDULE_ALERT_GUIDE).toContain("不要写成无法确认");
+  expect(SCHEDULE_ALERT_GUIDE).toContain("禁止自行换算 cron");
   const { SCHEDULE_UNGROUNDED_ALERT, decideAlertDelivery, parseAlertMarker } = await import("../src/schedule-alert.js");
   expect(parseAlertMarker(SCHEDULE_UNGROUNDED_ALERT)).toBe("NO_DATA");
   expect(SCHEDULE_UNGROUNDED_ALERT).not.toMatch(/阈值/);
@@ -193,6 +364,7 @@ test("unattendedToolDenial：拒绝文案按工具说明原因", () => {
   expect(unattendedToolDenial("request_clarification")).toContain("澄清");
   expect(unattendedToolDenial("render_chart")).toContain("出图");
   expect(unattendedToolDenial("run_command")).toContain("本期记录");
+  expect(unattendedToolDenial("list_schedules")).toContain("当前任务");
 });
 
 test("validateTiming：拒绝短于 1 分钟的周期", () => {

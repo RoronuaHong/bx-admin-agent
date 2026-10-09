@@ -4,8 +4,10 @@ import {
   calendarHourLabel,
   conversationCountTimeField,
   ensureConversationStartTime,
+  countListWithRetries,
   countPagedList,
   formatCountReport,
+  transientListFetchError,
   hourBucketLabel,
   mcpToolParts,
   LIST_COUNT_PAGE_LIMIT,
@@ -155,6 +157,87 @@ test("缺少时间或 id、重复页、接口错误都标成不完整", async ()
   expect(failed.complete).toBe(false);
   expect(failed.reason).toContain("upstream down");
   expect(failed.pages).toBe(1);
+});
+
+test("瞬时取页失败会立刻重试，永久错误只请求一次", async () => {
+  expect(transientListFetchError("Either the inputstream is invalid or absent")).toBe(true);
+  expect(transientListFetchError("unauthorized")).toBe(false);
+
+  let transientCalls = 0;
+  const recovered = await countPagedList(request({ fetchRetryDelayMs: 0 }), async () => {
+    transientCalls += 1;
+    if (transientCalls < 3) {
+      return {
+        text: JSON.stringify({ error: { message: "Either the inputstream is invalid or absent" } }),
+        isError: true,
+      };
+    }
+    return page([row("a", FROM)], false);
+  });
+  expect(transientCalls).toBe(3);
+  expect(recovered.complete).toBe(true);
+  expect(recovered.unique).toBe(1);
+  expect(recovered.pages).toBe(1);
+
+  let permanentCalls = 0;
+  const permanent = await countPagedList(request({ fetchRetryDelayMs: 0 }), async () => {
+    permanentCalls += 1;
+    return { text: JSON.stringify({ error: { message: "unauthorized" } }), isError: true };
+  });
+  expect(permanentCalls).toBe(1);
+  expect(permanent.reason).toBe("unauthorized");
+
+  let exhausted = 0;
+  const stillDown = await countPagedList(request({ fetchRetryDelayMs: 0 }), async () => {
+    exhausted += 1;
+    return {
+      text: JSON.stringify({ error: { message: "Either the inputstream is invalid or absent" } }),
+      isError: true,
+    };
+  });
+  expect(exhausted).toBe(3);
+  expect(stillDown.complete).toBe(false);
+  expect(stillDown.reason).toContain("inputstream");
+  expect(stillDown.reason).toContain("同一页已请求 3 次");
+});
+
+test("整次计数失败后再重试 3 次，工具未连接也算可重试", async () => {
+  expect(transientListFetchError("工具未找到或未连接：ZohoSalesIQ_getConversationsList")).toBe(true);
+
+  let calls = 0;
+  const recovered = await countListWithRetries(request({ fetchRetryDelayMs: 0 }), async () => {
+    calls += 1;
+    if (calls <= 3) {
+      return {
+        text: JSON.stringify({ error: { message: "工具未找到或未连接：ZohoSalesIQ_getConversationsList" } }),
+        isError: true,
+      };
+    }
+    return page([row("a", FROM)], false);
+  });
+  expect(calls).toBe(4);
+  expect(recovered.complete).toBe(true);
+  expect(recovered.unique).toBe(1);
+
+  let exhausted = 0;
+  const stillDown = await countListWithRetries(request({ fetchRetryDelayMs: 0 }), async () => {
+    exhausted += 1;
+    return {
+      text: JSON.stringify({ error: { message: "Either the inputstream is invalid or absent" } }),
+      isError: true,
+    };
+  });
+  expect(exhausted).toBe(12);
+  expect(stillDown.complete).toBe(false);
+  expect(stillDown.reason).toContain("整次计数已再试 3 次");
+
+  let permanent = 0;
+  const denied = await countListWithRetries(request({ fetchRetryDelayMs: 0 }), async () => {
+    permanent += 1;
+    return { text: JSON.stringify({ error: { message: "unauthorized" } }), isError: true };
+  });
+  expect(permanent).toBe(1);
+  expect(denied.reason).toBe("unauthorized");
 });
 
 test("空窗口是完整的零，取消和非法时区不装成零结果", async () => {
@@ -338,7 +421,7 @@ test("会话列表的字段投影必须带上 start_time，否则按 in_time 取
   expect(counted.skippedTime).toBe(0);
 });
 
-test("会话列表缺省按开始时间升序，已写排序则不覆盖", () => {
+test("会话列表只保留接口接受的排序，start_time 改回 in_time", () => {
   const filled = prepareListArgs("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", {
     query_params: { from_time: 1 },
   });
@@ -347,6 +430,10 @@ test("会话列表缺省按开始时间升序，已写排序则不覆盖", () =>
     query_params: { sort_by: "updated_time", sort_order: "desc" },
   });
   expect(kept.query_params).toMatchObject({ sort_by: "updated_time", sort_order: "desc" });
+  const illegal = prepareListArgs("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", {
+    query_params: { sort_by: "start_time", sort_order: "asc", from_time: 1 },
+  });
+  expect(illegal.query_params).toMatchObject({ sort_by: "in_time", sort_order: "asc", from_time: 1 });
   const other = prepareListArgs("mcp__other__list", { query_params: { from_time: 1 } });
   expect(other.query_params).toEqual({ from_time: 1 });
 });
@@ -367,7 +454,8 @@ test("工具名拆分与未连接的列表工具如实失败", async () => {
   expect(out?.ok).toBe(false);
   expect(out?.text).toContain("complete: false");
   expect(out?.text).toMatch(/未找到|未连接/);
-});
+  expect(out?.text).toContain("整次计数已再试 3 次");
+}, 20_000);
 
 test("没传时区时用用户时区，显式 UTC 不被改写", () => {
   expect(resolveCountTimeZone("", "Asia/Shanghai")).toBe("Asia/Shanghai");

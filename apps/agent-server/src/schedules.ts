@@ -92,7 +92,9 @@ export interface ChatSchedule {
   /**
    * 通知策略（docs/scheduled-spike-detection-plan.md）：
    * - "always"（缺省）：成功/失败都推（报告型）；
-   * - "on_alert"：失败仍推；成功则只在结论首行 [SPIKE]（及恢复）时推。
+   * - "on_alert"：成功只在 [SPIKE] 和恢复时推。[NO_DATA] 不推。
+   *   没有状态码的执行失败进入失败态才推，满 60 分钟再推。
+   *   模型接口返回可识别状态码时每一期都推，并写明状态码。
    */
   notifyPolicy?: ScheduleNotifyPolicy;
   /**

@@ -146,5 +146,11 @@ test("[4] governToolResults（本轮工具结果治理：卸载到工作区）",
   expect(result4.cleared).toBe(0);
   expect(result4.offloaded).toBe(0);
 
+  // 刚返回、还没被模型整合的一批必须整批留下，即使已经超过默认保留条数。
+  const fresh = Array.from({ length: 6 }, (_, i) => ({ role: "tool", name: `fresh${i}`, content: big })) as FakeTurn[];
+  const result5 = governToolResults(fresh as never, CONV, 6);
+  expect(result5.offloaded).toBe(0);
+  expect(fresh.every((turn) => turn.content === big)).toBe(true);
+
   fsRemoveConversation(CONV); // 清理测试写入的工作区文件
 });

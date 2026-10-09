@@ -9,6 +9,13 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getServer, isAllowedMcpCommand, mcpAllowlistRequired, loadServers, type McpServerConfig } from "./config.js";
 import { provenanceBlocked } from "./provenance.js";
+import {
+  catalogPlan,
+  readMcpToolCache,
+  usableCachedTools,
+  writeMcpToolCache,
+  type CachedMcpTool,
+} from "./tool-cache.js";
 
 export interface McpToolInfo {
   /** 注入模型的工具名（含命名空间） */
@@ -84,6 +91,42 @@ function timeoutOf(cfg: McpServerConfig): number {
   return cfg.timeoutMs && cfg.timeoutMs > 0 ? cfg.timeoutMs : DEFAULT_TIMEOUT_MS;
 }
 
+/** 列工具的瞬时失败。-32001 是 JSON-RPC 请求超时，Zoho 这条链上会出现。 */
+export function transientMcpListError(message: string): boolean {
+  return /-32001|timed out|timeout|econn|socket|network|fetch failed|(?:^|\D)(?:502|503|504|529)(?:\D|$)/i.test(message);
+}
+
+/**
+ * 会话已经不能再列工具。超时也会把这次 JSON-RPC 取消掉，原连接上再 list 不会发出去。
+ * -32001 / terminated 是 Zoho tools/list 超过本地等待后的典型结果。
+ */
+function listFailureNeedsReconnect(message: string): boolean {
+  return /not connected|connection closed|socket hang up|transport closed|-32001|timed out|timeout|terminated/i.test(message);
+}
+
+/** 还没有缓存时，tools/list 最多等这么久。Zoho 冷会话实测过 5 分钟才回包。 */
+const LIST_TIMEOUT_WHEN_UNSEEN_MS = 360_000;
+/** 已有缓存时只短探一次；探不回来就用缓存，不再把请求挂到超时取消。 */
+const LIST_TIMEOUT_WHEN_CACHED_MS = 30_000;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 已有连接能不能直接用。
+ * 冷却期内沿用上次结果。超时或断线过了冷却就整段重连；其它清单错误才在原连接上重列。
+ */
+export function mcpConnectionPlan(
+  conn: { error?: string; toolsError?: string; attemptedAt: number },
+  now: number,
+): "ready" | "cooldown" | "retry-tools" | "reconnect" {
+  if (!conn.error && !conn.toolsError) return "ready";
+  if (now - conn.attemptedAt < RECONNECT_COOLDOWN_MS) return "cooldown";
+  if (conn.error || (conn.toolsError && listFailureNeedsReconnect(conn.toolsError))) return "reconnect";
+  return "retry-tools";
+}
+
 function transportRefusal(cfg: McpServerConfig): string | null {
   if (cfg.transport === "stdio" && !isAllowedMcpCommand(cfg.command || "")) {
     const why =
@@ -127,36 +170,103 @@ function encodeToolName(serverId: string, tool: string, used: Set<string>): stri
   return name;
 }
 
-async function refreshTools(conn: Conn): Promise<void> {
+function installTools(conn: Conn, tools: CachedMcpTool[]): void {
   const used = new Set<string>();
-  try {
-    const res = await conn.client.listTools(undefined, { timeout: timeoutOf(conn.cfg) });
-    // 工具白名单：声明后只注入列出的原始工具名（未声明 = 全部），用于收窄多领域 server 的暴露面。
-    const allow = conn.cfg.tools?.length ? new Set(conn.cfg.tools) : null;
-    // 按工具名排序：工具清单是注入模型的 system 前缀的一部分，顺序稳定才谈得上 prompt 缓存命中。
-    conn.tools = (res.tools || [])
-      .filter((t) => !allow || allow.has(t.name))
-      .map((t) => ({
-        name: encodeToolName(conn.cfg.id, t.name, used),
-        serverId: conn.cfg.id,
-        tool: t.name,
-        description: t.description || t.name,
-        inputSchema: (t.inputSchema as Record<string, unknown>) || { type: "object", properties: {} },
-        // 注解是 server 的自我声明（hints），用于确认门判定，不当作安全保证。
-        ...(t.annotations ? { annotations: t.annotations as Record<string, unknown> } : {}),
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    delete conn.toolsError;
-  } catch (err) {
-    // 连上了但列不出工具：记录原因（上层据此告诉模型「该域暂时不可用」），不做静默 0 工具。
-    conn.tools = [];
-    conn.toolsError = String((err as Error)?.message || err);
-    console.warn(`[mcp:hub] listTools failed ${conn.cfg.id}: ${conn.toolsError}`);
+  conn.tools = tools
+    .map((tool) => ({
+      name: encodeToolName(conn.cfg.id, tool.name, used),
+      serverId: conn.cfg.id,
+      tool: tool.name,
+      description: tool.description || tool.name,
+      inputSchema: tool.inputSchema || { type: "object", properties: {} },
+      ...(tool.annotations ? { annotations: tool.annotations } : {}),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  delete conn.toolsError;
+}
+
+function cachedToolsFor(cfg: McpServerConfig): { savedAt: number; tools: CachedMcpTool[] } | null {
+  const entry = readMcpToolCache(cfg.id);
+  if (!entry) return null;
+  const tools = usableCachedTools(entry.tools, cfg.tools);
+  if (!tools) return null;
+  return { savedAt: entry.savedAt, tools };
+}
+
+/** fresh：清单已装上，当前会话可调用。reopen：清单来自缓存，但这次 list 已取消，传输要重开。failed：没有可用清单。 */
+async function refreshTools(conn: Conn, forceList = false): Promise<"fresh" | "reopen" | "failed"> {
+  const cached = cachedToolsFor(conn.cfg);
+  const plan = catalogPlan({
+    now: Date.now(),
+    savedAt: cached?.savedAt,
+    forceList,
+    hasUsableCache: Boolean(cached),
+  });
+  if (plan === "use-cache" && cached) {
+    installTools(conn, cached.tools);
+    console.log(`[mcp:hub] ${conn.cfg.id} 使用缓存的工具清单（${conn.tools.length}）`);
+    return "fresh";
   }
+  const timeout = cached ? Math.min(timeoutOf(conn.cfg), LIST_TIMEOUT_WHEN_CACHED_MS) : Math.max(timeoutOf(conn.cfg), LIST_TIMEOUT_WHEN_UNSEEN_MS);
+  let lastError = "";
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const res = await conn.client.listTools(undefined, { timeout });
+      const raw: CachedMcpTool[] = (res.tools || []).map((tool) => ({
+        name: tool.name,
+        ...(tool.description ? { description: tool.description } : {}),
+        inputSchema: (tool.inputSchema as Record<string, unknown>) || { type: "object", properties: {} },
+        ...(tool.annotations ? { annotations: tool.annotations as Record<string, unknown> } : {}),
+      }));
+      const allow = conn.cfg.tools?.length ? new Set(conn.cfg.tools) : null;
+      const picked = raw.filter((tool) => !allow || allow.has(tool.name));
+      if (!picked.length) {
+        lastError = "服务器未暴露白名单中的工具";
+        break;
+      }
+      writeMcpToolCache(conn.cfg.id, picked);
+      installTools(conn, picked);
+      return "fresh";
+    } catch (err) {
+      lastError = String((err as Error)?.message || err);
+      // 超时已经把这次请求取消了，同一条会话上再 list 只会空转。
+      if (listFailureNeedsReconnect(lastError) || !transientMcpListError(lastError) || attempt === 2) break;
+      await sleepMs(400);
+    }
+  }
+  if (cached) {
+    installTools(conn, cached.tools);
+    console.warn(`[mcp:hub] listTools failed ${conn.cfg.id}: ${lastError}；改用缓存清单（${conn.tools.length}）`);
+    return listFailureNeedsReconnect(lastError) ? "reopen" : "fresh";
+  }
+  // 连上了但列不出工具：记录原因（上层据此告诉模型「该域暂时不可用」），不做静默 0 工具。
+  conn.tools = [];
+  conn.toolsError = lastError || "工具清单获取失败";
+  console.warn(`[mcp:hub] listTools failed ${conn.cfg.id}: ${conn.toolsError}`);
+  return "failed";
+}
+
+function attachStderr(cfg: McpServerConfig, transport: StdioClientTransport | StreamableHTTPClientTransport): void {
+  // stdio 子进程的 stderr 是 MCP server 唯一的日志通道（stdout 被协议帧占用）：不接出来就是日志黑洞。
+  if (!(transport instanceof StdioClientTransport)) return;
+  transport.stderr?.on("data", (chunk: Buffer | string) => {
+    const line = String(chunk).trim();
+    if (line) console.log(`[mcp:${cfg.id}] ${line.slice(0, 2000)}`);
+  });
+}
+
+/** tools/list 超时会取消这次请求。缓存清单还在，但调用必须换一条没被取消的传输。 */
+async function reopenTransport(conn: Conn): Promise<void> {
+  await conn.client.close().catch(() => undefined);
+  const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {} });
+  const transport = buildTransport(conn.cfg);
+  attachStderr(conn.cfg, transport);
+  await client.connect(transport, { timeout: timeoutOf(conn.cfg) });
+  conn.client = client;
 }
 
 /** 真正建立连接（含列工具）。只在 connect 的单飞逻辑里调用。 */
-async function openConnection(cfg: McpServerConfig): Promise<Conn | null> {
+async function openConnection(cfg: McpServerConfig, forceList = false): Promise<Conn | null> {
   const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {} });
   const conn: Conn = {
     cfg,
@@ -177,17 +287,11 @@ async function openConnection(cfg: McpServerConfig): Promise<Conn | null> {
     console.warn(`[mcp:hub] connect failed ${cfg.id}: ${conn.error}`);
     return conn;
   }
-  // stdio 子进程的 stderr 是 MCP server 唯一的日志通道（stdout 被协议帧占用）：不接出来就是日志黑洞，
-  // 适配器侧的超时/报错在服务端日志里完全看不到。这里转发并加前缀、截断，避免刷屏。
-  if (transport instanceof StdioClientTransport) {
-    transport.stderr?.on("data", (chunk: Buffer | string) => {
-      const line = String(chunk).trim();
-      if (line) console.log(`[mcp:${cfg.id}] ${line.slice(0, 2000)}`);
-    });
-  }
+  attachStderr(cfg, transport);
   try {
     await client.connect(transport, { timeout: timeoutOf(cfg) });
-    await refreshTools(conn);
+    const outcome = await refreshTools(conn, forceList);
+    if (outcome === "reopen") await reopenTransport(conn);
     console.log(
       conn.toolsError
         ? `[mcp:hub] connected ${cfg.id} (${cfg.transport}) 但工具清单获取失败：${conn.toolsError}`
@@ -204,18 +308,35 @@ async function openConnection(cfg: McpServerConfig): Promise<Conn | null> {
   return conn;
 }
 
-export async function connect(serverId: string): Promise<Conn | null> {
+export async function connect(serverId: string, opts?: { forceList?: boolean }): Promise<Conn | null> {
   const cfg = getServer(serverId);
   if (!cfg) return null;
   // 连接中：复用同一个 promise —— 直接返回 conns 里的半成品会让上层看到「0 个工具」并误判服务器为空。
   const inflight = pendingConns.get(cfg.id);
   if (inflight) return inflight;
   const existing = conns.get(cfg.id);
-  if (existing && !existing.error) return existing;
-  // 冷却窗口内直接复用上次的失败状态，避免「一个挂掉的服务器拖慢每一轮对话」。
-  if (existing && Date.now() - existing.attemptedAt < RECONNECT_COOLDOWN_MS) return existing;
+  if (existing) {
+    const plan = mcpConnectionPlan(existing, Date.now());
+    if (plan === "ready" || plan === "cooldown") return existing;
+    if (plan === "retry-tools") {
+      const retry = (async () => {
+        existing.attemptedAt = Date.now();
+        existing.lastUsedAt = Date.now();
+        try {
+          const outcome = await refreshTools(existing, true);
+          if (outcome === "reopen") await reopenTransport(existing);
+        } catch (err) {
+          existing.error = String((err as Error)?.message || err);
+          console.warn(`[mcp:hub] reconnect tools failed ${existing.cfg.id}: ${existing.error}`);
+        }
+        return existing;
+      })().finally(() => pendingConns.delete(cfg.id));
+      pendingConns.set(cfg.id, retry);
+      return retry;
+    }
+  }
   if (existing) await disconnect(cfg.id);
-  const task = openConnection(cfg).finally(() => pendingConns.delete(cfg.id));
+  const task = openConnection(cfg, opts?.forceList === true).finally(() => pendingConns.delete(cfg.id));
   pendingConns.set(cfg.id, task);
   return task;
 }
@@ -292,7 +413,7 @@ export async function reload(serverId: string): Promise<ServerStatus | null> {
   const cfg = getServer(serverId);
   if (!cfg) return null;
   await disconnect(serverId);
-  const conn = await connect(serverId);
+  const conn = await connect(serverId, { forceList: true });
   return statusOf(cfg, conn);
 }
 

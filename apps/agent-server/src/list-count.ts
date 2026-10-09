@@ -54,6 +54,8 @@ export interface CountListRequest {
   pageLimit?: number;
   above?: number;
   maxPages: number;
+  /** 瞬时取页失败后的等待基数（毫秒）。测试可传 0。 */
+  fetchRetryDelayMs?: number;
   /**
    * 主时间字段整行都读不出时，改用这个字段归小时。
    * 会话列表用来接住模型写错的字段名，避免整页被标成不完整。
@@ -242,13 +244,11 @@ export function listToolProbeKey(toolName: string): string {
 }
 
 /**
- * 已知接口的稳定排序。offset 翻页在无序结果上会漏行或重复。
- * 只补这一家会话列表；其它工具不写入它不认识的 sort 字段。
- */
-/**
  * 会话列表的 sort_by=in_time 只保证翻页顺序。行上能归进小时的是 start_time。
  * 模型常把排序字段抄进 timeField，整页都读不出时间，计数就被标成不完整。
  */
+/** Zoho 会话列表只接受这四个排序字段。start_time 会让网关回 inputstream 错误。 */
+const CONVERSATION_SORT_FIELDS = new Set(["in_time", "end_time", "updated_time", "missed_time"]);
 export function conversationCountTimeField(toolName: string, timeField: string): string {
   const field = timeField.trim();
   if (!/getConversationsList/i.test(toolName)) return field || "start_time";
@@ -294,8 +294,10 @@ export function prepareListArgs(toolName: string, args: Record<string, unknown>)
   if (!/getConversationsList/i.test(toolName)) return copy;
   const query = asRecord(copy.query_params);
   if (!query) return copy;
-  if (query.sort_by == null || String(query.sort_by).trim() === "") query.sort_by = "in_time";
-  if (query.sort_order == null || String(query.sort_order).trim() === "") query.sort_order = "asc";
+  const sort = String(query.sort_by ?? "").trim();
+  if (!CONVERSATION_SORT_FIELDS.has(sort)) query.sort_by = "in_time";
+  const order = String(query.sort_order ?? "").trim();
+  if (order !== "asc" && order !== "desc") query.sort_order = "asc";
   return copy;
 }
 
@@ -412,6 +414,40 @@ function pageSizeRejected(message: string): boolean {
   return /limit invalid|invalid limit|page size|page_size|per_page|max(?:imum)? limit/i.test(message);
 }
 
+/**
+ * 同一页可以立刻再取的错误。
+ * Zoho 的 “inputstream is invalid or absent” 是空请求体一类瞬时故障：同一组参数下一分钟就能成功。
+ * 鉴权、权限、找不到资源不重试。状态码按完整数字认，避免 1504 这种数字被当成 504。
+ */
+export function transientListFetchError(message: string): boolean {
+  const msg = message.toLowerCase();
+  if (/(?:^|\D)(?:401|403)(?:\D|$)|unauthorized|permission|invalid oauth|not found|未知工具|无法识别/.test(msg)) return false;
+  return /inputstream|timeout|timed out|econn|socket|network|fetch failed|未连接|工具未找到|(?:^|\D)(?:429|502|503|504)(?:\D|$)|temporarily|unavailable|mcp 工具调用失败|gateway/.test(
+    msg,
+  );
+}
+
+/** 同一页最多请求次数，含第一次。 */
+const LIST_COUNT_FETCH_ATTEMPTS = 3;
+/** 整次计数失败后的额外重试次数。第一次失败后再试 3 次。 */
+const LIST_COUNT_EXTRA_RUNS = 3;
+
+function sleepForRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(!signal?.aborted);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function explicitMore(obj: Record<string, unknown>): boolean | undefined {
   for (const node of responseNodes(obj)) {
     for (const key of MORE_BOOL_KEYS) {
@@ -514,6 +550,8 @@ export async function countPagedList(
   let shrunkLimit = false;
   let complete = false;
   let reason = "";
+  let pageRetries = 0;
+  const retryDelayMs = request.fetchRetryDelayMs ?? 400;
 
   while (pages < maxPages) {
     if (signal?.aborted) {
@@ -530,9 +568,21 @@ export async function countPagedList(
         pages = 0;
         continue;
       }
-      reason = page.error;
+      // 模型看到 complete: false 就会按无数据收束，且被要求不要再调工具。瞬时错误要在这次调用里重取。
+      if (transientListFetchError(page.error) && pageRetries + 1 < LIST_COUNT_FETCH_ATTEMPTS) {
+        pageRetries += 1;
+        pages -= 1;
+        const waited = await sleepForRetry(retryDelayMs * pageRetries, signal);
+        if (!waited) {
+          reason = "已取消";
+          break;
+        }
+        continue;
+      }
+      reason = pageRetries > 0 ? `${page.error}（同一页已请求 ${pageRetries + 1} 次）` : page.error;
       break;
     }
+    pageRetries = 0;
     if (!page.rows.length) {
       if (!page.more) {
         complete = true;
@@ -625,6 +675,28 @@ export async function countPagedList(
     top,
     hours,
   };
+}
+
+/**
+ * 整次计数失败后再重试 3 次。同一页里的瞬时重试仍由 countPagedList 做；
+ * 这里覆盖「整次都失败」（含工具未连接）之后的再试。
+ */
+export async function countListWithRetries(
+  request: CountListRequest,
+  fetchPage: (args: Record<string, unknown>) => Promise<PageFetchResult>,
+  signal?: AbortSignal,
+): Promise<CountListReport> {
+  let report = await countPagedList(request, fetchPage, signal);
+  for (let extra = 1; extra <= LIST_COUNT_EXTRA_RUNS; extra += 1) {
+    if (report.ok || report.complete || !transientListFetchError(report.reason)) break;
+    if (signal?.aborted) break;
+    const waited = await sleepForRetry((request.fetchRetryDelayMs ?? 400) * extra, signal);
+    if (!waited) break;
+    const again = await countPagedList(request, fetchPage, signal);
+    if (again.ok || again.complete || !transientListFetchError(again.reason)) return again;
+    report = { ...again, reason: `${again.reason}（整次计数已再试 ${extra} 次）` };
+  }
+  return report;
 }
 
 function emptyReport(request: CountListRequest, complete: boolean, reason: string, ok: boolean): CountListReport {

@@ -4,12 +4,20 @@ import { test, expect } from "vitest";
 import {
   buildSynthesisHint,
   buildWrapUpUserContent,
-  clipHeadTail,
   clipWrapUpEvidence,
   collectWrapUpNarration,
   noteWrapUpEvidence,
+  verificationEvidence,
+  isBlankAnswerRound,
   shouldForceSynthesisRound,
 } from "../src/chat.js";
+
+test("只有思考、没有正文也没有工具调用，不算已经答完", () => {
+  expect(isBlankAnswerRound("", 0)).toBe(true);
+  expect(isBlankAnswerRound("   ", 0)).toBe(true);
+  expect(isBlankAnswerRound("", 1)).toBe(false);
+  expect(isBlankAnswerRound("[NORMAL]\n未破线", 0)).toBe(false);
+});
 
 test("还没有证据时，交互式最后一轮仍保留工具", () => {
   expect(
@@ -44,12 +52,13 @@ test("摘录从新到旧保留，超限丢掉更旧的结果", () => {
   expect(clipped).not.toContain("甲");
 });
 
-test("超长工具结果保留头尾，后半段的事实不会被切掉", () => {
-  const page = `${"前言".repeat(50)}航班 CZ3505 09:15`;
-  const clipped = clipHeadTail(page, 40);
-  expect(clipped.startsWith("前言")).toBe(true);
-  expect(clipped).toContain("CZ3505");
-  expect(clipped).toContain("中间已省略");
+test("长结果按回灌窗口保留中部事实，不被头尾对切丢掉", () => {
+  const fact = "航班 CZ3505 09:15";
+  const page = `${"前".repeat(8000)}${fact}${"后".repeat(8000)}`;
+  const parts: string[] = [];
+  noteWrapUpEvidence(parts, "fetch_url", page, 12_000, 4);
+  expect(parts[0]).toContain(fact);
+  expect(parts[0]!.length).toBeLessThan(page.length);
 });
 
 test("过程叙述带上思考流尾部；补位正文同时包含工具摘录和过程记录", () => {
@@ -65,4 +74,16 @@ test("过程叙述带上思考流尾部；补位正文同时包含工具摘录�
   expect(user).toContain("过程记录");
   expect(user).toContain("CZ3505");
   expect(user.indexOf("CZ3505")).toBeLessThan(user.indexOf("过程记录"));
+});
+
+test("核验证据带上已保存的定时配置，工具摘录为空时也不丢", () => {
+  const line = "名称：印度客服对话量预警。状态：已启用。频率：每 10 分钟执行一次。下次执行：2026/10/9 13:30:00。";
+  const text = verificationEvidence(line, "", "");
+  expect(text).toContain("【已保存配置】");
+  expect(text).toContain("每 10 分钟");
+  const withTools = verificationEvidence(line, "【count_list_by_time】\nunique: 24", "fallback");
+  expect(withTools.startsWith("【已保存配置】")).toBe(true);
+  expect(withTools).toContain("unique: 24");
+  expect(withTools).not.toContain("fallback");
+  expect(verificationEvidence(undefined, "", "只有工具")).toBe("只有工具");
 });

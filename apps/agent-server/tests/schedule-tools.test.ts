@@ -81,6 +81,39 @@ test("[E] 参数校验与 HTTP 同一套：缺 prompt / 时间非法 / 未知 ac
   for (const s of await listSchedules(OWNER)) await deleteSchedule(s.id, OWNER);
 });
 
+test("[G] list_schedules 把已保存的分钟间隔写成中文，两任务的频率不会串", async () => {
+  const created = await run("manage_schedule", {
+    action: "create",
+    prompt: "检查对话量",
+    name: "正式预警",
+    cron: "*/10 * * * *",
+  });
+  expect(created.ok, created.text).toBe(true);
+  const listed = await listSchedules(OWNER);
+  const id = listed.find((s) => s.name === "正式预警")!.id;
+  await patchSchedule(id, OWNER, { cron: "*/10 * * * *" });
+  const other = await run("manage_schedule", {
+    action: "create",
+    prompt: "测试",
+    name: "预警测试",
+    cron: "*/5 * * * *",
+  });
+  expect(other.ok, other.text).toBe(true);
+  const testId = (await listSchedules(OWNER)).find((s) => s.name === "预警测试")!.id;
+  await run("manage_schedule", { action: "pause", id: testId });
+  const out = await run("list_schedules", {});
+  expect(out.ok).toBe(true);
+  const liveLine = out.text.split("\n").find((line) => line.includes("正式预警")) || "";
+  const pausedLine = out.text.split("\n").find((line) => line.includes("预警测试")) || "";
+  expect(liveLine).toContain("频率：每 10 分钟执行一次");
+  expect(liveLine).not.toContain("每 5 分钟");
+  expect(pausedLine).toContain("已暂停");
+  expect(pausedLine).toContain("频率：每 5 分钟执行一次");
+  expect(out.text).toContain("禁止把别的任务的频率安到这一行");
+  await deleteSchedule(id, OWNER);
+  await deleteSchedule(testId, OWNER);
+});
+
 test("[F] 无 ownerKey 时如实拒绝（不做「全员可见」的兜底）", async () => {
   const out = await execBuiltin("list_schedules", JSON.stringify({}), CONV, "generic");
   expect(out.ok).toBe(false);

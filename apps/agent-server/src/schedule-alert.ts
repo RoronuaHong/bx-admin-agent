@@ -15,6 +15,13 @@ export interface ScheduleAlertState {
   lastAlertAt?: number;
   /** 告警中连续出现 NORMAL 的期数；满 2 期触发恢复通知。 */
   normalStreak?: number;
+  /**
+   * 检查器失败态的起点（没有结论文本或模型调用失败）。
+   * 没有这个字段 = 未在失败态。与 firing 无关：破线是业务异常，失败是检查没跑完。
+   */
+  failingSince?: number;
+  /** 最近一次把失败通知发出去的时刻。满 60 分钟才允许再发一条。 */
+  failNotifiedAt?: number;
 }
 
 /**
@@ -30,6 +37,67 @@ export const SCHEDULE_UNGROUNDED_ALERT =
 /** 定时报告在同样情况下的正文。不是交互对话那句道歉，也不编数字。 */
 export const SCHEDULE_UNGROUNDED_REPORT = "这次没有取到可核对的数据，没有写结论。";
 
+/** 工具已经返回，模型却没写面向用户的正文。不能当成检查成功。 */
+export const CONCLUSION_GAP_AFTER_TOOLS = "工具已经返回结果，但没有写出结论。";
+
+/** 整轮没有任何面向用户的正文。 */
+export const CONCLUSION_GAP = "这次没有写出结论。";
+
+export function isConclusionGap(text: string): boolean {
+  const body = String(text || "").trim();
+  return body === CONCLUSION_GAP || body === CONCLUSION_GAP_AFTER_TOOLS;
+}
+
+/**
+ * 没有检查结论时不推企业 IM。
+ * 空正文、占位句，以及预警任务里认不出 [SPIKE]/[NORMAL]/[NO_DATA] 的失败，都不发。
+ * 模型状态码说明是另一类结论，仍然发。
+ */
+export function shouldDeliverScheduleResult(input: {
+  status: "success" | "failed";
+  text: string;
+  policy?: ScheduleNotifyPolicy;
+  modelStatus?: boolean;
+}): boolean {
+  if (input.modelStatus) return true;
+  const body = conclusionBody(input.text);
+  if (!body || isConclusionGap(body)) return false;
+  if (pickNotifyPolicy(input.policy) === "on_alert" && input.status === "failed" && !parseAlertMarker(input.text)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 定时运行的最终成败。consumeTask 只看有没有 error 事件；
+ * 这里补上「有事件流但没有协议结论」：空正文、占位句、预警却没有首行标记，都记失败。
+ * 不把它们改写成 [NO_DATA]，否则破线会被静默放过。
+ */
+/** 去掉服务端附上的任务配置句，看模型有没有写出检查结论。 */
+function conclusionBody(text: string): string {
+  return String(text || "")
+    .split(/\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^- 名称：/.test(line))
+    .join("\n")
+    .trim();
+}
+
+export function scheduleFinishedStatus(input: {
+  finished: "success" | "failed" | "cancelled";
+  text: string;
+  ungrounded: boolean;
+  alert: boolean;
+}): "success" | "failed" | "cancelled" {
+  if (input.finished !== "success") return input.finished;
+  const text = String(input.text || "").trim();
+  const body = conclusionBody(text);
+  if (!text || !body || isConclusionGap(body)) return "failed";
+  if (input.ungrounded && !input.alert) return "failed";
+  if (input.alert && !parseAlertMarker(text)) return "failed";
+  return "success";
+}
+
 export const SCHEDULE_ALERT_GUIDE =
   "本次是数据预警检查（不是周期报告）。硬性规则：\n" +
   "1) 正文**第一行**单独输出且只输出下列标记之一（方括号保留）：\n" +
@@ -38,7 +106,10 @@ export const SCHEDULE_ALERT_GUIDE =
   "   [NO_DATA] — 取不到数据、结果为空、或计数不完整（不要猜数）。\n" +
   "2) 第一行之后最多再写 3～5 行，全部用中文：时间窗口、当前数量、阈值。\n" +
   "   不要写英文单词或字段名，不要写 complete、raw、unique、above。\n" +
-  "   不要写任务开关、下次执行时间、钉钉或推送通道。任务名、状态和时间由通知另附。\n" +
+  "   不要写钉钉或推送通道。\n" +
+  "   不要自己写本任务是否启用、执行频率或下次时间，也不要写成无法确认。" +
+  "需要时由服务端把已保存配置附在正文末尾。禁止自行换算 cron，禁止沿用本对话更早回复里的频率或时间，也不要为此再调用 list_schedules。" +
+  "对话历史里出现的其它定时任务与本期无关，不要引用它们的名称、频率或状态。\n" +
   "3) **禁止** render_chart、export_data、写报告 HTML、基于截断片段估算/外推。\n" +
   "4) 取数优先短窗口（按用户指令，常见 ≤60 分钟）与**聚合/计数**接口；" +
   "列表没有总数、又要按小时或阈值计数时，调用 count_list_by_time 一次取回，不要逐页翻列表。" +
@@ -74,6 +145,52 @@ export function buildUnattendedConclusion(input: {
 }
 
 /** 从结论正文解析首行协议标记；认不出来返回 null（on_alert 下按不推处理）。 */
+/**
+ * 计数结果里的比较由引擎做，不交给模型心算。
+ * complete 为 false → 无数据。带了 above 才比较 over_count。没带阈值则返回 null，仍由模型写标记。
+ */
+/** 预警指令里的破线阈值。只认「超过 N」，避免把「60 分钟」当成阈值。 */
+export function alertAboveFromPrompt(prompt: string): number | null {
+  const match = String(prompt || "").match(/超过\s*(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 模型没传 above 时补上指令里的阈值。已经传了数字就不动。 */
+export function fillCountAbove(
+  args: Record<string, unknown>,
+  above: number | null | undefined,
+): Record<string, unknown> {
+  if (above == null || !Number.isFinite(above)) return args;
+  const current = args.above;
+  if (current != null && current !== "" && Number.isFinite(Number(current))) return args;
+  return { ...args, above };
+}
+
+export function markerFromCountText(text: string): AlertMarker | null {
+  const complete = String(text || "").match(/^complete:\s*(true|false)\s*$/m);
+  if (!complete) return null;
+  if (complete[1] === "false") return "NO_DATA";
+  const above = String(text).match(/^above:\s*-?\d+(?:\.\d+)?\s*$/m);
+  const over = String(text).match(/^over_count:\s*(\d+)\s*$/m);
+  if (!above || !over) return null;
+  return Number(over[1]) > 0 ? "SPIKE" : "NORMAL";
+}
+
+/** 用计数结论覆盖首行标记。不完整时整段换成协议句，避免模型用残缺数字写成未破线。 */
+export function stampAlertMarker(text: string, marker: AlertMarker): string {
+  if (marker === "NO_DATA") return SCHEDULE_UNGROUNDED_ALERT;
+  const lines = String(text || "").split(/\n/);
+  const first = lines[0]?.trim() || "";
+  if (/^\[(SPIKE|NORMAL|NO_DATA)\]/i.test(first)) {
+    lines[0] = first.replace(/^\[(SPIKE|NORMAL|NO_DATA)\]/i, `[${marker}]`);
+    return lines.join("\n").trim();
+  }
+  const body = String(text || "").trim();
+  return body ? `[${marker}]\n${body}` : `[${marker}]`;
+}
+
 export function parseAlertMarker(text: string): AlertMarker | null {
   const first = String(text || "")
     .trim()
@@ -126,6 +243,68 @@ export function needsArmNotice(input: {
 }
 
 export type AlertDeliveryKind = "spike" | "recovered" | "skip" | "started";
+
+/** 同一失败态的再通知间隔。按跑完时刻算，不按 cron 拍数。 */
+export const ALERT_FAIL_REPEAT_MS = 60 * 60_000;
+
+export type AlertFailureKind = "notify" | "skip";
+
+/**
+ * 预警任务里「没写完结论」的执行失败怎么通知。
+ * 模型 402 / 429 / 500 / 502 / 503 / 504 不走 60 分钟合并，由调用方传 force，每一期都推。
+ * 业务破线不走这里。[SPIKE] 仍每期都推。
+ * - 刚进入失败态：推一条；
+ * - 已经在失败态且距上次通知不足 60 分钟：不推；
+ * - 满 60 分钟仍失败：再推一条，并重新计这 60 分钟；
+ * - force：启动确认必须发出。记成一次失败通知，避免下一期又当「刚失败」再推。
+ */
+export function decideAlertFailure(input: {
+  alertState?: ScheduleAlertState;
+  now?: number;
+  force?: boolean;
+}): { kind: AlertFailureKind; nextState: ScheduleAlertState } {
+  const now = input.now ?? Date.now();
+  const prev = input.alertState || {};
+  const base: ScheduleAlertState = {
+    ...(prev.firing ? { firing: true } : { firing: false }),
+    ...(prev.lastAlertAt !== undefined ? { lastAlertAt: prev.lastAlertAt } : {}),
+    ...(prev.normalStreak ? { normalStreak: prev.normalStreak } : { normalStreak: 0 }),
+  };
+  const since = prev.failingSince;
+  const notified = prev.failNotifiedAt;
+  const inFailure = since !== undefined && notified !== undefined;
+  const due = !inFailure || now - notified >= ALERT_FAIL_REPEAT_MS || input.force === true;
+  if (!due) {
+    return {
+      kind: "skip",
+      nextState: { ...base, failingSince: since, failNotifiedAt: notified },
+    };
+  }
+  return {
+    kind: "notify",
+    nextState: {
+      ...base,
+      failingSince: inFailure ? since : now,
+      failNotifiedAt: now,
+    },
+  };
+}
+
+/**
+ * 失败通知没发出去时，不要把 failNotifiedAt 往前拨。
+ * 否则通道挂了会吞掉下一次该发的失败提醒。failingSince 仍保留，失败态不断。
+ */
+export function commitAlertFailureNotice(
+  decided: ScheduleAlertState,
+  previous: ScheduleAlertState | undefined,
+  sent: boolean,
+): ScheduleAlertState {
+  if (sent) return decided;
+  const next: ScheduleAlertState = { ...decided };
+  if (previous?.failNotifiedAt !== undefined) next.failNotifiedAt = previous.failNotifiedAt;
+  else delete next.failNotifiedAt;
+  return next;
+}
 
 /**
  * 根据本期标记与任务上的 alertState 决定是否推送，并算出下一期状态。
@@ -204,6 +383,7 @@ const UNATTENDED_DENY_REASON: Record<string, string> = {
   run_command: "无人值守不允许执行系统命令",
   run_script: "无人值守不允许执行脚本",
   manage_schedule: "无人值守不允许改定时任务",
+  list_schedules: "本期只看当前任务。其它定时任务不在这次运行里，启用状态和频率以系统提示中的本任务配置为准",
   render_chart: "预警检查不允许出图",
   export_data: "预警检查不允许导出文件",
   request_clarification: "无人值守没有人回答澄清",
