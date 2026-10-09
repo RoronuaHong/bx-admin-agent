@@ -234,7 +234,7 @@ async function persist() {
     .filter((b) => b.text || b.images?.length)
     .map((b) => ({ role: b.role, text: b.text, images: b.images }));
   const title = bubbles.value.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
-  await saveConversationMessages(convId, stored, title).catch(() => {});
+  await saveConversationMessages(convId, stored, { title }).catch(() => {});
 }
 
 /** 语言切换：组件已先改内存（立即生效），这里负责把偏好落到当前会话，刷新后仍生效。 */

@@ -43,6 +43,7 @@ import {
   fetchChatPreferences,
   fetchChatSkills,
   fetchChatTaskStatus,
+  fetchConversation,
   fetchConversations,
   fetchModels,
   fetchMemory,
@@ -1692,6 +1693,14 @@ const threadEl = ref<HTMLElement | null>(null);
 const models = ref<ModelInfo[]>([]);
 const conversations = ref<ConversationDto[]>([]);
 
+/**
+ * 每个对话「已成功落库」的消息条数（增量落库基线）。
+ * 用 Map 而非响应式：它只是落库进度游标，不驱动渲染。
+ * 没记录过的对话（本会话首次落库）回退到服务端快照长度（conversations 里该对话的 messages 长度），
+ * 这样首次落库只回写「本地新增的部分」，不把整段历史（可达 MB 级）重新全量上传。
+ */
+const persistedCount = new Map<string, number>();
+
 // 侧栏会话搜索（原文 + 拼音，按标题过滤）。搜索态下隐藏分组分隔线、禁用拖拽（见模板）。
 const convQuery = ref("");
 const conversationsFiltered = computed(() => {
@@ -2375,25 +2384,71 @@ function settleStep(step: ToolStep): ToolStep {
   return step.status === "running" ? { ...step, status: "interrupted" } : step;
 }
 
+/** 与服务端快照窗口一致：只有最近一段带回思考和工具原文。 */
+const SNAPSHOT_DETAIL_TAIL = 40;
+const SNAPSHOT_THINKING_CAP = 8_000;
+const SNAPSHOT_STEP_RESULT_CAP = 4_000;
+
+function capTail(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `…\n${text.slice(text.length - max)}`;
+}
+
 function toStored(list: Bubble[]): StoredMessage[] {
-  return list
-    // 只出图、没有正文的气泡也必须落库：否则整条消息（连图一起）刷新后消失。
-    .filter((b) => b.text || b.images?.length || b.charts?.length || b.artifacts?.length)
-    .map((b) => ({
+  const kept = list.filter((b) => b.text || b.images?.length || b.charts?.length || b.artifacts?.length);
+  const detailFrom = Math.max(0, kept.length - SNAPSHOT_DETAIL_TAIL);
+  return kept.map((b, index) => {
+    const keepDetail = index >= detailFrom;
+    const steps = b.steps?.map(settleStep);
+    return {
       role: b.role,
       text: b.text,
       ...(b.at ? { at: b.at } : {}),
       images: b.images,
-      // 推理面板相关字段一并落库：刷新后从后端快照恢复，思考过程 / 工具步骤 / 任务规划不丢。
-      ...(b.thinking ? { thinking: b.thinking } : {}),
+      ...(keepDetail && b.thinking ? { thinking: capTail(b.thinking, SNAPSHOT_THINKING_CAP) } : {}),
       ...(b.thinkMs ? { thinkMs: b.thinkMs } : {}),
-      ...(b.steps?.length ? { steps: b.steps.map(settleStep) } : {}),
+      ...(steps?.length
+        ? {
+            steps: keepDetail
+              ? steps.map((step) => ({
+                  ...step,
+                  ...(step.result ? { result: capTail(step.result, SNAPSHOT_STEP_RESULT_CAP) } : {}),
+                  ...(step.args ? { args: capTail(step.args, 400) } : {}),
+                }))
+              : steps.map((step) => ({ id: step.id, name: step.name, server: step.server, status: step.status })),
+          }
+        : {}),
       ...(b.todos?.length ? { todos: b.todos } : {}),
-      // 图表 spec 也要落库：图是浏览器现场画的、产物只在内存，不存就会「刷新即消失」。
       ...(b.charts?.length ? { charts: b.charts } : {}),
-      // 下载卡片同理：产物实体在服务端，快照只存 spec，刷新后由卡片按 path 重绘。
       ...(b.artifacts?.length ? { artifacts: b.artifacts } : {}),
-    }));
+    };
+  });
+}
+
+function bubblesFromStored(messages: StoredMessage[], times: number[]): Bubble[] {
+  return messages.map((m, i) => ({
+    id: ++seq,
+    role: m.role,
+    at: times[i],
+    text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
+    images: m.images,
+    ...(m.thinking ? { thinking: m.thinking } : {}),
+    ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
+    ...(Array.isArray(m.steps) && m.steps.length ? { steps: (m.steps as ToolStep[]).map(settleStep) } : {}),
+    ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
+    ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
+    ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
+  }));
+}
+
+/** 列表快照没有推理细节。打开对话后补最近一段，生成中的气泡不被覆盖。 */
+async function upgradeConversationDetail(convId: string) {
+  const full = await fetchConversation(convId).catch(() => null);
+  const state = states.get(convId);
+  if (!full || !state || state.sending || state.bubbles.some((b) => b.streaming)) return;
+  const times = messageTimes(full.messages || [], full.createdAt, full.updatedAt);
+  state.bubbles = bubblesFromStored(full.messages || [], times);
+  persistedCount.set(convId, toStored(state.bubbles).length);
 }
 
 /**
@@ -2403,14 +2458,32 @@ function toStored(list: Bubble[]): StoredMessage[] {
  */
 async function persist(convId: string, list: Bubble[]) {
   if (!convId) return;
+  const stored = toStored(list);
   const title = list.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
+  // 本会话首次落库该对话时，用服务端快照长度当基线（避免把整段历史重新全量上传）。
+  const serverLen = conversations.value.find((c) => c.id === convId)?.messages?.length ?? 0;
+  const prev = persistedCount.get(convId) ?? serverLen;
   try {
-    await saveConversationMessages(convId, toStored(list), title);
+    if (stored.length < prev) {
+      // 长度回退（如清空对话）：全量替换。
+      await saveConversationMessages(convId, stored, { title, full: true });
+    } else if (stored.length === prev) {
+      if (prev > 0) {
+        // 没有新增消息，只可能是「最后一条正在流式更新」→ 只回写最后一条（base=prev-1 触发服务端原地替换）。
+        await saveConversationMessages(convId, [stored[prev - 1]!], { title, base: prev - 1 });
+      } else if (title) {
+        await saveConversationMessages(convId, [], { title, base: 0 });
+      }
+    } else {
+      // 有新增消息：只回写尾部增量（base=prev）。
+      await saveConversationMessages(convId, stored.slice(prev), { title, base: prev });
+    }
+    persistedCount.set(convId, stored.length);
     if (title) {
       conversations.value = conversations.value.map((c) => (c.id === convId ? { ...c, title } : c));
     }
   } catch {
-    /* 保存失败不打断对话 */
+    /* 保存失败不打断对话（下次变更会重试增量回写） */
   }
 }
 
@@ -2434,25 +2507,10 @@ function selectConversation(conv: ConversationDto) {
   // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
   const times = messageTimes(conv.messages || [], conv.createdAt, conv.updatedAt);
   if (!state.bubbles.length) {
-    state.bubbles = (conv.messages || []).map((m, i) => ({
-      id: ++seq,
-      role: m.role,
-      at: times[i],
-      text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
-      images: m.images,
-      // 推理面板相关字段恢复（与 toStored 对称）：思考过程 / 工具步骤 / 任务规划。
-      ...(m.thinking ? { thinking: m.thinking } : {}),
-      ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
-      // 历史快照里可能存着 running（收不到终态的轮次）：读回来先归一，否则刷新即「永久转圈」。
-      ...(Array.isArray(m.steps) && m.steps.length
-        ? { steps: (m.steps as ToolStep[]).map(settleStep) }
-        : {}),
-      ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
-      // 图表卡片恢复（与 toStored 对称）：刷新后由 ChartCard 按 spec 重绘。
-      ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
-      // 下载卡片恢复（与 toStored 对称）：刷新后由卡片按 spec 重绘。
-      ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
-    }));
+    state.bubbles = bubblesFromStored(conv.messages || [], times);
+    if (!persistedCount.has(conv.id)) persistedCount.set(conv.id, toStored(state.bubbles).length);
+    // 列表不含思考过程。打开后再取最近一段细节，不把整段推理塞进侧栏轮询。
+    void upgradeConversationDetail(conv.id);
   } else if (state.bubbles.length === times.length) {
     state.bubbles.forEach((bubble, index) => {
       if (!bubble.at) bubble.at = times[index];
@@ -2972,6 +3030,7 @@ async function removeConversation(id: string) {
 async function deleteConversationOnServer(id: string) {
   try {
     await apiDeleteConversation(id);
+    persistedCount.delete(id);
     await loadTasks();
   } catch {
     /* 删除失败不打断交互；任务列表交给轮询兜底 */
@@ -3312,6 +3371,7 @@ async function clearConversationById(id: string) {
     state.bubbles = [];
     state.error = "";
   }
+  persistedCount.delete(id);
   await Promise.all([
     clearConversation(id).catch(() => undefined),
     clearConversationContext(id).catch(() => undefined),

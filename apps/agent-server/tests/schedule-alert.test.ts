@@ -12,6 +12,8 @@ import {
   CONCLUSION_GAP_AFTER_TOOLS,
   alertAboveFromPrompt,
   fillCountAbove,
+  applyScheduledCountFacts,
+  formatScheduledCountFacts,
   markerFromCountText,
   parseAlertMarker,
   stampAlertMarker,
@@ -154,6 +156,70 @@ test("计数比较由引擎落标记，不完整时整段换成无数据", () =>
   expect(stampAlertMarker("[NORMAL]\n未破线", "SPIKE")).toMatch(/^\[SPIKE\]/);
   expect(stampAlertMarker("未破线", "NORMAL")).toMatch(/^\[NORMAL\]\n未破线/);
   expect(stampAlertMarker("[NORMAL]\n估了 12 条", "NO_DATA")).toBe(SCHEDULE_UNGROUNDED_ALERT);
+});
+
+const COUNT_REPORT = [
+  "complete: true",
+  "reason: 已翻到末页",
+  "unique: 33",
+  "timezone: Asia/Shanghai",
+  "range: 2026-10-09 14:00 .. 2026-10-09 15:00",
+  "above: 300",
+  "over_count: 0",
+  "hours:",
+  "2026-10-09 14:00\t19",
+  "2026-10-09 15:00\t14",
+].join("\n");
+
+test("完整计数的时间窗口、当前数量、阈值三行固定，小时按时间排序", () => {
+  expect(formatScheduledCountFacts("complete: false\nunique: 1")).toBeNull();
+  expect(formatScheduledCountFacts(COUNT_REPORT)).toBe(
+    [
+      "- 时间窗口：2026-10-09 14:00 至 2026-10-09 15:00（Asia/Shanghai）",
+      "- 当前数量：33（2026-10-09 14:00 为 19，2026-10-09 15:00 为 14），计数完整",
+      "- 阈值：超过 300；最高 19，未破线",
+    ].join("\n"),
+  );
+  const spiked = COUNT_REPORT.replace("over_count: 0", "over_count: 1").replace("2026-10-09 15:00\t14", "2026-10-09 15:00\t420");
+  expect(formatScheduledCountFacts(spiked)).toContain("最高 420，1 个小时破线");
+  const overFirst = [
+    "complete: true",
+    "unique: 33",
+    "timezone: Asia/Shanghai",
+    "range: 2026-10-09 14:00 .. 2026-10-09 15:00",
+    "above: 300",
+    "over_count: 0",
+    "2026-10-09 15:00\t420",
+    "hours:",
+    "2026-10-09 14:00\t19",
+    "2026-10-09 15:00\t14",
+  ].join("\n");
+  expect(formatScheduledCountFacts(overFirst)).toContain("2026-10-09 14:00 为 19，2026-10-09 15:00 为 14");
+  expect(formatScheduledCountFacts(overFirst)).not.toContain("420");
+  expect(
+    applyScheduledCountFacts({ text: "[SPIKE]\n估了", report: "complete: false", conclusion: "alert", marker: "NO_DATA" }),
+  ).toBe(SCHEDULE_UNGROUNDED_ALERT);
+});
+
+test("预警和定时报告用同一套三行，模型换过的标签会被盖掉", () => {
+  const drafted = "[NORMAL]\n- 分小时会话量：15 点时段 18 个，14 点时段 15 个\n- 阈值：两小时均未破线";
+  const alert = applyScheduledCountFacts({
+    text: drafted,
+    report: COUNT_REPORT,
+    conclusion: "alert",
+    marker: "NORMAL",
+  });
+  expect(alert.startsWith("[NORMAL]\n- 时间窗口：")).toBe(true);
+  expect(alert).toContain("- 当前数量：33（2026-10-09 14:00 为 19，2026-10-09 15:00 为 14），计数完整");
+  expect(alert).not.toContain("分小时会话量");
+  const report = applyScheduledCountFacts({
+    text: "- 当前会话量：33 个\n其余说明保持原样。",
+    report: COUNT_REPORT,
+    conclusion: "report",
+  });
+  expect(report.startsWith("- 时间窗口：")).toBe(true);
+  expect(report).toContain("其余说明保持原样。");
+  expect(report).not.toContain("当前会话量");
 });
 
 test("没有结论不投递；有协议标记或模型状态码才投递", () => {

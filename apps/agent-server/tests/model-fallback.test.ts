@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import {
   isDailyQuotaFailure,
   isModelDownFailure,
+  modelDownCooldownMs,
   isTransientModelError,
   modelAvailabilityNotice,
   modelAvailabilityStatus,
@@ -51,6 +52,11 @@ test("402、500、429 都立刻换模型；当日额度用尽才冷却，短暂 
   expect(isModelDownFailure("model http 408: timeout")).toBe(false);
   expect(isModelDownFailure("model http 529: overloaded")).toBe(false);
   expect(isModelDownFailure("model http 400: bad request")).toBe(false);
+});
+
+test("未开通的模型按小时冷却，500 只冷却一个调度周期", () => {
+  expect(modelDownCooldownMs("model http 402: 额度不足")).toBeGreaterThan(60 * 60 * 1000);
+  expect(modelDownCooldownMs("model http 500: internal")).toBe(10 * 60 * 1000);
 });
 
 test("预警轮次不被自主度下调；其它运行仍用收紧后的预算", () => {

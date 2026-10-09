@@ -76,7 +76,6 @@ export interface CountListReport {
   minHour?: string;
   maxHour?: string;
   over: HourBucket[];
-  top: HourBucket[];
   hours: HourBucket[];
   file?: string;
   fileError?: string;
@@ -655,7 +654,6 @@ export async function countPagedList(
   const hours = [...buckets.entries()]
     .map(([hour, count]) => ({ hour, count }))
     .sort((a, b) => (a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : 0));
-  const top = [...hours].sort((a, b) => b.count - a.count || (a.hour < b.hour ? -1 : 1)).slice(0, 15);
   const over = request.above == null ? [] : hours.filter((item) => item.count > request.above!);
   const unique = [...buckets.values()].reduce((sum, n) => sum + n, 0);
   // 接口失败且一行都没入账才算失败。缺时间、缺 id、翻到上限但仍有行，要 ok，
@@ -672,7 +670,6 @@ export async function countPagedList(
     ...(request.above != null ? { above: request.above } : {}),
     ...(hours.length ? { minHour: hours[0]!.hour, maxHour: hours[hours.length - 1]!.hour } : {}),
     over,
-    top,
     hours,
   };
 }
@@ -711,7 +708,6 @@ function emptyReport(request: CountListRequest, complete: boolean, reason: strin
     timeZone: request.timeZone,
     ...(request.above != null ? { above: request.above } : {}),
     over: [],
-    top: [],
     hours: [],
   };
 }
@@ -742,25 +738,22 @@ export function formatCountReport(report: CountListReport): string {
     `raw_rows: ${report.rawRows}`,
     `unique: ${report.unique}`,
     `timezone: ${report.timeZone}`,
-    `labels: 上列小时已按 ${report.timeZone} 标注。回答里照这个时区写，不要改成别的时区。`,
+    `labels: hours 段按 ${report.timeZone} 从早到晚列出。回答里照这个时区写，不要改成别的时区。`,
   );
   if (report.minHour && report.maxHour) lines.push(`range: ${report.minHour} .. ${report.maxHour}`);
   if (report.above != null) {
     lines.push(`above: ${report.above}`);
     lines.push(`over_count: ${report.over.length}`);
-    if (report.over.length === 0) {
-      lines.push(`note: 已覆盖全部已返回页。没有小时的计数超过 ${report.above}。`);
-      if (report.top.length) {
-        lines.push("top:");
-        lines.push(linesOf(report.top, 15, report.file));
-      }
-    } else {
-      lines.push("note: 下列小时的计数超过阈值。");
-      lines.push(linesOf(report.over, 40, report.file));
-    }
-  } else if (report.top.length) {
-    lines.push("top:");
-    lines.push(linesOf(report.top, 15, report.file));
+    lines.push(
+      report.over.length === 0
+        ? `note: 已覆盖全部已返回页。没有小时的计数超过 ${report.above}。`
+        : "note: 下列小时的计数超过阈值。",
+    );
+    if (report.over.length) lines.push(linesOf(report.over, 40));
+  }
+  if (report.hours.length) {
+    lines.push("hours:");
+    lines.push(linesOf(report.hours, 48, report.file));
   }
   if (report.file) lines.push(`file: ${report.file}`);
   if (report.fileError) lines.push(`file_error: ${report.fileError}`);

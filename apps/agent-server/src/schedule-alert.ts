@@ -104,7 +104,8 @@ export const SCHEDULE_ALERT_GUIDE =
   "   [SPIKE]  — 按用户指令判定为异常 / 破线；\n" +
   "   [NORMAL] — 有完整计数且未破线；\n" +
   "   [NO_DATA] — 取不到数据、结果为空、或计数不完整（不要猜数）。\n" +
-  "2) 第一行之后最多再写 3～5 行，全部用中文：时间窗口、当前数量、阈值。\n" +
+  "   计数结果里已有 above 与 over_count 时，服务端会按它校正这一行。\n" +
+  "2) 不要写时间窗口、当前数量、阈值或任何条数。计数完整时服务端按 hours 段写成这三行；不完整时只保留 [NO_DATA]，不要编数字。\n" +
   "   不要写英文单词或字段名，不要写 complete、raw、unique、above。\n" +
   "   不要写钉钉或推送通道。\n" +
   "   不要自己写本任务是否启用、执行频率或下次时间，也不要写成无法确认。" +
@@ -144,7 +145,6 @@ export function buildUnattendedConclusion(input: {
   return parseAlertMarker(body) ? body : SCHEDULE_UNGROUNDED_ALERT;
 }
 
-/** 从结论正文解析首行协议标记；认不出来返回 null（on_alert 下按不推处理）。 */
 /**
  * 计数结果里的比较由引擎做，不交给模型心算。
  * complete 为 false → 无数据。带了 above 才比较 over_count。没带阈值则返回 null，仍由模型写标记。
@@ -189,6 +189,119 @@ export function stampAlertMarker(text: string, marker: AlertMarker): string {
   }
   const body = String(text || "").trim();
   return body ? `[${marker}]\n${body}` : `[${marker}]`;
+}
+
+const HOUR_COUNT_LINE = /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})\t(\d+)\s*$/;
+const MORE_HOURS_LINE = /^…其余\s*(\d+)\s*个小时/;
+const RESTATED_COUNT_FACT = /^\s*(?:[-*•]\s*)?(?:时间窗口|当前数量|当前会话量|分小时会话量|阈值)\s*[:：]/;
+
+/**
+ * 预警和定时任务共用的计数结论。数字和标签都来自 count_list_by_time 的摘要，不看模型措辞。
+ * 小时按时间从早到晚，避免按大小重排后每期换一种说法。不完整的计数返回 null，调用方保持原结论。
+ */
+export function formatScheduledCountFacts(report: string): string | null {
+  const fields = new Map<string, string>();
+  const grouped: Record<"hours" | "top" | "loose", Array<{ hour: string; count: number }>> = {
+    hours: [],
+    top: [],
+    loose: [],
+  };
+  const moreBySection = { hours: 0, top: 0, loose: 0 };
+  let section: "hours" | "top" | "loose" = "loose";
+  for (const raw of String(report || "").split(/\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === "hours:" || line.startsWith("hours:")) {
+      section = "hours";
+      continue;
+    }
+    if (line === "top:" || line.startsWith("top:")) {
+      section = "top";
+      continue;
+    }
+    const hour = line.match(HOUR_COUNT_LINE);
+    if (hour) {
+      grouped[section].push({ hour: hour[1]!, count: Number(hour[2]) });
+      continue;
+    }
+    const extra = line.match(MORE_HOURS_LINE);
+    if (extra) {
+      moreBySection[section] += Number(extra[1]);
+      continue;
+    }
+    const field = line.match(/^([a-z_]+):\s*(.*)$/);
+    if (field && !fields.has(field[1]!)) fields.set(field[1]!, field[2]!.trim());
+    section = "loose";
+  }
+  if (fields.get("complete") !== "true") return null;
+  const uniqueRaw = fields.get("unique");
+  const unique = uniqueRaw != null && /^\d+$/.test(uniqueRaw) ? Number(uniqueRaw) : null;
+  const chosen = grouped.hours.length ? "hours" : grouped.top.length ? "top" : "loose";
+  const buckets = grouped[chosen];
+  const moreHours = moreBySection[chosen];
+  if (unique == null && buckets.length === 0) return null;
+  const ordered = [...buckets].sort((a, b) => (a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : 0));
+  const range = fields.get("range")?.match(/^(.+?)\s+\.\.\s+(.+)$/);
+  let windowText = range
+    ? `${range[1]} 至 ${range[2]}`
+    : ordered.length === 1
+      ? ordered[0]!.hour
+      : ordered.length > 1
+        ? `${ordered[0]!.hour} 至 ${ordered[ordered.length - 1]!.hour}`
+        : "";
+  const zone = fields.get("timezone") || "";
+  if (zone) windowText = windowText ? `${windowText}（${zone}）` : zone;
+  if (!windowText) return null;
+  const total = unique ?? ordered.reduce((sum, item) => sum + item.count, 0);
+  const detail = ordered.map((item) => `${item.hour} 为 ${item.count}`).join("，");
+  const more = moreHours > 0 ? `，另有 ${moreHours} 个小时` : "";
+  const lines = [
+    `- 时间窗口：${windowText}`,
+    detail ? `- 当前数量：${total}（${detail}${more}），计数完整` : `- 当前数量：${total}，计数完整`,
+  ];
+  const above = fields.get("above");
+  if (above && /^-?\d+(?:\.\d+)?$/.test(above)) {
+    const overRaw = fields.get("over_count");
+    const over = overRaw && /^\d+$/.test(overRaw) ? Number(overRaw) : 0;
+    const peak = ordered.length ? Math.max(...ordered.map((item) => item.count)) : null;
+    const verdict = over > 0 ? `${over} 个小时破线` : "未破线";
+    lines.push(`- 阈值：超过 ${above}；${peak != null ? `最高 ${peak}，` : ""}${verdict}`);
+  }
+  return lines.join("\n");
+}
+
+/** 去掉模型自己写的时间窗口 / 当前数量 / 阈值，避免和上面的固定三行重复。 */
+function stripRestatedCountFacts(text: string): string {
+  return String(text || "")
+    .split(/\n/)
+    .filter((line) => !RESTATED_COUNT_FACT.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * 有完整计数时，用同一套三行覆盖模型正文里的数量说法。
+ * 预警整段换成协议标记加这三行；定时报告把这三行放在正文前面，其余说明保留。
+ */
+export function applyScheduledCountFacts(input: {
+  text: string;
+  report: string;
+  conclusion?: "alert" | "report";
+  marker?: AlertMarker | null;
+}): string {
+  if (input.conclusion !== "alert" && input.conclusion !== "report") return input.text;
+  if (input.conclusion === "alert" && input.marker === "NO_DATA") return SCHEDULE_UNGROUNDED_ALERT;
+  const facts = formatScheduledCountFacts(input.report);
+  if (!facts) {
+    return input.conclusion === "alert" && input.marker ? stampAlertMarker(input.text, input.marker) : input.text;
+  }
+  if (input.conclusion === "alert") {
+    const marker = input.marker || parseAlertMarker(input.text);
+    return marker ? `[${marker}]\n${facts}` : facts;
+  }
+  const rest = stripRestatedCountFacts(input.text);
+  return rest ? `${facts}\n\n${rest}` : facts;
 }
 
 export function parseAlertMarker(text: string): AlertMarker | null {

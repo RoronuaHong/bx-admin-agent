@@ -303,10 +303,19 @@ export async function createConversation(payload: { id?: string; title?: string;
   return data.conversation;
 }
 
-export async function saveConversationMessages(id: string, messages: StoredMessage[], title?: string) {
+export async function saveConversationMessages(
+  id: string,
+  messages: StoredMessage[],
+  opts?: { title?: string; base?: number; full?: boolean },
+) {
+  const body: Record<string, unknown> = { messages };
+  if (opts?.title !== undefined) body.title = opts.title;
+  // 增量落库：带 base 时 messages 只含「自 base 起的新增 / 最后一条变更」，不再回写整段对话。
+  if (opts?.base !== undefined) body.base = opts.base;
+  if (opts?.full) body.full = true;
   return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/messages`, {
     method: "POST",
-    body: JSON.stringify({ messages, title }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -328,6 +337,11 @@ export async function cancelSubagent(conversationId: string, subagentId: string)
   return jsonFetch(`/agent/chat/subagent/${encodeURIComponent(conversationId)}/${encodeURIComponent(subagentId)}/cancel`, {
     method: "POST",
   });
+}
+
+export async function fetchConversation(id: string): Promise<ConversationDto> {
+  const data = (await jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}`)) as { conversation: ConversationDto };
+  return data.conversation;
 }
 
 export async function deleteConversation(id: string) {

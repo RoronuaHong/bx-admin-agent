@@ -86,7 +86,7 @@ test("跨页去重后按小时计数，并列出超过阈值的小时", async ()
   const text = formatCountReport(report);
   expect(text.startsWith("complete: true")).toBe(true);
   expect(text).toContain("没有小时的计数超过 2");
-  expect(text).toContain("top:");
+  expect(text).toContain("hours:");
 });
 
 test("超过阈值时列出小时，没翻完时禁止当成结论", async () => {

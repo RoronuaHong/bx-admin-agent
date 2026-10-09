@@ -202,6 +202,7 @@ const SCHEDULE_TASK_GUIDE =
   "本次是定时任务的新一期运行，请遵守两条：\n" +
   "1) 必须从数据源重新取数，不得沿用本对话历史轮次的结论、数字或图表数据；\n" +
   "2) 结论要能独立阅读，并且放在正文最前面：给出本次取数的口径、数据时间范围与关键结果（图表只作补充——推送/通知里不一定看得到图）。" +
+  "若本期用 count_list_by_time 取了完整小时计数，时间窗口、当前数量、阈值三行由服务端按 hours 段写在正文前面，与预警同一格式，不要再写一遍。" +
   "任务名、状态、触发方式和时间由通知另附，正文不要再写一遍。" +
   "图仍要用 render_chart 工具出（图在对话里看得到），但不要在正文里写图片链接或图片占位符。\n" +
   SCHEDULE_UNATTENDED_DENY;
@@ -294,6 +295,8 @@ async function consumeTask(
     scheduleStatusLine?: string;
     /** 浏览器上报的 IANA 时区。 */
     timeZone?: string;
+    /** 定时运行：页面正订阅时也由服务端落气泡。订阅者自己的整包保存会因体积超限失败，不落就会丢这一期。 */
+    persistOutcome?: boolean;
   },
 ): Promise<void> {
   const runId = newRunId();
@@ -344,10 +347,16 @@ async function consumeTask(
   void exportRunOtlp(runTrace).catch(() => false);
   // 行为异常检测（P2）：与基线比对，只报不管（误报代价远小于「护栏自己把服务搞挂」）。
   observeRun(runTrace);
-  // 结果回投：仅在客户端已断开时做（订阅者在线时由前端负责 UI 消息持久化，避免双写竞态）。
-  if (!task.live) {
-    outcomePersisted = await persistTaskOutcome(task).catch(() => false);
-    if (outcomePersisted) console.log(`[chat/task] ${task.id} 结果已回投（客户端断开）`);
+  // 交互运行：订阅者在线时由前端落库，避免和这里双写。
+  // 定时运行：页面开着时前端会提交整段快照，超限被 413 拒绝后气泡就没了，所以服务端照样落。
+  if (opts.persistOutcome || !task.live) {
+    outcomePersisted = await persistTaskOutcome(task).catch((err) => {
+      console.warn(`[chat/task] ${task.id} 结果回投失败：${String((err as Error)?.message || err)}`);
+      return false;
+    });
+    if (outcomePersisted) {
+      console.log(`[chat/task] ${task.id} 结果已回投（${task.live ? "定时运行" : "客户端断开"}）`);
+    }
   }
   const summary = getLastTaskSummary(task.conversationId);
   if (summary) summary.outcomePersisted = outcomePersisted;
@@ -528,6 +537,13 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
           : CONCLUSION_GAP;
   }
   const doc = await getConversation(task.conversationId);
+  const existing = (doc?.messages || []) as StoredMessage[];
+  const duplicateCut = task.startedAt - 2000;
+  if (
+    existing.slice(-6).some((message) => message.role === "assistant" && message.text === finalText && (message.at ?? 0) >= duplicateCut)
+  ) {
+    return true;
+  }
   const resultOk = new Map<string, boolean>();
   for (const event of task.buffer) {
     if (event.type === "tool_result") resultOk.set(event.id, event.ok);
@@ -551,7 +567,7 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   }
   const postedAt = Date.now();
   const messages = [
-    ...((doc?.messages || []) as StoredMessage[]),
+    ...existing,
     {
       role: "user" as const,
       text: task.userText,
@@ -775,6 +791,11 @@ function resolveModelSource(baseUrl: string, provider: string): string {
   return provider;
 }
 
+/** 对话消息快照单独放宽；其余接口用通用上限。0 表示该档关闭。 */
+export function bodyLimitFor(path: string, general: number, messages: number): number {
+  return /^\/chat\/conversations\/[^/]+\/messages\/?$/.test(path) ? messages : general;
+}
+
 export function createApp() {
   const app = new Hono();
 
@@ -786,8 +807,10 @@ export function createApp() {
   });
 
   // 请求体上限（0 = 关闭）：拒绝超大 Content-Length，挡住「声明一个巨型 body」的 OOM/DoS 向量。
-  // 仅看 Content-Length —— chunked 不带长度头的极端情况留给 Hono 自身缓冲上限，本服务都是小 JSON。
+  // 仅看 Content-Length —— chunked 不带长度头的极端情况留给 Hono 自身缓冲上限。
+  // 普通接口默认 1MB。对话快照带思考过程和工具步骤，整段会过 1MB，这条单独放宽。
   const MAX_BODY_BYTES = Math.max(0, Number(process.env.MAX_BODY_BYTES || 1_048_576));
+  const MAX_MESSAGES_BODY_BYTES = Math.max(0, Number(process.env.MAX_MESSAGES_BODY_BYTES || 8 * 1_048_576));
   // CORS 来源：以配置 webOrigin 为主，额外允许 CHAT_CORS_ORIGINS（逗号分隔）与本地开发端口。
   // credentials: true 下必须给具体来源、绝不能是 "*"（否则浏览器直接拒绝带凭据的请求）。
   // 先 filter(Boolean) 去掉未配置的 webOrigin 等空项，避免把 "undefined" 当成一个来源。
@@ -824,10 +847,11 @@ export function createApp() {
 
   // 请求体上限守卫：声明超大 Content-Length 直接 413，不让后续解析把内存撑爆。
   app.use("*", async (c, next) => {
-    if (MAX_BODY_BYTES > 0) {
+    const limit = bodyLimitFor(c.req.path, MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES);
+    if (limit > 0) {
       const len = Number(c.req.header("content-length"));
-      if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
-        return errorJson(c, 413, "PAYLOAD_TOO_LARGE", `请求体过大（上限 ${MAX_BODY_BYTES} 字节）`);
+      if (Number.isFinite(len) && len > limit) {
+        return errorJson(c, 413, "PAYLOAD_TOO_LARGE", `请求体过大（上限 ${limit} 字节）`);
       }
     }
     await next();
@@ -1643,11 +1667,11 @@ export function createApp() {
   app.post("/chat/conversations/:id/messages", async (c) => {
     const id = c.req.param("id");
     if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
-    const body = await readJson<{ messages?: StoredMessage[]; title?: string }>(c);
+    const body = await readJson<{ messages?: StoredMessage[]; title?: string; base?: number; full?: boolean }>(c);
     if (!Array.isArray(body.messages)) {
       return errorJson(c, 400, "CHAT_CONVERSATION_INVALID_MESSAGES", "messages 必须为数组");
     }
-    await upsertMessages({ id, messages: body.messages, title: body.title });
+    await upsertMessages({ id, messages: body.messages, title: body.title, base: body.base, full: body.full });
     return c.json({ ok: true });
   });
 
@@ -1990,6 +2014,7 @@ export function createApp() {
         unattendedConclusion: isAlertRun ? "alert" : "report",
         ...(taskAsksScheduleStatus(live.prompt) ? { scheduleStatusLine: scheduleStatusSentence(live, runStartedAt) } : {}),
         ...(live.timeZone ? { timeZone: live.timeZone } : {}),
+        persistOutcome: true,
       });
     } finally {
       unregisterActiveScheduleRun(schedule.id);

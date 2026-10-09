@@ -18,9 +18,10 @@ import {
   CONCLUSION_GAP_AFTER_TOOLS,
   alertAboveFromPrompt,
   fillCountAbove,
+  applyScheduledCountFacts,
+  formatScheduledCountFacts,
   markerFromCountText,
   parseAlertMarker,
-  stampAlertMarker,
   unattendedToolDenial,
 } from "./schedule-alert.js";
 import { applyScheduleStatus } from "./notify/deliver.js";
@@ -123,8 +124,16 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 既白付延迟（每个 20-100ms，慢模型更多）也刷满 402 日志噪音，还让「实际服务模型」的判定绕远路。
 // 因此给 402 / HTTP 500 加冷却：自动模式把它们排到队尾，先试其余模型。
 // 用户点名的模型仍排第一（点名就要先用它）；冷却名单用尽时仍会回头试，避免直接没模型。
-const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 10 * 60 * 1000);
+// 未开通 / 额度耗尽不会在十分钟内恢复。冷却若只有一个调度周期，每期都会再打一次已经死掉的模型。
+const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 6 * 60 * 60 * 1000);
+const TRANSIENT_COOLDOWN_MS = Number(process.env.MODEL_TRANSIENT_COOLDOWN_MS || 10 * 60 * 1000);
 const quotaCooldownUntil = new Map<string, number>();
+
+/** 500 可能是短故障，冷却一个调度周期。402 / 未开通 / 鉴权失败按小时冷却。 */
+export function modelDownCooldownMs(failure: string | null): number {
+  if (/model http 500\b/i.test(String(failure || ""))) return TRANSIENT_COOLDOWN_MS;
+  return QUOTA_COOLDOWN_MS;
+}
 
 /** 是否属「额度/未开通」类确定性失败（与 models.ts 的 402 判定同口径，不认厂商）。 */
 function isQuotaFailure(failure: string | null): boolean {
@@ -507,7 +516,7 @@ async function wrapUpWith(
     const again = (
       await ask(
         conclusion === "alert"
-          ? "上一稿不能用。正文第一行必须单独是 [SPIKE]、[NORMAL] 或 [NO_DATA] 之一，然后再写时间窗口和数量。"
+          ? "上一稿不能用。正文第一行必须单独是 [SPIKE]、[NORMAL] 或 [NO_DATA] 之一。不要写时间窗口、数量或阈值。"
           : "上一稿没有面向用户的正文。请直接写结论，不要只写思考过程。",
       )
     ).text.trim();
@@ -629,7 +638,8 @@ const WRAP_UP_HINT =
 /** 预警收尾必须带协议标记。收尾调用看不到主循环的任务指引，标记规则要写在这次调用上。 */
 const ALERT_WRAP_PROTOCOL =
   "这是数据预警检查。正文第一行只能单独写下面三个标记之一：[SPIKE]、[NORMAL]、[NO_DATA]。\n" +
-  "有完整计数且未破线写 [NORMAL]；按用户指令判定破线写 [SPIKE]；没有可用结果或计数不完整写 [NO_DATA]，不要估算。";
+  "有完整计数且未破线写 [NORMAL]；按用户指令判定破线写 [SPIKE]；没有可用结果或计数不完整写 [NO_DATA]，不要估算。\n" +
+  "不要写时间窗口、当前数量、阈值或任何条数；计数完整时这三行由服务端附上。";
 
 const BLANK_SYNTHESIS_HINT =
   "上一轮没有写出面向用户的正文。请直接写结论，不要只写思考过程。能根据已有结果作答就不要再调用工具。";
@@ -1577,6 +1587,8 @@ interface LoopOutcome {
   ungrounded: boolean;
   /** 最近一次 count_list_by_time 能确定的协议标记。没有阈值或认不出结果时为 null。 */
   countMarker: AlertMarker | null;
+  /** 最近一次 count_list_by_time 的原文。完整时用来写固定的时间窗口 / 当前数量 / 阈值。 */
+  countReportText: string;
   /** 累计发送的 prompt token 估算（成本护栏开启时统计）。 */
   spentTokens: number;
 }
@@ -1677,6 +1689,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let groundingRetries = 0;
   let ungrounded = false;
   let countMarker: AlertMarker | null = null;
+  let countReportText = "";
   // 事后核验状态：累积证据原文（供核验器对齐）+ 已核验次数。
   let groundingVerifications = 0;
   const evidence: string[] = [];
@@ -1762,17 +1775,25 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.system,
         wrapUp ? false : ctx.forceToolCall,
       );
+      const heldThinking: ChatEvent[] = [];
+      const ownAlertBody =
+        ctx.unattendedConclusion === "alert" && formatScheduledCountFacts(countReportText) != null;
       let step = await gen.next();
       while (!step.done) {
         const ev = step.value as ChatEvent;
         if (ev.type === "text_delta") {
           roundText += ev.text;
+        } else if (ownAlertBody && ev.type === "thinking_delta") {
+          heldThinking.push(ev);
         } else {
           yield ev;
         }
         step = await gen.next();
       }
       outcome = step.value as CallOutcome;
+      if (ownAlertBody && outcome.toolCalls.length) {
+        for (const ev of heldThinking) yield ev;
+      }
       // span 级埋点：一次模型尝试一行（重试各记一条）。只记耗时与成败，不记内容
       // （内容属于上下文治理，不该再抄一份；定位「时间花在哪」有这两项就够了）。
       if (ctx.runId) {
@@ -1908,7 +1929,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 运行时校验：事后核验（Chain-of-Verification 最小版）。零证据的情况已由上面拦截；这里覆盖
       // 「拿到部分数据后仍有超出证据的断言」——发现即作废并回灌纠正（可重新取数或删掉无支持内容）。
+      // 完整计数的预警结论由服务端按摘要重写。再让模型改一稿会换掉「当前数量」这类标签，数字也会被改口。
+      const canonicalAlertFacts =
+        ctx.unattendedConclusion === "alert" && formatScheduledCountFacts(countReportText) != null;
       if (
+        !canonicalAlertFacts &&
         shouldRunVerification({
           enforceGrounding: ctx.enforceGrounding,
           enabled: GROUNDING_VERIFY,
@@ -1996,7 +2021,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         break;
       }
       synthesisText = outcome.text;
-      if (roundText) yield { type: "text_delta", text: roundText };
+      if (roundText && !canonicalAlertFacts) yield { type: "text_delta", text: roundText };
       break;
     }
 
@@ -2548,7 +2573,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；
       // 记账 / 工作区类内置工具（write_todos、fs_write 等）成功也不算证据。
-      if (executed && call.name === "count_list_by_time") {
+      if (executed && call.name === "count_list_by_time" && rawText.trim()) {
+        countReportText = rawText;
         const next = markerFromCountText(rawText);
         if (next) countMarker = next;
       }
@@ -2695,6 +2721,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     ungrounded,
     spentTokens,
     countMarker,
+    countReportText,
   };
 }
 
@@ -3212,6 +3239,7 @@ export async function* chatStream(
   let groundingVerifications = 0;
   let ungrounded = false;
   let countMarker: AlertMarker | null = null;
+  let countReportText = "";
   let costTokens = 0;
   let modelFallbacks = 0;
 
@@ -3327,6 +3355,7 @@ export async function* chatStream(
     groundingVerifications = loop.groundingVerifications || 0;
     ungrounded = loop.ungrounded || false;
     countMarker = loop.countMarker ?? null;
+    countReportText = loop.countReportText || "";
     // 跨候选**累加**：切换模型时前一个候选已真实消耗的 token 不能丢。
     // 原实现是赋值，切一次就丢一份，配额只计入最后一个候选的量——
     // 配额是成本护栏，少扣是方向性错误（实测 modelFallbacks 可达 3，实际花费可能是计入值的 2-4 倍）。
@@ -3338,7 +3367,7 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
-    if (isModelDownFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + QUOTA_COOLDOWN_MS);
+    if (isModelDownFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + modelDownCooldownMs(failure));
     // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
     // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，
@@ -3425,14 +3454,20 @@ export async function* chatStream(
   // 没有事实断言的回答已在分诊放行。走到这里且 ungrounded 时，正文已是诚实兜底或确定性文案。
   const roleLabelFinal = getRole(conversation?.agentId).label;
   const guarded = enforceRoleIdentity(text.trim(), roleLabelFinal);
-  const stamped =
-    opts.unattendedConclusion === "alert" && countMarker ? stampAlertMarker(guarded, countMarker) : guarded;
+  const withFacts = opts.unattendedConclusion
+    ? applyScheduledCountFacts({
+        text: guarded,
+        report: countReportText,
+        conclusion: opts.unattendedConclusion,
+        marker: countMarker,
+      })
+    : guarded;
   // 无人值守（定时任务）且最终没取到可核对的数据时，正文按协议结论化（预警 = [NO_DATA] 首行标记）。
   // 按状态判定，不比对措辞：这段是模型写的诚实兜底，措辞每期都可能不同。
   // 出站最后一道过滤（OWASP ASI05 / LLM06）：Agent 会读文件、读环境、调外部系统，
   // 回答里若带了读到的密钥形态内容，打码后再给用户与落库（真正的防线是子进程不继承凭据）。
   const concluded =
-    buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: stamped }) ||
+    buildUnattendedConclusion({ ungrounded, conclusion: opts.unattendedConclusion, text: withFacts }) ||
     (ungrounded ? UNGROUNDED_REPLY : "");
   // 工具已返回但正文仍空：不要落成「生成未产出内容」。这句话不是协议结论，调度侧会记失败。
   const withGap = concluded.trim() || (toolCalls > 0 ? CONCLUSION_GAP_AFTER_TOOLS : CONCLUSION_GAP);

@@ -13,6 +13,66 @@ import { getMongoClient, MONGO_DB_NAME } from "./db.js";
 
 const COLL = "chat_conversations";
 
+/** 快照里保留推理细节的尾部条数。更早的只留结论，完整追踪在运行记录里。 */
+export const SNAPSHOT_DETAIL_TAIL = 40;
+/** 单条思考文本上限。超出留尾部，推理面板看到的是收尾而不是开头。 */
+export const SNAPSHOT_THINKING_CAP = 8_000;
+export const SNAPSHOT_STEP_RESULT_CAP = 4_000;
+const SNAPSHOT_STEP_ARGS_CAP = 400;
+
+type SnapshotStep = {
+  name: string;
+  status: string;
+  id?: string;
+  server?: string;
+  result?: string;
+  args?: string;
+};
+
+function capTail(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `…\n${text.slice(text.length - max)}`;
+}
+
+function slimStep(step: SnapshotStep, keepDetail: boolean): SnapshotStep {
+  const brief: SnapshotStep = { name: step.name, status: step.status };
+  if (step.id) brief.id = step.id;
+  if (step.server) brief.server = step.server;
+  if (!keepDetail) return brief;
+  if (step.result) brief.result = capTail(step.result, SNAPSHOT_STEP_RESULT_CAP);
+  if (step.args) brief.args = capTail(step.args, SNAPSHOT_STEP_ARGS_CAP);
+  return brief;
+}
+
+function slimStoredMessage(message: StoredMessage, keepDetail: boolean): StoredMessage {
+  const steps = (message.steps || []) as SnapshotStep[];
+  const thinking = message.thinking || "";
+  const thinkingOk = keepDetail ? thinking.length <= SNAPSHOT_THINKING_CAP : thinking.length === 0;
+  const stepsOk = steps.every((step) => {
+    if (!keepDetail) return !step.result && !step.args;
+    return (step.result?.length ?? 0) <= SNAPSHOT_STEP_RESULT_CAP && (step.args?.length ?? 0) <= SNAPSHOT_STEP_ARGS_CAP;
+  });
+  if (thinkingOk && stepsOk) return message;
+  const nextThinking = keepDetail && thinking ? capTail(thinking, SNAPSHOT_THINKING_CAP) : "";
+  const { thinking: _thinking, steps: _steps, ...rest } = message;
+  return {
+    ...rest,
+    ...(nextThinking ? { thinking: nextThinking } : {}),
+    ...(steps.length ? { steps: steps.map((step) => slimStep(step, keepDetail)) as StoredMessage["steps"] } : {}),
+  };
+}
+
+/** 列表用：不带思考过程和工具原文。打开对话再取最近一段细节。 */
+export function listSnapshot(messages: StoredMessage[]): StoredMessage[] {
+  return messages.map((message) => slimStoredMessage(message, false));
+}
+
+/** 打开对话 / 落库用：只给最近一段留推理细节，更早的收成结论。 */
+export function compactSnapshot(messages: StoredMessage[]): StoredMessage[] {
+  const detailFrom = Math.max(0, messages.length - SNAPSHOT_DETAIL_TAIL);
+  return messages.map((message, index) => slimStoredMessage(message, index >= detailFrom));
+}
+
 export interface StoredMessage {
   id?: string | number;
   role: "user" | "assistant";
@@ -23,8 +83,8 @@ export interface StoredMessage {
   /** 该助手消息用到的工具步骤摘要（便于历史还原"它做了什么"）。 */
   steps?: Array<{ name: string; status: string }>;
   /**
-   * 扩展思考（reasoning）文本：支持思考的模型才有，仅作展示、不回灌模型上下文。
-   * 必须持久化，否则刷新后推理面板的思考过程丢失（前端 toStored 会一并带上）。
+   * 扩展思考（reasoning）文本：仅作展示、不回灌模型上下文。
+   * 只留在最近一段快照里；更早的收成结论，完整追踪在运行记录。
    */
   thinking?: string;
   /** 任务规划（write_todos 产出，推理面板展示用；前端一并落库）。 */
@@ -213,7 +273,7 @@ export async function listConversations(
   const coll = await getColl();
   const stripContext = (doc: ConversationDoc): ConversationDoc => {
     const { context, ...rest } = doc;
-    return rest as ConversationDoc;
+    return { ...rest, messages: listSnapshot(rest.messages || []) } as ConversationDoc;
   };
   // 列表不返回 context（体积大）：切对话时用 GET /chat/conversations/:id 单独取。
   const all = visibleTo(
@@ -231,12 +291,24 @@ export async function listConversations(
 
 export async function getConversation(id: string): Promise<ConversationDoc | null> {
   const coll = await getColl();
-  if (!coll) return memory.get(id) || null;
+  if (!coll) {
+    const cached = memory.get(id);
+    if (!cached) return null;
+    cached.messages = compactSnapshot(cached.messages || []);
+    return cached;
+  }
   const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
   const { _id, ...rest } = doc;
+  const raw = (rest.messages ?? []) as StoredMessage[];
+  const messages = compactSnapshot(raw);
+  if (messages.some((message, index) => message !== raw[index])) {
+    await coll.updateOne({ _id }, { $set: { messages } }).catch((err) => {
+      console.warn(`[conversations] 收紧历史快照失败：${String((err as Error)?.message || err)}`);
+    });
+  }
   // 老数据或 upsert 漏字段时可能没有 messages；兜底成空数组，保证返回形状始终符合契约。
-  return { ...rest, messages: rest.messages ?? [] } as ConversationDoc;
+  return { ...rest, messages } as ConversationDoc;
 }
 
 export async function createConversation(input: {
@@ -345,39 +417,112 @@ export async function markConversationSchedule(id: string, scheduleId: string): 
   });
 }
 
+/** 刚写过的同一句助手结论不再追加。只看最近几条，且时间必须落在本轮，避免把上一期的相同结论误判成重复。 */
+export function withoutFreshAssistantDupes(
+  existing: Array<{ role?: string; text?: string; at?: number }>,
+  incoming: StoredMessage[],
+  notBefore: number,
+): StoredMessage[] {
+  return incoming.filter((message) => {
+    if (message.role !== "assistant" || !message.text) return true;
+    const start = Math.max(0, existing.length - 6);
+    for (let i = existing.length - 1; i >= start; i--) {
+      const prior = existing[i];
+      if (prior?.role === "assistant" && prior.text === message.text && (prior.at ?? 0) >= notBefore) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * 把服务端已有消息数组按 delta 应用成最新状态（与 Mongo 分支语义一致，进程内存降级版复用）。
+ * - base === L：尾部全是新增消息 → 直接 push；
+ * - base === L-1 且只带来 1 条：是「最后一条正在流式更新」→ 原地替换最后一条（避免重复堆积）；
+ * - 其它（多端/异常错位，单客户端理论上不会命中）：尽力 push，保证不丢。
+ */
+function applyDeltaMessages(arr: StoredMessage[], tail: StoredMessage[], base: number): void {
+  const L = arr.length;
+  if (base === L) {
+    arr.push(...tail);
+  } else if (base === L - 1 && tail.length === 1) {
+    arr[L - 1] = tail[0]!;
+  } else {
+    arr.push(...tail);
+  }
+}
+
 export async function upsertMessages(input: {
   id: string;
   messages: StoredMessage[];
   title?: string;
+  /**
+   * 增量落库基线：客户端已成功落库的消息条数。
+   * 传了 base（且非 full 强制全量）时，messages 只含「自 base 起的新增/最后一条变更」，
+   * 后端按 base 与当前长度的关系 push 或原地替换，避免每次把整段长对话（可达 MB 级）全量回写。
+   */
+  base?: number;
+  /** 强制全量替换（对话被清空等长度回退场景，或老客户端不带 base 的全量写法）。 */
+  full?: boolean;
 }): Promise<void> {
+  const { id, messages, title, base, full } = input;
+  // 仅当显式 full 或没给 base 时走全量替换：老客户端不带 base 发来的就是整段列表。
+  const isDelta = full !== true && typeof base === "number";
+
   const coll = await getColl();
   if (!coll) {
-    let doc = memory.get(input.id);
+    let doc = memory.get(id);
     if (!doc) {
       doc = {
-        id: input.id,
-        title: input.title || "新对话",
+        id,
+        title: title || "新对话",
         messages: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
-      memory.set(input.id, doc);
+      memory.set(id, doc);
     }
-    doc.messages = input.messages;
+    if (!isDelta) {
+      doc.messages = compactSnapshot(messages);
+    } else {
+      const fresh = withoutFreshAssistantDupes(doc.messages, messages, Date.now() - 120_000);
+      if (fresh.length) applyDeltaMessages(doc.messages, fresh, base);
+      doc.messages = compactSnapshot(doc.messages);
+    }
     doc.updatedAt = Date.now();
-    if (input.title) doc.title = input.title;
+    if (title) doc.title = title;
     return;
   }
-  await coll.updateMany(
-    { id: input.id },
-    {
-      $set: {
-        messages: input.messages,
-        updatedAt: Date.now(),
-        ...(input.title ? { title: input.title } : {}),
+
+  if (!isDelta) {
+    await coll.updateMany(
+      { id },
+      {
+        $set: {
+          messages: compactSnapshot(messages),
+          updatedAt: Date.now(),
+          ...(title ? { title } : {}),
+        },
+        $setOnInsert: { createdAt: Date.now() },
       },
-      $setOnInsert: { createdAt: Date.now() },
-    },
+      { upsert: true },
+    );
+    return;
+  }
+
+  // 增量：先取当前长度判定 push 还是替换最后一条，再定向更新。
+  const cur = await coll.findOne({ id }, { projection: { messages: 1 } });
+  const existing = (cur?.messages as StoredMessage[] | undefined) ?? [];
+  const fresh = withoutFreshAssistantDupes(existing, messages, Date.now() - 120_000);
+  if (!fresh.length) {
+    if (title) await coll.updateMany({ id }, { $set: { title, updatedAt: Date.now() } });
+    return;
+  }
+  const titleSet = title ? { title } : {};
+  const merged = existing.slice();
+  applyDeltaMessages(merged, fresh, base);
+  await coll.updateMany(
+    { id },
+    { $set: { messages: compactSnapshot(merged), updatedAt: Date.now(), ...titleSet } },
     { upsert: true },
   );
 }
