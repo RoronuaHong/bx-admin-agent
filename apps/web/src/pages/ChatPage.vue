@@ -1157,7 +1157,7 @@ interface ToolStep {
 
 interface Bubble {
   id: number;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "notice";
   text: string;
   /** 这条气泡出现的时刻（毫秒）。旧快照没有这个字段时不显示。 */
   at?: number;
@@ -1737,18 +1737,52 @@ function applyConversationLocale(locale: string | undefined) {
  * 模型切换：乐观更新 → PATCH 落库 → 失败回滚（对齐 TanStack 的 onMutate/onError/onSettled 三段式）。
  * 尚未创建对话时（首屏）只改内存，创建对话后随设置一起落库。
  */
+function modelChoiceLabel(id: string): string {
+  if (!id || id === MODEL_AUTO_ID) return tx("自动", "Auto", "Automático", "स्वतः");
+  return models.value.find((model) => model.id === id)?.label || id;
+}
+
+const modelSwitchHint = ref("");
+
 async function saveModelChoice(value: string) {
   const convId = currentId.value;
   const state = current.value;
   const prev = state.settings.modelId;
-  if (prev === value) return;
+  const prevShown = prev || MODEL_AUTO_ID;
+  if (prevShown === value) return;
   state.settings.modelId = value;
+  const fromLabel = modelChoiceLabel(prevShown);
+  const toLabel = modelChoiceLabel(value);
+  const hadThread = state.bubbles.some((bubble) => bubble.role !== "notice");
+  const noticeId = hadThread && fromLabel !== toLabel ? ++seq : 0;
+  if (noticeId) {
+    state.bubbles.push({
+      id: noticeId,
+      role: "notice",
+      at: Date.now(),
+      text: tx(
+        `模型已从 ${fromLabel} 更改为 ${toLabel}`,
+        `Model changed from ${fromLabel} to ${toLabel}`,
+        `Modelo alterado de ${fromLabel} para ${toLabel}`,
+        `मॉडल ${fromLabel} से ${toLabel} में बदला गया`,
+      ),
+    });
+    modelSwitchHint.value = tx(
+      "在对话中途更换模型可能降低效果，上下文的分词方式也会变化。",
+      "Switching models mid-chat can hurt quality, and the context is tokenized differently.",
+      "Trocar o modelo no meio da conversa pode piorar a resposta, e o contexto é tokenizado de outro jeito.",
+      "बीच बातचीत में मॉडल बदलने से गुणवत्ता घट सकती है, और संदर्भ अलग तरह से टोकनाइज़ होता है।",
+    );
+    void nextTick(() => queueScroll(true));
+  }
   if (!convId) return;
   try {
     await patchConversation(convId, { model: value });
     syncConvLocal(convId, { model: value });
   } catch (err) {
     state.settings.modelId = prev;
+    if (noticeId) state.bubbles = state.bubbles.filter((bubble) => bubble.id !== noticeId);
+    modelSwitchHint.value = "";
     showSettingsError(
       localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("模型保存失败", "Failed to save model", "Falha ao salvar o modelo", "मॉडल सहेजने में विफल")),
     );
@@ -2025,7 +2059,10 @@ function capTail(text: string, max: number): string {
 }
 
 function toStored(list: Bubble[]): StoredMessage[] {
-  const kept = list.filter((b) => b.text || b.images?.length || b.charts?.length || b.artifacts?.length);
+  const kept = list.filter(
+    (b): b is Bubble & { role: "user" | "assistant" } =>
+      b.role !== "notice" && !!(b.text || b.images?.length || b.charts?.length || b.artifacts?.length),
+  );
   const detailFrom = Math.max(0, kept.length - SNAPSHOT_DETAIL_TAIL);
   return kept.map((b, index) => {
     const keepDetail = index >= detailFrom;
@@ -2089,7 +2126,8 @@ function applyServerThread(convId: string, full: ConversationDto, force: boolean
   const serverMessages = full.messages || [];
   if (!force && !serverThreadAhead(state.bubbles, serverMessages)) return;
   const times = messageTimes(serverMessages, full.createdAt, full.updatedAt);
-  state.bubbles = bubblesFromStored(serverMessages, times);
+  const notices = state.bubbles.filter((bubble) => bubble.role === "notice");
+  state.bubbles = [...bubblesFromStored(serverMessages, times), ...notices];
   persistedCount.set(convId, toStored(state.bubbles).length);
   if (convId === currentId.value && followBottom) queueScroll();
 }
@@ -2112,9 +2150,10 @@ function tailSig(
 }
 
 function serverThreadAhead(local: Bubble[], server: StoredMessage[]): boolean {
-  if (server.length > local.length) return true;
-  if (server.length < local.length) return false;
-  const lb = local[local.length - 1];
+  const messages = local.filter((bubble) => bubble.role !== "notice");
+  if (server.length > messages.length) return true;
+  if (server.length < messages.length) return false;
+  const lb = messages[messages.length - 1];
   const sb = server[server.length - 1];
   if ((lb?.text?.length || 0) > (sb?.text?.length || 0)) return false;
   return tailSig(lb) !== tailSig(sb);
@@ -2196,6 +2235,7 @@ function selectConversation(conv: ConversationDto) {
   // 切走时若上一个对话仍在生成：交给后台守望，跑完提醒一次（免打扰的对话不提醒）。
   const leaving = currentId.value;
   if (leaving && leaving !== conv.id) {
+    modelSwitchHint.value = "";
     const leavingState = states.get(leaving);
     if (leavingState?.sending || leavingState?.controller) watchBackgroundDone(leaving);
   }
@@ -6276,9 +6316,15 @@ onBeforeUnmount(() => {
         <div v-else-if="!booting && !current.bubbles.length" class="empty">
           {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
         </div>
+        <div v-if="modelSwitchHint" class="model-switch-hint" role="status">
+          <span class="model-switch-hint__icon" aria-hidden="true">i</span>
+          <span>{{ modelSwitchHint }}</span>
+          <button type="button" class="model-switch-hint__close" :aria-label="tx('关闭', 'Dismiss', 'Fechar', 'बंद करें')" @click="modelSwitchHint = ''">×</button>
+        </div>
         <div v-for="b in current.bubbles" :key="b.id" class="row" :class="b.role">
+          <p v-if="b.role === 'notice'" class="model-switch">{{ b.text }}</p>
           <!-- has-chart：带图表的气泡要给确定宽度（否则气泡按文字收缩，图表卡片的百分比宽度会塌成窄条）。 -->
-          <div class="bubble-wrap" :class="{ 'has-chart': !!b.charts?.length }">
+          <div v-else class="bubble-wrap" :class="{ 'has-chart': !!b.charts?.length }">
           <div class="bubble">
             <div
               v-if="b.todos?.length || b.steps?.length || b.subagents?.length || hasThinking(b) || (b.streaming && !b.text)"

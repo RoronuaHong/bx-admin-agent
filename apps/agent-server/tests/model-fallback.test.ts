@@ -80,6 +80,30 @@ test("自动模式把刚失败的模型放到队尾，从还能用的开始", ()
   expect(orderModelCandidates(all, all[1]!, false, cooling, 1).map((item) => item.id)).toEqual(["b", "c", "a"]);
 });
 
+test("自动模式先免费模型，DeepSeek-Flash 兜底，不把默认模型插到队首", () => {
+  const all = [
+    { id: "ds4flash0731", name: "deepseek/deepseek-flash", label: "DeepSeek-Flash" },
+    { id: "step5", name: "step-5-preview", label: "Step-5-Preview" },
+    { id: "spacebunny", name: "space-bunny-free", label: "Space Bunny Free" },
+    { id: "ornem3u", name: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron-3-Ultra(OR免费)" },
+    { id: "orling31", name: "inclusionai/ling-3.1-flash", label: "Ling-3.1-Flash(OR免费)" },
+  ];
+  expect(orderModelCandidates(all, all[0]!, true).map((item) => item.id)).toEqual([
+    "spacebunny",
+    "ornem3u",
+    "orling31",
+    "ds4flash0731",
+    "step5",
+  ]);
+  const cooling = new Map<string, number>([["spacebunny", 9_999]]);
+  expect(orderModelCandidates(all, all[0]!, true, cooling, 1, true).map((item) => item.id)).toEqual([
+    "ornem3u",
+    "orling31",
+    "ds4flash0731",
+    "step5",
+  ]);
+});
+
 test("定时运行跳过冷却中的模型；一个能用的都没有就返回空名单", () => {
   const all = [{ id: "a" }, { id: "b" }, { id: "c" }];
   const cooling = new Map<string, number>([

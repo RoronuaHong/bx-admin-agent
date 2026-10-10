@@ -15,7 +15,9 @@ import {
   decideGrounding,
   extractToolRefs,
   GROUNDING_HINT,
+  hasBusinessDataSource,
   hasExternalDataSource,
+  isBusinessDataSourceTool,
   isExternalDataSourceTool,
   parseVerifyResult,
   UNGROUNDED_REPLY,
@@ -55,6 +57,16 @@ test("[2] hasExternalDataSource：只看有没有，且不被无关工具误导"
   expect(hasExternalDataSource(["fs_write", "write_todos"])).toBe(false);
   expect(hasExternalDataSource(["fs_read", "mcp__xx__getList"])).toBe(true);
   expect(hasExternalDataSource([])).toBe(false);
+});
+
+test("[2b] 业务数据源不含始终注入的联网检索", () => {
+  expect(isBusinessDataSourceTool("web_search")).toBe(false);
+  expect(isBusinessDataSourceTool("fetch_url")).toBe(false);
+  expect(isBusinessDataSourceTool("mcp__xx__getList")).toBe(true);
+  expect(isBusinessDataSourceTool("search_knowledge")).toBe(true);
+  expect(hasBusinessDataSource(["web_search", "fetch_url", "fs_read"])).toBe(false);
+  expect(hasBusinessDataSource(["web_search", "mcp__bi__list"])).toBe(true);
+  expect(hasBusinessDataSource([])).toBe(false);
 });
 
 test("[3] 零证据 + 无外部数据源 → 不参与护栏（纯工作区轮次不被误伤）", () => {

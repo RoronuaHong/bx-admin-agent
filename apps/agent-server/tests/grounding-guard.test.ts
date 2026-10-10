@@ -5,12 +5,15 @@ import { test, expect } from "vitest";
 import {
   buildClaimExtractPrompt,
   buildGroundedFallbackSystem,
+  buildGroundedFallbackUser,
   buildSupportPrompt,
   buildVerifyHint,
   CLAIM_EXTRACT_SYSTEM,
   DATA_NEED_SYSTEM,
   parseClaimExtraction,
   parseDataNeed,
+  priorTopicMessages,
+  probeAllowsRelease,
   buildVerifyPrompt,
   SUPPORT_SYSTEM,
   consensusUnsupported,
@@ -122,6 +125,46 @@ test("[E3] 受约束的诚实兜底提示：带角色名、禁止外部事实断
   expect(system).toContain("80 字");
   expect(system).toContain("不要说成取数失败");
   expect(buildGroundedFallbackSystem("客服助手")).toContain("客服助手");
+});
+
+test("[E4] 有上文的兜底：看得到话题，不复述作废数字；只开联网时数字标未核对", () => {
+  const strict = buildGroundedFallbackSystem("通用助手", { hasPriorTopic: true });
+  expect(strict).toContain("不要说自己看不到前文");
+  expect(strict).toContain("只问那一项");
+  expect(strict).toContain("被作废的那一版");
+  expect(strict).toContain("80 字");
+  expect(strict).not.toContain("未核对");
+  const webOnly = buildGroundedFallbackSystem("通用助手", { hasPriorTopic: true, webOnly: true });
+  expect(webOnly).toContain("未核对");
+  expect(webOnly).toContain("没有业务数据源");
+  expect(webOnly).not.toContain("80 字");
+  const user = buildGroundedFallbackUser("吃的和喝的分别是什么", [
+    { role: "user", content: "家里的狗 10 岁，40 到 50 斤" },
+    { role: "assistant", content: "这是中型犬" },
+  ]);
+  expect(user).toContain("10 岁");
+  expect(user).toContain("吃的和喝的分别是什么");
+  expect(user).toContain("不包括刚才被作废的那一版数字");
+  expect(buildGroundedFallbackUser("你好", [])).toBe("你好");
+});
+
+test("[E5] 上文只取本轮问题之前的对话，工具结果和本轮问题不带上", () => {
+  const prior = priorTopicMessages(
+    [
+      { role: "user", content: "家里的狗 10 岁，40 到 50 斤" },
+      { role: "assistant", content: "这是中型犬" },
+      { role: "tool", content: "检索结果不该进话题" },
+      { role: "user", content: "吃的和喝的分别是什么" },
+      { role: "assistant", content: "作废草稿：每天 300 克" },
+    ],
+    "吃的和喝的分别是什么",
+  );
+  expect(prior.map((item) => item.content)).toEqual(["家里的狗 10 岁，40 到 50 斤", "这是中型犬"]);
+  expect(probeAllowsRelease("no_data")).toBe(true);
+  expect(probeAllowsRelease("unavailable")).toBe(true);
+  expect(probeAllowsRelease("unavailable", { unattended: true })).toBe(false);
+  expect(probeAllowsRelease("data")).toBe(false);
+  expect(probeAllowsRelease(null)).toBe(false);
 });
 
 test("[F] 角色接线：movie 开启接地护栏，通用角色不参与", () => {

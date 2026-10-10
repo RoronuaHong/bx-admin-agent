@@ -42,6 +42,9 @@ const EXTERNAL_DATA_BUILTINS = new Set([
   "run_tool_code",
 ]);
 
+/** 联网检索：能引入站外事实，但不是用户勾选的业务数据源。 */
+const WEB_LOOKUP_BUILTINS = new Set(["web_search", "fetch_url"]);
+
 /** 单个工具名是否属于外部数据源。 */
 export function isExternalDataSourceTool(name: string): boolean {
   if (!name) return false;
@@ -52,6 +55,19 @@ export function isExternalDataSourceTool(name: string): boolean {
 /** 本轮是否注入了外部数据源工具：决定了接地护栏参不参与（按工具动态开启，而非按角色写死）。 */
 export function hasExternalDataSource(toolNames: readonly string[]): boolean {
   return (toolNames || []).some(isExternalDataSourceTool);
+}
+
+/**
+ * 业务数据源：用户勾选的 MCP、知识库、按时间计数、代码桥。
+ * 不含始终注入的联网检索。挂了这些工具时，零证据兜底仍禁止新写可核对数字。
+ */
+export function isBusinessDataSourceTool(name: string): boolean {
+  return isExternalDataSourceTool(name) && !WEB_LOOKUP_BUILTINS.has(name);
+}
+
+/** 本轮是否挂了业务数据源（相对「只开了联网检索」）。 */
+export function hasBusinessDataSource(toolNames: readonly string[]): boolean {
+  return (toolNames || []).some(isBusinessDataSourceTool);
 }
 
 /**
@@ -93,17 +109,42 @@ export const UNGROUNDED_REPLY =
  * 后者又说不清问题。让同一个模型在**明确禁止事实性断言**的口径下写这最后一句，既保住「零编造」的硬约束，
  * 又让话术能贴合场景（对齐「对无法完成的请求诚实说明」的通用行为准则）。
  */
-export function buildGroundedFallbackSystem(roleLabel: string): string {
-  return [
-    `你是「${roleLabel}」的最终收束环节：本轮对话没有任何外部数据可用，你要写唯一一段面向用户的回复。`,
+export function buildGroundedFallbackSystem(
+  roleLabel: string,
+  opts?: { hasPriorTopic?: boolean; webOnly?: boolean },
+): string {
+  const lines = [
+    `你是「${roleLabel}」的最终收束环节：本轮没有新的外部数据，你要写唯一一段面向用户的回复。`,
     "硬性约束：",
-    "1. 不得出现任何**外部**事实性内容（影片、人物、数字、日期、地点、标识、归属、关系、外部结论等）——这类内容必须有外部数据支撑。",
+    "1. 不得新写任何还没有出现在上文里的**外部**事实（影片、人物、数字、日期、地点、标识、归属、关系、外部结论）。这类内容必须有外部数据支撑。",
     "2. 你自己的角色身份与你能协助的范围属于系统给定信息，**可以说**：被问「你是谁 / 能做什么」时就正常自我介绍，并顺势问清需求或结束寒暄。不要回避身份问题。",
-    "3. 其余只允许表达三类意思：说明该请求超出你的职责范围并建议改问更合适的助手；如实说明因此无法给出可核对的结论；请用户补充信息或换一种问法。" +
-      "用户明确不要取数、或这个请求本身不需要外部数据时，直接这么说，不要说成取数失败。",
+    "3. 用户明确不要取数、或这个请求本身不需要外部数据时，直接回答，不要说成取数失败。",
     "4. 不要提及工具、函数调用、数据源、连接状态或任何内部机制，也不要让用户去改设置；不要输出思考过程、JSON、代码围栏。",
-    "5. 一到两句话，不超过 80 字，使用与用户相同的语言，语气自然、不要道歉超过一次。",
-  ].join("\n");
+  ];
+  if (opts?.hasPriorTopic) {
+    lines.push(
+      "5. 下面附有这条会话里已经确定的话题。你看得到这些内容，不要说自己看不到前文，也不要让用户把已经说过的对象、年龄、体型或用途再讲一遍。",
+      "6. 沿用用户已经确定的事实。不要采用刚才被作废的那一版里新写的数字。若前文助手说过自己看不到上文，那句作废，不要重复。",
+      "7. 话题已经能从上文补全时，直接按这个话题回答。只有上文里也没有的那一项才问，并且只问那一项。",
+    );
+    if (opts.webOnly) {
+      lines.push(
+        "8. 本轮没有业务数据源。常识范围内的做法按上文话题直接写。具体数字不能从上文确定时，表格照出，那一列写「未核对」，不要写成确定值。",
+        "9. 使用与用户相同的语言，语气自然、不要道歉超过一次。需要表格或分点时写完，不要为了缩短而改问用途。",
+      );
+    } else {
+      lines.push(
+        "8. 新的可核对数字没有取到时不要编。沿用上文话题说明这一项还不能给出可核对的取值。不要改问一个上文已经有的主题。",
+        "9. 一到两句话，不超过 80 字，使用与用户相同的语言，语气自然、不要道歉超过一次。",
+      );
+    }
+  } else {
+    lines.push(
+      "5. 其余只允许表达三类意思：说明该请求超出你的职责范围并建议改问更合适的助手；如实说明因此无法给出可核对的结论；请用户补充信息或换一种问法。",
+      "6. 一到两句话，不超过 80 字，使用与用户相同的语言，语气自然、不要道歉超过一次。",
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -147,6 +188,70 @@ export function parseDataNeed(raw: string): "data" | "no_data" | null {
   if (/\bNO[_\- ]?DATA\b/.test(text)) return "no_data";
   if (/\bDATA\b/.test(text)) return "data";
   return null;
+}
+
+/**
+ * 分诊之后要不要放行这一轮。
+ * NO_DATA 放行。调用本身失败（unavailable）在交互对话里也放行，避免端点拒参把整段回答换成兜底。
+ * 解析不出（null）和明确 DATA 不放行。无人值守不因调用失败放行，避免把没核对的数字发出去。
+ */
+export function probeAllowsRelease(
+  need: "data" | "no_data" | "unavailable" | null,
+  opts?: { unattended?: boolean },
+): boolean {
+  if (need === "no_data") return true;
+  return need === "unavailable" && !opts?.unattended;
+}
+
+/** 兜底能看见的上文条数和单条长度。只带已落库的话题，不带本轮被作废的草稿。 */
+const PRIOR_TOPIC_MESSAGES = 8;
+const PRIOR_TOPIC_EACH_CHARS = 800;
+
+/**
+ * 当前问题之前、已经落在这条会话里的用户/助手原文。
+ * 去掉本轮问题本身，也去掉工具结果。调用方不要把作废草稿或纠正提示传进来。
+ */
+export function priorTopicMessages(
+  turns: readonly { role: string; content?: string }[],
+  question: string,
+): Array<{ role: "user" | "assistant"; content: string }> {
+  const dialog = turns.filter(
+    (turn): turn is { role: "user" | "assistant"; content: string } =>
+      (turn.role === "user" || turn.role === "assistant") &&
+      typeof turn.content === "string" &&
+      turn.content.trim().length > 0,
+  );
+  const q = question.trim();
+  let end = dialog.length;
+  if (q) {
+    for (let i = dialog.length - 1; i >= 0; i -= 1) {
+      if (dialog[i]!.role === "user" && dialog[i]!.content.trim() === q) {
+        end = i;
+        break;
+      }
+    }
+  }
+  return dialog.slice(Math.max(0, end - PRIOR_TOPIC_MESSAGES), end).map((turn) => ({
+    role: turn.role,
+    content: turn.content.trim().slice(0, PRIOR_TOPIC_EACH_CHARS),
+  }));
+}
+
+/** 诚实兜底的用户消息：有上文时先给已确定话题，再给本轮问题。 */
+export function buildGroundedFallbackUser(
+  question: string,
+  prior: readonly { role: "user" | "assistant"; content: string }[],
+): string {
+  const q = question.trim() || "（用户本轮没有可识别的文本输入）";
+  if (!prior.length) return q;
+  const lines = prior.map((turn) => `${turn.role === "user" ? "用户" : "助手"}：${turn.content}`);
+  return [
+    "已确定的话题（这条会话里已经说过的内容。不是本轮新取到的数据，也不包括刚才被作废的那一版数字）：",
+    ...lines,
+    "",
+    "本轮问题：",
+    q,
+  ].join("\n");
 }
 
 export type GroundingDecision = "pass" | "retry" | "block";

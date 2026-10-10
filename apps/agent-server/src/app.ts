@@ -2022,7 +2022,24 @@ export function createApp() {
         omitBuiltinTools: deniedTools,
         denyBuiltinTools: deniedTools,
         unattendedConclusion: isAlertRun ? "alert" : "report",
-        ...(taskAsksScheduleStatus(live.prompt) ? { scheduleStatusLine: scheduleStatusSentence(live, runStartedAt) } : {}),
+        ...(taskAsksScheduleStatus(live.prompt)
+          ? {
+              scheduleStatusLine: scheduleStatusSentence(live, runStartedAt),
+              scheduleStatus: {
+                ...(live.name ? { name: live.name } : {}),
+                prompt: live.prompt,
+                enabled: live.enabled,
+                ...(live.cron ? { cron: live.cron } : {}),
+                ...(live.onceAt !== undefined ? { onceAt: live.onceAt } : {}),
+                ...(live.nextRunAt !== undefined ? { nextRunAt: live.nextRunAt } : {}),
+                ...(live.locale ? { locale: live.locale } : {}),
+                ...(live.purpose ? { purpose: live.purpose } : {}),
+                ...(live.notifyPolicy ? { notifyPolicy: live.notifyPolicy } : {}),
+                ...(live.alertState ? { alertState: live.alertState } : {}),
+                ...(live.lastMarker ? { lastMarker: live.lastMarker } : {}),
+              },
+            }
+          : {}),
         ...(live.timeZone ? { timeZone: live.timeZone } : {}),
         persistOutcome: true,
       });

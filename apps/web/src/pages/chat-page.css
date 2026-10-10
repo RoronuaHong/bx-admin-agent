@@ -3658,6 +3658,64 @@ button.step-head:disabled {
   cursor: default;
 }
 
+.model-switch-hint {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(640px, 100%);
+  margin: 0 auto 4px;
+  padding: 8px 10px 8px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel, var(--bg)) 88%, var(--ink));
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 18%, transparent);
+}
+.model-switch-hint__icon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  font-size: 11px;
+  line-height: 14px;
+  text-align: center;
+}
+.model-switch-hint__close {
+  flex: 0 0 auto;
+  margin-left: 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.model-switch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+.model-switch::before,
+.model-switch::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
 .thread {
   flex: 1;
   overflow-y: auto;

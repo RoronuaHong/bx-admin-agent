@@ -7,7 +7,17 @@
 //    因此对外提供「测试发送」端点：配完通道先自己发一条，别等任务到点才发现配错。
 import { createHmac } from "node:crypto";
 import type { NotifyChannel } from "./channels.js";
-import { garbledTextReason, nextRunAtOf } from "../schedules.js";
+import {
+  alertNextRunAt,
+  decideAlertDelivery,
+  parseAlertMarker,
+  pickNotifyPolicy,
+  type AlertMarker,
+  type ScheduleAlertState,
+  type ScheduleNotifyPolicy,
+  type SchedulePurpose,
+} from "../schedule-alert.js";
+import { garbledTextReason, nextRunAtOf, nextRunOf } from "../schedules.js";
 import { stripUserFacingToolTrace } from "../history.js";
 
 /** 正文预算（字符）：钉钉 markdown 硬限约 20000 字节、飞书约 30KB，这里留足余量。 */
@@ -896,15 +906,38 @@ export function describeScheduleTiming(
 /**
  * 给模型看的下次执行时刻。
  * 正在跑的这一期，库里的 nextRunAt 还是「这一档」（跑完才推进）。
- * 若它已经不晚于 now，按 cron 另算下一档，避免模型把当前这一期说成下次。
+ * 若它已经不晚于 now，按 cron 另算下一档，避免把当前这一期说成下次。
+ * 告警还没解除时，下一档按 alertNextRunAt 收紧（名义间隔的一半，不低于 5 分钟），
+ * 不能报成下一档 cron 整点——那一拍引擎并不会用。
  */
 export function upcomingScheduleRunAt(
-  schedule: { enabled?: boolean; cron?: string; onceAt?: number; nextRunAt?: number },
+  schedule: {
+    enabled?: boolean;
+    cron?: string;
+    onceAt?: number;
+    nextRunAt?: number;
+    purpose?: SchedulePurpose;
+    firing?: boolean;
+    marker?: AlertMarker | null;
+  },
   now = Date.now(),
 ): number | undefined {
   if (schedule.enabled === false) return undefined;
   if (schedule.onceAt !== undefined) return schedule.onceAt > now ? schedule.onceAt : undefined;
   if (schedule.nextRunAt !== undefined && schedule.nextRunAt > now) return schedule.nextRunAt;
+  const cron = String(schedule.cron || "").trim();
+  const hot = schedule.purpose === "alert" && (schedule.marker === "SPIKE" || schedule.firing === true);
+  if (hot && cron) {
+    const tight = alertNextRunAt({
+      cron,
+      finishedAt: now,
+      purpose: "alert",
+      firing: schedule.firing === true,
+      marker: schedule.marker ?? null,
+      cronNext: nextRunOf,
+    });
+    if (tight !== undefined && tight > now) return tight;
+  }
   const next = nextRunAtOf(schedule, new Date(now));
   return next !== undefined && next > now ? next : undefined;
 }
@@ -925,6 +958,9 @@ export function formatScheduleListLine(
     nextRunAt?: number;
     lastStatus?: string;
     locale?: string;
+    purpose?: SchedulePurpose;
+    alertState?: ScheduleAlertState;
+    lastMarker?: AlertMarker | null;
   },
   now = Date.now(),
 ): string {
@@ -932,7 +968,14 @@ export function formatScheduleListLine(
   const freq = describeScheduleTiming(schedule, lang);
   const name = schedule.name || schedule.prompt.slice(0, 20);
   const status = schedule.enabled === false ? "已暂停" : "已启用";
-  const nextAt = upcomingScheduleRunAt(schedule, now);
+  const nextAt = upcomingScheduleRunAt(
+    {
+      ...schedule,
+      firing: schedule.alertState?.firing === true,
+      marker: schedule.lastMarker ?? null,
+    },
+    now,
+  );
   return (
     `- ${schedule.id}｜${name}｜${status}｜频率：${freq}` +
     (nextAt ? `｜下次：${formatRunClock(nextAt, lang)}` : "") +
@@ -951,6 +994,9 @@ type ScheduleStatusInput = {
   onceAt?: number;
   nextRunAt?: number;
   locale?: string;
+  purpose?: SchedulePurpose;
+  firing?: boolean;
+  marker?: AlertMarker | null;
 };
 
 /** 给用户看的配置原句。来自已保存的任务，不从工具结果或历史回复推断。 */
@@ -960,8 +1006,46 @@ export function scheduleStatusSentence(schedule: ScheduleStatusInput, now = Date
   const name = (schedule.name || schedule.prompt.slice(0, 24) || "定时任务").trim();
   const status = schedule.enabled === false ? "已暂停" : "已启用";
   const nextAt = upcomingScheduleRunAt(schedule, now);
-  const next = nextAt ? `下次执行：${formatRunClock(nextAt, lang)}。` : "";
+  const hot = schedule.purpose === "alert" && (schedule.marker === "SPIKE" || schedule.firing === true);
+  const cronOnly = schedule.cron ? nextRunOf(schedule.cron, new Date(now)) : undefined;
+  const tightened = Boolean(hot && nextAt !== undefined && cronOnly !== undefined && nextAt + 1000 < cronOnly);
+  const mins = nextAt !== undefined ? Math.max(1, Math.round((nextAt - now) / 60_000)) : 0;
+  const next = nextAt
+    ? tightened
+      ? `下次执行：${formatRunClock(nextAt, lang)}（告警未解除，约 ${mins} 分钟后复查）。`
+      : `下次执行：${formatRunClock(nextAt, lang)}。`
+    : "";
   return `名称：${name}。状态：${status}。频率：${freq}。${next}`;
+}
+
+/**
+ * 跑完再写「下次执行」。开跑时库里的 nextRunAt 还是这一档，按 cron 会报成下一档整点；
+ * 告警未解除时引擎要等跑完才收紧，这句话必须用同一套时刻。
+ */
+export function finishedScheduleStatusSentence(
+  schedule: ScheduleStatusInput & {
+    notifyPolicy?: ScheduleNotifyPolicy;
+    alertState?: ScheduleAlertState;
+    lastMarker?: AlertMarker | null;
+  },
+  text: string,
+  now = Date.now(),
+): string {
+  const alert = schedule.purpose === "alert";
+  const parsed = alert ? parseAlertMarker(text) : null;
+  const marker = alert ? (parsed ?? schedule.lastMarker ?? null) : null;
+  const firing =
+    alert && pickNotifyPolicy(schedule.notifyPolicy) === "on_alert"
+      ? decideAlertDelivery({ marker, alertState: schedule.alertState, now }).nextState.firing === true
+      : schedule.alertState?.firing === true;
+  return scheduleStatusSentence(
+    {
+      ...schedule,
+      firing: alert && firing,
+      marker,
+    },
+    now,
+  );
 }
 
 /** 任务指令在问启用、频率或下次时间时，正文里的那一句由服务端写，不交给模型。 */
@@ -969,7 +1053,7 @@ export function taskAsksScheduleStatus(prompt: string): boolean {
   return /是否启用|是否已经启用|执行频率|多久执行|下次执行|预警功能/.test(prompt);
 }
 
-const SCHEDULE_STATUS_LINE = /预警是否启用|预警功能|每\s*\d+\s*分钟执行/;
+const SCHEDULE_STATUS_LINE = /预警是否启用|预警功能|每\s*\d+\s*分钟执行|下次执行\s*[:：]/;
 
 /** 去掉模型自己写的启用/频率句，换上已保存配置。模型常写成「无法确认」或沿用旧的 5 分钟。 */
 export function applyScheduleStatus(text: string, sentence: string): string {
@@ -987,7 +1071,8 @@ export function applyScheduleStatus(text: string, sentence: string): string {
 export function scheduleRunFacts(schedule: ScheduleStatusInput, now = Date.now()): string {
   return (
     "本任务当前配置（若指令要求说明是否启用、执行频率或下次时间，不要自己写，也不要写成无法确认；" +
-    "服务端会在正文末尾附上这句。禁止换算 cron，禁止沿用本对话更早回复）：" +
+    "服务端会在正文末尾附上这句。告警未解除时，附上的下次执行是跑完后的复查时刻，不是 cron 的下一档整点。" +
+    "禁止换算 cron，禁止沿用本对话更早回复）：" +
     scheduleStatusSentence(schedule, now)
   );
 }

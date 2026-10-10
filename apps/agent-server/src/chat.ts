@@ -24,7 +24,8 @@ import {
   parseAlertMarker,
   unattendedToolDenial,
 } from "./schedule-alert.js";
-import { applyScheduleStatus } from "./notify/deliver.js";
+import { applyScheduleStatus, finishedScheduleStatusSentence } from "./notify/deliver.js";
+import type { ScheduleAlertState, ScheduleNotifyPolicy, SchedulePurpose } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
 import { appendContext, getConversation, patchConversation, setConversationSummary, setConversationTodos } from "./conversations.js";
@@ -51,6 +52,7 @@ import { enforceRoleIdentity } from "./role-guard.js";
 import {
   buildDataNeedPrompt,
   buildGroundedFallbackSystem,
+  buildGroundedFallbackUser,
   buildClaimExtractPrompt,
   buildSupportPrompt,
   buildVerifyHint,
@@ -63,11 +65,14 @@ import {
   DATA_NEED_SYSTEM,
   decideGrounding,
   GROUNDING_HINT,
+  hasBusinessDataSource,
   hasExternalDataSource,
   isGroundingEvidenceTool,
   MAX_UNSUPPORTED_CLAIMS,
   parseDataNeed,
   parseVerifyResult,
+  priorTopicMessages,
+  probeAllowsRelease,
   shouldRunVerification,
   unknownToolRefs,
   UNGROUNDED_REPLY,
@@ -452,14 +457,15 @@ function verifyModelFor(fallback: ModelEntry): ModelEntry {
 /**
  * 「本轮是否需要外部数据」的轻判定调用（无工具、极短提示，通常几百毫秒级）。
  * 只在**零证据收束**时使用（见 runLoop 的 grounding 分支），用来决定是「补取数据再答」（重试重提示）
- * 还是「本就不需要数据 → 直接受约束兜底」（轻提示）。判定不可用（异常 / 解析不出）返回 null = 按 DATA 处理。
+ * 还是「本就不需要数据 → 直接受约束兜底」（轻提示）。
+ * 解析不出返回 null，调用方按 DATA 处理。调用本身失败返回 unavailable：交互对话放行，无人值守仍按 DATA。
  */
 async function probeNeedsExternalData(
   model: ModelEntry,
   question: string,
   answer: string,
   signal?: AbortSignal,
-): Promise<"data" | "no_data" | null> {
+): Promise<"data" | "no_data" | "unavailable" | null> {
   try {
     const result = await callAgent(
       model,
@@ -472,8 +478,8 @@ async function probeNeedsExternalData(
     );
     return parseDataNeed(result.text);
   } catch (err) {
-    console.warn(`[chat:grounding] 数据需求分诊调用失败，按 DATA 处理：${String((err as Error)?.message || err)}`);
-    return null;
+    console.warn(`[chat:grounding] 数据需求分诊调用失败：${String((err as Error)?.message || err)}`);
+    return "unavailable";
   }
 }
 
@@ -542,17 +548,22 @@ async function honestFallbackWith(
   model: ModelEntry,
   question: string,
   roleLabel: string,
+  prior: readonly { role: "user" | "assistant"; content: string }[],
+  webOnly: boolean,
   signal?: AbortSignal,
 ): Promise<string | null> {
   try {
     const result = await callAgent(
       model,
-      [{ role: "user", content: question.trim() || "（用户本轮没有可识别的文本输入）" }],
+      [{ role: "user", content: buildGroundedFallbackUser(question, prior) }],
       [],
       signal,
       undefined,
       {
-        systemParts: { stable: buildGroundedFallbackSystem(roleLabel), dynamic: "" },
+        systemParts: {
+          stable: buildGroundedFallbackSystem(roleLabel, { hasPriorTopic: prior.length > 0, webOnly }),
+          dynamic: "",
+        },
         disableThinking: true,
         temperature: 0,
       },
@@ -569,14 +580,46 @@ function truncateArgs(raw: string): string {
   return text.length > HANDLE_ARGS_CHARS ? `${text.slice(0, HANDLE_ARGS_CHARS)}…` : text;
 }
 
+/** 自动模式的付费兜底。登记表把它放在第一位也不提前；免费模型都试过之后才用它。 */
+export const FLASH_FALLBACK_ID = "ds4flash0731";
+
+export function isFlashFallback(model: { id: string; name?: string }): boolean {
+  return model.id === FLASH_FALLBACK_ID || (model.name || "").toLowerCase() === "deepseek/deepseek-flash";
+}
+
+/** 免费档：OpenRouter `:free` / `openrouter/free`、Zen 的 space-bunny-free，以及标签里写了免费的。 */
+export function isFreeTierModel(model: { id: string; name?: string; label?: string }): boolean {
+  if (isFlashFallback(model)) return false;
+  const blob = `${model.id}\n${model.name || ""}\n${model.label || ""}`;
+  if (blob.includes("免费")) return true;
+  return /:free\b|\/free\b|-free\b|\bfree\b/i.test(blob) || model.id.toLowerCase().includes("free");
+}
+
+/**
+ * 自动：免费模型保持登记顺序，DeepSeek-Flash 紧跟在后面兜底，其余付费模型再往后。
+ * 不把默认模型或对话里记住的模型插到队首。
+ */
+export function autoModelOrder<T extends { id: string; name?: string; label?: string }>(items: readonly T[]): T[] {
+  const free: T[] = [];
+  const flash: T[] = [];
+  const rest: T[] = [];
+  for (const item of items) {
+    if (isFlashFallback(item)) flash.push(item);
+    else if (isFreeTierModel(item)) free.push(item);
+    else rest.push(item);
+  }
+  return [...free, ...flash, ...rest];
+}
+
 /**
  * 排这一轮要试的模型。
- * 自动：冷却中的（刚 402 / 500 / 日限额）放到最后，从还能用的开始。用户点名的模型先试它，失败再换。
+ * 自动：先免费，再 DeepSeek-Flash，其余付费模型在最后。冷却中的放到队尾。
+ * 用户点名的模型先试它，失败再换。
  * 一个都不新鲜时仍按原顺序试，避免「全部冷却 → 直接没模型」。
  * 定时运行（skipCooled）：跳过冷却中的模型。自动模式下一个新鲜的都没有就返回空名单，由调用方记失败。
  * 点名的模型仍试它本身，不把其余冷却模型再走一遍。
  */
-export function orderModelCandidates<T extends { id: string }>(
+export function orderModelCandidates<T extends { id: string; name?: string; label?: string }>(
   all: readonly T[],
   preferred: T | null,
   auto: boolean,
@@ -592,13 +635,9 @@ export function orderModelCandidates<T extends { id: string }>(
       const others = fresh.filter((item) => item.id !== preferred.id);
       return [preferred, ...others];
     }
-    return fresh;
+    return auto ? autoModelOrder(fresh) : fresh;
   }
-  if (auto) {
-    const lead = preferred && fresh.some((item) => item.id === preferred.id) ? preferred : fresh[0];
-    const rest = fresh.filter((item) => item.id !== lead?.id);
-    return [...(lead ? [lead] : []), ...rest, ...cooled];
-  }
+  if (auto) return [...autoModelOrder(fresh), ...autoModelOrder(cooled)];
   if (!preferred) return [...fresh, ...cooled];
   const rest = all.filter((item) => item.id !== preferred.id);
   return [preferred, ...rest.filter((item) => !down(item)), ...rest.filter((item) => down(item))];
@@ -1657,6 +1696,8 @@ interface LoopContext {
   /** 角色级接地护栏（防「零数据凭记忆作答」，详见 src/grounding.ts）：本轮无任何外部数据时不允许收束。
    *  不填 = 不参与本护栏，通用角色行为不变。 */
   enforceGrounding?: boolean;
+  /** 护栏只因联网检索开启：没有业务数据源，角色也没声明接地。兜底按常识追问写，数字标未核对。 */
+  groundingWebOnly?: boolean;
   /** 定时运行拒绝执行的内置工具。模型仍可能点名调用，拒绝结果记入本期工具记录。 */
   deniedBuiltins?: ReadonlySet<string>;
   /** 本次运行的正向工具允许清单；存在时，清单外的内置工具既不注入、点名调用也拒绝。 */
@@ -2032,12 +2073,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       //   NO_DATA（回答里没有需外部数据支撑的事实断言：寒暄、身份与能力说明、职责边界、纯推理创作）
       //     → **直接放行**：这类回答不是幻觉来源，纠正它只会把模型本来正确的回复换成兜底话术
       //       （实测过：问候被换成「没取到数据」，既与事实不符、观感也更差）。
-      //   DATA / 判定失败 → 维持原路（作废 + 回灌纠正提示再跑一轮），反编造的自愈路径完全不变。
+      //   分诊调用失败 → 交互对话放行。端点拒参时按 DATA 处理会把整段回答换成「看不到前文」。
+      //     无人值守仍不放行，避免把没核对的数字发出去。
+      //   DATA / 解析不出 → 维持原路（作废 + 回灌纠正提示再跑一轮）。
       //     实测一次问候的耗时几乎全在「重提示重试」：重提示每轮 4-10s，轻提示 <1s。
+      const probeRelease = { unattended: Boolean(ctx.unattendedConclusion || ctx.forceWrapUp) };
       if (grounding === "retry") {
         const need = await probeNeedsExternalData(ctx.model, userQuestion, outcome.text, ctx.signal);
-        if (need === "no_data") {
-          console.log("[chat:grounding] 分诊判定本轮回答不含需外部数据支撑的断言：放行，不作废也不兜底");
+        if (probeAllowsRelease(need, probeRelease)) {
+          console.log(
+            need === "unavailable"
+              ? "[chat:grounding] 分诊调用失败，放行本轮回答，不作废也不兜底"
+              : "[chat:grounding] 分诊判定本轮回答不含需外部数据支撑的断言：放行，不作废也不兜底",
+          );
           synthesisText = outcome.text;
           if (roundText) yield { type: "text_delta", text: roundText };
           break;
@@ -2050,18 +2098,30 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         continue;
       }
       if (grounding === "block") {
-        // 纠正次数用尽前，分诊看的是更早的回答。最后这一段若已没有事实断言，放行，不要换成协议句。
+        // 纠正次数用尽前，分诊看的是更早的回答。最后这一段若已没有事实断言，或分诊调用失败，放行。
         const lastNeed = await probeNeedsExternalData(ctx.model, userQuestion, outcome.text, ctx.signal);
-        if (lastNeed === "no_data") {
-          console.log("[chat:grounding] 纠正用尽，但最后一段回答不含需外部数据支撑的断言：放行");
+        if (probeAllowsRelease(lastNeed, probeRelease)) {
+          console.log(
+            lastNeed === "unavailable"
+              ? "[chat:grounding] 纠正用尽，分诊调用失败，放行最后一段回答"
+              : "[chat:grounding] 纠正用尽，但最后一段回答不含需外部数据支撑的断言：放行",
+          );
           synthesisText = outcome.text;
           if (roundText) yield { type: "text_delta", text: roundText };
           break;
         }
         ungrounded = true;
         // 没有事实断言的已在上面放行。这里只剩「需要数据但没取到」：用受约束兜底，不用固定话术冒充取数失败。
+        // 上文用本轮开始时的 turns，不含刚才被作废的草稿和纠正提示。
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
-        const honest = await honestFallbackWith(ctx.model, userQuestion, getRole(ctx.namespace).label, ctx.signal);
+        const honest = await honestFallbackWith(
+          ctx.model,
+          userQuestion,
+          getRole(ctx.namespace).label,
+          priorTopicMessages(turns, userQuestion),
+          ctx.groundingWebOnly === true,
+          ctx.signal,
+        );
         const finalHonest = honest || UNGROUNDED_REPLY;
         console.log(
           `[chat:grounding] 纠正后仍未取得工具数据，改走受约束的诚实兜底${honest ? "" : "（调用不可用，回落确定性文案）"}`,
@@ -3227,6 +3287,23 @@ export async function* chatStream(
     unattendedConclusion?: "alert" | "report";
     /** 任务指令问了启用/频率时，收束前换成这句已保存配置，不采用模型自己写的频率。 */
     scheduleStatusLine?: string;
+    /**
+     * 同上，但在收束时按跑完时刻重算下次执行。
+     * 开跑时算的那句会把告警复查说成下一档 cron 整点。
+     */
+    scheduleStatus?: {
+      name?: string;
+      prompt: string;
+      enabled?: boolean;
+      cron?: string;
+      onceAt?: number;
+      nextRunAt?: number;
+      locale?: string;
+      purpose?: SchedulePurpose;
+      notifyPolicy?: ScheduleNotifyPolicy;
+      alertState?: ScheduleAlertState;
+      lastMarker?: AlertMarker | null;
+    };
     /** 浏览器上报的 IANA 时区。合法时写入本对话，并作为小时分桶的缺省时区。 */
     timeZone?: string;
   } = {},
@@ -3291,8 +3368,11 @@ export async function* chatStream(
     yield { type: "done" };
     return;
   }
-  yield { type: "model", id: model.id, label: model.label };
-  if (traceMeta) traceMeta.servedModel = model.id;
+  // 自动模式的真正顺序在候选链里才知道（免费在前）。这里先报会把默认的 DeepSeek-Flash 闪给用户。
+  if (explicitModel) {
+    yield { type: "model", id: model.id, label: model.label };
+    if (traceMeta) traceMeta.servedModel = model.id;
+  }
 
   // 去重 + 排序：工具清单的确定性来自这里（顺序稳定 → system+tools 前缀稳定 → prompt 缓存命中）。
   const conversationEnabled = [...new Set((conversation?.mcpServers || []).map((id) => String(id || "").trim()))].filter(
@@ -3369,9 +3449,11 @@ export async function* chatStream(
   // 开了会把写代码、翻译、创作也逼去凑证据——护栏拦的是「无证据的事实断言」，不是「没调工具」。
   // 注意用 `collected.tools`（本轮可用的全部 MCP 工具）而不是 `specs`：按需加载只预载少量 schema，
   // 其余仍可检索或直接点名调用，能力并未消失，不能因此放弃护栏。
-  const enforceGrounding =
-    roleEnforceGrounding === true ||
-    hasExternalDataSource([...collected.tools.map((tool) => tool.name), ...builtinSpecs.map((spec) => spec.name)]);
+  // 只开了联网检索、角色也没声明接地时，护栏仍开启，但兜底按常识追问写：沿用上文话题，数字标未核对。
+  const groundingTools = [...collected.tools.map((tool) => tool.name), ...builtinSpecs.map((spec) => spec.name)];
+  const businessData = hasBusinessDataSource(groundingTools);
+  const enforceGrounding = roleEnforceGrounding === true || hasExternalDataSource(groundingTools);
+  const groundingWebOnly = enforceGrounding && roleEnforceGrounding !== true && !businessData;
   // 只要有工具就进工具循环。内置工具恒在 → 这里恒真；保留该判断是为了让语义显式：
   // 「零工具直连」只在真的没有任何工具可用时成立，而不是由「勾了几个连接器」间接决定。
   const useTools = specs.length > 0;
@@ -3421,7 +3503,8 @@ export async function* chatStream(
   const toolSchemaTokens = specs.length ? estimateTokens(JSON.stringify(specs)) : 0;
 
   // 候选链：一个模型 402 / 500 / 日限额就换下一个，直到有一个做完，或名单用尽。
-  // 自动（含定时任务没指定模型）：冷却中的不打头。用户点名的模型仍先试它，失败再换。
+  // 自动（对话 / 客服 / 观影 / 定时任务没点名模型）：免费模型在前，DeepSeek-Flash 兜底，其余付费模型再往后。
+  // 用户点名的模型仍先试它，失败再换。
   // 定时运行跳过冷却中的模型；一个能用的都没有就记失败，不再把冷却链打一遍。
   const allModels = listModels();
   const unattended = Boolean(opts.forceWrapUp || opts.unattendedConclusion);
@@ -3553,6 +3636,7 @@ export async function* chatStream(
           namespace: conversation?.agentId || "generic",
           forceToolCall: roleForceToolCall,
           enforceGrounding,
+          groundingWebOnly,
           ownerKey: opts.ownerKey,
           ...(timeZone ? { timeZone } : {}),
           runId: traceMeta?.runId,
@@ -3703,8 +3787,11 @@ export async function* chatStream(
   // 工具已返回但正文仍空：不要落成「生成未产出内容」。这句话不是协议结论，调度侧会记失败。
   const withGap = concluded.trim() || (toolCalls > 0 ? CONCLUSION_GAP_AFTER_TOOLS : CONCLUSION_GAP);
   // 先去掉工具清单，再附定时状态。状态行也是「- …」，附在清单后面会被当成同一张表删掉。
-  const visibleText = opts.scheduleStatusLine
-    ? applyScheduleStatus(stripUserFacingToolTrace(withGap), opts.scheduleStatusLine)
+  const statusLine = opts.scheduleStatus
+    ? finishedScheduleStatusSentence(opts.scheduleStatus, withGap)
+    : opts.scheduleStatusLine;
+  const visibleText = statusLine
+    ? applyScheduleStatus(stripUserFacingToolTrace(withGap), statusLine)
     : stripUserFacingToolTrace(withGap);
   const finalText = redactSensitive(visibleText);
   if (finalText !== visibleText) {

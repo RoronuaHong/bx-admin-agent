@@ -10,6 +10,7 @@ import {
   formatScheduleListLine,
   scheduleConfigChanged,
   scheduleRunFacts,
+  finishedScheduleStatusSentence,
   scheduleStatusSentence,
   taskAsksScheduleStatus,
   upcomingScheduleRunAt,
@@ -331,6 +332,44 @@ test("[H4] 正在跑的这一档不算下次执行", () => {
   expect(facts).toContain("每 5 分钟执行一次");
   expect(facts).toContain("下次执行：");
   expect(facts).not.toContain("*/5");
+});
+
+test("[H4] 告警未解除时，下次执行写复查时刻，不写下一档 cron 整点", () => {
+  const now = Date.parse("2026-10-10T17:21:00+08:00");
+  const due = Date.parse("2026-10-10T17:15:57+08:00");
+  const schedule = {
+    name: "印度客服对话量预警",
+    prompt: "检查是否已经启用预警功能",
+    enabled: true,
+    cron: "*/10 * * * *",
+    nextRunAt: due,
+    locale: "zh",
+    purpose: "alert" as const,
+    notifyPolicy: "on_alert" as const,
+    alertState: { firing: true, normalStreak: 0 },
+    lastMarker: "SPIKE" as const,
+  };
+  const next = upcomingScheduleRunAt(
+    { ...schedule, firing: true, marker: "SPIKE" },
+    now,
+  );
+  expect(next).toBe(Date.parse("2026-10-10T17:26:00+08:00"));
+  const sentence = finishedScheduleStatusSentence(schedule, "[SPIKE]\n当前数量超过阈值", now);
+  expect(sentence).toContain("每 10 分钟执行一次");
+  expect(sentence).toContain("17:26:00");
+  expect(sentence).toContain("告警未解除，约 5 分钟后复查");
+  expect(sentence).not.toContain("17:20:00");
+  expect(sentence).not.toContain("17:30:00");
+  const shown = applyScheduleStatus("[SPIKE]\n- 下次执行：2026/10/10 17:20:00", sentence);
+  expect(shown).toContain("17:26:00");
+  expect(shown).not.toContain("17:20:00");
+  const cleared = finishedScheduleStatusSentence(
+    { ...schedule, alertState: { firing: true, normalStreak: 1 } },
+    "[NORMAL]\n已回落到阈值内",
+    now,
+  );
+  expect(cleared).toContain("17:30:00");
+  expect(cleared).not.toContain("告警未解除");
 });
 
 test("[H3] 模型都失败时，钉钉状态用状态码，正文写明原因", () => {
