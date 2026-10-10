@@ -8,6 +8,7 @@
 import { createHmac } from "node:crypto";
 import type { NotifyChannel } from "./channels.js";
 import { garbledTextReason, nextRunAtOf } from "../schedules.js";
+import { stripUserFacingToolTrace } from "../history.js";
 
 /** 正文预算（字符）：钉钉 markdown 硬限约 20000 字节、飞书约 30KB，这里留足余量。 */
 const MAX_BODY_CHARS = 3500;
@@ -315,12 +316,6 @@ function clampBody(body: string, pack: LangPack): string {
   return `${body.slice(0, MAX_BODY_CHARS)}\n\n${pack.truncated}`;
 }
 
-/** 对话落库会在正文后追加「本轮已执行的工具」供模型回忆；IM 不需要这段，JSON 参数在钉钉里会被当成乱码。 */
-function stripToolTrace(text: string): string {
-  const idx = text.search(/\n*\[本轮已执行的工具\]/);
-  return (idx >= 0 ? text.slice(0, idx) : text).trim();
-}
-
 /**
  * 对话里的协议标记只给引擎认。群消息用收件人语言的标识：
  * 异常 = 破线，正常 = 未破线，警告 = 没取到完整计数。
@@ -394,7 +389,7 @@ export function formatForIm(text: string, lang: LangPack | DeliveryLang = "zh"):
     typeof lang === "string"
       ? lang
       : ((Object.keys(LANGS) as DeliveryLang[]).find((key) => LANGS[key] === pack) ?? "zh");
-  const lines = stripToolTrace(text).split(/\r?\n/);
+  const lines = stripUserFacingToolTrace(text).split(/\r?\n/);
   const out: string[] = [];
   for (let i = 0; i < lines.length; i += 1) {
     if (!isTableRow(lines[i])) {

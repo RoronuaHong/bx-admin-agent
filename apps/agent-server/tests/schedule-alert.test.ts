@@ -23,6 +23,8 @@ import {
   pickPurpose,
   SCHEDULE_UNGROUNDED_ALERT,
   SCHEDULE_UNGROUNDED_REPORT,
+  SCHEDULE_DENIED_BUILTINS,
+  unattendedDenySentence,
   unattendedToolDenial,
 } from "../src/schedule-alert.js";
 import { garbledTextReason, scheduleLockPid, validateTiming } from "../src/schedules.js";
@@ -428,9 +430,15 @@ test("garbledTextReason：几乎全是问号才拒绝", () => {
 test("unattendedToolDenial：拒绝文案按工具说明原因", () => {
   expect(unattendedToolDenial("fs_delete")).toContain("删除文件");
   expect(unattendedToolDenial("request_clarification")).toContain("澄清");
+  expect(unattendedToolDenial("save_memory")).toContain("长期记忆");
   expect(unattendedToolDenial("render_chart")).toContain("出图");
   expect(unattendedToolDenial("run_command")).toContain("本期记录");
   expect(unattendedToolDenial("list_schedules")).toContain("当前任务");
+  const sentence = unattendedDenySentence();
+  for (const name of SCHEDULE_DENIED_BUILTINS) {
+    expect(sentence).toContain(name);
+    expect(unattendedToolDenial(name)).not.toContain("不允许这个操作");
+  }
 });
 
 test("validateTiming：拒绝短于 1 分钟的周期", () => {

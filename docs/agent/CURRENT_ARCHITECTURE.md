@@ -35,7 +35,7 @@
 | 其它只读汇总 | `run_tool_code`。脚本进程里没有 MCP，不能拿来翻 MCP 分页 |
 | 要确认的写操作、删文件、跑命令、改定时任务 | 留在主对话。定时运行会直接拒绝这些工具 |
 
-当前 skills 目录（`apps/agent-server/skills/`）：`business-data-query` / `chart-visualization` / `metric-caliber-check` / `movie` / `pdf` / `schema-probe` / `web-research`。
+当前 skills 目录（`apps/agent-server/skills/`）：`business-data-query` / `chart-visualization` / `metric-caliber-check` / `movie` / `pdf` / `schema-probe` / `support-salesiq` / `web-research`。索引按角色过滤：`movie`、`support-salesiq` 只出现在对应角色的系统提示里。
 
 ## 3. 治理与安全层
 
@@ -97,7 +97,7 @@ agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内�
 风险等级（`read`/`write` × `workspace`/`external`）由 `builtins.ts` 的 `BUILTIN_RISK` 声明，与服务端 `risk.ts` 策略联动（见 §3）；服务端 `toolRisks` 优先级更高。
 
 ### 4.2 MCP 子系统（`mcp/`）
-- `mcp/config.ts`：服务器来源有二——① `MCP_BUILTIN_SERVERS`（`.env` 里的 JSON 数组，部署期确定、不落盘；stdio 子进程继承父进程环境，凭据放 `.env` 即可）；② 运行时经 `POST /mcp/servers` 由用户添加。`conversation.mcpServers` 持久化「本对话启用集」。
+- `mcp/config.ts`：服务器来源有二——① `MCP_BUILTIN_SERVERS`（`.env` 里的 JSON 数组，部署期确定、不落盘；stdio 子进程只接收运行所需变量、`BI_` / `YAPI_` 前缀和该服务器声明的 `env`，这些凭据放 `.env` 即可）；② 运行时经 `POST /mcp/servers` 由用户添加。`conversation.mcpServers` 持久化「本对话启用集」。
 - `mcp/hub.ts`：`connect()` → `buildTransport()`（`StdioClientTransport` 命令式 / `StreamableHTTPClientTransport`）→ 拉取工具清单；含空闲回收、重连冷却、stdio 子进程 stderr 转发（避免日志黑洞）。外部工具统一命名空间 `mcp__<serverId>__*`。
 - 启动期（`index.ts`）自动重连所有已启用服务器；面板勾选态经 `app.ts` 增删并清理悬空引用。
 
@@ -116,19 +116,20 @@ agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内�
 
 ### 4.5 技能层（skills/）
 
-适配器与内置工具只解决"能不能调"，**技能（SKILL.md）解决"拿到工具后怎么用"**——把领域流程与纪律写进 system（`default: true` 的技能默认全部注入，除非角色另有指定）。角色（`roles.ts`）决定启用哪些 MCP 与默认工具集；技能决定具体怎么驱动它们。各技能自带 `SKILL.md` 即其规范：
+适配器与内置工具只解决"能不能调"，**技能（SKILL.md）解决"拿到工具后怎么用"**。`default: true` 只是不出现在技能勾选面板；索引仍常驻，全文在命中时用 `read_skill` 加载，不是整份注入。角色（`roles.ts`）决定启用哪些 MCP；技能描述决定何时加载。各技能自带 `SKILL.md` 即其规范：
 
 | 技能 | 触发场景 | 关键依赖 |
 |---|---|---|
-| [`business-data-query`](../../apps/agent-server/skills/business-data-query/SKILL.md)（业务取数） | 要真实业务数字（占比/趋势/排名/对比），哪怕用户没说"查一下" | BI MCP（`mcp__bi__*`） |
-| [`schema-probe`](../../apps/agent-server/skills/schema-probe/SKILL.md)（陌生库探查） | 首次接触陌生库/表，字段语义/表关系/主键不确定 | BI MCP 元数据工具（`get_database_schema` / `get_field_values`） |
-| [`metric-caliber-check`](../../apps/agent-server/skills/metric-caliber-check/SKILL.md)（指标口径核对） | 指标定义/口径差异/数据对不上 | BI MCP（`list_cards` / `get_card` / `run_native_query`） |
-| [`chart-visualization`](../../apps/agent-server/skills/chart-visualization/SKILL.md)（图表可视化） | 画图/可视化（饼/柱/折线/趋势/占比/结构/关系） | 上游取数 + 内置 `render_chart`（本地 AntV） |
+| [`business-data-query`](../../apps/agent-server/skills/business-data-query/SKILL.md)（业务取数） | 数字属于已连接的自有业务数据。主体在外部世界时不用 | BI MCP（`mcp__bi__*`） |
+| [`schema-probe`](../../apps/agent-server/skills/schema-probe/SKILL.md)（陌生库探查） | 已经确定在查自有数据，但库表还不熟。通用角色 | BI MCP 元数据工具（`get_database_schema` / `get_field_values`） |
+| [`metric-caliber-check`](../../apps/agent-server/skills/metric-caliber-check/SKILL.md)（指标口径核对） | 自有数据的指标定义或两个数对不上。通用角色 | BI MCP（`list_cards` / `get_card` / `run_native_query`） |
+| [`chart-visualization`](../../apps/agent-server/skills/chart-visualization/SKILL.md)（图表可视化） | 画图/可视化。通用角色与客服角色 | 上游取数 + 内置 `render_chart`（本地 AntV） |
 | [`movie`](../../apps/agent-server/skills/movie/SKILL.md)（观影助手） | 找片/了解影片/推荐/对比 | TMDb MCP（`mcp__movie__*`） |
 | [`pdf`](../../apps/agent-server/skills/pdf/SKILL.md)（PDF 资料问答） | 答案只在文档里（制度/报告/合同/附件） | 本地资料库检索（pdf/docx/xlsx 入库；无解析器如实报错，不静默跳过） |
-| [`web-research`](../../apps/agent-server/skills/web-research/SKILL.md)（联网检索与核实） | 时效信息/站外资料/可核实事实 | 内置 `web_search` / `fetch_url` |
+| [`support-salesiq`](../../apps/agent-server/skills/support-salesiq/SKILL.md)（客服会话） | 客服角色查在线会话列表或做时段计数 | Zoho SalesIQ MCP |
+| [`web-research`](../../apps/agent-server/skills/web-research/SKILL.md)（联网检索与核实） | 外部世界的公开事实。自有业务数据不走这里 | 内置 `web_search` / `fetch_url` |
 
-> 取数链路：`business-data-query` / `schema-probe` / `metric-caliber-check` 三者服务于 BI 取数正确性（先取证、再取数、再核对口径）；`movie` 对应 `roles.ts` 的 `movie` 角色；其余为通用角色默认注入。
+> 取数链路：`business-data-query` / `schema-probe` / `metric-caliber-check` 只进通用角色，服务于自有数据（先取证、再取数、再核对口径）。`movie`、`support-salesiq` 只进各自角色。`web-research` 只进通用角色。`pdf` 与 `chart-visualization` 进通用角色和客服角色。索引按 `roles` 过滤，不是整份注入。
 
 ## 5. 异步与定时
 

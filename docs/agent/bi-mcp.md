@@ -7,7 +7,7 @@
 业务取数走 **Metabase**（BI 平台），通过 `scripts/metabase-mcp.mjs` 这个 **stdio MCP server** 接入，serverId 在 `.env` 的 `MCP_BUILTIN_SERVERS` 中为 `bi`，工具命名空间 `mcp__bi__*`。
 
 - 把 Metabase REST API（仪表盘、卡片/提问、数据库元数据、原生 SQL）暴露为 MCP 工具。
-- 鉴权：请求头 `X-API-Key`（Metabase API Key）。**优先用只读账号 Key**（`BI_READONLY_API_KEY`），没有才回落管理员 `BI_API_KEY`；真正的只读边界仍须数据库/账号层用专用角色 `GRANT SELECT` 强制（适配器层只是「以只读身份访问」，不是只读保证）。
+- 鉴权：请求头 `X-API-Key`（Metabase API Key）。**优先用只读账号 Key**（`BI_READONLY_API_KEY`）。生产环境未配置只读 Key 时拒绝连接，不回落 `BI_API_KEY`；开发环境仍可回落。真正的只读边界仍须数据库/账号层用专用角色 `GRANT SELECT` 强制（适配器层只是「以只读身份访问」，不是只读保证）。
 - `mcp__bi__*` 是**接地证据工具**（外部数据源，`isGroundingEvidenceTool` 判真，见 `tests/grounding-guard.test.ts`），即这些工具返回算「外部数据证据」。
 
 ## 2. 接入与配置

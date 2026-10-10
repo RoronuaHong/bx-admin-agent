@@ -36,6 +36,43 @@ export function renderHandles(handles: ToolHandle[] | undefined): string {
   return `\n\n[本轮已执行的工具]\n${lines.join("\n")}`;
 }
 
+const TOOL_TRACE_HEAD = /^(?:#{1,6}[ \t]*)?(?:\*{1,2}|_{1,2})?\[?本轮已执行的工具\]?(?:\*{1,2}|_{1,2})?[ \t]*$/;
+const TOOL_TRACE_ITEM = /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S/;
+
+/**
+ * 模型有时会把历史里的工具清单抄进给用户的正文。
+ * 那段只该留在上下文里给模型回忆；用户界面的步骤区已经展示过。
+ * 只去掉独立成行的标题及其后紧挨着的列表，标题后面的正文留下。
+ * 同一行里顺口提到这几个字的，不删。
+ */
+export function stripUserFacingToolTrace(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!TOOL_TRACE_HEAD.test(lines[i].trim())) {
+      kept.push(lines[i]);
+      continue;
+    }
+    let j = i + 1;
+    while (j < lines.length) {
+      if (TOOL_TRACE_ITEM.test(lines[j])) {
+        j += 1;
+        continue;
+      }
+      if (lines[j].trim() !== "") break;
+      let k = j + 1;
+      while (k < lines.length && lines[k].trim() === "") k += 1;
+      if (k < lines.length && TOOL_TRACE_ITEM.test(lines[k])) {
+        j = k;
+        continue;
+      }
+      break;
+    }
+    i = j - 1;
+  }
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
 /** 单轮对话在上下文里的文本形态：正文 + 工具句柄。 */
 function turnContent(turn: { text: string; handles?: ToolHandle[] }): string {
   return `${turn.text}${renderHandles(turn.handles)}`;

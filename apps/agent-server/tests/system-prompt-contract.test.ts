@@ -62,6 +62,25 @@ test("[G] 工具纪律含事实核验条款（有检索工具就先核实；核�
   expect(stable).toContain("没有问到");
 });
 
+test("[I] 技能索引按主体分流，不写句式或自称词表", () => {
+  const { stable } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
+  expect(stable).toContain("已连接的自有业务数据");
+  expect(stable).toContain("外部主体的公开事实");
+  expect(stable).toContain("一次检索能把读法分开");
+  expect(stable).not.toContain("句首");
+  expect(stable).not.toContain("我们 / 本公司");
+  expect(stable).not.toContain("观影助手工作流");
+  expect(stable).not.toContain("Zoho SalesIQ");
+  const movie = buildSystemPrompt({ role: "movie", withMemory: false, tooling: TOOLING }).stable;
+  const support = buildSystemPrompt({ role: "support", withMemory: false, tooling: TOOLING }).stable;
+  expect(movie).toContain("TMDb");
+  expect(movie).not.toContain("已连接的自有业务数据");
+  expect(movie).not.toContain("外部主体的公开事实");
+  expect(support).toContain("ZohoSalesIQ_getConversationsList");
+  expect(support).not.toContain("已连接的自有业务数据");
+  expect(support).toContain("PDF");
+});
+
 test("[H] 动态段带当前 Unix 毫秒，工具纪律要求按参数说明筛选", () => {
   const { stable, dynamic } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
   expect(stable).toContain("不要写进参数");

@@ -99,6 +99,23 @@ export function validateTodos(raw: unknown): ValidationResult<TodoItem[]> {
 }
 
 /**
+ * 一轮已经给出最终回答时，把计划里还开着的步骤收成完成。
+ * 模型经常只在开头写一次计划，做完后不再调 write_todos，界面就一直停在进行中。
+ * cancelled 保持不动：那是明确不做的步骤，不能算完成。
+ * 没有变化时返回 null，调用方不必再发事件。
+ */
+export function settleFinishedTodos(todos: TodoItem[] | null | undefined): TodoItem[] | null {
+  if (!todos?.length) return null;
+  let changed = false;
+  const next = todos.map((item) => {
+    if (item.status !== "pending" && item.status !== "in_progress") return item;
+    changed = true;
+    return { content: item.content, status: "completed" as const };
+  });
+  return changed ? next : null;
+}
+
+/**
  * 图表 spec 形态校验（导出报告内嵌图表复用）：chartType 受支持且 data 形态正确。
  * 不合规的图表在导出时被安静丢弃（图表是装饰，不拖垮整个文件）。
  */

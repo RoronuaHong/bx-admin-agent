@@ -1,6 +1,6 @@
 // Metabase MCP 适配器（stdio）：把 Metabase REST API 暴露为 MCP 工具。
 // 鉴权：请求头 X-API-Key（Metabase API Key，无 Bearer 前缀）。
-// 配置来源：环境变量 BI_BASE_URL（实例地址）+ BI_API_KEY（API Key），由父进程继承 / .env 注入。
+// 配置来源：环境变量 BI_BASE_URL + BI_READONLY_API_KEY（生产必须）。开发环境可回落 BI_API_KEY。
 // 接口形状按实例自带 OpenAPI（GET /api/docs/openapi.json）核对；要点：
 //   - 仪表盘详情的卡片数组字段是 dashcards（旧版才是 ordered_cards）；
 //   - 数据库元数据用 skip_fields=true 只取表清单，避免一次吐出全部表的所有字段；
@@ -8,15 +8,16 @@
 //   - 元数据里本可用的「描述 / 语义类型 / 外键指向 / 指纹统计」必须映射出来：丢掉它们，
 //     模型就只能靠字段名猜语义（把真实存在的取值当成脏数据）。取证能力是取数正确性的前提。
 import "dotenv/config";
+import { resolveMetabaseKey } from "./metabase-key.mjs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const BASE = (process.env.BI_BASE_URL || "").replace(/\/+$/, "");
-// 凭据：优先**只读账号**（`BI_READONLY_API_KEY`），没有才回落管理员 Key——保留回滚路径，不覆盖原配置。
-// 定位要说清：换 Key 只是让「本适配器以只读身份访问」，真正的只读边界仍须由数据库/账号层强制
+// 凭据：优先只读账号。生产没有 BI_READONLY_API_KEY 时不回落管理员 Key。
+// 换 Key 只是让适配器以只读身份访问；真正的只读边界仍须由数据库账号强制
 // （专用角色 + 只 GRANT SELECT），见 docs/text2sql-text2api-plan.md 的 P1-1。
-const KEY = process.env.BI_READONLY_API_KEY || process.env.BI_API_KEY || "";
+const { key: KEY, blocked: KEY_BLOCKED } = resolveMetabaseKey(process.env);
 
 /**
  * 单次请求超时（默认 30s，可配 BI_TIMEOUT_MS；BI 查询 legitimately 慢时用 env 调大）。
@@ -28,6 +29,13 @@ const KEY = process.env.BI_READONLY_API_KEY || process.env.BI_API_KEY || "";
 const TIMEOUT_MS = Number(process.env.BI_TIMEOUT_MS || 30_000);
 
 async function mb(path, { method = "GET", body } = {}) {
+  if (KEY_BLOCKED) {
+    return {
+      ok: false,
+      status: 0,
+      text: "生产环境未配置 BI_READONLY_API_KEY，已拒绝使用管理员 Key。请配置只读账号后再连 BI。",
+    };
+  }
   if (!BASE || !KEY) {
     return { ok: false, status: 0, text: "未配置 BI_BASE_URL 或 BI_API_KEY（在 apps/agent-server/.env 填写）。" };
   }
@@ -241,6 +249,13 @@ const TOOLS = [
             : {}),
         })),
         ...(matched.length > cap ? { note: `仅列出前 ${cap} 张，可用 search 过滤或用 table 精确查看某张表` } : {}),
+        // 表名清单不是指标清单。模型看到 54 张业务表就宣布「没有净利润」时，跳过了已保存提问。
+        ...(include_fields === true
+          ? {}
+          : {
+              next:
+                "这只是表名，不能据此断定没有某个指标。下一步用 search 或 list_cards 找已保存的提问，再用 table 参数看具体字段。",
+            }),
       });
     },
   },

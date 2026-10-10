@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import type { ApiErrorPayload, ChartSpec, LocalizedToken, TodoItem } from "@bx/shared";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { getCookie, setCookie } from "hono/cookie";
 import { config, listModels } from "./config.js";
 import { answerConfirmation } from "./confirm.js";
@@ -28,6 +29,7 @@ import { verifyProvenance } from "./mcp/provenance.js";
 import { OUTPUT_SCHEMAS } from "./output-schema.js";
 import {
   addConversationReadGrant,
+  appendUserTurnIfMissing,
   clearContext,
   conversationOwnedBy,
   clearConversation,
@@ -129,6 +131,8 @@ import {
   pickNotifyPolicy,
   pickPurpose,
   SCHEDULE_ALERT_GUIDE,
+  SCHEDULE_DENIED_BUILTINS,
+  unattendedDenySentence,
   scheduleFinishedStatus,
   shouldDeliverScheduleResult,
   type ScheduleNotifyPolicy,
@@ -195,8 +199,7 @@ const SCHEDULE_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.MCP_SCHEDULE_MAX
  *   ② 结论全靠图表承载时，IM 推送渲染不了图，推过去只剩一句「以上为完整监测结果」。
  * 走系统提示的动态后缀注入（不进用户可见历史，也不污染稳定前缀/不影响 prompt cache）。
  */
-const SCHEDULE_UNATTENDED_DENY =
-  "无人值守不允许调用 fs_delete、run_command、run_script、manage_schedule、list_schedules、request_clarification；若仍调用，会被拒绝并记入本期记录。";
+const SCHEDULE_UNATTENDED_DENY = unattendedDenySentence();
 
 const SCHEDULE_TASK_GUIDE =
   "本次是定时任务的新一期运行，请遵守两条：\n" +
@@ -212,16 +215,6 @@ const SCHEDULE_ALERT_TASK_GUIDE =
   "本次是定时预警检查的新一期运行：必须从数据源重新取数，不得沿用本对话历史轮次的结论或数字。\n" +
   SCHEDULE_UNATTENDED_DENY +
   " 预警检查也不允许 render_chart、export_data。";
-
-/** 定时运行默认拒绝的内置工具。交互式对话不传这份清单。澄清会空等用户，无人值守也不能挂起。 */
-const SCHEDULE_DENIED_BUILTINS = [
-  "manage_schedule",
-  "list_schedules",
-  "fs_delete",
-  "run_command",
-  "run_script",
-  "request_clarification",
-];
 
 /**
  * 断线续传的收口语（跨进程）：补齐内容之后如实说明「这一轮已经不在了」。
@@ -302,6 +295,10 @@ async function consumeTask(
   const runId = newRunId();
   let status: RunStatus = "failed";
   let outcomePersisted = false;
+  // 提问先落库：刷新发生在这一轮还没写完时，对话里已经有用户气泡，而不是只剩一个空的助手占位。
+  await appendUserTurnIfMissing(task.conversationId, task.userText, task.startedAt).catch((err) => {
+    console.warn(`[chat/task] ${task.id} 提问落库失败：${String((err as Error)?.message || err)}`);
+  });
   // run 级追踪旁路 sink：chatStream 在此记录实际服务模型（first-class，不依赖受限的事件缓冲）。
   const traceMeta: { servedModel?: string; runId?: string } = { runId };
   try {
@@ -313,17 +310,16 @@ async function consumeTask(
     status = hadError ? "failed" : "success";
     finishTask(task, status, false);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "请求失败";
+    console.error(`[chat/task] ${task.id} failed:`, error);
     if (task.abort.signal.aborted) {
       status = "cancelled";
       finishTask(task, "cancelled", false);
     } else {
       status = "failed";
-      console.error(`[chat/task] ${task.id} failed:`, error);
       publishTaskEvent(task, {
         type: "error",
-        error: { code: "CHAT_TASK_FAILED", defaultMessage: message },
-        message,
+        error: { code: "CHAT_TASK_FAILED", defaultMessage: CLIENT_INTERNAL_ERROR },
+        message: CLIENT_INTERNAL_ERROR,
       });
       finishTask(task, "failed", false);
     }
@@ -566,23 +562,26 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     else if (event.type === "todos") todos = event.todos;
   }
   const postedAt = Date.now();
-  const messages = [
-    ...existing,
-    {
-      role: "user" as const,
-      text: task.userText,
-      at: postedAt,
-    },
-    {
-      role: "assistant" as const,
-      text: finalText,
-      at: postedAt,
-      ...(thinking ? { thinking } : {}),
-      ...(todos?.length ? { todos } : {}),
-      ...(steps.length ? { steps } : {}),
-      ...(charts.length ? { charts } : {}),
-    },
-  ];
+  const assistantMessage: StoredMessage = {
+    role: "assistant",
+    text: finalText,
+    at: postedAt,
+    ...(thinking ? { thinking } : {}),
+    ...(todos?.length ? { todos } : {}),
+    ...(steps.length ? { steps } : {}),
+    ...(charts.length ? { charts } : {}),
+  };
+  // 提问在开跑时已经写进快照。这里再追加一次会让刷新后出现两条一样的用户气泡。
+  const last = existing[existing.length - 1];
+  const prior = existing[existing.length - 2];
+  const userAlreadyTail = last?.role === "user" && (last.text || "") === task.userText;
+  const turnAlreadyStored =
+    last?.role === "assistant" &&
+    (last.text || "") === finalText &&
+    prior?.role === "user" &&
+    (prior.text || "") === task.userText;
+  if (turnAlreadyStored) return true;
+  const messages = userAlreadyTail ? [...existing, assistantMessage] : [...existing, { role: "user" as const, text: task.userText, at: task.startedAt }, assistantMessage];
   await upsertMessages({ id: task.conversationId, messages });
   return true;
 }
@@ -791,8 +790,15 @@ function resolveModelSource(baseUrl: string, provider: string): string {
   return provider;
 }
 
-/** 对话消息快照单独放宽；其余接口用通用上限。0 表示该档关闭。 */
-export function bodyLimitFor(path: string, general: number, messages: number): number {
+/** 对外错误不带回内部异常原文。详情只留在服务端日志。 */
+const CLIENT_INTERNAL_ERROR = "服务端内部错误，详情见服务端日志";
+
+/**
+ * 按路径取请求体上限。0 表示该档关闭。
+ * 对话快照和上传比普通 JSON 大，单独放宽；其余接口走通用上限。
+ */
+export function bodyLimitFor(path: string, general: number, messages: number, upload: number): number {
+  if (/^\/chat\/upload\/?$/.test(path)) return upload;
   return /^\/chat\/conversations\/[^/]+\/messages\/?$/.test(path) ? messages : general;
 }
 
@@ -806,11 +812,11 @@ export function createApp() {
     return errorJson(c, 500, "INTERNAL_ERROR", "服务端内部错误，详情见服务端日志");
   });
 
-  // 请求体上限（0 = 关闭）：拒绝超大 Content-Length，挡住「声明一个巨型 body」的 OOM/DoS 向量。
-  // 仅看 Content-Length —— chunked 不带长度头的极端情况留给 Hono 自身缓冲上限。
-  // 普通接口默认 1MB。对话快照带思考过程和工具步骤，整段会过 1MB，这条单独放宽。
+  // 请求体上限（0 = 关闭）。有 Content-Length 时直接比长度；分块且不带长度时按实际字节累计，超过即 413。
+  // 普通接口默认 1MB。对话快照单独放宽。上传按单文件 5MB × 一次 4 个，再留 2MB 给 multipart 开销。
   const MAX_BODY_BYTES = Math.max(0, Number(process.env.MAX_BODY_BYTES || 1_048_576));
   const MAX_MESSAGES_BODY_BYTES = Math.max(0, Number(process.env.MAX_MESSAGES_BODY_BYTES || 8 * 1_048_576));
+  const MAX_UPLOAD_BODY_BYTES = Math.max(0, Number(process.env.MAX_UPLOAD_BODY_BYTES || 22 * 1_048_576));
   // CORS 来源：以配置 webOrigin 为主，额外允许 CHAT_CORS_ORIGINS（逗号分隔）与本地开发端口。
   // credentials: true 下必须给具体来源、绝不能是 "*"（否则浏览器直接拒绝带凭据的请求）。
   // 先 filter(Boolean) 去掉未配置的 webOrigin 等空项，避免把 "undefined" 当成一个来源。
@@ -845,16 +851,14 @@ export function createApp() {
     console.log(`[http] ${c.req.method} ${c.req.path} ${c.res.status} ${Date.now() - start}ms`);
   });
 
-  // 请求体上限守卫：声明超大 Content-Length 直接 413，不让后续解析把内存撑爆。
+  // 请求体上限：声明长度和实际读到的字节都要看，避免不带 Content-Length 的分块请求绕过。
   app.use("*", async (c, next) => {
-    const limit = bodyLimitFor(c.req.path, MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES);
-    if (limit > 0) {
-      const len = Number(c.req.header("content-length"));
-      if (Number.isFinite(len) && len > limit) {
-        return errorJson(c, 413, "PAYLOAD_TOO_LARGE", `请求体过大（上限 ${limit} 字节）`);
-      }
-    }
-    await next();
+    const limit = bodyLimitFor(c.req.path, MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, MAX_UPLOAD_BODY_BYTES);
+    if (limit <= 0) return next();
+    return bodyLimit({
+      maxSize: limit,
+      onError: (ctx) => errorJson(ctx, 413, "PAYLOAD_TOO_LARGE", `请求体过大（上限 ${limit} 字节）`),
+    })(c, next);
   });
 
   // 基础安全响应头（内联实现，避免额外依赖）。
@@ -1457,7 +1461,7 @@ export function createApp() {
       return stream;
     } catch (error) {
       console.error("[chat/stream] error:", error);
-      return errorJson(c, 500, "CHAT_STREAM_FAILED", error instanceof Error ? error.message : "请求失败");
+      return errorJson(c, 500, "CHAT_STREAM_FAILED", CLIENT_INTERNAL_ERROR);
     }
   });
 
@@ -1590,6 +1594,7 @@ export function createApp() {
               elapsedMs: Date.now() - task.startedAt,
               live: task.live,
               lastEventSeq: task.seq,
+              userText: task.userText,
             },
           }
         : {}),
@@ -1643,7 +1648,7 @@ export function createApp() {
     }
     const id = body.id || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const agentId = body.agentId || "generic";
-    // 新对话不带任何对话级设置（model / mcpServers / locale 均为空）→ 前端默认"不选中 MCP"；带 owner 标注。
+    // 新对话的 MCP 启用集由角色默认决定（通用助手默认 bi）。不在这里传空数组，空数组会盖掉默认勾选。
     // fullAccess：显式传入 > 角色默认（如客服 false）> true——不传字段才走角色默认，不能写成 !!body.fullAccess。
     const doc = await createConversation({
       id,
@@ -2112,11 +2117,16 @@ function streamNdjson(run: (send: (event: unknown) => void) => Promise<void>, op
         await run(send);
       } catch (error) {
         // 流已开启后无法再改 HTTP 状态码，转成一条 error 事件推给前端。
-        const message = error instanceof Error ? error.message : "请求失败";
+        console.error("[chat/stream] 推送中断:", error);
         try {
           controller.enqueue(
             encoder.encode(
-              JSON.stringify({ type: "error", message, code: "STREAM_ERROR", error: token("STREAM_ERROR") }) + "\n",
+              JSON.stringify({
+                type: "error",
+                message: CLIENT_INTERNAL_ERROR,
+                code: "STREAM_ERROR",
+                error: token("STREAM_ERROR", CLIENT_INTERNAL_ERROR),
+              }) + "\n",
             ),
           );
         } catch {

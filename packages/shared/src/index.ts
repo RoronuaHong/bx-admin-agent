@@ -8,6 +8,22 @@ export interface ApiErrorPayload {
   error: LocalizedToken;
 }
 
+/** 预警结论文本首行标记。服务端判定与前端展示共用这一份。 */
+export type AlertMarker = "SPIKE" | "NORMAL" | "NO_DATA";
+
+/** 认结论首行的协议标记，忽略正文。大小写不敏感；标记后可以换行，也可以同一行带摘要。 */
+export function parseAlertMarker(text: string): AlertMarker | null {
+  const first = String(text || "")
+    .trim()
+    .split(/\r?\n/, 1)[0]
+    ?.trim() || "";
+  const matched =
+    first.match(/^\[(SPIKE|NORMAL|NO_DATA)\]\s*$/i) ||
+    first.match(/^\[(SPIKE|NORMAL|NO_DATA)\](?:\s|$)/i);
+  if (!matched) return null;
+  return matched[1]!.toUpperCase() as AlertMarker;
+}
+
 /** 任务规划条目（Deep Agents 的 write_todos 形态：全量替换，非增量）。 */
 export interface TodoItem {
   content: string;

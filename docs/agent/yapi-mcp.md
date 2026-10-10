@@ -14,7 +14,7 @@
 ## 2. 接入方式
 
 - 经 `.env` 的 `MCP_BUILTIN_SERVERS`（JSON 数组）声明，由 `mcp/config.ts` 在启动期加载；`mcp/hub.ts` 以 `StdioClientTransport`（command/args）拉起子进程并连接。
-- 凭据不写进 `MCP_BUILTIN_SERVERS`：stdio 子进程继承父进程环境（放 `.env` 即可）。
+- 凭据不写进 `MCP_BUILTIN_SERVERS`：`YAPI_` 前缀会从进程环境传给 stdio 子进程（放 `.env` 即可）。其它变量名需要写进该服务器的 `env` 或 `MCP_ENV_PASSTHROUGH`。
 - 对话级启用集 `conversation.mcpServers` 持久化本对话是否启用该服务器（`app.ts` 处理勾选/清理悬空引用）。
 - 工具命名空间：`mcp__<serverId>__*`（serverId 取 `MCP_BUILTIN_SERVERS` 中该条目的 id）。
 

@@ -2,10 +2,10 @@
 // 设计要点（对齐红线 / 最佳实践）：
 // - 凭证缺失或无效时返回配置指引，绝不抛错中断对话（fail-soft）。
 // - 仅只读检索，不下写任何数据。
-// - 不写死任何业务词；文档搜索端点在联调时按钉钉开放平台实际 API 微调（TODO 标注）。
+// - 不写死任何业务词。搜索地址必须由 DINGTALK_DOC_SEARCH_URL 显式给出，未设置则不发请求。
 const CLIENT_ID = process.env.DINGTALK_CLIENT_ID;
 const CLIENT_SECRET = process.env.DINGTALK_CLIENT_SECRET;
-const DOC_BASE_URL = (process.env.DINGTALK_DOC_BASE_URL || "https://www.dingtalk.com").replace(/\/+$/, "");
+const SEARCH_URL = (process.env.DINGTALK_DOC_SEARCH_URL || "").trim();
 
 export interface DingtalkDocResult {
   ok: boolean;
@@ -34,17 +34,23 @@ export async function searchDingtalkDoc(query: string, limit = 10): Promise<Ding
     return {
       ok: false,
       text:
-        "钉钉文档检索未配置：服务端需设置 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_DOC_BASE_URL（企业内部应用凭证）。" +
+        "钉钉文档检索未配置：服务端需设置 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET（企业内部应用凭证），以及 DINGTALK_DOC_SEARCH_URL。" +
         "配置前无法检索钉钉文档；也可先把文档导出到本地知识库走 search_knowledge_base。",
+    };
+  }
+  if (!SEARCH_URL) {
+    return {
+      ok: false,
+      text:
+        "钉钉文档检索端点未联调：请设置 DINGTALK_DOC_SEARCH_URL 为开放平台实际搜索地址。未设置时不会向猜测路径发请求。",
     };
   }
   const token = await getToken();
   if (!token) {
     return { ok: false, text: "钉钉文档检索鉴权失败：无法获取 access_token（检查 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET 是否有效）。" };
   }
-  // TODO（联调）：文档搜索端点需按钉钉开放平台实际 API 微调（路径 / 参数 / 返回字段）。
   try {
-    const url = `${DOC_BASE_URL}/docs/search?keyword=${encodeURIComponent(query)}&count=${Math.min(Math.max(limit, 1), 50)}`;
+    const url = `${SEARCH_URL}${SEARCH_URL.includes("?") ? "&" : "?"}keyword=${encodeURIComponent(query)}&count=${Math.min(Math.max(limit, 1), 50)}`;
     const res = await fetch(url, {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(10000),

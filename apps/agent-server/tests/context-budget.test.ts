@@ -2,7 +2,7 @@
 // 阈值在 vitest.config.ts 的 test.env 中固定。
 import { test, expect } from "vitest";
 import { governToolResults } from "../src/chat.js";
-import { assembleContext, renderHandles } from "../src/history.js";
+import { assembleContext, renderHandles, stripUserFacingToolTrace } from "../src/history.js";
 import { estimateTokens } from "../src/models.js";
 import { fsRead, fsRemoveConversation } from "../src/fs-store.js";
 
@@ -24,6 +24,19 @@ test("[1] renderHandles", () => {
   expect(text.includes("3 行 / 12 字符")).toBe(true);
   expect(renderHandles([])).toBe("");
   expect(renderHandles(undefined)).toBe("");
+});
+
+test("[1b] 文末工具清单不进给用户的正文", () => {
+  const body = "结论在这里。\n\n[本轮已执行的工具]\n- web_search → 6 条";
+  expect(stripUserFacingToolTrace(body)).toBe("结论在这里。");
+  expect(stripUserFacingToolTrace("结论在这里。\n\n[本轮已执行的工具]")).toBe("结论在这里。");
+  expect(stripUserFacingToolTrace("正文里提到本轮已执行的工具这个词，但不是清单。")).toBe(
+    "正文里提到本轮已执行的工具这个词，但不是清单。",
+  );
+  expect(
+    stripUserFacingToolTrace("前言\n\n[本轮已执行的工具]\n- web_search → 6 条\n\n结论在清单后面。"),
+  ).toBe("前言\n\n结论在清单后面。");
+  expect(stripUserFacingToolTrace("## **[本轮已执行的工具]**\n1. web_search")).toBe("");
 });
 
 test("[2] assembleContext（窗口 + 预算 + 首条必须 user）", async () => {

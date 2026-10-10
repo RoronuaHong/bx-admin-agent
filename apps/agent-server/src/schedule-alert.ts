@@ -2,11 +2,13 @@
  * 定时任务「预警 / 仅异常通知」纯逻辑（docs/scheduled-spike-detection-plan.md）。
  * 判定业务阈值在用户指令里；这里只认输出协议标记与恢复状态——不写死任何业务词。
  */
+import { parseAlertMarker, type AlertMarker } from "@bx/shared";
+
+export type { AlertMarker };
+export { parseAlertMarker };
+
 export type ScheduleNotifyPolicy = "always" | "on_alert";
 export type SchedulePurpose = "report" | "alert";
-
-/** 模型按协议写在结论首行的标记（大小写不敏感）。 */
-export type AlertMarker = "SPIKE" | "NORMAL" | "NO_DATA";
 
 export interface ScheduleAlertState {
   /** 当前是否处于告警中（已推过 SPIKE、尚未恢复）。 */
@@ -114,7 +116,6 @@ export const SCHEDULE_ALERT_GUIDE =
   "3) **禁止** render_chart、export_data、写报告 HTML、基于截断片段估算/外推。\n" +
   "4) 取数优先短窗口（按用户指令，常见 ≤60 分钟）与**聚合/计数**接口；" +
   "列表没有总数、又要按小时或阈值计数时，调用 count_list_by_time 一次取回，不要逐页翻列表。" +
-  "会话列表的小时按开始时间计；排序字段不是每条会话的开始时间，不要拿它当分桶字段。" +
   "小时桶以外的汇总用 run_tool_code，不要用 run_script 翻页。" +
   "参数说明里没有的筛选字段不要写进查询参数。" +
   "若工具结果含「结果已截断」或首行 complete: false（计数不完整），禁止用该片段估算——仍不完整则 [NO_DATA]。\n" +
@@ -304,17 +305,6 @@ export function applyScheduledCountFacts(input: {
   return rest ? `${facts}\n\n${rest}` : facts;
 }
 
-export function parseAlertMarker(text: string): AlertMarker | null {
-  const first = String(text || "")
-    .trim()
-    .split(/\r?\n/, 1)[0]
-    ?.trim() || "";
-  const m = first.match(/^\[(SPIKE|NORMAL|NO_DATA)\]\s*$/i)
-    || first.match(/^\[(SPIKE|NORMAL|NO_DATA)\](?:\s|$)/i);
-  if (!m) return null;
-  return m[1]!.toUpperCase() as AlertMarker;
-}
-
 export function pickNotifyPolicy(value?: unknown): ScheduleNotifyPolicy {
   return value === "on_alert" ? "on_alert" : "always";
 }
@@ -490,6 +480,22 @@ export function alertNextRunAt(input: {
   return Math.min(input.finishedAt + tight, cronNext);
 }
 
+/** 定时运行默认拒绝的内置工具。交互式对话不传这份清单。澄清会空等用户，记忆会写进以后每一轮。 */
+export const SCHEDULE_DENIED_BUILTINS = [
+  "manage_schedule",
+  "list_schedules",
+  "fs_delete",
+  "run_command",
+  "run_script",
+  "request_clarification",
+  "save_memory",
+] as const;
+
+/** 写进系统提示的拒绝句。工具名只从上面的清单来，避免提示和执行闸各写一份。 */
+export function unattendedDenySentence(): string {
+  return `无人值守不允许调用 ${SCHEDULE_DENIED_BUILTINS.join("、")}；若仍调用，会被拒绝并记入本期记录。`;
+}
+
 /** 定时运行拒绝执行时写进本期工具记录的说明（交互式对话不走这里）。 */
 const UNATTENDED_DENY_REASON: Record<string, string> = {
   fs_delete: "无人值守不允许删除文件",
@@ -500,6 +506,7 @@ const UNATTENDED_DENY_REASON: Record<string, string> = {
   render_chart: "预警检查不允许出图",
   export_data: "预警检查不允许导出文件",
   request_clarification: "无人值守没有人回答澄清",
+  save_memory: "无人值守不允许写入长期记忆",
 };
 
 export function unattendedToolDenial(name: string): string {

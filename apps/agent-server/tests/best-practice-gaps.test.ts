@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { countSecretHits, redactSecrets } from "../src/redact.js";
 import { isAllowedMcpCommand } from "../src/mcp/config.js";
+import { mcpChildEnv } from "../src/mcp/hub.js";
+import { resolveMetabaseKey } from "../scripts/metabase-key.mjs";
 
 /**
  * 对齐最佳实践补齐项的回归：
@@ -92,5 +94,56 @@ describe("MCP stdio 命令白名单（ASI06 供应链）", () => {
     expect(tryAt).toBeGreaterThan(open.indexOf("conns.set"));
     expect(open.indexOf("buildTransport")).toBeGreaterThan(tryAt);
     expect(open.slice(tryAt, open.indexOf("stderr"))).toContain("conn.error");
+  });
+});
+
+describe("MCP 子进程环境（不继承整份服务端环境）", () => {
+  const snapshot = {
+    MODEL_KEY: process.env.MODEL_KEY,
+    BI_API_KEY: process.env.BI_API_KEY,
+    PATH: process.env.PATH,
+    MCP_ENV_PASSTHROUGH: process.env.MCP_ENV_PASSTHROUGH,
+    CUSTOM_MCP_TOKEN: process.env.CUSTOM_MCP_TOKEN,
+  };
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  it("留下 PATH 和 BI_ 前缀，丢掉无关密钥；cfg.env 可覆盖", () => {
+    process.env.MODEL_KEY = "secret-model";
+    process.env.BI_API_KEY = "bi-secret";
+    process.env.MCP_ENV_PASSTHROUGH = "CUSTOM_MCP_TOKEN";
+    process.env.CUSTOM_MCP_TOKEN = "named";
+    const env = mcpChildEnv({ BI_API_KEY: "from-cfg" });
+    expect(env.PATH || env.Path).toBeTruthy();
+    expect(env.BI_API_KEY).toBe("from-cfg");
+    expect(env.CUSTOM_MCP_TOKEN).toBe("named");
+    expect(env.MODEL_KEY).toBeUndefined();
+  });
+});
+
+describe("Metabase Key 不在生产回落管理员 Key", () => {
+  it("开发环境没有只读 Key 时用 BI_API_KEY", () => {
+    expect(resolveMetabaseKey({ BI_API_KEY: "admin", NODE_ENV: "development" })).toEqual({
+      key: "admin",
+      blocked: false,
+    });
+  });
+
+  it("生产环境没有只读 Key 时拒绝", () => {
+    expect(resolveMetabaseKey({ BI_API_KEY: "admin", NODE_ENV: "production" })).toEqual({
+      key: "",
+      blocked: true,
+    });
+  });
+
+  it("有只读 Key 时生产也用只读 Key", () => {
+    expect(
+      resolveMetabaseKey({ BI_READONLY_API_KEY: "ro", BI_API_KEY: "admin", NODE_ENV: "production" }),
+    ).toEqual({ key: "ro", blocked: false });
   });
 });

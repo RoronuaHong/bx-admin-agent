@@ -5,6 +5,7 @@
 //    「是否需要确认」的判定统一在 src/risk.ts（本文件只暴露 describeMcpTool）；
 // 4. 连接失败不抛错对外，只记录 error，由状态接口暴露给前端。
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { toolCodeEnv } from "../tool-code.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getServer, isAllowedMcpCommand, mcpAllowlistRequired, loadServers, type McpServerConfig } from "./config.js";
@@ -141,6 +142,33 @@ function transportRefusal(cfg: McpServerConfig): string | null {
   return null;
 }
 
+/**
+ * stdio 子进程环境：跑起来所需的 PATH 等（toolCodeEnv）+ 适配器约定前缀
+ * （BI_ / YAPI_）+ MCP_ENV_PASSTHROUGH 点名的变量 + 该服务器 cfg.env。
+ * 不继承整份 process.env，避免把模型密钥和数据库连接串交给子进程。
+ */
+export function mcpChildEnv(extra?: Record<string, string>): Record<string, string> {
+  const picked: Record<string, string> = {};
+  const named = new Set(
+    (process.env.MCP_ENV_PASSTHROUGH || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+  );
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (key === "NODE_ENV" || named.has(key) || key.startsWith("BI_") || key.startsWith("YAPI_")) {
+      picked[key] = value;
+    }
+  }
+  const merged = toolCodeEnv({ ...picked, ...(extra || {}) });
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(merged)) {
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
 function buildTransport(cfg: McpServerConfig) {
   const refused = transportRefusal(cfg);
   if (refused) throw new Error(refused);
@@ -150,7 +178,7 @@ function buildTransport(cfg: McpServerConfig) {
     return new StdioClientTransport({
       command: cfg.command || "",
       args: cfg.args || [],
-      env: { ...(process.env as Record<string, string>), ...(cfg.env || {}) } as Record<string, string>,
+      env: mcpChildEnv(cfg.env),
       cwd: cfg.cwd,
       stderr: "pipe",
     });

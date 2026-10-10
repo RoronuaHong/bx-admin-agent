@@ -5,6 +5,7 @@ import {
   validateChartArgs,
   validateClarification,
   validateTodos,
+  settleFinishedTodos,
 } from "../src/output-schema.js";
 
 /** P2 补齐项：统一输出 schema 校验（LLM02 / ASI10）。 */
@@ -91,6 +92,22 @@ describe("write_todos 输出 schema 校验", () => {
   it("非法：未知 status", () => {
     const r = validateTodos([{ content: "x", status: "maybe" }]);
     expect(r.ok).toBe(false);
+  });
+
+  it("成功收束：未完成步骤标成 completed，cancelled 保留", () => {
+    const settled = settleFinishedTodos([
+      { content: "检索", status: "in_progress" },
+      { content: "整理", status: "pending" },
+      { content: "已做", status: "completed" },
+      { content: "不做", status: "cancelled" },
+    ]);
+    expect(settled?.map((item) => item.status)).toEqual(["completed", "completed", "completed", "cancelled"]);
+  });
+
+  it("没有未完成步骤时不发更新", () => {
+    expect(settleFinishedTodos([{ content: "已做", status: "completed" }])).toBeNull();
+    expect(settleFinishedTodos([])).toBeNull();
+    expect(settleFinishedTodos(null)).toBeNull();
   });
 });
 

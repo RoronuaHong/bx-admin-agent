@@ -7,12 +7,14 @@ import { test, expect } from "vitest";
 import {
   createConversation,
   getConversation,
+  appendUserTurnIfMissing,
   upsertMessages,
   deleteConversation,
   compactSnapshot,
   listSnapshot,
   SNAPSHOT_DETAIL_TAIL,
 } from "../src/conversations.js";
+import { getRole } from "../src/roles.js";
 
 /** 唯一 id：Mongo 在线时文档会真实落库，避免与其它用例 / 真实对话互相干扰。 */
 const uniq = (tag: string) => `conv_test_${tag}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -91,7 +93,29 @@ test("⑦上一期的相同结论仍要追加", async () => {
   await deleteConversation(id);
 });
 
-test("⑧快照只给最近一段留思考过程，列表则一律不带", () => {
+test("⑧开跑时先记下提问，客户端按旧基线回写整轮时不重复这条提问", async () => {
+  const id = uniq("user-first");
+  await createConversation({ id, title: "d" });
+  await appendUserTurnIfMissing(id, "前3个月净利润多少？", 1000);
+  await appendUserTurnIfMissing(id, "前3个月净利润多少？", 1000);
+  expect((await getConversation(id))!.messages).toEqual([{ role: "user", text: "前3个月净利润多少？", at: 1000 }]);
+  // 客户端还停在「库里是 0 条」，把提问和回复一起交上来。
+  await upsertMessages({
+    id,
+    messages: [
+      { role: "user", text: "前3个月净利润多少？", at: 1000 },
+      { role: "assistant", text: "这个数我给不出来。", at: 2000 },
+    ],
+    base: 0,
+  });
+  const msgs = (await getConversation(id))!.messages;
+  expect(msgs).toHaveLength(2);
+  expect(msgs[0]).toMatchObject({ role: "user", text: "前3个月净利润多少？" });
+  expect(msgs[1]).toMatchObject({ role: "assistant", text: "这个数我给不出来。" });
+  await deleteConversation(id);
+});
+
+test("⑨快照只给最近一段留思考过程，列表则一律不带", () => {
   const older = { role: "assistant" as const, text: "结论", thinking: "很长的思考", steps: [{ name: "count", status: "ok", result: "complete: true" }] };
   const recent = { role: "assistant" as const, text: "新结论", thinking: "x".repeat(20), steps: [{ name: "count", status: "ok", result: "ok" }] };
   const messages = [...Array.from({ length: SNAPSHOT_DETAIL_TAIL }, () => ({ ...older, steps: older.steps.map((s) => ({ ...s })) })), recent];
@@ -116,4 +140,16 @@ test("⑨全量替换向后兼容：不带 base（或 full）仍整段覆盖", a
   expect(msgs).toHaveLength(1);
   expect(msgs[0]).toMatchObject({ role: "user", text: "only" });
   await deleteConversation(id);
+});
+
+test("⑩通用助手新建对话不预勾连接器，显式空数组也不勾", async () => {
+  expect(getRole("generic").defaultMcpServers).toBeUndefined();
+  const id = uniq("generic-bi");
+  await createConversation({ id, title: "n" });
+  expect((await getConversation(id))!.mcpServers || []).toEqual([]);
+  const emptyId = uniq("explicit-empty");
+  await createConversation({ id: emptyId, title: "e", mcpServers: [] });
+  expect((await getConversation(emptyId))!.mcpServers).toEqual([]);
+  await deleteConversation(id);
+  await deleteConversation(emptyId);
 });

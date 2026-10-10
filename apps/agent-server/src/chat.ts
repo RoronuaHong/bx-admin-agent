@@ -27,7 +27,8 @@ import {
 import { applyScheduleStatus } from "./notify/deliver.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
-import { appendContext, getConversation, patchConversation, setConversationSummary } from "./conversations.js";
+import { appendContext, getConversation, patchConversation, setConversationSummary, setConversationTodos } from "./conversations.js";
+import { settleFinishedTodos } from "./output-schema.js";
 import { offloadToolResult } from "./fs-store.js";
 import {
   callAgent,
@@ -40,7 +41,7 @@ import {
   type Turn,
 } from "./models.js";
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
-import { getServer } from "./mcp/config.js";
+import { getServer, loadServers } from "./mcp/config.js";
 import { annotateMcpToolSpec, applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
 import { isHardDenied, resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
 import type { ToolHandle } from "./session.js";
@@ -77,7 +78,7 @@ import { wrapUntrusted } from "./untrusted.js";
 import { webSearchStatus } from "./web-search.js";
 import { getUploadImage, getUploadFile } from "./uploads.js";
 import { parseFile } from "./rag/parsers.js";
-import { assembleContext } from "./history.js";
+import { assembleContext, stripUserFacingToolTrace } from "./history.js";
 import { appendRoundTrace, appendSpanTrace } from "./trace.js";
 import { redactSensitive, countSecretHits } from "./redact.js";
 import { autonomyFor } from "./autonomy.js";
@@ -644,6 +645,52 @@ const ALERT_WRAP_PROTOCOL =
 const BLANK_SYNTHESIS_HINT =
   "上一轮没有写出面向用户的正文。请直接写结论，不要只写思考过程。能根据已有结果作答就不要再调用工具。";
 
+/**
+ * 模型已经判断「也许是外部主体」，却把公开检索留成让用户确认。
+ * 规则是：一次检索能把读法分开就先查。这里只认这一种收束，不认产品名。
+ */
+export function defersPublicLookup(text: string): boolean {
+  const body = String(text || "");
+  const asksFirst =
+    /外部/.test(body) && /联网|公开检索|公网/.test(body) && /确认|要不要|是否|告诉我/.test(body);
+  // 已经写出具体笔数/条数的，是自有业务结论，不是「库里没有这个主体」。
+  const deliveredCount = /\d[\d,]{2,}\s*(笔|条|元|个)/.test(body);
+  const closesOnInternalMiss =
+    !deliveredCount &&
+    /自有|数据源|主库/.test(body) &&
+    (/未找到|无结果|没命中|未发现/.test(body) || /没有[^。\n]{0,24}(数据|主体|相关)/.test(body));
+  return asksFirst || closesOnInternalMiss;
+}
+
+/**
+ * 只查过已连接的库，就把「库里没有这个指标」写成结论。
+ * 不依赖「主库 / 自有 / 数据源」这几个词：模型换一种说法时，来源仍然没分开。
+ * 已经给出具体笔数，或正文已经在说公开检索，都不是这种收束。
+ */
+export function answeredFromWarehouseMiss(text: string): boolean {
+  const body = String(text || "");
+  if (/\d[\d,]{2,}\s*(笔|条|元|个|单)/.test(body)) return false;
+  if (/公开检索|来源链接|web_search/.test(body)) return false;
+  const miss = /无法|不足以|没有确认|未找到|查不到|没命中|零命中|0\s*条|给不出|算不出|没有任何/.test(body);
+  const warehouse = /表|资产|指标|字段|记录|库|口径/.test(body);
+  return miss && warehouse;
+}
+
+const PUBLIC_LOOKUP_HINT =
+  "不要把「要不要公开检索」交回用户确认。这句话若同时有外部主体和自有业务两种读法，公开检索能把它们分开，就现在调用 web_search。" +
+  "不要再用自有业务连接器检索这个专名。用户已经把主体说成自己的业务时，不要改去公网，直接说明这个库没有该指标。";
+
+export function gaveUpAfterOwnBusinessBlock(text: string): boolean {
+  return /没能取到|没有返回|未返回|没拿到|无法确认|连接失败|没有可用/.test(String(text || ""));
+}
+
+const RETRY_OWN_BUSINESS_HINT =
+  "上一轮自有业务工具没有执行：当时技能正文还没进上下文，所以被拦住了。这不是连接失败，也不是库里没有数据。现在直接再调用那个自有业务工具取数。";
+
+const EMPTY_AFTER_INTERNAL_HINT =
+  "上一轮没有写出结论。若已有结果里已经有用户要的自有业务数字，直接写结论，不要再查。" +
+  "若结果只是自有库里没有这个主体，不要据此收束，现在调用 web_search。";
+
 /** 工具结果回到上下文后的整合提示：先判断能否作答，缺的才再查。只注入一次。 */
 const INTEGRATE_HINT =
   "上一轮工具已经返回结果。先根据这些结果整合并判断能不能回答用户。\n" +
@@ -860,6 +907,50 @@ export function summarizeArgsForConfirm(argsJson: string): Array<{ key: string; 
  * 工具清单是注入模型的 system 前缀的一部分，顺序稳定才谈得上 prompt 缓存命中。
  * 超出 MCP_MAX_TOOLS 时按顺序截断，并把「被裁掉的服务器」回报给调用方 —— 不静默丢弃。
  */
+/**
+ * 自有业务连接器的选源边界。
+ * 通用对话默认启用 bi，且工具数少时会整份注入（eager）。模型按工具说明选工具，
+ * 不会先翻技能正文。说明若只写「按关键词搜库」，净利润这类问题就会用这个库去核对专名。
+ * 与「业务取数」技能索引同一句边界，放在说明最前，让选工具的那一步看得到。
+ */
+const OWN_BUSINESS_TOOL_SCOPE =
+  "只用于已连接的自有业务数据。主体落在外部世界时不要调用，也不要用本工具的检索结果判断这个主体是不是自有数据。";
+
+/** 自有业务连接器对应的技能目录。未读全文前不允许执行，避免模型只看工具说明就把专名送进这个库。 */
+export const OWN_BUSINESS_SKILL = "business-data-query";
+
+export function ownBusinessToolRefusal(toolName: string, skillsRead: ReadonlySet<string>): string | null {
+  if (!toolName.startsWith("mcp__bi__")) return null;
+  if (skillsRead.has(OWN_BUSINESS_SKILL)) return null;
+  return (
+    "未执行，不是查询失败，库里也不是没有数据。调用自有业务连接器之前要先读完 business-data-query。" +
+    "若这一轮已经读过该技能，下一轮直接再调用本工具取数，不要告诉用户连接失败或没有返回。" +
+    "主体落在外部世界时不要用这个连接器，改用 web_search。"
+  );
+}
+
+/** 用户原话里的拉丁字母专名。还没做公开检索时，不能拿它去已连接的库里对归属。 */
+export function unscopedNameTokens(userText: string): string[] {
+  const found = String(userText || "").match(/[A-Za-z][A-Za-z0-9]{3,}/g) || [];
+  return [...new Set(found.map((token) => token.toLowerCase()))];
+}
+
+export const UNSCOPED_NAME_BI_REFUSAL =
+  "未执行。这句话里的专名还没有落到已连接的数据上，不要用这个连接器去找它，也不要用查找结果判断它属不属于这里。先调用 web_search。公开检索之后，如果要的是已连接业务里的指标，再回到这个连接器取数。";
+
+export function ownBusinessNameRefusal(toolName: string, userText: string, usedWebSearch: boolean): string | null {
+  if (usedWebSearch) return null;
+  if (!toolName.startsWith("mcp__bi__")) return null;
+  if (!unscopedNameTokens(userText).length) return null;
+  return UNSCOPED_NAME_BI_REFUSAL;
+}
+
+function rememberSkillRead(skillsRead: Set<string>, args: unknown): void {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return;
+  const name = String((args as Record<string, unknown>).name || "").trim();
+  if (name) skillsRead.add(name);
+}
+
 /** 模型看到的 MCP 工具说明：带上该服务器配置的固定 path_variables（如 SalesIQ screenname）。 */
 export function mcpToolSpec(tool: McpToolInfo): ToolSpec {
   const presented = annotateMcpToolSpec({
@@ -867,7 +958,9 @@ export function mcpToolSpec(tool: McpToolInfo): ToolSpec {
     parameters: tool.inputSchema,
     defaults: pathDefaultsForTool(getServer(tool.serverId)?.pathDefaults, tool.tool),
   });
-  return { name: tool.name, description: presented.description, parameters: presented.parameters };
+  const description =
+    tool.serverId === "bi" ? `${OWN_BUSINESS_TOOL_SCOPE}${presented.description}` : presented.description;
+  return { name: tool.name, description, parameters: presented.parameters };
 }
 
 export function selectMcpToolSpecs(tools: McpToolInfo[]): { specs: ToolSpec[]; droppedServers: string[] } {
@@ -1591,6 +1684,8 @@ interface LoopOutcome {
   countReportText: string;
   /** 累计发送的 prompt token 估算（成本护栏开启时统计）。 */
   spentTokens: number;
+  /** 本轮 write_todos 最后一次写给前端的计划。收束时用它，避免落库失败后读到旧计划盖掉新的。 */
+  todos: TodoItem[] | null;
 }
 
 /** 工具循环：模型 → tool_calls → 执行（内置 / MCP / 委派）→ 回灌 → 再调用，直到结论或轮次上限。 */
@@ -1638,15 +1733,23 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let clearedToolResults = 0;
   let offloadedToolResults = 0;
   let toolCallCount = 0;
+  let latestTodos: TodoItem[] | null = null;
   // 副作用计数（写/删/未知保守）：与「工具调用次数」分开——只读调用重跑无副作用，不该阻止换模型。
   let sideEffects = 0;
   // 循环护栏：同轮去重集合（每轮重置）+ 跨轮 Doom Loop 检测器。
   const executedSigs = new Set<string>();
   // 模型直接翻列表：每个列表工具本轮只放行第一页。代码桥和 count_list_by_time 不走这条。
   const directListSeen = new Set<string>();
+  const skillsRead = new Set<string>();
+  // 本轮开始前已经读过的技能。同一轮里模型还没看见技能正文，不能用这次 read_skill 给 BI 放行。
+  let skillsVisible = new Set<string>();
   const callToolFromCode = async (name: string, args: Record<string, unknown>) => {
     const denied = toolCodeDenied(name);
     if (denied) return { ok: false, text: denied };
+    const nameBlocked = ownBusinessNameRefusal(name, userQuestion, usedWebSearch);
+    if (nameBlocked) return { ok: false, text: nameBlocked };
+    const ownBusinessBlocked = ownBusinessToolRefusal(name, skillsVisible);
+    if (ownBusinessBlocked) return { ok: false, text: ownBusinessBlocked };
     const verdict = resolveToolRisk(name, ctx.grantServers, args);
     if (verdict.level !== "read" || verdict.deny || verdictNeedsConfirm(verdict)) {
       return { ok: false, text: `代码里只能调用只读且免确认的工具（${name}：${verdict.reason}）` };
@@ -1662,7 +1765,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       codeHooks,
       ctx.timeZone,
     );
-    if (builtin) return { ok: builtin.ok, text: builtin.text };
+    if (builtin) {
+      if (name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, args);
+      return { ok: builtin.ok, text: builtin.text };
+    }
     hydrateDeferred(name);
     const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
     return { ok: !result.isError, text: result.text };
@@ -1699,6 +1805,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const wrapReasoning: string[] = [];
   let integrateHinted = false;
   let blankSynthesisNudged = false;
+  let publicLookupNudged = false;
+  let keepToolsForLookup = false;
+  let usedWebSearch = false;
+  let usedOwnBusiness = false;
+  let ownBusinessRefused = false;
+  let ownBusinessExecuted = false;
+  let ownBusinessRetryNudged = false;
   /** 本轮证据的**来源集合**（工具名 / 服务器标识）：回答里声称的来源要能与它对上，否则就是编造的引用。 */
   const evidenceSources = new Set<string>();
   /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
@@ -1741,12 +1854,18 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // 最后一轮收尾：无人值守一律摘工具；交互式在已经有证据时同样摘工具。
     // 否则模型可以一路调工具打满预算，综合轮永远不出现。还没有证据时保留工具，留给最后一次取数。
     // 提示只压入一次：放进下面的重试循环里，瞬时失败重试会把同一段摘录再塞一遍。
-    const wrapUp = shouldForceSynthesisRound({
-      round,
-      maxRounds: ctx.maxRounds,
-      forceWrapUp: ctx.forceWrapUp === true,
-      evidenceCalls: groundingEvidence,
-    });
+    const wrapUp =
+      !keepToolsForLookup &&
+      shouldForceSynthesisRound({
+        round,
+        maxRounds: ctx.maxRounds,
+        forceWrapUp: ctx.forceWrapUp === true,
+        evidenceCalls: groundingEvidence,
+      });
+    if (keepToolsForLookup) {
+      keepToolsForLookup = false;
+      console.log("[chat:source] 这一轮保留工具，先做公开检索");
+    }
     if (wrapUp && round > 0) {
       console.log(
         ctx.forceWrapUp
@@ -1874,6 +1993,23 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           );
           continue;
         }
+      }
+      if (
+        !publicLookupNudged &&
+        !usedWebSearch &&
+        webSearchStatus().available &&
+        outcome.text.trim() &&
+        (defersPublicLookup(outcome.text) ||
+          (usedOwnBusiness && answeredFromWarehouseMiss(outcome.text)))
+      ) {
+        publicLookupNudged = true;
+        keepToolsForLookup = true;
+        if (round + 3 > ctx.maxRounds) ctx.maxRounds = round + 3;
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        conversation.push({ role: "assistant", content: outcome.text });
+        conversation.push({ role: "user", content: PUBLIC_LOOKUP_HINT });
+        console.log("[chat:source] 把公开检索留成确认，已要求先检索");
+        continue;
       }
       // 零证据收束：没有事实断言则放行；有事实断言才作废重试，用尽后走诚实兜底（详见 grounding.ts）。
       const grounding = decideGrounding({
@@ -2014,11 +2150,50 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (!outcome.text.trim()) {
         if (!blankSynthesisNudged && round + 1 < ctx.maxRounds) {
           blankSynthesisNudged = true;
-          conversation.push({ role: "user", content: BLANK_SYNTHESIS_HINT });
-          console.log("[chat:blank] 综合轮没有正文，已要求重写结论");
+          const afterInternalMiss = usedOwnBusiness && !usedWebSearch && webSearchStatus().available;
+          conversation.push({
+            role: "user",
+            content: afterInternalMiss ? EMPTY_AFTER_INTERNAL_HINT : BLANK_SYNTHESIS_HINT,
+          });
+          console.log(
+            afterInternalMiss
+              ? "[chat:source] 自有库之后没有结论，已要求改做公开检索"
+              : "[chat:blank] 综合轮没有正文，已要求重写结论",
+          );
           continue;
         }
         break;
+      }
+      if (
+        !ownBusinessRetryNudged &&
+        ownBusinessRefused &&
+        !ownBusinessExecuted &&
+        skillsRead.has(OWN_BUSINESS_SKILL) &&
+        round + 1 < ctx.maxRounds &&
+        gaveUpAfterOwnBusinessBlock(outcome.text)
+      ) {
+        ownBusinessRetryNudged = true;
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        conversation.push({ role: "assistant", content: outcome.text });
+        conversation.push({ role: "user", content: RETRY_OWN_BUSINESS_HINT });
+        console.log("[chat:source] 自有业务工具被技能闸拦住后模型停了，已要求重试取数");
+        continue;
+      }
+      if (
+        !publicLookupNudged &&
+        !usedWebSearch &&
+        webSearchStatus().available &&
+        (defersPublicLookup(outcome.text) ||
+          (usedOwnBusiness && answeredFromWarehouseMiss(outcome.text)))
+      ) {
+        publicLookupNudged = true;
+        keepToolsForLookup = true;
+        if (round + 3 > ctx.maxRounds) ctx.maxRounds = round + 3;
+        text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+        conversation.push({ role: "assistant", content: outcome.text });
+        conversation.push({ role: "user", content: PUBLIC_LOOKUP_HINT });
+        console.log("[chat:source] 把公开检索留成确认，已要求先检索");
+        continue;
       }
       synthesisText = outcome.text;
       if (roundText && !canonicalAlertFacts) yield { type: "text_delta", text: roundText };
@@ -2042,6 +2217,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
 
     // 逐个处理；**连续的** task 委派合并成一批并行执行（对齐 Deep Agents：单轮多个 task 并行）。
     const calls = outcome.toolCalls;
+    if (calls.some((call) => call.name === "web_search")) usedWebSearch = true;
+    if (calls.some((call) => call.name.startsWith("mcp__bi__"))) usedOwnBusiness = true;
+    skillsVisible = new Set(skillsRead);
     let index = 0;
 
     /**
@@ -2111,6 +2289,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.timeZone,
       );
       if (builtin) {
+        if (c.name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, safeJsonParse(c.argsJson));
         return {
           ok: builtin.ok,
           rawText: builtin.text,
@@ -2120,12 +2299,22 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
+      const nameBlocked = ownBusinessNameRefusal(c.name, userQuestion, usedWebSearch);
+      if (nameBlocked) return { ok: false, rawText: nameBlocked, executed: false };
+      const blocked = ownBusinessToolRefusal(c.name, skillsVisible);
+      if (blocked) {
+        ownBusinessRefused = true;
+        return { ok: false, rawText: blocked, executed: false };
+      }
       const refused = admitDirectListCall(c.name, c.argsJson, directListSeen);
       if (refused) return { ok: false, rawText: refused, executed: false };
       hydrateDeferred(c.name);
       const result = await callMcpTool(c.name, mcpArgs(c.name, c.argsJson), ctx.signal);
       if (result.isError) releaseDirectListCall(c.name, c.argsJson, directListSeen);
-      else rememberDirectListPage(c.name, c.argsJson, result.text, directListSeen);
+      else {
+        rememberDirectListPage(c.name, c.argsJson, result.text, directListSeen);
+        if (c.name.startsWith("mcp__bi__")) ownBusinessExecuted = true;
+      }
       return { ok: !result.isError, rawText: result.text, executed: true };
     };
     while (index < calls.length) {
@@ -2319,7 +2508,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               pushEvidence(out.rawText, item.call.name);
               noteWrapUpEvidence(wrapEvidence, item.call.name, out.rawText);
             }
-            if (out.todos) yield { type: "todos", todos: out.todos };
+            if (out.todos) {
+              latestTodos = out.todos;
+              yield { type: "todos", todos: out.todos };
+            }
             if (out.chart)
               yield {
                 type: "chart",
@@ -2504,8 +2696,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (builtin) {
         ok = builtin.ok;
         rawText = builtin.text;
+        if (call.name === "read_skill" && builtin.ok) {
+          rememberSkillRead(skillsRead, safeJsonParse(call.argsJson));
+        }
         // 任务规划即时可见（事件流），同时已持久化到 conversation.todos。
-        if (builtin.todos) yield { type: "todos", todos: builtin.todos };
+        if (builtin.todos) {
+          latestTodos = builtin.todos;
+          yield { type: "todos", todos: builtin.todos };
+        }
         if (builtin.chart)
           yield {
             type: "chart",
@@ -2518,33 +2716,46 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         if (builtin.artifact) yield { type: "artifact", ...builtin.artifact };
         // 结构化澄清：工具层不能自己挂起（事件发不出去），由循环下发事件并等待用户选择。
         if (builtin.clarification) {
-          const pending = requestClarification({
-            sessionId: ctx.sessionId || "",
-            conversationId: ctx.conversationId,
-            callId: call.id,
-          });
-          yield {
-            type: "clarification_required",
-            id: call.id,
-            ticket: pending.ticket,
-            question: builtin.clarification.question,
-            options: builtin.clarification.options,
-            ...(builtin.clarification.missingField ? { missingField: builtin.clarification.missingField } : {}),
-            ...(builtin.clarification.whyItMatters ? { whyItMatters: builtin.clarification.whyItMatters } : {}),
-            expiresInMs: pending.timeoutMs,
-          };
-          const answer = await pending.wait;
-          yield {
-            type: "clarification_response",
-            id: call.id,
-            ...(answer.value ? { answer: answer.value } : {}),
-          };
-          // 回执按「点选 / 自由文本 / 跳过 / 超时」分口径构造（见 buildClarifyAck）；
-          // ok 已由 builtin.ok（澄清成功必为 true）给出，无需重复赋值。
-          rawText = buildClarifyAck(answer, builtin.clarification.options);
+          const question = builtin.clarification.question || "";
+          const lookupStillOpen =
+            !usedWebSearch &&
+            webSearchStatus().available &&
+            (usedOwnBusiness || defersPublicLookup(question) || answeredFromWarehouseMiss(question));
+          if (lookupStillOpen) {
+            rawText = PUBLIC_LOOKUP_HINT;
+            console.log("[chat:source] 澄清会把来源留给用户，已改为先做公开检索");
+          } else {
+            const pending = requestClarification({
+              sessionId: ctx.sessionId || "",
+              conversationId: ctx.conversationId,
+              callId: call.id,
+            });
+            yield {
+              type: "clarification_required",
+              id: call.id,
+              ticket: pending.ticket,
+              question: builtin.clarification.question,
+              options: builtin.clarification.options,
+              ...(builtin.clarification.missingField ? { missingField: builtin.clarification.missingField } : {}),
+              ...(builtin.clarification.whyItMatters ? { whyItMatters: builtin.clarification.whyItMatters } : {}),
+              expiresInMs: pending.timeoutMs,
+            };
+            const answer = await pending.wait;
+            yield {
+              type: "clarification_response",
+              id: call.id,
+              ...(answer.value ? { answer: answer.value } : {}),
+            };
+            // 回执按「点选 / 自由文本 / 跳过 / 超时」分口径构造（见 buildClarifyAck）；
+            // ok 已由 builtin.ok（澄清成功必为 true）给出，无需重复赋值。
+            rawText = buildClarifyAck(answer, builtin.clarification.options);
+          }
         }
       } else {
-        const refused = admitDirectListCall(call.name, call.argsJson, directListSeen);
+        const nameBlocked = ownBusinessNameRefusal(call.name, userQuestion, usedWebSearch);
+        const blocked = nameBlocked ? null : ownBusinessToolRefusal(call.name, skillsVisible);
+        const refused = nameBlocked || blocked || admitDirectListCall(call.name, call.argsJson, directListSeen);
+        if (blocked) ownBusinessRefused = true;
         if (refused) {
           ok = false;
           rawText = refused;
@@ -2555,7 +2766,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ok = !result.isError;
           rawText = result.text;
           if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
-          else rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
+          else {
+            rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
+            if (call.name.startsWith("mcp__bi__")) ownBusinessExecuted = true;
+          }
         }
       }
       // 副作用计数：真正执行过、且级别非只读的调用。只读（read）不计——换模型重跑只读调用没有副作用，
@@ -2722,6 +2936,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     spentTokens,
     countMarker,
     countReportText,
+    todos: latestTodos,
   };
 }
 
@@ -3169,6 +3384,9 @@ export async function* chatStream(
         limit: MCP_MAX_TOOLS,
         // 联网检索通道：可用性进系统提示，让模型在「不可用」时如实说明而不是凭记忆作答。
         web: webChannel,
+        notSelected: loadServers()
+          .filter((server) => server.enabled !== false && !enabled.includes(server.id))
+          .map((server) => server.label),
         ...(toolSearch
           ? {
               deferred: true,
@@ -3219,6 +3437,7 @@ export async function* chatStream(
   let text = "";
   let failure: string | null = null;
   let handles: ToolHandle[] = [];
+  let latestTodos: TodoItem[] | null = null;
   let clearedToolResults = 0;
   let offloadedToolResults = 0;
   let budget = 0;
@@ -3343,6 +3562,7 @@ export async function* chatStream(
     text = outcome.text;
     const loop = outcome as LoopOutcome;
     handles = loop.handles || [];
+    if (useTools) latestTodos = loop.todos;
     clearedToolResults = loop.clearedToolResults || 0;
     offloadedToolResults = loop.offloadedToolResults || 0;
     rounds = loop.rounds || 0;
@@ -3471,18 +3691,29 @@ export async function* chatStream(
     (ungrounded ? UNGROUNDED_REPLY : "");
   // 工具已返回但正文仍空：不要落成「生成未产出内容」。这句话不是协议结论，调度侧会记失败。
   const withGap = concluded.trim() || (toolCalls > 0 ? CONCLUSION_GAP_AFTER_TOOLS : CONCLUSION_GAP);
-  const rawFinalText = opts.scheduleStatusLine
-    ? applyScheduleStatus(withGap, opts.scheduleStatusLine)
-    : withGap;
-  const finalText = redactSensitive(rawFinalText);
-  if (finalText !== rawFinalText) {
-    console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(rawFinalText)} 处`);
+  // 先去掉工具清单，再附定时状态。状态行也是「- …」，附在清单后面会被当成同一张表删掉。
+  const visibleText = opts.scheduleStatusLine
+    ? applyScheduleStatus(stripUserFacingToolTrace(withGap), opts.scheduleStatusLine)
+    : stripUserFacingToolTrace(withGap);
+  const finalText = redactSensitive(visibleText);
+  if (finalText !== visibleText) {
+    console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(visibleText)} 处`);
   }
   // 上下文写回该对话（thread）：单文档原子追加（$push + $inc）。
   await appendContext(conversationId, [
     { role: "user", text: userText },
     handles.length ? { role: "assistant", text: finalText, handles } : { role: "assistant", text: finalText },
   ]);
+  // 成功收束才收计划：进行中/未开始标成完成。中断或失败不收，避免把没做完的步骤画成勾。
+  // 本轮写过计划就用事件里的那份；落库失败时再读库会拿到旧计划，把前端刚显示的新计划盖掉。
+  const plan = latestTodos ?? (await getConversation(conversationId).catch(() => null))?.todos;
+  const settledTodos = settleFinishedTodos(plan);
+  if (settledTodos) {
+    await setConversationTodos(conversationId, settledTodos).catch((err) => {
+      console.warn(`[chat] 收束任务计划失败：${String((err as Error)?.message || err)}`);
+    });
+    yield { type: "todos", todos: settledTodos };
+  }
   yield { type: "text", text: finalText };
   yield usage;
   yield { type: "done" };

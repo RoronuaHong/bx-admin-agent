@@ -123,8 +123,13 @@ export async function saveUpload(file: {
   }
   const id = randomUUID();
   const path = resolve(UPLOAD_DIR, `${id}.${ext}`);
-  mkdirSync(UPLOAD_DIR, { recursive: true });
-  writeFileSync(path, Buffer.from(await file.arrayBuffer()));
+  try {
+    mkdirSync(UPLOAD_DIR, { recursive: true });
+    writeFileSync(path, Buffer.from(await file.arrayBuffer()));
+  } catch (error) {
+    console.error("[upload] 落盘失败:", error);
+    throw new Error("文件保存失败");
+  }
   const mediaType = (file.type || "").split(";")[0].trim().toLowerCase() || MEDIA_BY_EXT[ext] || "application/octet-stream";
   store.set(id, { id, mediaType, size: file.size, createdAt: Date.now(), path, name: file.name || `upload.${ext}` });
   return { id, name: file.name || `upload.${ext}`, size: file.size };

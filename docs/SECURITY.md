@@ -29,7 +29,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | 模型输出不可信 | 模型可能输出 prompt 注入（来自知识库/工具返回/子代理回传），所有外部内容走定界处理 |
 | 子进程代码来自模型 | `run_tool_code` 的代码是模型生成的，**可被 prompt 注入操控**，故其子进程受多重约束；`TOOL_CODE_FS_ALLOW` 放行凭据文件会削弱 §8.3 守卫，慎用 |
 
-**已明确不做**（超出当前范围）：OS 级容器沙箱、登录/多租户、多实例分布式限流、模型回复（出站）脱敏。见 §15。
+**已明确不做**（超出当前范围）：OS 级容器沙箱、登录/多租户、多实例分布式限流。凭据形态打码始终开启；通用 PII 打码默认关闭（`REDACT_PII=on` 才启用）。见 §15。
 
 ---
 
@@ -77,7 +77,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 
 ## 7. 输入处理
 
-- **请求体上限**：`MAX_BODY_BYTES`（默认 1MB，`0` 关闭）。声明超大 `Content-Length` 直接 `413`，挡住「巨型 payload」的 OOM/DoS 向量（仅看 `Content-Length`，chunked 不带长度头时由 Hono 自身缓冲上限兜底）。
+- **请求体上限**：`MAX_BODY_BYTES`（默认 1MB，`0` 关闭）。有 `Content-Length` 时直接比较；分块且不带长度时按实际读到的字节累计，超过即 `413`（`hono/body-limit`）。对话快照走 `MAX_MESSAGES_BODY_BYTES`（默认 8MB），上传走 `MAX_UPLOAD_BODY_BYTES`（默认 22MB）。
 - **全局错误兜底**：`app.onError` 把任何 handler 抛出的未捕获异常收敛成统一 JSON（`INTERNAL_ERROR`），不把内部堆栈/路径回吐给客户端，服务端留痕。
 - **ReDoS 护栏**（`fs-store.ts` `isCatastrophicPattern`，用于 `fsGrep` 等把正则交模型的入口）：
   - 拦「嵌套/量词套量词」：`(a+)+`、`(.*)*`、`(a*)*b`、`(a+b)+`、`((a+)b)+`、`(a+){2,}`。
@@ -116,7 +116,7 @@ bx-admin-agent 是一个 AI 对话 Agent 运行时：后端（Hono + TS）暴露
 | 环境白名单（不继承服务端凭据） | `ENV_ALLOW` | 子进程只拿到跑起来必需的环境变量（`PATH`/`TEMP`/locale 等）。**不继承** `process.env` 全量——否则把 `MONGO_URI`、各家 API key 交给「模型写的、可被注入操控」的代码，配上不受限出网即凭据外带 |
 | 输出边收边截断 | `STREAM_CAPTURE_MAX = 4MB` | 收集中超过上限即停止累加并标注，避免「疯狂 `print`」在收齐前先把内存打爆 |
 | 展示截断 | `OUTPUT_MAX = 12KB` | 回给模型的输出保头尾截断 |
-| 超时 + 强杀兜底 | run_tool_code：超时先 `SIGTERM`，1.5s 未退出升级 `SIGKILL`；run_command/run_script 走 `exec` 的 `timeout`（仅 `SIGTERM`，无 SIGKILL 升级） | 不留孤儿进程（run_tool_code 路径有 SIGKILL 兜底） |
+| 超时 + 强杀兜底 | 三条路径都是超时先 `SIGTERM`，1.5s 未退出升级 `SIGKILL` | 不留忽略软终止的孤儿进程 |
 | **并发上限** | `TOOL_SUBPROCESS_MAX_CONCURRENT = 4` | 进程内信号量，把「同时在跑的子进程数」收敛到上限，多出排队。防 fork-bomb / 资源耗尽（恶意或 bug 代码瞬间拉起大量解释器） |
 | 工具调用上限 | `TOOL_CODE_MAX_CALLS = 400` | `run_tool_code` 经只读桥调工具的调用次数上限 |
 | 只读工具桥 | `run_tool_code` 只能调 `read` 级工具 | 桥接服务端工具时强制 `verdict.level === "read"` 且免确认；MCP 写工具进不来 |
@@ -144,6 +144,7 @@ stdio 传输会 `spawn` 任意命令——**加了管理员令牌也挡不住**�
 - `MCP_ALLOWED_COMMANDS`（逗号分隔，可选）：配置后，stdio 命令必须命中名单（同时认完整路径与可执行名，如 `npx` 与 `/usr/bin/npx`）。
 - **两处校验**：配置时（`validateServerInput`）+ 建连时（`hub.ts` `transportRefusal`，在 `buildTransport` 里、真正 spawn 之前）。第二处挡的是「白名单启用前就已落盘」的旧服务器。拒绝记在连接的 `error` 上，避免半成品一直停在连接中。
 - 未配置时：开发环境放行。`NODE_ENV=production` 未配则拒绝全部 stdio（配置校验与 spawn 前都生效）。生产清单见 §14。
+- **子进程环境**（`mcpChildEnv`）：只给跑起来所需的 `PATH` 等、`BI_` / `YAPI_` 前缀、`MCP_ENV_PASSTHROUGH` 点名的变量，以及该服务器自己的 `env`。不继承 `MONGO_URI` 和模型密钥。自定义 MCP 要额外变量时，写进服务器 `env` 或 `MCP_ENV_PASSTHROUGH`。
 
 ### 8.6 出站凭据打码（OWASP ASI05 / LLM06）
 
@@ -280,6 +281,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 - [ ] 改 `.env` / 代码后重启：`pm2 delete agent-server-dev` → 确认 8787 释放 → `pm2 start ecosystem.dev.config.cjs --only agent-server-dev`。
 - [ ] 不信任网络下部署 `run_tool_code`/`run_command`/`run_script` 前，先解决 §8.4 的沙箱缺口。
 - [ ] 生产设置 `NODE_ENV=production`，并配置 `MCP_ALLOWED_COMMANDS`（未配则 stdio MCP 起不来）。需要内容级拒绝时再开 `MCP_REQUIRE_PROVENANCE=on`。
+- [ ] 生产 BI 配置 `BI_READONLY_API_KEY`。未配置时适配器拒绝连接，不会回落 `BI_API_KEY`。
 - [ ] 依赖审计进非阻断 CI；前端类型检查进非阻断 CI（巨型 SFC 结果不稳定）。
 
 ---
@@ -291,7 +293,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 子进程 OS 级沙箱 | ❌ 未做 | 绝对路径可读任意**非凭据**文件 / 无出网限制 / 无文件系统隔离。凭据文件读取（§8.3）与 `child_process` 命令执行（§8.3）已分别由模块级守卫收窄（均为拒绝清单，原生插件 / 重绑定仍可绕过）。需 microVM / Docker / AppContainer |
 | 登录与多租户 | ❌ 未做 | 当前为匿名 cookie 会话 + 设备 owner；多端接入前置项 |
 | 多实例限流 | ❌ 需 Redis | 当前限流进程内，多副本不共享 |
-| 出站内容（模型回复）脱敏 | ❌ 未做 | 回复中的敏感字段未自动脱敏 |
+| 出站凭据打码 | ✅ 始终开启 | `redact.ts` 认凭据形态；最终回答落库前打码。与下面的通用 PII 开关无关 |
 | 配置端点强制令牌 | 🟡 默认不强制 | 需显式配 `AGENT_ADMIN_TOKEN` 才启用；默认单机信任 |
 | 交替重叠 ReDoS 的更精确检测 | 🟡 启发式 | 当前靠「重叠分支 + 量化」启发式 + 2s 预算兜底，极罕见模式可能漏判但被预算兜住 |
 | 通用 PII / 出站 DLP | 🟡 可开启 | `REDACT_PII=on` 后打码 email/手机号/身份证/银行卡；**默认关闭**（业务数据误报高）。姓名/地址类不做（无形态可依） |

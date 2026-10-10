@@ -269,7 +269,7 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 服务器来源两处，**同 id 时以文件配置为准**（便于本地覆盖）：
 
 - **A. 内置（推荐）**：环境变量 `MCP_BUILTIN_SERVERS`（JSON 数组），随环境变化、**不落盘**、前端不可删。
-  凭据**不要**写进这个变量——stdio 子进程会继承父进程环境，凭据放 `.env` 即可。
+  凭据**不要**写进这个变量。stdio 子进程只收到 `PATH` 等运行所需变量、`BI_` / `YAPI_` 前缀、`MCP_ENV_PASSTHROUGH` 点名的变量，以及该条目自己的 `env`。`BI_*` / `YAPI_*` 放 `.env` 即可；其它密钥写进 `env` 或 `MCP_ENV_PASSTHROUGH`。
 - **B. 文件配置**：`apps/agent-server/.data/mcp-servers.json`（或调用 `POST /mcp/servers` 写入）。
 
 **stdio 示例**（本地文件系统类服务器）：
@@ -280,7 +280,7 @@ MCP_BUILTIN_SERVERS=[{"id":"fs","label":"文件系统","transport":"stdio","comm
 ```
 
 stdio 字段：`id / label / command / args(数组) / cwd / env / requireConfirm`
-（`cwd` 缺省继承服务进程工作目录；`env` 缺省继承父进程环境）。
+（`cwd` 缺省继承服务进程工作目录；`env` 只追加该条目声明的变量，不继承整份父进程环境）。
 
 **http 示例**（远程 Streamable HTTP 服务器）：
 

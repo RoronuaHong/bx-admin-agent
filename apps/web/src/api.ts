@@ -1,4 +1,5 @@
-import type { ArtifactSpec, LocalizedToken, ApiErrorPayload, ChatEvent, ChartSpec } from "@bx/shared";
+import type { ArtifactSpec, LocalizedToken, ApiErrorPayload, ChatEvent, ChartSpec, AlertMarker } from "@bx/shared";
+export type { AlertMarker };
 
 export class ApiError extends Error {
   status?: number;
@@ -585,7 +586,7 @@ export interface ChatTaskStatus {
   conversationId: string;
   running: boolean;
   /** `lastEventSeq` = 服务端事件序号上界（与本地游标比对可判断落后多少；排障用）。 */
-  task?: { id: string; startedAt: number; elapsedMs: number; live: boolean; lastEventSeq?: number };
+  task?: { id: string; startedAt: number; elapsedMs: number; live: boolean; lastEventSeq?: number; userText?: string };
   last?: { id: string; status: string; startedAt: number; settledAt: number; durationMs: number; outcomePersisted: boolean };
 }
 
@@ -664,8 +665,6 @@ export type ScheduleNotifyOn = "success" | "failed";
 export type ScheduleNotifyPolicy = "always" | "on_alert";
 /** 任务用途：报告 / 预警（表单回填；引擎以 notifyPolicy 为准）。 */
 export type SchedulePurpose = "report" | "alert";
-/** 预警结论文本首行标记。 */
-export type AlertMarker = "SPIKE" | "NORMAL" | "NO_DATA";
 
 export interface ScheduleAlertState {
   firing?: boolean;

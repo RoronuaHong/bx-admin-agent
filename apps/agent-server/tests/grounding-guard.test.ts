@@ -76,6 +76,10 @@ test("[E] 纠正提示是两支口径：需要数据的取数、本就不需要�
   // 回归锚点：纠正提示不许被复述进正文（实测出现过「我选②改写回答…」被当答案开头）。
   expect(GROUNDING_HINT).toContain("不要复述");
   expect(VERIFY_HINT_TAIL).toContain("不要复述");
+  expect(VERIFY_HINT_TAIL).toContain("不要为了复核");
+  expect(VERIFY_HINT_TAIL).toContain("方案自设");
+  expect(VERIFY_HINT_TAIL).toContain("思考只写一行");
+  expect(VERIFY_HINT_TAIL).not.toContain("请二选一");
 });
 
 test("[E2] 确定性兜底文案：如实说没取到，但不把责任推给用户去改设置", () => {

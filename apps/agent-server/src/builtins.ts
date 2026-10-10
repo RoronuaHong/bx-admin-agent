@@ -211,7 +211,11 @@ function runShell(
   return withSubprocessSlot(
     () =>
       new Promise<{ ok: boolean; text: string }>((resolve) => {
-    nodeExec(
+    let escalate: ReturnType<typeof setTimeout> | undefined;
+    const stopEscalate = () => {
+      if (escalate) clearTimeout(escalate);
+    };
+    const child = nodeExec(
       command,
       {
         cwd: opts.cwd,
@@ -226,6 +230,7 @@ function runShell(
         env,
       } as ExecOptionsWithBufferEncoding & { stdio?: ("ignore" | "pipe")[] },
       (err: Error | null, stdout: Buffer, stderr: Buffer) => {
+        stopEscalate();
         const out = decodeShellBytes(stdout as Buffer);
         const errOut = decodeShellBytes(stderr as Buffer);
         if (err) {
@@ -267,6 +272,19 @@ function runShell(
         });
       },
     );
+    // exec 的 timeout 只发 SIGTERM。忽略软终止的进程再等 1.5s 后强杀，与 run_tool_code 同一套。
+    // 回调里也会清计时器：进程若在监听 exit 之前就结束，不能留下一次对已退出进程的 kill。
+    escalate = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* 进程已经退出 */
+      }
+    }, opts.timeoutMs + 1_500);
+    escalate.unref();
+    if (child.exitCode !== null || child.signalCode) stopEscalate();
+    child.once("exit", stopEscalate);
+    child.once("error", stopEscalate);
     }),
   );
 }
@@ -542,7 +560,8 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     spec(
       "write_todos",
       "写入/更新任务计划（全量替换）。多步任务（≥2 次工具调用或明显分阶段）必须先调用本工具列出步骤，" +
-        "并随推进更新状态：pending → in_progress → completed/cancelled；单步问答可省略。",
+        "并随推进更新状态：pending → in_progress → completed/cancelled。同一时刻只保留一条 in_progress。" +
+        "某步做完就立刻标 completed，不要等到最后一批改。给出最终回答前再核对一遍，不要把已做完的步骤留在 pending 或 in_progress。单步问答可省略。",
       {
         type: "object",
         properties: {
@@ -681,7 +700,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "search_dingtalk_doc",
-      "在企业钉钉文档中按关键词检索文档（只读）。需服务端配置 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_DOC_BASE_URL（企业内部应用凭证）；未配置时返回配置指引而不报错。",
+      "在企业钉钉文档中按关键词检索文档（只读）。需服务端配置 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET，以及已联调的 DINGTALK_DOC_SEARCH_URL。未配置时返回指引而不报错，不会向猜测路径发请求。",
       {
         type: "object",
         properties: {
@@ -841,8 +860,8 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "search_knowledge",
-      "检索本地知识库（已入库的企业文档）。当用户问的是文档里才有的内容时，用它取原文片段；" +
-        "检索为空说明库中没有这份资料，如实说明，不要用通用知识代替。",
+      "检索本地知识库（已入库的文档）。用户问的是文档里才有的内容时，用它取原文片段。外部主体的公开事实不要走本工具。" +
+        "没有命中只说明这次查询没有命中，换说法再查；不要用它证明经营数字不存在，也不要用通用知识代替文档原文。",
       {
         type: "object",
         properties: {
@@ -889,8 +908,9 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       ? [
           spec(
             "web_search",
-            "在公开互联网上检索信息（新闻、官网、博客、文档等），返回若干条结果的标题、链接与摘要。" +
-              "当用户问的是你知识之外、需要最新或站外信息的内容时调用它；不要凭记忆编造这类内容。" +
+            "在公开互联网上检索，返回若干条结果的标题、链接与摘要。" +
+              "句子在问外部主体的公开事实时调用本工具。自有业务数字、内部文档、角色专用数据源不要改走本工具。" +
+              "某个连接器已经启用，不等于这件事的来源已经指定，也不要先用那个连接器检索专名来决定该不该联网。不要凭记忆编造。" +
               "需要某条结果的正文时，再用 fetch_url 打开它的链接。",
             {
               type: "object",
@@ -1830,7 +1850,7 @@ export async function execBuiltin(
       if (!query) return { ok: false, text: "search_knowledge 需要 query" };
       const topK = Math.min(Math.max(Number(args.topK) || 5, 1), 20);
       const hits = await ragSearch(query, topK, namespace, { ownerKey, role: namespace });
-      if (!hits.length) return { ok: true, text: "（知识库中没有匹配内容）" };
+      if (!hits.length) return { ok: true, text: "（这次检索没有命中。换个说法再查；不要据此断定资料里没有这件事，也不要拿它证明经营数字不存在）" };
       return {
         ok: true,
         text: hits
@@ -1851,7 +1871,7 @@ export async function execBuiltin(
       if (!query) return { ok: false, text: "web_search 需要 query" };
       const outcome = await webSearch(query, Number(args.count) || undefined);
       if (!outcome.ok) return { ok: false, text: outcome.error };
-      if (!outcome.hits.length) return { ok: true, text: "（没有检索到相关结果，可换关键词或如实说明未找到）" };
+      if (!outcome.hits.length) return { ok: true, text: "（这次公开检索没有命中。换个说法或换语言再查；仍然没有，就说明这个来源没有该结果，不要改用别的数据源换一个主体）" };
       const body = outcome.hits
         .map((hit, i) => {
           const meta = [hit.source, hit.publishedAt].filter(Boolean).join(" · ");

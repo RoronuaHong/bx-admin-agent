@@ -11,6 +11,14 @@ import {
   selectMcpToolSpecs,
   prefetchDeferredTools,
   argsWithinToolSchema,
+  mcpToolSpec,
+  ownBusinessToolRefusal,
+  OWN_BUSINESS_SKILL,
+  defersPublicLookup,
+  answeredFromWarehouseMiss,
+  gaveUpAfterOwnBusinessBlock,
+  unscopedNameTokens,
+  ownBusinessNameRefusal,
 } from "../src/chat.js";
 
 type FakeTool = { serverId: string; name: string; description?: string; inputSchema?: unknown };
@@ -72,6 +80,71 @@ test("[C] LoopGuard（跨轮 Doom Loop 熔断）", () => {
   g3.record([]); // 空轮不计入
   g3.record([]);
   expect(g3.record(['z::9'])).toBe(false);
+});
+
+test("[D2] bi 工具说明带上自有业务边界，其它服务器不改写", () => {
+  const bi = mcpToolSpec({
+    serverId: "bi",
+    name: "mcp__bi__search",
+    tool: "search",
+    description: "按关键词搜索资产。",
+    inputSchema: { type: "object", properties: {} },
+  });
+  expect(bi.description.startsWith("只用于已连接的自有业务数据")).toBe(true);
+  expect(bi.description).toContain("不要调用");
+  expect(bi.description.endsWith("按关键词搜索资产。")).toBe(true);
+  const movie = mcpToolSpec({
+    serverId: "movie",
+    name: "mcp__movie__movies_search",
+    tool: "movies_search",
+    description: "搜索影片。",
+    inputSchema: { type: "object", properties: {} },
+  });
+  expect(movie.description).toBe("搜索影片。");
+});
+
+test("[D3] 未读业务取数技能时拒绝自有业务连接器", () => {
+  const unread = new Set<string>();
+  expect(ownBusinessToolRefusal("mcp__bi__search", unread)).toContain("web_search");
+  expect(ownBusinessToolRefusal("mcp__movie__movies_search", unread)).toBeNull();
+  const read = new Set<string>([OWN_BUSINESS_SKILL]);
+  expect(ownBusinessToolRefusal("mcp__bi__search", read)).toBeNull();
+});
+
+test("[D4] 把公开检索留成确认时要先查", () => {
+  expect(
+    defersPublicLookup("若它是外部公司的公开数据，我可以用联网检索，需你确认。请告诉我怎么继续？"),
+  ).toBe(true);
+  expect(defersPublicLookup("已在自有业务数据中检索，未找到这个主体。")).toBe(true);
+  expect(defersPublicLookup("最近 7 天订单 280279 笔。")).toBe(false);
+  expect(defersPublicLookup("主库最近 7 天订单 280279 笔。没有按渠道拆分。")).toBe(false);
+  expect(defersPublicLookup("公开检索没有这条净利润，以下是来源链接。")).toBe(false);
+});
+
+test("[D4b] 只说库里没有指标时也要先做公开检索", () => {
+  expect(
+    answeredFromWarehouseMiss(
+      "目前无法计算该主体前 3 个月的净利润：54 张表里没有确认到净利润指标，搜索均为 0 条结果。",
+    ),
+  ).toBe(true);
+  expect(answeredFromWarehouseMiss("最近 7 天订单 280279 笔。")).toBe(false);
+  expect(answeredFromWarehouseMiss("主库最近 7 天订单 280279 笔。没有按渠道拆分。")).toBe(false);
+  expect(answeredFromWarehouseMiss("公开检索没有这条净利润，以下是来源链接。")).toBe(false);
+  expect(answeredFromWarehouseMiss("该名称在库里没有任何数据，也没有这个口径。")).toBe(true);
+});
+
+test("[D4c] 专名还没落到已连接数据上时，不要先去业务库里找", () => {
+  expect(unscopedNameTokens("workbuddy，进3个月的利润是多少？")).toEqual(["workbuddy"]);
+  expect(unscopedNameTokens("我们最近7天的订单量是多少？")).toEqual([]);
+  expect(ownBusinessNameRefusal("mcp__bi__search", "workbuddy，进3个月的利润是多少？", false)).toContain("web_search");
+  expect(ownBusinessNameRefusal("mcp__bi__list_databases", "workbuddy，进3个月的利润是多少？", true)).toBeNull();
+  expect(ownBusinessNameRefusal("mcp__bi__search", "我们最近7天的订单量是多少？", false)).toBeNull();
+  expect(ownBusinessNameRefusal("mcp__movie__movies_search", "workbuddy，进3个月的利润是多少？", false)).toBeNull();
+});
+
+test("[D5] 把技能闸拒绝说成取数失败时要重试", () => {
+  expect(gaveUpAfterOwnBusinessBlock("我这次没能取到订单数据。列数据库那一步没有返回任何结果。")).toBe(true);
+  expect(gaveUpAfterOwnBusinessBlock("最近 7 天订单 280279 笔。")).toBe(false);
 });
 
 test("[D] selectMcpToolSpecs（工具数上限截断）", () => {

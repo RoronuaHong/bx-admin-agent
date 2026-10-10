@@ -1,9 +1,8 @@
 /**
  * OTLP/HTTP 导出（P2 可观测互操作性）。
  *
- * 缺口：span 已经挂上了 OTel GenAI 标准属性（`gen_ai.*`），但数据只在自家 JSONL 里——
- * 接不进任何标准后端。这里补齐「导出」这一格：把 run / span 转成 OTLP/HTTP **JSON** 编码，
- * POST 给 Collector（或任何兼容 /v1/traces 的后端）。
+ * span 上已有 OTel GenAI 属性（`gen_ai.*`）。这里把 run / span 转成 OTLP/HTTP **JSON**，
+ * POST 给 Collector（或任何兼容 /v1/traces 的后端）。未配置端点时不发请求。
  *
  * 取舍：
  * - **只做 JSON 编码**，不做 protobuf：单机规模下 JSON 足够，protobuf 要引入编解码依赖，不值。

@@ -1,6 +1,7 @@
 // run_command 命令执行治理回归（2026-09-24，docs/artifact-delivery-plan.md §13）：
 // A 输出编码（Windows GBK 不再乱码）· B 超长输出头尾截断而非整体失败 ·
 // C 需要 stdin 的命令不挂死 · D 干净环境注入（BX_AGENT / NO_COLOR，对齐 Cursor 的 CURSOR_AGENT）。
+import { readFileSync } from "node:fs";
 import { test, expect, afterAll } from "vitest";
 import { execBuiltin, decodeShellBytes, truncateShellOutput } from "../src/builtins.js";
 import { fsRemoveConversation } from "../src/fs-store.js";
@@ -47,6 +48,15 @@ test("[C] 需要 stdin 的命令不挂死（stdin 已关闭，不再空等到超
   await run(isWin ? "pause" : "read x", 4000);
   expect(Date.now() - t0).toBeLessThan(10_000);
 }, 15_000);
+
+test("runShell 在 SIGTERM 之后升级 SIGKILL", () => {
+  const src = readFileSync(new URL("../src/builtins.ts", import.meta.url), "utf8");
+  const start = src.indexOf("function runShell");
+  const end = src.indexOf("function assertBuiltinRiskCoverage");
+  const slice = src.slice(start, end);
+  expect(slice).toContain('child.kill("SIGKILL")');
+  expect(slice).toContain("stopEscalate");
+});
 
 test("[D] 干净环境：BX_AGENT 注入对子进程可见", async () => {
   const out = await run(isWin ? "echo %BX_AGENT%" : "echo $BX_AGENT");

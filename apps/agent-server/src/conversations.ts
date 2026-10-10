@@ -7,7 +7,7 @@
 import { type Collection, type Db, type ObjectId } from "mongodb";
 import type { ArtifactSpec, ChartSpec, TodoItem } from "@bx/shared";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
-import { defaultMcpServers } from "./mcp/config.js";
+import { loadServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
 import { getMongoClient, MONGO_DB_NAME } from "./db.js";
 
@@ -331,11 +331,15 @@ export async function createConversation(input: {
   timeZone?: string;
 }): Promise<ConversationDoc> {
   const now = Date.now();
-  // MCP 默认勾选：显式传入 > 角色默认 > 配置了 defaultEnabled 的服务器。
-  const mcp = input.mcpServers || getRole(input.agentId).defaultMcpServers || defaultMcpServers();
+  // MCP 勾选：显式传入 > 该助手自带的数据源。通用助手没有自带源，新建就是空。
+  // 不读服务器上的 defaultEnabled：连接器要用户在输入栏里手动打开。
+  // 显式传入空数组 = 调用方不要任何连接器，不要被 || 当成「没传」而改走角色默认。
+  const requested = input.mcpServers ?? getRole(input.agentId).defaultMcpServers ?? [];
+  // 角色默认里的 id 必须是当前已配置的服务器。没配上的环境不能把悬空 id 写进对话。
+  const known = new Set(loadServers().filter((server) => server.enabled !== false).map((server) => server.id));
+  const mcp = input.mcpServers ? requested : requested.filter((id) => known.has(id));
   // 「完全访问」默认：显式传入 > 角色默认（如客服助手关，让写工具走人审确认）> 开箱即完全授权。
   const fullAccess = input.fullAccess ?? getRole(input.agentId).defaultFullAccess ?? true;
-  // 新对话默认勾选配置了 defaultEnabled 的 MCP 服务器（已有对话不受影响）。
   const doc: ConversationDoc = {
     id: input.id,
     title: input.title || "新对话",
@@ -434,21 +438,65 @@ export function withoutFreshAssistantDupes(
   });
 }
 
+function sameSnapshotMessage(a: StoredMessage, b: StoredMessage): boolean {
+  return a.role === b.role && (a.text || "") === (b.text || "");
+}
+
 /**
  * 把服务端已有消息数组按 delta 应用成最新状态（与 Mongo 分支语义一致，进程内存降级版复用）。
  * - base === L：尾部全是新增消息 → 直接 push；
  * - base === L-1 且只带来 1 条：是「最后一条正在流式更新」→ 原地替换最后一条（避免重复堆积）；
+ * - 服务端若已先写下本轮提问，客户端仍按旧基线交来「提问 + 回复」：跳过库里已有的前缀，避免刷新后出现两条一样的提问；
  * - 其它（多端/异常错位，单客户端理论上不会命中）：尽力 push，保证不丢。
  */
 function applyDeltaMessages(arr: StoredMessage[], tail: StoredMessage[], base: number): void {
-  const L = arr.length;
-  if (base === L) {
-    arr.push(...tail);
-  } else if (base === L - 1 && tail.length === 1) {
-    arr[L - 1] = tail[0]!;
-  } else {
-    arr.push(...tail);
+  let at = base;
+  let next = tail;
+  if (at >= 0 && at < arr.length) {
+    let skip = 0;
+    while (at + skip < arr.length && skip < next.length && sameSnapshotMessage(arr[at + skip]!, next[skip]!)) skip += 1;
+    if (skip > 0) {
+      at += skip;
+      next = next.slice(skip);
+    }
   }
+  if (!next.length) return;
+  const last = arr[arr.length - 1];
+  if (
+    next.length === 1 &&
+    next[0]?.role === "user" &&
+    last?.role === "user" &&
+    (last.text || "") === (next[0].text || "")
+  ) {
+    return;
+  }
+  const L = arr.length;
+  if (at === L) {
+    arr.push(...next);
+  } else if (at === L - 1 && next.length === 1) {
+    arr[L - 1] = next[0]!;
+  } else {
+    arr.push(...next);
+  }
+}
+
+/**
+ * 一轮刚开始就把用户提问写进 UI 快照。
+ * 刷新发生在模型还没答完时，快照里已经有这条提问，气泡不会空着等整轮结束。
+ * 末尾已经是同一句时不追加（客户端抢先落库、或重复进入同一轮）。
+ */
+export async function appendUserTurnIfMissing(id: string, text: string, at = Date.now()): Promise<void> {
+  if (!id || !text.trim()) return;
+  const doc = await getConversation(id);
+  if (!doc) return;
+  const existing = doc.messages || [];
+  const last = existing[existing.length - 1];
+  if (last?.role === "user" && (last.text || "") === text) return;
+  await upsertMessages({
+    id,
+    messages: [{ role: "user", text, at }],
+    base: existing.length,
+  });
 }
 
 export async function upsertMessages(input: {

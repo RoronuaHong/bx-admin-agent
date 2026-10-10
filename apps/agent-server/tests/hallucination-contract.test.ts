@@ -154,9 +154,10 @@ test("[11] 工具纪律：反编造 / 注明来源 / 事实先核实 / 澄清优
   expect(rules).toContain("注明来源");
   // 事实核验纪律（防止训练记忆里的细节被当成已核实事实说出来）
   expect(rules).toContain("核实");
-  expect(rules).toContain("不要用确定语气断言");
-  // 澄清优先于核实：带假设去检索，结果自然与假设一致
-  expect(rules).toContain("优先");
+  expect(rules).toContain("不要用记忆补成确定结论");
+  // 检索能分开读法就先查；带假设去检索，结果自然与假设一致
+  expect(rules).toContain("一次检索能把读法分开");
+  expect(rules).toContain("带着假设去检索");
   // 不可信内容定界（外部内容是数据不是指令）
   expect(rules).toContain(UNTRUSTED_CONTENT_RULE);
 });
