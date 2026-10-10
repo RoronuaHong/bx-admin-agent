@@ -168,16 +168,19 @@ async function loadTasks() {
   tasks.value = await fetchSchedules().catch(() => [] as ScheduleDto[]);
 }
 
-/** 定时任务健康态需要较新的 next/last/running：页面可见时每 20s 轻量刷新。 */
+/** 定时任务和各对话的新消息：页面可见时定期跟上，不必整页刷新。 */
 let tasksPollTimer: ReturnType<typeof setInterval> | null = null;
+let conversationSyncing = false;
+let pendingSyncId = "";
 function startTasksPoll() {
   if (tasksPollTimer) return;
   tasksPollTimer = setInterval(() => {
     if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
     void loadTasks();
-    // 顺带刷对话 running 标记，任务「执行中」才看得见。
     void refreshConversationsQuiet();
-  }, 20_000);
+    const openId = currentId.value;
+    if (openId) void syncOpenConversation(openId);
+  }, 5_000);
 }
 function stopTasksPoll() {
   if (!tasksPollTimer) return;
@@ -190,16 +193,20 @@ async function refreshConversationsQuiet() {
   if (!list) return;
   const pendingDeleted = undoDelete.value?.conv.id;
   const next = pendingDeleted ? list.filter((c) => c.id !== pendingDeleted) : list;
-  // 保留本地排序：只按 id 合并字段，避免轮询把「按最近活动」打乱。
+  const alive = new Set(next.map((c) => c.id));
+  const beforeIds = conversations.value.map((c) => c.id).join("\0");
+  // 别处删掉的对话从侧栏去掉。当前这条若刚创建、列表还没带回，先留着。
+  conversations.value = conversations.value.filter((c) => alive.has(c.id) || c.id === currentId.value);
   const byId = new Map(next.map((c) => [c.id, c]));
   conversations.value = conversations.value.map((c) => {
     const fresh = byId.get(c.id);
     return fresh ? { ...c, ...fresh } : c;
   });
-  // 新出现的对话（本期新会话）补进列表末尾，下次完整 reload 再排序。
   for (const c of next) {
     if (!conversations.value.some((x) => x.id === c.id)) conversations.value.push(c);
   }
+  const afterIds = conversations.value.map((c) => c.id).join("\0");
+  if (afterIds !== beforeIds) resortConversations();
 }
 
 /** 只刷新可用服务器连接状态（不依赖当前对话；任务表单勾选预热后用来同步「已连接」）。 */
@@ -2067,11 +2074,76 @@ function bubblesFromStored(messages: StoredMessage[], times: number[]): Bubble[]
 /** 列表快照没有推理细节。打开对话后补最近一段，生成中的气泡不被覆盖。 */
 async function upgradeConversationDetail(convId: string) {
   const full = await fetchConversation(convId).catch(() => null);
+  if (!full) return;
+  applyServerThread(convId, full, true);
+}
+
+/**
+ * 把服务端快照铺进这个对话。正在发送或流式输出时不覆盖。
+ * 本地更新、或条数更多时也不覆盖，避免刚生成的这一轮被旧快照抹掉。
+ * force 只用于第一次打开：补上列表快照里没有的推理细节。
+ */
+function applyServerThread(convId: string, full: ConversationDto, force: boolean) {
   const state = states.get(convId);
-  if (!full || !state || state.sending || state.bubbles.some((b) => b.streaming)) return;
-  const times = messageTimes(full.messages || [], full.createdAt, full.updatedAt);
-  state.bubbles = bubblesFromStored(full.messages || [], times);
+  if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
+  const serverMessages = full.messages || [];
+  if (!force && !serverThreadAhead(state.bubbles, serverMessages)) return;
+  const times = messageTimes(serverMessages, full.createdAt, full.updatedAt);
+  state.bubbles = bubblesFromStored(serverMessages, times);
   persistedCount.set(convId, toStored(state.bubbles).length);
+  if (convId === currentId.value && followBottom) queueScroll();
+}
+
+function tailSig(
+  item:
+    | {
+        text?: string;
+        charts?: unknown[];
+        artifacts?: unknown[];
+        steps?: unknown[];
+        todos?: unknown[];
+      }
+    | undefined,
+): string {
+  if (!item) return "";
+  const steps = ((item.steps as Array<{ status?: string }>) || []).map((step) => step.status || "").join(",");
+  const todos = ((item.todos as Array<{ status?: string }>) || []).map((todo) => todo.status || "").join(",");
+  return `${item.text?.length || 0}|${item.charts?.length || 0}|${item.artifacts?.length || 0}|${steps}|${todos}`;
+}
+
+function serverThreadAhead(local: Bubble[], server: StoredMessage[]): boolean {
+  if (server.length > local.length) return true;
+  if (server.length < local.length) return false;
+  const lb = local[local.length - 1];
+  const sb = server[server.length - 1];
+  if ((lb?.text?.length || 0) > (sb?.text?.length || 0)) return false;
+  return tailSig(lb) !== tailSig(sb);
+}
+
+/** 当前打开的对话：还在跑就接上事件流，已经写完就补上新消息。 */
+async function syncOpenConversation(convId: string) {
+  if (!convId) return;
+  if (conversationSyncing) {
+    pendingSyncId = convId;
+    return;
+  }
+  const state = states.get(convId);
+  if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
+  conversationSyncing = true;
+  try {
+    const status = await fetchChatTaskStatus(convId).catch(() => null);
+    if (status?.running) {
+      await attachRunningTask(convId);
+      return;
+    }
+    const full = await fetchConversation(convId).catch(() => null);
+    if (full) applyServerThread(convId, full, false);
+  } finally {
+    conversationSyncing = false;
+    const next = pendingSyncId;
+    pendingSyncId = "";
+    if (next && next !== convId) void syncOpenConversation(next);
+  }
 }
 
 /**
@@ -2151,8 +2223,8 @@ function selectConversation(conv: ConversationDto) {
   // 技能面板：可用列表全局，启用集按对话。
   void loadSkills(conv.id);
   queueScroll(true); // 切对话是用户动作：无条件回底，并重置跟底状态
-  // 服务端还有这个对话的任务在跑（刷新 / 换设备进来）：接回事件流继续显示，而不是干等结果回投。
-  void attachRunningTask(conv.id);
+  // 已看过的对话也再跟一次服务端：定时任务写入、或切走时跑完的那一轮，不用整页刷新。
+  void syncOpenConversation(conv.id);
 }
 
 /**
@@ -3533,10 +3605,10 @@ async function settleInterruptedRun(run: TurnRun): Promise<void> {
     reply.text,
     backgroundRunning
       ? tx(
-          "（连接已中断，生成仍在后台继续；完成后重新打开该对话即可看到结果）",
-          "(Connection lost; generation continues in the background — reopen this conversation to see the result)",
-          "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
-          "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
+          "（连接已中断，生成仍在后台继续；完成后会自动出现在这个对话里）",
+          "(Connection lost; generation continues in the background and will show up in this conversation)",
+          "(Conexão perdida; a geração continua em segundo plano e aparecerá nesta conversa)",
+          "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है और इसी चैट में दिखेगा)",
         )
       : tx(
           "（本轮已中断：连接结束且服务端没有在跑的任务，未完成的部分请重新发起）",

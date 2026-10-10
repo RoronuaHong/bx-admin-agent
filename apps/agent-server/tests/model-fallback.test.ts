@@ -5,6 +5,8 @@ import {
   modelDownCooldownMs,
   isTransientModelError,
   modelAvailabilityNotice,
+  partialInterruptLine,
+  UNCLASSIFIED_MODEL_FAILURE,
   modelAvailabilityStatus,
   orderModelCandidates,
   toolRoundsForRun,
@@ -40,6 +42,13 @@ test("402、500、429 都立刻换模型；当日额度用尽才冷却，短暂 
   expect(modelAvailabilityNotice("503")).toContain("仍然失败");
   expect(modelAvailabilityNotice("429")).toContain("429");
   expect(modelAvailabilityNotice("429")).not.toContain("{");
+  const raw = 'model http 402: {"error":{"message":"insufficient_quota"}}';
+  expect(partialInterruptLine(raw)).toContain("402");
+  expect(partialInterruptLine(raw)).not.toContain("insufficient_quota");
+  expect(partialInterruptLine("socket hang up")).toBe(
+    `生成中断，详情见服务端日志（以上为中断前的中间结果，可能不完整）`,
+  );
+  expect(UNCLASSIFIED_MODEL_FAILURE).not.toContain("{");
   for (const code of ["400", "401", "403", "404", "408", "413", "422", "529"] as const) {
     expect(modelAvailabilityStatus(`model http ${code}: detail`)).toBe(code);
     expect(isTransientModelError(`model http ${code}: detail`)).toBe(false);

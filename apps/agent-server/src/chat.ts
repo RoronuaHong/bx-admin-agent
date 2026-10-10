@@ -215,6 +215,15 @@ export function modelAvailabilityNotice(status: ModelAvailabilityStatus): string
   return `这次没有完成：模型返回 ${status}（${why[status]}）。已尝试更换模型，仍然失败。`;
 }
 
+/** 给用户看的中断说明。认得出状态码就只写码；认不出就不要把上游 JSON 贴进气泡。 */
+export const UNCLASSIFIED_MODEL_FAILURE = "模型没有返回结果，详情见服务端日志";
+
+export function partialInterruptLine(failure: string): string {
+  const status = modelAvailabilityStatus(failure);
+  const why = status ? `生成因模型返回 ${status} 中断` : "生成中断，详情见服务端日志";
+  return `${why}（以上为中断前的中间结果，可能不完整）`;
+}
+
 /**
  * 预警任务的轮次上限是无人值守预算，不再交给交互自主度下调。
  * 周期报告和交互对话仍用收紧后的值。
@@ -3645,23 +3654,25 @@ export async function* chatStream(
         console.warn(`[chat] 中断轮上下文写回失败，下一轮模型看不到这一轮：${String((e as Error)?.message || e)}`);
       });
     } else if (text.trim()) {
-      // 模型调用中途失败：保留已生成的中间结论，避免整轮成果丢失（如限流前已产出的部分答案），
-      // 并附中断说明。仅当完全无产出时才退回纯错误提示。
+      // 模型调用中途失败：保留已生成的中间结论。中断原因只写状态码，上游 JSON 留在日志。
+      if (!modelAvailabilityStatus(failure)) {
+        console.warn(`[chat] 未归类的模型失败：${failure.slice(0, 400)}`);
+      }
       yield {
         type: "text",
-        text: `${text.trim()}\n\n⚠️ 生成因以下原因中断：${failure}（以上为中断前的中间结果，可能不完整）`,
+        text: `${text.trim()}\n\n⚠️ ${partialInterruptLine(failure)}`,
       };
     }
     const availability = modelAvailabilityStatus(failure);
-    if (!text.trim() && availability) {
+    if (!text.trim() && availability && !signal?.aborted) {
       // 定时任务靠这段正文告知 402 / 500 / 429，不把上游 JSON 写进对话，也不把它当成业务失败去推送。
       yield { type: "text", text: modelAvailabilityNotice(availability) };
-    }
-    if (!text.trim()) {
+    } else if (!text.trim() && !signal?.aborted) {
+      console.warn(`[chat] 未归类的模型失败：${failure.slice(0, 400)}`);
       yield {
         type: "error",
-        error: { code: "MODEL_ERROR", defaultMessage: failure },
-        message: failure,
+        error: { code: "MODEL_ERROR", defaultMessage: UNCLASSIFIED_MODEL_FAILURE },
+        message: UNCLASSIFIED_MODEL_FAILURE,
       };
     }
     yield usage;
