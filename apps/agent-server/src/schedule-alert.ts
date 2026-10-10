@@ -106,7 +106,7 @@ export const SCHEDULE_ALERT_GUIDE =
   "   [SPIKE]  — 按用户指令判定为异常 / 破线；\n" +
   "   [NORMAL] — 有完整计数且未破线；\n" +
   "   [NO_DATA] — 取不到数据、结果为空、或计数不完整（不要猜数）。\n" +
-  "   计数结果里已有 above 与 over_count 时，服务端会按它校正这一行。\n" +
+  "   计数结果里已有 above 与 unique 时，服务端按窗口合计是否超过 above 校正这一行，不按单个小时的峰值。\n" +
   "2) 不要写时间窗口、当前数量、阈值或任何条数。计数完整时服务端按 hours 段写成这三行；不完整时只保留 [NO_DATA]，不要编数字。\n" +
   "   不要写英文单词或字段名，不要写 complete、raw、unique、above。\n" +
   "   不要写钉钉或推送通道。\n" +
@@ -148,7 +148,8 @@ export function buildUnattendedConclusion(input: {
 
 /**
  * 计数结果里的比较由引擎做，不交给模型心算。
- * complete 为 false → 无数据。带了 above 才比较 over_count。没带阈值则返回 null，仍由模型写标记。
+ * complete 为 false → 无数据。带了 above 与 unique 时，窗口合计严格大于 above 才是破线。
+ * 不按单个小时的峰值。没带阈值或合计则返回 null，仍由模型写标记。
  */
 /** 预警指令里的破线阈值。只认「超过 N」，避免把「60 分钟」当成阈值。 */
 export function alertAboveFromPrompt(prompt: string): number | null {
@@ -173,10 +174,10 @@ export function markerFromCountText(text: string): AlertMarker | null {
   const complete = String(text || "").match(/^complete:\s*(true|false)\s*$/m);
   if (!complete) return null;
   if (complete[1] === "false") return "NO_DATA";
-  const above = String(text).match(/^above:\s*-?\d+(?:\.\d+)?\s*$/m);
-  const over = String(text).match(/^over_count:\s*(\d+)\s*$/m);
-  if (!above || !over) return null;
-  return Number(over[1]) > 0 ? "SPIKE" : "NORMAL";
+  const above = String(text).match(/^above:\s*(-?\d+(?:\.\d+)?)\s*$/m);
+  const unique = String(text).match(/^unique:\s*(\d+)\s*$/m);
+  if (!above || !unique) return null;
+  return Number(unique[1]) > Number(above[1]) ? "SPIKE" : "NORMAL";
 }
 
 /** 用计数结论覆盖首行标记。不完整时整段换成协议句，避免模型用残缺数字写成未破线。 */
@@ -262,11 +263,8 @@ export function formatScheduledCountFacts(report: string): string | null {
   ];
   const above = fields.get("above");
   if (above && /^-?\d+(?:\.\d+)?$/.test(above)) {
-    const overRaw = fields.get("over_count");
-    const over = overRaw && /^\d+$/.test(overRaw) ? Number(overRaw) : 0;
-    const peak = ordered.length ? Math.max(...ordered.map((item) => item.count)) : null;
-    const verdict = over > 0 ? `${over} 个小时破线` : "未破线";
-    lines.push(`- 阈值：超过 ${above}；${peak != null ? `最高 ${peak}，` : ""}${verdict}`);
+    const verdict = total > Number(above) ? "已破线" : "未破线";
+    lines.push(`- 阈值：超过 ${above}；合计 ${total}，${verdict}`);
   }
   return lines.join("\n");
 }

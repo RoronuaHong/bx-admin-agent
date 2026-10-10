@@ -742,12 +742,11 @@ export function formatCountReport(report: CountListReport): string {
   );
   if (report.minHour && report.maxHour) lines.push(`range: ${report.minHour} .. ${report.maxHour}`);
   if (report.above != null) {
+    const windowOver = report.unique > report.above;
     lines.push(`above: ${report.above}`);
     lines.push(`over_count: ${report.over.length}`);
     lines.push(
-      report.over.length === 0
-        ? `note: 已覆盖全部已返回页。没有小时的计数超过 ${report.above}。`
-        : "note: 下列小时的计数超过阈值。",
+      `note: 已覆盖全部已返回页。窗口合计 ${report.unique}，${windowOver ? "已超过" : "没有超过"} ${report.above}。破线按窗口合计判断，不要按单个小时判断。`,
     );
     if (report.over.length) lines.push(linesOf(report.over, 40));
   }

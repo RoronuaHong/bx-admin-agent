@@ -606,13 +606,13 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     spec(
       "count_list_by_time",
       "把只返回分页明细的列表工具在服务端翻完，按整点小时计数，只把计数交回对话。" +
-        "用户要跨页统计（某一小时有没有超过 N、按小时的新开始条数）时用本工具一次完成。" +
+        "用户要跨页统计（一段时间内的合计有没有超过 N、按小时的新开始条数）时用本工具一次完成。" +
         "不要自己逐页调列表工具，也不要把翻页委派给子代理。" +
         "payload 放列表工具本来的参数（时间窗口、筛选、排序），不要自己循环翻页。" +
         "服务端沿用 payload 里已有的 index、offset、page 或 cursor；没有时写入 index 与 limit。" +
         "列表数组认 data、items、results、records、rows 等常见字段，也可以用 rowsField 指定。" +
         "结束条件认 more_data_available、has_more 或 next_cursor。单页条数有上限，调用方不用自己改页码。" +
-        "返回首行 complete 为 false 表示没翻完，不能据此判断是否超过阈值。timeZone 用 IANA 名；不传则用系统提示里的用户时区（未上报时才是 UTC）。回答里的小时必须与返回的 timezone 行一致，不要改标成别的时区。above 是严格大于。" +
+        "返回首行 complete 为 false 表示没翻完，不能据此判断是否超过阈值。timeZone 用 IANA 名；不传则用系统提示里的用户时区（未上报时才是 UTC）。回答里的小时必须与返回的 timezone 行一致，不要改标成别的时区。above 是窗口合计的破线阈值，严格大于才算破线；各小时计数只供核对，不能用峰值代替合计。" +
         "Zoho 会话列表按 start_time 分桶。in_time 只是翻页排序，写进 timeField 也会被改成 start_time。" +
         "小时桶以外的汇总不要自己翻页，用 run_tool_code。",
       {
@@ -627,7 +627,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           timeField: jsonType("string", "每行上的时间字段，Unix 毫秒、秒或 ISO 时间（默认 start_time）。Zoho 会话列表用 start_time，不要用 in_time。支持点路径，如 visitor.created_at"),
           idField: jsonType("string", "去重用的 id 字段（默认 id）。支持点路径"),
           timeZone: jsonType("string", "小时桶的 IANA 时区。不传则用系统提示里的用户时区"),
-          above: jsonType("number", "只列出计数严格大于该值的小时；不传则只给峰值"),
+          above: jsonType("number", "窗口合计的破线阈值（严格大于）。不传则只回各小时计数，不判断破线"),
           maxPages: jsonType("number", `最多翻多少页（默认 ${LIST_COUNT_DEFAULT_PAGES}）`),
         },
         required: ["tool", "payload"],

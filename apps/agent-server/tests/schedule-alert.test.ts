@@ -147,8 +147,9 @@ test("decideAlertDelivery：启用后第一期，未破线也要推启动确认�
 
 test("计数比较由引擎落标记，不完整时整段换成无数据", () => {
   expect(markerFromCountText("complete: false\nreason: 输入流无效")).toBe("NO_DATA");
-  expect(markerFromCountText("complete: true\nabove: 300\nover_count: 0\n")).toBe("NORMAL");
-  expect(markerFromCountText("complete: true\nabove: 300\nover_count: 2\n")).toBe("SPIKE");
+  expect(markerFromCountText("complete: true\nabove: 300\nunique: 192\nover_count: 0\n")).toBe("NORMAL");
+  expect(markerFromCountText("complete: true\nabove: 300\nunique: 305\nover_count: 0\n")).toBe("SPIKE");
+  expect(markerFromCountText("complete: true\nabove: 300\nover_count: 2\n")).toBeNull();
   expect(markerFromCountText("complete: true\nunique: 18\n")).toBeNull();
   const prompt = "超过300的1小时会话量，就要预警\n时间窗口：最近 60 分钟\n超过 300 → 异常";
   expect(alertAboveFromPrompt(prompt)).toBe(300);
@@ -179,11 +180,26 @@ test("完整计数的时间窗口、当前数量、阈值三行固定，小时�
     [
       "- 时间窗口：2026-10-09 14:00 至 2026-10-09 15:00（Asia/Shanghai）",
       "- 当前数量：33（2026-10-09 14:00 为 19，2026-10-09 15:00 为 14），计数完整",
-      "- 阈值：超过 300；最高 19，未破线",
+      "- 阈值：超过 300；合计 33，未破线",
     ].join("\n"),
   );
-  const spiked = COUNT_REPORT.replace("over_count: 0", "over_count: 1").replace("2026-10-09 15:00\t14", "2026-10-09 15:00\t420");
-  expect(formatScheduledCountFacts(spiked)).toContain("最高 420，1 个小时破线");
+  const spiked = COUNT_REPORT.replace("unique: 33", "unique: 439").replace("2026-10-09 15:00\t14", "2026-10-09 15:00\t420");
+  expect(formatScheduledCountFacts(spiked)).toContain("合计 439，已破线");
+  const splitHour = [
+    "complete: true",
+    "unique: 305",
+    "timezone: Asia/Shanghai",
+    "range: 2026-10-10 16:00 .. 2026-10-10 17:00",
+    "above: 300",
+    "over_count: 0",
+    "hours:",
+    "2026-10-10 16:00\t192",
+    "2026-10-10 17:00\t113",
+  ].join("\n");
+  expect(markerFromCountText(splitHour)).toBe("SPIKE");
+  expect(formatScheduledCountFacts(splitHour)).toContain("当前数量：305（2026-10-10 16:00 为 192，2026-10-10 17:00 为 113），计数完整");
+  expect(formatScheduledCountFacts(splitHour)).toContain("合计 305，已破线");
+  expect(formatScheduledCountFacts(splitHour)).not.toContain("最高");
   const overFirst = [
     "complete: true",
     "unique: 33",

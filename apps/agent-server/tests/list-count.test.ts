@@ -85,7 +85,8 @@ test("跨页去重后按小时计数，并列出超过阈值的小时", async ()
   expect(report.over).toEqual([]);
   const text = formatCountReport(report);
   expect(text.startsWith("complete: true")).toBe(true);
-  expect(text).toContain("没有小时的计数超过 2");
+  expect(text).toContain("窗口合计 4，已超过 2");
+  expect(text).toContain("不要按单个小时判断");
   expect(text).toContain("hours:");
 });
 
@@ -94,7 +95,7 @@ test("超过阈值时列出小时，没翻完时禁止当成结论", async () =>
     page([row("a", FROM), row("b", FROM)], false),
   );
   expect(formatCountReport(hit)).toContain("2026-09-16 07:00\t2");
-  expect(formatCountReport(hit)).toContain("下列小时的计数超过阈值");
+  expect(formatCountReport(hit)).toContain("窗口合计 2，已超过 1");
 
   const partial = await countPagedList(request({ above: 300, maxPages: 1 }), async () =>
     page([row("a", FROM)], true),
@@ -105,7 +106,7 @@ test("超过阈值时列出小时，没翻完时禁止当成结论", async () =>
   expect(text.startsWith("complete: false")).toBe(true);
   expect(text).toContain("计数不完整");
   expect(text).toContain("不能据此判断是否超过阈值");
-  expect(text).not.toContain("没有小时的计数超过");
+  expect(text).not.toContain("窗口合计");
   expect(text).not.toContain("top:");
   expect(text).not.toContain("over_count:");
   expect(text).not.toContain("unique:");
