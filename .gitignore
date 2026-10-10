@@ -20,3 +20,9 @@ coverage
 # 只忽略**仓库根目录**的 `_*` 文件——apps/agent-server/scripts/_*.mjs 这类刻意保留的回归脚本不受影响。
 /_*.png
 /_*.txt
+# 前端/服务端测试输出落盘（vitest/单测摘要），不进仓库
+apps/agent-server/vitest-full*.txt
+apps/agent-server/mf.txt
+# agent 运行时调试日志（对话抓包 / pm2 启停输出），仅本地排查用
+.codebuddy/cc-msg-*.txt
+.codebuddy/pm2-start-*.txt

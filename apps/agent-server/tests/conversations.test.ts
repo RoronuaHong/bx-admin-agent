@@ -93,6 +93,25 @@ test("⑦上一期的相同结论仍要追加", async () => {
   await deleteConversation(id);
 });
 
+test("⑧b 旧基线只交来回复时，不能把刚写下的提问盖成助手气泡", async () => {
+  const id = uniq("delta-keep-user");
+  await createConversation({ id, title: "d" });
+  await upsertMessages({
+    id,
+    messages: [
+      { role: "user", text: "【数据预警】", at: 1 },
+      { role: "assistant", text: "上一期正常", at: 2 },
+    ],
+  });
+  await appendUserTurnIfMissing(id, "【数据预警】", 3_000);
+  await upsertMessages({ id, messages: [{ role: "assistant", text: "本期异常", at: 4_000 }], base: 2 });
+  const msgs = (await getConversation(id))!.messages;
+  expect(msgs.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+  expect(msgs[2]).toMatchObject({ role: "user", text: "【数据预警】" });
+  expect(msgs[3]).toMatchObject({ role: "assistant", text: "本期异常" });
+  await deleteConversation(id);
+});
+
 test("⑧开跑时先记下提问，客户端按旧基线回写整轮时不重复这条提问", async () => {
   const id = uniq("user-first");
   await createConversation({ id, title: "d" });

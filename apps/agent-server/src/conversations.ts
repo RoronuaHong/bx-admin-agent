@@ -473,7 +473,9 @@ function applyDeltaMessages(arr: StoredMessage[], tail: StoredMessage[], base: n
   const L = arr.length;
   if (at === L) {
     arr.push(...next);
-  } else if (at === L - 1 && next.length === 1) {
+  } else if (at === L - 1 && next.length === 1 && next[0]?.role === arr[L - 1]?.role) {
+    // 只替换同一条的流式更新。角色不同时（库里刚写下本期提问，客户端还按旧基线只交来回复）
+    // 必须追加，不能把提问盖成助手气泡。
     arr[L - 1] = next[0]!;
   } else {
     arr.push(...next);

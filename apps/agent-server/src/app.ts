@@ -534,12 +534,6 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   }
   const doc = await getConversation(task.conversationId);
   const existing = (doc?.messages || []) as StoredMessage[];
-  const duplicateCut = task.startedAt - 2000;
-  if (
-    existing.slice(-6).some((message) => message.role === "assistant" && message.text === finalText && (message.at ?? 0) >= duplicateCut)
-  ) {
-    return true;
-  }
   const resultOk = new Map<string, boolean>();
   for (const event of task.buffer) {
     if (event.type === "tool_result") resultOk.set(event.id, event.ok);
@@ -571,7 +565,8 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     ...(steps.length ? { steps } : {}),
     ...(charts.length ? { charts } : {}),
   };
-  // 提问在开跑时已经写进快照。这里再追加一次会让刷新后出现两条一样的用户气泡。
+  // 提问在开跑时已经写进快照。同一期再追加一次会让刷新后出现两条一样的用户气泡。
+  // 上一期用了同一段提问时不能算「已经写过」：必须是紧挨在本期回复前面的那一条。
   const last = existing[existing.length - 1];
   const prior = existing[existing.length - 2];
   const userAlreadyTail = last?.role === "user" && (last.text || "") === task.userText;
@@ -581,7 +576,17 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     prior?.role === "user" &&
     (prior.text || "") === task.userText;
   if (turnAlreadyStored) return true;
-  const messages = userAlreadyTail ? [...existing, assistantMessage] : [...existing, { role: "user" as const, text: task.userText, at: task.startedAt }, assistantMessage];
+  // 回复先落库、提问被旧基线盖掉时：把提问插回这条回复前面，不再另起一条重复回复。
+  const promptMissingBeforeAnswer =
+    last?.role === "assistant" &&
+    (last.text || "") === finalText &&
+    (last.at ?? 0) >= task.startedAt - 2000 &&
+    !(prior?.role === "user" && (prior.text || "") === task.userText);
+  const messages = promptMissingBeforeAnswer
+    ? [...existing.slice(0, -1), { role: "user" as const, text: task.userText, at: task.startedAt }, last]
+    : userAlreadyTail
+      ? [...existing, assistantMessage]
+      : [...existing, { role: "user" as const, text: task.userText, at: task.startedAt }, assistantMessage];
   await upsertMessages({ id: task.conversationId, messages });
   return true;
 }

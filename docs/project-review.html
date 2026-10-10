@@ -243,7 +243,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-09） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7；含 2026-10-08：MCP 生产命令白名单与来源指纹，见 §9；含 2026-10-09：C 章全链路待办，F1–F7 已修）</p>
+  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-10） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7；含 2026-10-08：MCP 生产命令白名单与来源指纹，见 §9；含 2026-10-09：C 章全链路待办，F1–F7 已修；含 2026-10-10：对话约 5 秒同步，定时提问气泡按本期补上）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -1846,7 +1846,7 @@ src/
 
 <section id="s31">
 <h2 class="sec">C · 2026-10-09 全链路待办</h2>
-<p>对照 CodeBuddy（草稿对话、完全访问、产物预览）和千问办公网页（常驻定时任务、执行记录、停用后从下一拍继续）。F1–F7 已修。F8 已拆出样式、流事件、cron、一次性任务日期面板，预警首行标记前后端共用；定时任务页和对话模板仍在 <code>ChatPage.vue</code>。F12 的定时拒绝名单与提示句同一份，交互对话仍不确认 <code>save_memory</code>。F9、F10、F11、F13–F15 与 K1–K7 核对后维持。F16 计划已作废。</p>
+<p>对照 CodeBuddy（草稿对话、完全访问、产物预览）和千问办公网页（常驻定时任务、执行记录、停用后从下一拍继续）。F1–F7 已修。F8 已拆出样式、流事件、cron、一次性任务日期面板，预警首行标记前后端共用；定时任务页和对话模板仍在 <code>ChatPage.vue</code>。F12 的定时拒绝名单与提示句同一份，交互对话仍不确认 <code>save_memory</code>。F9、F10、F11、F13–F15 与 K1–K7 核对后维持。F16 计划已作废。2026-10-10 的 R1–R5 已修：当前对话约每 5 秒跟上服务端，定时提问按本期补上。</p>
 <div class="note"><strong>产品选择，单独确认：</strong>新对话默认完全访问，写操作不弹确认卡。硬拒仍然生效，定时任务另有拒绝名单。对齐 CodeBuddy。要改成默认逐项确认时单独说。</div>
 <table>
 <thead><tr><th>编号</th><th>状态</th><th>事项</th><th>核对与落点</th></tr></thead>
@@ -1874,6 +1874,7 @@ src/
 <tr><td>K5</td><td><span class="tag ok">维持</span></td><td>阈值写在指令里；推不推由引擎看标记</td><td>不把阈值铺成表单。</td></tr>
 <tr><td>K6</td><td><span class="tag ok">维持</span></td><td>文件索引，不上向量库</td><td>chunk 到 5 万以上再换。</td></tr>
 <tr><td>K7</td><td><span class="tag ok">维持</span></td><td>新对话默认完全访问</td><td>只跳过确认卡。见本节开头的产品选择。</td></tr>
+<tr><td>R1–R5</td><td><span class="tag ok">已修</span></td><td>当前对话要整页刷新才看见定时 / 预警的新消息；相同提问的本期气泡被上一期占掉；模型失败把上游 JSON 露给浏览器</td><td>2026-10-10。<code>ChatPage</code> 页面可见时约每 5 秒同步任务、侧栏和当前对话。提问按本期开始时间补上。<code>applyDeltaMessages</code> 不再把提问盖成助手回复。失败文案见 <code>UNCLASSIFIED_MODEL_FAILURE</code>。细目在 <code>docs/best-practice-alignment-review.md</code> 第 6 节。仍敞着：5 秒拉取而不是落库即推、英文思考只做展示层收起、<code>fs_ls</code> 复核只写在提示里。</td></tr>
 </tbody>
 </table>
 </section>

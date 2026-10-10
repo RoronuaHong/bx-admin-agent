@@ -2128,10 +2128,15 @@ async function syncOpenConversation(convId: string) {
     return;
   }
   const state = states.get(convId);
-  if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
+  if (!state) return;
   conversationSyncing = true;
   try {
     const status = await fetchChatTaskStatus(convId).catch(() => null);
+    // 正在跟流时不能整段覆盖，但本期提问必须在场：定时任务每期正文相同，不能拿上一期那条充数。
+    if (state.sending || state.bubbles.some((b) => b.streaming)) {
+      if (status?.running) ensureRunPrompt(state, status.task?.userText || "", status.task?.startedAt || 0);
+      return;
+    }
     if (status?.running) {
       await attachRunningTask(convId);
       return;
@@ -3623,6 +3628,24 @@ async function settleInterruptedRun(run: TurnRun): Promise<void> {
 }
 
 /**
+ * 把本期提问补进对话。定时任务每期正文相同，上一期那条不能算本期已经显示。
+ * 正在流式的助手气泡留在最后，提问插在它前面。
+ */
+function ensureRunPrompt(state: ConvState, userText: string, startedAt: number): void {
+  const text = userText.trim();
+  if (!text || !startedAt) return;
+  const floor = startedAt - 2000;
+  const belongs = (bubble: Bubble | undefined) =>
+    !!bubble && bubble.role === "user" && bubble.text === text && (bubble.at || 0) >= floor;
+  const last = state.bubbles[state.bubbles.length - 1];
+  const prev = state.bubbles[state.bubbles.length - 2];
+  if (belongs(last) || (belongs(prev) && last?.role === "assistant")) return;
+  const prompt: Bubble = { id: ++seq, role: "user", at: startedAt, text };
+  if (last?.streaming) state.bubbles.splice(state.bubbles.length - 1, 0, prompt);
+  else state.bubbles.push(prompt);
+}
+
+/**
  * 打开对话时若服务端仍有本对话的任务在跑：就地挂一个气泡跟随（游标 0 = 从头回放）。
  * 场景是刷新 / 换标签页 / 换设备进来——之前的表现是「界面上什么都看不到，只能等结果回投」，
  * 对齐最佳实践：重新挂上正在跑的流（客户端刷新后应接回当前 run，而不是从零等）。
@@ -3640,22 +3663,7 @@ async function attachRunningTask(convId: string): Promise<void> {
   if (!fresh || fresh.sending || fresh.bubbles.some((b) => b.streaming)) return;
   // 快照可能还没有这句提问（落库和刷新撞在一起）。先补上用户气泡，再挂助手占位，
   // 否则刷新后只剩一个空的「正在规划」，看起来像提问丢了、也像没反应。
-  const pendingQuestion = (status.task?.userText || "").trim();
-  if (pendingQuestion) {
-    const last = fresh.bubbles[fresh.bubbles.length - 1];
-    const prev = fresh.bubbles[fresh.bubbles.length - 2];
-    const alreadyThere =
-      (last?.role === "user" && last.text === pendingQuestion) ||
-      (prev?.role === "user" && prev.text === pendingQuestion && last?.role === "assistant");
-    if (!alreadyThere) {
-      fresh.bubbles.push({
-        id: ++seq,
-        role: "user",
-        at: status.task?.startedAt || Date.now(),
-        text: pendingQuestion,
-      });
-    }
-  }
+  ensureRunPrompt(fresh, status.task?.userText || "", status.task?.startedAt || 0);
   const reply = reactive<Bubble>({
     id: ++seq,
     role: "assistant",
