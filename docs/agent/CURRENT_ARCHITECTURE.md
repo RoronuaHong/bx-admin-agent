@@ -1,6 +1,6 @@
 # 当前架构：Deep-Agent 框架（唯一权威）
 
-> **版本**：基于 `apps/agent-server/src` 实际代码核对（2026-09-26）。
+> **版本**：基于 `apps/agent-server/src` 实际代码核对（2026-09-26；2026-10-11 增补接地兜底、模型候选链、定时状态句与对话快照去重口径）。
 > **定位**：本文是 `docs/agent/` 下文档的**当前架构唯一权威**。本目录其余文件均为「PC 后台管理 Agent」历史快照，与当前代码已脱节，请勿照抄。
 > **关联规划**：`docs/deep-agents-plan.md`（D1–D4 实施记录）、`docs/agent-infrastructure.md`（旧基础设施基线，已过时）。
 > **范围**：不上多进程 Agent 集群、不接 A2A。进程内 `task` 只做上下文隔离。新领域顺序见 [`domain-adaptation-guide.md`](../domain-adaptation-guide.md) 文首；生产白名单与脚本来源见 [`mcp-guide.md`](../mcp-guide.md) §10。外部 Agent 不能共用这套设备 cookie、或某个领域要独立扩容时，再单独立项，先做 A2A Server。
@@ -16,6 +16,7 @@
 - `chat.ts`：`chatStream` / `runWithTools` —— `AsyncGenerator<ChatEvent>`；模型 → tool_calls → 执行（MCP/内置）→ 回灌 → 再调，单轮 ≤ `MCP_MAX_TOOL_ROUNDS=14` 轮。
 - 事件流 `ChatEvent`：`text_delta` / `tool_call` / `confirmation_required` / `usage` / `subagent_start|delta|end` / `todos` / `done`。
 - 对话级并发：`chat-tasks.ts`（任务注册表 `startTask`/`consumeTask`、运行中流、pending 队列、对话级 409）。
+- 模型候选链（2026-10-11）：自动模式（未点名模型）按 `autoModelOrder` 排序——免费档在前、DeepSeek-Flash（`ds4flash0731`）兜底、其余付费在后；`orderModelCandidates` 负责冷却模型放队尾（无人值守直接丢弃），用户点名仍先试。模型中途失败或中断时，气泡只写认得出的状态码说明或固定一句（`partialInterruptLine` / `UNCLASSIFIED_MODEL_FAILURE`），上游原始 JSON 只进服务端日志。
 
 ## 2. 能力层（D1–D4，已落地，依据 `docs/deep-agents-plan.md` §8）
 
@@ -46,7 +47,7 @@
 | 工具风险分级 | `risk.ts` | 工具危险度由「工具声明 + 服务端策略」决定，默认 fail-closed；判据来源含 `sql-readonly`；与 `builtins.ts` 的 `BUILTIN_RISK` 联动（如 `request_clarification`=read/workspace、`web_search`=read/workspace、`search_dingtalk_doc`=read/external） |
 | 不可信内容护栏 | `untrusted.ts` | Prompt 注入防护（对齐 OWASP LLM01）：靠**结构隔离**而非词表——清洗不可见/危险控制符、每请求随机 nonce 定界并标注来源、中和伪造闭合标签；不检测自然语言 |
 | SQL 只读闸 | `sql-readonly.ts` | `isReadOnlySql` fail-closed：首词白名单（select/with/show/describe/explain）+ 黑名单词 + 危险构造（`into outfile`/`load_file`/`pg_read_file`/`writable_schema`）；与 Metabase MCP 适配器纵深防御 |
-| 接地门禁 | `grounding.ts` | 角色声明或本轮有外部数据源工具（`web_search`/`fetch_url`/`search_knowledge`/`mcp__*`）时开启。零证据且回答含事实断言 → 作废并回灌纠正；没有事实断言则放行 |
+| 接地门禁 | `grounding.ts` | 角色声明（`enforceGrounding`）或本轮有外部数据源工具时开启。零证据且回答含事实断言 → 作废并回灌纠正；没有事实断言则放行。2026-10-11 增强：区分**业务数据源**与仅联网检索（`hasBusinessDataSource`，`web_search`/`fetch_url` 不算业务源）——只挂了检索工具时走 `groundingWebOnly` 兜底口径；零证据收束前的轻探测 `probeNeedsExternalData` 返回 `data`/`no_data`/`unavailable`/`null`，由 `probeAllowsRelease` 判放行（`no_data` 恒放行；`unavailable` 仅交互对话放行，无人值守按保守 DATA 处理）；诚实兜底带已确定话题上下文（`priorTopicMessages` → `buildGroundedFallbackUser`，最多 8 条、每条 800 字符） |
 | 确认门 | `confirm.ts` + `toolNeedsConfirm` | 事件流内确认卡，队列在确认等待时暂停 |
 | 运行追踪 | `trace.ts` | run 级 JSONL（runId/会话归属/模型/轮次/token/耗时/状态/错误），是排障、评测基线、成本聚合的地基 |
 | 成本计量 | `cost.ts` | 只读聚合 `trace.ts` 落盘的 run 级记录；tokens 估算，单价 `COST_RATE_<模型ID大写>_PER_1K`，未配置记 `unpricedTokens`（如实显示「未定价」，不编造金额） |
@@ -135,6 +136,7 @@ agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内�
 
 - `chat-tasks.ts`：任务底座（`startTask`/`consumeTask`、运行中流、pending 队列、对话级 409）。
 - `schedules.ts`：`croner` 周期/一次性调度，Mongo `chat_schedules`；复用任务底座，结果回投到**任务专属对话**（`ownConversation`，避免刷屏）；任务级 `mcpServers` 最小权限白名单（运行时取「对话启用集 ∩ 清单」）；`notifyOn` 控制投递。
+- 状态句「跑完后重算」（2026-10-11）：定时任务问启用 / 频率 / 下次执行时，服务端不再沿用开跑时的那句，而是 `finishedScheduleStatusSentence`（`notify/deliver.ts`）按**跑完后的正文标记与告警状态**重算——告警 firing 由 `decideAlertDelivery` 判定，「下次执行」在告警未解除时写复查时刻（名义间隔一半、≥5 分钟），不是 cron 的下一档整点。传参走 `opts.scheduleStatus`（`app.ts` 带全 name/cron/nextRunAt/notifyPolicy/alertState/lastMarker 等），优先于旧的 `scheduleStatusLine`。
 
 ## 6. 持久化与上下文
 
@@ -142,6 +144,7 @@ agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内�
 - `history.ts`：窗口 → 无损裁剪 → LLM 摘要（预算按模型窗口推导）。
 - `memory.ts`：显式写入、可查删、注入 system。
 - `fs-store.ts`：大结果卸载落盘（见 §2 D2）。
+- 对话快照去重（2026-10-11）：`persistTaskOutcome`（`app.ts`）在「回复已先落库但本期提问不在其前面」时把提问插回这条回复前（`promptMissingBeforeAnswer` 分支），不另起重复回复；`applyDeltaMessages`（`conversations.ts`）只在尾条**同角色**时原地替换（流式更新），角色不同一律追加，避免把服务端刚写下的提问盖成助手气泡。
 
 ## 7. 与旧文档的关系
 

@@ -17,7 +17,7 @@
 ### [best-practice-alignment-review.md](./best-practice-alignment-review.md)
 - **定位**：2026-09-30 全项目逐步对照（千问办公 / CodeBuddy CLI / WorkBuddy / ChatGPT Monitoring）。
 - **覆盖**：定时任务 S1–S20；其余功能 F1–F20 只标是否要动。A1–A6 已落地。
-- **状态**：✅ A1–A6 已落地（2026-09-30）。产品口径仍以各主题现行文档为准。
+- **状态**：✅ A1–A6 已落地（2026-09-30）。2026-10-10 起第 5–6 节记录回答呈现与对话刷新（R1–R5）；2026-10-11 第 7 节记录零证据兜底 / 破线口径 / 模型链（G1–G5）。产品口径仍以各主题现行文档为准。
 
 ### [artifact-delivery-plan.md](./artifact-delivery-plan.md)
 - **定位**：产物交付闭环（模型生成文件 → 用户真能拿到）的设计与落地记录；也是后续「命令执行治理」「配置缓存」修复的承载文档。

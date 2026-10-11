@@ -1,6 +1,6 @@
 # 定时任务「数据暴涨检测 / 预警」（最佳实践版）
 
-> 状态：**P1～P2.5 已落地**（分钟频率 + 仅异常通知 + 恢复 + 指令脚手架 + **先测后跑**）。2026-10-08 起破线不再按时间去重。
+> 状态：**P1～P2.5 已落地**（分钟频率 + 仅异常通知 + 恢复 + 指令脚手架 + **先测后跑**）。2026-10-08 起破线不再按时间去重；2026-10-11 起破线按**窗口合计**判定（`unique` 严格大于 `above`），不按单小时峰值。
 > 入口：http://localhost:5173/chat → 对话试跑 / 定时任务。
 > 对齐：ChatGPT Monitoring +「先测后跑」。破线每期都推，恢复仍要连续 2 期正常。竞品对照见 `docs/scheduled-alert-best-practices-comparison.md`；会话落点见 `scheduled-task-sessions-plan.md`；总览见 `agent-infrastructure.md` §8。
 
@@ -91,6 +91,8 @@
 | `builtins.ts` | `manage_schedule` 支持 `purpose` / `notifyPolicy`；文案提示先测后跑 |
 | `ChatPage.vue` | 用途 / 频率 / 通知；「设为数据预警」「从对话带入」 |
 
+**破线按窗口合计判定（2026-10-11）**：`markerFromCountText`（`schedule-alert.ts`）在 `complete: true` 且同时解析出 `above` 与 `unique` 时，`unique > above` → `[SPIKE]`，否则 `[NORMAL]`；解析不出仍由模型写标记。`count_list_by_time` 的 `above` 参数语义是「窗口合计的破线阈值（严格大于）」，各小时计数只供核对，不能用峰值代替合计；计数事实行写「合计 X，已/未破线」。单个小时超阈不代表窗口破线。
+
 ---
 
 ## 4. 指令示例（非产品字段）
@@ -118,6 +120,7 @@
 | 无人值守结论协议按**状态**判定 | ✅ 2026-09-30。取证失败时预警正文必带 `[NO_DATA]`、报告按 `ungrounded` 记未产出结论；回归 `tests/schedule-unattended-conclusion.test.ts` |
 | 无总数列表的跨页计数 | ✅ 2026-10-01。`count_list_by_time` 在服务端翻完，只回小时计数；`complete: false` 不给各小时数字。直接翻第二页或换筛选再取，由 `list-page-gate.ts` 拒绝。其它汇总用 `run_tool_code` |
 | 不做：阈值一级表单化 | — |
+| 破线按窗口合计判定（`unique` 严格大于 `above`，不按单小时峰值 / `over_count`） | ✅ 2026-10-11。落点 `markerFromCountText` / `formatCountReport` / `formatScheduledCountFacts`；回归 `tests/schedule-alert.test.ts`、`tests/list-count.test.ts` |
 
 ---
 
