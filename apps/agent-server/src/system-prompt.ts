@@ -97,6 +97,24 @@ const TOOLING_RULES = [
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
 
+/**
+ * 回答结构示范（few-shot，稳定前缀）：把「结论先行 + 口径 + 来源」的骨架演示一遍，
+ * 比十条文字描述更稳（业界共识：与其描述十句，不如给 2~5 个高质量输入→输出示例）。
+ *
+ * 纪律：
+ * - 示例一律用 XX / <模块> / <接口> / <对象A> 占位（AGENT_CHARTER「禁止写死」红线 §示例说明），
+ *   不得以真实业务场景举例；
+ * - 与 business-data-query 技能的「交付格式」同源——此处只**演示**骨架，不重复规定，
+ *   避免同一纪律两处措辞（单一真相原则）；
+ * - 仅在注入工具时出现（示范里的「来源」对零工具模式无意义），保持无工具路径精简。
+ */
+const ANSWER_SHAPE_EXAMPLE = [
+  "回答结构示范（只示范骨架；XX 与尖括号换成真实结论，以下不是真实数据）：",
+  "用户问「XX 模块近 7 天有多少条」→ 答「共 128 条（口径：近 7 天、按天、全部状态）。来源：<接口/表>。已排除 3 条状态为空的记录。」",
+  "用户问「<对象A> 和 <对象B> 哪个高」→ 答「<对象A> 更高（120 对 86，差 34；口径：<时间范围>）。来源：<接口/表>。」",
+  "共同结构：第一句给结论（数字 + 口径），第二句给来源，第三句只写影响解读的点（没有就不写）；要图再出图、要明细再给明细。",
+].join("\n");
+
 /** 子代理系统提示：上下文隔离，只拿任务描述与最小工具集，回传摘要（对齐 Deep Agents Subagents）。 */
 export const SUBAGENT_PROMPT = [
   "你是被主代理委派的执行子代理，只负责完成给定的单一任务。",
@@ -312,7 +330,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
   // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
   const role = getRole(input.role);
   // 全局安全护栏放稳定前缀最前：跨角色共享、优先级最高，且随角色前缀各自缓存（不互相击穿）。
-  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, input.tooling ? TOOLING_RULES : "", renderSkillIndex(role.id)].filter(
+  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, input.tooling ? TOOLING_RULES : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
     (part) => part && part.trim(),
   );
   const dynamicParts = [

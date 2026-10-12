@@ -5,6 +5,7 @@
 import { test, expect } from "vitest";
 import { buildSystemPrompt, renderNowClock } from "../src/system-prompt.js";
 import { getRole } from "../src/roles.js";
+import { builtinToolSpecs } from "../src/builtins.js";
 
 const TOOLING = {
   mcpToolCount: 0,
@@ -106,4 +107,34 @@ test("[F] 观影人设写清「何时该调工具 / 何时不该调工具」（�
   expect(base).toContain("不要声称数据源故障");
   // 回归锚点：旧的「首轮系统会强制你先走一次工具通道」已随端点不兼容失效，不该留在人设里误导模型。
   expect(base).not.toContain("强制你先走一次工具通道");
+});
+
+// ---- Few-shot 示范（对齐「与其描述十句，不如给 2~5 个高质量示例」）----
+
+test("[J] 回答结构示范（few-shot）进稳定前缀：结论先行 + 口径 + 来源，且只用占位符", () => {
+  const { stable } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
+  expect(stable).toContain("回答结构示范");
+  expect(stable).toContain("口径");
+  expect(stable).toContain("来源：<接口/表>");
+  // 禁止写死红线审计锚点：示例只允许 XX / <…> 占位形态，不得夹带真实业务示例。
+  expect(stable).toContain("XX 模块");
+  // 无工具模式不注入（示范里的「来源」对零工具路径无意义，保持精简）。
+  const bare = buildSystemPrompt({ role: "generic", withMemory: false }).stable;
+  expect(bare).not.toContain("回答结构示范");
+});
+
+test("[K] 澄清工具描述含输入→输出示范：问题 + 两个互斥选项的形态", () => {
+  const spec = builtinToolSpecs().find((s) => s.name === "request_clarification");
+  expect(spec, "request_clarification 工具定义缺失").toBeTruthy();
+  expect(spec!.description).toContain("示例（仅示范结构，非真实场景）");
+  expect(spec!.description).toContain("<读法一>");
+  expect(spec!.description).toContain("<读法二>");
+});
+
+test("[L] 客服答复骨架示范：制度类与会话事实类各一个输入→输出，且用占位符", () => {
+  const base = getRole("support").basePrompt || "";
+  expect(base).toContain("答复骨架");
+  expect(base).toContain("按文档：<一句话结论>");
+  expect(base).toContain("依据：<来源文件>");
+  expect(base).toContain("共 N 条会话");
 });
