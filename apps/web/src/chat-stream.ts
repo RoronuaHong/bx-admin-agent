@@ -1,4 +1,4 @@
-import type { ArtifactSpec, ChartSpec, ChatEvent, LocalizedToken, TodoItem } from "@bx/shared";
+import type { ArtifactSpec, ChartSpec, ChatEvent, LocalizedToken, SupportLabels, TodoItem } from "@bx/shared";
 
 /** 流事件要改的气泡字段。页面上的 Bubble 多出来的展示字段不影响这里。 */
 export interface StreamReply {
@@ -36,6 +36,8 @@ export interface StreamReply {
     whyItMatters?: string;
     expiresInMs?: number;
   } | null;
+  /** 客服助手封闭分类。只在这一路出现，不改回复正文。 */
+  supportLabels?: SupportLabels;
   usage?: {
     tokens: number;
     budget: number;
@@ -217,6 +219,8 @@ export function applyStreamEvent<T extends StreamReply>(
       sa.text = event.text;
     }
     host.queueScrollIfCurrent(convId);
+  } else if (event.type === "support_labels") {
+    reply.supportLabels = event.labels;
   } else if (event.type === "usage") {
     reply.usage = {
       tokens: event.tokens,

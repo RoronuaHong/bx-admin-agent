@@ -14,6 +14,8 @@ import BackToTop from "../components/BackToTop.vue";
 import ModelSelect from "../components/ModelSelect.vue";
 import PromptBox from "../components/PromptBox.vue";
 import ToolsSearch from "../components/ToolsSearch.vue";
+import SkillAddForm from "../components/SkillAddForm.vue";
+import McpAddForm from "../components/McpAddForm.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import UiSelect from "../components/UiSelect.vue";
@@ -443,6 +445,8 @@ async function toggleChannelEnabled(ch: NotifyChannelDto) {
 // 若做成 0×0，菜单会贴在按钮底边上方 8px（压住按钮），飞出底边也对不齐。
 const taskToolsOpen = ref(false);
 const taskSkillOpen = ref(false);
+const taskSkillAddOpen = ref(false);
+const taskMcpAddOpen = ref(false);
 const taskMcpOpen = ref(false);
 const taskExpertOpen = ref(false);
 const taskSkillQuery = ref("");
@@ -505,9 +509,11 @@ function openTaskFlyout(kind: "skills" | "mcp" | "expert", focusSearch = true) {
   if (kind === "skills") {
     taskSkillOpen.value = true;
     taskSkillQuery.value = "";
+    taskSkillAddOpen.value = false;
   } else if (kind === "mcp") {
     taskMcpOpen.value = true;
     taskMcpQuery.value = "";
+    taskMcpAddOpen.value = false;
     void refreshMcpAvailable().then(() => ensureTaskMcpConnected());
   } else {
     taskExpertOpen.value = true;
@@ -1194,6 +1200,8 @@ interface Bubble {
     whyItMatters?: string;
     expiresInMs?: number;
   } | null;
+  /** 客服助手封闭分类（意图、情绪、紧急、路由建议、工单建议、越权、承诺门控）。 */
+  supportLabels?: import("@bx/shared").SupportLabels;
   /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
   usage?: {
     tokens: number;
@@ -2088,6 +2096,7 @@ function toStored(list: Bubble[]): StoredMessage[] {
       ...(b.todos?.length ? { todos: b.todos } : {}),
       ...(b.charts?.length ? { charts: b.charts } : {}),
       ...(b.artifacts?.length ? { artifacts: b.artifacts } : {}),
+      ...(b.supportLabels ? { supportLabels: b.supportLabels } : {}),
     };
   });
 }
@@ -2105,6 +2114,7 @@ function bubblesFromStored(messages: StoredMessage[], times: number[]): Bubble[]
     ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
     ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
     ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
+    ...(m.supportLabels ? { supportLabels: m.supportLabels } : {}),
   }));
 }
 
@@ -3979,6 +3989,7 @@ function openMcpPanel(focusSearch = true) {
   mcpOpen.value = true;
   skillOpen.value = false;
   expertOpen.value = false;
+  mcpAddOpen.value = false;
   mcpQuery.value = "";
   searchAutofocus.value = focusSearch;
   loadPinyin();
@@ -4132,6 +4143,8 @@ function taskRowState(s: McpServerStatus): { cls: string; text: string } {
 
 // ---- 技能面板（与 MCP 面板同构：列表全局、启用集按对话持久化）----
 const skillOpen = ref(false);
+const skillAddOpen = ref(false);
+const mcpAddOpen = ref(false);
 const skillAvailable = ref<SkillMeta[]>([]);
 const skillBusy = ref(false);
 const skillError = ref("");
@@ -4146,6 +4159,30 @@ async function loadSkills(convId = currentId.value) {
   state.settings.skillsEnabled = data.enabled;
 }
 
+async function onChatSkillCreated(dir: string) {
+  skillAddOpen.value = false;
+  await loadSkills();
+  if (!current.value.settings.skillsEnabled.includes(dir)) await toggleSkill(dir, true);
+}
+
+async function onTaskSkillCreated(dir: string) {
+  taskSkillAddOpen.value = false;
+  await loadSkills();
+  if (!taskDraft.skills.includes(dir)) taskDraft.skills.push(dir);
+}
+
+async function onChatMcpCreated(id: string) {
+  mcpAddOpen.value = false;
+  await loadMcp();
+  if (!current.value.settings.mcpEnabled.includes(id)) await toggleMcp(id, true);
+}
+
+async function onTaskMcpCreated(id: string) {
+  taskMcpAddOpen.value = false;
+  await loadMcp();
+  if (!taskDraft.mcpServers.includes(id)) taskDraft.mcpServers.push(id);
+}
+
 /** 打开技能飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
 function openSkillPanel(focusSearch = true) {
   // 已展开则保持：仅确保互斥，不重置搜索框/焦点/重新拉取（hover 重复进入不应清空用户输入）。
@@ -4157,6 +4194,7 @@ function openSkillPanel(focusSearch = true) {
   skillOpen.value = true;
   mcpOpen.value = false;
   expertOpen.value = false;
+  skillAddOpen.value = false;
   // 每次从关闭→打开都从空关键词开始，避免残留上次搜索词导致列表看着「少了几项」。
   skillQuery.value = "";
   searchAutofocus.value = focusSearch;
@@ -5899,14 +5937,22 @@ onBeforeUnmount(() => {
                           <p class="flyout-hint">
                             {{ tx("勾选的技能随任务每期运行注入；默认生效的技能无需勾选。", "Checked skills are injected on every run; default skills need no check.", "Habilidades marcadas são injetadas a cada execução; as padrão dispensam marcação.", "चुने गए स्किल हर रन में लगते हैं; डिफ़ॉल्ट स्किल को चिह्नित करने की आवश्यकता नहीं।") }}
                           </p>
-                          <button
-                            class="tools-flyout__action"
-                            type="button"
-                            :disabled="!taskDraft.skills.length"
-                            @click="clearTaskSkills"
-                          >
-                            {{ tx("取消全部已选技能", "Deselect all skills", "Desmarcar todas as habilidades", "सभी चयन हटाएँ") }}
-                          </button>
+                          <SkillAddForm v-if="taskSkillAddOpen" @created="onTaskSkillCreated" @cancel="taskSkillAddOpen = false" />
+                          <div class="tools-flyout__foot-row">
+                            <button class="tools-flyout__add" type="button" :aria-expanded="taskSkillAddOpen" @click="taskSkillAddOpen = !taskSkillAddOpen">
+                              <span class="tools-flyout__add-plus" aria-hidden="true">+</span>
+                              {{ tx("添加技能", "Add skill", "Adicionar habilidade", "स्किल जोड़ें") }}
+                            </button>
+                            <RouterLink class="tools-flyout__manage" to="/skills">{{ tx("管理", "Manage", "Gerenciar", "प्रबंधित करें") }}</RouterLink>
+                            <button
+                              class="tools-flyout__action"
+                              type="button"
+                              :disabled="!taskDraft.skills.length"
+                              @click="clearTaskSkills"
+                            >
+                              {{ tx("取消全部", "Clear", "Limpar", "साफ़ करें") }}
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -5981,14 +6027,21 @@ onBeforeUnmount(() => {
                           <p class="flyout-hint">
                             {{ tx("不勾选不带 MCP；写操作到点仍按风险策略确认。", "Unchecked = no MCP; writes still confirm at run time.", "Desmarcado = sem MCP; escritas ainda confirmam na execução.", "अनचेक = बिना MCP; रन पर राइट की पुष्टि रहेगी।") }}
                           </p>
-                          <button
-                            class="tools-flyout__action"
-                            type="button"
-                            :disabled="!taskMcpCount"
-                            @click="clearTaskMcp"
-                          >
-                            {{ tx("取消全部已选连接器", "Deselect all connectors", "Desmarcar todos os conectores", "सभी चयन हटाएँ") }}
-                          </button>
+                          <McpAddForm v-if="taskMcpAddOpen" @created="onTaskMcpCreated" @cancel="taskMcpAddOpen = false" />
+                          <div class="tools-flyout__foot-row">
+                            <button class="tools-flyout__add" type="button" :aria-expanded="taskMcpAddOpen" @click="taskMcpAddOpen = !taskMcpAddOpen">
+                              <span class="tools-flyout__add-plus" aria-hidden="true">+</span>
+                              {{ tx("添加连接器", "Add connector", "Adicionar conector", "कनेक्टर जोड़ें") }}
+                            </button>
+                            <button
+                              class="tools-flyout__action"
+                              type="button"
+                              :disabled="!taskMcpCount"
+                              @click="clearTaskMcp"
+                            >
+                              {{ tx("取消全部", "Clear", "Limpar", "साफ़ करें") }}
+                            </button>
+                          </div>
                         </div>
                       </div>
 
@@ -6529,6 +6582,14 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="b.role === 'user'" class="plain">{{ b.text }}</div>
             <template v-else>
+              <div v-if="b.supportLabels?.items?.length" class="support-labels">
+                <span
+                  v-for="item in b.supportLabels.items"
+                  :key="item.id"
+                  class="support-label"
+                  :class="`support-label--${item.band}`"
+                >{{ item.label }} {{ item.value }}</span>
+              </div>
               <!-- 流式 loading 态完全交给推理面板（正在规划/思考中/步骤/子代理），
                    答案气泡在出正文前保持空，避免与推理面板重复出现「思考中」指示。 -->
               <template v-if="b.text && alertMarkerInfo(b)">
@@ -6878,14 +6939,22 @@ onBeforeUnmount(() => {
                         )
                       }}
                     </p>
-                    <button
-                      class="tools-flyout__action"
-                      type="button"
-                      :disabled="!current.settings.skillsEnabled.length || skillBusy"
-                      @click="clearSkillSelection"
-                    >
-                      {{ tx("取消全部已选技能", "Deselect all skills", "Desmarcar todas as habilidades", "सभी चयन हटाएँ") }}
-                    </button>
+                    <SkillAddForm v-if="skillAddOpen" @created="onChatSkillCreated" @cancel="skillAddOpen = false" />
+                    <div class="tools-flyout__foot-row">
+                      <button class="tools-flyout__add" type="button" :aria-expanded="skillAddOpen" @click="skillAddOpen = !skillAddOpen">
+                        <span class="tools-flyout__add-plus" aria-hidden="true">+</span>
+                        {{ tx("添加技能", "Add skill", "Adicionar habilidade", "स्किल जोड़ें") }}
+                      </button>
+                      <RouterLink class="tools-flyout__manage" to="/skills">{{ tx("管理", "Manage", "Gerenciar", "प्रबंधित करें") }}</RouterLink>
+                      <button
+                        class="tools-flyout__action"
+                        type="button"
+                        :disabled="!current.settings.skillsEnabled.length || skillBusy"
+                        @click="clearSkillSelection"
+                      >
+                        {{ tx("取消全部", "Clear", "Limpar", "साफ़ करें") }}
+                      </button>
+                    </div>
                   </div>
                   <div v-if="skillError" class="mcp-error">{{ skillError }}</div>
                 </div>
@@ -6971,14 +7040,21 @@ onBeforeUnmount(() => {
                         )
                       }}
                     </p>
-                    <button
-                      class="tools-flyout__action"
-                      type="button"
-                      :disabled="!canClearOptionalMcp || mcpBusy"
-                      @click="clearMcpSelection"
-                    >
-                      {{ tx("取消全部已选连接器", "Deselect all connectors", "Desmarcar todos os conectores", "सभी चयन हटाएँ") }}
-                    </button>
+                    <McpAddForm v-if="mcpAddOpen" @created="onChatMcpCreated" @cancel="mcpAddOpen = false" />
+                    <div class="tools-flyout__foot-row">
+                      <button class="tools-flyout__add" type="button" :aria-expanded="mcpAddOpen" @click="mcpAddOpen = !mcpAddOpen">
+                        <span class="tools-flyout__add-plus" aria-hidden="true">+</span>
+                        {{ tx("添加连接器", "Add connector", "Adicionar conector", "कनेक्टर जोड़ें") }}
+                      </button>
+                      <button
+                        class="tools-flyout__action"
+                        type="button"
+                        :disabled="!canClearOptionalMcp || mcpBusy"
+                        @click="clearMcpSelection"
+                      >
+                        {{ tx("取消全部", "Clear", "Limpar", "साफ़ करें") }}
+                      </button>
+                    </div>
                   </div>
                   <div v-if="mcpError" class="mcp-error">{{ mcpError }}</div>
                 </div>

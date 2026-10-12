@@ -117,7 +117,7 @@ agent-server 自带的本机能力，经 `execBuiltin` 分发（另含两个内�
 
 ### 4.5 技能层（skills/）
 
-适配器与内置工具只解决"能不能调"，**技能（SKILL.md）解决"拿到工具后怎么用"**。`default: true` 只是不出现在技能勾选面板；索引仍常驻，全文在命中时用 `read_skill` 加载，不是整份注入。角色（`roles.ts`）决定启用哪些 MCP；技能描述决定何时加载。各技能自带 `SKILL.md` 即其规范：
+适配器与内置工具只解决"能不能调"，**技能（SKILL.md）解决"拿到工具后怎么用"**。`default: true` 只是不出现在技能勾选面板；索引仍常驻，全文在命中时用 `read_skill` 加载，不是整份注入。本地技能在 `.data/skills/`，全局开关在 `.data/skills-state.json`（关掉的不进索引，不改文件）。管理页是 `/skills`。对话飞出只决定本对话要不要全文注入。详见 `docs/skill-management-plan.md`。角色（`roles.ts`）决定启用哪些 MCP；技能描述决定何时加载。各技能自带 `SKILL.md` 即其规范：
 
 | 技能 | 触发场景 | 关键依赖 |
 |---|---|---|

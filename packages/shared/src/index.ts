@@ -24,6 +24,20 @@ export function parseAlertMarker(text: string): AlertMarker | null {
   return matched[1]!.toUpperCase() as AlertMarker;
 }
 
+/** 客服助手封闭分类的一格。band 只表示这格有多集中，不表示已经改派或已经授权。 */
+export interface SupportLabelItem {
+  id: string;
+  label: string;
+  value: string;
+  band: "high" | "review" | "low" | "missing";
+}
+
+/** 客服助手一轮的分类结果。draft 只决定承诺句要不要换成流程句。 */
+export interface SupportLabels {
+  items: SupportLabelItem[];
+  draft: "keep" | "flag" | "replace" | "unchecked";
+}
+
 /** 任务规划条目（Deep Agents 的 write_todos 形态：全量替换，非增量）。 */
 export interface TodoItem {
   content: string;
@@ -232,6 +246,11 @@ type ChatEventBody =
       costTokens?: number;
     }
   | { type: "done" }
+  /**
+   * 客服助手这一路的封闭分类。不改页面、不换模型。
+   * draft=replace 时，同一次回复的正文已由代码换成事先写好的流程句。
+   */
+  | { type: "support_labels"; labels: SupportLabels }
   /**
    * 传输层保活（长静默期的模型思考 / 长工具执行）：不占序号、不进服务端事件缓冲，
    * 前端忽略即可——它的作用只是让代理与空闲超时看到连接还活着。

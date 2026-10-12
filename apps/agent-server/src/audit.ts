@@ -19,7 +19,9 @@ export type AuditDecision =
   | "clarify_deferred" // 待澄清期间被冻结暂缓的非只读调用（未执行、未产生副作用）
   | "memory_write" // 长期记忆写入（OWASP ASI04 记忆投毒：留痕才能回溯是谁/哪次会话写进去的）
   | "quota_exceeded" // 成本硬配额用尽，新运行被拒（OWASP LLM04 / LLM10）
-  | "ownership_mismatch"; // 确认应答与当前会话不匹配
+  | "ownership_mismatch" // 确认应答与当前会话不匹配
+  | "skill_write" // 本地技能安装 / 更新 / 删除，或全局开关。不推送告警
+  | "mcp_write"; // 从对话面板添加远程连接器。不推送告警
 
 export interface AuditEvent {
   at: number;

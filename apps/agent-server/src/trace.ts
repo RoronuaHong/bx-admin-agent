@@ -7,6 +7,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import type { SupportLabels } from "@bx/shared";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 /** trace 落盘目录默认值（成本聚合消费同一份 JSONL）。 */
@@ -54,6 +55,8 @@ export interface RunTrace {
   error?: string;
   /** 代码版本（git sha / RELEASE env）：评测基线与排障按版本对比的必要条件。 */
   release?: string;
+  /** 客服助手这一路的封闭分类。其它角色没有这一项。 */
+  supportLabels?: SupportLabels;
 }
 
 // ---- release 标记（§13 最小版）：RELEASE env 优先 > git sha（进程内缓存一次）> unknown ----

@@ -16,6 +16,7 @@ export const router = createRouter({
     { path: "/support", component: ChatPage, props: { agentId: "support", agentLabel: "客服助手" } },
     // 运行追踪（可观测）：run 级运行列表，数据来自 /chat/trace/runs（服务端按 owner 过滤）。
     { path: "/trace", component: () => import("./pages/TracePage.vue") },
+    { path: "/skills", component: () => import("./pages/SkillsPage.vue") },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
 });

@@ -236,6 +236,7 @@
   <a href="#s29">A · 工程配套（内置 MCP/脚本/测试/文档）</a>
   <a href="#s30">B · 最佳实践偏离汇总</a>
   <a href="#s31">C · 2026-10-09 全链路待办</a>
+  <a href="#s31-jev">C · 客服助手 Jev</a>
 </nav>
 
 <main>
@@ -1877,6 +1878,8 @@ src/
 <tr><td>R1–R5</td><td><span class="tag ok">已修</span></td><td>当前对话要整页刷新才看见定时 / 预警的新消息；相同提问的本期气泡被上一期占掉；模型失败把上游 JSON 露给浏览器</td><td>2026-10-10。<code>ChatPage</code> 页面可见时约每 5 秒同步任务、侧栏和当前对话。提问按本期开始时间补上。<code>applyDeltaMessages</code> 不再把提问盖成助手回复。失败文案见 <code>UNCLASSIFIED_MODEL_FAILURE</code>。细目在 <code>docs/best-practice-alignment-review.md</code> 第 6 节。仍敞着：5 秒拉取而不是落库即推、英文思考只做展示层收起、<code>fs_ls</code> 复核只写在提示里。</td></tr>
 </tbody>
 </table>
+<h3 id="s31-jev">客服助手 Jev（2026-10-12，已接线）</h3>
+<p>只在 <code>/support</code>。Jev 不写回复，也不进对话模型名单。输入题是意图（退款 / 咨询 / 投诉 / 其他）、情绪（含其他）、是否紧急、路由建议（含其他）、是否该建单、是否越权。未配置密钥时不发请求。草稿再问一次有没有把退款说成已经答应。概率 ≥ 0.9 才把正文换成事先写好的流程句；0.5–0.9 只标记；没有结果时回复仍发出，但代发不放行。不跳转、不建单。知识库仍是对话模型调用 <code>search_knowledge</code>（词法 + 可选向量），Jev 不参与召回。全文在 <code>docs/agent/support-jev-plan.md</code>。</p>
 </section>
 
 <hr />

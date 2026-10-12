@@ -84,6 +84,17 @@
 - **现行落点（方案所指，实施前仍是现状）**：`roles.ts` 的 `support` · `.data/mcp-servers.json` 的 `zoho-salesiq`（目前仅 `ZohoSalesIQ_getConversationsList`）· `src/mcp/path-defaults.ts`。
 - **状态**：🟡 角色已挂上现有 `zoho-salesiq`（2026-10-08）。未新增连接器。单条消息与代发仍未做。订单/工单仍以 `docs/agent/support-data-source-plan.md` 为准；预警仍以 `scheduled-spike-detection-plan.md` 为准。
 
+### [agent/support-jev-plan.md](./agent/support-jev-plan.md)
+- **定位**：客服助手的封闭分类。2026-10-12 已接到 `/support`。
+- **做法**：Jev 不写回复，也不进对话模型名单。意图、情绪、紧急、路由建议、工单建议、越权只显示。草稿把退款说成已经答应且概率 ≥ 0.9 时，正文换成事先写好的流程句。代发在没有安全结果或概率 ≥ 0.9 时不放行。不是「向量召回 → Jev 精分 → 大模型兜底」；知识库检索仍由对话模型自己调 `search_knowledge`。
+- **现行落点**：`apps/agent-server/src/jev.ts` · `chat.ts`（仅 support）· 客服页气泡标签。
+- **状态**：✅ 客服助手已接线。其它角色不调用。
+
+### [skill-management-plan.md](./skill-management-plan.md)
+- **定位**：本地技能与技能管理页。2026-10-12 写入，**尚未改代码**。
+- **做法**：仓库 `skills/` 仍是只读内置；本地技能落 `.data/skills/`。管理页管增删和全局开关；对话飞出继续只做「本对话全文注入」。不对齐技能市场和技能包脚本。
+- **状态**：✅ 已落地（2026-10-12）。F12（`best-practice-alignment-review.md`）当时因技能少、静态目录而维持；技能目录与管理页以本文为准。
+
 ### [domain-adaptation-guide.md](./domain-adaptation-guide.md)
 - **定位**：规范性指南——如何在不动引擎的前提下把通用 Agent 改造成垂直领域 Agent（以观影助手为例）。
 - **状态**：✅ 现行（弱代码耦合，属「怎么做」而非「现状记录」）。

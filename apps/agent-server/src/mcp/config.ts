@@ -210,6 +210,66 @@ export function loadServers(): McpServerConfig[] {
   return [...byId.values()];
 }
 
+/** 这个 id 落在内置配置还是用户文件里。两者都有时算文件（文件覆盖内置）。 */
+export function connectorSlot(id: string): "builtin" | "file" | null {
+  const name = String(id || "").trim();
+  if (!name) return null;
+  if (fileServers().some((server) => server.id === name)) return "file";
+  if (builtinServers().some((server) => server.id === name)) return "builtin";
+  return null;
+}
+
+/**
+ * 对话里添加的自定义连接器只接受远程 HTTP。
+ * 本机 stdio 会启动进程，继续走服务端配置和命令白名单，不从聊天面板放进来。
+ */
+export function buildCustomHttpConnector(input: {
+  id?: string;
+  label?: string;
+  url?: string;
+  headerName?: string;
+  headerValue?: string;
+}): { ok: true; server: McpServerConfig } | { ok: false; error: string } {
+  const id = String(input.id || "").trim();
+  const label = String(input.label || "").trim();
+  const url = String(input.url || "").trim();
+  const headerName = String(input.headerName || "").trim();
+  const headerValue = String(input.headerValue || "");
+  const slot = connectorSlot(id);
+  if (slot === "builtin") return { ok: false, error: "不能覆盖系统自带连接器" };
+  if (slot === "file") return { ok: false, error: "同名连接器已存在" };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, error: "地址必须是 http 或 https" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "地址必须是 http 或 https" };
+  }
+  if (parsed.username || parsed.password) {
+    return { ok: false, error: "凭据请放在请求头，不要写进地址" };
+  }
+  if (headerValue && !headerName) return { ok: false, error: "填写了请求头的值，就要写请求头名称" };
+  if (headerName && !/^[\w-]{1,64}$/.test(headerName)) {
+    return { ok: false, error: "请求头名称只允许字母、数字、下划线和短横线" };
+  }
+  if (headerValue.length > 4096 || /[\r\n]/.test(headerValue)) {
+    return { ok: false, error: "请求头的值不合法" };
+  }
+  const server: McpServerConfig = {
+    id,
+    label: label || id,
+    transport: "http",
+    url,
+    enabled: true,
+    ...(headerName && headerValue ? { headers: { [headerName]: headerValue } } : {}),
+  };
+  const invalid = validateServerInput(server);
+  if (invalid) return { ok: false, error: invalid };
+  return { ok: true, server };
+}
+
 function persist(list: McpServerConfig[]): void {
   fileCache = list;
   atomicWriteJson(CONFIG_PATH, list, { logLabel: "mcp:config" });

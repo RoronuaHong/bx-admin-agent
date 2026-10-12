@@ -250,6 +250,8 @@ export interface StoredMessage {
    * 快照只存「指针 + 展示元数据」，必须随快照落库，否则刷新后下载卡片消失（与 charts 同理）。
    */
   artifacts?: ArtifactSpec[];
+  /** 客服助手封闭分类。刷新后仍显示，不回灌模型。 */
+  supportLabels?: import("@bx/shared").SupportLabels;
 }
 
 /** 排队中的待发消息（后端持久化，`conversation.pendingQueue`）。 */
@@ -482,6 +484,21 @@ export async function fetchMcpServers(): Promise<McpServerPublic[]> {
   return data.servers || [];
 }
 
+/** 对话面板添加远程 MCP。只接受 http(s)，本机命令不走这里。 */
+export async function saveCustomMcpServer(input: {
+  id: string;
+  label: string;
+  url: string;
+  headerName?: string;
+  headerValue?: string;
+}): Promise<McpServerPublic> {
+  const data = (await jsonFetch("/agent/chat/mcp/custom", {
+    method: "POST",
+    body: JSON.stringify(input),
+  })) as { server: McpServerPublic };
+  return data.server;
+}
+
 export async function saveMcpServer(payload: McpServerInput): Promise<McpServerPublic> {
   const data = (await jsonFetch("/agent/mcp/servers", {
     method: "POST",
@@ -552,6 +569,78 @@ export async function setChatSkills(
     body: JSON.stringify({ enabled, ...(conversationId ? { conversationId } : {}) }),
   })) as { available: SkillMeta[]; enabled: string[] };
   return { available: data.available || [], enabled: data.enabled || [] };
+}
+
+/** 技能目录（管理页）。与对话勾选分开：这里管文件和全局开关。 */
+export interface SkillCatalogItem extends SkillMeta {
+  source: "builtin" | "local";
+  enabled: boolean;
+  bytes: number;
+  roles?: string[];
+  default?: boolean;
+}
+
+export interface SkillDocument {
+  skill: SkillCatalogItem;
+  content: string;
+  body: string;
+}
+
+export interface SkillWriteResponse {
+  skill: SkillCatalogItem;
+  warning?: string;
+}
+
+export async function fetchSkillCatalog(): Promise<SkillCatalogItem[]> {
+  const data = (await jsonFetch("/agent/skills")) as { skills: SkillCatalogItem[] };
+  return data.skills || [];
+}
+
+export async function fetchSkillDocument(dir: string): Promise<SkillDocument> {
+  return jsonFetch(`/agent/skills/${encodeURIComponent(dir)}`) as Promise<SkillDocument>;
+}
+
+export async function createSkill(input: {
+  dir: string;
+  name: string;
+  description: string;
+  roles: string[];
+  body: string;
+}): Promise<SkillWriteResponse> {
+  return jsonFetch("/agent/skills", { method: "POST", body: JSON.stringify(input) }) as Promise<SkillWriteResponse>;
+}
+
+export async function updateSkill(
+  dir: string,
+  input: { name: string; description: string; roles: string[]; body: string },
+): Promise<SkillWriteResponse> {
+  return jsonFetch(`/agent/skills/${encodeURIComponent(dir)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  }) as Promise<SkillWriteResponse>;
+}
+
+export async function deleteSkill(dir: string): Promise<{ ok: boolean; notice?: string }> {
+  return jsonFetch(`/agent/skills/${encodeURIComponent(dir)}`, { method: "DELETE" }) as Promise<{ ok: boolean; notice?: string }>;
+}
+
+export async function setSkillEnabled(dir: string, enabled: boolean): Promise<{ skill: SkillCatalogItem }> {
+  return jsonFetch(`/agent/skills/${encodeURIComponent(dir)}/enabled`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled }),
+  }) as Promise<{ skill: SkillCatalogItem }>;
+}
+
+export async function importSkillFile(dir: string, file: File): Promise<SkillWriteResponse> {
+  const form = new FormData();
+  form.set("dir", dir);
+  form.set("file", file);
+  const res = await fetch(withOwnerParam("/agent/skills/import"), {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  return parseJson(res) as Promise<SkillWriteResponse>;
 }
 
 /**

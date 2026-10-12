@@ -25,6 +25,14 @@ import {
   unattendedToolDenial,
 } from "./schedule-alert.js";
 import { applyScheduleStatus, finishedScheduleStatusSentence } from "./notify/deliver.js";
+import {
+  buildSupportLabels,
+  classifySupportInput,
+  reviewSupportPromise,
+  SUPPORT_PROMISE_TEXT,
+  draftPromiseAction,
+  visitorSendRefusal,
+} from "./jev.js";
 import type { ScheduleAlertState, ScheduleNotifyPolicy, SchedulePurpose } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
 import { appendAudit, argsDigestOf } from "./audit.js";
@@ -1820,6 +1828,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       return { ok: builtin.ok, text: builtin.text };
     }
     hydrateDeferred(name);
+    const sendRefusal = ctx.namespace === "support" ? await visitorSendRefusal(name, mcpArgs(name, argsJson)) : null;
+    if (sendRefusal) return { ok: false, text: sendRefusal };
     const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
     return { ok: !result.isError, text: result.text };
   };
@@ -2378,6 +2388,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       const refused = admitDirectListCall(c.name, c.argsJson, directListSeen);
       if (refused) return { ok: false, rawText: refused, executed: false };
       hydrateDeferred(c.name);
+      const sendRefusal = ctx.namespace === "support" ? await visitorSendRefusal(c.name, mcpArgs(c.name, c.argsJson)) : null;
+      if (sendRefusal) return { ok: false, rawText: sendRefusal, executed: false };
       const result = await callMcpTool(c.name, mcpArgs(c.name, c.argsJson), ctx.signal);
       if (result.isError) releaseDirectListCall(c.name, c.argsJson, directListSeen);
       else {
@@ -2831,13 +2843,21 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           executed = false;
         } else {
           hydrateDeferred(call.name);
-          const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
-          ok = !result.isError;
-          rawText = result.text;
-          if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
-          else {
-            rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
-            if (call.name.startsWith("mcp__bi__")) ownBusinessExecuted = true;
+          const sendRefusal =
+            ctx.namespace === "support" ? await visitorSendRefusal(call.name, mcpArgs(call.name, call.argsJson)) : null;
+          if (sendRefusal) {
+            ok = false;
+            rawText = sendRefusal;
+            executed = false;
+          } else {
+            const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
+            ok = !result.isError;
+            rawText = result.text;
+            if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
+            else {
+              rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
+              if (call.name.startsWith("mcp__bi__")) ownBusinessExecuted = true;
+            }
           }
         }
       }
@@ -3337,6 +3357,8 @@ export async function* chatStream(
     return;
   }
   const conversation = await getConversation(conversationId);
+  const supportInput =
+    conversation?.agentId === "support" && !opts.unattendedConclusion ? classifySupportInput(userText) : null;
   const timeZone =
     normalizeTimeZone(opts.timeZone) || normalizeTimeZone(conversation?.timeZone) || undefined;
   if (timeZone && conversation && conversation.timeZone !== timeZone) {
@@ -3793,7 +3815,14 @@ export async function* chatStream(
   const visibleText = statusLine
     ? applyScheduleStatus(stripUserFacingToolTrace(withGap), statusLine)
     : stripUserFacingToolTrace(withGap);
-  const finalText = redactSensitive(visibleText);
+  let finalText = redactSensitive(visibleText);
+  if (conversation?.agentId === "support" && !opts.unattendedConclusion) {
+    const reading = supportInput ? await supportInput : null;
+    const promise = await reviewSupportPromise(finalText);
+    const labels = buildSupportLabels(reading, promise);
+    if (promise.reason === "ok" && draftPromiseAction(promise.probability) === "replace") finalText = SUPPORT_PROMISE_TEXT;
+    yield { type: "support_labels", labels };
+  }
   if (finalText !== visibleText) {
     console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(visibleText)} 处`);
   }

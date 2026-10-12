@@ -10,6 +10,7 @@ import {
   deleteServer,
   loadServers,
   toPublic,
+  buildCustomHttpConnector,
   upsertServer,
   validateServerInput,
   type McpServerConfig,
@@ -58,7 +59,18 @@ import {
   modelAvailabilityStatus,
   type ModelAvailabilityStatus,
 } from "./chat.js";
-import { listSelectableSkillMetas, listSkillMetas } from "./skills.js";
+import {
+  createLocalSkill,
+  deleteLocalSkill,
+  extractSkillMdFromZip,
+  importLocalSkillText,
+  listEnabledSkillDirs,
+  listSelectableSkillMetas,
+  listSkillCatalog,
+  readSkillDocument,
+  setSkillEnabled,
+  updateLocalSkill,
+} from "./skills.js";
 import { hasRole } from "./roles.js";
 import {
   cancelTask,
@@ -238,6 +250,7 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
   const usage = reversed.find((event) => event.type === "usage");
   const modelEvent = reversed.find((event) => event.type === "model");
   const errorEvent = reversed.find((event) => event.type === "error");
+  const labelEvent = reversed.find((event) => event.type === "support_labels");
   const model = modelEvent?.id || servedModelId || undefined;
   return {
     runId,
@@ -251,6 +264,7 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
     durationMs: (task.settledAt || Date.now()) - task.startedAt,
     ...(usage ? { rounds: usage.rounds, toolCalls: usage.toolCalls, tokens: usage.tokens, costTokens: usage.costTokens, modelRetries: usage.modelRetries, modelFallbacks: usage.modelFallbacks, groundingRetries: usage.groundingRetries, groundingVerifications: usage.groundingVerifications, ungrounded: usage.ungrounded } : {}),
     ...(errorEvent ? { error: String(errorEvent.message || errorEvent.error?.defaultMessage || "") } : {}),
+    ...(labelEvent?.type === "support_labels" ? { supportLabels: labelEvent.labels } : {}),
     release: getRelease(),
   };
 }
@@ -895,7 +909,7 @@ export function createApp() {
   app.use("*", async (c, next) => {
     const path = c.req.path;
     // /health 留给进程探活，不带令牌也要能查。
-    if (path === "/health" || path.startsWith("/chat/")) return next();
+    if (path === "/health" || path.startsWith("/chat/") || path === "/skills" || path.startsWith("/skills/")) return next();
     const gate = checkAdminToken({ token: ADMIN_TOKEN, provided: c.req.header("x-admin-token") });
     if (!gate.ok) {
       return errorJson(
@@ -920,14 +934,18 @@ export function createApp() {
 
   // 会话中间件（仅 chat 域）：统一解析匿名 cookie 会话 + 设备 owner（轻量归属隔离），
   // 新会话/新 owner 时回写 cookie，handler 直接取 c.get("session") / c.get("owner")。
-  app.use("/chat/*", async (c, next) => {
+  const attachSession = async (c: Context, next: () => Promise<void>) => {
     const sessionId = getCookie(c, COOKIE);
     const session = ensureSession(sessionId);
     if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
     c.set("session", session);
     c.set("owner", resolveOwner(c));
     await next();
-  });
+  };
+  app.use("/chat/*", attachSession);
+  // 技能管理页与对话勾选同一套设备会话，不走管理员令牌。
+  app.use("/skills", attachSession);
+  app.use("/skills/*", attachSession);
 
   /** 归属守卫：对话不存在或不属于当前设备 → 统一 404（不区分两种情况，不泄漏存在性）。 */
   async function conversationNotFoundFor(c: Context, id: string): Promise<boolean> {
@@ -1291,6 +1309,31 @@ export function createApp() {
     return c.json({ conversationId, enabled: [...next], available });
   });
 
+  // 对话面板里添加远程连接器。只接受 HTTP，不接受本机命令。走会话，不走管理员令牌。
+  app.post("/chat/mcp/custom", async (c) => {
+    const body = await readJson<{ id?: string; label?: string; url?: string; headerName?: string; headerValue?: string }>(c);
+    const built = buildCustomHttpConnector(body);
+    if (!built.ok) return errorJson(c, 400, "MCP_SERVER_INVALID", built.error);
+    const saved = upsertServer(built.server);
+    void connect(saved.id);
+    const session = c.get("session") as Session;
+    let host = "";
+    try {
+      host = new URL(saved.url || "").host;
+    } catch {
+      host = "";
+    }
+    appendAudit({
+      decision: "mcp_write",
+      tool: saved.id,
+      reason: "create",
+      sessionId: session.id,
+      ...(c.get("owner") ? { ownerKey: c.get("owner") } : {}),
+      ...(host ? { argsSummary: [{ key: "host", value: host }] } : {}),
+    });
+    return c.json({ server: toPublic(saved) });
+  });
+
   // ---- 对话级技能（Skills）启用集：与 MCP 启用集同构（按对话持久化）----
   // available = skills 目录索引（name/description/dir）；enabled = 用户勾选的目录名。
   app.get("/chat/skills", async (c) => {
@@ -1318,13 +1361,95 @@ export function createApp() {
     if (await conversationNotFoundFor(c, conversationId)) {
       return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     }
-    // 只接受真实存在的技能目录名；去重。不存在的目录名直接丢弃（诚实：不落库不存在的技能）。
-    // 校验用 **全量** 清单而非面板清单：默认技能（default: true）不再出现在面板里，
-    // 但历史对话可能已经勾选过它们，此时不能因为「面板不显示」就把已有勾选判为非法。
-    const known = new Set(listSkillMetas().map((s) => s.dir));
+    // 只接受全局开着、文件还在的目录名。不按角色收窄：观影技能只写了 roles: movie，
+    // 用通用清单过滤会把合法勾选丢掉。关掉或不存在的目录不落库。
+    const known = new Set(listEnabledSkillDirs());
     const next = [...new Set((Array.isArray(body.enabled) ? body.enabled : []).filter((x) => typeof x === "string" && known.has(x)))];
     await patchConversation(conversationId, { skillsEnabled: next });
-    return c.json({ conversationId, enabled: next, available: listSelectableSkillMetas() });
+    const doc = await getConversation(conversationId);
+    return c.json({
+      conversationId,
+      enabled: next,
+      available: listSelectableSkillMetas(doc?.agentId || "generic"),
+    });
+  });
+
+  function skillAudit(c: Context, dir: string, reason: string) {
+    const session = c.get("session") as Session | undefined;
+    appendAudit({
+      decision: "skill_write",
+      tool: dir,
+      reason,
+      ...(session?.id ? { sessionId: session.id } : {}),
+      ...(c.get("owner") ? { ownerKey: c.get("owner") } : {}),
+    });
+  }
+
+  // ---- 技能目录（管理页）：与对话勾选 /chat/skills 分开 ----
+  app.get("/skills", (c) => c.json({ skills: listSkillCatalog() }));
+
+  app.get("/skills/:dir", (c) => {
+    const doc = readSkillDocument(c.req.param("dir"));
+    if (!doc) return errorJson(c, 404, "SKILL_NOT_FOUND", "技能不存在");
+    return c.json(doc);
+  });
+
+  app.post("/skills", async (c) => {
+    const body = await readJson<{ dir?: string; name?: string; description?: string; roles?: string[]; body?: string }>(c);
+    const result = createLocalSkill(body);
+    if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    skillAudit(c, result.skill.dir, "create");
+    return c.json({ skill: result.skill, ...(result.warning ? { warning: result.warning } : {}) });
+  });
+
+  app.post("/skills/import", async (c) => {
+    const form = await c.req.parseBody();
+    const dir = typeof form.dir === "string" ? form.dir : "";
+    const file = form.file;
+    if (!file || typeof file === "string" || typeof (file as Blob).arrayBuffer !== "function") {
+      return errorJson(c, 400, "SKILL_ARCHIVE_INVALID", "请上传 SKILL.md 或只含该文件的 zip");
+    }
+    const buf = Buffer.from(await (file as Blob).arrayBuffer());
+    if (buf.length > 256 * 1024) return errorJson(c, 400, "SKILL_TOO_LARGE", "技能文件不能超过 256 KiB");
+    const isZip = buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50;
+    if (isZip) {
+      const extracted = extractSkillMdFromZip(buf);
+      if (!extracted.ok) return errorJson(c, 400, "SKILL_ARCHIVE_INVALID", extracted.error);
+      const result = importLocalSkillText(dir, extracted.text);
+      if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+      skillAudit(c, result.skill.dir, "import");
+      return c.json({ skill: result.skill, ...(result.warning ? { warning: result.warning } : {}) });
+    }
+    const result = importLocalSkillText(dir, buf.toString("utf-8"));
+    if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    skillAudit(c, result.skill.dir, "import");
+    return c.json({ skill: result.skill, ...(result.warning ? { warning: result.warning } : {}) });
+  });
+
+  app.put("/skills/:dir/enabled", async (c) => {
+    const body = await readJson<{ enabled?: boolean }>(c);
+    if (typeof body.enabled !== "boolean") return errorJson(c, 400, "SKILL_ENABLED_INVALID", "enabled 必须是布尔值");
+    const dir = c.req.param("dir");
+    const result = setSkillEnabled(dir, body.enabled);
+    if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    skillAudit(c, dir, body.enabled ? "enable" : "disable");
+    return c.json({ skill: result.skill });
+  });
+
+  app.put("/skills/:dir", async (c) => {
+    const body = await readJson<{ name?: string; description?: string; roles?: string[]; body?: string }>(c);
+    const result = updateLocalSkill(c.req.param("dir"), body);
+    if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    skillAudit(c, result.skill.dir, "update");
+    return c.json({ skill: result.skill, ...(result.warning ? { warning: result.warning } : {}) });
+  });
+
+  app.delete("/skills/:dir", (c) => {
+    const dir = c.req.param("dir");
+    const result = deleteLocalSkill(dir);
+    if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    skillAudit(c, dir, "delete");
+    return c.json({ ok: true, notice: "已从各对话勾选中消失" });
   });
 
   // ---- 工具调用二次确认回调（一次性票据 + 会话归属校验，写操作安全闸门 P0-4）----

@@ -105,6 +105,8 @@ export interface StoredMessage {
    * 刷新后由下载卡片按 spec 重绘；不随快照存就会「刷新即消失」。
    */
   artifacts?: ArtifactSpec[];
+  /** 客服助手封闭分类。只展示，不回灌模型。 */
+  supportLabels?: import("@bx/shared").SupportLabels;
 }
 
 /** 忙碌期间排队的待发消息（按对话持久化，先进先出）。 */
