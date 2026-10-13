@@ -106,6 +106,9 @@
 | `POST /mcp/servers` | 新增或更新服务器（按 `id` upsert） | `Partial<McpServerConfig>` | `{ server: McpServerPublic }` / 400（校验失败） |
 | `DELETE /mcp/servers/:id` | 删除配置并断开连接，从所有会话启用集摘除 | — | `{ ok: true }` / 404 |
 | `POST /mcp/servers/:id/reload` | 重连并重列工具（配置变更后刷新） | — | `{ status: ServerStatus }` / 404 |
+| `POST /chat/mcp/custom` | 对话面板添加**远程 HTTP** 连接器（走会话不走管理员令牌；拒绝 stdio / 同名 / 覆盖系统自带） | `{ id; label; url; headerName?; headerValue? }` | `{ server: McpServerPublic }` / 400 |
+| `DELETE /chat/mcp/custom/:id` | 移除对话面板添加的连接器（仅 `removable` 的文件级 HTTP；断连 + 全部对话勾选摘除 + 审计） | — | `{ ok: true }` / 404 |
+| `POST /chat/mcp/servers/:id/reload` | 对话里的「重连」：与管理端共用同一处理器，不走管理员令牌 | — | `{ status: ServerStatus }` / 404 |
 | `GET /chat/mcp/servers` | 可用服务器（含连接状态）+ **该对话**已启用 id | `?conversationId=` | `{ conversationId; available: ServerStatus[]; enabled: string[] }` |
 | `PUT /chat/mcp/servers` | 保存勾选结果到**该对话**，触发对应连接/断开（异步） | `{ conversationId; enabled: string[] }` | `{ conversationId; enabled: string[]; available: ServerStatus[] }` |
 | `GET /chat/skills` | 技能目录索引 + 该对话勾选的技能 | `?conversationId=` | `{ conversationId; available: SkillMeta[]; enabled: string[] }` |
@@ -114,7 +117,7 @@
 | `POST /chat/stream` | 一轮对话（HTTP Streamable，NDJSON 分块） | `{ text; model?; images?; conversationId? }` | `application/x-ndjson`（每行一条 `ChatEvent` JSON） |
 | `POST /chat/subagent/:conversationId/:subagentId/cancel` | **独立取消**某一个运行中的子代理（不影响主代理继续运行） | — | `{ ok: true; cancelled: boolean }`（未命中运行中实例 → `cancelled:false`）/ 404（对话不存在或不属于当前设备） |
 
-`ServerStatus`：`{ id, label, transport, enabled, connected, connecting?, error?, toolsError?, tools, toolNames }`（`connecting` = 连接过程未完（工具清单还没列完），此时 `connected=false`；`toolsError` = 连接正常但 `listTools` 失败，与「服务器本来没有工具」区分）。
+`ServerStatus`：`{ id, label, transport, enabled, connected, connecting?, error?, toolsError?, tools, toolNames, removable }`（`connecting` = 连接过程未完（工具清单还没列完），此时 `connected=false`；`toolsError` = 连接正常但 `listTools` 失败，与「服务器本来没有工具」区分；`removable` = 只有「对话面板添加的文件级远程 HTTP 连接器」为 true，前端据此显示移除按钮）。`SkillMeta` 带同名语义的 `source: "builtin" | "local"`（技能管理页只有 local 可编辑/删除）。
 
 会话 cookie 注意：`GET/PUT /chat/mcp/servers` 与 `POST /chat/stream` 在「未带有效会话 cookie」时**必须回写 cookie**，否则每次请求都生成新会话，启用集存不住（已修复）。
 

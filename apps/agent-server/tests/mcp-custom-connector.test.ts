@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import { isRemovableCustomConnector } from "../src/mcp/config.js";
 
 test("对话里添加的连接器只接受远程 http(s)，不能盖过系统自带", async () => {
   const prev = process.env.MCP_BUILTIN_SERVERS;
@@ -25,6 +26,10 @@ test("对话里添加的连接器只接受远程 http(s)，不能盖过系统自
   });
   expect(header.ok).toBe(true);
   if (header.ok) expect(header.server.headers?.Authorization).toBe("Bearer secret");
+  expect(isRemovableCustomConnector({ transport: "http" }, "file")).toBe(true);
+  expect(isRemovableCustomConnector({ transport: "http" }, "builtin")).toBe(false);
+  expect(isRemovableCustomConnector({ transport: "stdio" }, "file")).toBe(false);
+  expect(isRemovableCustomConnector(null, "file")).toBe(false);
   } finally {
     if (prev === undefined) delete process.env.MCP_BUILTIN_SERVERS;
     else process.env.MCP_BUILTIN_SERVERS = prev;

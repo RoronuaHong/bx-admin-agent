@@ -110,7 +110,7 @@ workflow  →  skill  →  MCP  →  tools  →  superpower
 - **缺关键槽位 → 反问**：module / operation / 操作对象等必要槽位缺失时反问（沿用反问顺序）。
 - **已明确请求 → 直接执行，不反问**：请求目标明确可执行（如明确的列表/详情查询）时直接取数；可选筛选条件（状态、时间范围、分页）缺失时用默认参数，不反问。
 
-> 承接：`request_clarification` description（tools.ts，已去掉「查询类缺筛选条件不反问」负面句，改为 AskQuestion 式纯正向）+ resident rule（agent-routing-baseline.mdc「目标/词义不明先反问，已明确请求直接执行」）+ `[workflow/tool-calling]`#4。改动均为 prompt 引导，反问判定完全交模型，服务端不做词形/正则写死判断。
+> 承接（现行落点，2026-10-12 核对）：`request_clarification` 描述（`src/builtins.ts`，AskQuestion 式纯正向，只写「怎么问」）+ 系统提示 `TOOLING_RULES` 第 6/8 条（`src/system-prompt.ts`，「能不能举出第二个说得通的解释」判据 + 核实与澄清的先后）。改动均为 prompt 引导，反问判定完全交模型，服务端不做词形/正则写死判断。（原 resident rule `.cursor/rules/*.mdc` 与 `[workflow/tool-calling]` step 已随 deep-agent 重构移除，纪律收口到上述两处，见「Prompt 变更纪律」单一真相原则。）
 
 ### 项目上下文（全局，跨轮持久）
 
@@ -122,12 +122,14 @@ workflow  →  skill  →  MCP  →  tools  →  superpower
 
 ```
 workflow: LLM 先行（自主调 tools）→ 模块定位：实时读 PC 端源码（grep + read_file，方案 A）→ 安全校验门（parse_intent 只校验+反问 / 写确认）→ call_api → normalize
-rules:    Cursor Rules（.cursor/rules/*.mdc）常驻底线，每次业务请求注入 system 层
+rules:    常驻底线 = system-prompt.ts 稳定前缀（SAFETY_GUARDRAIL 安全护栏 + TOOLING_RULES 工具纪律 + 角色人设），每次请求注入 system 层（2026-09 重构后收口，原 .cursor/rules/*.mdc 已移除）
 skill:    Cursor Skills + 本地 SKILL.md 按需注入指南（模型读 description 自主判断），约束「先检索再调用」
 MCP:      grep_codebase / search_api_module（实时 grep 源码定位）/ read_api_module / read_file（与聊天 tools 同源）
 tools:    submit_understood_intent、request_clarification、call_api、normalize_output…
 superpower: clarification-policy / field-mapping；call_api 前安全校验，缺槽/歧义才反问
 ```
+
+> ⚠️ **本块为已退役的 PC 后台管理 Agent 架构记录（2026-09-28 核实）**：`workflow-orchestrate.ts` / `submit_understood_intent` / `call_api` / `normalize_output` / `render_table` / `[workflow/*]` step 均已从 `src/` 移除，现行架构 = deep-agent 工具循环 + 角色 + 技能 + MCP，以 [CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。保留本块只为记录「禁止写死 / 全部由大模型判断」等原则的出处。
 
 **强制顺序**：先大模型理解并用 tools/skill/MCP/superpower 整理 → 再过规则落地。  
 禁止服务端跳过模型、用关键词硬编码直接编排业务链路。  
@@ -163,7 +165,7 @@ superpower: clarification-policy / field-mapping；call_api 前安全校验，�
 > **判定口径**：
 > - ❌ 禁止：任何「语言/功能词」写死的服务端正则或判定——如问候句式正则（你好/hello/有什么可以帮你）、业务功能词正则（列表/详情/查询/统计/导出/第X页/数据/记录 等）、中文参数键正则（方法/路径/参数/查询/模块/描述 等）、JSON 字段名功能词判定（module/operation/params/method/url 用于预判工具计划）。此类判定在 2026-08-25 已全部删除。
 > - ✅ 允许（协议/契约护栏，非语义判定）：**纯协议结构检测**（`isToolPlanText`/`validateFinalText` 仅识别「把工具调用写成文本」的 JSON/XML/方括号/action 形态，工具名取自 `AGENT_TOOL_NAMES` 英文契约，无中文无功能词）、**数量/循环护栏**（`understandAttempts`/`pseudoPlanExhausted`/`MAX_TOOL_ROUNDS`，仅计数不判语义）、**HTTP 方法**（`method!==GET` 判定写）、**英文 CRUD 契约词**（`get`/`List`/`Detail`/`create`/`update`/`delete`/`Option`/`Stat`/`Report`，代码契约非语义）、**通用字典**（`id`→`ID`、`1001`→英语）、**历史压缩阈值**（`HISTORY_*`，数量预算）。
-> - **模型引导走 prompt / skill**：业务与闲聊的判别、意图、接口选路、参数补齐、字段中文化、报表/导出触发等，一律通过系统提示（如 `[workflow/tool-calling]` 第 5 条）与 skill 规范交模型判断；prompt 里可以描述「涉及业务数据就要调工具」，但服务端代码逻辑不得再出现用于判定的中文/功能词正则。
+> - **模型引导走 prompt / skill**：业务与闲聊的判别、意图、接口选路、参数补齐、字段中文化、报表/导出触发等，一律通过系统提示（`src/system-prompt.ts` 的 `TOOLING_RULES` 工具使用纪律，含第 5 条「回复面向最终结论」与第 7 条事实核验纪律）与 skill 规范交模型判断；prompt 里可以描述「涉及业务数据就要调工具」，但服务端代码逻辑不得再出现用于判定的中文/功能词正则。（原 `[workflow/tool-calling]` step 已随 deep-agent 重构移除，纪律收口至 `TOOLING_RULES`。）
 > - **审计口径**：新增/修改任何服务端判定逻辑时，grep 不得出现「问候/功能词/参数键」形态的正则；出现即视为违反本红线，PR 必须驳回。判定语义的唯一来源是大模型输出（tool_calls / operationType / text）。
 
 ### Prompt 变更纪律（2026-10-12 新增，强制）

@@ -287,6 +287,9 @@ export interface ConversationDto {
   muted?: boolean;
   /** 完全访问：true = 写/破坏性/外部操作不逐项弹确认卡（默认 true）。 */
   fullAccess?: boolean;
+  /** Agent 角色（generic = 通用助手，movie = 观影助手…）；缺省 = generic（旧对话向后兼容）。
+   *  多 Agent 分槽用：列表按角色过滤，回复人设 / 技能 / 模型也按它取。服务端一直回传，这里补类型声明。 */
+  agentId?: string;
 }
 
 export async function fetchConversations(includeArchived = false, agentId?: string): Promise<ConversationDto[]> {
@@ -396,6 +399,8 @@ export type ConvSortMode = "recent" | "manual";
 
 export interface ChatPreferences {
   activeConversationId: string;
+  /** 各非 generic 角色的「上次打开的对话」（后端维护）；前端非 generic 页据此恢复自己上次那条。 */
+  activeByAgent?: Record<string, string>;
   theme: "" | "light" | "dark";
   locale: string;
   convSortMode: ConvSortMode;
@@ -410,6 +415,10 @@ export interface ChatPreferences {
 function toPreferences(data: Partial<ChatPreferences>): ChatPreferences {
   return {
     activeConversationId: data.activeConversationId || "",
+    activeByAgent:
+      data.activeByAgent && typeof data.activeByAgent === "object"
+        ? (data.activeByAgent as Record<string, string>)
+        : {},
     theme: data.theme || "",
     locale: data.locale || "",
     convSortMode: data.convSortMode === "manual" ? "manual" : "recent",
@@ -425,6 +434,8 @@ export async function fetchChatPreferences(): Promise<ChatPreferences> {
 
 export async function saveChatPreferences(patch: {
   activeConversationId?: string;
+  /** 写入哪个角色槽（缺省 generic）；非 generic 角色写 activeByAgent[agentId]。 */
+  agentId?: string;
   theme?: "light" | "dark";
   locale?: string;
   convSortMode?: ConvSortMode;
@@ -469,6 +480,8 @@ export interface McpServerStatus {
   toolsError?: string;
   tools: number;
   toolNames: string[];
+  /** 对话面板里添加的远程连接器，可以在同一处移除。 */
+  removable?: boolean;
 }
 
 export interface McpServerInput extends Partial<Omit<McpServerPublic, "envKeys" | "headerKeys">> {
@@ -499,6 +512,11 @@ export async function saveCustomMcpServer(input: {
   return data.server;
 }
 
+/** 移除对话面板添加的远程连接器。系统自带和本机命令不走这里。 */
+export async function deleteCustomMcpServer(id: string) {
+  return jsonFetch(`/agent/chat/mcp/custom/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 export async function saveMcpServer(payload: McpServerInput): Promise<McpServerPublic> {
   const data = (await jsonFetch("/agent/mcp/servers", {
     method: "POST",
@@ -512,7 +530,7 @@ export async function deleteMcpServer(id: string) {
 }
 
 export async function reloadMcpServer(id: string): Promise<McpServerStatus> {
-  const data = (await jsonFetch(`/agent/mcp/servers/${encodeURIComponent(id)}/reload`, {
+  const data = (await jsonFetch(`/agent/chat/mcp/servers/${encodeURIComponent(id)}/reload`, {
     method: "POST",
   })) as { status: McpServerStatus };
   return data.status;
@@ -547,6 +565,8 @@ export interface SkillMeta {
   description: string;
   /** skills 目录名（勾选集存的值 / read_skill 的入参）。 */
   dir: string;
+  /** 系统自带或本地添加。只有 local 能在对话面板里移除。 */
+  source?: "builtin" | "local";
 }
 
 export async function fetchChatSkills(

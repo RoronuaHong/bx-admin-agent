@@ -7,7 +7,10 @@ import { config, listModels } from "./config.js";
 import { answerConfirmation } from "./confirm.js";
 import { connect, disconnect, listStatuses, reload } from "./mcp/hub.js";
 import {
+  connectorSlot,
   deleteServer,
+  getServer,
+  isRemovableCustomConnector,
   loadServers,
   toPublic,
   buildCustomHttpConnector,
@@ -41,6 +44,7 @@ import {
   listEnabledMcpServers,
   patchConversation,
   pullMcpServerFromAllConversations,
+  pullSkillFromAllConversations,
   duplicateConversation,
   getFullConversation,
   renderConversationMarkdown,
@@ -320,7 +324,11 @@ async function consumeTask(
       publishTaskEvent(task, event);
     }
     // 诚实状态：生成器正常结束但产出过 error 事件（如无模型/模型失败）→ 标 failed 而非 success。
-    const hadError = task.buffer.some((event) => event.type === "error");
+    // 模型不可用失败（所有候选 402 / 429 …）走的是正文说明 + usage.modelStatus，没有 error 事件——
+    // 只看 error 会把「所有模型都不可用的一期」记成 success（2026-10-12 实测：钉钉因此不推送）。
+    const hadError =
+      task.buffer.some((event) => event.type === "error") ||
+      task.buffer.some((event) => event.type === "usage" && Boolean(event.modelStatus));
     status = hadError ? "failed" : "success";
     finishTask(task, status, false);
   } catch (error) {
@@ -527,8 +535,12 @@ function ungroundedOfTask(task: ChatTask): boolean {
 function modelAvailabilityOf(task: ChatTask): ReturnType<typeof modelAvailabilityStatus> {
   for (let i = task.buffer.length - 1; i >= 0; i--) {
     const event = task.buffer[i];
-    if (!event || event.type !== "error") continue;
-    return modelAvailabilityStatus(event.message || "");
+    if (!event) continue;
+    // 优先认 usage 的协议字段：模型不可用失败不带 error 事件（正文只是人话说明）。
+    if (event.type === "usage" && event.modelStatus) {
+      return event.modelStatus as ReturnType<typeof modelAvailabilityStatus>;
+    }
+    if (event.type === "error") return modelAvailabilityStatus(event.message || "");
   }
   return null;
 }
@@ -570,6 +582,8 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     else if (event.type === "todos") todos = event.todos;
   }
   const postedAt = Date.now();
+  const labelEvent = [...task.buffer].reverse().find((event) => event.type === "support_labels");
+  const supportLabels = labelEvent?.type === "support_labels" ? labelEvent.labels : undefined;
   const assistantMessage: StoredMessage = {
     role: "assistant",
     text: finalText,
@@ -578,6 +592,7 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     ...(todos?.length ? { todos } : {}),
     ...(steps.length ? { steps } : {}),
     ...(charts.length ? { charts } : {}),
+    ...(supportLabels ? { supportLabels } : {}),
   };
   // 提问在开跑时已经写进快照。同一期再追加一次会让刷新后出现两条一样的用户气泡。
   // 上一期用了同一段提问时不能算「已经写过」：必须是紧挨在本期回复前面的那一条。
@@ -589,15 +604,24 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
     (last.text || "") === finalText &&
     prior?.role === "user" &&
     (prior.text || "") === task.userText;
-  if (turnAlreadyStored) return true;
+  if (turnAlreadyStored) {
+    if (supportLabels && last && !last.supportLabels) {
+      await upsertMessages({
+        id: task.conversationId,
+        messages: [...existing.slice(0, -1), { ...last, supportLabels }],
+      });
+    }
+    return true;
+  }
   // 回复先落库、提问被旧基线盖掉时：把提问插回这条回复前面，不再另起一条重复回复。
   const promptMissingBeforeAnswer =
     last?.role === "assistant" &&
     (last.text || "") === finalText &&
     (last.at ?? 0) >= task.startedAt - 2000 &&
     !(prior?.role === "user" && (prior.text || "") === task.userText);
+  const answered = supportLabels && last && !last.supportLabels ? { ...last, supportLabels } : last;
   const messages = promptMissingBeforeAnswer
-    ? [...existing.slice(0, -1), { role: "user" as const, text: task.userText, at: task.startedAt }, last]
+    ? [...existing.slice(0, -1), { role: "user" as const, text: task.userText, at: task.startedAt }, answered]
     : userAlreadyTail
       ? [...existing, assistantMessage]
       : [...existing, { role: "user" as const, text: task.userText, at: task.startedAt }, assistantMessage];
@@ -1239,7 +1263,11 @@ export function createApp() {
     const body = await readJson<Partial<McpServerConfig>>(c);
     const invalid = validateServerInput(body);
     if (invalid) return errorJson(c, 400, "MCP_SERVER_INVALID", invalid);
+    const existed = connectorSlot(String(body.id || "")) === "file";
     const saved = upsertServer(body as McpServerConfig);
+    // 管理端改的是全局配置（stdio 可 spawn 子进程），与对话路径的 mcp_write 同口径留痕；
+    // 管理端没有会话上下文，只记决策/工具/原因。
+    appendAudit({ decision: "mcp_write", tool: saved.id, reason: existed ? "update" : "create" });
     return c.json({ server: toPublic(saved) });
   });
 
@@ -1249,14 +1277,26 @@ export function createApp() {
     // 配置删除后断开连接，并从所有对话的启用集里摘除（避免悬空引用）。
     await disconnect(id);
     await pullMcpServerFromAllConversations(id);
+    appendAudit({ decision: "mcp_write", tool: id, reason: "delete" });
     return c.json({ ok: true });
   });
 
-  app.post("/mcp/servers/:id/reload", async (c) => {
-    const status = await reload(c.req.param("id"));
+  // 管理端与对话端共用一个重连处理器：reload 对未知 id 本就返回 null → 404，无需预检。
+  // reload 的设计是「连接失败也返回带 error 的状态」，走到异常说明是真故障（如配置读取竞争）：
+  // 接成 502 明确错误码，而不是裸 500——前端据此显示「重连失败」，而非「服务端内部错误」。
+  const reloadMcpServerById = async (c: Context) => {
+    const id = c.req.param("id") || "";
+    let status: Awaited<ReturnType<typeof reload>>;
+    try {
+      status = await reload(id);
+    } catch (err) {
+      console.warn(`[mcp:hub] reload threw ${id}: ${String((err as Error)?.message || err)}`);
+      return errorJson(c, 502, "MCP_RELOAD_FAILED", "重连失败，请稍后重试或查看服务端日志");
+    }
     if (!status) return errorJson(c, 404, "MCP_SERVER_NOT_FOUND", "服务器不存在");
     return c.json({ status });
-  });
+  };
+  app.post("/mcp/servers/:id/reload", reloadMcpServerById);
 
   // ---- 对话级 MCP 启用集（按对话持久化，不再是 cookie 级的全局启用集）----
   // 会话靠匿名 cookie 识别：首次访问要回写 cookie，否则每次请求都是新会话。
@@ -1309,6 +1349,9 @@ export function createApp() {
     return c.json({ conversationId, enabled: [...next], available });
   });
 
+  // 对话里的「重连」不走管理员接口：面板上能看见的服务器，会话就可以重连（处理器与管理端共用）。
+  app.post("/chat/mcp/servers/:id/reload", reloadMcpServerById);
+
   // 对话面板里添加远程连接器。只接受 HTTP，不接受本机命令。走会话，不走管理员令牌。
   app.post("/chat/mcp/custom", async (c) => {
     const body = await readJson<{ id?: string; label?: string; url?: string; headerName?: string; headerValue?: string }>(c);
@@ -1334,6 +1377,27 @@ export function createApp() {
     return c.json({ server: toPublic(saved) });
   });
 
+  // 只移除对话面板添加的远程连接器。系统自带和本机命令仍走管理员接口。
+  app.delete("/chat/mcp/custom/:id", async (c) => {
+    const id = c.req.param("id");
+    const server = getServer(id);
+    if (!isRemovableCustomConnector(server, connectorSlot(id))) {
+      return errorJson(c, 404, "MCP_SERVER_NOT_FOUND", "只能移除在对话里添加的远程连接器");
+    }
+    if (!deleteServer(id)) return errorJson(c, 404, "MCP_SERVER_NOT_FOUND", "连接器不存在");
+    await disconnect(id);
+    await pullMcpServerFromAllConversations(id);
+    const session = c.get("session") as Session;
+    appendAudit({
+      decision: "mcp_write",
+      tool: id,
+      reason: "delete",
+      sessionId: session.id,
+      ...(c.get("owner") ? { ownerKey: c.get("owner") } : {}),
+    });
+    return c.json({ ok: true });
+  });
+
   // ---- 对话级技能（Skills）启用集：与 MCP 启用集同构（按对话持久化）----
   // available = skills 目录索引（name/description/dir）；enabled = 用户勾选的目录名。
   app.get("/chat/skills", async (c) => {
@@ -1341,12 +1405,13 @@ export function createApp() {
     const conversationId = c.req.query("conversationId") || session.activeConversationId || "";
     const owned = conversationId ? await conversationOwnedBy(conversationId, c.get("owner")) : false;
     const doc = owned && conversationId ? await getConversation(conversationId) : null;
+    const knownSkills = new Set(listEnabledSkillDirs());
     return c.json({
       conversationId,
       // 面板只列**可勾选**的技能：按对话角色过滤（观影对话只见 generic + movie 技能），
       // 并排除默认生效的技能（`default: true`，它们本来就随索引生效，不需要用户勾选）。
       available: listSelectableSkillMetas(doc?.agentId || "generic"),
-      enabled: doc?.skillsEnabled || [],
+      enabled: (doc?.skillsEnabled || []).filter((dir) => knownSkills.has(dir)),
     });
   });
 
@@ -1444,10 +1509,11 @@ export function createApp() {
     return c.json({ skill: result.skill, ...(result.warning ? { warning: result.warning } : {}) });
   });
 
-  app.delete("/skills/:dir", (c) => {
+  app.delete("/skills/:dir", async (c) => {
     const dir = c.req.param("dir");
     const result = deleteLocalSkill(dir);
     if (!result.ok) return errorJson(c, result.status, result.code, result.error);
+    await pullSkillFromAllConversations(dir);
     skillAudit(c, dir, "delete");
     return c.json({ ok: true, notice: "已从各对话勾选中消失" });
   });
@@ -1531,16 +1597,20 @@ export function createApp() {
       if (await conversationNotFoundFor(c, conversationId)) {
         return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
       }
-      // 活跃槽：generic 走旧字段；其余角色走分槽映射（多 Agent 页面互不顶掉）。
-      const reqAgentId = typeof body.agentId === "string" && body.agentId ? body.agentId : "generic";
-      if (reqAgentId === "generic") {
+      // 活跃槽按**会话自身角色**归位（generic 走旧字段；其余角色走分槽映射，多 Agent 页面互不顶掉）。
+      // 不用页面角色 body.agentId：在 /generic 页打开并回复一条 support 会话时，按页面角色写会把
+      // support 会话塞进 generic 槽、污染 generic 首屏恢复（见 docs/cross-role-restore-scoping.md）。
+      const convDoc = await getConversation(conversationId);
+      const rawAgent = convDoc?.agentId;
+      const slotAgent = rawAgent && rawAgent !== "generic" && hasRole(rawAgent) ? rawAgent : "generic";
+      if (slotAgent === "generic") {
         if (session.activeConversationId !== conversationId) {
           session.activeConversationId = conversationId;
           touchSession(session);
         }
-      } else if (session.activeByAgent?.[reqAgentId] !== conversationId) {
+      } else if (session.activeByAgent?.[slotAgent] !== conversationId) {
         session.activeByAgent = session.activeByAgent || {};
-        session.activeByAgent[reqAgentId] = conversationId;
+        session.activeByAgent[slotAgent] = conversationId;
         touchSession(session);
       }
 
@@ -1819,11 +1889,23 @@ export function createApp() {
     // 运行记录一致性：清掉任务 runs[] 里指向该会话的条目，免得侧栏留「幽灵运行记录」。
     await pruneRunsOfConversation(c.get("owner"), id).catch(() => undefined);
     // 删掉的正好是活跃对话时清空指针，避免回退到一个已不存在的 id。
+    // generic 走旧字段；其余角色走 activeByAgent——两种槽都要清（否则非 generic 页恢复会读到已删除的 id，
+    // 留下悬空指针；见 docs/cross-role-restore-scoping.md）。
     const session = c.get("session") as Session;
+    let slotChanged = false;
     if (session.activeConversationId === id) {
       session.activeConversationId = "";
-      touchSession(session);
+      slotChanged = true;
     }
+    if (session.activeByAgent) {
+      for (const [role, activeId] of Object.entries(session.activeByAgent)) {
+        if (activeId === id) {
+          delete session.activeByAgent[role];
+          slotChanged = true;
+        }
+      }
+    }
+    if (slotChanged) touchSession(session);
     return c.json({ ok: true });
   });
 
@@ -1996,6 +2078,8 @@ export function createApp() {
   function prefsPayload(session: ReturnType<typeof ensureSession>) {
     return {
       activeConversationId: session.activeConversationId || "",
+      // 各非 generic 角色的活跃对话：前端非 generic 页据此按角色恢复（见 docs/cross-role-restore-scoping.md）。
+      activeByAgent: session.activeByAgent || {},
       theme: session.preferences?.theme || "",
       locale: session.preferences?.locale || "",
       convSortMode: session.preferences?.convSortMode || "recent",
@@ -2014,6 +2098,7 @@ export function createApp() {
   app.put("/chat/preferences", async (c) => {
     const body = await readJson<{
       activeConversationId?: string;
+      agentId?: string;
       theme?: "light" | "dark";
       locale?: string;
       convSortMode?: string;
@@ -2021,13 +2106,27 @@ export function createApp() {
       timeZone?: string;
     }>(c);
     const session = c.get("session") as Session;
+    // 写入哪个角色槽：generic 走旧字段，已知非 generic 角色走 activeByAgent；未知 / 缺省一律 generic（保持旧行为）。
+    const slotAgent =
+      typeof body.agentId === "string" && body.agentId && body.agentId !== "generic" && hasRole(body.agentId)
+        ? body.agentId
+        : "generic";
     // 归属守卫：活跃对话指针不允许指向别人的对话（否则后续不带 conversationId 的请求会串台）。
     if (typeof body.activeConversationId === "string" && body.activeConversationId) {
       if (await conversationOwnedBy(body.activeConversationId, c.get("owner"))) {
-        session.activeConversationId = body.activeConversationId;
+        if (slotAgent === "generic") {
+          session.activeConversationId = body.activeConversationId;
+        } else {
+          session.activeByAgent = session.activeByAgent || {};
+          session.activeByAgent[slotAgent] = body.activeConversationId;
+        }
       }
     } else if (body.activeConversationId === "") {
-      session.activeConversationId = "";
+      if (slotAgent === "generic") {
+        session.activeConversationId = "";
+      } else if (session.activeByAgent) {
+        delete session.activeByAgent[slotAgent];
+      }
     }
     const prefs = session.preferences || {};
     if (body.theme === "light" || body.theme === "dark") prefs.theme = body.theme;

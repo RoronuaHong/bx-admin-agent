@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { toolCodeEnv } from "../tool-code.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { getServer, isAllowedMcpCommand, mcpAllowlistRequired, loadServers, type McpServerConfig } from "./config.js";
+import { connectorSlot, getServer, isAllowedMcpCommand, isRemovableCustomConnector, mcpAllowlistRequired, loadServers, type McpServerConfig } from "./config.js";
 import { provenanceBlocked } from "./provenance.js";
 import {
   catalogPlan,
@@ -45,6 +45,8 @@ export interface ServerStatus {
   toolsError?: string;
   tools: number;
   toolNames: string[];
+  /** 对话面板里添加的远程连接器，可以在同一处移除。 */
+  removable?: boolean;
 }
 
 interface Conn {
@@ -198,17 +200,30 @@ function encodeToolName(serverId: string, tool: string, used: Set<string>): stri
   return name;
 }
 
+/**
+ * 把配置里的中文用途注记并进工具描述（导出仅为测试）。
+ * 注记随 description 进入检索索引与工具 schema；工具缓存里仍是上游原文，合并发生在注入前。
+ */
+export function withToolNote(description: string, note: string | undefined): string {
+  const text = note?.trim();
+  return text ? `${description}\n（用途：${text}）` : description;
+}
+
 function installTools(conn: Conn, tools: CachedMcpTool[]): void {
   const used = new Set<string>();
+  const notes = conn.cfg.toolNotes;
   conn.tools = tools
-    .map((tool) => ({
-      name: encodeToolName(conn.cfg.id, tool.name, used),
-      serverId: conn.cfg.id,
-      tool: tool.name,
-      description: tool.description || tool.name,
-      inputSchema: tool.inputSchema || { type: "object", properties: {} },
-      ...(tool.annotations ? { annotations: tool.annotations } : {}),
-    }))
+    .map((tool) => {
+      const note = notes?.[tool.name] ?? notes?.["*"];
+      return {
+        name: encodeToolName(conn.cfg.id, tool.name, used),
+        serverId: conn.cfg.id,
+        tool: tool.name,
+        description: withToolNote(tool.description || tool.name, note),
+        inputSchema: tool.inputSchema || { type: "object", properties: {} },
+        ...(tool.annotations ? { annotations: tool.annotations } : {}),
+      };
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
   delete conn.toolsError;
 }
@@ -428,6 +443,7 @@ function statusOf(cfg: McpServerConfig, conn: Conn | null): ServerStatus {
     ...(conn?.toolsError ? { toolsError: conn.toolsError } : {}),
     tools: conn?.tools.length || 0,
     toolNames: (conn?.tools || []).map((t) => t.tool),
+    removable: isRemovableCustomConnector(cfg, connectorSlot(cfg.id)),
   };
 }
 
@@ -506,6 +522,11 @@ function findTool(namespacedName: string): { conn: Conn; info: McpToolInfo } | n
     if (info) return { conn, info };
   }
   return null;
+}
+
+/** 取命名空间工具的 inputSchema（查不到返回 null）：内置组合工具据此做参数字段发现。 */
+export function findMcpToolSchema(namespacedName: string): Record<string, unknown> | null {
+  return findTool(namespacedName)?.info.inputSchema ?? null;
 }
 
 /** 风险分级所需的服务器事实（不做判定；判定统一在 src/risk.ts）。 */

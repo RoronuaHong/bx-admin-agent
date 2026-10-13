@@ -741,6 +741,20 @@ export async function pullMcpServerFromAllConversations(id: string): Promise<voi
   await coll.updateMany({ mcpServers: id }, { $pull: { mcpServers: id } });
 }
 
+/** 从所有对话的技能勾选里摘除某个目录（本地技能被删除时调用）。 */
+export async function pullSkillFromAllConversations(dir: string): Promise<void> {
+  const name = String(dir || "").trim();
+  if (!name) return;
+  const coll = await getColl();
+  if (!coll) {
+    for (const doc of memory.values()) {
+      if (doc.skillsEnabled?.includes(name)) doc.skillsEnabled = doc.skillsEnabled.filter((item) => item !== name);
+    }
+    return;
+  }
+  await coll.updateMany({ skillsEnabled: name }, { $pull: { skillsEnabled: name } });
+}
+
 /**
  * 启动维护：把所有对话启用集里「配置中已不存在」的 id 摘掉，返回被改动的对话数。
  *

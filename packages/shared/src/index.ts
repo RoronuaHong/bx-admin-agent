@@ -24,18 +24,18 @@ export function parseAlertMarker(text: string): AlertMarker | null {
   return matched[1]!.toUpperCase() as AlertMarker;
 }
 
-/** 客服助手封闭分类的一格。band 只表示这格有多集中，不表示已经改派或已经授权。 */
+/** 客服助手封闭分类的一格。high / review / low 表示分布有多集中，alert 表示到达执行线，missing 表示没有结果。都不表示已经改派或已经授权。 */
 export interface SupportLabelItem {
   id: string;
   label: string;
   value: string;
-  band: "high" | "review" | "low" | "missing";
+  band: "high" | "review" | "low" | "missing" | "alert";
 }
 
-/** 客服助手一轮的分类结果。draft 只决定承诺句要不要换成流程句。 */
+/** 客服助手一轮的分类结果。risk 只标记高风险，不改正文。 */
 export interface SupportLabels {
   items: SupportLabelItem[];
-  draft: "keep" | "flag" | "replace" | "unchecked";
+  draft: "keep" | "flag" | "risk" | "unchecked";
 }
 
 /** 任务规划条目（Deep Agents 的 write_todos 形态：全量替换，非增量）。 */
@@ -244,11 +244,16 @@ type ChatEventBody =
       ungrounded?: boolean;
       /** 循环累计发送的 prompt token 估算（成本护栏开启时统计）。 */
       costTokens?: number;
+      /**
+       * 本期模型不可用的状态码（402 / 429 / 500 …）：所有候选模型都失败时才携带。
+       * 调度侧据此把定时任务如实记为 failed 并推送企业 IM（没有 error 事件，正文只是人话说明）。
+       */
+      modelStatus?: string;
     }
   | { type: "done" }
   /**
    * 客服助手这一路的封闭分类。不改页面、不换模型。
-   * draft=replace 时，同一次回复的正文已由代码换成事先写好的流程句。
+   * draft=risk 时正文仍保留，只把承诺标成高风险。代发另由服务端拒绝。
    */
   | { type: "support_labels"; labels: SupportLabels }
   /**

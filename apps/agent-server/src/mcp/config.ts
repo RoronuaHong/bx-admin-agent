@@ -41,6 +41,14 @@ export interface McpServerConfig {
    * 未知 portal 会被接口报成 1002 Invalid authorization header，看起来像授权坏了。
    */
   pathDefaults?: Record<string, Record<string, string>>;
+  /**
+   * 工具用途注记。键 = 原始工具名（`*` = 该服务器全部工具），值 = 一行中文说明，
+   * 在 installTools 时并进 description 末尾（不改动上游原始 schema，缓存里仍是原文）。
+   * 典型用途：按需加载（deferred）下的检索与理解——上游工具描述多为英文，
+   * 中文问句关键词命不中英文名/描述（searchMcpTools 是字面匹配）；
+   * 注记随 description 一起进入检索索引与工具 schema，让中文关键词能命中。
+   */
+  toolNotes?: Record<string, string>;
 }
 
 /** 新建对话应默认启用的服务器 id 集（defaultEnabled 且未停用）。 */
@@ -268,6 +276,14 @@ export function buildCustomHttpConnector(input: {
   const invalid = validateServerInput(server);
   if (invalid) return { ok: false, error: invalid };
   return { ok: true, server };
+}
+
+/** 对话面板只能移除「写在用户文件里的远程 HTTP 连接器」。系统自带和本机命令不从这里删。 */
+export function isRemovableCustomConnector(
+  server: Pick<McpServerConfig, "transport"> | null | undefined,
+  slot: "builtin" | "file" | null,
+): boolean {
+  return Boolean(server && server.transport === "http" && slot === "file");
 }
 
 function persist(list: McpServerConfig[]): void {

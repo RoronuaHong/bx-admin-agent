@@ -50,7 +50,7 @@ import { matchesFuzzyScoped, matchesFuzzy, loadPinyin, pinyinReady } from "../pi
 import { getUiLocale, detectDefaultLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { showToolServer, toolDisplayName, visibleThinking } from "../trace-labels";
 import { localizeToken } from "../localize";
-import { AGENTS, agentText, type AgentEntry } from "../agents";
+import { AGENTS, agentText, findAgent, type AgentEntry } from "../agents";
 import { readStoredTheme, useTheme } from "../theme";
 import {
   cancelChatTask,
@@ -67,6 +67,7 @@ import {
   deleteConversation as apiDeleteConversation,
   deleteNotifyChannel,
   duplicateConversation,
+  deleteCustomMcpServer,
   fetchChatMcpServers,
   fetchChatPreferences,
   fetchChatSkills,
@@ -231,7 +232,6 @@ async function toggleTaskServer(id: string) {
   const i = taskDraft.mcpServers.indexOf(id);
   if (i >= 0) {
     taskDraft.mcpServers.splice(i, 1);
-    if (taskMcpExpanded.value === id) taskMcpExpanded.value = "";
     return;
   }
   taskDraft.mcpServers.push(id);
@@ -454,7 +454,6 @@ const taskMcpQuery = ref("");
 const taskExpertQuery = ref("");
 /** 本次打开任务飞出是否把焦点放进搜索框（点击 = true，悬停 = false；与对话区 searchAutofocus 同口径）。 */
 const taskSearchAutofocus = ref(true);
-const taskMcpExpanded = ref("");
 const taskToolsRoot = ref<HTMLElement | null>(null);
 const taskToolsPanel = ref<HTMLElement | null>(null);
 const taskToolsPos = reactive({ left: 0, bottom: 0, height: 0 });
@@ -551,12 +550,12 @@ const taskSkillFiltered = computed(() => {
   return skillAvailable.value.filter((s) => matchesFuzzyScoped([s.name], [s.dir, s.description], q));
 });
 
-/** 任务连接器搜索：与对话区 mcpFiltered 同口径。 */
+/** 任务连接器搜索：与对话区 mcpFiltered 同口径；每行预存连接状态（taskRowState 只算一次）。 */
 const taskMcpFiltered = computed(() => {
   const q = taskMcpQuery.value.trim().toLowerCase();
   void pinyinReady.value;
-  if (!q) return mcpAvailable.value;
-  return mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
+  const list = !q ? mcpAvailable.value : mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
+  return list.map((s) => ({ server: s, state: taskRowState(s) }));
 });
 
 /** 任务助手搜索：与对话区 expertFiltered 同口径；列表前另有「跟随当前入口」固定项。 */
@@ -586,7 +585,6 @@ function clearTaskSkills() {
 
 function clearTaskMcp() {
   taskDraft.mcpServers = [];
-  taskMcpExpanded.value = "";
 }
 
 /** 助手菜单行的选中徽标：选了专家角色显示 1，「跟随当前入口」不显示。 */
@@ -898,7 +896,6 @@ function openTaskForm(task?: ScheduleDto) {
   taskSkillQuery.value = "";
   taskMcpQuery.value = "";
   taskExpertQuery.value = "";
-  taskMcpExpanded.value = "";
   taskError.value = "";
   showTaskForm.value = true;
   // 任务表单也要选 MCP / 技能 / 通知通道。新建不预勾连接器，已保存的任务沿用自己的启用集。
@@ -1114,21 +1111,29 @@ const editingTask = computed(() => tasks.value.find((t) => t.id === editingTaskI
  * 打开某个结果会话：本地列表没有（换设备 / 刚被重建）就先刷新一次列表再选；
  * 实在没有则提示等下次运行时自动重建。任务对话与某一期对话共用这一段逻辑。
  */
-async function openConversationById(convId: string, notFound: "task" | "run"): Promise<void> {
+async function openConversationById(convId: string, notFound: "task" | "run" | "link"): Promise<void> {
+  // 先在已加载的本角色列表里找：命中即开，零额外请求。
   let conv = conversations.value.find((c) => c.id === convId);
+  // 列表里没有（跨角色的任务/期次会话，或刚建好还没进列表）：直接按 id 直取——
+  // 服务端不分角色、只校验归属，取到即补进本地列表（侧栏可见选中态）。
+  // 先取具体资源、不再整列刷新：避免刷新打乱手动排序、也少一次请求（最佳实践）。
   if (!conv) {
-    const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
-    if (list) {
-      conversations.value = list;
+    try {
+      const doc = await fetchConversation(convId);
+      conversations.value = [doc, ...conversations.value.filter((c) => c.id !== doc.id)];
       resortConversations();
-      conv = list.find((c) => c.id === convId);
+      conv = doc;
+    } catch {
+      // 保持 conv 为空 → 走下面的「已不存在」提示（真被删掉/换设备还没跑过/无权访问）。
     }
   }
   if (!conv) {
     showSettingsError(
       notFound === "task"
         ? tx("该任务的对话已不存在，下次到点运行时会自动重建", "This task's chat is gone — it will be recreated on the next run", "A conversa desta tarefa não existe — será recriada na próxima execução", "इस कार्य की चैट मौजूद नहीं है — अगली रन पर फिर बनेगी")
-        : tx("这一期的结果会话已不存在", "This run's chat no longer exists", "A conversa desta execução não existe mais", "इस रन की चैट अब मौजूद नहीं है"),
+        : notFound === "run"
+        ? tx("这一期的结果会话已不存在", "This run's chat no longer exists", "A conversa desta execução não existe mais", "इस रन की चैट अब मौजूद नहीं है")
+        : tx("该对话已不存在或无权访问", "This conversation no longer exists or you don't have access", "Esta conversa não existe mais ou você não tem acesso", "यह चैट अब मौजूद नहीं है या आपकी पहुँच नहीं है"),
     );
     return;
   }
@@ -1200,7 +1205,7 @@ interface Bubble {
     whyItMatters?: string;
     expiresInMs?: number;
   } | null;
-  /** 客服助手封闭分类（意图、情绪、紧急、路由建议、工单建议、越权、承诺门控）。 */
+  /** 客服助手封闭分类（事项、是否要求代发、路由建议、越权、承诺门控）。 */
   supportLabels?: import("@bx/shared").SupportLabels;
   /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
   usage?: {
@@ -1356,6 +1361,27 @@ function updateIsMobile() {
 function toggleSidebar() {
   if (isMobile.value) sidebarOpen.value = !sidebarOpen.value;
   else sidebarCollapsed.value = !sidebarCollapsed.value;
+}
+
+// 侧栏顶部「助手切换器」（对齐 CodeBuddy 的助手选择）：点当前助手名 → 下拉列出全部助手。
+// 选中即 router.push —— App.vue 的 RouterView 按 path 加了 key，会整页重挂载并按新角色拉会话。
+// 解决「切进 /support 后侧栏切不回通用助手」：不用再绕道门户页。
+const agentMenuOpen = ref(false);
+const agentMenuEl = ref<HTMLElement | null>(null);
+const currentAgent = computed(() => findAgent(AGENT_ID));
+function toggleAgentMenu() {
+  agentMenuOpen.value = !agentMenuOpen.value;
+}
+function onPickAgent(agent: AgentEntry) {
+  agentMenuOpen.value = false;
+  if (agent.id === AGENT_ID) return;
+  router.push(agent.path);
+}
+function onAgentMenuOutside(event: MouseEvent) {
+  if (!agentMenuEl.value?.contains(event.target as Node)) agentMenuOpen.value = false;
+}
+function onAgentMenuEsc(event: KeyboardEvent) {
+  if (event.key === "Escape") agentMenuOpen.value = false;
 }
 function onSidebarEsc(e: KeyboardEvent) {
   if (e.key === "Escape") sidebarOpen.value = false;
@@ -1832,7 +1858,11 @@ const imagesUnsupported = computed(
 const mcpOpen = ref(false);
 const mcpAvailable = ref<McpServerStatus[]>([]);
 const mcpBusy = ref(false);
-const mcpExpanded = ref("");
+/**
+ * 正在重连的服务器 id 集（按行置忙）。reload 一台 stdio 服务器可能要几十秒到几分钟
+ * （子进程重启慢），用全局 busy 会冻结整个面板——别的行无法勾选。这里只冻当前行。
+ */
+const mcpReconnecting = reactive(new Set<string>());
 const mcpError = ref("");
 
 let seq = 0;
@@ -2251,7 +2281,7 @@ function selectConversation(conv: ConversationDto) {
   }
   currentId.value = conv.id;
   sidebarOpen.value = false; // 移动端选中对话后收起抽屉
-  reportActiveConversation(conv.id);
+  reportActiveConversation(conv);
   // 打开的是某一期的结果 → 该任务的未读清零（放在选中之后：即便清零请求失败也不影响阅读）。
   clearTaskUnread(conv.id);
   // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
@@ -2336,7 +2366,7 @@ async function createConvFromDraft(firstText: string): Promise<string> {
   const st = stateOf(conv.id);
   st.settings = { ...draft.settings, locale: uiLocale.value };
   currentId.value = conv.id;
-  reportActiveConversation(conv.id);
+  reportActiveConversation(conv);
   const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[] } = {
     locale: st.settings.locale,
   };
@@ -4040,7 +4070,6 @@ async function toggleMcp(id: string, on: boolean) {
   const prev = state.settings.mcpEnabled;
   const next = on ? [...new Set([...prev, id])] : prev.filter((item) => item !== id);
   state.settings.mcpEnabled = next;
-  if (!on && mcpExpanded.value === id) mcpExpanded.value = "";
   // 草稿态只改内存，对齐模型选择：首条消息创建对话时再落库（createConvFromDraft）。
   // 勾选时预热连接，行状态才能从「未启用」变成连接中/已连接。
   if (!convId) {
@@ -4075,7 +4104,6 @@ async function clearMcpSelection() {
   const prev = state.settings.mcpEnabled;
   const keep = boundMcpIds.value.filter((id) => mcpAvailable.value.some((server) => server.id === id));
   state.settings.mcpEnabled = keep;
-  mcpExpanded.value = "";
   if (!convId) return;
   mcpBusy.value = true;
   mcpError.value = "";
@@ -4098,12 +4126,47 @@ async function clearMcpSelection() {
 
 async function reconnectMcp(id: string) {
   const convId = currentId.value;
-  mcpBusy.value = true;
+  mcpReconnecting.add(id);
   mcpError.value = "";
+  // 立即给这一行「连接中」的反馈：reload 可能要几十秒，不能让人以为点了没反应。
+  patchMcpRow(id, { connecting: true, connected: false, error: undefined, toolsError: undefined });
   try {
     await reloadMcpServer(id);
     // 任务表单可能没有对话 id：仍要刷新 available 才能看到「已连接」。
     if (convId) await loadMcp(convId);
+    else await refreshMcpAvailable();
+  } catch (err) {
+    patchMcpRow(id, {
+      connecting: false,
+      connected: false,
+      error: (err as Error)?.message || tx("连接失败", "connect failed", "falha na conexão", "कनेक्शन विफल"),
+    });
+    mcpError.value = localizeToken(
+      uiLocale.value,
+      getApiErrorToken(err),
+      (err as Error)?.message || tx("连接失败", "connect failed", "falha na conexão", "कनेक्ट विफल"),
+    );
+  } finally {
+    mcpReconnecting.delete(id);
+  }
+}
+
+async function removeCustomMcp(id: string) {
+  const ok = window.confirm(
+    tx(
+      "移除这个连接器？各对话里的勾选会一起去掉。",
+      "Remove this connector? It will also be unchecked in every conversation.",
+      "Remover este conector? Ele também será desmarcado em todas as conversas.",
+      "यह कनेक्टर हटाएँ? सभी बातचीत से चयन भी हट जाएगा।",
+    ),
+  );
+  if (!ok) return;
+  mcpBusy.value = true;
+  mcpError.value = "";
+  try {
+    await deleteCustomMcpServer(id);
+    taskDraft.mcpServers = taskDraft.mcpServers.filter((item) => item !== id);
+    if (currentId.value) await loadMcp(currentId.value);
     else await refreshMcpAvailable();
   } catch (err) {
     mcpError.value = localizeToken(
@@ -4126,8 +4189,11 @@ async function reconnectMcp(id: string) {
 function mcpRowState(
   s: McpServerStatus,
   enabled: readonly string[] = current.value.settings.mcpEnabled,
+  bound = false,
 ): { cls: string; text: string } {
-  if (!enabled.includes(s.id)) {
+  // bound（客服自带）服务器恒为启用态、且不可在本面板关闭：跳过启用集判定，
+  // 否则会出现「已启用」pin 与状态「未启用」并存的矛盾。
+  if (!bound && !enabled.includes(s.id)) {
     return { cls: "idle", text: tx("未启用", "not enabled", "não ativado", "सक्षम नहीं") };
   }
   if (s.connected) return { cls: "ok", text: tx("已连接", "connected", "conectado", "कनेक्टेड") };
@@ -4180,7 +4246,11 @@ async function onChatMcpCreated(id: string) {
 async function onTaskMcpCreated(id: string) {
   taskMcpAddOpen.value = false;
   await loadMcp();
-  if (!taskDraft.mcpServers.includes(id)) taskDraft.mcpServers.push(id);
+  if (!taskDraft.mcpServers.includes(id)) {
+    taskDraft.mcpServers.push(id);
+    // 与对话区一致：新建即预热连接，否则行状态会停在「未连接」。
+    void connectTaskMcp(id);
+  }
 }
 
 /** 打开技能飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
@@ -4285,7 +4355,13 @@ const mcpPanelRows = computed(() => {
   void uiLocale.value;
   const rows: Array<
     | { kind: "label"; key: string; text: string }
-    | { kind: "server"; key: string; server: (typeof mcpAvailable.value)[number]; bound: boolean }
+    | {
+        kind: "server";
+        key: string;
+        server: (typeof mcpAvailable.value)[number];
+        bound: boolean;
+        state: { cls: string; text: string };
+      }
   > = [];
   if (mcpBoundRows.value.length) {
     rows.push({
@@ -4293,7 +4369,9 @@ const mcpPanelRows = computed(() => {
       key: "bound",
       text: tx("客服已启用", "Included with support", "Incluído no suporte", "सहायता के साथ शामिल"),
     });
-    for (const server of mcpBoundRows.value) rows.push({ kind: "server", key: server.id, server, bound: true });
+    // 行内连接状态每行只算一次（mcpRowState 是纯函数），模板只读取，避免一处渲染重复算三遍。
+    for (const server of mcpBoundRows.value)
+      rows.push({ kind: "server", key: server.id, server, bound: true, state: mcpRowState(server, current.value.settings.mcpEnabled, true) });
   }
   if (mcpOptionalRows.value.length) {
     if (mcpBoundRows.value.length) {
@@ -4303,7 +4381,8 @@ const mcpPanelRows = computed(() => {
         text: tx("其他连接器", "Other connectors", "Outros conectores", "अन्य कनेक्टर"),
       });
     }
-    for (const server of mcpOptionalRows.value) rows.push({ kind: "server", key: server.id, server, bound: false });
+    for (const server of mcpOptionalRows.value)
+      rows.push({ kind: "server", key: server.id, server, bound: false, state: mcpRowState(server, current.value.settings.mcpEnabled, false) });
   }
   return rows;
 });
@@ -4674,13 +4753,15 @@ let skeletonTimer: ReturnType<typeof setTimeout> | null = null;
  * 上报「上次打开的对话」（设备态）。
  * 节流 500ms：连点会话卡不该刷写后端。
  */
-function reportActiveConversation(convId: string) {
+function reportActiveConversation(conv: { id: string; agentId?: string }) {
+  const convId = conv?.id;
   if (!convId) return;
-  // 活跃对话槽按角色分存（generic 才写旧字段；其余角色由服务端 stream 时的 activeByAgent 维护）。
-  if (AGENT_ID !== "generic") return;
+  // 只把「本角色」的会话记进本角色活跃槽：跨角色会话（如 /generic 页点开 support 期次）不写，
+  // 否则会污染首屏按角色恢复（见 docs/cross-role-restore-scoping.md）。
+  if ((conv.agentId || "generic") !== AGENT_ID) return;
   if (activeReportTimer) clearTimeout(activeReportTimer);
   activeReportTimer = setTimeout(() => {
-    void saveChatPreferences({ activeConversationId: convId }).catch(() => undefined);
+    void saveChatPreferences({ agentId: AGENT_ID, activeConversationId: convId }).catch(() => undefined);
   }, 500);
 }
 
@@ -4788,6 +4869,9 @@ onMounted(async () => {
   // 交给下面的 selectConversation / newConversation 按对话加载。
   window.addEventListener("mousedown", onOutsideTools);
   window.addEventListener("keydown", onEscTools);
+  // 侧栏助手切换菜单：点击外部 / Esc 收起。
+  window.addEventListener("mousedown", onAgentMenuOutside);
+  window.addEventListener("keydown", onAgentMenuEsc);
   // 任务表单的 Esc：capture 阶段先于上面几个 Esc 处理器，模态开着时由它独占（见 onTaskFormEsc）。
   window.addEventListener("keydown", onTaskFormEsc, true);
   window.addEventListener("mousedown", onOutsideRes);
@@ -4819,7 +4903,10 @@ onMounted(async () => {
     adoptTheme(prefs.theme);
     sortMode.value = prefs.convSortMode;
     showArchived.value = prefs.showArchived;
-    initialConversationId = prefs.activeConversationId;
+    // 按角色取「上次打开的对话」：generic 用旧槽；其余角色用 activeByAgent（后端维护）。
+    // 不用 generic 槽：否则双角色用户进 /support 会把 generic 的会话当首屏打开（见 docs/cross-role-restore-scoping.md）。
+    initialConversationId =
+      AGENT_ID === "generic" ? prefs.activeConversationId : prefs.activeByAgent?.[AGENT_ID] || "";
     const zone = browserTimeZone();
     if (zone && zone !== prefs.timeZone) {
       void saveChatPreferences({ timeZone: zone }).catch(() => undefined);
@@ -4837,7 +4924,26 @@ onMounted(async () => {
   void loadNotifyChannels();
   // IM 通知里的「打开对话」链接带 ?conv=<id>：显式指定优先于设备上次打开的对话。
   const linkedConvId = String(router.currentRoute.value.query.conv || "").trim();
-  const target = list.find((c) => c.id === (linkedConvId || initialConversationId)) || list[0];
+  const findInList = (id: string) => (id ? list.find((c) => c.id === id) : undefined);
+  // 首屏恢复按角色收窄（见 docs/cross-role-restore-scoping.md）：自动恢复的活跃槽只在**本角色列表里**才打开，
+  // 否则回落 list[0]——不把别角色的会话按 id 直取拖进本页（那会既串列表又串人设）。
+  let target = findInList(linkedConvId) || findInList(initialConversationId) || list[0];
+  // 只有**显式深链**（IM 通知 ?conv=）才跨角色按 id 直取：如从通用对话建的定时任务，其专属 / 某期会话
+  // 属 generic，却在 /support 打开——按 id 直取（服务端只校验归属），取到补进列表并优先打开。
+  if (linkedConvId && !findInList(linkedConvId)) {
+    const doc = await fetchConversation(linkedConvId).catch(() => null);
+    if (doc) {
+      conversations.value = [doc, ...conversations.value.filter((c) => c.id !== doc.id)];
+      resortConversations();
+      target = doc;
+    } else {
+      // 显式深链既不在本角色列表、直取又失败：如实提示，
+      // 不再静默落到别的对话（用户点了链接却进了一个毫不相关的会话而无感知）。
+      showSettingsError(
+        tx("该对话已不存在或无权访问", "This conversation no longer exists or you don't have access", "Esta conversa não existe mais ou você não tem acesso", "यह चैट अब मौजूद नहीं है या आपकी पहुँच नहीं है"),
+      );
+    }
+  }
   try {
     if (target) selectConversation(target);
     else await newConversation();
@@ -4852,12 +4958,25 @@ onMounted(async () => {
   }
 });
 
+// 同路径只换 ?conv= 时（App.vue 以 $route.path 作 key，组件不重挂载，onMounted 不重跑）：
+// 运行期从 IM 通知链接跳来的切换要在这里接住。首屏已由上面的 onMounted 处理，这里用非 immediate，
+// 避免和首屏逻辑重复触发；空值（离开深链）或已是当前对话则不动，维持既有导航行为。
+watch(
+  () => String(router.currentRoute.value.query.conv || "").trim(),
+  (convId) => {
+    if (!convId || convId === currentId.value) return;
+    void openConversationById(convId, "link");
+  },
+);
+
 onBeforeUnmount(() => {
   if (nowClockTimer) window.clearInterval(nowClockTimer);
   stopTasksPoll();
   window.removeEventListener("keydown", onSidebarEsc);
   window.removeEventListener("mousedown", onOutsideTools);
   window.removeEventListener("keydown", onEscTools);
+  window.removeEventListener("mousedown", onAgentMenuOutside);
+  window.removeEventListener("keydown", onAgentMenuEsc);
   window.removeEventListener("keydown", onTaskFormEsc, true);
   window.removeEventListener("mousedown", onOutsideRes);
   window.removeEventListener("mousedown", onOutsideDt);
@@ -4893,7 +5012,69 @@ onBeforeUnmount(() => {
     <aside class="sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }" :aria-label="tx('会话列表', 'Conversations', 'Conversas', 'चैट सूची')">
       <div class="sidebar__inner">
       <div class="brand">
-        <h1 class="brand__name">{{ AGENT_LABEL || tx("小助手", "Assistant", "Assistente", "सहायक") }}</h1>
+        <div ref="agentMenuEl" class="brand__agent">
+          <h1 class="brand__name">
+            <button
+              type="button"
+              class="brand__switch"
+              :aria-expanded="agentMenuOpen ? 'true' : 'false'"
+              aria-haspopup="menu"
+              :title="tx('切换助手', 'Switch assistant', 'Trocar assistente', 'सहायक बदलें')"
+              @click="toggleAgentMenu()"
+            >
+              <span class="brand__agent-name">{{
+                currentAgent
+                  ? agentText(currentAgent.label, uiLocale)
+                  : AGENT_LABEL || tx("小助手", "Assistant", "Assistente", "सहायक")
+              }}</span>
+              <svg
+                class="brand__agent-caret"
+                :class="{ open: agentMenuOpen }"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+          </h1>
+          <!-- 助手下拉：列出全部角色（对齐 CodeBuddy 的助手选择）；当前项打勾，点击即整页切换。 -->
+          <div v-if="agentMenuOpen" class="agent-menu" role="menu" :aria-label="tx('切换助手', 'Switch assistant', 'Trocar assistente', 'सहायक बदलें')">
+            <button
+              v-for="a in AGENTS"
+              :key="a.id"
+              type="button"
+              role="menuitem"
+              class="agent-menu__item"
+              :class="{ active: a.id === AGENT_ID }"
+              @click="onPickAgent(a)"
+            >
+              <span class="agent-menu__icon" aria-hidden="true">{{ a.icon }}</span>
+              <span class="agent-menu__label">{{ agentText(a.label, uiLocale) }}</span>
+              <svg
+                v-if="a.id === AGENT_ID"
+                class="agent-menu__check"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="m5 13 4 4L19 7" />
+              </svg>
+            </button>
+          </div>
+        </div>
         <RouterLink to="/" class="brand__home" :title="tx('返回门户', 'Back to portal', 'Voltar ao portal', 'पोर्टल पर वापस')">⌂</RouterLink>
         <button
           v-if="!isMobile"
@@ -5968,57 +6149,56 @@ onBeforeUnmount(() => {
                             }}
                           </div>
                           <div
-                            v-for="s in taskMcpFiltered"
-                            :key="s.id"
+                            v-for="item in taskMcpFiltered"
+                            :key="item.server.id"
                             class="tools-item"
-                            :class="{ on: taskDraft.mcpServers.includes(s.id) }"
+                            :class="{ on: taskDraft.mcpServers.includes(item.server.id) }"
                           >
                             <button
                               type="button"
                               class="tools-item__main"
-                              @click="toggleTaskServer(s.id)"
+                              @click="toggleTaskServer(item.server.id)"
                             >
-                              <span class="tools-item__icon" :style="iconStyle(s.id)" aria-hidden="true">{{ iconChar(s.label) }}</span>
+                              <span class="tools-item__icon" :style="iconStyle(item.server.id)" aria-hidden="true">{{ iconChar(item.server.label) }}</span>
                               <span class="tools-item__body">
                                 <span class="tools-item__name">
-                                  {{ s.label }}
-                                  <span class="mcp-status" :class="taskRowState(s).cls">
-                                    <span class="mcp-dot" :class="taskRowState(s).cls"></span>
-                                    {{ taskRowState(s).text }}
+                                  {{ item.server.label }}
+                                  <span class="mcp-status" :class="item.state.cls">
+                                    <span class="mcp-dot" :class="item.state.cls"></span>
+                                    {{ item.state.text }}
                                   </span>
                                 </span>
-                                <span class="tools-item__desc" :title="mcpDescText(s)">{{ mcpDescText(s) }}</span>
-                                <span v-if="taskMcpExpanded === s.id && s.toolNames.length" class="tools-item__tools">{{ s.toolNames.join("、") }}</span>
+                                <span class="tools-item__desc" :title="mcpDescText(item.server)">{{ mcpDescText(item.server) }}</span>
+                              </span>
+                              <!-- 勾选圆点在按钮内：整行（含圆圈）都是点击目标，与对话区连接器面板同构。 -->
+                              <span class="tools-item__check-slot" aria-hidden="true">
+                                <svg v-if="taskDraft.mcpServers.includes(item.server.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                  <path d="m5 12.5 4.5 4.5L19 7.5" />
+                                </svg>
                               </span>
                             </button>
-                            <!-- 勾选位固定宽，避免与右侧操作挤在一起；无勾时留空位保持列对齐。 -->
-                            <span class="tools-item__check-slot" aria-hidden="true">
-                              <svg v-if="taskDraft.mcpServers.includes(s.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="m5 12.5 4.5 4.5L19 7.5" />
-                              </svg>
-                            </span>
                             <span class="tools-item__ops">
-                              <!-- 无工具清单也占位，保证各行 ⟳ 纵向对齐。 -->
-                              <button
-                                class="mcp-mini"
-                                :class="{ 'is-ghost': !s.toolNames.length }"
-                                type="button"
-                                :disabled="!s.toolNames.length"
-                                :tabindex="s.toolNames.length ? undefined : -1"
-                                :title="s.toolNames.length ? tx('工具清单', 'Tool list', 'Lista de ferramentas', 'टूल सूची') : undefined"
-                                :aria-hidden="!s.toolNames.length"
-                                @click.stop="s.toolNames.length && (taskMcpExpanded = taskMcpExpanded === s.id ? '' : s.id)"
-                              >
-                                {{ taskMcpExpanded === s.id ? "▴" : "▾" }}
-                              </button>
                               <button
                                 class="mcp-mini"
                                 type="button"
-                                :disabled="mcpBusy || !taskDraft.mcpServers.includes(s.id) || !!s.connecting"
+                                :disabled="!taskDraft.mcpServers.includes(item.server.id) || !!item.server.connecting || mcpReconnecting.has(item.server.id)"
                                 :title="tx('重连', 'Reconnect', 'Reconectar', 'पुनः कनेक्ट')"
-                                @click.stop="reconnectMcp(s.id)"
+                                @click.stop="reconnectMcp(item.server.id)"
                               >
                                 ⟳
+                              </button>
+                              <!-- 不可移除时占位（ghost），保证各行 ⟳ 纵向对齐。 -->
+                              <button
+                                class="mcp-mini"
+                                :class="{ 'is-ghost': !item.server.removable }"
+                                type="button"
+                                :disabled="!item.server.removable || mcpBusy"
+                                :tabindex="item.server.removable ? undefined : -1"
+                                :title="item.server.removable ? tx('移除', 'Remove', 'Remover', 'हटाएँ') : undefined"
+                                :aria-hidden="!item.server.removable"
+                                @click.stop="item.server.removable && removeCustomMcp(item.server.id)"
+                              >
+                                ×
                               </button>
                             </span>
                           </div>
@@ -6988,41 +7168,43 @@ onBeforeUnmount(() => {
                           <span class="tools-item__name">
                             {{ row.server.label }}
                             <span v-if="row.bound" class="tools-item__pin">{{ tx("已启用", "On", "Ativo", "चालू") }}</span>
-                            <span class="mcp-status" :class="mcpRowState(row.server).cls">
-                              <span class="mcp-dot" :class="mcpRowState(row.server).cls"></span>
-                              {{ mcpRowState(row.server).text }}
-                            </span>
+                          </span>
+                          <span class="mcp-status" :class="row.state.cls">
+                            <span class="mcp-dot" :class="row.state.cls"></span>
+                            {{ row.state.text }}
                           </span>
                           <span class="tools-item__desc" :title="row.bound ? tx('客服助手自带，不能在这里关闭', 'Included with the support assistant and cannot be turned off here', 'Incluído no assistente de suporte e não pode ser desligado aqui', 'सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता') : mcpDescText(row.server)">{{ row.bound ? tx("客服助手自带，不能在这里关闭", "Included with the support assistant and cannot be turned off here", "Incluído no assistente de suporte e não pode ser desligado aqui", "सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता") : mcpDescText(row.server) }}</span>
-                          <span v-if="mcpExpanded === row.server.id && row.server.toolNames.length" class="tools-item__tools">{{ row.server.toolNames.join("、") }}</span>
+                        </span>
+                        <!-- 勾选圆点在按钮内：整行（含圆圈）都是点击目标。圆点是可见控件，
+                             放在按钮外会形成「看得见点不着」的死区（曾有点击圆圈无反应的反馈）。 -->
+                        <span class="tools-item__check-slot" aria-hidden="true">
+                          <svg v-if="!row.bound && current.settings.mcpEnabled.includes(row.server.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="m5 12.5 4.5 4.5L19 7.5" />
+                          </svg>
                         </span>
                       </button>
-                      <span class="tools-item__check-slot" aria-hidden="true">
-                        <svg v-if="!row.bound && current.settings.mcpEnabled.includes(row.server.id)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="m5 12.5 4.5 4.5L19 7.5" />
-                        </svg>
-                      </span>
                       <span class="tools-item__ops">
                         <button
                           class="mcp-mini"
-                          :class="{ 'is-ghost': !row.server.toolNames.length }"
                           type="button"
-                          :disabled="!row.server.toolNames.length"
-                          :tabindex="row.server.toolNames.length ? undefined : -1"
-                          :title="row.server.toolNames.length ? tx('工具清单', 'Tool list', 'Lista de ferramentas', 'टूल सूची') : undefined"
-                          :aria-hidden="!row.server.toolNames.length"
-                          @click.stop="row.server.toolNames.length && (mcpExpanded = mcpExpanded === row.server.id ? '' : row.server.id)"
-                        >
-                          {{ mcpExpanded === row.server.id ? "▴" : "▾" }}
-                        </button>
-                        <button
-                          class="mcp-mini"
-                          type="button"
-                          :disabled="mcpBusy || !current.settings.mcpEnabled.includes(row.server.id)"
+                          :disabled="!current.settings.mcpEnabled.includes(row.server.id) || mcpReconnecting.has(row.server.id)"
                           :title="tx('重连', 'Reconnect', 'Reconectar', 'पुनः कनेक्ट')"
                           @click.stop="reconnectMcp(row.server.id)"
                         >
                           ⟳
+                        </button>
+                        <!-- 不可移除时占位（ghost），保证各行 ⟳ 纵向对齐。 -->
+                        <button
+                          class="mcp-mini"
+                          :class="{ 'is-ghost': !row.server.removable }"
+                          type="button"
+                          :disabled="!row.server.removable || mcpBusy"
+                          :tabindex="row.server.removable ? undefined : -1"
+                          :title="row.server.removable ? tx('移除', 'Remove', 'Remover', 'हटाएँ') : undefined"
+                          :aria-hidden="!row.server.removable"
+                          @click.stop="row.server.removable && removeCustomMcp(row.server.id)"
+                        >
+                          ×
                         </button>
                       </span>
                     </div>

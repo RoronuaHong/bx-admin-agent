@@ -7,7 +7,7 @@
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
-import { BUILTIN_SERVER, builtinToolSpecs, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
+import { BUILTIN_SERVER, builtinToolSpecs, CONVERSATION_STATE_TOOLS, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
 import { admitDirectListCall, releaseDirectListCall, rememberDirectListPage } from "./list-page-gate.js";
 import { extractListRows, listResponseHasMore, normalizeTimeZone } from "./list-count.js";
 import { toolCodeDenied } from "./tool-code.js";
@@ -29,9 +29,8 @@ import {
   buildSupportLabels,
   classifySupportInput,
   reviewSupportPromise,
-  SUPPORT_PROMISE_TEXT,
-  draftPromiseAction,
   visitorSendRefusal,
+  isVisitorVisibleSend,
 } from "./jev.js";
 import type { ScheduleAlertState, ScheduleNotifyPolicy, SchedulePurpose } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
@@ -142,6 +141,8 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 6 * 60 * 60 * 1000);
 const TRANSIENT_COOLDOWN_MS = Number(process.env.MODEL_TRANSIENT_COOLDOWN_MS || 10 * 60 * 1000);
 const quotaCooldownUntil = new Map<string, number>();
+/** 冷却原因的状态码（402 / 429 …）。冷却表只有时刻没有原因；「定时运行跳过冷却 → 名单为空」时要靠它如实告知。 */
+const quotaCooldownStatus = new Map<string, ModelAvailabilityStatus>();
 
 /** 500 可能是短故障，冷却一个调度周期。402 / 未开通 / 鉴权失败按小时冷却。 */
 export function modelDownCooldownMs(failure: string | null): number {
@@ -368,6 +369,22 @@ export function cancelSubagentsOfConversation(conversationId: string): void {
 // 工具按需加载（对齐 Claude Code 的 ToolSearch：工具定义占用超过窗口一定比例时改为「按需检索加载」）。
 const TOOL_SEARCH_MODE = (process.env.TOOL_SEARCH_MODE || "auto").toLowerCase(); // auto | on | off
 const TOOL_SEARCH_RATIO = Number(process.env.TOOL_SEARCH_RATIO || 0.1);
+
+/**
+ * 对访客可见的发送工具失败时的友好化（阶段四代发）：
+ * 6018 = 当前坐席不是该会话参与者——模型和坐席都需要知道下一步（先接起/加入会话），不能只透传原始错误码。
+ * 其余错误原样返回。
+ */
+function friendlySendFailure(name: string, failureText: string): string {
+  if (!isVisitorVisibleSend(name)) return failureText;
+  if (/\b6018\b/.test(failureText)) {
+    return (
+      "发送失败：当前坐席不是该会话的参与者（Zoho 6018）。请先在 SalesIQ 里接起或加入该会话，再重新发送。" +
+      `接口原文：${failureText.slice(0, 300)}`
+    );
+  }
+  return failureText;
+}
 const TOOL_SEARCH_RESULTS = Number(process.env.TOOL_SEARCH_RESULTS || 8);
 const TOOL_SEARCH_MAX_RESULTS = 20;
 
@@ -1831,7 +1848,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     const sendRefusal = ctx.namespace === "support" ? await visitorSendRefusal(name, mcpArgs(name, argsJson)) : null;
     if (sendRefusal) return { ok: false, text: sendRefusal };
     const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
-    return { ok: !result.isError, text: result.text };
+    return { ok: !result.isError, text: result.isError ? friendlySendFailure(name, result.text) : result.text };
   };
   const codeHooks: BuiltinHooks = { callTool: (name, args) => callToolFromCode(name, args) };
   let roundExecuted: string[] = [];
@@ -2396,7 +2413,11 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         rememberDirectListPage(c.name, c.argsJson, result.text, directListSeen);
         if (c.name.startsWith("mcp__bi__")) ownBusinessExecuted = true;
       }
-      return { ok: !result.isError, rawText: result.text, executed: true };
+      return {
+        ok: !result.isError,
+        rawText: result.isError ? friendlySendFailure(c.name, result.text) : result.text,
+        executed: true,
+      };
     };
     while (index < calls.length) {
       const call = calls[index]!;
@@ -2572,8 +2593,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           for (let k = 0; k < batch.length; k += 1) {
             const item = batch[k]!;
             const out = outcomes[k]!;
-            // 副作用计数（与单调用路径同口径，见其注释）。
-            if (out.executed && item.verdict.level !== "read") sideEffects += 1;
+            // 副作用计数（与单调用路径同口径，见其注释）。纯对话内部状态工具（write_todos 等）
+            // 不计——重跑只更新对话内展示状态，无文件 / 外部副作用，不该拦住换模型重跑。
+            if (out.executed && item.verdict.level !== "read" && !CONVERSATION_STATE_TOOLS.has(item.call.name)) sideEffects += 1;
             // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
             if (out.executed) {
               if (out.ok) {
@@ -2852,7 +2874,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           } else {
             const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
             ok = !result.isError;
-            rawText = result.text;
+            rawText = result.isError ? friendlySendFailure(call.name, result.text) : result.text;
             if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
             else {
               rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);
@@ -2863,7 +2885,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       // 副作用计数：真正执行过、且级别非只读的调用。只读（read）不计——换模型重跑只读调用没有副作用，
       // 不该被「已产生副作用就不能切候选」的护栏拦住（见 chatStream 候选循环的说明）。
-      if (executed && verdict.level !== "read") sideEffects += 1;
+      // 纯对话内部状态工具（write_todos 等）也不计：它只更新对话内展示状态，重跑无文件 / 外部副作用。
+      // 漏排除的后果是实测过的：首轮 write_todos 后次轮模型 429，候选链（含付费兜底）被整体斩断。
+      if (executed && verdict.level !== "read" && !CONVERSATION_STATE_TOOLS.has(call.name)) sideEffects += 1;
       // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
       if (executed) {
         if (ok) {
@@ -3702,7 +3726,11 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
-    if (isModelDownFailure(failure)) quotaCooldownUntil.set(m.id, Date.now() + modelDownCooldownMs(failure));
+    if (isModelDownFailure(failure)) {
+      quotaCooldownUntil.set(m.id, Date.now() + modelDownCooldownMs(failure));
+      const st = modelAvailabilityStatus(failure);
+      if (st) quotaCooldownStatus.set(m.id, st);
+    }
     // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
     // 原实现「永久错误不切模型」会让默认模型一死整条 auto 链跟着死（auto 形同虚设，
@@ -3725,6 +3753,15 @@ export async function* chatStream(
   // 上下文估算 totalTokens，保持与原行为一致，避免改成「完全不扣」。
   addDailyTokens(costTokens > 0 ? costTokens : totalTokens, opts.ownerKey);
 
+  // 本期模型不可用的可归类状态码（402 / 429 / 500 …），挂在 usage 事件上供调度侧消费：
+  // ①候选循环的最终 failure；②候选名单为空（定时运行把冷却中的模型全跳过）时，
+  // 回落冷却表里记录的状态码——「所有模型都不可用」也必须如实记失败并推送企业 IM，不能静默。
+  // 成功收束时 failure 为空 → availability 为 null → usage 不带该字段。
+  const availability = failure
+    ? modelAvailabilityStatus(failure) ??
+      (failure.startsWith("没有可用模型") ? [...quotaCooldownStatus.values()][0] ?? null : null)
+    : null;
+
   const usage: ChatEvent = {
     type: "usage",
     tokens: costTokens > 0 ? costTokens : totalTokens,
@@ -3745,6 +3782,7 @@ export async function* chatStream(
     groundingVerifications,
     ungrounded,
     costTokens,
+    ...(availability ? { modelStatus: availability } : {}),
   };
 
   if (failure) {
@@ -3769,9 +3807,10 @@ export async function* chatStream(
         text: `${text.trim()}\n\n⚠️ ${partialInterruptLine(failure)}`,
       };
     }
-    const availability = modelAvailabilityStatus(failure);
     if (!text.trim() && availability && !signal?.aborted) {
-      // 定时任务靠这段正文告知 402 / 500 / 429，不把上游 JSON 写进对话，也不把它当成业务失败去推送。
+      // 定时任务靠这段正文告知 402 / 500 / 429，不把上游 JSON 写进对话。状态码同时挂在 usage
+      // 事件（modelStatus）上：调度侧据此把本期记为 failed 并推送企业 IM——
+      // 模型状态码失败每一期都推（用户要求：除非所有模型都不可用，否则必须有正确输出）。
       yield { type: "text", text: modelAvailabilityNotice(availability) };
     } else if (!text.trim() && !signal?.aborted) {
       console.warn(`[chat] 未归类的模型失败：${failure.slice(0, 400)}`);
@@ -3819,9 +3858,7 @@ export async function* chatStream(
   if (conversation?.agentId === "support" && !opts.unattendedConclusion) {
     const reading = supportInput ? await supportInput : null;
     const promise = await reviewSupportPromise(finalText);
-    const labels = buildSupportLabels(reading, promise);
-    if (promise.reason === "ok" && draftPromiseAction(promise.probability) === "replace") finalText = SUPPORT_PROMISE_TEXT;
-    yield { type: "support_labels", labels };
+    yield { type: "support_labels", labels: buildSupportLabels(reading, promise) };
   }
   if (finalText !== visibleText) {
     console.warn(`[chat:redact] 最终回答命中凭据形态，已打码 ${countSecretHits(visibleText)} 处`);

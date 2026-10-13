@@ -53,7 +53,7 @@ test("本地技能进入索引和可勾选列表，关闭后三处都没有，�
   if (!created.ok) return;
   const file = join(dataDir, "skills", "weekly-report", "SKILL.md");
   const before = statSync(file).size;
-  expect(listSelectableSkillMetas("generic").some((skill) => skill.dir === "weekly-report")).toBe(true);
+  expect(listSelectableSkillMetas("generic").some((skill) => skill.dir === "weekly-report" && skill.source === "local")).toBe(true);
   expect(renderSkillIndex("generic")).toContain("weekly-report");
   expect(readSkill("weekly-report")).toContain("先列本周完成");
   expect(renderEnabledSkills(["weekly-report"])).toContain("先列本周完成");
@@ -72,6 +72,25 @@ test("本地技能进入索引和可勾选列表，关闭后三处都没有，�
   expect(enabled.ok).toBe(true);
   expect(statSync(file).size).toBe(before);
   expect(readSkill("weekly-report")).toContain("先列本周完成");
+});
+
+test("正文里残留的 frontmatter 不会重复（客户端把整份 SKILL.md 当正文传也安全）", async () => {
+  const { createLocalSkill, readSkillDocument } = await api();
+  const created = createLocalSkill({
+    dir: "full-md",
+    name: "整份文件",
+    description: "用户直接贴了完整 SKILL.md 当正文。",
+    body: "---\nname: 旧名字\ndescription: 旧描述\n---\n\n先列本周完成，再列下周计划。\n",
+  });
+  expect(created.ok).toBe(true);
+  const doc = readSkillDocument("full-md");
+  expect(doc).toBeTruthy();
+  // 正文里的旧 frontmatter 被剥离，不泄漏到正文。
+  expect(doc!.body).toContain("先列本周完成");
+  expect(doc!.body).not.toContain("旧名字");
+  expect(doc!.body).not.toContain("旧描述");
+  // 整份文件里只应有一组 frontmatter 键（服务端重新生成的那份）。
+  expect((doc!.content.match(/^description:/m) || []).length).toBe(1);
 });
 
 test("不能覆盖或删除内置技能，也不能写入路径穿越", async () => {

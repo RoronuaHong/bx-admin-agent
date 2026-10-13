@@ -54,6 +54,8 @@ export interface SkillMeta {
    * 本地技能一律不当成 default，避免一份上传文件把自己从面板藏掉。
    */
   default?: boolean;
+  /** 系统自带或本地添加。面板只允许移除本地技能。 */
+  source?: "builtin" | "local";
 }
 
 export interface SkillCatalogItem extends SkillMeta {
@@ -254,6 +256,7 @@ export function listSkillMetas(role?: string | null): SkillMeta[] {
       dir: skill.dir,
       ...(skill.roles ? { roles: skill.roles } : {}),
       ...(skill.default ? { default: true } : {}),
+      source: skill.source,
     }));
 }
 
@@ -341,8 +344,15 @@ function validateFields(input: { name?: string; description?: string; roles?: st
   return null;
 }
 
+/** 去除正文中可能残留的头部 frontmatter（客户端把整份 SKILL.md 当正文传、或粘贴了带 --- 的开头时）。
+ *  没有 frontmatter 时原样返回，幂等——与上传路径 importLocalSkillText 行为保持一致。 */
+function stripLeadingFrontmatter(raw: string): string {
+  return bodyAfterFrontmatter(raw) ?? raw;
+}
+
 function composeSkillFile(input: { name: string; description: string; roles?: string[]; body: string }): string {
   const roles = (input.roles || []).map((role) => role.trim()).filter(Boolean);
+  const body = stripLeadingFrontmatter(input.body).replace(/^\uFEFF/, "").replace(/^\r?\n/, "");
   const lines = [
     "---",
     `name: ${input.name.trim()}`,
@@ -350,7 +360,7 @@ function composeSkillFile(input: { name: string; description: string; roles?: st
     ...(roles.length ? [`roles: ${roles.join(", ")}`] : []),
     "---",
     "",
-    input.body.replace(/^\uFEFF/, "").replace(/^\r?\n/, ""),
+    body,
   ];
   const text = lines.join("\n");
   return text.endsWith("\n") ? text : `${text}\n`;

@@ -41,7 +41,8 @@ import { addMemory, listMemory } from "./memory.js";
 import { appendAudit } from "./audit.js";
 import { addHistory, setFeedback } from "./movie/profile.js";
 import { fetchPage, readWebSearchConfig, webSearch } from "./web-search.js";
-import { callMcpTool } from "./mcp/hub.js";
+import { callMcpTool, findMcpToolSchema } from "./mcp/hub.js";
+import { composeChatBrief, conversationIdKeys } from "./salesiq-brief.js";
 import { getServer } from "./mcp/config.js";
 import { applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
 import {
@@ -119,6 +120,13 @@ export const BUILTIN_RISK: Record<
     scope: "external",
     reason: "在代码里调用只读工具并只回传聚合输出（明细不进上下文）",
   },
+  // 会话简报（阶段三 Workflow 化）：服务端串「按 id 取详情 + 取消息」两个只读调用并裁剪字段。
+  // 与 count_list_by_time 同口径（read/external）：子代理可用、无副作用、额度失败可换模型重跑。
+  salesiq_chat_brief: {
+    level: "read",
+    scope: "external",
+    reason: "一次取 Zoho SalesIQ 会话详情与逐句消息（只读组合，服务端裁剪字段）",
+  },
   // 定时任务（§17）：拆成「只读列举」与「变更管理」两个工具，而不是一个带 action 的多面工具——
   // risk.ts 对内建工具**只看工具名**（不看参数），一个工具只能有一个风险级别，
   // 合并就会让「列举」也被要求确认。
@@ -143,6 +151,15 @@ export const BUILTIN_RISK: Record<
 // 注：不含 fs_delete —— 本集合语义是「**已免确认**、靠审计兜底」；fs_delete 登记为 destructive 会走确认闸门，
 // 确认动作本身就有 confirmed / denied / timeout 留痕（audit.ts），不必再按「免确认」口径记一条。
 export const WORKSPACE_FILE_WRITE_TOOLS = new Set<string>(["fs_write", "fs_edit", "export_data"]);
+
+/**
+ * 只更新对话内部状态（任务计划等展示层）的内置工具：执行后重跑没有任何文件 / 外部副作用。
+ * chat.ts 的 sideEffects 护栏据此排除——这类工具若按 level:"write" 计入副作用，
+ * 「首轮写了计划、次轮模型失败」就会被「已产生副作用不能换模型重跑」误拦，
+ * 候选链（含付费兜底）被整体斩断（2026-10-12 定时预警实测：write_todos 后模型 429，
+ * 排在后面的 ds4flash0731 / step5 / ds4vexp 一个都没试）。
+ */
+export const CONVERSATION_STATE_TOOLS = new Set<string>(["write_todos"]);
 
 /**
  * 终端命令执行（对齐 CodeBuddy「完全访问」的「终端命令」能力）：
@@ -631,6 +648,21 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           maxPages: jsonType("number", `最多翻多少页（默认 ${LIST_COUNT_DEFAULT_PAGES}）`),
         },
         required: ["tool", "payload"],
+      },
+    ),
+    spec(
+      "salesiq_chat_brief",
+      "一次取一条 Zoho SalesIQ 会话的详情和逐句消息（服务端合并 getConversationById 与 getConversationMessages 并裁剪字段）。" +
+        "有会话号、要看「这条会话讲了啥 / 访客说了什么 / 接待人是谁」时优先用它，不要分别调那两个 MCP 工具。" +
+        "没有会话号时先用 mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList 找到会话 id 再来取。" +
+        "要单独看访客设备/反馈/内部备注时，再用对应的单个 MCP 工具。" +
+        "返回空消息列表不等于访客没说过话：可能是保留策略裁剪或归档。",
+      {
+        type: "object",
+        properties: {
+          conversationId: jsonType("string", "SalesIQ 会话 id（数字字符串）"),
+        },
+        required: ["conversationId"],
       },
     ),
     spec(
@@ -1991,6 +2023,38 @@ export async function execBuiltin(
       );
       attachHourFile(conversationId, report);
       return { ok: report.ok, text: formatCountReport(report) };
+    }
+    case "salesiq_chat_brief": {
+      const convId = str(args, "conversationId").trim();
+      if (!convId) return { ok: false, text: "salesiq_chat_brief 需要 conversationId（SalesIQ 会话 id）" };
+      const cfg = getServer("zoho-salesiq");
+      if (!cfg) return { ok: false, text: "zoho-salesiq 未配置：会话简报不可用" };
+      const detailName = "mcp__zoho-salesiq__ZohoSalesIQ_getConversationById";
+      const msgName = "mcp__zoho-salesiq__ZohoSalesIQ_getConversationMessages";
+      // 两个接口的 path_variables 分属两族（详情 screenname+conversation_id、消息 portalid+id），
+      // 会话 id 键按【各自】schema 发现（实测共用一次发现必挂），portalid 等由 pathDefaults 逐工具注入。
+      const detailPv: Record<string, string> = {};
+      for (const key of conversationIdKeys(findMcpToolSchema(detailName))) detailPv[key] = convId;
+      const detail = await callMcpTool(
+        detailName,
+        applyPathDefaults({ path_variables: { ...detailPv } }, pathDefaultsForTool(cfg.pathDefaults, "ZohoSalesIQ_getConversationById")),
+        signal,
+      );
+      if (detail.isError) return { ok: false, text: `取会话详情失败：${detail.text.slice(0, 600)}` };
+      const msgPv: Record<string, string> = {};
+      for (const key of conversationIdKeys(findMcpToolSchema(msgName))) msgPv[key] = convId;
+      const msgs = await callMcpTool(
+        msgName,
+        applyPathDefaults(
+          { path_variables: { ...msgPv }, query_params: { from: "top", limit: 100 } },
+          pathDefaultsForTool(cfg.pathDefaults, "ZohoSalesIQ_getConversationMessages"),
+        ),
+        signal,
+      );
+      return {
+        ok: true,
+        text: composeChatBrief(detail.text, msgs.text, { conversationId: convId, messagesError: msgs.isError }),
+      };
     }
     default:
       return null;
