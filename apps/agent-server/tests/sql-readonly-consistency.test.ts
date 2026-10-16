@@ -94,3 +94,31 @@ test("MCP 适配器未再内联 isReadOnlySql（唯一来源必须是 common 模
   // 必须是从单一源 import。
   expect(src).toContain('import { isReadOnlySql } from "./sql-readonly-common.mjs"');
 });
+
+// ---- 失败文案的可操作性（2026-10-14 事故复盘 §5 P1-5②）----
+// 对标 Anthropic《Writing effective tools for agents》：错误要说明「这次没拿到什么」
+// 「能不能原样重试」「下一步按什么顺序改」，而不是只丢状态码、或只告诉运维去调旋钮。
+// 事故形态：外部查询 10 次失败 6 次（其中一次正好 30s 超时），而旧文案只说「可用 BI_TIMEOUT_MS 调大」——
+// 模型既不知道这次没拿到数据，也不知道该改查询，于是原样重试。
+
+const ADAPTER_SRC = readFileSync(fileURLToPath(new URL("../scripts/metabase-mcp.mjs", import.meta.url)), "utf8");
+
+test("查询超时文案：说清没拿到数据 + 原样重试无效 + 按序给出可操作动作", () => {
+  expect(ADAPTER_SRC).toContain("本次没有拿到数据");
+  expect(ADAPTER_SRC).toContain("原样重试不会更快");
+  expect(ADAPTER_SRC).toContain("缩小范围");
+  expect(ADAPTER_SRC).toContain("list_cards");
+});
+
+test("上游拒绝文案：回显原文之外还要给排查顺序（别只丢状态码）", () => {
+  expect(ADAPTER_SRC).toContain("查询被上游拒绝");
+  expect(ADAPTER_SRC).toContain("get_database_schema 复核真实结构");
+});
+
+test("失败文案不再把运维环境变量当唯一指引（那是运维的事，不是模型的下一步）", () => {
+  const start = ADAPTER_SRC.indexOf("查询超时");
+  expect(start).toBeGreaterThan(-1);
+  const timedOut = ADAPTER_SRC.slice(start, start + 1200);
+  expect(timedOut).not.toMatch(/\bBI_[A-Z_]+\b/);
+});
+

@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "meta": {
+    "source": "2026-10-15 BI 取数复跑（同一多维分析问题，auto 模型跑 9 轮）+ SQL 写法审计（30 条模型自写 SQL）",
+    "doc": "docs/text2sql-text2api-plan.md §12.4~§12.7 · docs/bi-sql-best-practices.md",
+    "redaction": "零业务词：国家线 / 指标 / 维度 / 归因目标一律用占位（主体A、主体B、指标甲、指标乙、维度丙）；不写真实表名、列名与任何业务对象名。",
+    "whySeparateFile": "stall-incident-cases.json 只覆盖「零进展」事故（跑不动）。本文件覆盖「跑得动但答不全」这一类——它在 L3 在线评测里完全不可见：现有 8 个维度（converged/grounded/rounds/tokens/latency/stability/correction/classifier_health）全是过程量，没有任何「任务覆盖度」维度。",
+    "tiers": {
+      "L0": "本文件：case 定义 + 期望行为 + 结构化期望值（供人工触发与统计对照）",
+      "L1": "确定性回归：进 pnpm test，断言护栏行为",
+      "L2": "trace 级断言：真实运行后读逐轮/span 落盘断言形态（人工触发，脚本 scripts/_bi-replay.mjs）",
+      "L3": "在线评测：真实运行持续打分（只观测、不断言）"
+    },
+    "binding": "每个 case 的 boundTests 列出承载它的测试文件与测试名；tests/text2sql-eval-fixture.test.ts 会校验这些测试**真实存在**，且校验本文件零业务词、每个 case 至少绑一个测试——避免 fixture 退化成没人引用的死文档（stall-incident-cases.json 当前就是这种状态：全仓零代码引用）。"
+  },
+  "observedShape": {
+    "note": "9 轮实测计数，作为结构化对照基线。同一问题、同一模型档，答案完整度差异极大——这正是需要 case 固化的原因。",
+    "runs": 9,
+    "toolCallsRange": [11, 128],
+    "maxToolRepeatRange": [3, 48],
+    "offloadedResultsRange": [31, 100],
+    "readBackRatioWorst": "48 次 fs_read 捞回 48 条已卸载结果（占单次运行工具调用的 38%）",
+    "readBackRatioBest": "0~2 次",
+    "newHighLevelToolUsage": "14 个工具已下发，但新补的 5 个高层工具在 9 轮里仅 1 轮被用到（execute_query×2）",
+    "modelSqlSample": 30,
+    "modelSqlNoWhere": 14,
+    "modelSqlGroupByNoLimit": 7,
+    "modelSqlNoLimitRows": 1,
+    "modelSqlCorrectnessClassHits": 0
+  },
+  "cases": [
+    {
+      "id": "reuse-saved-question-instead-of-rewriting-its-sql",
+      "tier": "L1",
+      "title": "找到现成的已保存提问要直接执行它，而不是只读定义然后自己重写 SQL",
+      "shape": "多维取数问题；实例里存在同一口径的已保存提问",
+      "inject": [
+        "元数据/搜索类工具能返回与目标口径同义的已保存提问",
+        "该提问带可执行定义（无需重写即可取数）"
+      ],
+      "expectedBehavior": [
+        "找到现成提问后调用执行类工具跑它，而不是停在读定义",
+        "读定义与执行的比例不倒挂（读定义次数显著多于执行次数即为反模式）"
+      ],
+      "assertions": [
+        "工具描述/注记声明了取数阶梯与默认优先级（否则模型无从判断该选哪个）",
+        "技能层写明「找到就直接执行」，且不出现把动作说成「参考」的措辞"
+      ],
+      "regression": "2026-10-15 A-读侧补齐后发现新工具 0 调用",
+      "boundTests": [
+        { "file": "tests/bi-tool-ergonomics.test.ts", "test": "[N] 取数阶梯必须在工具注记里声明优先级，否则重叠工具等于没补" },
+        { "file": "tests/bi-tool-ergonomics.test.ts", "test": "[O] 技能层必须写「找到就执行」，而不是让模型照着重写" }
+      ]
+    },
+    {
+      "id": "offloaded-results-must-not-be-read-back-one-by-one",
+      "tier": "L1",
+      "title": "大结果被卸载后不许逐个读回来；提示必须内联摘要并给出聚合替代路径",
+      "shape": "单轮工具结果总量超预算，被卸载成工作区文件",
+      "inject": [
+        "一次运行产生数十条超出预算的工具结果",
+        "卸载占位只给出文件路径（模型无法判断里面有没有需要的字段）"
+      ],
+      "expectedBehavior": [
+        "占位提示内联开头摘要，多数诉求零次取回即满足",
+        "占位提示明确「默认不要读回」",
+        "占位提示给出正确替代路径：重发一条已聚合的查询，而不是把一堆明细捞回来"
+      ],
+      "assertions": [
+        "卸载提示三要素齐全（摘要 / 禁止逐条捞回 / 聚合替代路径）",
+        "短结果不谎称被截断，空结果不崩"
+      ],
+      "regression": "2026-10-15 实测：卸载 70~100 条、fs_read 捞回 47~48 次，单工具重复度冲到 48",
+      "boundTests": [
+        { "file": "tests/context-budget.test.ts", "test": "[1c] 卸载提示：内联开头摘要 + 禁止逐条捞回 + 给出聚合替代路径" },
+        { "file": "tests/context-budget.test.ts", "test": "[1d] 卸载提示：短结果不谎称被截断，且摘要为空时也不崩" }
+      ]
+    },
+    {
+      "id": "partial-unanswerable-needs-evidence-and-full-coverage",
+      "tier": "L1",
+      "title": "某个维度答不了时：先穷尽候选来源、逐个子问题都要有交代、限制放在交付之后",
+      "shape": "多主体 × 多指标 × 两档时间窗 × 一个明细维度 × 一个归因子问题；其中归因子问题在当前可见结构里没有对应字段",
+      "inject": [
+        "第一个候选来源在该维度上只有当前快照、没有所需粒度",
+        "另一个候选来源（快照表/明细表）本可给出所需粒度"
+      ],
+      "expectedBehavior": [
+        "换过一个候选来源再宣布取不到，并列出试过哪些来源、各自缺什么",
+        "逐个子问题都有交代（给数字 / 给数字并说明限制 / 明确说缺什么数据，三者选一）",
+        "先交付可答部分，再单独说明限制；不能让取不到的部分取代整体交付"
+      ],
+      "assertions": [
+        "技能层措辞把「覆盖率」放在前面、「说明限制」放在交付之后",
+        "技能层不含许可式措辞（不得出现把「可以断言不存在」写成规则的句式）",
+        "技能层步骤编号连续"
+      ],
+      "regression": "2026-10-15 事故：探 5 张表就收尾，漏掉能给所需粒度的那张，完整维度退化为只有快照；另一次因措辞许可化，连续两轮把能答的子问题也判成答不了",
+      "boundTests": [
+        { "file": "tests/bi-tool-ergonomics.test.ts", "test": "[O] 技能层必须写「找到就执行」，而不是让模型照着重写" }
+      ]
+    },
+    {
+      "id": "sql-must-be-bounded-and-sargable",
+      "tier": "L1",
+      "title": "查库 SQL 要结果集有界、谓词可裁剪、分组完整",
+      "shape": "模型自写原生 SQL 执行取数",
+      "inject": [
+        "明细/聚合查询不带 LIMIT",
+        "无 WHERE 的全表扫描",
+        "谓词列被函数包裹（toDate(col) = …）",
+        "SELECT 里的裸列既不在 GROUP BY 也不在聚合里"
+      ],
+      "expectedBehavior": [
+        "执行前给出可操作体检提示并指明改法",
+        "体检 fail-open：照常执行，不改写也不拒绝（误杀合法探索语句比慢更糟）",
+        "元数据/会话语句不被行级规则误伤"
+      ],
+      "assertions": [
+        "13 条判据每条都有可触发用例且都带可操作文案",
+        "fail-open 语义被测试锁住（摘要写明「本次仍已执行」）",
+        "字面量/注释里的关键字不误报；序号分组放弃判定；LIKE 判据跑在保留字面量的文本上"
+      ],
+      "regression": "2026-10-15 审计 30 条：NO_WHERE 14 / GROUP_BY_NO_LIMIT 7 / NO_LIMIT_ROWS 1；正确性类 0 命中（属预防项）",
+      "boundTests": [
+        { "file": "tests/sql-lint.test.ts", "test": "[A] 无界结果集：明细无 LIMIT / 分组无 LIMIT" },
+        { "file": "tests/sql-lint.test.ts", "test": "[H] fail-open：体检从不改写、从不拒绝，只产出提示" },
+        { "file": "tests/sql-lint.test.ts", "test": "[K+] 13 条判据全部有码有话（新增判据不能只进代码不进清单）" }
+      ]
+    },
+    {
+      "id": "upstream-outage-is-not-data-absence",
+      "tier": "L1",
+      "title": "上游失败必须与「数据不存在」在文案上可区分",
+      "shape": "查询上游返回 5xx（网关/反代错误页）",
+      "inject": ["外部查询返回 502 错误页而非结果集"],
+      "expectedBehavior": [
+        "失败文案自带「上游/执行失败」定性",
+        "适配器不替业务下「库里没有」这类数据缺失结论"
+      ],
+      "assertions": [
+        "上游拒绝与未返回结果两条文案都在",
+        "失败文案里不出现数据缺失定性",
+        "适配器全局不出现「库里没有」"
+      ],
+      "regression": "2026-10-15 实测整轮失败（11 次调用 6 次失败）曾被误当作模型能力问题",
+      "boundTests": [
+        { "file": "tests/bi-tool-ergonomics.test.ts", "test": "[Q] 上游失败必须在文案上与「数据不存在」可区分（否则模型会把 502 说成库里没有）" }
+      ]
+    },
+    {
+      "id": "code-tool-language-mismatch-feedback-must-be-actionable",
+      "tier": "L1",
+      "title": "代码工具的语言错配要在起进程前拦下，并给出正确写法",
+      "shape": "模型用代码工具在服务端聚合（明细不进上下文）",
+      "inject": ["language 选了其中一种，代码却写成另一种的语法（顶层 await / console.log / print / def）"],
+      "expectedBehavior": [
+        "起子进程前拦下，不产生原始解释器报错",
+        "提示指明语言错配并给出该语言的正确调用写法"
+      ],
+      "assertions": [
+        "两种方向都能识别",
+        "语言与写法一致时一律放行（字符串字面量里的关键字不误伤）",
+        "不支持的语言仍由原有分支报错"
+      ],
+      "regression": "2026-10-15 实测每轮因此白费 4~11 次调用",
+      "boundTests": [
+        { "file": "tests/tool-code-language.test.ts", "test": "[A] python 里写 JS 写法 → 拦下并指出正确 API" },
+        { "file": "tests/tool-code-language.test.ts", "test": "[C] 不误伤：语言与写法一致时一律放行" }
+      ]
+    }
+  ]
+}

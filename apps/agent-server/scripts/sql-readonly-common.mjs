@@ -23,6 +23,25 @@ const DENY_KEYWORDS = [
 // 危险构造：首词是 select 也要拒（写文件 / 读文件 / 改库配置）。
 const DENY_PATTERNS = [/into\s+(out|dump)file/, /load_file\s*\(/, /pg_read_file\s*\(/, /writable_schema/];
 
+// 表值函数（table-valued function）：能**越出数据库边界**的，一律拒。
+//
+// 为什么必须单列：这些函数的首词是 select、也不含任何写操作关键字，纯靠首词白名单 +
+// 关键字黑名单**全部放行**——但它们的能力并不小：
+//   · url() / urlCluster() / remote() / remoteSecure() —— 任意 HTTP/TCP 出网。
+//     `SELECT * FROM url('http://169.254.169.254/…')` 就是经典 SSRF，可读云元数据凭据，
+//     也可探测内网服务。对"把 SQL 暴露给模型"的通道这是最高危的一类漏洞。
+//   · file() / hdfs() / s3() —— 读服务器本地文件或对象存储（.env、密钥、配置都在射程内）。
+//   · mysql() / postgresql() / mongodb() / redis() / odbc() / jdbc() —— 可连任意其它数据源，
+//     相当于绕过本库账号权限边界去读别处。
+//   · executable() —— 旧版本可执行命令。
+// 这些不是"写操作"，所以只读闸门原本完全看不见它们；但它们**同样突破只读边界的意图**
+// （只允许读本库数据）。fail-closed 一律拒，不做"看起来像读就放行"的判断。
+//
+// 刻意**不**拒的：`values()` / `numbers()` / `input()` —— 它们只产生内联数据，不越界。
+const DENY_TABLE_FUNCTIONS =
+  "url|urlCluster|remote|remoteSecure|file|hdfs|s3|mysql|postgresql|mongodb|redis|odbc|jdbc|executable";
+const DENY_TABLE_FN_RE = new RegExp(`\\b(${DENY_TABLE_FUNCTIONS})\\s*\\(`, "i");
+
 const DENY_RE = new RegExp("\\b(" + DENY_KEYWORDS.join("|") + ")\\b");
 
 /** 去注释：注释里的关键字不参与判定（避免 `-- drop table` 之类被误杀）。 */
@@ -45,5 +64,8 @@ export function isReadOnlySql(raw) {
   if (parts.length !== 1) return false; // 多语句一律拒绝（无正当用途）
   const lower = parts[0].toLowerCase();
   const first = lower.match(/^[a-z]+/)?.[0] || "";
-  return LEADING_KEYWORDS.includes(first) && !DENY_RE.test(lower) && !DENY_PATTERNS.some((re) => re.test(lower));
+  return LEADING_KEYWORDS.includes(first) && !DENY_RE.test(lower) && !DENY_PATTERNS.some((re) => re.test(lower)) && !DENY_TABLE_FN_RE.test(parts[0]);
 }
+
+/** 供测试与文档引用：当前被拒的表值函数清单。 */
+export const READONLY_DENIED_TABLE_FUNCTIONS = DENY_TABLE_FUNCTIONS.split("|");

@@ -9,6 +9,8 @@
 //     模型就只能靠字段名猜语义（把真实存在的取值当成脏数据）。取证能力是取数正确性的前提。
 import "dotenv/config";
 import { resolveMetabaseKey } from "./metabase-key.mjs";
+import { DETAIL_HINT, detailMode, projectRows } from "./metabase-concise.mjs";
+import { LatencyWindow, deriveAdaptiveTimeoutMs } from "./adaptive-timeout.mjs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -20,15 +22,38 @@ const BASE = (process.env.BI_BASE_URL || "").replace(/\/+$/, "");
 const { key: KEY, blocked: KEY_BLOCKED } = resolveMetabaseKey(process.env);
 
 /**
- * 单次请求超时（默认 30s，可配 BI_TIMEOUT_MS；BI 查询 legitimately 慢时用 env 调大）。
+ * 单次请求超时（默认 60s，可配 BI_TIMEOUT_MS；BI 查询 legitimately 慢时用 env 调大）。
  * 最佳实践：外部调用必须有界——否则一个挂住的查询会占住整个 stdio 连接，
  * 表现为「模型卡住不动」且没有任何可诊断信息。超时后 fail-closed 并返回可操作提示。
  * **局限**：客户端 abort 只是「不再等」，数据库上的那条 SQL 仍在跑；要真正掐断需在 DB 层设
  * statement_timeout。所以这条防的是「agent 会话被拖死」，不是「数据库被拖死」。
+ *
+ * 第 6 批（对标 AWS「超时值按误超时率反推」）：固定值对多维聚合必然误超时（实测 30002ms 被打断），
+ * 但把默认值拍大又会让挂死的查询拖更久。取中：按**实测成功延迟的 p95 × 2** 自适应派生，
+ * 保底 = 配置值、封顶 = `BI_TIMEOUT_MAX_MS`。样本只收成功的查询（超时的真实耗时未知，
+ * 收进来会污染分布）；冷启动无样本时按配置值走。派生逻辑在 metabase-query-timeout.mjs（纯函数可测）。
  */
-const TIMEOUT_MS = Number(process.env.BI_TIMEOUT_MS || 30_000);
+const TIMEOUT_MS = Number(process.env.BI_TIMEOUT_MS || 60_000);
+const TIMEOUT_MAX_MS = Math.max(TIMEOUT_MS, Number(process.env.BI_TIMEOUT_MAX_MS || 120_000));
+const queryLatency = new LatencyWindow(Number(process.env.BI_LATENCY_WINDOW || 50));
+let effectiveTimeoutMs = TIMEOUT_MS;
+/** 当前生效的超时阈值；派生值变化时打一行日志——「为什么这次等了 60s」必须可解释。 */
+function currentTimeoutMs() {
+  const next = deriveAdaptiveTimeoutMs({
+    configuredMs: TIMEOUT_MS,
+    samples: queryLatency.snapshot(),
+    maxMs: TIMEOUT_MAX_MS,
+  });
+  if (next !== effectiveTimeoutMs) {
+    console.error(
+      `[bi-metabase] 超时阈值自适应：${effectiveTimeoutMs}ms → ${next}ms（近期成功 p95 派生，样本 ${queryLatency.size} 条）`,
+    );
+    effectiveTimeoutMs = next;
+  }
+  return next;
+}
 
-async function mb(path, { method = "GET", body } = {}) {
+async function mb(path, { method = "GET", body, query = false } = {}) {
   if (KEY_BLOCKED) {
     return {
       ok: false,
@@ -39,22 +64,41 @@ async function mb(path, { method = "GET", body } = {}) {
   if (!BASE || !KEY) {
     return { ok: false, status: 0, text: "未配置 BI_BASE_URL 或 BI_API_KEY（在 apps/agent-server/.env 填写）。" };
   }
+  const timeout = currentTimeoutMs();
+  const startedAt = Date.now();
   let res;
   try {
     res = await fetch(`${BASE}/api${path}`, {
       method,
       headers: { "Content-Type": "application/json", "X-API-Key": KEY },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeout),
     });
   } catch (err) {
     // 超时/网络错误统一塞进 data（字符串）：调用方原有 `[status] data` 的渲染无需改动即可显示人话。
+    //
+    // 文案口径（对标 Anthropic《Writing effective tools for agents》）：错误要**可操作**——
+    // 说清「这次没拿到数据」「能不能原样重试」「下一步按什么顺序改」，而不是只告诉运维去调哪个旋钮。
+    // 零业务词：只给通用取数动作，不出现任何具体库/表/字段/指标名。
     const aborted = err?.name === "TimeoutError" || err?.name === "AbortError";
     const text = aborted
-      ? `请求超时（${TIMEOUT_MS}ms；可用 BI_TIMEOUT_MS 调大，并确认服务器配置的 timeoutMs 不小于它）`
-      : `请求失败：${String(err?.message || err)}`;
+      ? [
+          `查询超时（${timeout}ms），本次没有拿到数据。原样重试不会更快——先改查询，再重试：`,
+          "① 缩小范围：更短的时间窗、或去掉一个维度，确认能跑通再逐段放大；",
+          "② 先量级后明细：只做分组计数（不取明细列）确认规模，再决定要不要取明细；",
+          "③ 增加过滤条件，减少要扫描的行数；",
+          "④ 先看服务端有没有已验证的现成查询（list_cards / get_card）能直接替代这次手写查询。",
+          "若这几步都试过仍超时，说明这个口径本身太重，应如实告诉用户「这个范围查不动，请缩小范围或分两次查」。",
+        ].join("\n")
+      : [
+          `请求失败：${String(err?.message || err)}`,
+          "本次没有拿到数据。可以换个更小的范围或更窄的过滤后重试；若反复失败，",
+          "先用 list_cards / get_card 看有没有现成的已验证查询，并在回答里如实说明这次取数没有成功。",
+        ].join("\n");
     return { ok: false, status: 0, text, data: text };
   }
+  // 成功延迟进样本（仅 query 类调用：元数据 GET 混进来会把 p95 稀释到失真的低值）。
+  if (query && res.ok) queryLatency.record(Date.now() - startedAt);
   const text = await res.text();
   let data;
   try {
@@ -82,6 +126,10 @@ function asList(data) {
 // 首词白名单 + 全文黑名单 + 危险构造（写文件 / 读文件 / 改库配置）。fail-closed：不明朗一律拒绝。
 // 局限：这是代码层约束；Key 一旦泄露、攻击者直连 Metabase API 即可绕过。真正的只读边界仍须 DB/账号层 GRANT SELECT。
 import { isReadOnlySql } from "./sql-readonly-common.mjs";
+// 静态体检（查表/聚合语句的效率实践）：与只读判定同一个「共享单源」思路——两侧共用一份，
+// 杜绝漂移。fail-open，只提示不拦（误杀合法探索语句比慢一点更糟）。
+import { lintSql, lintSummary } from "./sql-lint-common.mjs";
+import { buildColumnSearchSql } from "./metabase-column-search.mjs";
 
 // ---- 元数据映射：写查询之前的「取证」基础 ----
 
@@ -142,6 +190,94 @@ function renderCell(value) {
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
+// ---- 取数执行核心（run_native_query / execute_sql / query 共用，单一实现防漂移）----
+// 只读硬校验 + 多语句拦截 + 执行渲染集中在此；任何「执行 SQL」的入口都必须经它，
+// 不允许再各自内联一份（那正是 src/sql-readonly-common.mjs 注释里警示的漂移来源）。
+// 口径护栏：拦截已知会产出错误业务结论的取数方式。弱模型会无视 skill 里的软性提示，
+// 故此处做硬拒绝（与只读校验同一失败通道，fail-closed），逼模型改用正确口径，
+// 而不是替它改写 SQL（改写等于猜口径，且会掩盖模型的能力缺口）。
+function checkCaliber(sql) {
+  // ① 国家维度：禁止用 IP/网络代理列，必须用 elt_user_full.countryCode
+  if (/\bipcountrycode\b/i.test(sql) || /\bnetworkcountryiso\b/i.test(sql)) {
+    return {
+      ok: false,
+      error:
+        "口径错误：国家维度不能用 ipCountryCode / networkCountryIso 这类代理列（来自 elt_app_params 关联，匹配稀疏、语义是「登录 IP 所在国」而非「账号所属国」）。" +
+        "请改用 elt_user_full.countryCode（数值口径：91=印度、55=巴西），无需 JOIN elt_app_params，直接按该列分组即可。",
+    };
+  }
+  // ② 会员存量：禁止用 elt_user_full_history.vipExpireDay>0 的设备级快照替代会员表
+  if (/\belt_user_full_history\b/i.test(sql) && /\bvipexpireday\b/i.test(sql)) {
+    return {
+      ok: false,
+      error:
+        "口径错误：会员存量不能用 elt_user_full_history.vipExpireDay>0 的设备级快照（会漏算/多算、且无去重账号语义，趋势必然失真）。" +
+        "请改用 elt_user_vip_info 的「去重账号」口径：vipType=2 且 startDate<=统计日 且 endDate>=统计日，uniqExact(uid) 得当日有效会员数；按日存量需逐日扫描该表。",
+    };
+  }
+  return { ok: true };
+}
+
+function assertSql(input) {
+  const sql = String(input ?? "").trim().replace(/;+\s*$/, "");
+  if (!sql) return { ok: false, error: "SQL 为空。" };
+  // 多语句判定只看「引号外 / 注释外」的分号，与 src/sql-readonly.ts 口径对齐，避免误杀合法单条查询。
+  const bare = sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n\r]*/g, " ")
+    .replace(/'[^']*'/g, "''")
+    .replace(/"[^"]*"/g, '""')
+    .replace(/`[^`]*`/g, "``");
+  if (bare.includes(";")) return { ok: false, error: "不接受多语句：一次只能执行一条 SQL。" };
+  if (!isReadOnlySql(sql)) {
+    return { ok: false, error: "只接受只读查询（SELECT / WITH / SHOW / EXPLAIN 等），写操作（INSERT/UPDATE/DELETE/DROP/…）被拒绝。" };
+  }
+  const caliber = checkCaliber(sql);
+  if (!caliber.ok) return { ok: false, error: caliber.error };
+  return { ok: true, sql };
+}
+
+async function runSql(database_id, sql, limit = 200) {
+  const check = assertSql(sql);
+  if (!check.ok) return json(check.error, true);
+  const r = await mb("/dataset", {
+    method: "POST",
+    body: { database: database_id, type: "native", native: { query: check.sql } },
+    query: true, // 成功耗时进自适应超时样本池（第 6 批）
+  });
+  if (!r.ok) {
+    const upstream = typeof r.data === "string" ? r.data : JSON.stringify(r.data);
+    return json(
+      [
+        `[${r.status}] 查询被上游拒绝：${upstream}`,
+        "本次没有拿到数据。按这个顺序改：",
+        "① 对照报错里的字段/表名，用 get_database_schema 复核真实结构（别猜列名）；",
+        "② 去掉可疑的函数/聚合，换成基础列先跑通，再逐个加回来；",
+        "③ 加上明确的过滤条件缩小扫描范围。",
+        "同一句原样重试不会成功；改不动就在回答里如实说明这个口径查不出来。",
+      ].join("\n"),
+      true,
+    );
+  }
+  const payload = r.data?.data;
+  if (!payload || !Array.isArray(payload.cols)) {
+    const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
+    return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或缩小查询范围。`, true);
+  }
+  const cols = payload.cols.map((c) => c.display_name || c.name);
+  const allRows = Array.isArray(payload.rows) ? payload.rows : [];
+  const truncated = allRows.length > limit;
+  const rows = allRows.slice(0, limit);
+  const lines = [cols.join("\t")];
+  for (const row of rows) lines.push(row.map(renderCell).join("\t")); // NULL 与空串区分渲染：都是真实取值
+  if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
+  const echo = `-- 实际执行的 SQL（仅供核对口径，不要重复执行）：\n${check.sql}`;
+  // 静态体检结论回灌（fail-open：照常执行，但把"可以怎么改"一并给模型，让它下次写对）。
+  // 不静默改写 SQL——改写等于替模型猜口径；只提示。
+  const lint = lintSummary(lintSql(check.sql));
+  return json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}`);
+}
+
 /**
  * 只读工具名单：用于声明 MCP 标准注解 readOnlyHint（服务端风险判定第 4 条据此免确认）。
  * 例外 `run_native_query` **不在名单里**——它执行任意 SQL，效果取决于传入的 SQL 文本，
@@ -152,21 +288,31 @@ const READ_ONLY_TOOLS = new Set([
   "list_databases",
   "get_database_schema",
   "get_field_values",
+  "search_columns", // 跨库列级检索（查 system.columns 系统目录，只读）
   "list_cards",
   "list_dashboards",
   "get_dashboard",
   "get_card",
   "search",
+  "execute_query", // 执行已保存卡片（只读结果）
+  "construct_query", // 仅构造/校验查询，不执行
+  "read_resource", // 仅读取资产元数据
 ]);
+// 说明：execute_sql / query 也走只读闸门（runSql），但它们执行「任意 SQL」，
+// 与 run_native_query 同理不在此名单——是否放行由服务端风险策略（toolRisks / 未知兜底）决定，
+// 工具自述不替服务端做放行决策（见上方注释「声明事实而非放行」）。
 // 只读工具天然幂等（`idempotentHint`，MCP 注解）：供客户端/网关判断失败后能否安全重试。
 const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true };
 
 const TOOLS = [
   {
     name: "list_databases",
-    description: "列出 Metabase 已连接的所有数据库（id / name / engine）。",
-    inputSchema: { type: "object", properties: {} },
-    async run() {
+    description: `列出 Metabase 已连接的所有数据库（id / name / engine）。${DETAIL_HINT}`,
+    inputSchema: {
+      type: "object",
+      properties: { detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT } },
+    },
+    async run({ detail } = {}) {
       const r = await mb("/database");
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
       const rows = asList(r.data).map((d) => ({
@@ -176,14 +322,21 @@ const TOOLS = [
         timezone: d.timezone,
         ...(d.is_sample === true ? { sample: true } : {}),
       }));
-      return json(rows);
+      // concise：id/name/engine 就够定位；detailed 才带时区与样本标记。
+      const p = projectRows(rows, { detail, keys: ["id", "name", "engine"], cap: 50 });
+      return json({
+        databases: p.rows,
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.mode === "concise" ? { detail: "concise" } : {}),
+      });
     },
   },
   {
     name: "get_database_schema",
     description:
       "查看数据库的表结构。默认只返回表清单（可用 search 过滤表名，带表描述）；指定 table 时返回该表的字段" +
-      "（name / type / 描述 / 语义类型 / 外键指向 / 去重值个数）。写查询前用它确认表名、字段名与字段语义，不要凭字段名猜。",
+      "（name / type / 描述 / 语义类型 / 外键指向 / 去重值个数）。写查询前用它确认表名、字段名与字段语义，不要凭字段名猜。" +
+      DETAIL_HINT,
     inputSchema: {
       type: "object",
       properties: {
@@ -191,10 +344,11 @@ const TOOLS = [
         table: { type: "string", description: "表名（精确匹配，可写 schema.table）；给了就返回该表字段" },
         search: { type: "string", description: "按表名子串过滤（不区分大小写），仅在未指定 table 时生效" },
         include_fields: { type: "boolean", description: "表清单里是否附带字段名预览（默认 false；表多时不要开）" },
+        detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
       },
       required: ["database_id"],
     },
-    async run({ database_id, table, search, include_fields }) {
+    async run({ database_id, table, search, include_fields, detail }) {
       const wantFields = Boolean(table) || include_fields === true;
       // skip_fields 是官方参数：只取表清单时用它，避免一次拉回所有表的所有字段。
       const r = await mb(`/database/${database_id}/metadata${wantFields ? "" : "?skip_fields=true"}`);
@@ -219,23 +373,31 @@ const TOOLS = [
         }
         // 字段索引在整库范围内建：外键指向可能落在别的表上，必须跨表解析。
         const fieldIndex = buildFieldIndex(tables);
+        // concise：字段按上限截断（name/type 是认路的最小集，描述/语义/外键/指纹仍保留——那是「别猜语义」的证据）；
+        // detailed：不截断（调用方显式要全量）。
+        const p = projectRows((hit.fields || []).map((f) => mapField(f, fieldIndex)), {
+          detail,
+          cap: 60,
+          hint: "可用 search 过滤别的表，或对关注字段单独用 get_field_values 看取值",
+        });
         return json({
           table: hit.name,
           schema: hit.schema,
           ...(hit.description ? { description: clipText(hit.description, 400) } : {}),
           fieldCount: (hit.fields || []).length,
-          fields: (hit.fields || []).map((f) => mapField(f, fieldIndex)),
+          fields: p.rows,
+          ...(p.note ? { note: p.note } : {}),
         });
       }
       const matched = search
         ? tables.filter((t) => String(t.name || "").toLowerCase().includes(String(search).toLowerCase()))
         : tables;
       // 带字段时单表体积大得多，条数上限收紧，避免一次输出过大被截断。
+      // concise 用收紧上限；detailed 放宽（显式要全量时就该给全量）。
       const cap = include_fields === true ? 20 : 80;
-      return json({
-        totalTables: tables.length,
-        matched: matched.length,
-        tables: matched.slice(0, cap).map((t) => ({
+      const effectiveCap = detailMode(detail) === "detailed" ? cap * 3 : cap;
+      const p = projectRows(
+        matched.map((t) => ({
           table: t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name,
           ...(t.description ? { description: clipText(t.description, 160) } : {}),
           // 只有真的取回了字段时才报数量与名字（skip_fields 模式下字段为空数组，报 0 会误导）。
@@ -248,7 +410,13 @@ const TOOLS = [
               }
             : {}),
         })),
-        ...(matched.length > cap ? { note: `仅列出前 ${cap} 张，可用 search 过滤或用 table 精确查看某张表` } : {}),
+        { detail, cap: effectiveCap, hint: "可用 search 过滤表名，或用 table 参数精确查看某张表" },
+      );
+      return json({
+        totalTables: tables.length,
+        matched: matched.length,
+        tables: p.rows,
+        ...(p.note ? { note: p.note } : {}),
         // 表名清单不是指标清单。模型看到 54 张业务表就宣布「没有净利润」时，跳过了已保存提问。
         ...(include_fields === true
           ? {}
@@ -260,10 +428,36 @@ const TOOLS = [
     },
   },
   {
+    name: "search_columns",
+    description:
+      "跨库列级检索：按列名/注释子串，一次扫出整个集群里所有数据库、所有表中匹配的列" +
+      "（database / table / name / type / comment），用于定位跨表关联列。" +
+      "归因/关联类问题常需把分布在不同表里的关联列拼出来：先用本工具找到候选列，" +
+      "再写 JOIN/聚合 SQL 取数，而不是凭表名猜。" +
+      "查的是后端系统目录（system.columns），任意 database_id 连接都看得到全集群列，不需要逐库翻 schema。" +
+      "在写跨表 JOIN / 聚合之前先用它定位关联列，而不是凭一张表的字段名猜别的表也有同名列。" +
+      "pattern 是列名或注释的子串（不区分大小写），不要带通配符。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "number", description: "任一数据库 id（来自 list_databases）；系统目录跨整个集群可见" },
+        pattern: { type: "string", description: "要找的列名/注释子串，如 reason、status、user_id、amount" },
+        limit: { type: "number", description: "返回上限（默认 200，最大 1000）" },
+      },
+      required: ["database_id", "pattern"],
+    },
+    async run({ database_id, pattern, limit }) {
+      const built = buildColumnSearchSql(pattern, { limit });
+      if (!built.ok) return json(built.error, true);
+      return runSql(database_id, built.sql, Number(limit) > 0 ? Number(limit) : 200);
+    },
+  },
+  {
     name: "get_field_values",
     description:
       "查看某字段的取值分布（去重值 + 出现次数）。写过滤 / 分组条件之前先用它确认合法取值与空值语义：" +
-      "取值里若存在空串或某个默认值，说明它是真实存在的取值，不能当成脏数据顺手排除。",
+      "取值里若存在空串或某个默认值，说明它是真实存在的取值，不能当成脏数据顺手排除。" +
+      DETAIL_HINT,
     inputSchema: {
       type: "object",
       properties: {
@@ -277,10 +471,11 @@ const TOOLS = [
             "取样行数上限：传了就走「带出现次数」的统计路径，默认 200000 行（大表全表分组会超时，所以只扫前 N 行），" +
             "传 0 = 全表精确统计（可能很慢）。不传则优先用实例缓存的取值列表（最快，但不含出现次数）",
         },
+        detail: { type: "string", enum: ["concise", "detailed"], description: `${DETAIL_HINT}（detailed 才带出现次数与执行的 SQL）` },
       },
       required: ["database_id", "table", "field"],
     },
-    async run({ database_id, table, field, limit = 50, sample }) {
+    async run({ database_id, table, field, limit = 50, sample, detail }) {
       // 标识符白名单校验：表名 / 字段名会拼进兜底 SQL，只放行安全字符（含 schema.table 形式）。
       const ident = (v) => /^[A-Za-z0-9_$]+$/.test(String(v ?? "").trim());
       const parts = String(table ?? "").trim().split(".");
@@ -341,6 +536,7 @@ const TOOLS = [
       const res = await mb("/dataset", {
         method: "POST",
         body: { database: database_id, type: "native", native: { query: sql } },
+        query: true,
       });
       const payload = res.data?.data;
       if (!res.ok || !payload || !Array.isArray(payload.cols)) {
@@ -361,14 +557,20 @@ const TOOLS = [
         ...(hasEmpty ? ["取值里包含 NULL 或空串——它们是真实存在的取值，排除之前先确认业务含义。"] : []),
         ...(scan > 0 ? [`计数基于最多 ${scan} 行取样（要全表精确统计请传 sample=0，大表可能很慢）。`] : []),
       ];
+      // concise：只要取值本身（写过滤条件够用），出现次数/SQL/取样说明进 detailed——
+      // 这个工具在事故里被单轮反复调，全量回灌是上下文膨胀的直接来源。
+      const detailed = detailMode(detail) === "detailed";
+      const p = detailed
+        ? { rows: values, note: "" }
+        : projectRows(values, { detail, keys: ["value"], cap, hint: "出现次数与执行的 SQL 请传 detail=detailed" });
       return json({
         ...hints,
         source: "group-by",
-        sql,
+        ...(detailed ? { sql } : {}),
         ...(scan > 0 ? { approximate: true, scanLimit: scan } : { exact: true }),
-        values,
+        values: p.rows,
         ...(notes.length ? { note: notes.join(" ") } : {}),
-        ...(rows.length >= cap ? { truncated: `只取出现次数最多的 ${cap} 个取值，可能还有更多` } : {}),
+        ...(p.note ? { truncated: p.note } : {}),
       });
     },
   },
@@ -385,72 +587,33 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        database_id: { type: "number", description: "数据库 id（来自 list_databases）" },
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）。本实例分析数仓为 METABASE_DATABASE_ID（默认 2），业务查询都用它；缺省或填 1（Metabase 自带样例库）会自动落到数仓。" },
         query: { type: "string", description: "原生 SQL 语句" },
         limit: { type: "number", description: "返回行数上限（默认 200）" },
       },
       required: ["database_id", "query"],
     },
     async run({ database_id, query, limit = 200 }) {
-      // 单语句约束（数据源侧的纵深防御）：多语句一律拒绝，不执行。
-      // 单条语句是读是写由服务端风险闸门判定（src/risk.ts 用 src/sql-readonly.ts 判定后决定是否弹确认卡），
-      // 这里只额外堵住「一次塞多条」这个没有正当用途的口子。
-      const sql = String(query ?? "").trim().replace(/;+\s*$/, "");
-      if (!sql) return json("SQL 为空。", true);
-      // 多语句判定只看「引号外 / 注释外」的分号：字符串/标识符里的分号（如 WHERE note='a;b'）
-      // 不算多语句。与 src/sql-readonly.ts 的判定口径对齐，避免误杀合法单条查询。
-      const bare = sql
-        .replace(/\/\*[\s\S]*?\*\//g, " ")
-        .replace(/--[^\n\r]*/g, " ")
-        .replace(/'[^']*'/g, "''")
-        .replace(/"[^"]*"/g, '""')
-        .replace(/`[^`]*`/g, "``");
-      if (bare.includes(";")) return json("不接受多语句：一次只能执行一条 SQL。", true);
-
-      // 只读硬校验（纵深防御）：只转发 SELECT/WITH/SHOW/EXPLAIN 等只读查询；写操作在这里就被拦下，
-      // 不依赖服务端确认闸门——哪怕持有管理员 Key，也无法经本工具改库。
-      if (!isReadOnlySql(sql)) {
-        return json("只接受只读查询（SELECT / WITH / SHOW / EXPLAIN 等），写操作（INSERT/UPDATE/DELETE/DROP/…）被拒绝。", true);
-      }
-
-      const r = await mb("/dataset", {
-        method: "POST",
-        body: { database: database_id, type: "native", native: { query: sql } },
-      });
-      if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
-      const payload = r.data?.data;
-      if (!payload || !Array.isArray(payload.cols)) {
-        // 异步查询：可能先返回 status=running（HTTP 202），此时没有 cols/rows。
-        const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
-        return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或缩小查询范围。`, true);
-      }
-      const cols = payload.cols.map((c) => c.display_name || c.name);
-      const allRows = Array.isArray(payload.rows) ? payload.rows : [];
-      const truncated = allRows.length > limit;
-      const rows = allRows.slice(0, limit);
-      const lines = [cols.join("\t")];
-      for (const row of rows) {
-        // NULL 与空串区分渲染（同 renderCell）：两者都是真实取值，不要混成「空」。
-        lines.push(row.map(renderCell).join("\t"));
-      }
-      if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
-      // G17 结果合理性展示：回显实际执行的 SQL，便于核对口径（join 路径 / 过滤条件是否漏）。
-      // 提示注入防护在 chat.ts 层仍会把整段包进 untrusted 定界；这里回显的是模型自己提交的 SQL，无新增不可信面。
-      const echo = `-- 实际执行的 SQL（仅供核对口径，不要重复执行）：\n${sql}`;
-      return json(`${echo}\n\n${lines.join("\n")}`);
+      // 本实例分析数仓在 METABASE_DATABASE_ID；模型偶尔误填 Metabase 自带样例库(=1)或漏填。
+      // 没填或填成样例库(=1) 时落到数仓，避免「跑错库被只读闸门拒绝」。
+      const wid = Number(process.env.METABASE_DATABASE_ID || 2);
+      if (!database_id || database_id === 1) database_id = wid;
+      // 复用统一取数核心（runSql）：只读校验 / 多语句拦截 / 执行渲染单一实现，避免与 execute_sql / query 漂移。
+      return runSql(database_id, query, limit);
     },
   },
   {
     name: "list_cards",
-    description: "列出 Metabase 已保存的提问（Questions / 卡片）：id / name / 数据库 / 集合。可用 search 过滤名称。",
+    description: `列出 Metabase 已保存的提问（Questions / 卡片）：id / name / 数据库 / 集合。可用 search 过滤名称。${DETAIL_HINT}`,
     inputSchema: {
       type: "object",
       properties: {
         search: { type: "string", description: "按名称子串过滤（不区分大小写）" },
         limit: { type: "number", description: "最多返回条数（默认 50）" },
+        detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
       },
     },
-    async run({ search, limit = 50 } = {}) {
+    async run({ search, limit = 50, detail } = {}) {
       const r = await mb("/card");
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
       let rows = asList(r.data).map((c) => ({
@@ -464,17 +627,27 @@ const TOOLS = [
         const needle = String(search).toLowerCase();
         rows = rows.filter((x) => String(x.name || "").toLowerCase().includes(needle));
       }
-      return json({ total: rows.length, cards: rows.slice(0, limit) });
+      // concise：id/name 就够定位（定位到再用 get_card 看明细）；detailed 才带数据库/集合/查询类型。
+      const p = projectRows(rows, {
+        detail,
+        keys: ["id", "name"],
+        cap: Math.max(1, Number(limit) || 50),
+        hint: "数据库 / 集合 / 查询类型请传 detail=detailed，或对某个 id 用 get_card 看明细",
+      });
+      return json({ total: p.total, cards: p.rows, ...(p.note ? { note: p.note } : {}) });
     },
   },
   {
     name: "list_dashboards",
-    description: "列出 Metabase 仪表盘（Dashboards）：id / name / 集合。可用 search 过滤名称。",
+    description: `列出 Metabase 仪表盘（Dashboards）：id / name / 集合。可用 search 过滤名称。${DETAIL_HINT}`,
     inputSchema: {
       type: "object",
-      properties: { search: { type: "string", description: "按名称子串过滤（不区分大小写）" } },
+      properties: {
+        search: { type: "string", description: "按名称子串过滤（不区分大小写）" },
+        detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
+      },
     },
-    async run({ search } = {}) {
+    async run({ search, detail } = {}) {
       // 注：官方 OpenAPI 把 GET /api/dashboard 标为 deprecated，但当前版本仍可用且返回裸数组。
       const r = await mb("/dashboard");
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
@@ -487,18 +660,22 @@ const TOOLS = [
         const needle = String(search).toLowerCase();
         rows = rows.filter((x) => String(x.name || "").toLowerCase().includes(needle));
       }
-      return json(rows);
+      const p = projectRows(rows, { detail, keys: ["id", "name"], cap: 50, hint: "所属集合请传 detail=detailed" });
+      return json({ total: p.total, dashboards: p.rows, ...(p.note ? { note: p.note } : {}) });
     },
   },
   {
     name: "get_dashboard",
-    description: "获取某个仪表盘详情（标题、包含的卡片 id/名称/可视化类型）。",
+    description: `获取某个仪表盘详情（标题、包含的卡片 id/名称/可视化类型）。${DETAIL_HINT}`,
     inputSchema: {
       type: "object",
-      properties: { dashboard_id: { type: "number", description: "仪表盘 id（来自 list_dashboards）" } },
+      properties: {
+        dashboard_id: { type: "number", description: "仪表盘 id（来自 list_dashboards）" },
+        detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
+      },
       required: ["dashboard_id"],
     },
-    async run({ dashboard_id }) {
+    async run({ dashboard_id, detail }) {
       const r = await mb(`/dashboard/${dashboard_id}`);
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
       // 卡片数组字段：v0.5x+ 用 dashcards（ordered_cards 已被移除，仅老版本存在）。
@@ -513,24 +690,53 @@ const TOOLS = [
         visualization: dc.card?.display ?? null,
         ...(dc.dashboard_tab_id ? { tab: dc.dashboard_tab_id } : {}),
       }));
-      return json({ id: r.data.id, name: r.data.name, tabs: (r.data.tabs || []).length, cards });
+      // concise：card_id/name（够定位去 get_card）；detailed 才带可视化类型与分页 tab。
+      const p = projectRows(cards, { detail, keys: ["card_id", "name"], cap: 40, hint: "可视化类型请传 detail=detailed" });
+      return json({
+        id: r.data.id,
+        name: r.data.name,
+        tabs: (r.data.tabs || []).length,
+        cards: p.rows,
+        ...(p.note ? { note: p.note } : {}),
+      });
     },
   },
   {
     name: "get_card",
     description:
-      "获取某个已保存提问（卡片）的详情，并尽量给出其**原生 SQL**（MBQL 卡片由服务端编译成 SQL）；编译失败时才退回原始查询定义。",
+      "获取某个已保存提问（卡片）的详情，并尽量给出其**原生 SQL**（MBQL 卡片由服务端编译成 SQL）；编译失败时才退回原始查询定义。" +
+      DETAIL_HINT +
+      "（SQL 只在 detailed 模式返回——它通常是本工具最占体积的一段，认路阶段不需要它。）",
     inputSchema: {
       type: "object",
-      properties: { card_id: { type: "number", description: "卡片 id（来自 list_cards / search）" } },
+      properties: {
+        card_id: { type: "number", description: "卡片 id（来自 list_cards / search）" },
+        detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
+      },
       required: ["card_id"],
     },
-    async run({ card_id }) {
+    async run({ card_id, detail }) {
       // legacy-mbql=true：把 dataset_query 统一成 {database,type,query}，便于编译成 SQL。
       const legacy = await mb(`/card/${card_id}?legacy-mbql=true`);
       const card = legacy.ok ? legacy.data : (await mb(`/card/${card_id}`)).data;
       if (!card) return json(`[${legacy.status}] ${JSON.stringify(legacy.data)}`, true);
       const dq = card.dataset_query || {};
+      // concise：只回元信息，不编译也不回 SQL——「这卡片存在、在哪个库、大概怎么查」已经够认路。
+      if (detailMode(detail) !== "detailed") {
+        const p = projectRows(
+          [
+            {
+              id: card.id,
+              name: card.name,
+              database: card.database_id,
+              display: card.display,
+              queryType: dq.type ?? card.query_type,
+            },
+          ],
+          { detail, cap: 1, hint: "" },
+        );
+        return json({ ...p.rows[0], hint: "要看它的原生 SQL / 完整定义请传 detail=detailed" });
+      }
       let sql = null;
       if (typeof dq.native?.query === "string") {
         sql = dq.native.query; // 原生卡片
@@ -583,6 +789,241 @@ const TOOLS = [
         ...(x.table_name ? { table: x.table_name } : {}),
       }));
       return json({ total: r.data?.total ?? rows.length, results: rows.slice(0, limit) });
+    },
+  },
+  {
+    name: "execute_query",
+    description:
+      "执行一个已保存的 Metabase 提问（卡片）并返回结果行列。适合直接用 list_cards / search 找到的现成、已验证查询，避免重复写 SQL。" +
+      "取数阶梯里它是首选入口：已有现成提问时优先用它，不要自己重写 SQL。" +
+      "可带 parameters 传入卡片变量。只读：卡片本质是已存查询，执行不会改变数据。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question_id: { type: "number", description: "卡片 id（来自 list_cards / search）" },
+        parameters: {
+          type: "array",
+          items: { type: "object" },
+          description: "卡片参数（[{ type, target, value }]），无参数可不传",
+        },
+        limit: { type: "number", description: "返回行数上限（默认 200）" },
+      },
+      required: ["question_id"],
+    },
+    async run({ question_id, parameters, limit = 200 }) {
+      const body = { ignore_cache: false, ...(Array.isArray(parameters) ? { parameters } : {}) };
+      const r = await mb(`/card/${question_id}/query`, { method: "POST", body, query: true });
+      if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
+      const payload = r.data?.data;
+      if (!payload || !Array.isArray(payload.cols)) {
+        const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
+        return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或检查卡片。`, true);
+      }
+      const cols = payload.cols.map((c) => c.display_name || c.name);
+      const allRows = Array.isArray(payload.rows) ? payload.rows : [];
+      const truncated = allRows.length > limit;
+      const rows = allRows.slice(0, limit);
+      const lines = [cols.join("\t")];
+      for (const row of rows) lines.push(row.map(renderCell).join("\t"));
+      if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
+      return json(lines.join("\n"));
+    },
+  },
+  {
+    name: "execute_sql",
+    description:
+      "在指定数据库执行原生 SQL（仅只读，与 run_native_query 同一只读闸门：写操作被直接拒绝），返回行列文本。" +
+      "与 run_native_query 等价，作为高层取数入口的底层执行器；只在 construct_query 校验过、且没有现成提问（execute_query）时才用它。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）" },
+        query: { type: "string", description: "原生 SQL 语句" },
+        limit: { type: "number", description: "返回行数上限（默认 200）" },
+      },
+      required: ["database_id", "query"],
+    },
+    async run({ database_id, query, limit = 200 }) {
+      return runSql(database_id, query, limit);
+    },
+  },
+  {
+    name: "query",
+    description:
+      "高层取数入口：给定 question_id 就执行已保存提问，给定 database_id + sql 就执行原生 SQL（只读闸门同 run_native_query）。" +
+      "一个工具覆盖「现成查询」与「手写 SQL」两种取数方式，减少在多个工具间切换。有现成提问时优先走 execute_query；" +
+      "只在确定要手写 SQL、且不确定走卡片还是原生 SQL 时才用它。只读校验在该入口内部统一执行。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question_id: { type: "number", description: "执行已保存卡片（优先于 sql）" },
+        database_id: { type: "number", description: "执行原生 SQL 时的库 id" },
+        sql: { type: "string", description: "原生 SQL（与 question_id 二选一）" },
+        parameters: { type: "array", items: { type: "object" }, description: "卡片参数" },
+        limit: { type: "number", description: "返回行数上限（默认 200）" },
+      },
+    },
+    async run({ question_id, database_id, sql, parameters, limit = 200 }) {
+      if (question_id != null) {
+        const body = { ignore_cache: false, ...(Array.isArray(parameters) ? { parameters } : {}) };
+        const r = await mb(`/card/${question_id}/query`, { method: "POST", body, query: true });
+        if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
+        const payload = r.data?.data;
+        if (!payload || !Array.isArray(payload.cols)) {
+          const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
+          return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或检查卡片。`, true);
+        }
+        const cols = payload.cols.map((c) => c.display_name || c.name);
+        const allRows = Array.isArray(payload.rows) ? payload.rows : [];
+        const truncated = allRows.length > limit;
+        const rows = allRows.slice(0, limit);
+        const lines = [cols.join("\t")];
+        for (const row of rows) lines.push(row.map(renderCell).join("\t"));
+        if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
+        return json(lines.join("\n"));
+      }
+      if (database_id != null && sql != null) return runSql(database_id, sql, limit);
+      return json("请提供 question_id（执行已保存提问），或 database_id + sql（执行原生 SQL）。", true);
+    },
+  },
+  {
+    name: "construct_query",
+    description:
+      "构造/校验一个取数查询但**不执行**：传入 database_id + sql 会校验其为只读并返回可直接交给 execute_sql / run_native_query 的原生查询对象；" +
+      "传入 question_id 则返回该已保存提问的查询定义（MBQL 或原生）。用于「先确认口径再执行」，减少试错往返。写新 SQL 时先过这一步校验，再交给 execute_sql 执行。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "number", description: "库 id（与 sql 配合）" },
+        sql: { type: "string", description: "原生 SQL（与 question_id 二选一）" },
+        question_id: { type: "number", description: "已保存卡片 id（与 sql 二选一）" },
+      },
+    },
+    async run({ database_id, sql, question_id }) {
+      if (question_id != null) {
+        const legacy = await mb(`/card/${question_id}?legacy-mbql=true`);
+        const card = legacy.ok ? legacy.data : (await mb(`/card/${question_id}`)).data;
+        if (!card) return json(`[${legacy.status}] ${JSON.stringify(legacy.data)}`, true);
+        return json({
+          id: card.id,
+          name: card.name,
+          database: card.database_id,
+          queryType: card.query_type ?? card.dataset_query?.type,
+          dataset_query: card.dataset_query,
+          note: "这是该提问的查询定义（未执行）。要取数请用 execute_query / query 传入同一 question_id。",
+        });
+      }
+      if (sql != null) {
+        const check = assertSql(sql);
+        if (!check.ok) return json(check.error, true);
+        // 校验阶段就把体检结论给出来：这是「执行前确认口径」的关键一环，
+        // 模型在这里看到问题比自己执行后才发现要便宜得多。
+        const lint = lintSummary(lintSql(check.sql));
+        return json({
+          ok: true,
+          database: database_id,
+          type: "native",
+          native: { query: check.sql },
+          ...(lint ? { lint } : {}),
+          note: "已校验为只读，可直接交给 execute_sql / run_native_query 执行。",
+        });
+      }
+      return json("请提供 question_id 或 sql 之一。", true);
+    },
+  },
+  {
+    name: "read_resource",
+    description:
+      "按类型读取一个 Metabase 资源（card / dashboard / collection / database / table）的元数据，返回结构化信息。" +
+      "是 get_card / get_dashboard 的统一入口，并额外支持集合 / 库 / 表。写 SQL 前用它确认资产存在与结构，纯读取不改变数据。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: {
+          type: "string",
+          enum: ["card", "dashboard", "collection", "database", "table"],
+          description: "资源类型",
+        },
+        // 类型是 union：card/dashboard/collection/database 用数字 id，而 table 用的是表名。
+        // 声明成单一 number 会让模型照 schema 传数字 → 表查找必然落空（实测口径：表是按名字定位的）。
+        id: {
+          type: ["number", "string"],
+          description:
+            "card / dashboard / collection / database 传数字 id；table 传表名（可写 schema.table）。默认按 type 决定用哪一种。",
+        },
+        database_id: { type: "number", description: "仅 table 类型需要：所属库 id" },
+      },
+      required: ["type"],
+    },
+    async run({ type, id, database_id }) {
+      if (type === "card") {
+        const legacy = await mb(`/card/${id}?legacy-mbql=true`);
+        const card = legacy.ok ? legacy.data : (await mb(`/card/${id}`)).data;
+        if (!card) return json(`[${legacy.status}] 未找到卡片 ${id}`, true);
+        return json({
+          id: card.id,
+          name: card.name,
+          description: card.description,
+          database: card.database_id,
+          display: card.display,
+          collection: card.collection_id,
+          queryType: card.dataset_query?.type ?? card.query_type,
+          hint: "要看原生 SQL 或完整定义，改用 get_card detail=detailed 或 construct_query。",
+        });
+      }
+      if (type === "dashboard") {
+        const r = await mb(`/dashboard/${id}`);
+        if (!r.ok) return json(`[${r.status}] 未找到仪表盘 ${id}`, true);
+        const raw = Array.isArray(r.data?.dashcards)
+          ? r.data.dashcards
+          : Array.isArray(r.data?.ordered_cards)
+            ? r.data.ordered_cards
+            : [];
+        return json({
+          id: r.data.id,
+          name: r.data.name,
+          tabs: (r.data.tabs || []).length,
+          cards: raw.map((dc) => ({ card_id: dc.card?.id ?? dc.card_id ?? null, name: dc.card?.name ?? null })),
+        });
+      }
+      if (type === "collection") {
+        const r = await mb(`/collection/${id}`);
+        if (!r.ok) return json(`[${r.status}] 未找到集合 ${id}`, true);
+        return json({
+          id: r.data.id,
+          name: r.data.name,
+          description: r.data.description,
+          parent: r.data.parent_id ?? null,
+          itemCount: r.data.item_count ?? null,
+        });
+      }
+      if (type === "database") {
+        const r = await mb(`/database/${id}`);
+        if (!r.ok) return json(`[${r.status}] 未找到数据库 ${id}`, true);
+        return json({ id: r.data.id, name: r.data.name, engine: r.data.engine, timezone: r.data.timezone });
+      }
+      if (type === "table") {
+        if (database_id == null) return json("table 类型需要提供 database_id。", true);
+        const r = await mb(`/database/${database_id}/metadata?skip_fields=true`);
+        if (!r.ok) return json(`[${r.status}] 未找到库 ${database_id}`, true);
+        const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
+        const needle = String(id).trim().toLowerCase();
+        const hit = tables.find((t) => {
+          const bare = String(t.name || "").toLowerCase();
+          const qualified = `${t.schema ? `${t.schema}.` : ""}${t.name}`.toLowerCase();
+          return bare === needle || qualified === needle;
+        });
+        if (!hit) return json(`未找到表「${id}」。`, true);
+        const fieldIndex = buildFieldIndex(tables);
+        return json({
+          table: hit.name,
+          schema: hit.schema,
+          ...(hit.description ? { description: clipText(hit.description, 400) } : {}),
+          fieldCount: (hit.fields || []).length,
+          fields: (hit.fields || []).map((f) => mapField(f, fieldIndex)),
+        });
+      }
+      return json(`未知资源类型：${type}`, true);
     },
   },
 ];
