@@ -1305,6 +1305,9 @@ function blankState(): ConvState {
 
 const threadEl = ref<HTMLElement | null>(null);
 const models = ref<ModelInfo[]>([]);
+/** 模型列表是否已取回（含失败）：只有取回后才能判定对话存的 modelId 是否还有效，
+ *  避免列表还在 loading 时把有效 id 误判成失效。 */
+const modelsLoaded = ref(false);
 const conversations = ref<ConversationDto[]>([]);
 
 /**
@@ -1723,9 +1726,17 @@ watch(
   },
 );
 
-/** 当前对话的模型选择；空 = 自动模式（运行时挑可用模型），UI 兜底展示「自动」。 */
+/** 当前对话的模型选择；空 = 自动模式（运行时挑可用模型），UI 兜底展示「自动」。
+ *  对话里存的 id 已被挪出模型配置（失效 id）时同样回落「自动」：
+ *  失效 id 在任何列表里都查不到，UI 会退化成没有标签的「选择模型」空壳——
+ *  而它本身不承载任何信息，回落自动既有标签、发送时也会解析到可用模型。 */
 const modelId = computed({
-  get: () => current.value.settings.modelId || MODEL_AUTO_ID,
+  get: () => {
+    const stored = current.value.settings.modelId;
+    if (!stored) return MODEL_AUTO_ID;
+    if (modelsLoaded.value && !models.value.some((model) => model.id === stored)) return MODEL_AUTO_ID;
+    return stored;
+  },
   set: (value: string) => {
     void saveModelChoice(value);
   },
@@ -3515,6 +3526,8 @@ async function runTurn(
   state.error = "";
   // 新一轮从底部开始：用户可能正停在历史上方，Enter 发送必须回到最底（不受 240px 跟随阈值限制）。
   if (currentId.value === convId) queueScroll(true);
+  // 模型取自该对话自己的设置（后台出队时可能与当前展示的不同）。
+  // 失效 id 无需在此特殊处理：resolveModel 对查不到的 id 与 auto 走同一条回落链。
   const selected = state.settings.modelId || MODEL_AUTO_ID;
   // 自动模式把挑选权交给服务端：402 / 500 会当场换下一个还能用的模型，而不是先钉死一个再失败。
   const chosenModel = selected === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(selected);
@@ -4866,6 +4879,7 @@ onMounted(async () => {
   // 移动端抽屉：Esc 关闭（桌面端无抽屉、此监听无害）。
   window.addEventListener("keydown", onSidebarEsc);
   models.value = await fetchModels().catch(() => []);
+  modelsLoaded.value = true;
   // 不在这里写 modelId：它已按对话派生（空 = 自动模式，UI 兜底展示「自动」），
   // 赋值会触发一次无意义的 PATCH。
   // 不在这里 loadMcp()：此刻还没选中对话，请求会回退到服务端的 activeConversationId（可能是别的对话）。
@@ -6155,7 +6169,9 @@ provide(bubbleContextKey, {
                           >
                             <span class="tools-item__icon" :style="iconStyle(s.dir)" aria-hidden="true">{{ iconChar(s.name) }}</span>
                             <span class="tools-item__body">
-                              <span class="tools-item__name">{{ s.name }}</span>
+                              <span class="tools-item__name"
+                                ><span class="tools-item__label" :title="s.name">{{ s.name }}</span></span
+                              >
                               <span class="tools-item__desc" :title="s.description || ''">{{ s.description || tx("（无描述）", "(no description)", "(sem descrição)", "(कोई विवरण नहीं)") }}</span>
                             </span>
                             <svg v-if="taskDraft.skills.includes(s.dir)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6210,8 +6226,8 @@ provide(bubbleContextKey, {
                             >
                               <span class="tools-item__icon" :style="iconStyle(item.server.id)" aria-hidden="true">{{ iconChar(item.server.label) }}</span>
                               <span class="tools-item__body">
-                                <span class="tools-item__name">
-                                  {{ item.server.label }}
+                                <span class="tools-item__name"
+                                  ><span class="tools-item__label" :title="item.server.label">{{ item.server.label }}</span>
                                   <span class="mcp-status" :class="item.state.cls">
                                     <span class="mcp-dot" :class="item.state.cls"></span>
                                     {{ item.state.text }}
@@ -6290,7 +6306,9 @@ provide(bubbleContextKey, {
                           >
                             <span class="tools-item__icon" :style="iconStyle(AGENT_ID)" aria-hidden="true">{{ iconChar(AGENT_ID) }}</span>
                             <span class="tools-item__body">
-                              <span class="tools-item__name">{{ tx("跟随当前入口", "Follow this page", "Seguir esta página", "इस पेज के अनुसार") }}</span>
+                              <span class="tools-item__name"
+                                ><span class="tools-item__label">{{ tx("跟随当前入口", "Follow this page", "Seguir esta página", "इस पेज के अनुसार") }}</span></span
+                              >
                               <span class="tools-item__desc">{{ tx("用打开本页的角色运行任务", "Run the task as this page's agent", "Executar a tarefa como o agente desta página", "इस पेज के एजेंट के रूप में चलें") }}</span>
                             </span>
                             <svg v-if="!taskDraft.agentId" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6307,7 +6325,9 @@ provide(bubbleContextKey, {
                           >
                             <span class="tools-item__icon" :style="iconStyle(a.id)" aria-hidden="true">{{ a.icon }}</span>
                             <span class="tools-item__body">
-                              <span class="tools-item__name">{{ agentText(a.label, uiLocale) }}</span>
+                              <span class="tools-item__name"
+                                ><span class="tools-item__label" :title="agentText(a.label, uiLocale)">{{ agentText(a.label, uiLocale) }}</span></span
+                              >
                               <span class="tools-item__desc" :title="agentText(a.description, uiLocale)">{{ agentText(a.description, uiLocale) }}</span>
                             </span>
                             <svg v-if="taskDraft.agentId === a.id" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6850,7 +6870,9 @@ provide(bubbleContextKey, {
                     >
                       <span class="tools-item__icon" :style="iconStyle(s.dir)" aria-hidden="true">{{ iconChar(s.name) }}</span>
                       <span class="tools-item__body">
-                        <span class="tools-item__name">{{ s.name }}</span>
+                        <span class="tools-item__name"
+                          ><span class="tools-item__label" :title="s.name">{{ s.name }}</span></span
+                        >
                         <span class="tools-item__desc" :title="s.description || ''">{{ s.description || tx("（无描述）", "(no description)", "(sem descrição)", "(कोई विवरण नहीं)") }}</span>
                       </span>
                       <svg v-if="current.settings.skillsEnabled.includes(s.dir)" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6917,12 +6939,12 @@ provide(bubbleContextKey, {
                         <span class="tools-item__icon" :style="iconStyle(row.server.id)" aria-hidden="true">{{ iconChar(row.server.label) }}</span>
                         <span class="tools-item__body">
                           <span class="tools-item__name">
-                            {{ row.server.label }}
+                            <span class="tools-item__label" :title="row.server.label">{{ row.server.label }}</span>
                             <span v-if="row.bound" class="tools-item__pin">{{ tx("已启用", "On", "Ativo", "चालू") }}</span>
-                          </span>
-                          <span class="mcp-status" :class="row.state.cls">
-                            <span class="mcp-dot" :class="row.state.cls"></span>
-                            {{ row.state.text }}
+                            <span class="mcp-status" :class="row.state.cls">
+                              <span class="mcp-dot" :class="row.state.cls"></span>
+                              {{ row.state.text }}
+                            </span>
                           </span>
                           <span class="tools-item__desc" :title="row.bound ? tx('客服助手自带，不能在这里关闭', 'Included with the support assistant and cannot be turned off here', 'Incluído no assistente de suporte e não pode ser desligado aqui', 'सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता') : mcpDescText(row.server)">{{ row.bound ? tx("客服助手自带，不能在这里关闭", "Included with the support assistant and cannot be turned off here", "Incluído no assistente de suporte e não pode ser desligado aqui", "सहायता सहायक के साथ शामिल, यहाँ बंद नहीं किया जा सकता") : mcpDescText(row.server) }}</span>
                         </span>
@@ -7009,7 +7031,9 @@ provide(bubbleContextKey, {
                     >
                       <span class="tools-item__icon" :style="iconStyle(a.id)" aria-hidden="true">{{ a.icon }}</span>
                       <span class="tools-item__body">
-                        <span class="tools-item__name">{{ agentText(a.label, uiLocale) }}</span>
+                        <span class="tools-item__name"
+                          ><span class="tools-item__label" :title="agentText(a.label, uiLocale)">{{ agentText(a.label, uiLocale) }}</span></span
+                        >
                         <span class="tools-item__desc" :title="agentText(a.description, uiLocale)">{{ agentText(a.description, uiLocale) }}</span>
                       </span>
                       <svg v-if="a.id === AGENT_ID" class="tools-item__check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
