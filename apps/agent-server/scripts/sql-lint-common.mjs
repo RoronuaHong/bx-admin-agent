@@ -19,7 +19,7 @@
 
 /**
  * @typedef {Object} SqlLintFinding
- * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"} code 稳定的机器可读码，便于测试锚定与后续统计
+ * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"DEVICE_LEVEL_COUNT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"} code 稳定的机器可读码，便于测试锚定与后续统计
  * @property {string} message 回灌给模型的可操作提示（含怎么改）
  */
 
@@ -94,6 +94,17 @@ export function lintSql(input) {
     findings.push({
       code: "COUNT_DISTINCT",
       message: "count(DISTINCT x) 在列式引擎上会退化为全量去重，改用 uniqExact(x)（精确）或 uniq(x)（近似）更快",
+    });
+  }
+  // 设备级(guid)去重：设备级宽表一号多机，用 guid 统计「用户/会员/日活人数」会系统性虚高。
+  // 2026-10-16 /chat 实跑：模型用 uniqExactIf(guid,...) 出「日活人数」，虚高约 1.6 倍。
+  // 绑定去重到账号（uid）才是用户口径。确实要数设备时忽略本条（advisory 不阻断）。
+  if (/\b(?:uniq\w*|count\w*)\s*\(\s*(?:distinct\s+)?(?:[\w.]+\.)?guid\b/i.test(sql)) {
+    findings.push({
+      code: "DEVICE_LEVEL_COUNT",
+      message:
+        "检测到按 guid（设备）去重/计数：设备级宽表一号多机，按 guid 统计「用户/会员/日活人数」会系统性虚高。" +
+        "统计用户/会员人数请绑定去重到账号（uniqExact(uid)）；若确实要统计设备数，可忽略本条",
     });
   }
   // 前导通配：无法用跳数/主键索引，退化为全扫。

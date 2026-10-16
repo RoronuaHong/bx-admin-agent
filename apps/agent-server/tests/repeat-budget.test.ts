@@ -13,6 +13,7 @@ import {
   repeatEscalation,
   repeatEscalationStep,
   repeatStopNotice,
+  forceSynthesisByToolCallTotal,
 } from "../src/repeat-budget.js";
 
 const base = { toolName: "toolA", priorCount: 0, totalOther: 0 };
@@ -115,12 +116,48 @@ test("复跑形态回放：累计 32 次至少被提醒 3 次（改动前全程�
   expect(notified, "8 / 16 / 32 三个台阶各提醒一次").toBe(3);
 });
 
+test("事故形态回放：多轮多条「不同」查询绕过单工具护栏，总量上限必须拦住", () => {
+  // 2026-10-16 /chat 实跑形态：每轮跑 1~2 条不同查询，单工具各只调 1 次 → perRoundLimit、
+  // shareLimit、跨轮阶梯全部不触发；只有总调用预算能拦住。evidence=3（早就取到数了）。
+  const cap = 30;
+  let total = 0;
+  let forcedAt = -1;
+  for (let round = 1; round <= 27 && forcedAt < 0; round += 1) {
+    for (const tag of ["a", "b"]) {
+      total += 1;
+      const toolName = `query_${round}${tag}`; // 每条查询都是一个"新工具"
+      // 单工具护栏：这种形态一次都不该触发（这正是它收不住总量的证据）
+      expect(repeatBudgetNotice({ toolName, perRoundCount: 1, priorCount: 0, totalOther: total - 1 })).toBeNull();
+      expect(repeatEscalation({ toolName, total: 1, notifiedStep: 0 }).notice).toBeNull();
+      if (forceSynthesisByToolCallTotal(total, cap, 3)) forcedAt = total;
+    }
+  }
+  expect(forcedAt, "不同查询绕过单工具护栏，但总量上限必须在 cap 处强制收尾").toBe(cap);
+});
+
 test("静态接线：阶梯提醒与停止上限都真的挂在主循环上", () => {
   const src = readFileSync(new URL("../src/chat.ts", import.meta.url), "utf-8");
   expect(src).toContain("repeatEscalation({");
   expect(src).toContain("repeatEscalatedStep.set(");
   expect(src).toContain("repeatBudgetStop(repeatTotal)");
   expect(src).toContain("repeatStopNotice(");
+  // 总调用预算必须真的接进「是否强制收尾」的判据（否则只是加了个没人调用的函数）
+  expect(src).toContain("forceSynthesisByToolCallTotal(");
+  expect(src).toContain("MCP_MAX_TOTAL_TOOL_CALLS");
+  expect(src).toContain("toolCallTotal,");
+});
+
+/* ── 总调用预算（2026-10-16 /chat 多子问题取数事故：25 条不同 SQL 跑满轮次） ── */
+
+test("总量预算：达到上限且已有证据 → 强制收尾（不论第几轮）", () => {
+  expect(forceSynthesisByToolCallTotal(30, 30, 3)).toBe(true);
+  expect(forceSynthesisByToolCallTotal(41, 30, 12)).toBe(true); // 事故形态：41 次调用
+  // 未达上限不强制
+  expect(forceSynthesisByToolCallTotal(29, 30, 12)).toBe(false);
+  // 还没有任何证据 → 不强制（否则把探索掐死成「没数据」），交给轮次预算兜底
+  expect(forceSynthesisByToolCallTotal(41, 30, 0)).toBe(false);
+  // 预算关闭（0）→ 行为完全不变
+  expect(forceSynthesisByToolCallTotal(1000, 0, 5)).toBe(false);
 });
 
 test("事故形态回放：24 次换参数的元数据探查必须被提示（改动前完全逃过）", () => {

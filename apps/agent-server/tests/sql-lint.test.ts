@@ -132,6 +132,7 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
     "SELECT a, count() AS c FROM t WHERE d > 1 GROUP BY a", // GROUP_BY_NO_LIMIT
     "SELECT * FROM t WHERE d > 1", // SELECT_STAR_UNBOUNDED
     "SELECT count(DISTINCT a) FROM t WHERE d > 1 LIMIT 1", // COUNT_DISTINCT
+    "SELECT uniqExact(guid) FROM t WHERE d > 1 LIMIT 1", // DEVICE_LEVEL_COUNT
     "SELECT a FROM t WHERE n LIKE '%x' LIMIT 1", // LIKE_LEADING_WILDCARD
     "SHOW CREATE TABLE t", // SHOW_CREATE_TABLE
     "SELECT a.x FROM a JOIN b WHERE a.x > 0 LIMIT 1", // JOIN_WITHOUT_ON
@@ -145,7 +146,7 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
   const seen = new Set(all.flatMap((sql) => lintSql(sql).map((f) => f.code)));
   const expected = [
     "NO_LIMIT_ROWS", "NO_WHERE", "DISTINCT_WITHOUT_LIMIT", "GROUP_BY_NO_LIMIT", "SELECT_STAR_UNBOUNDED",
-    "COUNT_DISTINCT", "LIKE_LEADING_WILDCARD", "SHOW_CREATE_TABLE", "JOIN_WITHOUT_ON",
+    "COUNT_DISTINCT", "DEVICE_LEVEL_COUNT", "LIKE_LEADING_WILDCARD", "SHOW_CREATE_TABLE", "JOIN_WITHOUT_ON",
     "IMPLICIT_CROSS_JOIN", "NON_SARGABLE_PREDICATE", "GROUP_BY_SELECT_MISMATCH",     "DEEP_SUBQUERY_NESTING",
     "SENSITIVE_COLUMN",
     "JOIN_DANGLING_REF",
@@ -210,4 +211,15 @@ test("[M] 深层嵌套与 DISTINCT 的隐性代价", () => {
   expect(codes(deep)).toContain("DEEP_SUBQUERY_NESTING");
   expect(codes("SELECT DISTINCT a FROM t WHERE d > 1")).toContain("DISTINCT_WITHOUT_LIMIT");
   expect(codes("SELECT DISTINCT a FROM t WHERE d > 1 LIMIT 10")).toEqual([]);
+});
+
+test("[N] 设备级 guid 去重告警：按设备数人会被判（2026-10-16 /chat 虚高 1.6 倍事故回归）", () => {
+  // 事故真实形态：uniqExactIf(guid, ...) 用来算日活人数 → 设备级，口径错
+  expect(codes("SELECT uniqExactIf(a.guid, u.cc = 91) AS dau FROM film_report.elt_active_guid a JOIN film_report.elt_user_full u ON a.guid = u.guid WHERE a.d >= '2026-01-01'")).toContain("DEVICE_LEVEL_COUNT");
+  expect(codes("SELECT uniqExact(guid) AS users FROM t WHERE d > 1")).toContain("DEVICE_LEVEL_COUNT");
+  expect(codes("SELECT count(DISTINCT guid) AS users FROM t WHERE d > 1")).toContain("DEVICE_LEVEL_COUNT");
+  expect(codes("SELECT count(guid) FROM t WHERE d > 1")).toContain("DEVICE_LEVEL_COUNT");
+  // 账号级(uid)不告警；字面量/子串不误报
+  expect(codes("SELECT uniqExact(uid) AS users FROM t WHERE d > 1")).not.toContain("DEVICE_LEVEL_COUNT");
+  expect(codes("SELECT uniq(guid_hash) FROM t WHERE d > 1")).not.toContain("DEVICE_LEVEL_COUNT");
 });

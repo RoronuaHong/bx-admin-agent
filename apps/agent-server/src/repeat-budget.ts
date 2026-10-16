@@ -165,3 +165,24 @@ export function repeatBudgetNotice(input: RepeatBudgetInput, opts: RepeatBudgetO
   return null;
 }
 
+/* ── 总调用预算：单工具护栏收不住总量（2026-10-16 客服/BI 复跑事故） ─────────────
+ *
+ * 要补的洞：上面所有判据都按**单个工具**统计，于是「换一个工具/换一条查询继续探」
+ * 完全逃逸。2026-10-16 在 /chat 实跑一个多子问题取数：模型用 **25 条不同 SQL** 跑到
+ * ~27 轮 / ~41 次工具调用，单工具重复一次都没超限，perRoundLimit / shareLimit / 阶梯
+ * 全部没触发——典型的**护栏拦得住单点、收不住总量**。
+ *
+ * 网上最佳实践同向：迭代必须有硬上限防失控循环，逼近上限时**强制用已取到的结果总结**，
+ * 而不是继续探到预算耗尽。这里给的就是那个「总量上限 + 强制收尾」的判据。
+ *
+ * 为什么仍要求 `evidenceCalls > 0`：没有证据时强制收尾只会得到一句「没取到数」，
+ * 那属于把探索掐死。零证据的极端情形仍由轮次预算 / Doom Loop / token 预算兜底。
+ */
+export function forceSynthesisByToolCallTotal(
+  toolCallTotal: number,
+  cap: number,
+  evidenceCalls: number,
+): boolean {
+  return cap > 0 && evidenceCalls > 0 && toolCallTotal >= cap;
+}
+

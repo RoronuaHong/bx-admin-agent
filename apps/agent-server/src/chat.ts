@@ -53,7 +53,7 @@ import {
 } from "./models.js";
 import { healthOrderEnabled, healthTier, orderByHealth, readModelHealth, type ModelHealth } from "./model-health.js";
 import { classifyToolFailure, KIND_LABEL, ToolHealthWindow, type ToolErrorKind } from "./tool-failure.js";
-import { repeatBudgetNotice, repeatBudgetStop, repeatEscalation, repeatStopNotice, REPEAT_STOP_AFTER } from "./repeat-budget.js";
+import { repeatBudgetNotice, repeatBudgetStop, repeatEscalation, repeatStopNotice, forceSynthesisByToolCallTotal, REPEAT_STOP_AFTER } from "./repeat-budget.js";
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
 import { getServer, loadServers } from "./mcp/config.js";
 import { annotateMcpToolSpec, applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
@@ -289,6 +289,12 @@ export function toolRoundsForRun(baseRounds: number, tightenedRounds: number, al
 // 循环护栏：同轮同参数去重 + 跨轮 Doom Loop 熔断（防止模型卡在无效工具循环空耗 token）。
 const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLowerCase() !== "off";
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
+/**
+ * 总工具调用预算：一次运行里真实执行的工具调用达到该数、且已有接地证据时，
+ * 剥掉工具强制模型用已取到的结果写结论（0 = 关闭）。与轮次预算并列的第二道闸门，
+ * 专门治「单工具重复护栏收不住总量」——多子问题取数里模型用几十条不同查询就能跑满轮次。
+ */
+const TOTAL_TOOL_CALL_CAP = Math.max(0, Math.floor(Number(process.env.MCP_MAX_TOTAL_TOOL_CALLS || 30)));
 /**
  * 跨轮重复调用的观察提示（服务端文本，只进模型上下文；执行照常放行——数据可能需要刷新）。
  * 对齐「观察 → 再决策」：不硬拦非连续的同参调用（Doom Loop 只管连续重复），但在回灌时附一句
@@ -884,7 +890,15 @@ export function shouldForceSynthesisRound(input: {
   maxRounds: number;
   forceWrapUp: boolean;
   evidenceCalls: number;
+  /** 本次运行已真实执行的工具调用累计数（判总量预算用）。 */
+  toolCallTotal?: number;
+  /** 总调用预算上限（0 = 不启用）。 */
+  totalToolCallCap?: number;
 }): boolean {
+  // 总量预算命中：不论轮到哪一轮，只要有证据就摘工具强制收尾（治「收不住总量」）。
+  if (forceSynthesisByToolCallTotal(input.toolCallTotal ?? 0, input.totalToolCallCap ?? 0, input.evidenceCalls)) {
+    return true;
+  }
   if (input.maxRounds <= 1 || input.round !== input.maxRounds - 1) return false;
   return input.forceWrapUp || input.evidenceCalls > 0;
 }
@@ -2198,6 +2212,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         maxRounds: ctx.maxRounds,
         forceWrapUp: ctx.forceWrapUp === true,
         evidenceCalls: groundingEvidence,
+        toolCallTotal,
+        totalToolCallCap: TOTAL_TOOL_CALL_CAP,
       });
     if (keepToolsForLookup) {
       keepToolsForLookup = false;
