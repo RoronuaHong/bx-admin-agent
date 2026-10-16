@@ -145,6 +145,10 @@ test("静态接线：阶梯提醒与停止上限都真的挂在主循环上", ()
   expect(src).toContain("forceSynthesisByToolCallTotal(");
   expect(src).toContain("MCP_MAX_TOTAL_TOOL_CALLS");
   expect(src).toContain("toolCallTotal,");
+  // Fix 2 提前收敛提示：预算用到约 2/3 且已有证据时一次性要求收敛（治低效探索）
+  expect(src).toContain("convergeNudged");
+  expect(src).toContain("CONVERGE_HINT");
+  expect(src).toContain("round >= Math.ceil(ctx.maxRounds * (2 / 3))");
 });
 
 /* ── 总调用预算（2026-10-16 /chat 多子问题取数事故：25 条不同 SQL 跑满轮次） ── */

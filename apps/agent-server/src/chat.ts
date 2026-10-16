@@ -865,6 +865,9 @@ export function gaveUpAfterOwnBusinessBlock(text: string): boolean {
 const RETRY_OWN_BUSINESS_HINT =
   "上一轮自有业务工具没有执行：当时技能正文还没进上下文，所以被拦住了。这不是连接失败，也不是库里没有数据。现在直接再调用那个自有业务工具取数。";
 
+const CONVERGE_HINT =
+  "你已取到不少数据，请开始收敛：用已有结果直接给出结论与数据表；若还有明确缺项，一次性列出还需要查什么，不要再用多轮零散探查去补。";
+
 const EMPTY_AFTER_INTERNAL_HINT =
   "上一轮没有写出结论。若已有结果里已经有用户要的自有业务数字，直接写结论，不要再查。" +
   "若结果只是自有库里没有这个主体，不要据此收束，现在调用 web_search。";
@@ -2151,6 +2154,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let ownBusinessRefused = false;
   let ownBusinessExecuted = false;
   let ownBusinessRetryNudged = false;
+  let convergeNudged = false;
   /** 本轮证据的**来源集合**（工具名 / 服务器标识）：回答里声称的来源要能与它对上，否则就是编造的引用。 */
   const evidenceSources = new Set<string>();
   /** 累积证据原文（受 GROUNDING_EVIDENCE_CHARS 约束；超限后不再追加，保证核验调用不膨胀）。
@@ -2215,6 +2219,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         toolCallTotal,
         totalToolCallCap: TOTAL_TOOL_CALL_CAP,
       });
+    // 收敛提示（Fix 2，治 P2/P3 低效探索）：预算用到约 2/3 且已取到证据时一次性要求模型用已有
+    // 结果收敛，比「最后一轮才摘工具」更早给信号，避免把整段交互耗在重复探查上。总调用预算（Fix 1）
+    // 命中时会直接摘工具强制收尾，这里只给软提示，不重复触发。
+    if (
+      !convergeNudged &&
+      !wrapUp &&
+      groundingEvidence > 0 &&
+      round >= Math.ceil(ctx.maxRounds * (2 / 3))
+    ) {
+      convergeNudged = true;
+      conversation.push({ role: "user", content: CONVERGE_HINT });
+      console.log("[chat:converge] 已用约 2/3 预算且已有证据，要求收敛");
+    }
     if (keepToolsForLookup) {
       keepToolsForLookup = false;
       console.log("[chat:source] 这一轮保留工具，先做公开检索");

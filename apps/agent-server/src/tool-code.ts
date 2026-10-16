@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { withSubprocessSlot } from "./subprocess-limit.js";
 import { guardSourceLooksIntact, nodeFsGuardPreloadSource, pyFsGuardSource } from "./tool-code-fs-guard.js";
+import { lintToolCodeForDeviceLevelCount } from "./tool-code-lint.js";
 
 function capOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
@@ -401,6 +402,8 @@ export async function runToolCode(opts: {
   }
 
   const captured = [stdout.trim(), stderr.trim() ? `--- stderr ---\n${stderr.trim()}` : ""].filter(Boolean).join("\n");
+  // 设备级口径告警（advisory）：与 BI SQL 体检同源；命中只附提示、不改执行结果。
+  const deviceWarn = lintToolCodeForDeviceLevelCount(opts.code);
   const output = capOutput(
     streamTruncated ? `（输出已超 ${STREAM_CAPTURE_MAX} 字符被截断）\n${captured}` : captured,
     OUTPUT_MAX,
@@ -414,7 +417,10 @@ export async function runToolCode(opts: {
   if (okCalls === 0) {
     return { ok: false, text: `代码没有成功调用只读工具，输出不能当作事实。\n${output}` };
   }
-  return { ok: true, text: output || "（代码没有输出。请用 print / console.log 打出聚合结果）" };
+  return {
+    ok: true,
+    text: (deviceWarn ? `${deviceWarn}\n\n` : "") + (output || "（代码没有输出。请用 print / console.log 打出聚合结果）"),
+  };
   });
 }
 

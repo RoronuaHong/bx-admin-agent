@@ -30,7 +30,7 @@ default: true
 - **会员"退订/流失"先探到期列，再下结论**：不要凭"没看到退订事件表"就断言答不了。先 `DESCRIBE` / `get_database_schema` 看 `elt_user_vip_info` 是否带到期/结束时间列（如 `vipEndTime` / `expireTime`）；若有，可据此定义"到期时间已过且充值日志里无后续续费"的流失人群。只有确认既无到期列、也无任何续费/取消事件流，才写"本源无法直接给出退订人群"。
 - **会员数 / 会员存量一律用 `elt_user_vip_info` 的「去重账号」口径**：`vipType = 2 AND startDate <= 基准日 AND endDate >= 基准日`，聚合用 `uniqExact(uid)`。**不要**用 `elt_user_full_history.vipExpireDay > 0` 这类设备级快照替代——实测该快照覆盖不全（存在整日缺失、且只保留近 30 天），早期计数人为偏低，会算出与真实趋势**相反**的假"回升"；它还是设备维度，一号多机会把数字放大。判断"会员是升是降"必须以会员主表在两个基准日的存量对比为准，并用「新增 − 流失」交叉验证（两者应能对上）。
 - **"新增会员" ≠ "首次付费"**：`elt_user_vip_recharge_log` 的 `rechargeType=3 & isFirst=1`（首充）里**混有大量"老赠送/试用会员转付费"的存量账号**——他们本来就是会员，不会让会员存量增加。算会员净增时，新增要用**首次开通会员**（`elt_user_vip_info.startDate` 落在窗口内、`uniqExact(uid)`）；首充只能作为"付费转化"单独口径，**不能拿来抵消流失**。实测两者可差 5 倍以上，混用会得出完全相反的结论。
-- **跨表统计一律去重到账号**：`elt_user_vip_info` 一个账号可有多条会员记录（实测印度记录数约为账号数的 1.6 倍），`elt_user_full` 是设备级宽表（一号多机）。凡涉及"多少会员 / 多少用户"，聚合必须用 `uniqExact(uid)`；用 `count()` 数记录会系统性虚高。
+- **跨表统计一律去重到账号**：`elt_user_vip_info` 一个账号可有多条会员记录（实测印度记录数约为账号数的 1.6 倍），`elt_user_full` 是设备级宽表（一号多机）。凡涉及"多少会员 / 多少用户"，聚合必须用 `uniqExact(uid)`；用 `count()` 数记录会系统性虚高。**这条同样适用于「运行代码」（run_tool_code 里的 Python/pandas）：按 uid 去重，勿按 guid（`df['guid'].nunique()` / `len(df.guid.unique())` / `drop_duplicates('guid')` 都会复刻设备级虚高）。代码执行器已对 guid 邻近计数/去重动词给出同源告警，但别依赖它——下笔前就按账号口径写。**
 
 ## SQL 怎么写
 
