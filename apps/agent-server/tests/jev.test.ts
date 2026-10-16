@@ -11,6 +11,7 @@ import {
   supportSendAllowed,
   visitorSendRefusal,
   JEV_ACT_AT,
+  JEV_REVIEW_AT,
 } from "../src/jev.js";
 
 describe("jev support labels", () => {
@@ -43,9 +44,12 @@ describe("jev support labels", () => {
     expect(draftPromiseAction(0.1)).toBe("keep");
     expect(draftPromiseAction(null)).toBe("unchecked");
     expect(supportSendAllowed(0.95)).toBe(false);
-    expect(supportSendAllowed(0.6)).toBe(true);
+    // CJK 地板抬到 0.6：p>=0.6 的模糊一带也 fail-open 拒发，仅 p<0.6 才放行
+    expect(supportSendAllowed(0.6)).toBe(false);
+    expect(supportSendAllowed(0.5)).toBe(true);
     expect(supportSendAllowed(null)).toBe(false);
     expect(JEV_ACT_AT).toBe(0.9);
+    expect(JEV_REVIEW_AT).toBe(0.6);
     const blocked = buildSupportLabels(null, { probability: null, reason: "failed" });
     expect(blocked.draft).toBe("unchecked");
     expect(blocked.items[0]?.value).toContain("不能视为已通过");
