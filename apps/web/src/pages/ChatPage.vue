@@ -25,6 +25,9 @@ import ChatBubble from "../components/ChatBubble.vue";
 import { bubbleContextKey } from "../components/bubble-context";
 import { renderChatMarkdown } from "../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../chat-stream";
+// 气泡相关共享类型以 chat-types.ts 为**单一来源**（原先在页面内各有一份重复定义，抽 ChatBubble 后需共享）。
+// 不要在此再定义同名类型——重复定义会导致 provide/inject 两侧签名漂移（改一处漏两处即类型冲突）。
+import type { StepStatus, SubagentStatus, ToolStep } from "../chat-types";
 import {
   MINUTELY_INTERVALS,
   REPEAT_FREQS,
@@ -1153,21 +1156,8 @@ function openRunConversation(run: TaskGroupRun): void {
   void openConversationById(run.conversationId, "run");
 }
 
-/** 工具步骤状态。`interrupted` = 没等到结果（连接中断 / 服务进程重启），如实展示，不冒充「失败」。 */
-type StepStatus = "running" | "ok" | "error" | "cancelled" | "interrupted";
-
-/** 子代理状态（独立事件维度）。`interrupted` 同 StepStatus 语义。 */
-type SubagentStatus = "running" | "done" | "cancelled" | "error" | "interrupted";
-
-/** 气泡里的一个工具步骤（MCP 工具调用）。 */
-interface ToolStep {
-  id: string;
-  name: string;
-  server?: string;
-  args?: string;
-  status: StepStatus;
-  result?: string;
-}
+// 步骤状态 / 子代理状态 / 工具步骤：以上方 import 的 chat-types.ts 为单一来源，此处不再重复定义。
+// （历史原因：这三个类型曾在页面内各有一份，抽 ChatBubble 组件后已抽取到 chat-types.ts 共享。）
 
 interface Bubble {
   id: number;
@@ -4668,6 +4658,8 @@ function formatBytes(bytes: number): string {
 
 function stepClass(status: StepStatus): string {
   if (status === "ok") return "ok";
+  // 未执行（闸门/跳过）：黄色警告——标成红色会让人以为工具自己坏了，实为「先去读技能/未授权」等。
+  if (status === "refused") return "warn";
   if (status === "error" || status === "cancelled" || status === "interrupted") return "err";
   return "running";
 }
@@ -4676,6 +4668,8 @@ function stepStatusText(status: StepStatus): string {
   if (status === "ok") return tx("已完成", "done", "concluído", "पूर्ण");
   if (status === "error") return tx("失败", "failed", "falhou", "विफल");
   if (status === "cancelled") return tx("已拒绝", "denied", "recusado", "अस्वीकृत");
+  // 未执行 ≠ 失败：闸/跳过导致这一步没跑，标「失败」会误导（具体原因见步骤展开的提示文案）。
+  if (status === "refused") return tx("未执行", "not run", "não executado", "निष्पादित नहीं");
   // 中断 ≠ 失败：不知道结果就如实说不知道（标成失败会让人以为工具自己报错了）。
   if (status === "interrupted") return tx("已中断", "interrupted", "interrompido", "बाधित");
   return tx("执行中", "running", "executando", "चल रहा है");

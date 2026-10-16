@@ -3915,9 +3915,14 @@
   border-color: color-mix(in srgb, var(--stop) 32%, var(--line));
 }
 
-/* MCP 抽屉：状态点 err / running（ok 变体已在上方保留）。 */
+/* MCP 抽屉：状态点 err / warn / running（ok 变体已在上方保留）。 */
 .mcp-dot.err {
   background: var(--danger);
+}
+
+/* 未执行（闸门拒绝 / 跳过 / 未授权 / 等待澄清）：琥珀警示色，区别于失败的红。 */
+.mcp-dot.warn {
+  background: var(--warn, #b26a00);
 }
 
 .mcp-dot.running {

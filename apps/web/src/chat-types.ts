@@ -3,7 +3,11 @@
 import type { ChartSpec } from "./api";
 import type { ArtifactSpec, TodoItem, SupportLabels } from "@bx/shared";
 
-export type StepStatus = "running" | "ok" | "error" | "cancelled" | "interrupted";
+/**
+ * 步骤状态。`refused` = 闸门未通过/跳过而**未执行**（如「先读完 business-data-query 技能」、同轮重复跳过、
+ * 未授权、等待澄清等）——它不是工具报错，UI 用黄色「未执行」区分红色「失败」，避免让人以为工具坏了。
+ */
+export type StepStatus = "running" | "ok" | "error" | "cancelled" | "interrupted" | "refused";
 
 export type SubagentStatus = "running" | "done" | "cancelled" | "error" | "interrupted";
 

@@ -143,7 +143,20 @@ type ChatEventBody =
   | { type: "thinking_delta"; text: string }
   | { type: "model"; id: string; label: string }
   | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
-  | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
+  | {
+      type: "tool_result";
+      id: string;
+      name: string;
+      ok: boolean;
+      /**
+       * 是否**真正执行过**（后端区分「闸门未通过/跳过」与「真执行失败」）。
+       * - `false` = 未执行（技能闸、未授权、同轮重复跳过、等待澄清等）→ UI 黄色「未执行」+ 原因；
+       * - `true` 且 `ok:false` = 工具真的跑失败 → UI 红色「失败」。
+       * 旧版本/未发此字段时按 `undefined` 处理（沿用红色失败，不影响既有行为）。
+       */
+      executed?: boolean;
+      text: string;
+    }
   | {
       type: "confirmation_required";
       /** 工具调用 id（UI 关联步骤用，不再用于批准）。 */

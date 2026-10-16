@@ -140,6 +140,25 @@ test("[D4c] 专名还没落到已连接数据上时，不要先去业务库里�
   expect(ownBusinessNameRefusal("mcp__bi__list_databases", "workbuddy，进3个月的利润是多少？", true)).toBeNull();
   expect(ownBusinessNameRefusal("mcp__bi__search", "我们最近7天的订单量是多少？", false)).toBeNull();
   expect(ownBusinessNameRefusal("mcp__movie__movies_search", "workbuddy，进3个月的利润是多少？", false)).toBeNull();
+  // 内部数据标识符（schema.table / snake_case / 多段驼峰 / 通用字段词）不是外部专名，不得据此拦内部取数
+  expect(unscopedNameTokens("查 film_report.elt_user_vip_info 的 countryCode 和 vipType")).toEqual([]);
+  expect(unscopedNameTokens("按 status 和 endDate 查会员存量，guid 和 channel 也要")).toEqual([]);
+  // 外部主体专名仍要被识别（护栏本意不变）
+  expect(unscopedNameTokens("workbuddy 的利润和 Google 的广告费")).toEqual(["workbuddy", "google"]);
+  // 带表名/字段名的取数消息：即使未 web_search 也应放行（2026-10-16 专名护栏误拦回归）
+  expect(
+    ownBusinessNameRefusal(
+      "mcp__bi__runSql",
+      "国家按 elt_user_full.countryCode 关联，会员按 elt_user_vip_info 存量口径（vipType=2 且 status=0 且 endDate>=基准日）",
+      false,
+    ),
+  ).toBeNull();
+  // 外部专名仍未 web_search 时依旧拦下、要求先公开检索
+  expect(ownBusinessNameRefusal("mcp__bi__search", "workbuddy 进3个月的利润是多少", false)).toContain("web_search");
+  // 方向C：读过「业务取数」技能 = 有选源判断依据 → 信任模型，即使原话含外部专名也不再词形硬拦
+  expect(
+    ownBusinessNameRefusal("mcp__bi__search", "workbuddy 进3个月的利润是多少？", false, new Set([OWN_BUSINESS_SKILL])),
+  ).toBeNull();
 });
 
 test("[D5] 把技能闸拒绝说成取数失败时要重试", () => {

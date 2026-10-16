@@ -1,4 +1,6 @@
 import type { ArtifactSpec, ChartSpec, ChatEvent, LocalizedToken, SupportLabels, TodoItem } from "@bx/shared";
+// 步骤类型以 chat-types.ts 为单一来源（与 ChatPage / ChatBubble 共用），不在此重复内联。
+import type { ToolStep } from "./chat-types";
 
 /** 流事件要改的气泡字段。页面上的 Bubble 多出来的展示字段不影响这里。 */
 export interface StreamReply {
@@ -7,14 +9,7 @@ export interface StreamReply {
   streaming?: boolean;
   error?: string;
   thinking?: string;
-  steps?: Array<{
-    id: string;
-    name: string;
-    server?: string;
-    args?: string;
-    status: "running" | "ok" | "error" | "cancelled" | "interrupted";
-    result?: string;
-  }>;
+  steps?: ToolStep[];
   pending?: {
     id: string;
     ticket: string;
@@ -128,7 +123,9 @@ export function applyStreamEvent<T extends StreamReply>(
   } else if (event.type === "tool_result") {
     const step = (reply.steps || []).find((item) => item.id === event.id);
     if (step) {
-      step.status = event.ok ? "ok" : "error";
+      // 未执行（闸门拒绝/跳过）≠ 真执行失败：前者黄色「未执行」+ 原因，后者才是红色「失败」。
+      // executed 为 undefined（老版本未发该字段）时沿用红色，不改变既有行为。
+      step.status = event.ok ? "ok" : event.executed === false ? "refused" : "error";
       step.result = event.text;
     }
     reply.pending = null;

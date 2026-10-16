@@ -241,6 +241,10 @@ test("[O] 资源类·精确去重无窗/长窗（2026-10-16 内存爆顶事故�
   const msg = lintSql("SELECT uniqExact(guid) FROM t WHERE d >= '2026-10-09'").find((f) => f.code === "HEAVY_EXACT_AGG_NOWINDOW")?.message ?? "";
   expect(msg).toContain("uniq()");
   expect(msg).toContain("时间窗");
+  // 裸列「>= 起 AND < 止」双比较：按真实交集跨度判，不再一律 Infinity（2026-10-16 hasDateWindow 修复回归）
+  expect(codes("SELECT uniqExact(guid) FROM t WHERE d >= '2026-10-10' AND d < '2026-10-17'")).not.toContain("HEAVY_EXACT_AGG_NOWINDOW"); // 7 天短窗：不再误报
+  expect(codes("SELECT uniqExact(guid) FROM t WHERE d >= '2026-09-01' AND d < '2026-10-17'")).toContain("HEAVY_EXACT_AGG_NOWINDOW"); // 46 天长窗：仍正确触发
+  expect(codes("SELECT uniqExact(guid) FROM t WHERE d = '2026-10-15'")).not.toContain("HEAVY_EXACT_AGG_NOWINDOW"); // 单日等值：0 跨度，不误报
 });
 
 test("[P] 资源类·多表 JOIN 无时间窗（放大扫描）", () => {

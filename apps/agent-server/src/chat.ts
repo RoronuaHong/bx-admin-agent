@@ -93,6 +93,7 @@ import {
   VERIFY_SYSTEM,
   type VerifyResult,
 } from "./grounding.js";
+import { verifyNumericConsistency, buildNumericHint } from "./numeric-verify.js";
 import { wrapUntrusted } from "./untrusted.js";
 import { webSearchStatus } from "./web-search.js";
 import { getUploadImage, getUploadFile } from "./uploads.js";
@@ -358,6 +359,9 @@ const GROUNDING_VERIFY_TWO_STAGES = (process.env.GROUNDING_VERIFY_STAGES || "two
 // 独立核验模型（缓解 LLM-as-judge 的自我偏好：同一模型评自己的答案倾向于判「没问题」）。
 // 未配置 = 沿用本轮主模型，行为与配置前完全一致。
 const GROUNDING_VERIFY_MODEL_ID = String(process.env.GROUNDING_VERIFY_MODEL || "").trim();
+// 数值一致性校验（O3）：确定性、零模型调用，仅当有取数证据（wrapEvidence 非空）时运行；
+// 写代码/闲聊类无取数回答自动跳过。GROUNDING_NUMERIC_VERIFY=off 可关闭。
+const GROUNDING_NUMERIC_VERIFY = (process.env.GROUNDING_NUMERIC_VERIFY || "on").toLowerCase() !== "off";
 // 循环内层瞬时重试：某轮模型调用遇 SSE 断流 / 超时 / 限流等瞬态错误时重试，
 // 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
 const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
@@ -1118,18 +1122,57 @@ export function ownBusinessToolRefusal(toolName: string, skillsRead: ReadonlySet
   );
 }
 
-/** 用户原话里的拉丁字母专名。还没做公开检索时，不能拿它去已连接的库里对归属。 */
+/**
+ * 跨系统通用英文词（接口命名/字段语义词），不是外部主体专名——消息里出现它们不代表用户在校对外部世界。
+ * 这些都是任何系统都可能出现的通用词，不属「业务词写死」红线禁止的范畴（章程允许通用字段语义词）。
+ */
+const GENERIC_LATIN_TOKENS = new Set([
+  "status", "type", "name", "date", "time", "user", "users", "info", "guid", "channel",
+  "table", "field", "data", "count", "level", "price", "amount", "active", "order",
+  "detail", "list", "total", "day", "days", "week", "month", "year", "new", "old",
+  "create", "created", "update", "updated", "start", "end", "id", "code", "num",
+  "number", "flag", "desc", "title", "label",
+]);
+
+/**
+ * 用户原话里「可能是外部主体的拉丁专名」。还没做公开检索时，不能拿它去已连接的库里对归属。
+ *
+ * 关键修正：内部取数时常在原话里带表名/字段名（如 film_report.elt_user_vip_info、countryCode、vipType…），
+ * 它们是内部数据标识符、不是外部专名。旧实现把所有≥4字母拉丁词当专名，会用「专名未落到已连接数据」
+ * 把内部取数误拦（要求先 web_search），导致带表名/字段名的取数消息无法执行（2026-10-16 端到端实测复现）。
+ * 故先剔除内部标识符形态的整词（schema.table 限定名 / snake_case / 多段驼峰，均不拆子词），
+ * 再剔除跨系统通用词，最后只把剩余的孤立拉丁词当作外部专名候选。
+ */
 export function unscopedNameTokens(userText: string): string[] {
-  const found = String(userText || "").match(/[A-Za-z][A-Za-z0-9]{3,}/g) || [];
-  return [...new Set(found.map((token) => token.toLowerCase()))];
+  const withoutInternal = String(userText || "")
+    .replace(/[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+/g, " ") // schema.table 限定名
+    .replace(/[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+/g, " ") // snake_case（含下划线）
+    .replace(/[a-z]+[A-Z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*)*/g, " "); // 多段驼峰 countryCode / vipType / endDate
+  const found = withoutInternal.match(/[A-Za-z][A-Za-z0-9]{3,}/g) || [];
+  return [
+    ...new Set(
+      found
+        .map((token) => token.toLowerCase())
+        .filter((token) => !GENERIC_LATIN_TOKENS.has(token)),
+    ),
+  ];
 }
 
 export const UNSCOPED_NAME_BI_REFUSAL =
   "未执行。这句话里的专名还没有落到已连接的数据上，不要用这个连接器去找它，也不要用查找结果判断它属不属于这里。先调用 web_search。公开检索之后，如果要的是已连接业务里的指标，再回到这个连接器取数。";
 
-export function ownBusinessNameRefusal(toolName: string, userText: string, usedWebSearch: boolean): string | null {
+export function ownBusinessNameRefusal(
+  toolName: string,
+  userText: string,
+  usedWebSearch: boolean,
+  skillsRead: ReadonlySet<string> = new Set(),
+): string | null {
   if (usedWebSearch) return null;
   if (!toolName.startsWith("mcp__bi__")) return null;
+  // 读过「业务取数」技能 = 模型已有选源判断依据（工具说明 + 技能纪律），此时信任模型自行判断内外部、
+  // 不再用「用户原话词形」硬拦——词形猜意图脆弱，会把带表名/字段名的内部取数误判成外部专名（2026-10-16 端到端实测复现）。
+  // 仅在模型尚未读技能（无判断依据）时，才保留专名硬拦兜底，防止没读技能就拿业务库搜外部专名。
+  if (skillsRead.has(OWN_BUSINESS_SKILL)) return null;
   if (!unscopedNameTokens(userText).length) return null;
   return UNSCOPED_NAME_BI_REFUSAL;
 }
@@ -2052,7 +2095,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const callToolFromCode = async (name: string, args: Record<string, unknown>) => {
     const denied = toolCodeDenied(name);
     if (denied) return { ok: false, text: denied };
-    const nameBlocked = ownBusinessNameRefusal(name, userQuestion, usedWebSearch);
+    const nameBlocked = ownBusinessNameRefusal(name, userQuestion, usedWebSearch, skillsVisible);
     if (nameBlocked) return { ok: false, text: nameBlocked };
     const ownBusinessBlocked = ownBusinessToolRefusal(name, skillsVisible);
     if (ownBusinessBlocked) return { ok: false, text: ownBusinessBlocked };
@@ -2507,6 +2550,27 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // 完整计数的预警结论由服务端按摘要重写。再让模型改一稿会换掉「当前数量」这类标签，数字也会被改口。
       const canonicalAlertFacts =
         ctx.unattendedConclusion === "alert" && formatScheduledCountFacts(countReportText) != null;
+      // 数值一致性校验（O3，确定性、零模型调用）：工具返回的总数 / 回答内分项求和 与 模型声明的合计 比对。
+      // 对齐「programmatic verification over self-claims」——数值算术不应交给模型自核。
+      // 仅当有取数证据（wrapEvidence 非空）时运行；fail-soft：发现不一致只回灌复核，不阻断作答。
+      if (GROUNDING_NUMERIC_VERIFY && wrapEvidence.length > 0 && outcome.text.trim()) {
+        const numMismatches = verifyNumericConsistency({
+          evidence: wrapEvidence.join("\n"),
+          answer: outcome.text,
+        });
+        if (numMismatches.length) {
+          // 不一致条目来自确定性比对（非模型生成），仍按不可信数据定界后回灌，与 grounding 回灌同机制。
+          const wrapped = wrapUntrusted(
+            numMismatches.map((m) => `- ${m}`).join("\n"),
+            { kind: "numeric_verify", source: "numeric-verify" },
+          );
+          text = text.slice(0, Math.max(0, text.length - outcome.text.length));
+          conversation.push({ role: "assistant", content: outcome.text });
+          conversation.push({ role: "user", content: buildNumericHint(wrapped.text) });
+          console.log(`[chat:numeric] 发现 ${numMismatches.length} 处数值不一致，已回灌复核`);
+          continue;
+        }
+      }
       if (
         !canonicalAlertFacts &&
         shouldRunVerification({
@@ -2748,7 +2812,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
-      const nameBlocked = ownBusinessNameRefusal(c.name, userQuestion, usedWebSearch);
+      const nameBlocked = ownBusinessNameRefusal(c.name, userQuestion, usedWebSearch, skillsVisible);
       if (nameBlocked) return { ok: false, rawText: nameBlocked, executed: false };
       const blocked = ownBusinessToolRefusal(c.name, skillsVisible);
       if (blocked) {
@@ -2788,6 +2852,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           id: call.id,
           name: call.name,
           ok: false,
+          executed: false, // 跳过≠失败：UI 显示黄色「未执行」而非红色「失败」
           text: `跳过：本轮已执行过相同调用（${call.name} + 相同参数），不重复执行。`,
         };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: "（重复调用已跳过）" });
@@ -2802,7 +2867,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           if (TOOL_DEDUP_SAME_ROUND && executedSigs.has(tsig)) {
             // 重复子任务：单独回灌跳过结果，不进并行批量。
             yield { type: "tool_call", id: t.id, name: "task", server: BUILTIN_SERVER, args: t.argsJson };
-            yield { type: "tool_result", id: t.id, name: "task", ok: false, text: "跳过：本轮已委派过相同子任务。" };
+            yield {
+              type: "tool_result",
+              id: t.id,
+              name: "task",
+              ok: false,
+              executed: false, // 跳过≠失败
+              text: "跳过：本轮已委派过相同子任务。",
+            };
             conversation.push({ role: "tool", toolCallId: t.id, name: "task", content: "（重复子任务已跳过）" });
             handles.push({ name: "task", args: truncateArgs(t.argsJson), summary: "已跳过（同轮重复）" });
             index += 1;
@@ -2828,7 +2900,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         for (const result of results) {
           // 交接文本（P1-3）：结构化状态 + 覆盖面 + 原因 + 回传正文，父轮与用户都能直接读。
           const handoff = subagentHandoffText(result);
-          yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: handoff };
+          // 子代理确实跑了（无论成败），executed=true：失败才标红色「失败」
+          yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, executed: true, text: handoff };
           // 子代理回传也是外部数据 → 计入接地证据（见 src/grounding.ts）。
           // **只有 success 算证据**（P1-3）：partial / no_findings / failed 都不是可引用的
           // 完整事实——「没跑完」与「没找到」都不得当结论，父轮必须据此续跑或如实收束。
@@ -2945,7 +3018,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             .join("\n");
         }
         const searched = truncateResult(rawText);
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: searched };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: true, // 按需检索确实执行过（「无命中」不是工具失败）
+          text: searched,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: searched });
         handles.push({
           name: call.name,
@@ -2963,7 +3043,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         toolFusions += 1;
         const fused = fuse.reason;
         yield { type: "tool_call", id: call.id, name: call.name, server: serverOf.get(call.name), args: call.argsJson };
-        yield { type: "tool_result", id: call.id, name: call.name, ok: false, text: fused };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok: false,
+          executed: false, // 融合跳过≠失败
+          text: fused,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: fused });
         handles.push({
           name: call.name,
@@ -3050,7 +3137,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               };
             if (out.artifact) yield { type: "artifact", ...out.artifact };
             const outContent = prepareToolResultText(item.call.name, out.rawText);
-            yield { type: "tool_result", id: item.call.id, name: item.call.name, ok: out.ok, text: outContent };
+            yield {
+              type: "tool_result",
+              id: item.call.id,
+              name: item.call.name,
+              ok: out.ok,
+              // 「闸门拒绝/跳过（未执行）」与「真执行失败」在 UI 上必须分开显示：
+              // 前者是黄色「未执行」+ 原因提示，后者才是红色「失败」。
+              executed: out.executed,
+              text: outContent,
+            };
             const wrappedOut = wrapUntrusted(outContent, {
               kind: "tool_result",
               source: serverOf.get(item.call.name) || item.call.name,
@@ -3138,7 +3234,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (!subagentMayExecute(verdict, ctx.allowWrite)) {
         ok = false;
         rawText = `该操作（${verdict.level}，带外部副作用）不能委派给子代理执行：请在主对话里直接发起（这类操作需要你确认，会在主对话弹确认卡）。`;
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: false, // 未执行（闸门/授权原因）≠ 工具失败
+          text: rawText,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理不能做需确认的操作）" });
         appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
@@ -3154,7 +3257,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         rawText = verdict.reason
           ? `工具 ${call.name} 被安全闸门拒绝：${verdict.reason}`
           : `工具 ${call.name} 未声明操作级别，按当前安全口径拒绝执行；如确需使用，请在服务器配置中显式声明该工具的风险级别。`;
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: false, // 安全闸门拒绝 = 未执行，不是工具报错
+          text: rawText,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未知工具被拒绝）" });
         appendAudit({ kind: "gate", decision: "denied", ...auditBase });
@@ -3167,7 +3277,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         rawText =
           `本轮你请求了澄清，在用户回答之前该操作（${verdict.level}）已暂缓、未执行；` +
           "拿到用户的回答后，如果仍需要做这件事，请重新调用。";
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: false, // 暂缓 = 未执行
+          text: rawText,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "已暂缓（等待澄清）" });
         // 闸门决策留痕：与其他 gate 口径一致，便于审计追溯「pending 期间拦下了哪些写操作」。
@@ -3212,7 +3329,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         if (!answer.confirmed) {
           ok = false;
           rawText = answer.timedOut ? "等待确认超时，已取消该工具调用" : "用户已拒绝该工具调用";
-          yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+          yield {
+            type: "tool_result",
+            id: call.id,
+            name: call.name,
+            ok,
+            executed: false, // 被拒绝/取消 = 未执行（不是工具报错）
+            text: rawText,
+          };
           conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
           handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（未确认）" });
           continue;
@@ -3226,7 +3350,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (ctx.deniedBuiltins?.has(call.name)) {
         ok = false;
         rawText = unattendedToolDenial(call.name);
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: false, // 定时运行拒绝 = 未执行
+          text: rawText,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（定时运行拒绝）" });
         continue;
@@ -3234,7 +3365,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       if (ctx.allowBuiltins && !ctx.allowBuiltins.has(call.name)) {
         ok = false;
         rawText = `本次运行未授权该工具（工具允许清单已收窄）：${call.name}`;
-        yield { type: "tool_result", id: call.id, name: call.name, ok, text: rawText };
+        yield {
+          type: "tool_result",
+          id: call.id,
+          name: call.name,
+          ok,
+          executed: false, // 不在允许清单 = 未执行
+          text: rawText,
+        };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
         handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（不在允许清单）" });
         continue;
@@ -3314,7 +3452,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           }
         }
       } else {
-        const nameBlocked = ownBusinessNameRefusal(call.name, userQuestion, usedWebSearch);
+        const nameBlocked = ownBusinessNameRefusal(call.name, userQuestion, usedWebSearch, skillsVisible);
         const blocked = nameBlocked ? null : ownBusinessToolRefusal(call.name, skillsVisible);
         const refused = nameBlocked || blocked || admitDirectListCall(call.name, call.argsJson, directListSeen);
         if (blocked) ownBusinessRefused = true;
@@ -3368,7 +3506,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         noteWrapUpEvidence(wrapEvidence, call.name, rawText);
       }
       content = prepareToolResultText(call.name, rawText);
-      yield { type: "tool_result", id: call.id, name: call.name, ok, text: content };
+      yield {
+        type: "tool_result",
+        id: call.id,
+        name: call.name,
+        ok,
+        // 「闸门拒绝/跳过（未执行）」与「真执行失败」在 UI 上必须分开显示：
+        // 前者是黄色「未执行」+ 原因提示，后者才是红色「失败」。
+        executed,
+        text: content,
+      };
       // 注入防护：外部内容回灌模型前包成带 nonce 与来源的不可信数据块（指令与数据分离）。
       // 展示给用户的事件流仍是原文（UI 不受影响），只有模型看到的上下文被定界。
       const wrapped = wrapUntrusted(content, {

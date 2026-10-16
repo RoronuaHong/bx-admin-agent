@@ -67,8 +67,29 @@ function hasDateWindow(input) {
       return { bounded: true, days: Math.abs(b - a) / 86_400_000 };
     }
   }
-  const cmps = sql.match(/[<>]=?\s*'(\d{4}-\d{2}-\d{2})'/g);
-  if (cmps && cmps.length >= 1) return { bounded: true, days: Infinity };
+  // 裸列与日期字面量的比较：同时有下界(>=/>) 与上界(</<=) 时，算「上界最小 − 下界最大」的真实交集跨度，
+  // 与 BETWEEN 口径一致；`col = 'YYYY-MM-DD'` 视为单日窗（跨度 0）。只有单边（仅下界或仅上界）
+  // 才判 Infinity（无明确上界）。旧实现只要出现一个比较就一律 Infinity，会把 `col >= '起' AND col < '止'`
+  // 这种有界短窗误判成无上界/长窗，导致短窗裸列比较的重聚合被误报 HEAVY（2026-10-16 端到端复现）。
+  const lowers = [];
+  const uppers = [];
+  for (const m of sql.matchAll(/(>=|<=|>|<|=)\s*'(\d{4}-\d{2}-\d{2})'/g)) {
+    const d = Date.parse(m[2]);
+    if (Number.isNaN(d)) continue;
+    if (m[1] === "=") {
+      lowers.push(d);
+      uppers.push(d); // 单日等值：既是下界也是上界 → 跨度 0
+    } else if (m[1].startsWith(">")) {
+      lowers.push(d);
+    } else {
+      uppers.push(d);
+    }
+  }
+  if (lowers.length && uppers.length) {
+    const span = (Math.min(...uppers) - Math.max(...lowers)) / 86_400_000;
+    return { bounded: true, days: Math.max(0, span) };
+  }
+  if (lowers.length || uppers.length) return { bounded: true, days: Infinity }; // 单边：无明确上界
   return { bounded: false, days: Infinity };
 }
 

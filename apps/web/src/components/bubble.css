@@ -87,6 +87,12 @@
   background: var(--danger);
 }
 
+/* 未执行（闸门拒绝 / 同轮跳过 / 未授权 / 等待澄清）：琥珀警示色——
+   既不是成功的绿、也不是失败的红，避免让人误以为工具自己报错。 */
+.mcp-dot.warn {
+  background: var(--warn, #b26a00);
+}
+
 .mcp-dot.running {
   background: var(--accent);
   animation: mcp-pulse 1.4s var(--ease) infinite;
@@ -227,6 +233,12 @@ button.step-head:disabled {
 
 .step.err .mcp-dot {
   box-shadow: 0 0 0 3px var(--panel), 0 0 0 5px color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.step.warn .mcp-dot {
+  box-shadow:
+    0 0 0 3px var(--panel),
+    0 0 0 5px color-mix(in srgb, var(--warn, #b26a00) 30%, transparent);
 }
 
 .step-name {

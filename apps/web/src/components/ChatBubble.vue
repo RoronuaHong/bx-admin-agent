@@ -372,5 +372,11 @@ const alertBodyHtml = computed(() =>
 
 <!-- 气泡专用样式：从 chat-page.css 拆出，仅含 .row/.bubble/.md :deep(...) 等气泡规则，
      以本组件作用域编译命中气泡 DOM。共享类（.mcp-dot/.mcp-link/.confirm-text）在本文件与
-     chat-page.css 各留一份，分别服务气泡与页面两侧 DOM，避免任一侧漏样式。 -->
+     chat-page.css 各留一份，分别服务气泡与页面两侧 DOM，避免任一侧漏样式。
+
+     ⚠️ 改 bubble.css 之后**必须重启 web-dev**（vite dev）才会生效：本文件用
+     <style scoped src="..."> 引入，vite 不会因这个 .css 依赖变更去重新编译本 SFC，
+     改完刷新页面也看不到新规则（2026-10-17 实测：新增 .mcp-dot.warn 后页面 styleSheets
+     里只有 chat-page.css 那份 [data-v-32b89a82]，气泡侧 [data-v-3555f277] 规则缺失、
+     圆点没有背景色），重启 dev server 后气泡侧规则才编译进去。 -->
 <style scoped src="./bubble.css"></style>
