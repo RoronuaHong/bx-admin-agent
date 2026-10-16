@@ -167,7 +167,7 @@ WHERE user = 'metabase_user' AND event_time > now() - INTERVAL 1 DAY;
 - `defaultClickHouseSettings` 在原有 `max_execution_time` + 聚合/排序落盘两项基础上补齐（全部 env 可配，与 P0 profile 对齐且略保守）：
   - `max_result_rows = 1_000_000` + `result_overflow_mode = 'break'` —— 结果集超阈截断，治"结果物化成本"（P0 未做时 P1 兜底；`runSql` 的 `limit=200` 只是展示层 slice，ClickHouse 仍算全量，故此条关键）。
   - `timeout_overflow_mode = 'throw'` —— 超 `max_execution_time` 直接中断，显式写出更稳。
-  - `max_estimated_execution_cost`（env `BI_CH_MAX_ESTIMATED_COST`，默认 `0`=关闭）—— 查询前基于规划估算成本硬拦，超过则**执行前直接拒绝**，不先跑再爆（对应文档 6.5.1）；默认关闭以避免误杀合法大查询，由运维/DBA 按经验开启保守阈值。
+  - `max_estimated_execution_time`（env `BI_CH_MAX_ESTIMATED_TIME`，默认 `0`=关闭）—— 查询前基于规划估算执行时间的硬拦，超过则**执行前直接拒绝**，不先跑再爆（对应文档 6.5.1）。**注意**：ClickHouse 24.2 没有 `max_estimated_execution_cost`（会 UNKNOWN_SETTING 致整条查询 400），故改用内建的 `max_estimated_execution_time`（基于成本估算的执行时间上限，单位秒）；默认关闭以避免误杀合法大查询，由运维/DBA 按经验开启保守阈值。
 - `appendClickHouseSettings` 字符串值（如 `result_overflow_mode='break'`）自动加单引号，避免 SQL 语法非法；数字值不加引号，保持原行为。
 - **仍不做** DBA 侧 P0（profile / QUOTA / `max_concurrent_queries_for_user` / 只读副本 / Metabase 超时对齐）—— 那些由平台/DBA 负责，见第六节的 6.1–6.4。
 
@@ -227,7 +227,7 @@ max_concurrent_queries_for_user = 4;  -- metabase_user 同时最多 4 条查询
 
 仅服务端限流不够，Agent 自身也应加护栏，从源头减少重查询：
 
-1. **查询成本预估（fail-closed 前置）**：ClickHouse 提供 `max_estimated_execution_cost`——基于查询规划估算执行成本，超过即**查询前拒绝**（不先跑再爆），比现有 fail-open lint 更前一步。可对"明显会爆"的形态（如 `uniqExact` 全历史无窗）先用 `EXPLAIN`/估算成本做硬拦，其余仍 fail-open 提示。
+1. **查询成本预估（fail-closed 前置）**：ClickHouse 提供 `max_estimated_execution_time`——基于查询规划估算执行时间，超过即**查询前拒绝**（不先跑再爆），比现有 fail-open lint 更前一步（已在 `defaultClickHouseSettings` 落地，env `BI_CH_MAX_ESTIMATED_TIME` 默认关闭）。注意 `max_estimated_execution_cost` 在 24.2 不存在（UNKNOWN_SETTING），故不用。可对"明显会爆"的形态（如 `uniqExact` 全历史无窗）先用 `EXPLAIN`/估算成本做硬拦，其余仍 fail-open 提示。
 2. **结果缓存 / 去重**（已落地，见 6.5.2）：R4 证据显示同一会话连续 10+ 条 `uniqExact` 反复换口径——应在 Agent 层对同一对话内的相似查询做结果缓存/复用，避免重复跑同一重查询。
 3. **Human-in-the-loop**：对预估成本超阈（如预计扫 >X 行 / 跑 >Y s）的查询，先让用户确认再执行，而非静默发出。
 4. **速率/并发限制（per session）**：单会话单位时间内的重查询次数/并发上限（与服务端 `max_concurrent_queries_for_user` 互为补充，Agent 侧更早拦截、用户体验更好）。**暂未落地**：`runSql` 当前无会话维度入参，per-session 限流需改工具 schema + agent 调用方传 `conversation_id`，改动较大；短期依赖服务端 `QUOTA` / `max_concurrent_queries_for_user`（6.2/6.3）兜底。
@@ -264,7 +264,7 @@ timeout_overflow_mode = 'throw',   -- 超 max_execution_time 直接中断（默�
 | P0-中 | `max_concurrent_queries_for_user` 并发限制 | DBA | 待办 |
 | P0-中 | Metabase 连接指向只读副本 | DBA/平台 | 待办 |
 | P1-中 | 代码 `SETTINGS` 补齐 `max_result_rows` / `result_overflow_mode` / `timeout_overflow_mode` | 我们 | 已落地 |
-| P2-低 | Agent 层查询成本预估硬拦（`max_estimated_execution_cost` 已加为 SETTINGS 机制，默认关闭，env 可开） | 我们 | 已落地(机制) |
+| P2-低 | Agent 层查询成本预估硬拦（`max_estimated_execution_time` 已加为 SETTINGS 机制，默认关闭，env 可开；`max_estimated_execution_cost` 在 24.2 不支持已弃用） | 我们 | 已落地(机制) |
 | P2-低 | Agent 层结果缓存/去重（进程内，已落地，见 6.5.2） | 我们 | 已落地 |
 | P2-低 | Agent 层会话级速率限制 / 高成本 HITL 确认（需会话维度，暂未做，依赖服务端 QUOTA） | 我们 | 待评估 |
 
@@ -285,9 +285,19 @@ timeout_overflow_mode = 'throw',   -- 超 max_execution_time 直接中断（默�
 1. **[已修复] `HEAVY_EXACT_AGG_NOWINDOW` 漏覆盖 `count(distinct ...)` 大窗**：原正则只认 `uniqExact()`，日活常用的 `count(distinct guid)` 近一月只被判「退化变慢」、没被判「内存爆库」。`sql-lint-common.mjs` 已把精确去重大类扩展到 `uniqExact(...)` 与 `count(DISTINCT ...)` 同等对待；新增 `[R]` 回归测试固化（见 `tests/sql-lint.test.ts`）。
 2. **[已补强·对齐最新实践] 优先复用预聚合表**：日活/留存/会员存量/漏斗这类指标，正确做法是走预聚合物化视图（`_mv`/`_daily`/`_retention`）或现成 Metabase 卡片，而不是每次 `uniqExact(uid)` 对全量明细宽表扫 30 天——后者既慢又易爆库，正是事故根因形态。`skills/business-data-query/SKILL.md` 资源纪律已加第 0 条「优先复用现成聚合」，并提示先用 `list_cards`/`get_card` 找现成卡片。`SETTINGS` 兜底只是「防爆库」，预聚合才是「从源头把正常查询成本降几个数量级」。
 3. **[趋势参考] ClickHouse 26.7 原生支持「TopK 查询条件缓存」**：说明查询缓存是官方认可方向，与我们的进程内缓存去重（6.5.2）互补——我们在应用层（MCP），原生在引擎层（跨查询/跨用户），可叠加。
-4. **[呼应] `EXPLAIN` / `system.query_log` 取证成本**：与已加但默认关闭的 `max_estimated_execution_cost` 思路一致——对重查询先预估成本再执行。是否默认开启仍建议由 DBA/运维按经验定（避免误杀合法大查询）。
+4. **[呼应] `EXPLAIN` / `system.query_log` 取证成本**：与已加但默认关闭的 `max_estimated_execution_time` 思路一致——对重查询先预估成本再执行。是否默认开启仍建议由 DBA/运维按经验定（避免误杀合法大查询）。
 
 ### 7.3 仍存在的边界（如实记录）
 - 缓存是按「SQL 内容」去重、不含会话维度，故无法合并「同一会话内不同口径的相似查询」（语义级去重需模型/规划层，不在本层）。
 - `max_result_rows=1_000_000` 截断对聚合结果足够，但对「退订会员明细」这类大结果集仍可能物化百万行；如需更紧，可下调该默认值或按查询类型区别。
 - 会员退订下降的真正归因（哪些会员/渠道/类型退订）是分析建模问题，护栏只能保证「这类查询跑得动、不爆库、口径正确」，归因结论仍需模型基于正确数据去推导。
+
+### 7.4 线上回归与修复（2026-10-16 17:45，本次端到端测试发现）
+用 chrome-devtools 真实走 `/chat` 端到端测试时，新对话启用 BI 数仓后**所有 BI 查询 `[400]` 上游拒绝**，错误 `Code: 115 UNKNOWN_SETTING: Setting max_estimated_execution_cost ... Maybe you meant ['max_estimated_execution_time']`。
+
+- **根因**：`defaultClickHouseSettings` 把 `max_estimated_execution_cost` 默认设为 `0`（关闭态）；`appendClickHouseSettings` 当时只跳过 `undefined/null/""`，**不跳过 `0`**，于是 `max_estimated_execution_cost=0` 被追加到**每一条**查询的 `SETTINGS` 末尾；而目标 ClickHouse `24.2.1.2248` 根本不认识该 setting → 整条查询 400。这是 2026-10-16 下午提交引入的回归（上午的历史对话用旧代码，故当时成功）。
+- **修复**：
+  1. setting 改名 `max_estimated_execution_time`（ClickHouse 24.x 内建，基于成本估算的执行时间上限，单位秒）；环境变量 `BI_CH_MAX_ESTIMATED_COST` → `BI_CH_MAX_ESTIMATED_TIME`。`max_estimated_execution_cost` 在 24.2 不存在，彻底弃用。
+  2. `appendClickHouseSettings` 循环跳过数值 `0`（0 = 关闭/不限制，不追加），双保险。
+  3. 测试新增 `[S8]` 固化该回归（默认 settings 追加后不得出现任何 `=0` 或旧名）。
+- **教训**：给 ClickHouse 追加 `SETTINGS` 前必须确认目标 CK 版本支持该 setting；且「关闭态的 0 值」绝不能追加进 SQL——否则会让整条查询失败，比不设这道护栏更糟。

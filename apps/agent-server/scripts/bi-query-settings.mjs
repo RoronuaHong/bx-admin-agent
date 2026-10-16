@@ -36,9 +36,11 @@ export function defaultClickHouseSettings(env = process.env) {
     result_overflow_mode: (env["BI_CH_RESULT_OVERFLOW_MODE"] || "break").toString(),
     // 超 max_execution_time 直接中断（默认 throw，显式写出更稳；根治 R3「假超时」需配合 Metabase 超时对齐，见文档 6.1）。
     timeout_overflow_mode: (env["BI_CH_TIMEOUT_OVERFLOW_MODE"] || "throw").toString(),
-    // 查询前基于规划估算成本的硬拦：超过则执行前直接拒绝（不先跑再爆），比 fail-open lint 更前一步（文档 6.5.1）。
+    // 查询前基于规划估算执行时间的硬拦：超过则执行前直接拒绝（不先跑再爆），比 fail-open lint 更前一步（文档 6.5.1）。
+    // 用 max_estimated_execution_time（ClickHouse 24.x 内建，基于成本估算的执行时间上限，单位秒）；
+    // 注意 max_estimated_execution_cost 在 24.2 不存在（会触发 UNKNOWN_SETTING 让整条查询 400 失败），故不用。
     // 默认 0 = 不限制（关闭），避免误杀合法大查询；由运维/DBA 按经验开启一个保守阈值。
-    max_estimated_execution_cost: num("BI_CH_MAX_ESTIMATED_COST", 0),
+    max_estimated_execution_time: num("BI_CH_MAX_ESTIMATED_TIME", 0),
   };
 }
 
@@ -70,7 +72,9 @@ export function appendClickHouseSettings(sql, settings) {
   if (alreadyHasSettings(sql)) return sql; // 已声明，不重复
   const clauses = [];
   for (const [k, v] of Object.entries(settings)) {
-    if (v === undefined || v === null || v === "") continue;
+    // 数值 0 视为「关闭/不限制」：不追加。否则会把 CK 不支持的 setting（或无效值）带上，
+    // 触发 UNKNOWN_SETTING 让整条查询 400 失败（见 2026-10-16 线上回归：max_estimated_execution_cost=0 被追加）。
+    if (v === undefined || v === null || v === "" || v === 0) continue;
     // 字符串值（如 result_overflow_mode='break'）必须加引号，否则 SQL 语法非法；
     // 数字值（max_execution_time 等）不加引号，保持原行为。
     const val = typeof v === "string" ? `'${v}'` : v;
