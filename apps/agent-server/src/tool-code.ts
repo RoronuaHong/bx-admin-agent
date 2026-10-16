@@ -155,6 +155,79 @@ function readLine(sock: Socket): Promise<string> {
   });
 }
 
+/**
+ * 语言错配预检：把「两种语言的 API 记混了」这类错误**在跑之前**拦下来。
+ *
+ * 为什么值得单独做（实测踩到）：工具描述里已经写明「Node 用 `await callTool(...)`、
+ * Python 用 `call_tool(...)`」，但弱模型经常照着另一种语言的写法提交。跑下去得到的是
+ * 解释器原始报错（Python 的 `SyntaxError: invalid syntax` 指向 `await`、或 JS 的
+ * `console.log is not defined` 之类），既不指出"语言选错了"，也不告诉它正确写法——
+ * 模型只能再猜一次，实测一次运行里因此白费 4~11 次调用。
+ *
+ * 判据只用**两种语言各自的语法标志**（协议层，不含任何业务语义）：
+ *   · Python 里出现 JS 专有写法（顶层 await / console.log / `=>` 箭头 / `const|let`）→ 疑似按 JS 写的；
+ *   · Node 里出现 Python 专有写法（`print(` / `def ` / `elif ` / `True|False|None`）→ 疑似按 Python 写的。
+ * 命中即返回可操作提示，不启动子进程（省一轮预算，也避免半途副作用）。
+ */
+/**
+ * 扫描前先剥掉字符串字面量与注释——否则 `print('const x = 1')` 这类**合法 Python**
+ * 会因为字面量里的关键字被误判成语言错配（与 src/sql-readonly.ts 判定前脱引号同理：
+ * 判据只认真实语法，不被字面量与注释里的字符误导）。
+ */
+function stripCodeNoise(code: string): string {
+  return code
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n\r]*/g, "$1 ")
+    .replace(/"""[\s\S]*?"""/g, '""')
+    .replace(/'''[\s\S]*?'''/g, "''")
+    .replace(/"(?:[^"\\\r\n]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\\r\n]|\\.)*'/g, "''")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``");
+}
+
+export function detectToolCodeLanguageMismatch(language: string, code: string): string | null {
+  const lang = language.trim().toLowerCase();
+  const python = lang === "python" || lang === "py";
+  const node = lang === "node" || lang === "js" || lang === "javascript" || lang === "";
+  const src = stripCodeNoise(String(code || ""));
+  if (python) {
+    const jsMarkers = [
+      { re: /(^|[^.\w])await\s+[A-Za-z_$]/, hint: "顶层 await" },
+      { re: /console\.\w+\s*\(/, hint: "console.log" },
+      { re: /=>/, hint: "箭头函数 =>" },
+      { re: /(^|[^.\w])(const|let)\s+[A-Za-z_$]/, hint: "const/let 声明" },
+    ].filter((m) => m.re.test(src));
+    if (jsMarkers.length) {
+      return (
+        `语言错配：这次 language 选了 python，但代码里出现了 JavaScript 写法（${jsMarkers
+          .map((m) => m.hint)
+          .join("、")}）。` +
+        "Python 里调用只读工具请写 `call_tool(工具全名, 参数对象)`，不要写 await / console.log / 箭头函数；" +
+        "想用 JS 写法就把 language 改成 node。"
+      );
+    }
+    return null;
+  }
+  if (node) {
+    const pyMarkers = [
+      { re: /(^|[^.\w])print\s*\(/, hint: "print()" },
+      { re: /(^|\s)def\s+[A-Za-z_]/, hint: "def 函数定义" },
+      { re: /(^|\s)elif\s/, hint: "elif 分支" },
+      { re: /(^|[^.\w])(True|False|None)\b/, hint: "True/False/None" },
+    ].filter((m) => m.re.test(src));
+    if (pyMarkers.length) {
+      return (
+        `语言错配：这次 language 选了 node，但代码里出现了 Python 写法（${pyMarkers
+          .map((m) => m.hint)
+          .join("、")}）。` +
+        "Node 里调用只读工具请写 `await callTool(工具全名, 参数对象)`，输出用 console.log；" +
+        "想用 Python 写法就把 language 改成 python。"
+      );
+    }
+  }
+  return null;
+}
+
 export async function runToolCode(opts: {
   language: string;
   code: string;
@@ -170,6 +243,9 @@ export async function runToolCode(opts: {
     return { ok: false, text: `run_tool_code 不支持的语言：${language || "(空)"}（支持 node/js/javascript、python/py）` };
   }
   if (!opts.code.trim()) return { ok: false, text: "run_tool_code 需要 code" };
+  // 语言错配在起子进程之前拦下：错一次就白费一轮，给原始 traceback 等于让它再猜一次。
+  const mismatch = detectToolCodeLanguageMismatch(language, opts.code);
+  if (mismatch) return { ok: false, text: mismatch };
   mkdirSync(opts.cwd, { recursive: true });
   const token = randomBytes(16).toString("hex");
   let calls = 0;

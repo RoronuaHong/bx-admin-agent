@@ -1,0 +1,280 @@
+{
+  "version": 1,
+  "meta": {
+    "source": "2026-10-14 取数类对话「零进展」事故（run_c284e83d-e327-458c-ae6c-52de5a0d8bb1）",
+    "doc": "docs/agent-stall-incident-20261014.md",
+    "redaction": "零业务词：国家线 / 指标 / 维度 / 归因目标一律不出现；工具一律用 role 字段指代，不写真实工具名；只保留基础设施语义与计数。",
+    "tiers": {
+      "L0": "事故快照（本文件）：脱敏轨迹特征 + 期望行为，供回归测试与脚本引用",
+      "L1": "确定性回归：mock SSE 驱动真实主流程，断言护栏行为（进 CI）",
+      "L2": "trace 级断言：真实运行后读逐轮/span 落盘断言形态（人工触发）",
+      "L3": "在线评测：真实运行持续打分（只观测、不断言）"
+    },
+    "split": "public 进仓库供 CI 引用；private 仅本地保留（真实失败正文、真实对象名），避免只对少数任务过拟合。"
+  },
+  "observedShape": {
+    "note": "本次事故的真实计数，作为回归对照基线；数值口径来自逐轮 trace 与 span 埋点。",
+    "wallClockMs": 1423658,
+    "staleMsBeforeWatchdog": 627,
+    "watchdogThresholdMs": 600,
+    "modelCalls": 74,
+    "modelCallsFailed": 40,
+    "modelCallsFailedAfterAbort": 39,
+    "externalToolCalls": 48,
+    "externalToolCallsFailed": 7,
+    "builtinToolCalls": 5,
+    "builtinToolCallsFailed": 3,
+    "mainLoopRounds": 23,
+    "subagentRounds": 5,
+    "synthesisRounds": 0,
+    "oneQueryToolCalls": 10,
+    "oneQueryToolCallsFailed": 6,
+    "oneQueryTimeoutCount": 1,
+    "oneQueryTimeoutMs": 30002,
+    "metadataProbeCalls": 24,
+    "toolResultsOffloaded": 45,
+    "toolResultsTrimmed": 0,
+    "longestModelCallMs": 180007,
+    "candidatesProbedBeforeWork": 5,
+    "quotaExhaustedCandidates": 4
+  },
+  "cases": [
+    {
+      "id": "daily-quota-cooldown-aligns-to-utc-day",
+      "tier": "L1",
+      "title": "每日配额型限流应冷却到配额重置点，而不是固定小时数",
+      "shape": "开场按链顺序探测模型，前若干个返回每日配额型限流",
+      "inject": [
+        "首候选返回 429，正文含每日配额型标识（实现侧判定见文档 §4.4）",
+        "同一进程内紧接着发起第二个请求"
+      ],
+      "expectedBehavior": [
+        "该候选进入冷却，冷却终点不早于下一个配额重置点",
+        "第二个请求的候选链不再包含它",
+        "整轮不因限流失败而丢掉其余候选"
+      ],
+      "assertions": [
+        "冷却时长计算为纯函数且可单测（给定时间戳 → 期望冷却终点）",
+        "同进程第二个请求的开场探测次数下降",
+        "限流类失败不进瞬时重试（不做无意义退避重打）"
+      ],
+      "regression": "P0-1",
+      "fixtureAssertions": {
+        "quotaExhaustedCandidates": 4,
+        "expectProbesOnSecondRequest": 0
+      }
+    },
+    {
+      "id": "tool-failure-uses-window-not-streak",
+      "tier": "L1",
+      "title": "工具错误率熔断：交替失败也必须摘除，成功一次不得把风险清零",
+      "shape": "同一只读外部工具在窗口内错误与成功交错",
+      "inject": [
+        "同一工具连续 6 次调用，其中 3 次失败、3 次成功（失败被成功分隔）",
+        "另一工具持续成功，作为对照组"
+      ],
+      "expectedBehavior": [
+        "达到阈值后该工具被摘除，不再真实执行",
+        "摘除时回灌提示包含可执行动作：换工具 / 换取证路径 / 先给部分结论",
+        "持续成功的对照工具不受影响"
+      ],
+      "assertions": [
+        "滑动窗口判据在交替失败序列上触发摘除（连续计数判据在此序列下不触发，这是本次事故的直接成因）",
+        "全成功序列不触发摘除",
+        "摘除状态可被显式解除并在回灌中说明"
+      ],
+      "regression": "P1-1",
+      "fixtureAssertions": {
+        "oneQueryToolCalls": 10,
+        "oneQueryToolCallsFailed": 6,
+        "expectFusedAfterWindowThreshold": true
+      }
+    },
+    {
+      "id": "tool-error-text-is-actionable-for-model",
+      "tier": "L1",
+      "title": "工具失败文案要让模型知道下一步怎么做，而不只是让运维知道调哪个旋钮",
+      "shape": "外部查询超时或被上游拒绝",
+      "inject": ["外部查询工具返回超时或上游错误"],
+      "expectedBehavior": [
+        "回灌文本含可操作建议（缩小查询范围 / 增加过滤 / 分页 / 先取摘要再取明细）",
+        "标明本次失败是否可重试",
+        "区分「完全没拿到」与「拿到一部分」",
+        "不把内部实现细节与运维参数名当作唯一指引交给模型"
+      ],
+      "assertions": [
+        "超时文案含可操作建议与 retryable 标记",
+        "部分成功场景不返回整体失败语义",
+        "文案零业务词"
+      ],
+      "regression": "P1-5②",
+      "fixtureAssertions": {
+        "oneQueryTimeoutCount": 1,
+        "expectActionableHint": true
+      }
+    },
+    {
+      "id": "same-tool-repeat-budget",
+      "tier": "L1",
+      "title": "跨轮重复探查：参数不同也算重复",
+      "shape": "模型反复拉取同一元数据工具（每次对象不同）",
+      "inject": ["同一元数据工具在单轮内被并发调用多次，整轮累计远超预算"],
+      "expectedBehavior": [
+        "触发重复探查提示（参数全等与同工具高次数两类判据都覆盖）",
+        "提示告诉模型已有结果在哪、如何避免重探",
+        "不硬拦（数据可能确实需要刷新）"
+      ],
+      "assertions": [
+        "同工具单轮次数超阈值即触发提示",
+        "整轮累计超阈值即触发提示",
+        "本次事故轨迹回放应能命中该提示（原有判据只认参数全等，完全逃过）"
+      ],
+      "regression": "P1-2",
+      "fixtureAssertions": {
+        "metadataProbeCalls": 24,
+        "expectRepeatHintTriggered": true
+      }
+    },
+    {
+      "id": "subagent-status-contract",
+      "tier": "L1",
+      "title": "子代理必须能区分「没找到」与「没跑完」",
+      "shape": "子代理零发现返回 / 失败返回 / 被外部中止",
+      "inject": [
+        "子代理返回零发现",
+        "子代理执行失败",
+        "子代理在长耗时调用中被外部中止"
+      ],
+      "expectedBehavior": [
+        "回传带结构化状态（成功 / 部分 / 零发现 / 失败）与覆盖范围、错误信息",
+        "零发现不计入父轮接地证据",
+        "被中止时父轮不得把它当普通失败静默吞掉",
+        "父轮必须给用户一句如实交代，不把「未完成」说成「已完成」"
+      ],
+      "assertions": [
+        "状态字段缺失时按失败处理（fail-closed）",
+        "失败或零发现回传不增加父轮证据计数",
+        "父轮收到失败状态后仍能继续下一轮或如实收束"
+      ],
+      "regression": "P1-3",
+      "fixtureAssertions": {
+        "subagentRounds": 5,
+        "synthesisRounds": 0,
+        "expectStatusFieldPresent": true
+      }
+    },
+    {
+      "id": "wrap-up-survives-external-abort",
+      "tier": "L1",
+      "title": "被外部中止时也要有结论",
+      "shape": "已有大量证据，但末轮被外部中止（看门狗 / 客户端取消）",
+      "inject": ["循环末轮 signal 被 abort，且此前已取得证据"],
+      "expectedBehavior": [
+        "仍执行一次带独立短 deadline 的收尾（忽略已中止的 signal）",
+        "正文回答「已取到什么 + 还缺什么」，不落通用兜底句",
+        "收束后如实标记本轮未完成"
+      ],
+      "assertions": [
+        "收尾调用在中止状态下仍成功产出文本",
+        "有证据时不得落兜底句（本次因条件含「无失败」而跳过，39 条证据全废）",
+        "收尾自身有独立超时，不会因原 signal 已死而立即失败"
+      ],
+      "regression": "P1-4",
+      "fixtureAssertions": {
+        "toolResultsOffloaded": 45,
+        "expectConclusionNotGapSentence": true
+      }
+    },
+    {
+      "id": "abort-short-circuits-candidate-sweep",
+      "tier": "L1",
+      "title": "中止信号必须短路候选链",
+      "shape": "运行被外部中止后，候选链仍逐个尝试剩余模型",
+      "inject": ["首候选执行期间触发 abort"],
+      "expectedBehavior": [
+        "abort 后不再对剩余候选发起真实调用",
+        "不产生「重试瞬时失败」类的噪音日志与 span",
+        "终态如实标记为中止而非失败"
+      ],
+      "assertions": [
+        "abort 后模型调用次数不再增长",
+        "span 中不出现成批的瞬时中断记录"
+      ],
+      "regression": "P1-4 附带项",
+      "fixtureAssertions": {
+        "modelCallsFailedAfterAbort": 39,
+        "expectCallsAfterAbort": 0
+      }
+    },
+    {
+      "id": "sse-inline-error-becomes-status",
+      "tier": "L1",
+      "title": "流内限流必须被识别，不能当成空回合",
+      "shape": "流式响应已开始后才下发限流错误（供应商以错误事件形式返回）",
+      "inject": ["流中途下发错误事件（含错误对象与结束原因标记）"],
+      "expectedBehavior": [
+        "归一化为带状态码的失败（进入现有冷却与候选切换逻辑）",
+        "不按「模型空回合」处理",
+        "计入稳定性维度"
+      ],
+      "assertions": [
+        "解析层识别流内错误并产出带状态码的失败（现实现只读增量字段，完全无视错误帧）",
+        "该失败被判定为需要冷却的模型级失败",
+        "不会额外消耗空回合重试预算"
+      ],
+      "regression": "P1-5①",
+      "fixtureAssertions": {
+        "expectStatusCodeFromInlineError": 429
+      }
+    },
+    {
+      "id": "tool-error-observability",
+      "tier": "L1",
+      "title": "工具失败必须可复盘：分类 + 摘要落盘",
+      "shape": "任意工具失败",
+      "inject": ["构造超时 / 被拒 / 上游错误 / 结构错误四类失败"],
+      "expectedBehavior": [
+        "span 记录错误分类与脱敏后的短摘要",
+        "同一次运行可在事后复原「哪一步失败、为什么失败」"
+      ],
+      "assertions": [
+        "四类错误各自打上正确分类",
+        "摘要中的凭据形态被打码",
+        "本次事故形态（6 次外部查询失败原因不可复原）视为该用例的失败基线"
+      ],
+      "regression": "P2-1",
+      "fixtureAssertions": {
+        "externalToolCallsFailed": 7,
+        "expectErrorKindRecorded": true
+      }
+    },
+    {
+      "id": "online-eval-catches-stall",
+      "tier": "L3",
+      "title": "在线评测必须能把这类轨迹判为 poor",
+      "shape": "本次事故轨迹回放",
+      "inject": ["把本次运行的 trace 喂给在线打分"],
+      "expectedBehavior": [
+        "判定为 poor",
+        "未达标维度包含收敛类与工具健康类（而非只报耗时）"
+      ],
+      "assertions": [
+        "打分结果为 poor 且失败维度可解释",
+        "缺字段的维度不计入分母（诚实优先）",
+        "本次事故在该打分下不应被判为 good"
+      ],
+      "regression": "P2-2",
+      "fixtureAssertions": {
+        "expectVerdict": "poor"
+      }
+    }
+  ],
+  "excludedFromFixtures": {
+    "note": "以下内容刻意不写入本文件，按 private 处理或以文档指针替代。",
+    "items": [
+      "真实提问原文与业务口径（国家线 / 指标 / 归因目标）→ 仅存于运行 trace 的 userText 字段",
+      "真实工具名与对象名（外部查询、元数据探查、代码桥的真实英文名）→ 仅存于源码与文档 §8",
+      "6 次外部查询失败的真实正文 → 现存于任何落盘数据之前不可得，正是 P2-1 的修复目标"
+    ]
+  }
+}

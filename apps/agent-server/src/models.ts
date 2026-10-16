@@ -47,6 +47,12 @@ export interface ToolResultTurn {
   toolCallId: string;
   name: string;
   content: string;
+  /**
+   * 内容是「多轮子过程推导出来的」（如子代理交接），不是再调一次工具就能拿回的。
+   * 上下文治理据此把它归为**不可重放**：最后才卸载，且落盘失败时保留原文而不是清成占位符
+   * （见 `tool-result-governance.ts`）。未标 = 可原样重放。
+   */
+  derived?: boolean;
 }
 
 export type Turn = ModelTurn | ToolResultTurn;
@@ -102,6 +108,13 @@ export interface CallOptions {
    * `dynamic` 低频变化（记忆 / 摘要 / 语言）。OpenAI 兼容通道的隐式前缀缓存无需标记。
    */
   systemParts?: { stable: string; dynamic: string };
+  /**
+   * 运行级重试预算的**取用回调**（第 8 批，对齐 AWS「只在一层重试」）：
+   * 多 key 轮换本身也是一层重试，换下一个 key 之前先过这个回调；返回 false 表示预算已耗尽，
+   * 于是**不再换 key**，把失败响应原样交给上层（走冷却分类 / 切候选），不再叠加。
+   * 不传 = 不限额（既有行为，测试与直连路径不受影响）。
+   */
+  spendRetry?: () => boolean;
 }
 
 export async function callAgent(
@@ -177,10 +190,16 @@ let keyRotationCounter = 0;
  * 按 key 池逐个尝试发起请求：当前 key 遇 429（限流）/5xx（服务端错误）或网络异常时，
  * 自动切换池中下一个 key 重试（最多 pool.length 轮）。4xx（如 401/403）等不可重试错误
  * 原样返回，交由上层错误处理。
+ *
+ * 换 key 是**一次重试**：给了 `spendRetry` 就先从运行级预算取用，取不到即停（不再换下一个 key）。
+ * 否则「N 个 key × 每层各 N 次重试」会乘起来 —— 事故复盘里 abort 后的 39 条无效调用正是这种叠加。
+ * 停在原样返回（而不是抛异常）是刻意的：429/5xx 响应要交给上层的冷却分类与候选切换，
+ * 那才是真正该发生的事；换 key 只是同一台上游的横向冗余。
  */
 async function fetchWithKeyRotation(
   model: ModelEntry,
   attempt: (key: string) => Promise<Response>,
+  spendRetry?: () => boolean,
 ): Promise<Response> {
   const pool = model.apiKeys.length ? model.apiKeys : model.apiKey ? [model.apiKey] : [""];
   if (pool.length <= 1) return attempt(pool[0] || "");
@@ -193,6 +212,8 @@ async function fetchWithKeyRotation(
       if (res.ok) return res;
       if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
         lastErr = new Error(`model http ${res.status}`);
+        // 预算耗尽：把这条失败响应原样交回上层分类（冷却 / 切候选），不再横向铺开。
+        if (spendRetry && !spendRetry()) return res;
         continue;
       }
       return res; // 4xx 等不可重试，原样返回
@@ -200,6 +221,7 @@ async function fetchWithKeyRotation(
       lastErr = e instanceof Error ? e : new Error(String(e));
       // 超时/中断不再重试（避免无限拖慢响应）
       if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) throw e;
+      if (spendRetry && !spendRetry()) throw lastErr;
       continue;
     }
   }
@@ -210,6 +232,51 @@ function timeoutSignalOf(model: ModelEntry, signal?: AbortSignal): AbortSignal {
   return signal
     ? AbortSignal.any([signal, AbortSignal.timeout(model.timeoutMs)])
     : AbortSignal.timeout(model.timeoutMs);
+}
+
+/**
+ * 归一化「流内错误」：**响应已经开始之后**才下发的错误帧。
+ *
+ * 为什么必须单独认：不少网关（含 OpenRouter）在流式响应发出后才把限流/配额错误
+ * 写进 SSE（错误对象 + `finish_reason: "error"`），此时 HTTP 状态码早已是 200。
+ * 原实现只读 `choices[0].delta`，于是这类帧被**静默丢弃**：整轮读成「模型空回合」——
+ * 既不记状态码、也不进冷却表、也不切候选，只白白消耗空回合重试预算
+ * （2026-10-14 事故复盘 §4.4 记录的盲区，此前从未被触发过）。
+ *
+ * 归一化成既有形态 `model http <code>: <message>`，就能直接复用
+ * `isModelDownFailure` / `isDailyQuotaFailure` / 冷却表 / 候选切换这一整条既有链路。
+ *
+ * 无显式状态码时按文案归类：命中限流/配额 → 429（否则配额型错误会被当成 502 而只冷却 10 分钟），
+ * 其余按上游/网关 502。返回 null = 这一帧不是错误。
+ */
+export function normalizeInlineStreamError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const frame = payload as {
+    error?: unknown;
+    choices?: Array<{ finish_reason?: unknown } | undefined>;
+  };
+  const raw = frame.error;
+  const finishedAsError =
+    Array.isArray(frame.choices) && frame.choices.some((choice) => choice?.finish_reason === "error");
+  if (!raw && !finishedAsError) return null;
+
+  let code = 0;
+  let message = "";
+  if (typeof raw === "string") {
+    message = raw;
+  } else if (raw && typeof raw === "object") {
+    const err = raw as { code?: unknown; message?: unknown };
+    const numeric = typeof err.code === "number" ? err.code : Number(err.code);
+    code = Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+    message = String(err.message ?? "");
+  }
+  if (!code) {
+    code = /(?:rate.?limit|too\s+many\s+requests|\b429\b|free-models-per-day|freeusagelimit|quota|限流)/i.test(message)
+      ? 429
+      : 502;
+  }
+  const detail = message.trim().slice(0, 200);
+  return `model http ${code}${detail ? `: ${detail}` : ""}`;
 }
 
 /** 转成 anthropic 消息：工具结果用 user 消息里的 tool_result 块回灌（与官方文档一致）。 */
@@ -312,6 +379,7 @@ async function callAnthropic(
       body: JSON.stringify(body),
       signal: timeoutSignalOf(model, signal),
     }),
+    opts.spendRetry,
   );
   const isStream = (response.headers.get("content-type") || "").includes("text/event-stream");
   if (!isStream) {
@@ -387,11 +455,20 @@ async function callAnthropic(
         index?: number;
         delta?: { type?: string; text?: string; thinking?: string; partial_json?: string; stop_reason?: string };
         content_block?: { type?: string; id?: string; name?: string };
+        error?: { type?: string; message?: string };
       };
       try {
         event = JSON.parse(payload);
       } catch {
         continue;
+      }
+      // 同样的盲区：Anthropic 形状的错误事件（{"type":"error",...}）此前也会被静默丢弃，
+      // 整轮读成空回合。这里归一化后复用同一套冷却/候选逻辑（overloaded → 503 对齐本仓既有口径）。
+      if (event.type === "error") {
+        const kind = String(event.error?.type || "");
+        const message = String(event.error?.message || kind || "上游错误");
+        const code = /overload/i.test(kind) ? 503 : 502;
+        throw new Error(`model http ${code}: ${message.slice(0, 200)}`);
       }
       if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
         const index = typeof event.index === "number" ? event.index : 0;
@@ -719,6 +796,7 @@ async function callOpenAi(
         body: JSON.stringify(body),
         signal: timeoutSignalOf(model, signal),
       }),
+      opts.spendRetry,
     );
   };
 
@@ -823,6 +901,7 @@ async function callOpenAi(
       }
       let chunk: {
         choices?: Array<{
+          finish_reason?: string | null;
           delta?: {
             content?: string | null;
             reasoning?: string | null;
@@ -832,12 +911,17 @@ async function callOpenAi(
             tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
           };
         }>;
+        error?: unknown;
       };
       try {
         chunk = JSON.parse(payload);
       } catch {
         continue;
       }
+      // 流内错误帧：HTTP 已是 200，错误只出现在这里。不认它就等于把限流读成「模型没说话」，
+      // 代价是既不记状态码也不切候选（见 normalizeInlineStreamError 的说明）。
+      const inlineError = normalizeInlineStreamError(chunk);
+      if (inlineError) throw new Error(inlineError);
       const delta = chunk.choices?.[0]?.delta;
       const content = delta?.content;
       if (content) {

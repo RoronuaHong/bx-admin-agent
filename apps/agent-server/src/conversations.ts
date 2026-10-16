@@ -301,16 +301,20 @@ export async function getConversation(id: string): Promise<ConversationDoc | nul
   }
   const doc = await coll.find({ id }).sort({ updatedAt: -1 }).limit(1).next();
   if (!doc) return null;
-  const { _id, ...rest } = doc;
+  const { _id, updatedAt: readVersion, ...rest } = doc;
   const raw = (rest.messages ?? []) as StoredMessage[];
   const messages = compactSnapshot(raw);
   if (messages.some((message, index) => message !== raw[index])) {
-    await coll.updateOne({ _id }, { $set: { messages } }).catch((err) => {
-      console.warn(`[conversations] 收紧历史快照失败：${String((err as Error)?.message || err)}`);
-    });
+    // 乐观并发守卫：仅当自读取以来文档未被改写（并发的回投写会改 updatedAt）才回写。
+    // 否则跳过——读取到的旧快照若整体覆盖，会把并发刚落库的助手气泡抹掉（lost update）。
+    await coll
+      .updateOne({ _id, updatedAt: readVersion }, { $set: { messages, updatedAt: Date.now() } })
+      .catch((err) => {
+        console.warn(`[conversations] 收紧历史快照失败：${String((err as Error)?.message || err)}`);
+      });
   }
   // 老数据或 upsert 漏字段时可能没有 messages；兜底成空数组，保证返回形状始终符合契约。
-  return { ...rest, messages } as ConversationDoc;
+  return { ...rest, updatedAt: readVersion, messages } as ConversationDoc;
 }
 
 export async function createConversation(input: {

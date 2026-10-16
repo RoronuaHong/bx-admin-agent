@@ -981,6 +981,53 @@ function str(args: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+/**
+ * 计数窗口护栏：模型偶发会把「最近 60 分钟」算成一个时点（起点=终点），
+ * 让 count_list_by_time 只扫到一个小时桶、却把零长度窗口当成合法计数回灌展示。
+ * 这里在调用前识别 payload 里明显的起止时间字段，发现起点≥终点（零/负长度）就返回清晰错误，
+ * 让模型用正确窗口重试，而不是吐出「13:00 至 13:00」这类误导结论。
+ * 只认通用时间窗字段形态（from/start/begin 配 to/end/until，且带 time/date），不碰业务词。
+ */
+function toWindowMillis(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    const n = Number(text);
+    if (!Number.isFinite(n)) return null;
+    // 裸数字时间戳：秒级（< 1e12）按毫秒换算，避免与毫秒混用导致误判。
+    return n < 1e12 ? n * 1000 : n;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function validateCountWindow(payload: Record<string, unknown> | undefined): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const startKeys = /^(.*\.)?(from|start|begin).*(time|date)$|^(.*\.)?(time|date).*(from|start|begin)$/i;
+  const endKeys = /^(.*\.)?(to|end|until).*(time|date)$|^(.*\.)?(time|date).*(to|end|until)$/i;
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (const [key, value] of Object.entries(payload)) {
+    const ms = toWindowMillis(value);
+    if (ms == null) continue;
+    if (startKeys.test(key)) starts.push(ms);
+    else if (endKeys.test(key)) ends.push(ms);
+  }
+  if (!starts.length || !ends.length) return null;
+  const minStart = Math.min(...starts);
+  const maxEnd = Math.max(...ends);
+  if (minStart >= maxEnd) {
+    return (
+      `时间窗口起点必须早于终点（检测到零长度或负长度窗口：起点 ${new Date(minStart).toISOString()} 不早于终点 ${new Date(maxEnd).toISOString()}）。` +
+      "请重新传入正确的起止时间（如终点=当前整点、起点=终点前 60 分钟），不要把起点和终点写成同一个时刻。"
+    );
+  }
+  return null;
+}
+
 /** 扩展名归一：把同一产物的别名映射到标准格式（`.xls → xlsx`、`.htm → html`）。 */
 function normalizeExportFormat(format: string): string {
   if (format === "xls") return "xlsx";
@@ -1984,6 +2031,8 @@ export async function execBuiltin(
       };
     }
     case "count_list_by_time": {
+      const windowError = validateCountWindow(args.payload as Record<string, unknown> | undefined);
+      if (windowError) return { ok: false, text: windowError };
       const toolName = str(args, "tool").trim();
       if (!toolName) {
         return { ok: false, text: "count_list_by_time 需要 tool（MCP 工具全名）" };

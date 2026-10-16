@@ -7,10 +7,10 @@
  * 设计取舍（重要）：
  * - **纯确定性打分，不调模型**：不引入 LLM-as-judge。在线评测要跑在每一次真实运行上，
  *   再叠一次模型调用等于把成本翻倍，还会引入「评委偏好」。这里只用 trace 已经如实记录的字段
- *   （是否收束 / 是否取证 / 轮数 / token / 耗时 / 模型切换 / 纠正次数）判——判不了的就不判，
- *   绝不用「看起来像」的启发式凑维度。
+ *   （是否收束 / 是否取证 / 轮数 / token / 耗时 / 模型切换 / 纠正次数 / 工具健康 / 综合轮 /
+ *   停滞 / 重复度）判——判不了的就不判，绝不用「看起来像」的启发式凑维度。
  * - **best-effort**：落盘失败只告警，绝不阻断对话。
- * - **零业务词**：维度是通用质量语义（收束 / 取证 / 效率 / 稳定性 / 纠正），
+ * - **零业务词**：维度是通用质量语义（收束 / 取证 / 效率 / 稳定性 / 纠正 / 工具健康），
  *   不含任何业务词（符合「禁写死」红线）。
  * - 阈值全走环境变量，未配置用默认值。
  */
@@ -80,6 +80,37 @@ export function scoreRunTrace(rt: RunTrace): RunEvalScore {
   }
   if (typeof rt.groundingRetries === "number") {
     check("correction", rt.groundingRetries <= threshold("EVAL_MAX_GROUNDING_RETRIES", 1));
+  }
+
+  // ── 第 3 批 P2-2：四维韧性信号（2026-10-14「零进展 23 分钟」事故复盘 §5）────────────
+  // 与既有维度同口径：**有数据才判**，缺字段不计入分母（不会因为没埋点就判差）。
+  // 判据全部来自 trace 里如实记录的计数，没有一个「看起来像」的启发式。
+  const toolCalls = typeof rt.toolCalls === "number" ? rt.toolCalls : undefined;
+  // tool_health：真实执行的工具失败率。只依赖侧问题（超时/上游）才该被这条抓住——
+  // 闸门拒绝/未执行不计入 toolFailures（见 trace.ts 字段注释），不会被误伤。
+  if (toolCalls !== undefined && toolCalls > 0 && typeof rt.toolFailures === "number") {
+    check("tool_health", rt.toolFailures / toolCalls <= threshold("EVAL_MAX_TOOL_FAIL_RATE", 0.2));
+  }
+  // synthesis：有工具调用却零综合轮 = 预算耗尽也没写出结论（事故：28 轮 0 综合轮）。
+  if (toolCalls !== undefined && toolCalls > 0 && typeof rt.synthesisRounds === "number") {
+    check("synthesis", rt.synthesisRounds >= 1);
+  }
+  // stall：被无进展看门狗收口（用户侧先经历长时间空白才拿到收口）。
+  if (typeof rt.stalled === "boolean") {
+    check("stall", rt.stalled !== true);
+  }
+  // efficiency：同工具重复峰值。单工具反复探查（事故：24 次换参数）烧掉的是整个预算。
+  if (toolCalls !== undefined && toolCalls > 0 && typeof rt.toolRepeatMax === "number") {
+    check("efficiency", rt.toolRepeatMax <= threshold("EVAL_MAX_TOOL_REPEAT", 8));
+  }
+
+  // classifier_health（第 7 批，客服路的 Jev）：**只判分类调用自己的成败**，不混进收敛类维度——
+  // Jev 不生成回复，拿「有没有综合轮」判它没有意义。它持续失败意味着代发检查与承诺检查
+  // 一直处在「没有结果」状态（第 7 批之前这些失败只存在于服务端日志里）。
+  // 未配置密钥时 calls=0 → 不判（没调过不等于坏了）。
+  if (typeof rt.classifierCalls === "number" && rt.classifierCalls > 0 && typeof rt.classifierFailures === "number") {
+    const rate = rt.classifierFailures / rt.classifierCalls;
+    check("classifier_health", rate <= threshold("EVAL_MAX_CLASSIFIER_FAIL_RATE", 0.2));
   }
 
   const score = total ? (total - failed.length) / total : 0;

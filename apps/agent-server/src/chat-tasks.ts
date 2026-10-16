@@ -13,6 +13,7 @@
 //     过期即回收，不留档时行为回到「明确告知已收束」。
 import { randomUUID } from "node:crypto";
 import type { ChatEvent } from "@bx/shared";
+import { listModels } from "./config.js";
 import {
   TASK_DB_RETAIN_MS,
   flushTask,
@@ -30,13 +31,58 @@ const TASK_RETAIN_MS = Math.max(0, Number(process.env.CHAT_TASK_RETAIN_MS ?? 300
 const RETAIN_MAX_TASKS = Math.max(1, Number(process.env.CHAT_TASK_RETAIN_MAX ?? 100));
 /** 落库间隔（毫秒）：事件缓冲按批写 Mongo（避免逐事件往返），正文与状态整体覆盖。 */
 const FLUSH_MS = Math.max(100, Number(process.env.CHAT_TASK_FLUSH_MS ?? 800));
-/** 模型调用单次超时（看门狗阈值要大于任何合法静默步长，它是其中最长的那个）。 */
-const MODEL_TIMEOUT_MS = Math.max(10_000, Number(process.env.MODEL_TIMEOUT_MS ?? 300_000));
+/** 读不到注册表时的模型超时回落值（与 config.ts 的默认同口径）。 */
+const MODEL_TIMEOUT_FALLBACK_MS = Math.max(10_000, Number(process.env.MODEL_TIMEOUT_MS || 120_000));
+/**
+ * 实测模型超时（毫秒）：当前注册模型里**最大的**那个 `timeoutMs`。
+ *
+ * 为什么必须取实测值而不是本文件自带的默认值：看门狗阈值要大于「任何合法静默步长」，
+ * 而最长的合法静默就是单次模型调用。旧口径在这里读了一个与 `config.ts` 不同的默认值
+ * （300s），而真实部署里每个模型都显式配了 180s —— 推导出的 600s 阈值与实测不匹配，
+ * 表现为「一次卡死要 10 分钟后才被收口」（2026-10-14 事故复盘 §5 P2-3）。
+ * 取 max 而非默认值：某个模型配了更长超时时，阈值必须跟着涨，不能误杀它。
+ */
+function actualModelTimeoutMs(): number {
+  try {
+    const models = listModels();
+    const max = models.reduce((acc, model) => Math.max(acc, model.timeoutMs), 0);
+    if (Number.isFinite(max) && max > 0) return max;
+  } catch {
+    /* 配置不可用（极少见）：回落 env / 默认值 */
+  }
+  return MODEL_TIMEOUT_FALLBACK_MS;
+}
+
+/** 本进程实测到的模型超时（模块加载时算一次：注册表来自 env，运行期不变）。 */
+const MODEL_TIMEOUT_ACTUAL_MS = actualModelTimeoutMs();
+/** 看门狗阈值下限（毫秒）：再快的模型也不低于它——工具执行批次同样可以合法静默。 */
+const STALL_FLOOR_MS = Math.max(60_000, Number(process.env.CHAT_TASK_STALL_FLOOR_MS || 240_000));
+
+/**
+ * 纯函数：由「实测模型超时」推导无进展看门狗阈值。
+ *
+ * 口径（AWS《Timeouts, Retries, and Backoff with Jitter》「超时值按实测分位数反推」的落地）：
+ *   阈值 = max(2 × 实测模型超时, 下限) —— 留出「模型最长静默 + 一次工具执行」的余量，
+ *   既不误杀正常长跑，也不让卡死拖到默认 300s 推导值那种失真量级；
+ *   `CHAT_TASK_STALL_MS` 显式覆盖优先（回滚 / 调试用），仍受 60s 绝对下限保护。
+ */
+export function deriveStallMs(
+  modelTimeoutMs: number,
+  overrideMs: number | undefined = Number(process.env.CHAT_TASK_STALL_MS),
+  floorMs: number = STALL_FLOOR_MS,
+): number {
+  if (Number.isFinite(overrideMs) && (overrideMs as number) > 0) {
+    return Math.max(60_000, Math.floor(overrideMs as number));
+  }
+  const base = Number.isFinite(modelTimeoutMs) && modelTimeoutMs > 0 ? modelTimeoutMs : MODEL_TIMEOUT_FALLBACK_MS;
+  return Math.max(floorMs, Math.floor(base * 2));
+}
+
 /**
  * 无进展看门狗阈值（毫秒）：距最后一个**实质事件**超过它，就主动收口。
- * 默认 = 模型超时 + 5 分钟（留出「模型最长静默 + 工具执行」的余量），因此正常长跑不会误杀。
+ * 由实测模型超时派生（见 deriveStallMs），因此正常长跑不会误杀、卡死也不会拖过真实超时一个量级。
  */
-const STALL_MS = Math.max(60_000, Number(process.env.CHAT_TASK_STALL_MS ?? MODEL_TIMEOUT_MS + 300_000));
+const STALL_MS = deriveStallMs(MODEL_TIMEOUT_ACTUAL_MS);
 /**
  * 本进程启动时刻：判定「留档里的任务是不是在我们启动之前就没了」的唯一可靠基准。
  * 为什么不用「心跳超过 N 秒算过期」：那个阈值必须大于任何合法静默步长（模型长调用期间本来就不产出事件），
@@ -291,6 +337,17 @@ export function stallIdleMs(
   return idle >= thresholdMs ? idle : null;
 }
 
+/** 看门狗阈值的推导依据（启动日志与排障用）：把「为什么是这个数」显式化，别再靠默认值隐式决定。 */
+export function stallThresholdInfo(): { stallMs: number; modelTimeoutMs: number; floorMs: number; overridden: boolean } {
+  const override = Number(process.env.CHAT_TASK_STALL_MS);
+  return {
+    stallMs: STALL_MS,
+    modelTimeoutMs: MODEL_TIMEOUT_ACTUAL_MS,
+    floorMs: STALL_FLOOR_MS,
+    overridden: Number.isFinite(override) && override > 0,
+  };
+}
+
 /**
  * 无进展看门狗：由**服务端**判定「这一轮还活着吗」。
  * 判据只有一个——**距最后一个实质事件的时长**（`lastEventAt`）：HTTP 层的 `ping` 是无条件保活，
@@ -300,6 +357,13 @@ export function stallIdleMs(
 export function startTaskWatchdog(opts: { stallMs?: number; tickMs?: number } = {}): NodeJS.Timeout {
   const stallMs = opts.stallMs ?? STALL_MS;
   const tickMs = opts.tickMs ?? Math.max(5_000, Math.min(30_000, Math.floor(stallMs / 10))); // 至少 5s、至多 30s 巡检一次
+  // 启动日志打印推导依据（P2-3）：阈值与真实模型超时不匹配时，这一行是排查入口。
+  const info = stallThresholdInfo();
+  console.log(
+    `[chat:watchdog] 无进展阈值 ${Math.round(info.stallMs / 1000)}s = max(2 × 实测模型超时 ${Math.round(
+      info.modelTimeoutMs / 1000,
+    )}s, 下限 ${Math.round(info.floorMs / 1000)}s)${info.overridden ? "（已被 CHAT_TASK_STALL_MS 覆盖）" : ""}`,
+  );
   const timer = setInterval(() => {
     const now = Date.now();
     for (const task of [...running.values()]) {

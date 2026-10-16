@@ -256,6 +256,12 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
   const errorEvent = reversed.find((event) => event.type === "error");
   const labelEvent = reversed.find((event) => event.type === "support_labels");
   const model = modelEvent?.id || servedModelId || undefined;
+  // 看门狗停滞标记（第 3 批 P2-2）：收口时它发的 error 事件是缓冲里最后一条，
+  // 不会被 2000 条上限裁掉（裁掉的是最旧的）。用它而不是状态字段——「用户先看到
+  // 长时间空白才收到收口」这件事只有看门狗自己知道。
+  const stalled = task.buffer.some(
+    (event) => event.type === "error" && (event as { error?: { code?: string } }).error?.code === "CHAT_TASK_STALLED",
+  );
   return {
     runId,
     at: task.startedAt,
@@ -266,7 +272,25 @@ function buildRunTrace(task: ChatTask, runId: string, status: RunStatus, session
     ...(model ? { model } : {}),
     status,
     durationMs: (task.settledAt || Date.now()) - task.startedAt,
-    ...(usage ? { rounds: usage.rounds, toolCalls: usage.toolCalls, tokens: usage.tokens, costTokens: usage.costTokens, modelRetries: usage.modelRetries, modelFallbacks: usage.modelFallbacks, groundingRetries: usage.groundingRetries, groundingVerifications: usage.groundingVerifications, ungrounded: usage.ungrounded } : {}),
+    ...(usage
+      ? {
+          rounds: usage.rounds,
+          toolCalls: usage.toolCalls,
+          tokens: usage.tokens,
+          costTokens: usage.costTokens,
+          modelRetries: usage.modelRetries,
+          modelFallbacks: usage.modelFallbacks,
+          groundingRetries: usage.groundingRetries,
+          groundingVerifications: usage.groundingVerifications,
+          ungrounded: usage.ungrounded,
+          toolFailures: usage.toolFailures,
+          synthesisRounds: usage.synthesisRounds,
+          toolRepeatMax: usage.toolRepeatMax,
+          classifierCalls: usage.classifierCalls,
+          classifierFailures: usage.classifierFailures,
+        }
+      : {}),
+    ...(stalled ? { stalled: true } : {}),
     ...(errorEvent ? { error: String(errorEvent.message || errorEvent.error?.defaultMessage || "") } : {}),
     ...(labelEvent?.type === "support_labels" ? { supportLabels: labelEvent.labels } : {}),
     release: getRelease(),

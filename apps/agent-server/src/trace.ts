@@ -52,6 +52,29 @@ export interface RunTrace {
   groundingVerifications?: number;
   /** 纠正用尽仍未取得工具数据、以确定性拒答收束（>0 说明本轮模型有编造倾向）。 */
   ungrounded?: boolean;
+  /**
+   * 真正执行且失败的工具调用数（第 3 批 P2-2 工具健康度）。
+   * 只计**真实执行过**的失败：闸门拒绝 / 同轮跳过 / 熔断摘除（未真实发出的调用）不计，
+   * 它们是另一类信号（toolFusions），混在一起会让「工具坏了」与「没让工具跑」分不开。
+   */
+  toolFailures?: number;
+  /**
+   * 综合轮次数（第 3 批 P2-2 收敛质量）：无工具调用、直接收束出最终答案的轮数。
+   * 有工具调用却零综合轮 = 预算耗尽也没写出结论（2026-10-14 事故形态：28 轮 0 综合轮）。
+   */
+  synthesisRounds?: number;
+  /** 同一工具被重复调用的最大次数（第 3 批 P2-2 效率维度）：单工具 24 次探查即事故形态。 */
+  toolRepeatMax?: number;
+  /** 是否被无进展看门狗收口（第 3 批 P2-2 停滞维度）：用户侧先看到长时间空白才收到收口。 */
+  stalled?: boolean;
+  /**
+   * 分类器调用次数（第 7 批，客服路的 Jev）。与对话模型的轮次**分开计**：
+   * Jev 不生成回复，它的失败不该混进收敛/效率类维度，只单独立一个健康度维度。
+   * 未配置密钥时为 0（没调用过），不当作「调用失败」。
+   */
+  classifierCalls?: number;
+  /** 分类器调用失败次数（网络/超时/HTTP 非 2xx；被外部中止不计）。 */
+  classifierFailures?: number;
   error?: string;
   /** 代码版本（git sha / RELEASE env）：评测基线与排障按版本对比的必要条件。 */
   release?: string;

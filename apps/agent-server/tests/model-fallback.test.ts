@@ -22,7 +22,7 @@ test("402、500、503 都换模型，不在同一个模型上重试", () => {
   expect(isTransientModelError("model http 400: max 500")).toBe(false);
 });
 
-test("402、500、429 都立刻换模型；当日额度用尽才冷却，短暂 429 不冷却", () => {
+test("402、500、429 都立刻换模型；当日额度用尽才按日切冷却，分钟级限流走短冷却档", () => {
   const daily = 'model http 429: {"error":{"message":"Rate limit exceeded: free-models-per-day"}}';
   const brief = "model http 429: temporarily rate-limited upstream";
   expect(isDailyQuotaFailure(daily)).toBe(true);
@@ -31,7 +31,10 @@ test("402、500、429 都立刻换模型；当日额度用尽才冷却，短暂 
   expect(modelAvailabilityStatus(daily)).toBe("429");
   expect(isDailyQuotaFailure("model http 429: FreeUsageLimitError")).toBe(true);
   expect(isTransientModelError(brief)).toBe(false);
-  expect(isModelDownFailure(brief)).toBe(false);
+  // 第 5 批 C2（§4.4 三类分层）：分钟级限流也是模型级失败——进冷却表、切候选，
+  // 但只冷却一个短档（默认 90s），不再是「不冷却」或「按小时/日冷却」两个坏档。
+  expect(isModelDownFailure(brief)).toBe(true);
+  expect(modelDownCooldownMs(brief)).toBe(90_000);
   expect(modelAvailabilityStatus(brief)).toBe("429");
   expect(modelAvailabilityStatus("model http 402: 额度不足")).toBe("402");
   expect(modelAvailabilityStatus("model http 500: internal")).toBe("500");

@@ -1,0 +1,137 @@
+// 同工具重复调用预算（第 2 批 P1-2）。
+//
+// 事故形态：模型对同一个元数据工具调了 24 次，每次换对象/换字段 —— 参数全不相同，
+// 于是既有的「参数全等才算重复」提示一次没触发，27 轮预算大半耗在重复探查上。
+//
+// 判据借两处思想：AWS 的**重试预算**（用占比而非绝对次数，阈值才与任务复杂度无关）、
+// Fowler 的**比率必须配最小样本数**。只提示不硬拦（重复有时是正当的）。
+import { test, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import {
+  repeatBudgetNotice,
+  repeatBudgetStop,
+  repeatEscalation,
+  repeatEscalationStep,
+  repeatStopNotice,
+} from "../src/repeat-budget.js";
+
+const base = { toolName: "toolA", priorCount: 0, totalOther: 0 };
+
+test("单轮同工具超限即提示，并给出两条可执行的下一步", () => {
+  const notice = repeatBudgetNotice({ ...base, perRoundCount: 4 });
+  expect(notice).toContain("toolA");
+  expect(notice).toContain("同一轮");
+  // 提示必须给动作，而不是只说「重复了」
+  expect(notice).toContain("如实说明");
+  expect(notice).toContain("换");
+});
+
+test("单轮未超限不提示", () => {
+  expect(repeatBudgetNotice({ ...base, perRoundCount: 3 })).toBeNull();
+  expect(repeatBudgetNotice({ ...base, perRoundCount: 1 })).toBeNull();
+});
+
+test("占比超限即提示（跨轮累计靠同一个工具硬撑）", () => {
+  // 累计 7 次 toolA、另有 4 次别的工具 = 占比 64% > 40%
+  const notice = repeatBudgetNotice({ toolName: "toolA", perRoundCount: 1, priorCount: 6, totalOther: 4 });
+  expect(notice).toContain("toolA");
+  expect(notice).toContain("%");
+});
+
+test("样本不足时不算占比（避免 1 次调用就 100%）", () => {
+  // 累计 2 次、样本 2 < minSamples 6
+  expect(repeatBudgetNotice({ toolName: "toolA", perRoundCount: 1, priorCount: 1, totalOther: 0 })).toBeNull();
+});
+
+test("占比未超限不提示（工具分布均匀属正常）", () => {
+  // 累计 3 次 toolA、另有 9 次别的 = 25% < 40%
+  expect(repeatBudgetNotice({ toolName: "toolA", perRoundCount: 1, priorCount: 2, totalOther: 9 })).toBeNull();
+});
+
+test("阈值可注入（按部署调整，且便于单测钉边界）", () => {
+  expect(repeatBudgetNotice({ ...base, perRoundCount: 2 }, { perRoundLimit: 2 })).toContain("同一轮");
+  expect(repeatBudgetNotice({ toolName: "t", perRoundCount: 1, priorCount: 6, totalOther: 4 }, { shareLimit: 0.9 })).toBeNull();
+});
+
+/* ── 第 10 批：跨轮阶梯提醒 + 可选运行级重复上限 ──────────────────────────
+ * 真实复跑（2026-10-15）暴露的洞：上面的提示「同一工具只提示一次」，
+ * 于是「第 8 次被提醒过一次，之后又调了 24 次」——单工具累计 32 次、28 轮 / 83 次调用。
+ */
+
+test("阶梯值翻倍：未达首阶为 0，跨阶只认已跨过的最高台阶", () => {
+  const o = { firstStep: 8, factor: 2 };
+  expect(repeatEscalationStep(7, o)).toBe(0);
+  expect(repeatEscalationStep(8, o)).toBe(8);
+  expect(repeatEscalationStep(15, o)).toBe(8);
+  expect(repeatEscalationStep(16, o)).toBe(16);
+  expect(repeatEscalationStep(31, o)).toBe(16);
+  expect(repeatEscalationStep(32, o)).toBe(32);
+  expect(repeatEscalationStep(100, o)).toBe(64);
+});
+
+test("阶梯可注入（firstStep/factor 都不是写死常量）", () => {
+  expect(repeatEscalationStep(3, { firstStep: 3, factor: 3 })).toBe(3);
+  expect(repeatEscalationStep(9, { firstStep: 3, factor: 3 })).toBe(9);
+  expect(repeatEscalationStep(10, { firstStep: 3, factor: 3 })).toBe(9);
+});
+
+test("首次提醒给两条出路；同一台阶不重复提醒；上台阶后文案加重", () => {
+  const first = repeatEscalation({ toolName: "toolA", total: 8, notifiedStep: 0 }, { firstStep: 8 });
+  expect(first.notice).toContain("toolA");
+  expect(first.notice).toContain("二选一");
+  expect(first.step).toBe(8);
+
+  // 已提示到第 8 阶、累计仍是 12 → 不再提示（防刷屏）
+  expect(repeatEscalation({ toolName: "toolA", total: 12, notifiedStep: 8 }, { firstStep: 8 }).notice).toBeNull();
+
+  // 跨到第 16 阶 → 再提示一次，且明确「再次提醒」
+  const again = repeatEscalation({ toolName: "toolA", total: 16, notifiedStep: 8 }, { firstStep: 8 });
+  expect(again.notice).toContain("再次提醒");
+  expect(again.step).toBe(16);
+});
+
+test("运行级重复上限默认关（重复有时是正当的，不硬拦）", () => {
+  expect(repeatBudgetStop(32)).toBe(false);
+  expect(repeatBudgetStop(1000)).toBe(false);
+  expect(repeatBudgetStop(8, { stopAfter: 8 })).toBe(true);
+  expect(repeatBudgetStop(7, { stopAfter: 8 })).toBe(false);
+});
+
+test("停止执行的回灌文案必须给替代动作（否则模型会当工具坏了反复重试）", () => {
+  const text = repeatStopNotice("toolA", 24, 24);
+  expect(text).toContain("toolA");
+  expect(text).toContain("已停止执行");
+  expect(text).toContain("换一条取证路径");
+});
+
+test("复跑形态回放：累计 32 次至少被提醒 3 次（改动前全程只有 1 次）", () => {
+  let notified = 0;
+  let step = 0;
+  for (let total = 1; total <= 32; total += 1) {
+    const esc = repeatEscalation({ toolName: "toolA", total, notifiedStep: step }, { firstStep: 8 });
+    if (esc.notice) notified += 1;
+    step = esc.step;
+  }
+  expect(notified, "8 / 16 / 32 三个台阶各提醒一次").toBe(3);
+});
+
+test("静态接线：阶梯提醒与停止上限都真的挂在主循环上", () => {
+  const src = readFileSync(new URL("../src/chat.ts", import.meta.url), "utf-8");
+  expect(src).toContain("repeatEscalation({");
+  expect(src).toContain("repeatEscalatedStep.set(");
+  expect(src).toContain("repeatBudgetStop(repeatTotal)");
+  expect(src).toContain("repeatStopNotice(");
+});
+
+test("事故形态回放：24 次换参数的元数据探查必须被提示（改动前完全逃过）", () => {
+  // 逐轮各调一次 toolA，累计到第 4 轮时占比已超阈值
+  let prior = 0;
+  let noticed: string | null = null;
+  for (let round = 1; round <= 24 && !noticed; round += 1) {
+    const other = round <= 8 ? round - 1 : 8; // 前 8 轮有别的工具，之后全靠 toolA
+    noticed = repeatBudgetNotice({ toolName: "toolA", perRoundCount: 1, priorCount: prior, totalOther: other });
+    prior += 1;
+  }
+  expect(noticed, "24 次换参数探查必须在某一轮触发提示").not.toBeNull();
+});
+

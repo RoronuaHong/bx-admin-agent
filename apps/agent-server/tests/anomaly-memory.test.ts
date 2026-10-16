@@ -13,6 +13,7 @@ function baseline(over: Partial<OwnerBaseline> = {}): OwnerBaseline {
     durations: [1000, 1000, 1000, 1000, 1000],
     tools: new Set(["fs_read", "fs_write"]),
     ungroundedWindow: [false, false],
+    repeatMax: [2, 2, 2, 2, 2],
     ...over,
   };
 }
@@ -59,6 +60,38 @@ describe("行为异常检测（纯函数）", () => {
     expect(
       detectAnomalies({ durationMs: 1000, toolNames: [], ungrounded: true }, baseline()),
     ).not.toContain("ungrounded_burst");
+  });
+
+  it("同工具重复峰值突增 → tool_repeat_spike（事故形态：24 次换参数探查）", () => {
+    expect(
+      detectAnomalies({ durationMs: 1000, toolNames: ["fs_read"], toolRepeatMax: 24 }, baseline()),
+    ).toContain("tool_repeat_spike");
+    // 与基线持平不判（判据同 rounds_spike：比率配绝对增量下限）
+    expect(
+      detectAnomalies({ durationMs: 1000, toolNames: ["fs_read"], toolRepeatMax: 2 }, baseline()),
+    ).not.toContain("tool_repeat_spike");
+    // 缺字段不判（聊天型 run 没有重复峰值）
+    expect(detectAnomalies({ durationMs: 1000, toolNames: [] }, baseline())).not.toContain(
+      "tool_repeat_spike",
+    );
+  });
+
+  it("observeRun 透传 toolRepeatMax 进基线（缺字段的 run 不稀释中位数）", () => {
+    resetAnomalyForTest();
+    const mk = (runId: string, toolRepeatMax?: number) =>
+      observeRun({
+        runId,
+        at: Date.now(),
+        conversationId: "c",
+        status: "success",
+        durationMs: 1000,
+        ownerKey: "u-repeat",
+        ...(toolRepeatMax !== undefined ? { toolRepeatMax } : {}),
+      });
+    for (let i = 0; i < 5; i++) mk(`ok${i}`, 2);
+    // 聊天型 run（无 toolRepeatMax）不应把基线中位数拉低
+    for (let i = 0; i < 5; i++) mk(`chat${i}`);
+    expect(mk("repeat-spike", 24).flags).toContain("tool_repeat_spike");
   });
 
   it("observeRun 会积累基线且不抛错", () => {

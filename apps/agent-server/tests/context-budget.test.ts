@@ -1,7 +1,7 @@
 // 上下文装配与工具结果治理的单元验证（纯逻辑，不需要网络；fs 卸载会写本地文件，结尾清理）。
 // 阈值在 vitest.config.ts 的 test.env 中固定。
 import { test, expect } from "vitest";
-import { governToolResults } from "../src/chat.js";
+import { governToolResults, offloadRecallNotice, TOOL_RESULT_OFFLOAD_HEAD_CHARS } from "../src/chat.js";
 import { assembleContext, renderHandles, stripUserFacingToolTrace } from "../src/history.js";
 import { estimateTokens } from "../src/models.js";
 import { fsRead, fsRemoveConversation } from "../src/fs-store.js";
@@ -24,6 +24,34 @@ test("[1] renderHandles", () => {
   expect(text.includes("3 行 / 12 字符")).toBe(true);
   expect(renderHandles([])).toBe("");
   expect(renderHandles(undefined)).toBe("");
+});
+
+// 卸载提示的三件事（对齐 Anthropic《Effective context engineering》「offload 前先留可读摘要」）。
+// 实测事故形态：只给文件路径时，模型没有线索判断「里面有没有我要的东西」，
+// 唯一可行动作就是把每个卸载文件 fs_read 捞回来——实测卸载 70 条、捞回 47 次，单工具重复度 47。
+test("[1c] 卸载提示：内联开头摘要 + 禁止逐条捞回 + 给出聚合替代路径", () => {
+  const body = "HEAD".padEnd(TOOL_RESULT_OFFLOAD_HEAD_CHARS + 50, "x"); // 超长，确保走截断分支
+  const notice = offloadRecallNotice("results/c1_mcp__bi__x.txt", 4096, body);
+  // ① 内联摘要：前 HEAD_CHARS 字留在上下文里
+  expect(notice.startsWith("…（该工具结果已卸载到工作区文件 results/c1_mcp__bi__x.txt")).toBe(true);
+  expect(notice).toContain("HEAD");
+  expect(notice).toContain("摘要到此");
+  // ② 明确禁止默认读回
+  expect(notice).toContain("默认不要读回");
+  // ③ 正确替代路径是「重发聚合查询」，不是把明细捞回来
+  expect(notice).toContain("聚合");
+  expect(notice).toContain("一次只读一个");
+  // 旧文案特征串不能丢（有测试与 isGovernedPlaceholder 依赖它）
+  expect(notice).toContain("已卸载到工作区文件");
+});
+
+test("[1d] 卸载提示：短结果不谎称被截断，且摘要为空时也不崩", () => {
+  const short = offloadRecallNotice("results/c2_x.txt", 10, "就这一行");
+  expect(short).toContain("就这一行");
+  expect(short).not.toContain("摘要到此");
+  const empty = offloadRecallNotice("results/c3_x.txt", 0, "");
+  expect(empty).toContain("已卸载到工作区文件");
+  expect(empty).toContain("默认不要读回");
 });
 
 test("[1b] 文末工具清单不进给用户的正文", () => {
@@ -129,9 +157,11 @@ test("[4] governToolResults（本轮工具结果治理：卸载到工作区）",
 
   const conv = Array.from({ length: 5 }, (_, i) => ({ role: "tool", name: `t${i}`, content: big })) as FakeTurn[];
   const result = governToolResults(conv as never, CONV);
-  expect(result.cleared + result.offloaded).toBe(2);
-  expect(conv.slice(2).every((t) => t.content === big)).toBe(true);
+  // 5 条各 100 tok、保留窗口 3、预算 200：只卸掉「超出 keep 窗口」的 t0/t1，t2/t3/t4 整组保留
+  // （keep 是硬下限，绝不为凑预算丢最近证据；收口交给历史压缩）。只卸载、绝不丢弃。
+  expect(result.cleared).toBe(0);
   expect(result.offloaded).toBe(2);
+  expect(conv.slice(2).every((t) => t.content === big)).toBe(true);
   expect(conv[0].content.includes("已卸载到工作区文件")).toBe(true);
   const match = conv[0].content.match(/results\/[^\s]+\.txt/);
   expect(match).toBeTruthy();
@@ -151,8 +181,11 @@ test("[4] governToolResults（本轮工具结果治理：卸载到工作区）",
     ...Array.from({ length: 4 }, () => ({ role: "tool", name: "other", content: big })),
   ] as FakeTurn[];
   const result3 = governToolResults(conv3 as never, CONV);
-  expect(conv3[0].content).toBe(big);
-  expect(result3.cleared + result3.offloaded).toBeGreaterThanOrEqual(1);
+  // 最旧的 keepme 与 other0 在 keep 窗口外 → 卸载到工作区（可恢复，绝不丢弃）；
+  // 最新的 other（index4）在 keep 窗口内 → 整条保留。
+  expect(conv3[4].content).toBe(big);
+  expect(result3.cleared).toBe(0);
+  expect(result3.offloaded).toBeGreaterThanOrEqual(1);
 
   const conv4 = [{ role: "user", content: big }] as FakeTurn[];
   const result4 = governToolResults(conv4 as never, CONV);

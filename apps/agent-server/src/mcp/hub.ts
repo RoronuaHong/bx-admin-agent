@@ -301,7 +301,7 @@ function attachStderr(cfg: McpServerConfig, transport: StdioClientTransport | St
 /** tools/list 超时会取消这次请求。缓存清单还在，但调用必须换一条没被取消的传输。 */
 async function reopenTransport(conn: Conn): Promise<void> {
   await conn.client.close().catch(() => undefined);
-  const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {} });
+  const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {}, requestTimeout: timeoutOf(conn.cfg) });
   const transport = buildTransport(conn.cfg);
   attachStderr(conn.cfg, transport);
   await client.connect(transport, { timeout: timeoutOf(conn.cfg) });
@@ -310,7 +310,7 @@ async function reopenTransport(conn: Conn): Promise<void> {
 
 /** 真正建立连接（含列工具）。只在 connect 的单飞逻辑里调用。 */
 async function openConnection(cfg: McpServerConfig, forceList = false): Promise<Conn | null> {
-  const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {} });
+  const client = new Client({ name: "bx-agent", version: "1.0.0" }, { capabilities: {}, requestTimeout: timeoutOf(cfg) });
   const conn: Conn = {
     cfg,
     client,

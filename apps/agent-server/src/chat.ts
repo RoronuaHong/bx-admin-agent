@@ -31,6 +31,8 @@ import {
   reviewSupportPromise,
   visitorSendRefusal,
   isVisitorVisibleSend,
+  type ClassifierStats,
+  type JevCallOpts,
 } from "./jev.js";
 import type { ScheduleAlertState, ScheduleNotifyPolicy, SchedulePurpose } from "./schedule-alert.js";
 import { requestClarification, requestConfirmation } from "./confirm.js";
@@ -45,13 +47,18 @@ import {
   safeJsonParse,
   type OptionImage,
   type ToolCall,
+  type ToolResultTurn,
   type ToolSpec,
   type Turn,
 } from "./models.js";
+import { healthOrderEnabled, healthTier, orderByHealth, readModelHealth, type ModelHealth } from "./model-health.js";
+import { classifyToolFailure, KIND_LABEL, ToolHealthWindow, type ToolErrorKind } from "./tool-failure.js";
+import { repeatBudgetNotice, repeatBudgetStop, repeatEscalation, repeatStopNotice, REPEAT_STOP_AFTER } from "./repeat-budget.js";
 import { callMcpTool, collectToolsDetailed, type McpToolInfo } from "./mcp/hub.js";
 import { getServer, loadServers } from "./mcp/config.js";
 import { annotateMcpToolSpec, applyPathDefaults, pathDefaultsForTool } from "./mcp/path-defaults.js";
 import { isHardDenied, resolveToolRisk, subagentMayExecute, verdictNeedsConfirm } from "./risk.js";
+import { classifyRecall, orderByRecallCost } from "./tool-result-governance.js";
 import type { ToolHandle } from "./session.js";
 import { buildSystemPrompt, SUBAGENT_PROMPT, type SystemPrompt, type ToolingStatus } from "./system-prompt.js";
 import { getRole } from "./roles.js";
@@ -98,6 +105,20 @@ import { incCounter, observeSummary } from "./process-metrics.js";
 import { addDailyTokens, quotaState } from "./quota.js";
 import { readFileSync } from "node:fs";
 import { fsImportFile } from "./fs-store.js";
+import { loadModelCooldowns, modelCooldownPersistenceEnabled } from "./model-cooldown.js";
+import {
+  dailyQuotaCooldownMs,
+  isCoolingDown,
+  isDailyQuotaFailure,
+  isModelDownFailure,
+  modelAvailabilityStatus,
+  noteDailyQuotaExhausted,
+  noteDownFailure,
+  quotaCooldownStatus,
+  quotaCooldownUntil,
+  type ModelAvailabilityStatus,
+} from "./model-availability.js";
+import { findExhaustedQuotaModels, quotaPreflightEnabled } from "./model-quota.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
@@ -131,6 +152,16 @@ const MCP_MAX_TOOLS = Number(process.env.MCP_MAX_TOOLS || 80);
 const MAX_TOOL_ROUNDS = Number(process.env.MCP_MAX_TOOL_ROUNDS || 28);
 const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12_000);
 
+/**
+ * 工具路径上调用 Jev 时的上下文（第 7 批）：runId 关联 span、run 级统计、当前中止信号。
+ * 三个代发检查点共用同一份口径，避免各处漏传 runId（漏了就成了「查不出来的失败」）。
+ */
+const jevOpts = (ctx: LoopContext): JevCallOpts => ({
+  runId: ctx.runId,
+  stats: ctx.classifierStats,
+  signal: ctx.signal,
+});
+
 // ---- 额度类失败的进程内冷却 ----
 // 实测动因：网关的免费额度是被用完的小池子，某些模型 402（额度耗尽）后短则几小时不会恢复，
 // 而候选链是「注册表顺序」，于是每次对话都要把已经死掉的模型从头打一遍（本次 5 个），
@@ -138,75 +169,84 @@ const MAX_TOOL_RESULT_CHARS = Number(process.env.MCP_MAX_TOOL_RESULT_CHARS || 12
 // 因此给 402 / HTTP 500 加冷却：自动模式把它们排到队尾，先试其余模型。
 // 用户点名的模型仍排第一（点名就要先用它）；冷却名单用尽时仍会回头试，避免直接没模型。
 // 未开通 / 额度耗尽不会在十分钟内恢复。冷却若只有一个调度周期，每期都会再打一次已经死掉的模型。
-const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 6 * 60 * 60 * 1000);
-const TRANSIENT_COOLDOWN_MS = Number(process.env.MODEL_TRANSIENT_COOLDOWN_MS || 10 * 60 * 1000);
-const quotaCooldownUntil = new Map<string, number>();
-/** 冷却原因的状态码（402 / 429 …）。冷却表只有时刻没有原因；「定时运行跳过冷却 → 名单为空」时要靠它如实告知。 */
-const quotaCooldownStatus = new Map<string, ModelAvailabilityStatus>();
+//
+// 第 7 批：判据、两张共享冷却表与「记一次降级」（含落盘）都移到 src/model-availability.ts ——
+// 客服分类器 Jev 走同一套判据，两边共用一份实现（唯一可信来源，避免两份冷却口径漂移）。
+// 本文件保留「启动恢复」与「用户可见文案」，分类/冷却一律调用共享模块。
 
-/** 500 可能是短故障，冷却一个调度周期。402 / 未开通 / 鉴权失败按小时冷却。 */
-export function modelDownCooldownMs(failure: string | null): number {
-  if (/model http 500\b/i.test(String(failure || ""))) return TRANSIENT_COOLDOWN_MS;
-  return QUOTA_COOLDOWN_MS;
-}
-
-/** 是否属「额度/未开通」类确定性失败（与 models.ts 的 402 判定同口径，不认厂商）。 */
-function isQuotaFailure(failure: string | null): boolean {
-  return /401008|402|额度|未开通|余额|quota/i.test(String(failure || ""));
+/**
+ * 冷却状态跨重启恢复（第 3 批 P0-2）：进程内 `Map` 重启即清，导致每次重启开场都把已耗尽
+ * 配额的模型从头打一遍（2026-10-14 事故的跨进程形态——冷却只活在进程里，重启即失效）。
+ * 启动时从持久层读回未过期冷却写回进程内表；读路径（`orderModelCandidates` 的
+ * `coolingUntil`）零改动。连不上 Mongo 或开关关闭时静默返回 0，行为回到修复前现状。
+ */
+export async function restoreModelCooldowns(): Promise<number> {
+  if (!modelCooldownPersistenceEnabled()) return 0;
+  let entries: Awaited<ReturnType<typeof loadModelCooldowns>>;
+  try {
+    entries = await loadModelCooldowns();
+  } catch {
+    return 0;
+  }
+  const now = Date.now();
+  let restored = 0;
+  for (const entry of entries) {
+    if (!entry.modelId || !(entry.until > now)) continue;
+    quotaCooldownUntil.set(entry.modelId, entry.until);
+    if (entry.status) quotaCooldownStatus.set(entry.modelId, entry.status as ModelAvailabilityStatus);
+    restored += 1;
+  }
+  if (restored) console.log(`[chat:model] 已恢复 ${restored} 个模型的冷却状态（重启后不再重打）`);
+  return restored;
 }
 
 /**
- * 当日免费额度用尽的 429。除了立刻换模型，还要冷却：短时间内再打同一个模型没有意义。
- * 其它 429 只换模型、不冷却，下一期还可以再试它。
+ * 冷却判据与共享冷却表已移入 `src/model-availability.ts`（第 7 批）：
+ * `modelDownCooldownMs` / `rateLimitCooldownMs` / `isDailyQuotaFailure` / `dailyQuotaCooldownMs` /
+ * `isModelDownFailure` / `modelAvailabilityStatus` / `quotaCooldownUntil` / `quotaCooldownStatus`
+ * 以及统一记账入口 `noteDownFailure`（写表 + 状态码 + best-effort 落盘）。
+ * 本文件继续原样 re-export 它们，既有引用方（app.ts / 既有单测）无需改动。
  */
-export function isDailyQuotaFailure(failure: string | null): boolean {
-  return /free-models-per-day|freeusagelimit|openrouter_free_tier_daily|free[_ -]?tier.{0,40}daily|当日.{0,12}(额度|限额)|免费额度/i.test(
-    String(failure || ""),
-  );
-}
-
-/** 这个模型短时间不会自己好。自动模式应冷却并换下一个。 */
-export function isModelDownFailure(failure: string | null): boolean {
-  // 只认状态码。正文里的「500」不能算（例如 400 的「max 500」），否则健康模型会被冷却。
-  // 401 / 403 / 404 是这把钥匙或这个模型用不了，冷却。408 / 413 / 422 / 529 可能是这一次请求的问题，不冷却。
-  return (
-    isQuotaFailure(failure) ||
-    isDailyQuotaFailure(failure) ||
-    /model http (401|403|404|500)\b/i.test(String(failure || ""))
-  );
-}
 
 /**
- * 模型接口的可识别状态码。同一模型不再重试，交给下一个候选。
- * 全部候选都失败时，对话和钉钉写这个码，不用笼统的「失败」。
- * 400 参数、401 鉴权、403 无权限、404 模型不存在、408 超时、413 过大、422 无法处理、529 过载，
- * 与 402 / 429 / 5xx 同一条链。各模型可以有自己的钥匙，所以 401 也换下一个，而不是认定整池都失效。
+ * 健康度分档日志（5 分钟节流）：排查「为什么这个模型排在这个位置」时，第一眼要看的就是它。
+ * 只在有健康度数据时打；无数据（读不到评测文件）时安静跳过。
  */
-export type ModelAvailabilityStatus =
-  | "400"
-  | "401"
-  | "402"
-  | "403"
-  | "404"
-  | "408"
-  | "413"
-  | "422"
-  | "429"
-  | "500"
-  | "502"
-  | "503"
-  | "504"
-  | "529";
-
-export function modelAvailabilityStatus(failure: string | null): ModelAvailabilityStatus | null {
-  const msg = String(failure || "");
-  const http = msg.match(/model http (400|401|402|403|404|408|413|422|429|500|502|503|504|529)\b/i);
-  if (http) return http[1] as ModelAvailabilityStatus;
-  if (isDailyQuotaFailure(msg)) return "429";
-  if (/模型服务暂时不可用/.test(msg)) return "503";
-  if (isQuotaFailure(msg)) return "402";
-  return null;
+let lastHealthLogAt = 0;
+function logHealthTiers(health: ReadonlyMap<string, ModelHealth>, orderedIds: readonly string[]): void {
+  const now = Date.now();
+  if (now - lastHealthLogAt < 5 * 60_000) return;
+  lastHealthLogAt = now;
+  const groups: Record<string, string[]> = { healthy: [], unknown: [], unhealthy: [] };
+  for (const id of orderedIds) groups[healthTier(health.get(id))].push(id);
+  const detail = (ids: string[]) =>
+    ids
+      .map((id) => {
+        const h = health.get(id);
+        return h ? `${id}(${h.samples - h.failures}/${h.samples})` : `${id}(无样本)`;
+      })
+      .join(" ");
+  console.log(
+    `[chat:model] 健康度分档（样本=稳定/总）：可用 ${detail(groups.healthy) || "-"} · ` +
+      `未验证 ${detail(groups.unknown) || "-"} · 不稳 ${detail(groups.unhealthy) || "-"}`,
+  );
 }
+/**
+ * 每日配额型失败的冷却时长、模型级失败判据、状态码类型与识别函数，均已移入
+ * `src/model-availability.ts`（第 7 批，Jev 纳入治理时共用同一份判据）。
+ * 这里原样 re-export，既有引用方（app.ts / 既有单测）零改动。
+ */
+export {
+  dailyQuotaCooldownMs,
+  isDailyQuotaFailure,
+  isModelDownFailure,
+  modelAvailabilityStatus,
+  modelDownCooldownMs,
+  quotaCooldownStatus,
+  quotaCooldownUntil,
+  rateLimitCooldownMs,
+  type ModelAvailabilityStatus,
+} from "./model-availability.js";
 
 /** 写进任务对话和钉钉的一句说明。不带上游原文，避免把一长段 JSON 当成结论。 */
 export function modelAvailabilityNotice(status: ModelAvailabilityStatus): string {
@@ -316,6 +356,19 @@ const GROUNDING_VERIFY_MODEL_ID = String(process.env.GROUNDING_VERIFY_MODEL || "
 // 不累加失败文本、对用户透明。4xx 等永久错误（401/402/400）不重试。
 const MODEL_CALL_RETRIES = Math.max(0, Number(process.env.MODEL_CALL_RETRIES || 2));
 
+/**
+ * 运行级重试预算（第 5 批 C3，对标 AWS《Timeouts, Retries, and Backoff with Jitter》
+ * 「重试预算（token bucket）：限制整个调用群体的重试总量；只设最大次数防不住重试风暴」）。
+ *
+ * 每轮 `MODEL_CALL_RETRIES` 只管一层；候选数 × 轮次 × key 轮换叠起来仍可放大
+ * （本次事故 abort 后 39 条无效调用就是三层叠加的表现）。这里给整个 run 一个总预算：
+ * 瞬时重试与空回合重试都从它支出，耗尽后只失败不重试（快速换候选 / 收束），不再叠加。
+ * 调用时读 env（不取模块加载期快照）：便于按部署调整与单测注入。
+ */
+export function runRetryBudget(): number {
+  return Math.max(0, Number(process.env.MODEL_RUN_RETRY_BUDGET || 8));
+}
+
 /** 没有正文、也没有工具调用。思考类模型常把话只写进 reasoning，这不算已经答完。 */
 export function isBlankAnswerRound(text: string, toolCalls: number): boolean {
   return !String(text || "").trim() && toolCalls === 0;
@@ -323,8 +376,18 @@ export function isBlankAnswerRound(text: string, toolCalls: number): boolean {
 // 成本护栏：单轮对话累计 prompt token 上限（0 = 关闭）。轮次上限之外的第二道成本闸门，
 // 防止「每轮调不同工具、不触发 Doom Loop」时轮次未到但 token 已爆。
 const MAX_TOTAL_TOKENS = Math.max(0, Number(process.env.MCP_MAX_TOTAL_TOKENS || 0));
-// 失败熔断：同一工具连续失败达阈值后，本对话内不再实际执行（避免对已挂的上游反复空耗）。
+// 失败熔断（第 2 批 P1-1）：连续依赖侧失败达阈值即熔断（快路径）。
+// 慢路径（窗口错误率 + 最小样本数）在 src/tool-failure.ts 的 ToolHealthWindow 里。
+// 注意判据已从「任何失败连续计数」改为「**依赖侧失败**连续计数 + 窗口比率」：
+// 闸门拒绝、参数/语义错误、被中止都不计入（详见 src/tool-failure.ts 顶部说明）。
 const TOOL_FAILURE_LIMIT = Math.max(1, Number(process.env.MCP_TOOL_FAILURE_LIMIT || 3));
+/** 窗口容量 / 最小样本数 / 错误率阈值：Fowler 要求比率必须配最小样本数，故三项都可调。 */
+const toolFailureWindow = (): number => Math.max(3, Number(process.env.MCP_TOOL_FAILURE_WINDOW || 6));
+const toolFailureMinSamples = (): number => Math.max(2, Number(process.env.MCP_TOOL_FAILURE_MIN_SAMPLES || 3));
+const toolFailureRate = (): number => {
+  const v = Number(process.env.MCP_TOOL_FAILURE_RATE ?? 0.5);
+  return Number.isFinite(v) && v > 0 && v <= 1 ? v : 0.5;
+};
 
 // 子代理护栏：轮次、回传摘要上限、并发数（对齐 Deep Agents「同步子代理」语义）。
 const SUBAGENT_MAX_ROUNDS = Number(process.env.SUBAGENT_MAX_ROUNDS || 10);
@@ -532,6 +595,23 @@ function wrapUpReady(text: string, conclusion?: "alert" | "report"): boolean {
   return true;
 }
 
+/**
+ * 「运行被外部中止」时的收尾提示（第 2 批 P1-4）。
+ *
+ * 为什么单独一份：默认提示写的是「已达到工具调用轮次上限」，那是**预防式**收尾的语境。
+ * 被中止（看门狗 / 客户端取消）时若照抄这句，模型会如实复述一个不存在的停止原因。
+ * Anthropic《Building Effective Agents》把这种情况归为「受控停止」，要求
+ * **返回当前最佳结果并说明未完成**——所以这里把真实原因说清楚，其余要求不变。
+ */
+const WRAP_UP_ABORT_HINT =
+  "这一轮运行在完成之前被外部中止了（可能是超时保护或用户停止），工具已经不能再用。\n" +
+  "请基于已经获得的数据给出结论性回答，并**如实区分三件事**：" +
+  "① 已经查到什么（给出具体数字与口径）；② 哪些问题因为运行中断没能查完；③ 中断的原因。\n" +
+  "不要重新描述你打算查什么，也不要用推测补齐没拿到的数字；确实拿不到就写「这一项没有取到」。";
+
+/** 被中止后的收尾独立 deadline：原 signal 已死，必须另给一个有界预算，否则这次调用必然立刻失败。 */
+const WRAP_UP_ON_ABORT_DEADLINE_MS = Math.max(5_000, Number(process.env.WRAP_UP_ON_ABORT_DEADLINE_MS || 25_000));
+
 async function wrapUpWith(
   model: ModelEntry,
   question: string,
@@ -539,15 +619,28 @@ async function wrapUpWith(
   evidence: string,
   signal?: AbortSignal,
   conclusion?: "alert" | "report",
+  /**
+   * `abortedRun=true` 表示这次收尾是因为**运行被外部中止**（而非轮次自然耗尽）。
+   * 此时原 signal 已经 aborted：直接传它会让这次调用 0 毫秒失败，所以改用独立短 deadline，
+   * 并换用如实说明中止原因的提示（见 WRAP_UP_ABORT_HINT）。
+   */
+  opts: { abortedRun?: boolean } = {},
 ): Promise<string | null> {
-  const stable = conclusion === "alert" ? `${WRAP_UP_HINT}\n\n${ALERT_WRAP_PROTOCOL}` : WRAP_UP_HINT;
+  const abortedRun = opts.abortedRun === true;
+  const stable = abortedRun
+    ? WRAP_UP_ABORT_HINT
+    : conclusion === "alert"
+      ? `${WRAP_UP_HINT}\n\n${ALERT_WRAP_PROTOCOL}`
+      : WRAP_UP_HINT;
+  // 被中止时给一份**活着的**有界 signal：独立 deadline，不受已中止的原 signal 影响。
+  const callSignal = abortedRun ? AbortSignal.timeout(WRAP_UP_ON_ABORT_DEADLINE_MS) : signal;
   const content = buildWrapUpUserContent(question, narration, evidence);
   const ask = (extra: string) =>
     callAgent(
       model,
       [{ role: "user", content: extra ? `${content}\n\n${extra}` : content }],
       [],
-      signal,
+      callSignal,
       undefined,
       { systemParts: { stable, dynamic: "" }, disableThinking: true },
     );
@@ -643,6 +736,10 @@ export function autoModelOrder<T extends { id: string; name?: string; label?: st
  * 一个都不新鲜时仍按原顺序试，避免「全部冷却 → 直接没模型」。
  * 定时运行（skipCooled）：跳过冷却中的模型。自动模式下一个新鲜的都没有就返回空名单，由调用方记失败。
  * 点名的模型仍试它本身，不把其余冷却模型再走一遍。
+ *
+ * `health`：可选的模型健康度（`src/model-health.ts`，只读在线评测的确定性打分）。
+ * 传了就按「可用 → 未验证 → 不稳」分档重排**新鲜候选**，同档内仍沿用上面的免费优先次序；
+ * 不传（默认）= 纯次序函数，行为与从前逐字节一致——单测因此不需要任何评测数据。
  */
 export function orderModelCandidates<T extends { id: string; name?: string; label?: string }>(
   all: readonly T[],
@@ -651,8 +748,10 @@ export function orderModelCandidates<T extends { id: string; name?: string; labe
   coolingUntil: ReadonlyMap<string, number> = quotaCooldownUntil,
   now = Date.now(),
   skipCooled = false,
+  health?: ReadonlyMap<string, ModelHealth> | null,
 ): T[] {
   const down = (item: T) => (coolingUntil.get(item.id) || 0) > now;
+  const rank = (items: readonly T[]) => (health ? orderByHealth(items, health) : autoModelOrder(items));
   const fresh = all.filter((item) => !down(item));
   const cooled = all.filter((item) => down(item));
   if (skipCooled) {
@@ -660,9 +759,9 @@ export function orderModelCandidates<T extends { id: string; name?: string; labe
       const others = fresh.filter((item) => item.id !== preferred.id);
       return [preferred, ...others];
     }
-    return auto ? autoModelOrder(fresh) : fresh;
+    return auto ? rank(fresh) : fresh;
   }
-  if (auto) return [...autoModelOrder(fresh), ...autoModelOrder(cooled)];
+  if (auto) return [...rank(fresh), ...autoModelOrder(cooled)];
   if (!preferred) return [...fresh, ...cooled];
   const rest = all.filter((item) => item.id !== preferred.id);
   return [preferred, ...rest.filter((item) => !down(item)), ...rest.filter((item) => down(item))];
@@ -1200,10 +1299,65 @@ function isGovernedPlaceholder(content: string): boolean {
 }
 
 /**
- * 本轮工具结果治理：超出预算时从最旧的开始处理，但永远保留最近 keep 组、
- * 且不处理白名单工具。处理方式（Deep Agents 的 offloading 思路）：
- * 大结果先**卸载到工作区文件**（保留 fs_read 指针，可取回），落盘失败才退化为纯占位符。
- * keep 至少要盖住刚返回、模型还没整合的那一批，否则并行结果会在下一轮调用前被卸掉。
+ * 卸载后**留在上下文里的那一份**：开头摘要 + 取回协议。
+ *
+ * 为什么不能只给一个文件路径（这是实测踩到的坑）：只给路径时，模型没有任何线索判断
+ * 「这个结果里有没有我要的东西」，唯一可行的动作就是 `fs_read` 把每个文件捞回来——
+ * 实测一次多维分析里卸载 70 条、模型逐条捞回 47 次，单工具重复度冲到 47，
+ * 一半轮次预算耗在把同一批数据搬回上下文上，而不是在想口径。
+ *
+ * 三件事一起做才有效（对齐 Anthropic《Effective context engineering》「offload 前先留可读摘要」）：
+ * ① 内联开头摘要——多数「看一眼就够」的诉求直接满足，零次取回；
+ * ② 说清「默认不要读回」——把默认动作从「捞文件」改成「用已有摘要决定要不要」；
+ * ③ 给正确替代路径——需要全量时优先**重发一条已聚合的查询**，而不是把一堆明细读回来。
+ */
+export const TOOL_RESULT_OFFLOAD_HEAD_CHARS = 1200;
+
+export function offloadRecallNotice(path: string, bytes: number, content: string): string {
+  const head = String(content || "").slice(0, TOOL_RESULT_OFFLOAD_HEAD_CHARS).trim();
+  const truncated = String(content || "").trim().length > TOOL_RESULT_OFFLOAD_HEAD_CHARS;
+  return (
+    `…（该工具结果已卸载到工作区文件 ${path}，${bytes} 字节。以下是开头摘要，多半已经够判断了）\n` +
+    (head ? `${head}${truncated ? "\n…（摘要到此，全文在上面的文件里）" : ""}\n` : "") +
+    "取回协议：**默认不要读回这些文件**——先看摘要够不够。确实需要全量时二选一：" +
+    "① 优先**重发一条已经聚合好的查询**（分组 / 去重 / 求和，只取你要的那几行），这是正确做法；" +
+    "② 必须用原文时，**一次只读一个**，不要把多个卸载文件逐个捞回来（实测这样会有一半轮次耗在搬数据上）。"
+  );
+}
+
+/**
+ * 该次调用的结果能否靠「原样重放」取回：只读调用重放无副作用；非只读重放会再产生一次副作用。
+ * 判定走**执行闸门的同一真源**（risk.ts 登记表），不另立一套名单。
+ * 未登记 / 当前查不到的工具按不可重放保守处理（只卸载、绝不丢弃）——宁可少卸，不可丢证据。
+ */
+export function isRecallableCall(name: string): boolean {
+  if (!name) return false;
+  return resolveToolRisk(name).level === "read";
+}
+
+/** 从 assistant 轮回捞「每次调用的参数原文」，用于判定「同输入是否已重放过」。 */
+function argsByToolCallId(conversation: Turn[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const turn of conversation) {
+    if (turn.role !== "assistant" || !turn.toolCalls) continue;
+    for (const call of turn.toolCalls) if (call?.id) out.set(call.id, call.argsJson || "");
+  }
+  return out;
+}
+
+/** 重放签名：工具名 + 参数原文（纯协议比较，不解析参数语义）。 */
+function recallSignature(turn: ToolResultTurn, argsById: Map<string, string>): string {
+  return `${turn.name || ""}|${argsById.get(turn.toolCallId) ?? ""}`;
+}
+
+/**
+ * 本轮工具结果治理（第 8 批 recall 优先 + 第 11 批对齐 CodeBuddy 的 Micro-compact 方案）：
+ * 超出预算时按**重取代价从低到高**处理（recall 优先），但**最近 keep 组是硬下限，绝不越过**——
+ * 对齐 Anthropic「过度压缩是主要失败模式」：模型还没整合的最近一批证据不能为了凑预算而丢。
+ * CodeBuddy 的 Micro-compact 还做了「保留窗口逐级收窄」的 token 闸门，但那会丢最近证据，
+ * 与本项目既有的 keep 窗口保证冲突，故**不采用**；收尾时的收口交给历史压缩（history compact）。
+ * 处理方式是 Deep Agents 的 offloading：大结果先**卸载到工作区文件**（保留 fs_read 指针）；
+ * 只有「重放不出来」的结果在落盘失败时才保留原文，其余退化为纯占位符。
  */
 export function governToolResults(
   conversation: Turn[],
@@ -1213,26 +1367,59 @@ export function governToolResults(
   const toolTurns = conversation.filter((turn) => turn.role === "tool");
   if (!toolTurns.length) return { cleared: 0, offloaded: 0 };
   const retain = Math.max(0, keep);
+  const beforeChars = toolTurns.reduce((n, turn) => n + turn.content.length, 0);
   let total = estimateTokensOf(toolTurns.map((turn) => turn.content));
-  const older = toolTurns.filter(
-    (turn, index) =>
-      index < toolTurns.length - retain &&
-      !isToolResultProtected(turn.name || "") &&
-      !isGovernedPlaceholder(turn.content),
-  );
+  const argsById = argsByToolCallId(conversation);
   let cleared = 0;
   let offloaded = 0;
-  for (const turn of older) {
-    if (total <= TOOL_RESULT_BUDGET) break;
-    total -= estimateTokens(turn.content);
-    const saved = offloadToolResult(conversationId, turn.toolCallId || "unknown", turn.name || "tool", turn.content);
-    turn.content =
-      "error" in saved
-        ? TOOL_RESULT_CLEARED
-        : `…（该工具结果已卸载到工作区文件 ${saved.path}，${saved.bytes} 字节；需要时用 fs_read 读取，或重新调用工具）`;
-    if ("error" in saved) cleared += 1;
-    else offloaded += 1;
+  // 只动「最近 keep 组」之外的；keep 是硬下限，绝不越过（否则会丢模型还没整合的最近证据）。
+  const candidates = toolTurns
+    .map((turn, index) => ({ turn, index }))
+    .filter(
+      ({ turn, index }) =>
+        index < toolTurns.length - retain &&
+        !isToolResultProtected(turn.name || "") &&
+        !isGovernedPlaceholder(turn.content),
+    )
+    .map(({ turn }) => turn);
+  const signatureCount = new Map<string, number>();
+  for (const turn of candidates) {
+    const sig = recallSignature(turn, argsById);
+    signatureCount.set(sig, (signatureCount.get(sig) || 0) + 1);
   }
+  const ranked = orderByRecallCost(
+    candidates.map((turn) => ({
+      turn,
+      cls: classifyRecall({
+        duplicated: (signatureCount.get(recallSignature(turn, argsById)) || 0) > 1,
+        read: isRecallableCall(turn.name || ""),
+        derived: turn.derived === true,
+      }),
+    })),
+    (entry) => entry.cls,
+  );
+  for (const { turn, cls } of ranked) {
+    if (total <= TOOL_RESULT_BUDGET) break;
+    const freed = estimateTokens(turn.content);
+    const saved = offloadToolResult(conversationId, turn.toolCallId || "unknown", turn.name || "tool", turn.content);
+    if ("error" in saved) {
+      // 重放不出来的结果（重放有副作用 / 多轮推导产物）：丢掉就再也拿不回来 ——
+      // 宁可继续占着预算也保留原文，把「超预算」交给历史压缩去消化。
+      if (cls === "irreplaceable") continue;
+      turn.content = TOOL_RESULT_CLEARED;
+      cleared += 1;
+    } else {
+      turn.content = offloadRecallNotice(saved.path, saved.bytes, turn.content);
+      offloaded += 1;
+    }
+    // 只扣「摘掉的原文」：保留原文的分支不扣（否则账目会假装腾出了空间，循环提前收手）。
+    total -= freed;
+  }
+  const afterChars = toolTurns.reduce((n, turn) => n + turn.content.length, 0);
+  console.log(
+    `[chat:compact] 工具结果 ${toolTurns.length} 条，字符 ${beforeChars} → ${afterChars}（预算 ${TOOL_RESULT_BUDGET} tok，估算 ${total}）` +
+      `：卸载 ${offloaded} / 清空 ${cleared}（keep 窗口为硬下限，绝不越过）`,
+  );
   return { cleared, offloaded };
 }
 
@@ -1551,6 +1738,9 @@ export async function* streamCall(
   /** 角色级首轮强制工具调用（对齐 Anthropic「防凭记忆作答」最佳实践）：仅当存在且当前尚无工具结果时，
    *  把 tool_choice 设为 required 逼模型先调工具；拿到结果后（或角色未开启）走 auto。不传 = auto。 */
   forceToolCall?: boolean,
+  /** 运行级重试预算的取用回调（第 8 批）：透传给 models.ts 的多 key 轮换——换 key 也是一次重试，
+   *  必须和本层的瞬时/空回合重试共用同一份预算。不传 = 不限额（既有行为）。 */
+  spendRetry?: () => boolean,
 ): AsyncGenerator<ChatEvent, CallOutcome> {
   // 单一有序队列：文本与思考增量按到达顺序入队（同一 read 内也保持先后），消费循环严格 FIFO
   // 下发，避免「优先取文本」导致整段 SSE 一次性送达时思考被排到正文之后。
@@ -1588,8 +1778,8 @@ export async function* streamCall(
         wake?.();
       },
       tools.length
-        ? { tools, toolChoice, systemParts: system }
-        : { systemParts: system },
+        ? { tools, toolChoice, systemParts: system, spendRetry }
+        : { systemParts: system, spendRetry },
       (tchunk) => {
         // 注意：thinking 通道不应置 streamed——streamed 只表示「文本增量已通过流式通道到达」，
         // 用于决定是否走非流式文本兜底。否则非流式模型一旦返回 thinking，会误把最终正文丢弃。
@@ -1684,6 +1874,17 @@ interface LoopContext {
   loadedTools: Set<string>;
   system: SystemPrompt;
   signal?: AbortSignal;
+  /**
+   * 运行级重试预算（第 5 批 C3）：整个 run（跨候选共享）的瞬时/空回合重试总量。
+   * 由 chatStream 创建并注入；未注入（测试 / 直连路径）= 不限额，行为与从前一致。
+   */
+  retryBudget?: { left: number };
+  /**
+   * run 级分类器统计（第 7 批）：Jev 每轮最多问两次（输入 + 草稿），也可能在工具路径上
+   * 因代发检查被调用。它们与对话模型共用一个统计对象，由 chatStream 创建、runLoop 透传，
+   * 结束后回填 usage 事件 → 在线评测 `classifier_health` 维度。
+   */
+  classifierStats?: ClassifierStats;
   /** 主代理 = true（可用 task 委派）；子代理 = false（防递归）。 */
   allowTask: boolean;
   /** 主代理 = true；子代理 = false（子代理送不出确认事件 → 需要用户拍板的操作在闸门处立即拒绝，
@@ -1745,6 +1946,19 @@ interface LoopOutcome {
   modelRetries: number;
   /** 因连续失败被熔断跳过的工具调用次数。 */
   toolFusions: number;
+  /**
+   * 真正执行过且失败的工具调用数（第 3 批 P2-2 工具健康度）。
+   * 只计真实执行的失败：闸门拒绝 / 同轮去重跳过 / 熔断摘除都不计（它们另有计数与提示），
+   * 混在一起会让「工具坏了」与「没让工具跑」分不开——事故复盘要的正是前者。
+   */
+  toolFailures: number;
+  /**
+   * 综合轮次数（第 3 批 P2-2 收敛质量）：无工具调用、通过纠正后直接收束的轮数。
+   * 有工具调用却零综合轮 = 预算耗尽也没写出结论（2026-10-14 事故：28 轮 0 综合轮）。
+   */
+  synthesisRounds: number;
+  /** 同一工具被重复调用的最大次数（第 3 批 P2-2 效率维度）。 */
+  toolRepeatMax: number;
   /** 协议护栏拦截纠正的次数（伪工具调用 / 伪出图占位符）。 */
   pseudoCallRetries: number;
   /** 接地护栏纠正次数（零数据作答被作废并回灌提示的次数）。 */
@@ -1845,7 +2059,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       return { ok: builtin.ok, text: builtin.text };
     }
     hydrateDeferred(name);
-    const sendRefusal = ctx.namespace === "support" ? await visitorSendRefusal(name, mcpArgs(name, argsJson)) : null;
+    const sendRefusal =
+      ctx.namespace === "support"
+        ? await visitorSendRefusal(name, mcpArgs(name, argsJson), jevOpts(ctx))
+        : null;
     if (sendRefusal) return { ok: false, text: sendRefusal };
     const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
     return { ok: !result.isError, text: result.isError ? friendlySendFailure(name, result.text) : result.text };
@@ -1860,13 +2077,44 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const guard = new LoopGuard(DOOM_LOOP_MAX_ROUNDS);
   // 成本护栏：累计本轮已发送的 prompt token 估算；失败熔断：各工具连续失败计数。
   let spentTokens = 0;
-  const failedTools = new Map<string, number>();
+  // 失败熔断状态（第 2 批 P1-1）：窗口判据 + 按错误分类，见 src/tool-failure.ts 的判据说明。
+  const toolHealth = new ToolHealthWindow({
+    window: toolFailureWindow(),
+    minSamples: toolFailureMinSamples(),
+    failRate: toolFailureRate(),
+    consecutive: TOOL_FAILURE_LIMIT,
+  });
+  // 重复调用预算（第 2 批 P1-2）：按工具名统计整轮累计调用次数 + 每轮增量，
+  // 轮末统一判据（src/repeat-budget.ts）。只提示不硬拦；同一工具只提示一次，避免刷屏。
+  const toolCallCounts = new Map<string, number>();
+  const repeatBudgetNotified = new Set<string>();
+  // 第 10 批：上面那条提示是「同一工具只提示一次」，于是出现「第 8 次提醒过一次、之后又调 24 次」。
+  // 这里再挂一条**跨轮阶梯**账：记住已提示到哪一级台阶，每上一个台阶再提醒一次（默认仍不硬拦）。
+  const repeatEscalatedStep = new Map<string, number>();
+  let toolCallTotal = 0;
+  /** 记一次真实执行（重复预算用；不计入被闸门拦下与同轮去重的跳过）。 */
+  const noteToolCall = (name: string): void => {
+    toolCallCounts.set(name, (toolCallCounts.get(name) || 0) + 1);
+    toolCallTotal += 1;
+  };
   // 运行时统计（回填 usage 事件）：轮次 / 重试 / 熔断 / 协议护栏纠正（伪调用与伪出图共用一次预算）。
   let rounds = 0;
   let modelRetries = 0;
   let toolFusions = 0;
   let pseudoCallRetries = 0;
   let pseudoCallRetried = false;
+  // 第 3 批 P2-2 三维统计：真实执行的失败 / 综合轮 / 同工具重复峰值（回填 usage 事件，进在线评测）。
+  let toolFailures = 0;
+  let synthesisRounds = 0;
+  /**
+   * 标记「本轮即综合轮」（P2-2 收敛质量）：产出最终答案的那一轮。
+   * 四条收束路径（接地放行 / 纠正用尽放行 / 诚实兜底 / 正常收尾）都经过它——
+   * 有工具调用却零综合轮 = 预算耗尽也没写出结论（2026-10-14 事故：28 轮 0 综合轮）。
+   */
+  const markSynthesis = (finalText: string): string => {
+    synthesisRounds += 1;
+    return finalText;
+  };
   // 接地护栏状态：evidence = 本轮真正执行成功且引入外部数据的工具数；未取证就收束则按 decision 处理。
   let groundingEvidence = 0;
   let groundingRetries = 0;
@@ -1908,6 +2156,18 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const userQuestion = [...turns].reverse().find((turn) => turn.role === "user")?.content || "";
 
   for (let round = 0; round < ctx.maxRounds; round++) {
+    // 中止短路（第 5 批）：本轮开始前就已被外部中止（上一轮工具执行期间被看门狗/用户触发）→
+    // 不再发起模型调用。与候选循环顶部的短路配套：没有这一条，中止后每个候选还会各产生一次
+    // 0-2ms 的无效调用与 llm span（事故 L7 的 39 条无效 span 即此形态）。
+    if (ctx.signal?.aborted) {
+      failure = "运行已被外部中止";
+      break;
+    }
+    // per-round 状态在**轮首**重置（第 4 批修正）：旧位置在工具路径里，综合轮直接 break 出循环，
+    // 绕过了那两行——下一轮的 roundExecuted 会残留上一轮的工具签名（mode 误判成 tool），
+    // executedSigs 也会把上一轮的去重记录错成本轮的（同参调用被误判「本轮已执行过」而跳过）。
+    executedSigs.clear();
+    roundExecuted = [];
     // 成本护栏：轮次上限之外的第二道闸门。累计每轮实际发送的 prompt（历史 + 工具 schema）
     // 估算，超过预算即停止继续调用（已生成内容仍会正常返回）。
     if (MAX_TOTAL_TOKENS > 0) {
@@ -1959,6 +2219,24 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     }
     // 该轮模型调用瞬时失败重试：SSE 中途断流 / 超时 / 限流等瞬态错误应重试，
     // 4xx 等永久错误不重试。重试对用户透明（不累加失败文本，成功后才计入 text）。
+    // 运行级重试预算（第 5 批 C3）的告警哨：每轮最多提醒一次，避免循环内刷屏。
+    let budgetWarned = false;
+    // 重试预算（第 5 批 C3）：整个 run 的总量管制，跨候选共享（ctx.retryBudget 由 chatStream 创建）。
+    // 每轮次数上限管「这一轮最多重试几次」，预算管「整个 run 最多重试几次」——两层都要过。
+    // 第 8 批：同一个回调也交给 models.ts 的 key 轮换 —— 换 key 也是一次重试；
+    // 不从这里出账就会变成「key 数 × 每层重试数」的乘积（AWS：只在一层重试）。
+    const canRetry = (): boolean => {
+      if (!ctx.retryBudget) return true; // 未注入 = 不限额（测试 / 直连路径）
+      if (ctx.retryBudget.left <= 0) {
+        if (!budgetWarned) {
+          budgetWarned = true;
+          console.log("[chat:retry] 运行级重试预算已耗尽，后续失败不再重试（快速换候选/收束）");
+        }
+        return false;
+      }
+      ctx.retryBudget.left -= 1;
+      return true;
+    };
     while (true) {
       // 强制工具通道在「没有工具」时无意义（部分网关会直接 400），收尾轮必须一起关掉。
       const llmStart = Date.now();
@@ -1970,6 +2248,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.signal,
         ctx.system,
         wrapUp ? false : ctx.forceToolCall,
+        canRetry,
       );
       const heldThinking: ChatEvent[] = [];
       const ownAlertBody =
@@ -2025,7 +2304,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         // 没有正文也没有工具调用，不算答完。思考类模型经常只写 reasoning，正文是空的；
         // 直接收束就会落成「生成未产出内容」。用同一份重试预算再要一次正文。
         const emptyRound = isBlankAnswerRound(outcome.text, outcome.toolCalls.length);
-        if (emptyRound && callAttempt < MODEL_CALL_RETRIES) {
+        if (emptyRound && callAttempt < MODEL_CALL_RETRIES && canRetry()) {
           callAttempt += 1;
           modelRetries += 1;
           console.log(`[chat:retry] 模型返回空回合，重试 ${callAttempt}/${MODEL_CALL_RETRIES}`);
@@ -2033,7 +2312,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         }
         break;
       }
-      if (callAttempt < MODEL_CALL_RETRIES && isTransientModelError(outcome.failure)) {
+      if (callAttempt < MODEL_CALL_RETRIES && isTransientModelError(outcome.failure) && canRetry()) {
         callAttempt += 1;
         modelRetries += 1;
         console.log(`[chat:retry] 模型调用瞬时失败，重试 ${callAttempt}/${MODEL_CALL_RETRIES}：${outcome.failure}`);
@@ -2044,6 +2323,34 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     text += outcome.text;
     if (outcome.reasoning.trim()) wrapReasoning.push(outcome.reasoning);
     rounds = round + 1;
+    /**
+     * 逐轮追踪（best-effort，§12.6）：每轮落一行 rounds-<runId>.jsonl。
+     *
+     * **为什么提成闭包**：综合轮以前在下面直接 `break` 出轮级循环，绕过了轮末埋点——
+     * `RoundTrace.mode` 类型一直声明了 `synthesis` 却从未写过，「综合轮出现 0 次」这个
+     * 事故核心数字因此无法从落盘直接数出（2026-10-14 复盘 L2 的前提）。现在综合轮
+     * break 前也落一行（`mode=synthesis`），工具轮走轮末那一次。
+     */
+    const traceRound = (): void => {
+      if (!ctx.runId) return;
+      const clearedDelta = clearedToolResults - lastCleared;
+      const offloadedDelta = offloadedToolResults - lastOffloaded;
+      lastCleared = clearedToolResults;
+      lastOffloaded = offloadedToolResults;
+      appendRoundTrace({
+        runId: ctx.runId,
+        round,
+        at: Date.now(),
+        // mode 按「本轮实际做了什么」记：执行了工具 = tool；没有 = 模型在收束（synthesis）。
+        mode: roundExecuted.length > 0 ? "tool" : "synthesis",
+        toolCallsThisRound: roundExecuted.length,
+        clearedDelta,
+        offloadedDelta,
+        groundingEvidence,
+        spentTokens,
+        ...(failure ? { note: "failure" } : {}),
+      });
+    };
     if (outcome.failure) {
       failure = outcome.failure;
       break;
@@ -2113,8 +2420,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               ? "[chat:grounding] 分诊调用失败，放行本轮回答，不作废也不兜底"
               : "[chat:grounding] 分诊判定本轮回答不含需外部数据支撑的断言：放行，不作废也不兜底",
           );
-          synthesisText = outcome.text;
+          synthesisText = markSynthesis(outcome.text);
           if (roundText) yield { type: "text_delta", text: roundText };
+          traceRound();
           break;
         }
         groundingRetries += 1;
@@ -2133,8 +2441,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               ? "[chat:grounding] 纠正用尽，分诊调用失败，放行最后一段回答"
               : "[chat:grounding] 纠正用尽，但最后一段回答不含需外部数据支撑的断言：放行",
           );
-          synthesisText = outcome.text;
+          synthesisText = markSynthesis(outcome.text);
           if (roundText) yield { type: "text_delta", text: roundText };
+          traceRound();
           break;
         }
         ungrounded = true;
@@ -2155,8 +2464,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         );
         spentTokens += estimateTokens(finalHonest);
         text += finalHonest;
-        synthesisText = finalHonest;
+        synthesisText = markSynthesis(finalHonest);
         yield { type: "text_delta", text: finalHonest };
+        traceRound();
         break;
       }
       // 运行时校验：事后核验（Chain-of-Verification 最小版）。零证据的情况已由上面拦截；这里覆盖
@@ -2291,14 +2601,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         console.log("[chat:source] 把公开检索留成确认，已要求先检索");
         continue;
       }
-      synthesisText = outcome.text;
+      synthesisText = markSynthesis(outcome.text);
       if (roundText && !canonicalAlertFacts) yield { type: "text_delta", text: roundText };
+      traceRound();
       break;
     }
 
-    // 每轮重置同轮去重集合（跨轮允许重新执行，避免误杀「重新取数」等合法重复）。
-    executedSigs.clear();
-    roundExecuted = [];
+    // per-round 状态（同轮去重集合 / 本轮已执行签名）已在轮首重置，见循环入口。
     const toolsBefore = conversation.filter((turn) => turn.role === "tool").length;
 
     // 工具调用轮：把本轮思考一并带上（`reasoning`）——思考类模型在工具循环里要求 assistant 工具调用消息
@@ -2358,10 +2667,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       ok: boolean;
       rawText: string;
       executed: boolean;
+      /** 开始时刻：批量并发下每个调用各自的耗时（并发批的 span 以前完全缺失）。 */
+      startedAt?: number;
       todos?: TodoItem[];
       chart?: { title?: string; chartType: string; data: unknown; encode?: Record<string, string>; options?: Record<string, unknown> };
       artifact?: ArtifactSpec;
     }> => {
+      const startedAt = Date.now();
       if (ctx.deniedBuiltins?.has(c.name)) {
         return { ok: false, rawText: unattendedToolDenial(c.name), executed: false };
       }
@@ -2373,6 +2685,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           rawText: `本次运行未授权该工具（工具允许清单已收窄）：${c.name}`,
           executed: false,
         };
+      }
+      // 运行级重复上限（第 10 批，默认关 —— TOOL_REPEAT_STOP_AFTER）：累计到上限就不再执行，
+      // 回灌替代动作（静默丢弃会让模型以为工具坏了而反复重试）。
+      const repeatTotal = toolCallCounts.get(c.name) || 0;
+      if (repeatBudgetStop(repeatTotal)) {
+        console.log(`[chat:repeat] ${c.name} 累计 ${repeatTotal} 次，达到上限 ${REPEAT_STOP_AFTER}，本次不再执行`);
+        return { ok: false, rawText: repeatStopNotice(c.name, repeatTotal, REPEAT_STOP_AFTER), executed: false };
       }
       const builtin = await execBuiltin(
         c.name,
@@ -2390,6 +2709,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ok: builtin.ok,
           rawText: builtin.text,
           executed: true,
+          startedAt,
           ...(builtin.todos ? { todos: builtin.todos } : {}),
           ...(builtin.chart ? { chart: builtin.chart } : {}),
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
@@ -2405,7 +2725,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       const refused = admitDirectListCall(c.name, c.argsJson, directListSeen);
       if (refused) return { ok: false, rawText: refused, executed: false };
       hydrateDeferred(c.name);
-      const sendRefusal = ctx.namespace === "support" ? await visitorSendRefusal(c.name, mcpArgs(c.name, c.argsJson)) : null;
+      const sendRefusal =
+        ctx.namespace === "support"
+          ? await visitorSendRefusal(c.name, mcpArgs(c.name, c.argsJson), jevOpts(ctx))
+          : null;
       if (sendRefusal) return { ok: false, rawText: sendRefusal, executed: false };
       const result = await callMcpTool(c.name, mcpArgs(c.name, c.argsJson), ctx.signal);
       if (result.isError) releaseDirectListCall(c.name, c.argsJson, directListSeen);
@@ -2417,6 +2740,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ok: !result.isError,
         rawText: result.isError ? friendlySendFailure(c.name, result.text) : result.text,
         executed: true,
+        startedAt,
       };
     };
     while (index < calls.length) {
@@ -2462,25 +2786,87 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         }
         const results: SubagentResult[] = new Array(batch.length);
         const batchGen = runSubagentBatch(batch, ctx, results);
+        // 子代理墙钟时间的度量基准（span 埋点用）：事故 §7 的「父轮 task 调用没有 span」
+        // 说的就是这里——批量分支跑完直接 continue，一次委派耗时多久、是成功还是空转，
+        // 在 span 层完全不可见（子代理空转 7.5 分钟 therefore 无迹可寻）。
+        const taskStartedAt = Date.now();
         // 逐片转发子代理的 subagent_start / subagent_delta / subagent_end 独立事件。
         for await (const ev of batchGen) yield ev;
         for (const result of results) {
-          yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: result.text };
+          // 交接文本（P1-3）：结构化状态 + 覆盖面 + 原因 + 回传正文，父轮与用户都能直接读。
+          const handoff = subagentHandoffText(result);
+          yield { type: "tool_result", id: result.id, name: "task", ok: result.ok, text: handoff };
           // 子代理回传也是外部数据 → 计入接地证据（见 src/grounding.ts）。
-          if (result.ok) {
+          // **只有 success 算证据**（P1-3）：partial / no_findings / failed 都不是可引用的
+          // 完整事实——「没跑完」与「没找到」都不得当结论，父轮必须据此续跑或如实收束。
+          if (result.ok && result.status === "success") {
             groundingEvidence += 1;
             pushEvidence(result.text, "task");
             noteWrapUpEvidence(wrapEvidence, "task", result.text);
           }
           // 子代理回传同样是不可信数据（它自己读的也都是外部内容）：定界后回灌。
-          const wrappedTask = wrapUntrusted(result.text, { kind: "subagent_summary", source: "task" });
-          conversation.push({ role: "tool", toolCallId: result.id, name: "task", content: wrappedTask.text });
+          const wrappedTask = wrapUntrusted(handoff, { kind: "subagent_summary", source: "task" });
+          // derived：这份内容是子代理跑若干轮推导出来的，再委派一次也未必复现（成本高、结果还可能不同）。
+          // 上下文治理据此把它归为「不可重放」——最后才卸载，且落盘失败时保留原文（见 tool-result-governance.ts）。
+          conversation.push({
+            role: "tool",
+            toolCallId: result.id,
+            name: "task",
+            content: wrappedTask.text,
+            derived: true,
+          });
           roundExecuted.push(toolCallSignature("task", result.args));
           handles.push({
             name: "task",
             args: truncateArgs(result.args),
-            summary: result.ok ? `子代理 · ${result.toolCalls} 次工具调用` : "子代理执行失败",
+            summary:
+              result.status === "success"
+                ? `子代理 · ${result.toolCalls} 次工具调用`
+                : `子代理${SUBAGENT_STATUS_LABEL[result.status]}`,
           });
+          // span 埋点（第 4 批，补事故 §7 的 task 无 span 缺口）：一次委派一行，
+          // 与其它工具路径同口径（OTel GenAI：每次工具执行都该有 span）。
+          // 结构化状态作为**低基数** attr 落盘（success/partial/no_findings/failed 四值），
+          // 可直接聚合「多少委派是空转/失败」而不炸基数；墙钟时间让「卡死的委派」可见。
+          if (ctx.runId) {
+            appendSpanTrace({
+              runId: ctx.runId,
+              at: taskStartedAt,
+              kind: "tool",
+              name: "task",
+              durationMs: Math.max(0, Date.now() - taskStartedAt),
+              ok: result.ok,
+              attrs: {
+                "gen_ai.tool.name": "task",
+                "gen_ai.tool.type": "function",
+                "gen_ai.conversation.id": ctx.conversationId,
+                "gen_ai.tool.subagent.status": result.status,
+                "gen_ai.tool.subagent.calls": result.toolCalls,
+                ...(result.ok
+                  ? {}
+                  : {
+                      // ok=false + executed=true 时分类必非 null（纯函数保证），`?? "other"` 只为类型收窄。
+                      "error.type":
+                        classifyToolFailure({
+                          executed: true,
+                          ok: false,
+                          text: result.errors?.join("；") || handoff,
+                          aborted: ctx.signal?.aborted,
+                        }) ?? "other",
+                      "error.description": redactSensitive(handoff).slice(0, 200),
+                    }),
+              },
+            });
+            incCounter("bx_agent_tool_calls_total", "工具调用次数（按结果）", {
+              status: result.ok ? "ok" : "error",
+            });
+            observeSummary(
+              "bx_agent_tool_duration_ms",
+              "工具执行耗时（毫秒）",
+              { status: result.ok ? "ok" : "error" },
+              Math.max(0, Date.now() - taskStartedAt),
+            );
+          }
         }
         continue;
       }
@@ -2535,21 +2921,21 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         });
         continue;
       }
-      // 失败熔断：某工具连续失败达上限后，本对话内不再实际执行（避免对已挂的上游反复空耗）。
-      const failCount = failedTools.get(call.name) || 0;
-      if (failCount >= TOOL_FAILURE_LIMIT) {
+      // 失败熔断（第 2 批 P1-1）：窗口判据 + **按错误分类**。
+      // 只有依赖侧问题（超时/上游不可用）才计入；闸门拒绝、参数错误、被中止都不算——
+      // 「成功一次就清零」的旧判据在交替失败下永远不触发（本次事故形态），已废弃。
+      const fuse = toolHealth.fuseVerdict(call.name);
+      if (fuse.fuse) {
         index += 1;
         toolFusions += 1;
-        const fused =
-          `工具 ${call.name} 已连续失败 ${failCount} 次，本对话内暂时跳过；` +
-          "请改用其他工具，或换一种方式完成任务。";
+        const fused = fuse.reason;
         yield { type: "tool_call", id: call.id, name: call.name, server: serverOf.get(call.name), args: call.argsJson };
         yield { type: "tool_result", id: call.id, name: call.name, ok: false, text: fused };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: fused });
         handles.push({
           name: call.name,
           args: truncateArgs(call.argsJson),
-          summary: `已熔断（连续失败 ${failCount} 次）`,
+          summary: `已熔断（${KIND_LABEL[toolHealth.lastKind(call.name) || "other"]}）`,
         });
         continue;
       }
@@ -2561,7 +2947,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           max: MAX_CONCURRENT_CALLS,
           signature: toolCallSignature,
           isExecuted: (s) => TOOL_DEDUP_SAME_ROUND && executedSigs.has(s),
-          isFused: (name) => (failedTools.get(name) || 0) >= TOOL_FAILURE_LIMIT,
+          isFused: (name) => toolHealth.fuseVerdict(name).fuse,
           canRun: (name, argsJson) => concurrentOk(name, resolveToolRisk(name, ctx.grantServers, safeJsonParse(argsJson))),
         });
         const batch = planned.map((item) => ({
@@ -2596,15 +2982,20 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             // 副作用计数（与单调用路径同口径，见其注释）。纯对话内部状态工具（write_todos 等）
             // 不计——重跑只更新对话内展示状态，无文件 / 外部副作用，不该拦住换模型重跑。
             if (out.executed && item.verdict.level !== "read" && !CONVERSATION_STATE_TOOLS.has(item.call.name)) sideEffects += 1;
-            // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
+            // 失败熔断记账（第 2 批 P1-1）：按错误**分类**记进窗口，成功不再清零统计。
+            // 分类在这里算一次，下面 span 埋点复用同一个值（分类是纯函数，两次结果也一致）。
+            const batchErrorKind = classifyToolFailure({
+              executed: out.executed,
+              ok: out.ok,
+              text: out.rawText,
+              aborted: ctx.signal?.aborted,
+            });
             if (out.executed) {
-              if (out.ok) {
-                failedTools.delete(item.call.name);
-                // 首执行轮次登记（跨轮重复软提示依据；失败后的重试不算重复）。
-                if (!executedSigRounds.has(item.sig)) executedSigRounds.set(item.sig, round);
-              } else {
-                failedTools.set(item.call.name, (failedTools.get(item.call.name) || 0) + 1);
-              }
+              toolHealth.record(item.call.name, batchErrorKind);
+              noteToolCall(item.call.name);
+              // P2-2 工具健康度：只记真实执行的失败（闸门拒绝/同轮跳过/熔断摘除都不计）。
+              if (!out.ok) toolFailures += 1;
+              if (out.ok && !executedSigRounds.has(item.sig)) executedSigRounds.set(item.sig, round);
             }
             if (out.executed && out.ok && isGroundingEvidenceTool(item.call.name)) {
               groundingEvidence += 1;
@@ -2652,6 +3043,41 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
                   ? "未执行（定时运行拒绝）"
                   : "执行失败",
             });
+            // span 埋点（第 2 批 P2-1）：并发批以前完全没有 span —— 本次事故 53 次工具调用
+            // 只留下 17 条 span，缺口就在这里，导致「哪一次调用失败、失败成什么」无法复盘。
+            if (ctx.runId) {
+              const startedAt = out.startedAt ?? Date.now();
+              appendSpanTrace({
+                runId: ctx.runId,
+                at: startedAt,
+                kind: "tool",
+                name: item.call.name,
+                durationMs: Math.max(0, Date.now() - startedAt),
+                ok: out.executed && out.ok,
+                attrs: {
+                  "gen_ai.tool.name": item.call.name,
+                  "gen_ai.tool.type": "function",
+                  "gen_ai.conversation.id": ctx.conversationId,
+                  // 并发批标记：与单条路径区分，便于统计「有多少调用走的是并发批」。
+                  "gen_ai.tool.concurrent": true,
+                  ...(batchErrorKind
+                    ? {
+                        "error.type": batchErrorKind,
+                        "error.description": redactSensitive(String(out.rawText || "")).slice(0, 200),
+                      }
+                    : {}),
+                },
+              });
+              incCounter("bx_agent_tool_calls_total", "工具调用次数（按结果）", {
+                status: out.executed && out.ok ? "ok" : "error",
+              });
+              observeSummary(
+                "bx_agent_tool_duration_ms",
+                "工具执行耗时（毫秒）",
+                { status: out.executed && out.ok ? "ok" : "error" },
+                Math.max(0, Date.now() - startedAt),
+              );
+            }
           }
           continue;
         }
@@ -2866,7 +3292,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         } else {
           hydrateDeferred(call.name);
           const sendRefusal =
-            ctx.namespace === "support" ? await visitorSendRefusal(call.name, mcpArgs(call.name, call.argsJson)) : null;
+            ctx.namespace === "support" ? await visitorSendRefusal(call.name, mcpArgs(call.name, call.argsJson), jevOpts(ctx)) : null;
           if (sendRefusal) {
             ok = false;
             rawText = sendRefusal;
@@ -2888,15 +3314,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // 纯对话内部状态工具（write_todos 等）也不计：它只更新对话内展示状态，重跑无文件 / 外部副作用。
       // 漏排除的后果是实测过的：首轮 write_todos 后次轮模型 429，候选链（含付费兜底）被整体斩断。
       if (executed && verdict.level !== "read" && !CONVERSATION_STATE_TOOLS.has(call.name)) sideEffects += 1;
-      // 失败计数（供失败熔断）：真正执行且成功 → 清零；真正执行但失败 → 累计。
+      // 失败熔断记账（第 2 批 P1-1）：按错误分类记窗口；成功不再清零统计。
       if (executed) {
-        if (ok) {
-          failedTools.delete(call.name);
-          // 首执行轮次登记（跨轮重复软提示依据；失败后的重试不算重复）。
-          if (!executedSigRounds.has(sig)) executedSigRounds.set(sig, round);
-        } else {
-          failedTools.set(call.name, (failedTools.get(call.name) || 0) + 1);
-        }
+        toolHealth.record(call.name, classifyToolFailure({ executed, ok, text: rawText, aborted: ctx.signal?.aborted }));
+        noteToolCall(call.name);
+        // P2-2 工具健康度：只记真实执行的失败（未执行的拒绝/跳过不进分母，见 LoopOutcome 注释）。
+        if (!ok) toolFailures += 1;
+        if (ok && !executedSigRounds.has(sig)) executedSigRounds.set(sig, round);
       }
       // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；
       // 记账 / 工作区类内置工具（write_todos、fs_write 等）成功也不算证据。
@@ -2938,6 +3362,12 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // span 级埋点：单个工具一行。慢工具是「这一轮为什么这么久」最常见的答案，
       // 轮级只有聚合数，看不出是哪一个卡住。
       if (ctx.runId) {
+        // 失败时按 OTel 语义约定补 error.type（低基数分类）+ error.description（人话摘要）：
+        // 只有 ok=false 而没有分类，等于把「超时 / 闸门拒绝 / 参数错」抹平成同一类，
+        // 事后无法复盘（2026-10-14 事故的 7 次工具失败至今查不出原因即源于此）。
+        // 分类为 null（成功）时**不写** error.*：OTel 明确「已被正常处理的错误不应记录」。
+        const errorKind =
+          executed && !ok ? classifyToolFailure({ executed, ok, text: rawText, aborted: ctx.signal?.aborted }) : null;
         appendSpanTrace({
           runId: ctx.runId,
           at: toolStart,
@@ -2949,6 +3379,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             "gen_ai.tool.name": call.name,
             "gen_ai.tool.type": "function",
             "gen_ai.conversation.id": ctx.conversationId,
+            ...(errorKind
+              ? {
+                  // 低基数分类值（绝不填消息文本：那会炸基数并泄露内容）。
+                  "error.type": errorKind,
+                  // 人话说明走独立属性并脱敏截断，替代 span status.description。
+                  "error.description": redactSensitive(String(rawText || "")).slice(0, 200),
+                }
+              : {}),
           },
         });
         incCounter("bx_agent_tool_calls_total", "工具调用次数（按结果）", {
@@ -2983,25 +3421,40 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     }
     clearedToolResults += governed.cleared;
     offloadedToolResults += governed.offloaded;
-    // 逐轮追踪（best-effort，不阻断对话）：每轮落一行，使「重复探查 / 预算耗尽 / 熔断」可被复盘（§12.6 疑问①）。
-    if (ctx.runId) {
-      const clearedDelta = clearedToolResults - lastCleared;
-      const offloadedDelta = offloadedToolResults - lastOffloaded;
-      lastCleared = clearedToolResults;
-      lastOffloaded = offloadedToolResults;
-      appendRoundTrace({
-        runId: ctx.runId,
-        round,
-        at: Date.now(),
-        mode: "tool",
-        toolCallsThisRound: roundExecuted.length,
-        clearedDelta,
-        offloadedDelta,
-        groundingEvidence,
-        spentTokens,
-        ...(failure ? { note: "failure" } : {}),
-      });
+    // 重复调用预算（P1-2）：按「本轮该工具次数 + 整轮占比」两个维度给一次提示。
+    // 现有跨轮提示只认参数全等，换参数重试完全逃过（本次事故 24 次元数据探查即如此）。
+    if (roundExecuted.length) {
+      const perRound = new Map<string, number>();
+      for (const s of roundExecuted) {
+        const name = s.split("|")[0] || s;
+        perRound.set(name, (perRound.get(name) || 0) + 1);
+      }
+      for (const [name, count] of perRound) {
+        if (repeatBudgetNotified.has(name)) continue;
+        const notice = repeatBudgetNotice({
+          toolName: name,
+          perRoundCount: count,
+          priorCount: Math.max(0, (toolCallCounts.get(name) || 0) - count),
+          totalOther: Math.max(0, toolCallTotal - count),
+        });
+        if (!notice) continue;
+        repeatBudgetNotified.add(name);
+        conversation.push({ role: "user", content: notice });
+        console.log(`[chat:repeat] ${name} 本轮 ${count} 次 / 累计 ${toolCallCounts.get(name)} 次，已提示换路径`);
+      }
+      // 第 10 批：阶梯升级——上面那条只提示一次，之后同一工具再探 20 次也不会再被提醒。
+      // 这里按累计次数的翻倍台阶（8 → 16 → 32）每上一级再提醒一次，文案逐级加重。
+      for (const name of perRound.keys()) {
+        const total = toolCallCounts.get(name) || 0;
+        const esc = repeatEscalation({ toolName: name, total, notifiedStep: repeatEscalatedStep.get(name) || 0 });
+        if (!esc.notice) continue;
+        repeatEscalatedStep.set(name, esc.step);
+        conversation.push({ role: "user", content: esc.notice });
+        console.log(`[chat:repeat] ${name} 累计 ${total} 次，阶梯提醒 step=${esc.step}`);
+      }
     }
+    // 逐轮追踪（best-effort，不阻断对话）：工具轮在轮末落一行（综合轮在 break 前已落，见 traceRound）。
+    traceRound();
     // 跨轮 Doom Loop 熔断：同一组工具调用连续重复达阈值 → 主动收束，避免无效循环空耗 token。
     if (guard.record(roundExecuted)) {
       text +=
@@ -3013,8 +3466,19 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
 
   // 轮次预算耗尽且从未出现综合轮：补一次无工具收尾。叙述带上思考流，并附最近的工具结果摘录。
   const wrapNarration = collectWrapUpNarration(text, wrapReasoning);
-  if (!synthesisText && !failure && (wrapNarration.trim() || wrapEvidence.length)) {
-    console.log("[chat:wrap-up] 轮次预算耗尽且无综合轮，补一次无工具收尾生成结论");
+  // 第 2 批 P1-4：被外部中止（看门狗 / 用户取消）时这条路径以前被 `!failure` 挡住 ——
+  // 已取到的证据全部白扔，只落一句通用兜底（2026-10-14 事故：39 条证据、0 次收尾）。
+  // Anthropic《Building Effective Agents》把这种情况归为「受控停止」：
+  // **返回当前最佳结果并说明未完成**，而不是丢弃。
+  const abortedRun = ctx.signal?.aborted === true;
+  const worthWrapUp = Boolean(wrapNarration.trim() || wrapEvidence.length);
+  const shouldWrapUp = !synthesisText && worthWrapUp && (!failure || (abortedRun && wrapEvidence.length > 0));
+  if (shouldWrapUp) {
+    console.log(
+      abortedRun
+        ? "[chat:wrap-up] 运行被中止且已有证据，用独立 deadline 补一次收尾（不因已中止的 signal 失败）"
+        : "[chat:wrap-up] 轮次预算耗尽且无综合轮，补一次无工具收尾生成结论",
+    );
     const wrapped = await wrapUpWith(
       ctx.model,
       userQuestion,
@@ -3022,13 +3486,20 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       clipWrapUpEvidence(wrapEvidence),
       ctx.signal,
       ctx.unattendedConclusion,
+      { abortedRun },
     );
     if (wrapped) {
       synthesisText = wrapped;
+      // 补位收尾同样是一次「无工具、产出最终答案」的调用（P2-2）：循环里没出现综合轮、
+      // 靠这里救回来的运行，不该在收敛质量上被记成零——它确实写出了结论。
+      synthesisRounds += 1;
       spentTokens += estimateTokens(wrapped);
     }
   }
 
+  // 同工具重复峰值（P2-2 效率维度）：整个循环里单一工具被调用的最大次数。
+  // 单工具 24 次换参数探查正是 2026-10-14 事故的形态——它逃过了「参数全等」的跨轮提示。
+  const toolRepeatMax = toolCallCounts.size ? Math.max(...toolCallCounts.values()) : 0;
   return {
     // 只把综合轮的文本作为答案返回；没有综合轮（失败 / 熔断 / 预算耗尽）时回退到累计文本，
     // 保证这些降级路径仍能看到已完成的部分成果。
@@ -3042,6 +3513,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     rounds,
     modelRetries,
     toolFusions,
+    toolFailures,
+    synthesisRounds,
+    toolRepeatMax,
     pseudoCallRetries,
     groundingRetries,
     groundingVerifications,
@@ -3053,12 +3527,63 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   };
 }
 
+/**
+ * 子代理结构化状态（第 3 批 P1-3）：父轮据此区分「没找到」与「没跑完」。
+ * 对标 Anthropic 子代理隔离的结构化返回契约——回传只有 `ok + 摘要文本`时，
+ * 被取消/空转的子代理会被父轮当普通失败静默吞掉（2026-10-14 事故：空转 7.5 分钟零产出）。
+ */
+export type SubagentStatus = "success" | "partial" | "no_findings" | "failed";
+
+/** 状态 → 人话标签（交接文本与句柄摘要共用；零业务词）。 */
+export const SUBAGENT_STATUS_LABEL: Record<SubagentStatus, string> = {
+  success: "已完成",
+  partial: "部分完成（已产出的内容可用，未完成的原因附后）",
+  no_findings: "已跑完但未发现目标内容",
+  failed: "未完成（失败或被中止）",
+};
+
 interface SubagentResult {
   id: string;
   args: string;
   ok: boolean;
+  /** 结构化状态：父轮的证据计数与后续动作都按它分流，不按 ok 猜。 */
+  status: SubagentStatus;
+  /** 覆盖面（人话）：做了什么、覆盖到哪，供父轮决定续跑还是如实收束。 */
+  coverage?: string;
+  /** 结构化原因（失败 / 中止 / 未找到时给）：父轮可如实转述，不静默吞掉。 */
+  errors?: string[];
   text: string;
   toolCalls: number;
+}
+
+/**
+ * 子代理交接文本（第 3 批 P1-3）：把结构化状态写成父轮（与用户）能直接读的一行，
+ * 再接回传正文。目的是让父轮**分得清**「没找到」与「没跑完」——前者可以换路径再试，
+ * 后者必须如实交代「未完成」，不得把「未完成」说成「已完成」。
+ */
+export function subagentHandoffText(result: {
+  status: SubagentStatus;
+  ok: boolean;
+  coverage?: string;
+  errors?: string[];
+  text: string;
+  toolCalls: number;
+}): string {
+  // fail-closed：状态缺失/越界（旧数据、未来新状态）一律按「未完成」呈现——
+  // 父轮与用户都不得把一个来历不明的回传当成成功（见 L1 断言矩阵）。
+  const label = SUBAGENT_STATUS_LABEL[result.status] ?? SUBAGENT_STATUS_LABEL.failed;
+  const lines = [`子代理${label}（工具调用 ${result.toolCalls} 次）`];
+  if (result.coverage) lines.push(`覆盖面：${result.coverage}`);
+  if (result.errors?.length) lines.push(`原因：${result.errors.join("；")}`);
+  lines.push(result.text);
+  return lines.join("\n");
+}
+
+/** 子代理摘要截断（原内联在 runSubagent 里，抽出来供各回传路径共用）。 */
+function clipSubagentText(text: string): string {
+  return text.length > SUBAGENT_RESULT_CHARS
+    ? `${text.slice(0, SUBAGENT_RESULT_CHARS)}\n…（已截断；如需完整数据，让子代理先用 fs_write 落盘，再用 fs_read 读取）`
+    : text;
 }
 
 /**
@@ -3100,7 +3625,15 @@ async function* runSubagent(
   const args = safeJsonParse(call.argsJson);
   const description = String(args.description || args.task || "").trim();
   if (!description) {
-    return { id: call.id, args: call.argsJson, ok: false, text: "task 需要提供 description（要委派的具体任务）", toolCalls: 0 };
+    return {
+      id: call.id,
+      args: call.argsJson,
+      ok: false,
+      status: "failed",
+      errors: ["缺少任务描述（description）"],
+      text: "task 需要提供 description（要委派的具体任务）",
+      toolCalls: 0,
+    };
   }
   // 可选白名单：把子代理的工具限定在它真正需要的服务器上（对齐 Deep Agents「只给它需要的工具」）。
   const resolved = resolveSubagentTools(
@@ -3108,7 +3641,15 @@ async function* runSubagent(
     Array.isArray(args.servers) ? args.servers.map((id) => String(id || "")) : [],
   );
   if (resolved.error) {
-    return { id: call.id, args: call.argsJson, ok: false, text: resolved.error, toolCalls: 0 };
+    return {
+      id: call.id,
+      args: call.argsJson,
+      ok: false,
+      status: "failed",
+      errors: [resolved.error],
+      text: resolved.error,
+      toolCalls: 0,
+    };
   }
   const subTools = resolved.tools;
   // 子代理不得向用户提问（排除 request_clarification）：用户决策权归父任务（对齐 Deep Agents
@@ -3195,34 +3736,91 @@ async function* runSubagent(
     const status = cancelled ? "cancelled" : "error";
     handle.status = status;
     const text = cancelled ? "子代理已被取消。" : `子代理执行出错：${String((err as Error)?.message || err)}`;
+    // 结构化状态（P1-3）：被中止 = 「没跑完」，与「没找到」是两回事，父轮必须分得清。
+    const result: SubagentResult = {
+      id: call.id,
+      args: call.argsJson,
+      ok: false,
+      status: "failed",
+      errors: [cancelled ? "运行被中止，子代理未跑完" : `子代理执行出错：${String((err as Error)?.message || err)}`],
+      text,
+      toolCalls,
+    };
     yield { type: "subagent_end", id: subagentId, ok: false, status, text };
     subagentRegistry.delete(subagentId);
-    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
+    return result;
   }
 
   detachParent();
   handle.status = outcome!.failure ? "error" : "done";
+  // 覆盖面（P1-3）：父轮据此判断「这个子代理到底跑了多少」，决定续跑还是如实收束。
+  const coverage = `模型轮次 ${outcome!.rounds}`;
   if (outcome!.failure) {
+    const produced = outcome!.text.trim();
+    if (produced) {
+      // 部分完成：带着已产出的内容收场（父轮可续用），但失败原因必须结构化附上——
+      // 旧实现把 produced 整个丢掉，只回一句「执行失败」，已取到的内容就此消失。
+      const clipped = clipSubagentText(produced);
+      yield { type: "subagent_end", id: subagentId, ok: true, status: "done", text: clipped };
+      subagentRegistry.delete(subagentId);
+      return {
+        id: call.id,
+        args: call.argsJson,
+        ok: true,
+        status: "partial",
+        coverage,
+        errors: [outcome!.failure],
+        text: clipped,
+        toolCalls,
+      };
+    }
     const text = `子代理执行失败：${outcome!.failure}`;
     yield { type: "subagent_end", id: subagentId, ok: false, status: "error", text };
     subagentRegistry.delete(subagentId);
-    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
+    return {
+      id: call.id,
+      args: call.argsJson,
+      ok: false,
+      status: "failed",
+      coverage,
+      errors: [outcome!.failure],
+      text,
+      toolCalls,
+    };
   }
   const summary = outcome!.text.trim() || "（子代理未返回内容）";
   // 接地护栏：子代理纠正用尽仍无数据 → 不以「成功摘要」回传，避免把未接地内容当结论回灌主代理。
+  // 结构化状态是 no_findings（跑完了、没找到）而不是 failed（没跑完）——父轮的处理不同。
   if (outcome!.ungrounded) {
     const text = UNGROUNDED_REPLY;
     yield { type: "subagent_end", id: subagentId, ok: false, status: "error", text };
     subagentRegistry.delete(subagentId);
-    return { id: call.id, args: call.argsJson, ok: false, text, toolCalls };
+    return {
+      id: call.id,
+      args: call.argsJson,
+      ok: false,
+      status: "no_findings",
+      coverage,
+      errors: ["纠正后仍未取得可支撑结论的工具数据"],
+      text,
+      toolCalls,
+    };
   }
-  const clipped =
-    summary.length > SUBAGENT_RESULT_CHARS
-      ? `${summary.slice(0, SUBAGENT_RESULT_CHARS)}\n…（已截断；如需完整数据，让子代理先用 fs_write 落盘，再用 fs_read 读取）`
-      : summary;
+  const clipped = clipSubagentText(summary);
+  // 零发现：跑完了但没有任何内容。ok 保持 true（它确实完成了），但状态是 no_findings——
+  // 父轮不得把它计入接地证据，也不得把「未发现」当成结论（见 L1 断言矩阵）。
+  const found = summary !== "（子代理未返回内容）";
   yield { type: "subagent_end", id: subagentId, ok: true, status: "done", text: clipped };
   subagentRegistry.delete(subagentId);
-  return { id: call.id, args: call.argsJson, ok: true, text: clipped, toolCalls };
+  return {
+    id: call.id,
+    args: call.argsJson,
+    ok: true,
+    status: found ? "success" : "no_findings",
+    coverage,
+    text: clipped,
+    toolCalls,
+  };
 }
 
 /**
@@ -3253,7 +3851,15 @@ async function* runSubagentBatch(
       // settled 永远到不了 batch.length —— 下面的轮询会无限转下去，整条请求挂死；
       // 且 results[index] 留空会让交接时的 result.id 读空指针。故在此兜底成一条失败交接。
       const text = `子代理启动失败：${String((err as Error)?.message || err)}`;
-      results[index] = { id: call.id, args: call.argsJson, ok: false, text, toolCalls: 0 };
+      results[index] = {
+        id: call.id,
+        args: call.argsJson,
+        ok: false,
+        status: "failed",
+        errors: [text],
+        text,
+        toolCalls: 0,
+      };
       queue.push({ type: "subagent_end", id: call.id, ok: false, status: "error", text });
     } finally {
       settled += 1;
@@ -3381,8 +3987,14 @@ export async function* chatStream(
     return;
   }
   const conversation = await getConversation(conversationId);
+  // 分类器统计（第 7 批）：与本次 run 同生命周期的对象——Jev 每次调用/失败都往里记，
+  // 结束时回填 usage 事件 → RunTrace → 在线评测 classifier_health。
+  // 声明放在这里（而不是候选循环旁）：客服分类在开场就会跑一次，必须先于它存在。
+  const classifierStats: ClassifierStats = { calls: 0, failures: 0 };
   const supportInput =
-    conversation?.agentId === "support" && !opts.unattendedConclusion ? classifySupportInput(userText) : null;
+    conversation?.agentId === "support" && !opts.unattendedConclusion
+    ? classifySupportInput(userText, { runId: traceMeta?.runId, stats: classifierStats })
+    : null;
   const timeZone =
     normalizeTimeZone(opts.timeZone) || normalizeTimeZone(conversation?.timeZone) || undefined;
   if (timeZone && conversation && conversation.timeZone !== timeZone) {
@@ -3554,6 +4166,30 @@ export async function* chatStream(
   // 定时运行跳过冷却中的模型；一个能用的都没有就记失败，不再把冷却链打一遍。
   const allModels = listModels();
   const unattended = Boolean(opts.forceWrapUp || opts.unattendedConclusion);
+  // 额度预检（第 5 批 C4）：排候选之前问一次密钥额度端点，当日免费额度已耗尽的模型按
+  // 「每日配额型」冷却到 UTC 日切——复用既有冷却表，于是无人值守的跳过、交互式的队尾下沉、
+  // 状态码上报全部沿现有链路生效，不新开机制。只认自动模式：用户点名的模型照旧先试
+  // （点名就要先用它），撞了 429 再走既有冷却。best-effort：查过就当没查，绝不影响候选链。
+  if (!explicitModel && quotaPreflightEnabled()) {
+    try {
+      const exhausted = await findExhaustedQuotaModels(allModels);
+      if (exhausted.size) {
+        const now = Date.now();
+        const coolMs = dailyQuotaCooldownMs(now);
+        for (const id of exhausted) {
+          // 统一记账入口：与 429 日切档同一口径（含落盘，重启后不重打）。
+          noteDailyQuotaExhausted(id, now);
+        }
+        console.log(
+          `[chat:model] 额度预检：${exhausted.size} 个模型的密钥当日免费额度已耗尽，冷却到下一个 UTC 日切` +
+            `（${[...exhausted].join(",")}）`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[chat:model] 额度预检失败（不影响候选链）：${String((err as Error)?.message || err)}`);
+    }
+  }
+  const health = !explicitModel && healthOrderEnabled() ? readModelHealth() : null;
   const candidates = orderModelCandidates(
     allModels,
     model,
@@ -3561,7 +4197,11 @@ export async function* chatStream(
     quotaCooldownUntil,
     Date.now(),
     unattended,
+    // 健康度重排只交给「自动模式 + 开关打开」这一条路径；用户点名与定时运行都不受它影响。
+    // 读不到评测数据时返回空表 = 不排序 = 与从前逐字节一致（best-effort）。
+    health,
   );
+  if (health && health.size) logHealthTiers(health, candidates.map((m) => m.id));
   const cooling = candidates.filter((m) => (quotaCooldownUntil.get(m.id) || 0) > Date.now());
   if (cooling.length && cooling.length < candidates.length) {
     console.log(`[chat:model] 不可用冷却中已后移：${cooling.map((m) => m.id).join(",")}`);
@@ -3595,15 +4235,29 @@ export async function* chatStream(
   let groundingRetries = 0;
   let groundingVerifications = 0;
   let ungrounded = false;
+  // 第 3 批 P2-2 三维统计（跨候选累加：切换模型时前一个候选已发生的失败/综合轮/重复不能丢）。
+  let toolFailures = 0;
+  let synthesisRounds = 0;
+  let toolRepeatMax = 0;
   let countMarker: AlertMarker | null = null;
   let countReportText = "";
   let costTokens = 0;
   let modelFallbacks = 0;
+  // 运行级重试预算（第 5 批 C3）：跨候选共享的一份总量——切模型不重置预算，
+  // 否则「每个候选都能重试 N 次」叠加起来仍是重试风暴（AWS：只设最大次数防不住）。
+  const runRetryBudgetState = { left: runRetryBudget() };
 
   if (!candidates.length) {
     failure = "没有可用模型：定时运行跳过了冷却中的模型";
   }
   for (const m of candidates) {
+    // 中止短路（第 5 批，对标 AWS「重试不得把局部故障放大」+ 事故 L7）：运行被外部中止
+    // （无进展看门狗 / 用户点停止）后**不再尝试剩余候选**——旧行为把剩余模型各打一遍，
+    // 实测 abort 后 10 个候选 × 3 次瞬时重试全部 0-2ms 立即中断，白产 39 条无效 span 与日志。
+    if (signal?.aborted) {
+      console.log(`[chat:model] 运行已被外部中止，跳过剩余候选（${m.id} 起未再尝试）`);
+      break;
+    }
     budget = historyBudgetTokens(m, toolSchemaTokens);
     // 上下文装配（history.ts）：窗口 → 无损裁剪 → 超预算时 LLM 摘要（水位线增量）→ 硬丢弃。
     const assembled = await assembleContext({
@@ -3686,6 +4340,9 @@ export async function* chatStream(
           ownerKey: opts.ownerKey,
           ...(timeZone ? { timeZone } : {}),
           runId: traceMeta?.runId,
+          // 运行级重试预算（第 5 批 C3）：跨候选共享，见创建处注释。
+          retryBudget: runRetryBudgetState,
+          classifierStats,
           system: systemPrompt,
           ...(deniedBuiltins.size ? { deniedBuiltins } : {}),
           ...(allowBuiltins?.size ? { allowBuiltins } : {}),
@@ -3709,6 +4366,10 @@ export async function* chatStream(
     sideEffects = loop.sideEffects || 0;
     modelRetries = loop.modelRetries || 0;
     toolFusions = loop.toolFusions || 0;
+    // 第 3 批 P2-2 三维：跨候选累加（切模型时前一个候选已发生的量不能丢，与 token 累计同口径）。
+    toolFailures += loop.toolFailures || 0;
+    synthesisRounds += loop.synthesisRounds || 0;
+    toolRepeatMax = Math.max(toolRepeatMax, loop.toolRepeatMax || 0);
     pseudoCallRetries = loop.pseudoCallRetries || 0;
     groundingRetries = loop.groundingRetries || 0;
     groundingVerifications = loop.groundingVerifications || 0;
@@ -3726,10 +4387,17 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
-    if (isModelDownFailure(failure)) {
-      quotaCooldownUntil.set(m.id, Date.now() + modelDownCooldownMs(failure));
-      const st = modelAvailabilityStatus(failure);
-      if (st) quotaCooldownStatus.set(m.id, st);
+    // 统一记账入口（第 7 批）：判冷却时长 → 写共享冷却表 → best-effort 落盘，三步在共享模块里，
+    // Jev 走同一个入口（此前这套逻辑内联在此，Jev 若各写一份必然漂移）。
+    const down = noteDownFailure(m.id, failure);
+    if (down) {
+      // 冷却原因与时长进日志：配额型与额度型同为「冷却」但恢复时间差一个数量级，
+      // 排查「为什么某模型今天一直不被试」时必须能一眼区分（见事故复盘 §5 P0-1）。
+      console.log(
+        `[chat:model] 冷却 ${m.id}：${Math.round(down.coolingMs / 1000)}s（${
+          isDailyQuotaFailure(failure) ? "每日配额型，到下一个 UTC 日切" : "额度/不可用型"
+        }）`,
+      );
     }
     // 模型级失败一律切下一个候选（对齐 LiteLLM / OpenRouter 的 fallback 语义）：
     // 一个模型的 402 额度耗尽 / 400 参数问题都不代表其它模型不可用，只有候选用尽才按失败收束。
@@ -3772,6 +4440,11 @@ export async function* chatStream(
     summarized,
     toolResultsCleared: clearedToolResults,
     toolResultsOffloaded: offloadedToolResults,
+    // 第 3 批 P2-2 三维：回填进 usage 事件 → app.ts buildRunTrace → eval-online 打分。
+    // 零值的字段照常下发（0 综合轮本身就是事故形态的信号，不能靠缺字段隐身）。
+    toolFailures,
+    synthesisRounds,
+    toolRepeatMax,
     rounds,
     toolCalls,
     modelRetries,
@@ -3781,6 +4454,8 @@ export async function* chatStream(
     groundingRetries,
     groundingVerifications,
     ungrounded,
+    classifierCalls: classifierStats.calls,
+    classifierFailures: classifierStats.failures,
     costTokens,
     ...(availability ? { modelStatus: availability } : {}),
   };
@@ -3789,6 +4464,12 @@ export async function* chatStream(
     // 用户主动中断（点「停止」/ 关页面）：这一轮已经发生了，仍要写回上下文，
     // 否则下一轮模型看不到它，而界面上用户已经看到这段内容 —— 上下文与界面不一致。
     if (signal?.aborted) {
+      // 中止也可能来自**无进展看门狗**（超时保护），此时用户仍在等一个结果。
+      // runLoop 在中止时已用独立 deadline 补过一次收尾（见 wrapUpWith 的 abortedRun 分支），
+      // 那是「返回当前最佳结果并说明未完成」的最后机会——**交付它比什么都不给好**。
+      // 用户主动点「停止」时任务已被 finishTask 取消，这些事件不会有人消费
+      //（publishTaskEvent 的 status 守卫会丢弃），所以这里多发一条也无副作用。
+      if (text.trim()) yield { type: "text", text: text.trim() };
       // 正文为空（用户在任何正文产生前就点了「停止」）时，appendContext 会丢掉这条空的 assistant 轮：
       // 上游对空 assistant 消息直接 400，且确定性成立 → 该会话会永久卡死。只写 user 轮即可。
       await appendContext(
@@ -3857,7 +4538,7 @@ export async function* chatStream(
   let finalText = redactSensitive(visibleText);
   if (conversation?.agentId === "support" && !opts.unattendedConclusion) {
     const reading = supportInput ? await supportInput : null;
-    const promise = await reviewSupportPromise(finalText);
+    const promise = await reviewSupportPromise(finalText, { runId: traceMeta?.runId, stats: classifierStats });
     yield { type: "support_labels", labels: buildSupportLabels(reading, promise) };
   }
   if (finalText !== visibleText) {

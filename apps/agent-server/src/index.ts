@@ -14,6 +14,9 @@ import {
 } from "./chat-tasks.js";
 import { startTraceRetentionSweeper } from "./trace.js";
 import { initTaskStore } from "./task-store.js";
+import { initModelCooldown } from "./model-cooldown.js";
+import { restoreModelCooldowns } from "./chat.js";
+import { jevTimeoutInfo } from "./jev.js";
 
 // 启动断言：内置工具漏登记风险级别直接拒绝启动（否则会在运行时静默按「未知」兜底）。
 assertBuiltinRiskCoverage();
@@ -75,6 +78,19 @@ serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () => {
   void initTaskStore().then(async (ok) => {
     if (ok) await recoverStaleTasks();
   });
+  // 模型冷却状态持久化（P0-2）：连得上 Mongo 就把「还在冷却期」的模型状态读回来，
+  // 重启后第一个请求的候选链直接跳过它们，不再从头重打已耗尽配额的模型。
+  // 连不上 / 开关关闭时静默跳过，行为回到「进程内 Map、重启即清」的现状。
+  void initModelCooldown().then(async (ok) => {
+    if (ok) await restoreModelCooldowns();
+  });
+  // 客服分类器 Jev 的超时推导依据（第 7 批）：与看门狗阈值同一思路——「为什么这次等了 N 秒」必须可解释。
+  // 未配置 JEV_API_KEY 时只说明推导口径，不表示它会被调用。
+  const jevTimeout = jevTimeoutInfo();
+  console.log(
+    `[jev] 超时阈值 ${jevTimeout.timeoutMs}ms = clamp(2 × 实测成功 p95, 保底 ${jevTimeout.floorMs}ms, 封顶 ${jevTimeout.maxMs}ms)` +
+      `（样本 ${jevTimeout.samples} 条${jevTimeout.overridden ? "；已被 JEV_TIMEOUT_MS 覆盖" : ""}）`,
+  );
   // 启动维护：把「配置里已不存在」的 MCP id 从各对话启用集里摘掉。
   // 服务器的增减多来自 .env（只在启动时读），除了 DELETE 端点没有别的清理点；
   // 放在这里而不是 GET 里，见 conversations.ts 的 pruneUnknownMcpServers 注释（安全方法语义）。

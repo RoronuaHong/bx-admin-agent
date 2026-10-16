@@ -233,9 +233,21 @@ function canonicalize(value: unknown, stripPaging: boolean): unknown {
 
 /** 去掉页码后的筛选签名。同一列表工具是否已探过，另见 listToolProbeKey。 */
 export function listProbeKey(toolName: string, argsJson: string): string {
+  const shape = listProbeShape(argsJson);
+  if (shape == null) return `${toolName}\0${argsJson}`;
+  return `${toolName}\0${shape}`;
+}
+
+/**
+ * 去掉分页键后的**规格化结构**（JSON 字符串）。与 listProbeKey 同一口径，但只返回结构部分，
+ * 供翻页护栏判"单叶数值步进"（时间切片代替翻页）复用，避免把判定逻辑写两份。
+ * 分页键（cursor/offset/limit/page，见 LIST_ARG_KEYS）被剥掉——所以 index:0 与 index:10 归一成同一形状，
+ * 由"重复"判据拦；非分页的数值叶（from_time 等）保留，由"步进"判据拦。
+ */
+export function listProbeShape(argsJson: string): string | null {
   const obj = readArgs(argsJson);
-  if (!obj) return `${toolName}\0${argsJson}`;
-  return `${toolName}\0${JSON.stringify(canonicalize(obj, true))}`;
+  if (!obj) return null;
+  return JSON.stringify(canonicalize(obj, true));
 }
 
 export function listToolProbeKey(toolName: string): string {

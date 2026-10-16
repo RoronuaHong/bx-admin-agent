@@ -33,6 +33,11 @@ export interface RunSample {
   durationMs: number;
   toolNames: string[];
   ungrounded?: boolean;
+  /**
+   * 同工具重复调用峰值（第 4 批，来自 RunTrace.toolRepeatMax）。
+   * 只有用过工具的 run 才有值；聊天型 run 不进这一维的基线（缺字段不判，与其它维度同口径）。
+   */
+  toolRepeatMax?: number;
 }
 
 export interface OwnerBaseline {
@@ -42,6 +47,8 @@ export interface OwnerBaseline {
   durations: number[];
   tools: Set<string>;
   ungroundedWindow: boolean[];
+  /** 同工具重复峰值基线（仅收集用过工具的 run）。 */
+  repeatMax: number[];
 }
 
 const baselines = new Map<string, OwnerBaseline>();
@@ -104,6 +111,19 @@ export function detectAnomalies(
   const novel = current.toolNames.filter((name) => !baseline.tools.has(name));
   if (novel.length) flags.push("tool_novelty");
 
+  // 同工具重复峰值突增（第 4 批，对标 Anthropic「重复调用是设计信号」+ 事故文档 §4.2 的
+  // 「有信号无门禁」）：单工具反复换参数探查（事故：24 次）会烧掉整个轮次预算，而 P1-2
+  // 的重复预算刻意**只提示不硬拦**（重复有时是正当的），这里由「只报不管」的基线检测补上
+  // 「偏离基线」这一格。判据与 rounds_spike 同构：比率配绝对增量下限，防基线极小时误报。
+  // **错误率不进这里**：它的正确机制是 P1-1 的进程内滑动窗口熔断（已接线），
+  // 异常检测重复做一套只会双机制各自误报。
+  const medRepeat = median(baseline.repeatMax || []);
+  if (typeof current.toolRepeatMax === "number" && typeof medRepeat === "number") {
+    if (current.toolRepeatMax >= Math.max(medRepeat * SPIKE_FACTOR, medRepeat + 5)) {
+      flags.push("tool_repeat_spike");
+    }
+  }
+
   if (current.ungrounded) {
     const recent = baseline.ungroundedWindow.slice(-UNGROUNDED_WINDOW);
     if (recent.filter(Boolean).length + 1 >= UNGROUNDED_BURST) flags.push("ungrounded_burst");
@@ -114,7 +134,15 @@ export function detectAnomalies(
 function baselineOf(key: string): OwnerBaseline {
   let base = baselines.get(key);
   if (!base) {
-    base = { count: 0, rounds: [], tokens: [], durations: [], tools: new Set(), ungroundedWindow: [] };
+    base = {
+      count: 0,
+      rounds: [],
+      tokens: [],
+      durations: [],
+      tools: new Set(),
+      ungroundedWindow: [],
+      repeatMax: [],
+    };
     baselines.set(key, base);
   }
   return base;
@@ -127,6 +155,8 @@ function updateBaseline(base: OwnerBaseline, sample: RunSample): void {
   if (typeof sample.tokens === "number") pushCapped(base.tokens, sample.tokens);
   pushCapped(base.durations, sample.durationMs);
   for (const name of sample.toolNames) base.tools.add(name);
+  // 重复峰值只收集用过工具的 run：聊天型 run 没有这个值，混进来会把中位数稀释成 0。
+  if (typeof sample.toolRepeatMax === "number") pushCapped(base.repeatMax, sample.toolRepeatMax);
   base.ungroundedWindow.push(sample.ungrounded === true);
   if (base.ungroundedWindow.length > UNGROUNDED_WINDOW) base.ungroundedWindow.shift();
 }
@@ -150,6 +180,7 @@ export function observeRun(rt: RunTrace): AnomalyReport {
     ...(typeof rt.rounds === "number" ? { rounds: rt.rounds } : {}),
     ...(typeof rt.tokens === "number" ? { tokens: rt.tokens } : {}),
     ...(rt.ungrounded !== undefined ? { ungrounded: rt.ungrounded } : {}),
+    ...(typeof rt.toolRepeatMax === "number" ? { toolRepeatMax: rt.toolRepeatMax } : {}),
   };
   const key = rt.ownerKey || "__anon__";
   const base = baselines.get(key) || null;
