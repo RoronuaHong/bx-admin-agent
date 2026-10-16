@@ -170,7 +170,8 @@ promise/send/override 视为高利害，复用已抬到 0.6 的 `JEV_REVIEW_AT`�
 当前 jev 接线在**治理与 fail-open** 上已超出官网公开文档的要求；主要缺口集中在**三处可量化项**：① 模型版本未钉（用 `jev-latest`）、② 未记录真实版本与用量、③ 中文置信度未校准且 CJK 地板偏低（0.5）。这三项按 7.3 的片段补上即可与网上最佳实践对齐；其中 ①②③ 已于 2026-10-16 落到 `src/jev.ts`（见下方「实施记录」），④ 为持续性校准工作。
 
 ### 7.5 实施记录（2026-10-16）
-- `jev.ts:jevConfig` 增加「未钉版本」一次性启动告警；生产经 `JEV_MODEL` 钉死（默认仍 `jev-latest` 不阻断未配置环境）。
+- `jev.ts:jevConfig` 默认版本由 `jev-latest` 钉为 `jev-1.13.0`（多源印证 jev-latest 解析到 jev-1.13.0）；仍显式用别名（*-latest）时启动告警一次；base 增加 trim。
 - `postSystemOne` 的 span 新增 `gen_ai.response.model` 与 `bx.jev.usage`（取自响应顶层），请求别名仍记 `gen_ai.request.model` 以便对比漂移。
 - `JEV_REVIEW_AT` 默认值 `0.5 → 0.6`（CJK 地板），可经 `JEV_REVIEW_AT` 覆盖；`supportSendAllowed` 改为「仅 `p<0.6` 且非 null 才放行」（fail-open：模糊/无结果一律拒发，由坐席确认卡兜底）。
 - 行为变更提醒：代发闸门以前在 `p∈[0.6,0.9)` 放行（交确认卡），现在该一带直接拒发；这是更保守的 fail-open，与网上最佳实践一致。回归见 `tests/jev-governance.test.ts`（[J] 已同步更新地板断言）。
+- **连通性实测（2026-10-16）**：本实现打 TypeSafe 私有路由 `POST /v1/systemone`。① 直连 `api.typesafe.ai` 用 OpenRouter key → 401（key 不属 TypeSafe）；② 走 `openrouter.ai/api/v1/systemone`（key 有效）→ 400 schema（OpenRouter 不代理该路由，只走 `/api/v1/chat/completions` + `typesafe/jev-1.13`，另一套集成）。**结论：`.env` 指 OpenRouter 时 jev 每次调用都失败并 fail-open（标签恒「没有结果」、代发永不放行）——安全但无产出。要真正启用须 `JEV_BASE_URL=https://api.typesafe.ai` + 一个 TypeSafe API key；`jev-latest`/OpenRouter slug 分别为 `jev-1.13.0`/`typesafe/jev-1.13`。**

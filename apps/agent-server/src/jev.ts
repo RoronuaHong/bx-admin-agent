@@ -128,14 +128,14 @@ let warnedJevAlias = false;
 function jevConfig(): { key: string; base: string; model: string } | null {
   const key = (process.env.JEV_API_KEY || "").trim();
   if (!key) return null;
-  const base = (process.env.JEV_BASE_URL || "https://api.typesafe.ai").replace(/\/$/, "");
-  const model = (process.env.JEV_MODEL || "jev-latest").trim() || "jev-latest";
-  // 最佳实践：生产必须钉版本，不能用别名 jev-latest（别名漂移会破坏阈值）。
-  // 未显式配置时只告警一次，缺省仍走 jev-latest（开发/未配置不阻断）；
-  // 真实运行版本由每次调用的 gen_ai.response.model 落盘，便于回抄成固定版本。
-  if (model === "jev-latest" && !warnedJevAlias) {
+  const base = (process.env.JEV_BASE_URL || "https://api.typesafe.ai").trim().replace(/\/$/, "");
+  // 钉版本（网上最佳实践：别用别名）。jev-latest 解析到 jev-1.13.0（多源印证）；
+  // 生产仍建议经 JEV_MODEL 显式钉死，真实版本由 gen_ai.response.model 落盘可核对。
+  const model = (process.env.JEV_MODEL || "jev-1.13.0").trim() || "jev-1.13.0";
+  // 仍有人显式用别名（含 *-latest）时告警一次：别名漂移会破坏阈值。
+  if (/latest/i.test(model) && !warnedJevAlias) {
     warnedJevAlias = true;
-    console.warn("[jev] JEV_MODEL 未钉版本（当前 jev-latest）。生产应设为固定版本（如 jev-1.x.x），否则别名漂移会改变分类阈值行为。");
+    console.warn(`[jev] JEV_MODEL 用了别名「${model}」，生产应钉死具体版本（当前已知 jev-latest→jev-1.13.0），否则别名漂移会改变分类阈值行为。`);
   }
   return { key, base, model };
 }
