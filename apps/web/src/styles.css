@@ -42,6 +42,13 @@
   /* 时间轴竖轨：与发丝边框（--line）分开控制——深色下边框要极轻，但连接线太暗就「断成几个点」，
      所以两个主题各给一档（深色用更亮的 #3a3a35，浅色沿用 --line 的灰）。 */
   --rail: #dbdbd4;
+  /* 下游组件（气泡 / 图表卡片）引用的语义变量：此前从未在此声明，全靠各处的回退值
+     （如 --text→#1f2430 深字、--surface→#fff 白底），导致深色模式下图表白底、
+     support-label 深字不可见。统一声明，随主题切换。 */
+  --text: var(--ink);
+  --surface: #ffffff;
+  --border: var(--line);
+  --warn: #b26a00;
   color-scheme: light;
 }
 
@@ -69,6 +76,10 @@ html[data-theme="dark"] {
   --surface-3: #1d1d1b;
   /* 时间轴竖轨：深色下提亮一档，否则连接线在深底上几乎看不见（步骤被读成互不相关的孤点）。 */
   --rail: #3a3a35;
+  --text: var(--ink);
+  --surface: #191917;
+  --border: var(--line);
+  --warn: #e3bd75;
   color-scheme: dark;
 }
 

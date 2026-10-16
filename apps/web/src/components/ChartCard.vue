@@ -30,7 +30,9 @@ const chartAriaLabel = computed(() =>
 );
 
 function isDark(): boolean {
-  return typeof document !== "undefined" && document.documentElement.classList.contains("dark");
+  // 全仓深色靠 <html data-theme="dark"> 属性激活（见 styles.css），`.dark` 类从不使用——
+  // 原先读 classList 永远为 false，导致图表在深色模式下仍按 light 渲染、与深色卡片割裂。
+  return typeof document !== "undefined" && document.documentElement.getAttribute("data-theme") === "dark";
 }
 
 function dispose() {
@@ -584,7 +586,8 @@ onMounted(() => {
   themeObserver = new MutationObserver(() => {
     if (instance) render();
   });
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+  // 监听 data-theme 属性（全仓深色激活方式），而非 class——原先监听 class 永远不触发重绘。
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
   // 容器尺寸变化（窗口缩放、侧栏折叠、气泡宽度变化）时重适配：G2/G6 只在创建时按容器尺寸定画布，
   // 之后不跟随容器变化，不重适配会把图永久留在首次测量的尺寸上。
   if (el.value && typeof ResizeObserver !== "undefined") {
