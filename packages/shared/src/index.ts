@@ -224,6 +224,16 @@ type ChatEventBody =
       toolResultsCleared: number;
       /** 本轮被卸载到虚拟文件系统（可 fs_read 取回）的工具结果条数。 */
       toolResultsOffloaded?: number;
+      /** 真正执行过且失败的工具调用数（第 3 批 P2-2：工具健康度；闸门拒绝/同轮跳过等未执行的不计）。 */
+      toolFailures?: number;
+      /** 综合轮次数（无工具调用、直接收束出答案的轮数；P2-2 收敛质量）。 */
+      synthesisRounds?: number;
+      /** 同一工具被重复调用的最大次数（P2-2 效率维度）。 */
+      toolRepeatMax?: number;
+      /** 分类器调用次数（第 7 批，客服路的 Jev）。未配置密钥时为 0——「没配」不算「调用」。 */
+      classifierCalls?: number;
+      /** 分类器调用失败次数（网络/超时/HTTP 非 2xx；被外部中止不计）。 */
+      classifierFailures?: number;
       /** 工具循环实际使用的轮次（模型调用次数）。 */
       rounds?: number;
       /** 本轮实际执行的工具调用次数。 */
