@@ -12,6 +12,9 @@ import {
   deleteConversation,
   compactSnapshot,
   listSnapshot,
+  patchConversation,
+  duplicateConversation,
+  sanitizeModelId,
   SNAPSHOT_DETAIL_TAIL,
 } from "../src/conversations.js";
 import { getRole } from "../src/roles.js";
@@ -171,4 +174,36 @@ test("⑩通用助手新建对话不预勾连接器，显式空数组也不勾",
   expect((await getConversation(emptyId))!.mcpServers).toEqual([]);
   await deleteConversation(id);
   await deleteConversation(emptyId);
+});
+
+// 模型 id 落库清洗（2026-10-16 修复「打开对话显示选择模型空壳」的根因）：
+// MODEL_PROVIDERS 重组会把模型挪出配置，对话里的悬空 id 有三重伤害——运行期被
+// getModel 静默跳过、前端选择器查不到标签退化成「选择模型」、复制对话还传脏值给副本。
+// 落库是唯一能拦住它的地方：失效 id 一律改写为「自动」。
+test("⑪模型 id 落库清洗：失效 id 改写「自动」，有效 id 原样通过", async () => {
+  const saved = process.env.MODEL_PROVIDERS;
+  process.env.MODEL_PROVIDERS = "convtestmodel";
+  try {
+    // 纯函数：空 / 自动哨兵 / 有效 id 原样；失效 id → auto
+    expect(sanitizeModelId("")).toBe("");
+    expect(sanitizeModelId("auto")).toBe("auto");
+    expect(sanitizeModelId("convtestmodel")).toBe("convtestmodel");
+    expect(sanitizeModelId("  convtestmodel  ")).toBe("convtestmodel");
+    expect(sanitizeModelId("kimi")).toBe("auto");
+    expect(sanitizeModelId("kimik3")).toBe("auto");
+
+    // PATCH 落库路径同样清洗（前端只应收到干净值）
+    const id = uniq("model-sanitize");
+    await createConversation({ id, title: "d" });
+    expect((await patchConversation(id, { model: "kimi28" }))!.model).toBe("auto");
+    expect((await patchConversation(id, { model: "convtestmodel" }))!.model).toBe("convtestmodel");
+    // 复制对话：有效模型随副本保留（共享同一清洗函数，失效值同样被拦）
+    const dup = await duplicateConversation(id);
+    expect(dup!.model).toBe("convtestmodel");
+    await deleteConversation(id);
+    await deleteConversation(dup!.id);
+  } finally {
+    if (saved === undefined) delete process.env.MODEL_PROVIDERS;
+    else process.env.MODEL_PROVIDERS = saved;
+  }
 });

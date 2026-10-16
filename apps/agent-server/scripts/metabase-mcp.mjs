@@ -20,6 +20,9 @@ const BASE = (process.env.BI_BASE_URL || "").replace(/\/+$/, "");
 // 换 Key 只是让适配器以只读身份访问；真正的只读边界仍须由数据库账号强制
 // （专用角色 + 只 GRANT SELECT），见 docs/text2sql-text2api-plan.md 的 P1-1。
 const { key: KEY, blocked: KEY_BLOCKED } = resolveMetabaseKey(process.env);
+// 进程内查询缓存（文档 6.5.2）：同 db + 同 SQL + 同 limit 的重复取数直接命中，不再下发 ClickHouse。
+// 治 R4「反复换口径 / 重试同一重查询」。短 TTL + 仅缓存成功结果，重启即清空，不持久化。
+const queryCache = createQueryCacheFromEnv(process.env);
 
 /**
  * 单次请求超时（默认 60s，可配 BI_TIMEOUT_MS；BI 查询 legitimately 慢时用 env 调大）。
@@ -129,6 +132,8 @@ import { isReadOnlySql } from "./sql-readonly-common.mjs";
 // 静态体检（查表/聚合语句的效率实践）：与只读判定同一个「共享单源」思路——两侧共用一份，
 // 杜绝漂移。fail-open，只提示不拦（误杀合法探索语句比慢一点更糟）。
 import { lintSql, lintSummary } from "./sql-lint-common.mjs";
+import { appendClickHouseSettings, defaultClickHouseSettings, classifyUpstreamError } from "./bi-query-settings.mjs";
+import { createQueryCacheFromEnv } from "./bi-query-cache.mjs";
 import { buildColumnSearchSql } from "./metabase-column-search.mjs";
 
 // ---- 元数据映射：写查询之前的「取证」基础 ----
@@ -240,27 +245,45 @@ function assertSql(input) {
 async function runSql(database_id, sql, limit = 200) {
   const check = assertSql(sql);
   if (!check.ok) return json(check.error, true);
+  // 查询级资源护栏（P1）：在执行 SQL 末尾追加 SETTINGS（聚合/排序超阈值落盘、服务端超时掐断）。
+  // 这是第二道保险——即使 DBA 还没给 metabase_user 配 profile（P0），我们自己的查询也自带边界。
+  // 不改写 SQL 语义：原 SQL 仍用于回显与静态体检，只有发往 ClickHouse 的那份带 SETTINGS。
+  const execSql = appendClickHouseSettings(check.sql, defaultClickHouseSettings());
+  // 结果缓存去重（文档 6.5.2）：相同 db + SQL + limit 的重复取数直接命中，跳过下游 POST /dataset。
+  const cached = queryCache.get(database_id, check.sql, limit);
+  if (cached) {
+    console.error(`[bi-metabase] 命中查询缓存，跳过重复下发（db=${database_id}，cache size=${queryCache.size()}）`);
+    return cached;
+  }
   const r = await mb("/dataset", {
     method: "POST",
-    body: { database: database_id, type: "native", native: { query: check.sql } },
+    body: { database: database_id, type: "native", native: { query: execSql } },
     query: true, // 成功耗时进自适应超时样本池（第 6 批）
   });
   if (!r.ok) {
     const upstream = typeof r.data === "string" ? r.data : JSON.stringify(r.data);
-    return json(
-      [
-        `[${r.status}] 查询被上游拒绝：${upstream}`,
-        "本次没有拿到数据。按这个顺序改：",
-        "① 对照报错里的字段/表名，用 get_database_schema 复核真实结构（别猜列名）；",
-        "② 去掉可疑的函数/聚合，换成基础列先跑通，再逐个加回来；",
-        "③ 加上明确的过滤条件缩小扫描范围。",
-        "同一句原样重试不会成功；改不动就在回答里如实说明这个口径查不出来。",
-      ].join("\n"),
-      true,
-    );
+    // 资源类错误码（241 内存 / 307 扫描上限 / 394 超时）翻译成可操作提示；其它回落通用文案。
+    const classified = classifyUpstreamError(upstream);
+    const guidance = classified ?? [
+      "本次没有拿到数据。按这个顺序改：",
+      "① 对照报错里的字段/表名，用 get_database_schema 复核真实结构（别猜列名）；",
+      "② 去掉可疑的函数/聚合，换成基础列先跑通，再逐个加回来；",
+      "③ 加上明确的过滤条件缩小扫描范围。",
+      "同一句原样重试不会成功；改不动就在回答里如实说明这个口径查不出来。",
+    ].join("\n");
+    return json(`[${r.status}] 查询被上游拒绝：${upstream}\n\n${guidance}`, true);
   }
   const payload = r.data?.data;
   if (!payload || !Array.isArray(payload.cols)) {
+    const upstreamErr = typeof r.data?.error === "string" ? r.data.error : "";
+    const classified = classifyUpstreamError(`${upstreamErr} ${JSON.stringify(r.data?.error ?? "")}`);
+    // Metabase 偶尔把错误包进 200 响应的 error 字段（而非 4xx），这里补一道识别。
+    if (upstreamErr) {
+      return json(
+        `[${r.status}] 查询未返回结果：${upstreamErr}\n\n${classified ?? "本次没有拿到数据。缩小查询范围或稍后重试；若反复失败，在回答里如实说明这个口径查不出来。"}`,
+        true,
+      );
+    }
     const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
     return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或缩小查询范围。`, true);
   }
@@ -275,7 +298,10 @@ async function runSql(database_id, sql, limit = 200) {
   // 静态体检结论回灌（fail-open：照常执行，但把"可以怎么改"一并给模型，让它下次写对）。
   // 不静默改写 SQL——改写等于替模型猜口径；只提示。
   const lint = lintSummary(lintSql(check.sql));
-  return json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}`);
+  const result = json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}`);
+  // 结果缓存去重（文档 6.5.2）：成功结果才入缓存，失败路径不缓存。
+  queryCache.set(database_id, check.sql, limit, result);
+  return result;
 }
 
 /**

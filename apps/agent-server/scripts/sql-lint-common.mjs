@@ -19,7 +19,7 @@
 
 /**
  * @typedef {Object} SqlLintFinding
- * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"DEVICE_LEVEL_COUNT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"} code 稳定的机器可读码，便于测试锚定与后续统计
+ * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"DEVICE_LEVEL_COUNT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"|"HEAVY_EXACT_AGG_NOWINDOW"|"MULTI_JOIN_UNBOUNDED"|"GROUP_BY_HIGH_DIM_NOLIMIT"} code 稳定的机器可读码，便于测试锚定与后续统计
  * @property {string} message 回灌给模型的可操作提示（含怎么改）
  */
 
@@ -39,6 +39,37 @@ function stripNoise(sql) {
     .replace(/'(?:[^'\\]|\\.)*'/g, "''")
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     .replace(/`(?:[^`\\]|\\.)*`/g, "``");
+}
+
+/**
+ * 时间窗判据阈值（天）：窗口 ≥ 此值视为「长窗口」，配合高基数精确聚合会吃到大量内存。
+ * 只做结构判定（SQL 里有没有日期范围过滤），不含任何业务语义——不判断某张表该不该加时间窗。
+ */
+const LONG_WINDOW_DAYS = 14;
+
+/**
+ * 判断 SQL 是否带了「时间窗」过滤（用于资源类规则：无窗 / 长窗的重聚合是内存杀手）。
+ * 只认结构：BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'，或裸列与日期字面量的比较（>= / <= / =）。
+ * 返回 { bounded, days }：
+ *   · bounded=false  → 完全没有日期范围过滤（视为无窗，最危险）；
+ *   · days=Infinity  → 有比较但无明确上界（如 col >= '2026-10-09'），仍视为长窗；
+ *   · days=数字      → BETWEEN 的跨度天数（< 阈值算短窗、安全）。
+ */
+function hasDateWindow(input) {
+  // 在「只去注释、保留字符串字面量」的文本上判定——否则 stripNoise 会把 'YYYY-MM-DD' 抹成 ''，
+  // 短窗口会被误判成「无时间窗」。与 lintSql 主体里 stripNoise 的口径分离。
+  const sql = stripComments(String(input ?? ""));
+  const between = /\bbetween\s+'(\d{4}-\d{2}-\d{2})'\s+and\s+'(\d{4}-\d{2}-\d{2})'/i.exec(sql);
+  if (between) {
+    const a = Date.parse(between[1]);
+    const b = Date.parse(between[2]);
+    if (!Number.isNaN(a) && !Number.isNaN(b)) {
+      return { bounded: true, days: Math.abs(b - a) / 86_400_000 };
+    }
+  }
+  const cmps = sql.match(/[<>]=?\s*'(\d{4}-\d{2}-\d{2})'/g);
+  if (cmps && cmps.length >= 1) return { bounded: true, days: Infinity };
+  return { bounded: false, days: Infinity };
 }
 
 /** 疑似敏感列的形态（个人信息类）。只做形态匹配、不含业务语义、零业务词。
@@ -198,6 +229,44 @@ export function lintSql(input) {
           "明文返回有泄露风险。确认输出已脱敏、或已获授权、或仅做聚合统计而非返回明细；确需明细请走脱敏通道。",
       });
     }
+  }
+
+  // ---- 资源类规则（2026-10-16 事故后补）：重聚合的内存/扫描代价，advisory（不阻断）----
+  // 判据只用 SQL 结构（是否精确去重、是否带时间窗、JOIN 数量、GROUP BY 维度），不含业务语义。
+  const win = hasDateWindow(raw);
+  const longOrNoWindow = !win.bounded || win.days >= LONG_WINDOW_DAYS;
+
+  // 精确去重大类：uniqExact(...) 与 count(DISTINCT ...) 在 ClickHouse 内都做全量精确去重，
+  // 大窗/无窗时内存随去重基数线性增长，全历史宽表上极易爆库（不仅是退化变慢，更会撞内存上限）。
+  // 注：count(distinct) 在小窗已由 COUNT_DISTINCT 提示「退化变慢」，此处只在「大窗/无窗」叠加「爆库」警告。
+  if ((/\buniq\s*exact\s*\(/i.test(sql) || /count\s*\(\s*distinct\s+/i.test(sql)) && longOrNoWindow) {
+    findings.push({
+      code: "HEAVY_EXACT_AGG_NOWINDOW",
+      message:
+        "uniqExact(...)（精确去重）出现在「无时间窗」或「窗口 ≥ " + LONG_WINDOW_DAYS + " 天」的查询里：它会为每一行维护精确去重状态，" +
+        "内存随去重值数线性增长，全历史宽表上极易触发服务端内存上限。若只要趋势/看板类指标，改用近似 uniq()（误差约 1~2%，量级一致）；" +
+        "若必须精确，先收窄时间窗（1~3 天跑通再逐段放大）或改用已聚合表/现成卡片（list_cards / get_card）。",
+    });
+  }
+  // 多表 JOIN 且整体无时间窗：每个 JOIN 都放大扫描，无范围过滤时整条链路全扫。
+  const joinCount = (sql.match(/\bjoin\b/gi) || []).length;
+  if (!meta && joinCount >= 2 && longOrNoWindow) {
+    findings.push({
+      code: "MULTI_JOIN_UNBOUNDED",
+      message:
+        "出现 " + joinCount + " 个 JOIN 且整条查询没有时间窗过滤：JOIN 会放大要扫描的数据量，无范围过滤时整条链路退化为全扫。" +
+        "建议先对每张表在子查询里各自过滤（缩时间窗/加条件）再 JOIN，并把小表放在 JOIN 右侧（哈希表更小）。",
+    });
+  }
+  // GROUP BY 维度很多（≥3）又无 LIMIT：中间分组状态规模不可控，ORDER BY 聚合列时容易一次性拉满。
+  const gbCols = groupByColumns(sql);
+  if (gbCols && gbCols.size >= 3 && /\border\s+by\b/i.test(sql) && !hasLimit) {
+    findings.push({
+      code: "GROUP_BY_HIGH_DIM_NOLIMIT",
+      message:
+        "GROUP BY 维度 ≥ 3 且带 ORDER BY 但没有 LIMIT：高维分组的中间状态规模由数据决定、不可控。" +
+        "加 LIMIT 截断（配合 ORDER BY ... DESC 取头部），或先降维到核心维度再逐步展开。",
+    });
   }
 
   // Join 引用完整性（幻觉防护）：JOIN ON 里点号前缀必须指向 FROM/JOIN 中真实声明的表或别名。

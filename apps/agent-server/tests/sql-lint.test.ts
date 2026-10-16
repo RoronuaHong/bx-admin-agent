@@ -142,6 +142,9 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
     "SELECT count() AS c FROM (SELECT count() AS c2 FROM (SELECT count() AS c3 FROM (SELECT a FROM t WHERE d > 1) AS q1 GROUP BY a) AS q2 GROUP BY a) AS q3 LIMIT 1", // DEEP_SUBQUERY_NESTING
     "SELECT email FROM t WHERE d > 1 LIMIT 1", // SENSITIVE_COLUMN
     "SELECT a.x FROM t1 AS a JOIN t2 AS b ON a.x = ghost.y WHERE d > 1 LIMIT 1", // JOIN_DANGLING_REF
+    "SELECT uniqExact(uid) FROM t WHERE d >= '2026-10-09'", // HEAVY_EXACT_AGG_NOWINDOW
+    "SELECT a.x FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id", // MULTI_JOIN_UNBOUNDED
+    "SELECT a, b, c, count() AS n FROM t GROUP BY a, b, c ORDER BY 3 DESC", // GROUP_BY_HIGH_DIM_NOLIMIT
   ];
   const seen = new Set(all.flatMap((sql) => lintSql(sql).map((f) => f.code)));
   const expected = [
@@ -150,6 +153,7 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
     "IMPLICIT_CROSS_JOIN", "NON_SARGABLE_PREDICATE", "GROUP_BY_SELECT_MISMATCH",     "DEEP_SUBQUERY_NESTING",
     "SENSITIVE_COLUMN",
     "JOIN_DANGLING_REF",
+    "HEAVY_EXACT_AGG_NOWINDOW", "MULTI_JOIN_UNBOUNDED", "GROUP_BY_HIGH_DIM_NOLIMIT",
   ];
   expect([...expected].filter((c) => !seen.has(c)), "这些判据没被任何用例触发").toEqual([]);
   // 每条发现都必须带可操作提示（不能只有码没有"怎么改"）
@@ -222,4 +226,50 @@ test("[N] 设备级 guid 去重告警：按设备数人会被判（2026-10-16 /c
   // 账号级(uid)不告警；字面量/子串不误报
   expect(codes("SELECT uniqExact(uid) AS users FROM t WHERE d > 1")).not.toContain("DEVICE_LEVEL_COUNT");
   expect(codes("SELECT uniq(guid_hash) FROM t WHERE d > 1")).not.toContain("DEVICE_LEVEL_COUNT");
+});
+
+test("[O] 资源类·精确去重无窗/长窗（2026-10-16 内存爆顶事故回归）", () => {
+  // 事故真实形态：uniqExact(guid) 全历史宽表、无上界时间窗 → 内存随去重值数线性增长
+  expect(codes("SELECT recordDate, uniqExact(guid) AS devs FROM elt_user_full_history WHERE recordDate >= '2026-10-09' GROUP BY recordDate, countryCode ORDER BY recordDate, devs DESC")).toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 单边界无上界（>= 某天）也视为长窗
+  expect(codes("SELECT uniqExact(uid) FROM t WHERE d >= '2026-10-09'")).toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 短窗（< 14 天）不报：鼓励先小范围探通再放大
+  expect(codes("SELECT uniqExact(guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-03'")).not.toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 长窗（≥ 14 天）报
+  expect(codes("SELECT uniqExact(guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-31'")).toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 提示里明确给「近似 uniq()」与「缩窗/预聚合」两条路
+  const msg = lintSql("SELECT uniqExact(guid) FROM t WHERE d >= '2026-10-09'").find((f) => f.code === "HEAVY_EXACT_AGG_NOWINDOW")?.message ?? "";
+  expect(msg).toContain("uniq()");
+  expect(msg).toContain("时间窗");
+});
+
+test("[P] 资源类·多表 JOIN 无时间窗（放大扫描）", () => {
+  // 两个 JOIN 且无任何时间窗 → 整条链路全扫
+  expect(codes("SELECT a.x, b.y, c.z FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id")).toContain("MULTI_JOIN_UNBOUNDED");
+  // 有非日期过滤但无时间窗，仍算无窗（扫描未被时间裁剪）
+  expect(codes("SELECT a.x FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id WHERE a.flag = 1")).toContain("MULTI_JOIN_UNBOUNDED");
+  // 短日期窗 → 不报
+  expect(codes("SELECT a.x FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id WHERE d BETWEEN '2026-10-01' AND '2026-10-02'")).not.toContain("MULTI_JOIN_UNBOUNDED");
+  // 单 JOIN 不报（规则只针对多表放大）
+  expect(codes("SELECT a.x FROM a JOIN b ON a.id=b.id WHERE d >= '2026-10-09'")).not.toContain("MULTI_JOIN_UNBOUNDED");
+});
+
+test("[Q] 资源类·高维 GROUP BY 无 LIMIT", () => {
+  // 维度 ≥3 + ORDER BY + 无 LIMIT → 中间状态规模不可控
+  expect(codes("SELECT a, b, c, count() AS n FROM t GROUP BY a, b, c ORDER BY 3 DESC")).toContain("GROUP_BY_HIGH_DIM_NOLIMIT");
+  // 加 LIMIT 就不报
+  expect(codes("SELECT a, b, c, count() AS n FROM t GROUP BY a, b, c ORDER BY 3 DESC LIMIT 50")).not.toContain("GROUP_BY_HIGH_DIM_NOLIMIT");
+  // 维度少（2）不报
+  expect(codes("SELECT a, b, count() AS n FROM t GROUP BY a, b ORDER BY 3 DESC")).not.toContain("GROUP_BY_HIGH_DIM_NOLIMIT");
+});
+
+test("[R] 资源类·count(DISTINCT) 大窗同样按精确去重判内存爆库（补齐 HEAVY 漏覆盖）", () => {
+  // 日活/获客渠道常用 count(distinct guid) 近一月：与 uniqExact 同等内存风险，原 HEAVY 只认 uniqExact 漏了它。
+  // 长窗 / 无上界单边界 → 报（与 [O] 的 uniqExact 形态对称）
+  expect(codes("SELECT count(DISTINCT guid) FROM elt_user_full_history WHERE recordDate >= '2026-09-16'")).toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  expect(codes("SELECT count(DISTINCT uid) FROM t WHERE d >= '2026-10-09'")).toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 短窗（< 14 天）不报：鼓励先小范围探通再放大
+  expect(codes("SELECT count(DISTINCT guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-03'")).not.toContain("HEAVY_EXACT_AGG_NOWINDOW");
+  // 短窗仍走 COUNT_DISTINCT（退化变慢）提示，与 HEAVY 不冲突
+  expect(codes("SELECT count(DISTINCT guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-03'")).toContain("COUNT_DISTINCT");
 });

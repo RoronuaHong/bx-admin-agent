@@ -6,6 +6,7 @@
 
 import { type Collection, type Db, type ObjectId } from "mongodb";
 import type { ArtifactSpec, ChartSpec, TodoItem } from "@bx/shared";
+import { listModels } from "./config.js";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 import { loadServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
@@ -638,6 +639,24 @@ export async function clearConversation(id: string): Promise<void> {
 
 // ---- 对话级设置 ----
 
+/** 「自动」哨兵 id：与 chat.ts 的 `requestedId !== "auto"`、前端 MODEL_AUTO_ID 同一契约。 */
+export const MODEL_AUTO_ID = "auto";
+
+/**
+ * 对话级模型 id 落库清洗（纯函数）：空 / 「自动」原样通过；其余必须存在于当前 MODEL_PROVIDERS。
+ *
+ * 失效 id（模型被挪出配置）有三重伤害：运行期 getModel 直接跳过、静默回落默认模型；
+ * 前端选择器查不到标签、退化成「选择模型」空壳；复制对话还会把脏值传给副本。
+ * 落库是唯一能拦住它的地方——统一改写为「自动」并告警，让数据自愈而不是把脏值写进去。
+ */
+export function sanitizeModelId(value: string): string {
+  const id = String(value || "").trim();
+  if (!id || id === MODEL_AUTO_ID) return id;
+  if (listModels().some((model) => model.id === id)) return id;
+  console.warn(`[conversations] 模型 ${id} 未在 MODEL_PROVIDERS 中配置，该对话回落自动模式`);
+  return MODEL_AUTO_ID;
+}
+
 export interface ConversationPatch {
   title?: string;
   model?: string;
@@ -675,6 +694,8 @@ export async function patchConversation(id: string, patch: ConversationPatch): P
   for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "timeZone", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
+  // 失效模型 id 一律改写成「自动」（见 sanitizeModelId）：不让悬空 id 落库。
+  if (patch.model !== undefined) set.model = sanitizeModelId(patch.model);
   if (!Object.keys(set).length) return getConversation(id);
   if (Object.keys(set).some((key) => !ACTIVITY_NEUTRAL_KEYS.has(key))) set.updatedAt = Date.now();
   const coll = await getColl();
@@ -949,6 +970,8 @@ export async function duplicateConversation(id: string, ownerKey?: string): Prom
   const newId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const now = Date.now();
   const clone = JSON.parse(JSON.stringify(src)) as ConversationDoc;
+  // 源对话的模型 id 可能已失效（复制的是旧数据）：副本落库前同样清洗，别把脏值传下去。
+  if (typeof clone.model === "string") clone.model = sanitizeModelId(clone.model);
   const doc: ConversationDoc = {
     ...clone,
     _id: undefined,
