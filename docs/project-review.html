@@ -1729,7 +1729,7 @@ src/
 <table>
 <thead><tr><th>id</th><th>传输</th><th>实现</th><th>风险声明</th></tr></thead>
 <tbody>
-<tr><td><code>bi</code>（Metabase）</td><td>stdio → <code>scripts/metabase-mcp.mjs</code></td><td>8 个只读工具（list/search/get 元数据与取值域）+ <code>run_native_query</code></td><td><code>toolRisks</code>：7 个 read + <code>run_native_query: destructive</code>；<code>readOnlySqlTools</code> 声明走只读 SQL 校验（<strong>双层</strong>：MCP 内 <code>isReadOnlySql</code> + 服务端 <code>src/sql-readonly.ts</code>，口径必须同步改）</td></tr>
+<tr><td><code>bi</code>（Metabase）</td><td>stdio → <code>scripts/metabase-mcp.mjs</code></td><td><strong>14 个工具</strong>：11 个只读（list/search/get 元数据与取值域 + <code>execute_query</code>/<code>construct_query</code>/<code>read_resource</code> 读侧高层）+ 3 个执行任意 SQL（<code>run_native_query</code>/<code>execute_sql</code>/<code>query</code>，共走一个 <code>runSql</code> 只读闸门）</td><td><code>toolRisks</code>：11 个 read + 3 个 destructive；<code>readOnlySqlTools</code> 声明走只读 SQL 校验（<strong>双层</strong>：MCP 内 <code>isReadOnlySql</code> + 服务端 <code>src/sql-readonly.ts</code>，口径必须同步改）</td></tr>
 <tr><td><code>yapi</code></td><td>stdio → <code>scripts/yapi-mcp.mjs</code></td><td>接口平台元数据</td><td>超时 60s</td></tr>
 <tr><td><code>movie</code>（TMDb）</td><td><strong>http</strong>（Streamable HTTP 托管端点）</td><td>21 个只读电影工具白名单</td><td><code>toolRisks: {"*":"read"}</code> 整站只读</td></tr>
 <tr><td><code>orders</code>（订单/工单·示例）</td><td>stdio → <code>scripts/order-mock-mcp.mjs</code></td><td>5 个工具（<code>order_search / order_get / ticket_list / ticket_get / ticket_create</code>），<strong>全内存 mock</strong>，进程重启即还原</td><td>⚠️ 定位是<strong>示例数据源</strong>：接真实后端只改本条目的 command/url 与凭据，<strong>工具契约不变</strong>，服务端与角色人设零改动（口径见 <code>docs/agent/support-data-source-plan.md</code>）</td></tr>

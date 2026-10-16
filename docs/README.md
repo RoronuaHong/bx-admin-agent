@@ -47,11 +47,26 @@
 - **状态**：✅ 现行。
 - **注意**：§5.9 自述「本期只解决一半」——第二个风险轴是**数据外发**；且 `isReadOnlySql` 降级属体验优化层，真正边界应由数据库只读角色提供（与 `text2sql-text2api-plan.md` 同口径）。
 
+### [bi-sql-best-practices.md](./bi-sql-best-practices.md)
+- **定位**：bi（Metabase）取数通道上 **SQL 怎么写** 的权威口径——13 条判据、改法示例、实测审计数据、实现坑。
+- **覆盖**：两道闸门的分工（只读 fail-closed vs 写法体检 fail-open）· 四类判据（结果集有界 / 扫描代价 / **正确性** / 引擎实践）· 元数据语句的例外 · 审计脚本与局限。
+- **现行落点**：`scripts/sql-lint-common.mjs`（判据唯一实现）· `scripts/sql-readonly-common.mjs`（只读）· `scripts/metabase-mcp.mjs` 的 `runSql` / `construct_query`（回灌）· `skills/business-data-query/SKILL.md` 的「SQL 怎么写」。
+- **回归**：`tests/sql-lint.test.ts`（13 例，含不误伤与 fail-open 反向约束）· 审计 `scripts/_audit-bi-sql.mjs`。
+- **评测集**：`tests/fixtures/text2sql-bi-cases.json`（6 case，零业务词，每个 case 绑定真实测试名）+ `tests/text2sql-eval-fixture.test.ts`（fixture 不腐化门禁：绑定必须存在 + 零业务词自检）。
+- **状态**：🆕 2026-10-15 新建。
+
 ### [text2sql-text2api-plan.md](./text2sql-text2api-plan.md)
 - **定位**：bi（text2sql）/ yapi（text2api）两类取数通道的最佳实践对齐。
 - **现行落点**：`scripts/metabase-mcp.mjs`（8 工具 + MCP 侧 `isReadOnlySql`）· `scripts/yapi-mcp.mjs`（GET-only + 项目白名单）· `src/sql-readonly.ts`（服务端同口径，**双层必须同步改**）· `risk.ts` 的只读 SQL 降级。
 - **状态**：✅ 现行（2026-09-24 已逐项核对关键声明与代码一致：bi/yapi 工具名、只读降级 + 非只读硬拒、`call_api` 硬编码 GET、调试脚本确已移除；仅补了路径/配置落点说明）。
 - **注意**：文内 ❌（DB 层只读角色、行级权限/身份透传）指的是**安全边界**仍缺，不要因为看到 `sql-readonly.ts` 就以为已补齐。
+
+### [agent-stall-incident-20261014.md](./agent-stall-incident-20261014.md)
+- **定位**：取数类对话「零进展 23 分钟」事故复盘（2026-10-14，run `run_c284e83d`）+ 对标 4 篇权威原文的分步修复计划 + 评测集固化方案。**只讲韧性 / 收敛 / 资源治理**；取数正确性与只读安全见上一份文档。
+- **核心结论**：28 轮预算从未出现综合轮（0 次）→ 48 次外部工具调用 7 次失败 → 45 条结果被卸载成句柄 → 静默 627s 被看门狗收口 → 落兜底句。对标 Anthropic 上下文工程 / 工具设计、AWS 超时重试预算、OpenRouter 配额口径共 4 篇，给出 P0×3 / P1×5 / P2×3 修复项，每项含验收与回滚开关。
+- **评测集**：L0 case 定义已落 `apps/agent-server/tests/fixtures/stall-incident-cases.json`（10 个 case，**零业务词**、public/private 分层）；L1 确定性回归进 `pnpm test`；L3 扩在线评测维度。
+- **状态**：🆕 2026-10-14 新建；**第 1 批 + 第 2 批修复已实施**。`tsc` 0 错误；全量 87 文件 577 用例全绿。第 1 批（P0-1 配额冷却对齐 UTC 日切 / P0-3 候选链健康度优先 / P1-5 流内错误识别 + 工具失败文案可操作化，落地记录见 §5「第 1 批实施记录」）。第 2 批（P2-1 工具错误分类 + span 补齐并发批 / P1-1 熔断改滑动窗口错误率 / P1-2 同工具重复预算 / P1-4 中止时受控收尾，落地记录见 §5「第 2 批实施记录」）。第 3 批（P1-3 子代理状态契约、P0-2 冷却落盘、P2-2 评测扩维、P2-3）**仍为待办**。
+- **注意**：与 `text2sql-text2api-plan.md` §3.2「语句超时默认 30s」不冲突——那份证明"外部调用必须有界"，本份补上"超时/反复失败之后模型与运行该怎么处置"。
 
 ### [conversation-state-plan.md](./conversation-state-plan.md)
 - **定位**：会话状态与上下文/记忆层契约（thread / 并发 / 队列）。

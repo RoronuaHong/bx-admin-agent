@@ -88,6 +88,14 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 
 > **⚠️ 2026-09-26 校正**：本节写于 09-04，当时 `eval-core.mjs` / `eval-trace-gate.mjs` 为门禁主力。现状（见 `agent-infrastructure.md` §11）旧 G1-G6 harness 已**归档**（备份在 `.data/trash-20260916/code/scripts`，与当前瘦身后契约不一致，未原样恢复）；现行评测门禁为 `scripts/_movie-grounding-gate.mjs`（movie 角色事实型夹具，G1/G2/G7-A~D）+ `tests/grounding-guard.test.ts`（11 例进程内），意图路由旧脚本 `eval-intent-routing.mjs` 仍失效排除。回归入口统一为 `pnpm test`（`apps/agent-server/tests/*.test.ts`）。
 
+> **✅ 2026-10-14 补齐「真实回归集缺位」**：原 §5 遗留的「缺真实回归集」已由
+> [`agent-stall-incident-20261014.md`](../agent-stall-incident-20261014.md) §6 的四层方案落地——
+> **L0** 事故快照 fixture（`tests/fixtures/stall-incident-cases.json`，public/private 分层、零业务词）·
+> **L1** 12 个 mock SSE 驱动真实 `chatStream` 的确定性回归文件（含一次真实事故轨迹的完整修复链）·
+> **L2** 轮级/span 落盘形态断言（`tests/round-trace.test.ts`）·
+> **L3** 在线评测扩到十一维（`eval-online.ts` + env 阈值，只观测不断言）。
+> 现状口径：真实模型/真实 BI 的端到端 gate 仍属独立立项（该文 §6.5），不进 CI。
+
 ### 2.5 成本 Cost ✅ P1 已落地
 - 采集：`trace.ts` 的 `llm` span 捕获 `usage`（promptTokens/completionTokens/totalTokens）。
 - **聚合（本次落地）**：`src/cost.ts` 纯只读遍历 trace JSONL，按 **日 / 模型 / 会话** 维度汇总 token 与费用 + 慢调用 Top N；单个损坏文件跳过不中断。

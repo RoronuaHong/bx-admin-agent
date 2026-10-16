@@ -32,6 +32,8 @@ get_card · get_dashboard · get_database_schema · list_cards
 list_dashboards · list_databases · run_native_query · search
 ```
 
+> 注（2026-10-15）：这是当时的实测记录。工具面后续补齐了 5 个**读侧高层工具**（`execute_query` / `execute_sql` / `query` / `construct_query` / `read_resource`），现共 14 个；其中 `execute_sql` / `query` 也执行任意 SQL，与 `run_native_query` 同定为 `destructive`、共用同一个只读闸门。**写侧工具始终未加入**，本文的写操作结论不受影响。
+
 **没有 `create_card`。** 两种解释都指向同一结论：
 
 - **幻觉**：模型凭"Metabase 应该有建卡功能"编了个工具名，并认真地征求许可。→ 散文许可连"工具是否存在"都不保证（真调用只会得到 `工具未找到或未连接`，`hub.ts` L373）。

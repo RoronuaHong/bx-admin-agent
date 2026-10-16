@@ -310,7 +310,7 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 
 ### 内置 BI 服务器（Metabase）的工具清单
 
-`scripts/metabase-mcp.mjs` 把实例 REST API 暴露为 9 个工具，其中除 `run_native_query`（执行任意 SQL）外全部只读并声明 MCP 标准注解 `readOnlyHint`——**声明事实而非放行**：服务端风险判定（`src/risk.ts`）仍以 `toolRisks` 优先。接口形状按**实例自带**的 `GET /api/docs/openapi.json` 核对（当前实例 v0.62.x）：
+`scripts/metabase-mcp.mjs` 把实例 REST API 暴露为 **14 个工具**，其中 11 个只读并声明 MCP 标准注解 `readOnlyHint`，另 3 个（执行任意 SQL 的 `run_native_query` / `execute_sql` / `query`）**不声明只读**——**声明事实而非放行**：服务端风险判定（`src/risk.ts`）仍以 `toolRisks` 优先。接口形状按**实例自带**的 `GET /api/docs/openapi.json` 核对（当前实例 v0.62.x）：
 
 | 工具 | 对应接口 | 说明 |
 |---|---|---|
@@ -321,6 +321,69 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 | `search` | `GET /api/search` | 关键词找表 / 提问 / 仪表盘（写 SQL 前先定位数据） |
 | `list_cards` / `get_card` | `GET /api/card[/:id]` | 已保存提问，详情含 MBQL 定义 |
 | `list_dashboards` / `get_dashboard` | `GET /api/dashboard[/:id]` | 仪表盘与其中卡片 |
+
+**高层读侧工具（2026-10-15 补齐，5 个）**：前 9 个是**低层封装**（裸 REST 映射），模型只能一条条拼 SQL、反复探字段——这正是「同一工具被反复调」的根因。补的这 5 个是**高层抽象**，让模型用更少调用表达多维分析。通用经验：*能用一次调用说清的需求，不要给模型五次调用的机会*（Anthropic《Writing effective tools for agents》）。
+
+| 工具 | 对应接口 | 只读注解 | 说明 |
+|---|---|---|---|
+| `execute_query` | `POST /api/card/:id/query` | ✅ | 执行**已保存提问**（可带 `parameters`）。复用现成、已验证口径，避免重复写 SQL——**取数首选入口** |
+| `execute_sql` | `POST /api/dataset` | ❌ | 原生 SQL 执行器，**与 `run_native_query` 同一只读闸门**（共用 `runSql` 单实现，不重复校验逻辑） |
+| `query` | 上面两者之一 | ❌ | **统一取数入口**：给 `question_id` 走卡片、给 `database_id` + `sql` 走原生 SQL，一个工具覆盖两种取数 |
+| `construct_query` | — | ✅ | **只构造 / 校验不执行**：校验 SQL 为只读并返回可直接交给执行工具的查询对象；或返回已保存提问的定义。支撑「先确认口径再执行」 |
+| `read_resource` | card / dashboard / collection / database / table | ✅ | 按类型读资产元数据的**统一入口**（`get_card` / `get_dashboard` 的超集） |
+
+只读边界刻意分两层，与 `run_native_query` 同原则：
+
+- **声明只读**（`execute_query` / `construct_query` / `read_resource`）——它们的效果不取决于传入的任意文本，执行已存查询 / 只读元数据 / 纯校验。
+- **不声明只读**（`execute_sql` / `query`）——它们执行**任意 SQL**，是否放行交给服务端 `toolRisks`（配置为 `destructive`），工具自述不替服务端做放行决策。
+
+**同一件事有多个入口时，必须声明默认优先级**（`toolNotes` 配置项，在 `installTools` 时并进 description 末尾）：
+
+| 场景 | 首选 | 为什么 |
+|---|---|---|
+| 已有现成的已保存提问 | `execute_query` | 复用已验证口径，比现场重写 SQL 更快也更准 |
+| 没有现成、想先确认口径 | `construct_query` | 只校验不执行，避免"边写边试"耗轮次 |
+| 确实要新写 SQL | `execute_sql` / `run_native_query` | 底层执行器 |
+| 不确定走哪条 | `query` | 统一入口，**只在不确定时用** |
+| 读卡片 / 仪表盘 / 集合 / 库 / 表元数据 | `read_resource` | 统一读取，替代分别调 `get_card` / `get_dashboard` |
+
+> ⚠️ 实测教训（2026-10-15）：工具**下发 ≠ 模型会用**。补齐 5 个高层工具后连续两次复跑，这 5 个工具**一次都没被调用**，模型全程走老路——因为有 3 组功能重叠却没有任何地方说明该选哪个。补工具后必须同时补「指路信息」（优先级注记 + 技能层措辞），否则等于没补。回归由 `tests/bi-tool-ergonomics.test.ts` [N][O] 锁住。
+
+### 查库/查表 SQL 的写法与静态体检（2026-10-15）
+
+**完整判据表、改法示例、审计数据与实现坑见 [`bi-sql-best-practices.md`](./bi-sql-best-practices.md)（权威口径）。** 本节只给骨架。
+
+`scripts/sql-lint-common.mjs` 与只读判定同一套架构（共享单源、服务端与适配器共用）：
+
+| 模块 | 问的问题 | 处置 | 理由 |
+|---|---|---|---|
+| `sql-readonly-common.mjs` | **能不能执行**（写操作 / 多语句） | **fail-closed**，不合规直接拒 | 安全问题，不能商量 |
+| `sql-lint-common.mjs` | **该不该这么写**（结果集无界 / 全表扫描 / 分组缺失） | **fail-open**，照常执行 + 把「怎么改」回灌 | 效率与**正确性**问题，拦了会误杀合法探索语句 |
+
+判据分四类共 13 条，**只用 SQL 语法与结构**，不含业务语义：
+
+| 类别 | 判据 |
+|---|---|
+| 结果集有界 | `NO_LIMIT_ROWS` · `GROUP_BY_NO_LIMIT` · `SELECT_STAR_UNBOUNDED` · `DISTINCT_WITHOUT_LIMIT` |
+| 扫描代价 | `NO_WHERE` · `NON_SARGABLE_PREDICATE`（谓词列被 `toDate()` 等函数包裹 → 全扫）· `LIKE_LEADING_WILDCARD` · `DEEP_SUBQUERY_NESTING` |
+| **正确性**（跑得通但数是错的） | `GROUP_BY_SELECT_MISMATCH` · `JOIN_WITHOUT_ON` · `IMPLICIT_CROSS_JOIN` |
+| 引擎实践 | `COUNT_DISTINCT`（→ `uniqExact`）· `SHOW_CREATE_TABLE` |
+
+**实测审计（9 轮 30 条模型自写 SQL）**：`NO_WHERE` 14 · `GROUP_BY_NO_LIMIT` 7 · `NO_LIMIT_ROWS` 1，**正确性类 0 命中**。即：前 3 类是真问题（不稳），后 3 类是**预防**（防模型退化），不要混算成"修了 6 个缺陷"。
+
+**两个实现坑（测试当场抓出，已留档）**：① 判据若跑在剥掉字符串字面量的文本上，`LIKE '%x%'` 的模式会被抹掉 → 该规则形同虚设（现另留"只去注释、保留字面量"的文本专供 `LIKE`）；② `GROUP BY 1,2` 是合法序号写法，按列名比对会**误报**（现识别到全序号就放弃判定）。③ `SHOW TABLES` / `DESCRIBE` / `system.*` 不适用行级规则，否则大量误杀。
+
+落点：`runSql`（执行类入口统一回灌）与 `construct_query`（**执行前**就给结论）。回归 `tests/sql-lint.test.ts` 13 例，含"不误伤"与"fail-open"两组反向约束。审计脚本 `scripts/_audit-bi-sql.mjs`。
+
+### 大结果卸载的取回协议（2026-10-15）
+
+工具结果超出预算时卸载到对话工作区文件。**占位提示不能只给路径**——模型无法判断"里面有没有我要的东西"，唯一可行动作就是把每个文件 `fs_read` 捞回来。实测一次多维分析卸载 70 条、捞回 47 次，单工具重复度冲到 47，一半轮次预算耗在搬数据上。
+
+现在的占位提示做三件事（`chat.ts` 的 `offloadRecallNotice`，对齐 Anthropic《Effective context engineering》"offload 前先留可读摘要"）：
+
+1. **内联开头摘要**（前 1200 字）——多数"看一眼就够"的诉求零次取回即满足。
+2. **明确"默认不要读回"**——把默认动作从"捞文件"改成"用摘要判断要不要"。
+3. **给出正确替代路径**——需要全量时优先**重发一条已聚合的查询**（分组 / 去重 / 求和），而不是把一堆明细读回来。
 
 **七个已踩过的坑（按文档修正）**：
 
@@ -345,6 +408,8 @@ MCP_BUILTIN_SERVERS=[{"id":"remote-api","label":"内部接口","transport":"http
 | **优先复用已验证口径** | `run_native_query` 描述提示先用 `list_cards` / `get_card` / `search` 找现成查询 | Text-to-SQL 通用经验：复用已验证 SQL 比现场重新生成可靠得多 |
 
 > 运维提示：适配器代码改动 → `POST /mcp/servers/:id/reload` 即可；但 **`src/mcp/hub.ts` 这类服务端改动必须重启进程**（reload 不重载服务端代码）。
+>
+> ⚠️ **只重启进程不够**：工具清单有 **24 小时磁盘缓存**（`apps/agent-server/.data/mcp-tool-cache.json`，`MCP_TOOL_CACHE_FRESH_MS`）。缓存新鲜时 hub 直接用缓存清单、**不再发 `tools/list`**（避免取消会话），所以**新增/改名工具后重启服务仍会用旧清单**，模型看到的还是老工具面。实测踩过：适配器已改到 14 个工具、独立探针 `ListTools` 也确认 14 个，但复跑日志里仍是 `ready=bi(9)`、新工具 0 次调用——差别只在探针是新进程直连、hub 吃的是磁盘缓存。**判据**：以 `POST /mcp/servers/:id/reload` 返回的 `tools` 数量为准，不要用「另起进程探针」当部署验证，那会给出假绿。
 
 ### 陌生库取证：一次误判的复盘（通用规律 vs 缺陷）
 
