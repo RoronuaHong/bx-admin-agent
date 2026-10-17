@@ -123,6 +123,30 @@ test("[J] 回答结构示范（few-shot）进稳定前缀：结论先行 + 口�
   expect(bare).not.toContain("回答结构示范");
 });
 
+test("[J2] 新增 4 条总分总 / 口径披露规则进稳定前缀：通用型（占位符、无业务词），且仅工具模式注入", () => {
+  const { stable } = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING });
+  // 四条规定均应按「工具模式」注入，且用占位符形态（证明是通用规则，非某业务场景写死）。
+  expect(stable).toContain("总 → 分 → 总");
+  expect(stable).toContain("口径冲突主动披露");
+  expect(stable).toContain("关键数字标注计算口径");
+  expect(stable).toContain("数据口径与方法");
+  // 查缺补漏新增（workbuddy 报告对照审计）：故障≠缺数 踩坑证据句 + 未覆盖子问题逐条枚举。
+  expect(stable).toContain("故障 ≠ 缺数");
+  expect(stable).toContain("未覆盖 / 无法回答的子问题");
+  // 小基数隔离护栏（workbuddy 对账实测：仅 528 用户的巴西被并列成「两国对比」盲区）。
+  expect(stable).toContain("小基数隔离");
+  // 占位符 / 通用陷阱示例校验：不得夹带真实业务字段或表名（禁止写死红线）。
+  expect(stable).toContain("COUNT(DISTINCT <键>)");
+  expect(stable).toContain("<字段>=<值>");
+  // 无工具模式不注入（避免零工具路径被报告式结构噪声污染）。
+  const bare = buildSystemPrompt({ role: "generic", withMemory: false }).stable;
+  expect(bare).not.toContain("总 → 分 → 总");
+  expect(bare).not.toContain("数据口径与方法");
+  expect(bare).not.toContain("故障 ≠ 缺数");
+  expect(bare).not.toContain("未覆盖 / 无法回答的子问题");
+  expect(bare).not.toContain("小基数隔离");
+});
+
 test("[K] 澄清工具描述含输入→输出示范：问题 + 两个互斥选项的形态", () => {
   const spec = builtinToolSpecs().find((s) => s.name === "request_clarification");
   expect(spec, "request_clarification 工具定义缺失").toBeTruthy();
