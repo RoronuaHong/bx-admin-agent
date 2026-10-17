@@ -605,6 +605,11 @@ function wrapUpReady(text: string, conclusion?: "alert" | "report"): boolean {
   return true;
 }
 
+/** 分析类回答是否已含「数据口径与方法」段（结构契约的收尾硬性要求）。 */
+function hasCaliberSection(text: string): boolean {
+  return /数据口径与方法|口径与方法|口径说明|口径与来源/.test(text);
+}
+
 /**
  * 「运行被外部中止」时的收尾提示（第 2 批 P1-4）。
  *
@@ -656,7 +661,22 @@ async function wrapUpWith(
     );
   try {
     const first = (await ask("")).text.trim();
-    if (wrapUpReady(first, conclusion)) return first;
+    if (wrapUpReady(first, conclusion)) {
+      // 校验闭环：分析类长回答若已成形但缺「数据口径与方法」段，补一轮让其补齐
+      // （对齐 grounding 事后核验；结构契约已写在系统提示 / 合成提示里，不依赖技能加载）。
+      if (conclusion !== "alert" && first.length > 300 && !hasCaliberSection(first)) {
+        const patched = (
+          await ask(
+            "上一稿缺少「数据口径与方法」段。请在结尾补上该段，逐条列出：数据来源（库/表）、字段级口径、" +
+              "去重/计数法（COUNT(DISTINCT <键>) 还是 COUNT(*)，是否被设备级放大）、时间窗（左闭右开、含时区）、" +
+              "层级（设备级还是账号/用户级）、近似与冲突、故障≠缺数、未答子问题；每个关键数字都要带口径。" +
+              "不要改动已有结论与数据。",
+          )
+        ).text.trim();
+        if (patched) return patched;
+      }
+      return first;
+    }
     const again = (
       await ask(
         conclusion === "alert"
@@ -816,7 +836,11 @@ const FAKE_CHART_HINT =
 const WRAP_UP_HINT =
   "本轮已达到工具调用轮次上限，工具不可再用。\n" +
   "请仅基于已经获得的数据，直接给出结论性回答；不要再描述你打算查什么。\n" +
-  "若已有数据不足以支撑结论，就如实说明已经查到什么、还缺哪一项，禁止编造数据。";
+  "若已有数据不足以支撑结论，就如实说明已经查到什么、还缺哪一项，禁止编造数据。\n\n" +
+  "【分析 / 数据类回答的结构要求】若本次是基于取数、指标或数据的分析 / 报告，必须采用「总—分—总」：" +
+  "开头「执行摘要」结论先行（每条 = 粗体结论句 + 关键数字 + 口径）；中间按子问题 / 维度分章（表格或图 + 字段级口径，区分 result 与 insight）；" +
+  "结尾「数据口径与方法」段必须存在（数据来源、字段级口径、去重 / 计数法、时间窗、层级、近似与冲突、故障 ≠ 缺数、未答子问题，均按系统提示要求列出）。" +
+  "每个关键数字都要带口径；不完整 / 部分周期必须显式标注或剔除，不得静默混入均值 / 环比 / 占比。";
 
 /** 预警收尾必须带协议标记。收尾调用看不到主循环的任务指引，标记规则要写在这次调用上。 */
 const ALERT_WRAP_PROTOCOL =
