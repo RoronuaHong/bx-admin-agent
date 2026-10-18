@@ -56,6 +56,18 @@ const {
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 
+// 门禁未执行（refused）步骤：收起态摘要对用户友好化——隐藏给 agent 的内部指令
+// （如「先读 business-data-query 技能 / 下一轮再调用」），只说明「未执行且非失败/缺数」，
+// 完整门禁说明留在展开后的 step-result 里，不向终端用户暴露操作指令。
+function refusalHint(): string {
+  return tx(
+    "未执行（工具门禁拦截，并非查询失败或库里没有数据，稍后按流程重试）",
+    "Not executed (tool gate blocked — not a failure or missing data; will retry per flow)",
+    "Não executado (gate da ferramenta bloqueou — não é falha nem dados ausentes; repetirá)",
+    "निष्पादित नहीं (टूल गेट ब्लॉक — विफलता या डेटा अनुपस्थित नहीं; प्रवाह के अनुसार पुनः प्रयास)",
+  );
+}
+
 // toRef 保证：流式原地改 text（同一对象）时 computed 跟踪 .text 重算；
 // 整段对话重载（数组被替换、bubble 换成新对象）时也能跟随 prop 更新。
 const b = toRef(props, "bubble");
@@ -188,7 +200,7 @@ function stepSegments(step: { result?: string }): StepSegment[] {
                   <span v-if="stepQuery(step)" class="step-server" :title="stepQuery(step)">「{{ stepQuery(step) }}」</span>
                   <span v-if="showToolServer(step.name, step.server)" class="step-server" :title="step.server">{{ step.server }}</span>
                   <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">
-                    {{ stepSummary(step) }}
+                    {{ step.status === "refused" ? refusalHint() : stepSummary(step) }}
                   </span>
                   <span class="step-status">{{ stepStatusText(step.status) }}</span>
                   <span v-if="step.result" class="step-caret" aria-hidden="true"></span>
