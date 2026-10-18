@@ -292,8 +292,9 @@ const TOOL_DEDUP_SAME_ROUND = (process.env.MCP_DEDUP_SAME_ROUND || "on").toLower
 const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX || 3));
 /**
  * 总工具调用预算：一次运行里真实执行的工具调用达到该数、且已有接地证据时，
- * 剥掉工具强制模型用已取到的结果写结论（0 = 关闭）。与轮次预算并列的第二道闸门，
- * 专门治「单工具重复护栏收不住总量」——多子问题取数里模型用几十条不同查询就能跑满轮次。
+ * 取数预算上限（0 = 关闭）。与轮次预算并列的第二道闸门，
+ * 专门治「单工具重复护栏收不住取数总量」——多子问题取数里模型用几十条不同查询就能跑满轮次。
+ * 只计真正的取数/查询执行（dataCalls），BI 元数据探索不占它（见 EXPLORE_TOOL_CALL_CAP）。
  */
 const TOTAL_TOOL_CALL_CAP = Math.max(0, Math.floor(Number(process.env.MCP_MAX_TOTAL_TOOL_CALLS || 30)));
 // 探索预算上限（元数据/发现类工具独立软上限，不挤占取数预算；0 = 不启用）。
