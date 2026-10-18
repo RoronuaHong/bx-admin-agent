@@ -2936,6 +2936,8 @@
   background: var(--success);
 }
 
+/* 全局唯一 mcp-pulse 定义：气泡侧 .mcp-dot.running 跨文件复用此关键帧，
+   不要在本文件之外再复制一份，避免「改一漏一」两套不一致。 */
 @keyframes mcp-pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
   70% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
@@ -3259,7 +3261,7 @@
 }
 
 .confirm-level-write {
-  color: var(--warn, #b26a00);
+  color: var(--warn);
   border: 1px solid currentColor;
 }
 
@@ -3922,7 +3924,7 @@
 
 /* 未执行（闸门拒绝 / 跳过 / 未授权 / 等待澄清）：琥珀警示色，区别于失败的红。 */
 .mcp-dot.warn {
-  background: var(--warn, #b26a00);
+  background: var(--warn);
 }
 
 .mcp-dot.running {

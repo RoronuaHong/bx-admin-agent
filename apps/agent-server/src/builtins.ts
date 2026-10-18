@@ -15,6 +15,7 @@ export { CHART_TYPES, GRAPH_CHART_TYPES } from "./output-schema.js";
 import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS, type ReportKpi } from "./report.js";
 import { setConversationTodos } from "./conversations.js";
+import { translateField } from "./label-dictionary.js";
 import {
   MAX_CLARIFY_DESC,
   MAX_CLARIFY_FIELD,
@@ -1075,12 +1076,12 @@ function cellValue(v: unknown): unknown {
  * - 二维数组：第一行即表头（columns 长度一致时用它覆盖首行）。
  * 刻意不接受「纯标量数组」：没有表头的表格不是可用产物，静默猜一个列名比报错更糟。
  */
-function exportMatrix(raw: unknown, columns?: string[]): { matrix: unknown[][] } | { error: string } {
+function exportMatrix(raw: unknown, columns?: string[], locale?: string | null): { matrix: unknown[][] } | { error: string } {
   if (!Array.isArray(raw) || !raw.length) return { error: "缺少数据行（rows 必须是非空数组）" };
   const first = raw[0];
   if (Array.isArray(first)) {
     const matrix = raw.map((row) => (Array.isArray(row) ? row.map(cellValue) : [cellValue(row)]));
-    if (columns?.length && columns.length === matrix[0]!.length) matrix[0] = columns.slice();
+    if (columns?.length && columns.length === matrix[0]!.length) matrix[0] = columns.map((c) => translateField(c, locale));
     return { matrix };
   }
   if (first && typeof first === "object") {
@@ -1092,7 +1093,7 @@ function exportMatrix(raw: unknown, columns?: string[]): { matrix: unknown[][] }
     if (!keys.length) return { error: "数据行里没有任何字段（行对象至少需要一个键）" };
     const picked = columns?.filter((c) => keys.includes(c)) ?? [];
     const ordered = picked.length ? [...picked, ...keys.filter((k) => !picked.includes(k))] : keys;
-    const matrix: unknown[][] = [ordered.slice()];
+    const matrix: unknown[][] = [ordered.map((key) => translateField(key, locale))];
     for (const row of raw) {
       const rec = (row && typeof row === "object" && !Array.isArray(row) ? row : {}) as Record<string, unknown>;
       matrix.push(ordered.map((key) => cellValue(rec[key])));
@@ -1466,6 +1467,7 @@ export async function execBuiltin(
   signal?: AbortSignal,
   hooks?: BuiltinHooks,
   timeZone?: string,
+  locale?: string,
 ): Promise<BuiltinOutcome | null> {
   const args = safeJsonParse(argsJson);
   switch (name) {
@@ -1852,7 +1854,11 @@ export async function execBuiltin(
       let totalRows = 0;
       for (const raw of rawSheets) {
         const rec = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-        const matrix = exportMatrix(rec.rows, Array.isArray(rec.columns) ? rec.columns.map((x) => String(x)) : undefined);
+        const matrix = exportMatrix(
+          rec.rows,
+          Array.isArray(rec.columns) ? rec.columns.map((x) => String(x)) : undefined,
+          locale,
+        );
         if ("error" in matrix) return { ok: false, text: `导出失败：${matrix.error}` };
         totalRows += Math.max(0, matrix.matrix.length - 1);
         built.push({

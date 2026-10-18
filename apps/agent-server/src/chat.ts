@@ -669,7 +669,7 @@ async function wrapUpWith(
           await ask(
             "上一稿缺少「数据口径与方法」段。请在结尾补上该段，逐条列出：数据来源（库/表）、字段级口径、" +
               "去重/计数法（COUNT(DISTINCT <键>) 还是 COUNT(*)，是否被设备级放大）、时间窗（左闭右开、含时区）、" +
-              "层级（设备级还是账号/用户级）、近似与冲突、故障≠缺数、小基数隔离（若某分组样本量极小，须单列并标注样本量，不得与主群体并列对比）、未答子问题；每个关键数字都要带口径。" +
+              "层级（设备级还是账号/用户级）、近似与冲突、故障≠缺数（写明具体缺失项与替代口径）、小基数隔离（若某分组样本量极小，须单列并标注样本量，不得与主群体并列对比）、未覆盖 / 无法回答的子问题（逐条列举）；每个关键数字都要带口径。" +
               "不要改动已有结论与数据。",
           )
         ).text.trim();
@@ -1182,8 +1182,19 @@ export function unscopedNameTokens(userText: string): string[] {
   ];
 }
 
-export const UNSCOPED_NAME_BI_REFUSAL =
-  "未执行。这句话里的专名还没有落到已连接的数据上，不要用这个连接器去找它，也不要用查找结果判断它属不属于这里。先调用 web_search。公开检索之后，如果要的是已连接业务里的指标，再回到这个连接器取数。";
+/**
+ * 专名护栏（advisory，不阻断）：用户原话里出现的名称尚未在已连接业务数据中落到实处时，
+ * 返回一条**提示**（不返回拒绝）——只读 BI 查询 fail-open，对齐 AWS/Anthropic「保守设计只用于写/副作用」原则。
+ * 提示模型：若该名称是外部主体，请先用 web_search 核对；若是内部业务指标/维度取值，可继续取数，无需先检索。
+ * 触发时 console.log 记录（可观测，便于统计误报率）。
+ *
+ * 历史：旧版返回「未执行」硬拦（强制先 web_search），会误伤内部渠道编码（如 INGoogle8）等内部标识符，
+ * 导致 2026-10-17 端到端复现「模型被卡死、web_search 无果后空手」。当日降级为 advisory（方案 C）。
+ */
+export const UNSCOPED_NAME_BI_HINT = (tokens: string[]): string =>
+  "提示：这句话里出现了尚未在已连接业务数据中落到实处的名称（" +
+  tokens.join("、") +
+  "）。若它是外部主体，请先用 web_search 核对；若是内部业务指标或维度取值，可继续用本连接器取数，无需先检索。";
 
 export function ownBusinessNameRefusal(
   toolName: string,
@@ -1195,10 +1206,12 @@ export function ownBusinessNameRefusal(
   if (!toolName.startsWith("mcp__bi__")) return null;
   // 读过「业务取数」技能 = 模型已有选源判断依据（工具说明 + 技能纪律），此时信任模型自行判断内外部、
   // 不再用「用户原话词形」硬拦——词形猜意图脆弱，会把带表名/字段名的内部取数误判成外部专名（2026-10-16 端到端实测复现）。
-  // 仅在模型尚未读技能（无判断依据）时，才保留专名硬拦兜底，防止没读技能就拿业务库搜外部专名。
+  // 仅在模型尚未读技能（无判断依据）时，才保留专名提示兜底，防止没读技能就拿业务库搜外部专名。
   if (skillsRead.has(OWN_BUSINESS_SKILL)) return null;
-  if (!unscopedNameTokens(userText).length) return null;
-  return UNSCOPED_NAME_BI_REFUSAL;
+  const tokens = unscopedNameTokens(userText);
+  if (!tokens.length) return null;
+  console.log("[chat:guard] 专名软提示（不阻断，只读 BI 照常执行）：" + tokens.join(","));
+  return UNSCOPED_NAME_BI_HINT(tokens);
 }
 
 function rememberSkillRead(skillsRead: Set<string>, args: unknown): void {
@@ -2119,8 +2132,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   const callToolFromCode = async (name: string, args: Record<string, unknown>) => {
     const denied = toolCodeDenied(name);
     if (denied) return { ok: false, text: denied };
-    const nameBlocked = ownBusinessNameRefusal(name, userQuestion, usedWebSearch, skillsVisible);
-    if (nameBlocked) return { ok: false, text: nameBlocked };
+    // 专名护栏已降级为 advisory（不阻断）：仅保留提示，照常执行；成功返回时附到文本末尾。
+    const nameHint = ownBusinessNameRefusal(name, userQuestion, usedWebSearch, skillsVisible);
     const ownBusinessBlocked = ownBusinessToolRefusal(name, skillsVisible);
     if (ownBusinessBlocked) return { ok: false, text: ownBusinessBlocked };
     const verdict = resolveToolRisk(name, ctx.grantServers, args);
@@ -2137,6 +2150,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       ctx.signal,
       codeHooks,
       ctx.timeZone,
+      conversation?.locale,
     );
     if (builtin) {
       if (name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, args);
@@ -2149,7 +2163,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         : null;
     if (sendRefusal) return { ok: false, text: sendRefusal };
     const result = await callMcpTool(name, mcpArgs(name, argsJson), ctx.signal);
-    return { ok: !result.isError, text: result.isError ? friendlySendFailure(name, result.text) : result.text };
+    return { ok: !result.isError, text: (result.isError ? friendlySendFailure(name, result.text) : result.text) + (nameHint ? "\n\n" + nameHint : "") };
   };
   const codeHooks: BuiltinHooks = { callTool: (name, args) => callToolFromCode(name, args) };
   let roundExecuted: string[] = [];
@@ -2823,6 +2837,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.signal,
         codeHooks,
         ctx.timeZone,
+        conversation?.locale,
       );
       if (builtin) {
         if (c.name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, safeJsonParse(c.argsJson));
@@ -2836,8 +2851,8 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           ...(builtin.artifact ? { artifact: builtin.artifact } : {}),
         };
       }
-      const nameBlocked = ownBusinessNameRefusal(c.name, userQuestion, usedWebSearch, skillsVisible);
-      if (nameBlocked) return { ok: false, rawText: nameBlocked, executed: false };
+      // 专名护栏已降级为 advisory（不阻断）：仅保留提示，照常执行；成功返回时附到 rawText 末尾。
+      const nameHint = ownBusinessNameRefusal(c.name, userQuestion, usedWebSearch, skillsVisible);
       const blocked = ownBusinessToolRefusal(c.name, skillsVisible);
       if (blocked) {
         ownBusinessRefused = true;
@@ -2859,7 +2874,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       }
       return {
         ok: !result.isError,
-        rawText: result.isError ? friendlySendFailure(c.name, result.text) : result.text,
+        rawText: (result.isError ? friendlySendFailure(c.name, result.text) : result.text) + (nameHint ? "\n\n" + nameHint : ""),
         executed: true,
         startedAt,
       };
@@ -3414,6 +3429,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.signal,
         codeHooks,
         ctx.timeZone,
+        conversation?.locale,
       );
       // executed=false 表示并未真正执行（定时运行拒绝等）——不计入失败熔断。
       let executed = true;
@@ -3476,9 +3492,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           }
         }
       } else {
-        const nameBlocked = ownBusinessNameRefusal(call.name, userQuestion, usedWebSearch, skillsVisible);
-        const blocked = nameBlocked ? null : ownBusinessToolRefusal(call.name, skillsVisible);
-        const refused = nameBlocked || blocked || admitDirectListCall(call.name, call.argsJson, directListSeen);
+        // 专名护栏已降级为 advisory（不阻断）：只作提示，照常执行；技能闸始终计算。
+        const nameHint = ownBusinessNameRefusal(call.name, userQuestion, usedWebSearch, skillsVisible);
+        const blocked = ownBusinessToolRefusal(call.name, skillsVisible);
+        const refused = blocked || admitDirectListCall(call.name, call.argsJson, directListSeen);
         if (blocked) ownBusinessRefused = true;
         if (refused) {
           ok = false;
@@ -3495,7 +3512,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           } else {
             const result = await callMcpTool(call.name, mcpArgs(call.name, call.argsJson), ctx.signal);
             ok = !result.isError;
-            rawText = result.isError ? friendlySendFailure(call.name, result.text) : result.text;
+            rawText = (result.isError ? friendlySendFailure(call.name, result.text) : result.text) + (nameHint ? "\n\n" + nameHint : "");
             if (result.isError) releaseDirectListCall(call.name, call.argsJson, directListSeen);
             else {
               rememberDirectListPage(call.name, call.argsJson, result.text, directListSeen);

@@ -11,7 +11,7 @@
       "L2": "trace 级断言：真实运行后读逐轮/span 落盘断言形态（人工触发，脚本 scripts/_bi-replay.mjs）",
       "L3": "在线评测：真实运行持续打分（只观测、不断言）"
     },
-    "binding": "每个 case 的 boundTests 列出承载它的测试文件与测试名；tests/text2sql-eval-fixture.test.ts 会校验这些测试**真实存在**，且校验本文件零业务词、每个 case 至少绑一个测试——避免 fixture 退化成没人引用的死文档（stall-incident-cases.json 当前就是这种状态：全仓零代码引用）。"
+    "binding": "每个 case 的 boundTests 列出承载它的测试文件与测试名；tests/text2sql-eval-fixture.test.ts 会校验这些测试**真实存在**，且校验本文件零业务词、每个 case 至少绑一个测试——避免 fixture 退化成没人引用的死文档（stall-incident-cases.json 早期也曾是这种状态，现已由 tests/stall-incident-fixture.test.ts 绑定到 10 个真实回归测试，不再零代码引用）。"
   },
   "observedShape": {
     "note": "9 轮实测计数，作为结构化对照基线。同一问题、同一模型档，答案完整度差异极大——这正是需要 case 固化的原因。",

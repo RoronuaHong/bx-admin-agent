@@ -19,7 +19,7 @@ export const SNAPSHOT_DETAIL_TAIL = 40;
 /** 单条思考文本上限。超出留尾部，推理面板看到的是收尾而不是开头。 */
 export const SNAPSHOT_THINKING_CAP = 8_000;
 export const SNAPSHOT_STEP_RESULT_CAP = 4_000;
-const SNAPSHOT_STEP_ARGS_CAP = 400;
+export const SNAPSHOT_STEP_ARGS_CAP = 400;
 
 type SnapshotStep = {
   name: string;
@@ -30,7 +30,7 @@ type SnapshotStep = {
   args?: string;
 };
 
-function capTail(text: string, max: number): string {
+export function capTail(text: string, max: number): string {
   if (text.length <= max) return text;
   return `…\n${text.slice(text.length - max)}`;
 }
@@ -81,8 +81,8 @@ export interface StoredMessage {
   /** 这条消息出现的时刻（毫秒）。只用于气泡上的时间，不回灌模型。 */
   at?: number;
   images?: Array<{ id: string; name: string }>;
-  /** 该助手消息用到的工具步骤摘要（便于历史还原"它做了什么"）。 */
-  steps?: Array<{ name: string; status: string }>;
+  /** 该助手消息用到的工具步骤（含 web_search/fetch_url 的查询与返回来源，便于历史还原"它做了什么"）。 */
+  steps?: SnapshotStep[];
   /**
    * 扩展思考（reasoning）文本：仅作展示、不回灌模型上下文。
    * 只留在最近一段快照里；更早的收成结论，完整追踪在运行记录。

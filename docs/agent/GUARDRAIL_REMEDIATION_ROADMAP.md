@@ -27,7 +27,7 @@
 ## 二、业界最佳实践（检索依据，2026-10-17 补充）
 
 ### 2.1 权威风险框架
-- **OWASP GenAI LLM Top 10（2026 版）**：LLM03 **Excessive Agency**（过度代理，升至第 3）、LLM06 **Unbounded Consumption**（无界消耗）、LLM07 **Misinformation**（幻觉）、LLM02 敏感信息泄露、LLM01 提示注入。
+- **OWASP LLM Top 10（2025 v1.1）**：Excessive Agency（过度代理）、Unbounded Consumption（无界消耗）、Misinformation（幻觉）、敏感信息泄露、提示注入。
 - **AWS Well-Architected「Generative AI Lens」**：代理风险在于"未确认时执行**不可逆**操作" → fail-closed 施加于**写/副作用**，只读动作不应一刀切硬拦。
 - **Anthropic 工具许可**："默认对任何**可能修改系统**的操作请求授权……刻意保守设计" → 保守作用于写操作，只读 fail-open。
 

@@ -1,5 +1,7 @@
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
+import hljs from "highlight.js/lib/common";
+import "./chat-code.css";
 import type { UiLocale } from "./ui-locale";
 import { repairTables } from "./md-tables";
 
@@ -7,7 +9,28 @@ const md = new MarkdownIt({
   html: true,
   linkify: true,
   breaks: true,
+  highlight: highlightCode,
 });
+
+/**
+ * 代码块语法高亮（highlight.js，同步执行——契合本模块同步渲染 + 缓存架构）。
+ * 注：shiki 是 2025+ 主流（VS Code 级高亮），但它是异步的，需把 renderChatMarkdown 改成 async 并重写缓存，
+ * 代价过大，故不采用；highlight.js 的 common 子集已覆盖 BI 场景常见语言（sql/json/bash/js/ts/py…）。
+ */
+function highlightCode(str: string, lang: string): string {
+  if (lang && hljs.getLanguage(lang)) {
+    try {
+      return hljs.highlight(str, { language: lang, ignoreIllegals: true }).value;
+    } catch {
+      /* 落到自动识别 */
+    }
+  }
+  try {
+    return hljs.highlightAuto(str).value;
+  } catch {
+    return ""; // 交给 markdown-it 默认转义，不影响内容正确性
+  }
+}
 
 const defaultLinkOpen =
   md.renderer.rules.link_open ||

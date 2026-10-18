@@ -66,6 +66,41 @@ const bodyHtml = computed(() => renderChatMarkdown(bubbleBody(b.value), uiLocale
 const alertBodyHtml = computed(() =>
   alert.value ? renderChatMarkdown(alert.value.body, uiLocale.value) : "",
 );
+
+// 步骤里 web_search 的查询词（从 args JSON 里取 query），用于展示「搜了什么」。
+function stepQuery(step: { args?: string }): string | null {
+  if (!step.args) return null;
+  try {
+    const parsed = JSON.parse(step.args) as Record<string, unknown>;
+    const q = parsed.query;
+    return typeof q === "string" && q ? q : null;
+  } catch {
+    return null;
+  }
+}
+
+// 把工具结果里的裸 URL 切成片段：普通文本 + 可点击链接。
+// 用真实 <a> 绑定（:href + 文本插值），不走 v-html，从构造上杜绝注入。
+interface StepSegment {
+  text: string;
+  url?: string;
+}
+const URL_RE = /(https?:\/\/[^\s<>"')\]}]+)/g;
+function stepSegments(step: { result?: string }): StepSegment[] {
+  const text = step.result;
+  if (!text) return [];
+  const segments: StepSegment[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  URL_RE.lastIndex = 0;
+  while ((m = URL_RE.exec(text)) !== null) {
+    if (m.index > last) segments.push({ text: text.slice(last, m.index) });
+    segments.push({ text: m[1], url: m[1] });
+    last = m.index + m[1].length;
+  }
+  if (last < text.length) segments.push({ text: text.slice(last) });
+  return segments;
+}
 </script>
 
 <template>
@@ -150,6 +185,7 @@ const alertBodyHtml = computed(() =>
                 >
                   <span class="mcp-dot" :class="stepClass(step.status)"></span>
                   <span class="step-name" :title="step.name">{{ toolDisplayName(step.name, uiLocale) }}</span>
+                  <span v-if="stepQuery(step)" class="step-server">「{{ stepQuery(step) }}」</span>
                   <span v-if="showToolServer(step.name, step.server)" class="step-server">{{ step.server }}</span>
                   <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">
                     {{ stepSummary(step) }}
@@ -162,7 +198,13 @@ const alertBodyHtml = computed(() =>
                   v-show="openSteps.has(stepKey(b, step))"
                   :id="`step-result-${step.id}`"
                   class="step-result"
-                >{{ step.result }}</pre>
+                ><template v-for="(seg, si) in stepSegments(step)" :key="si"><a
+                    v-if="seg.url"
+                    :href="seg.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="step-link"
+                  >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></pre>
               </div>
             </div>
             <div v-if="b.subagents?.length" class="subagents">

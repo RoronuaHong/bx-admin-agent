@@ -107,6 +107,10 @@ interface LangPack {
   chartSection: (count: number) => string;
   rows: (total: number, shown: number) => string;
   truncated: string;
+  /** 任务被手动暂停（不再自动执行）。 */
+  paused: string;
+  /** 任务被手动启用 / 恢复（开始按频率自动执行）。 */
+  resumed: string;
 }
 
 /** 投递文案的四种语言（通用显示词缀，与业务无关）。 */
@@ -141,6 +145,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     chartSection: (count) => `本次图表数据（${count} 张，图见对话）：`,
     rows: (total, shown) => `（表格共 ${total} 行，此处仅列前 ${shown} 行）`,
     truncated: "（内容过长已截断，完整结果见对话）",
+    paused: "已暂停",
+    resumed: "已启用",
   },
   en: {
     ok: "Success",
@@ -171,6 +177,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     chartSection: (count) => `Chart data (${count}; charts live in the chat):`,
     rows: (total, shown) => `(table has ${total} rows; showing first ${shown})`,
     truncated: "(truncated; see the chat for the full result)",
+    paused: "Paused",
+    resumed: "Enabled",
   },
   pt: {
     ok: "Sucesso",
@@ -201,6 +209,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     chartSection: (count) => `Dados dos gráficos (${count}; os gráficos ficam na conversa):`,
     rows: (total, shown) => `(tabela com ${total} linhas; mostrando as primeiras ${shown})`,
     truncated: "(truncado; veja a conversa para o resultado completo)",
+    paused: "Pausada",
+    resumed: "Ativada",
   },
   hi: {
     ok: "सफल",
@@ -231,6 +241,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     chartSection: (count) => `चार्ट डेटा (${count}; चार्ट चैट में हैं):`,
     rows: (total, shown) => `(तालिका में ${total} पंक्तियाँ; पहली ${shown} दिखाई गईं)`,
     truncated: "(काट दिया गया; पूरा परिणाम चैट में देखें)",
+    paused: "रोकी गई",
+    resumed: "सक्षम",
   },
 };
 
@@ -741,7 +753,8 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
         },
       ]
     : [];
-  return { title: `${name} · ${statusText}`, body, ...(links.length ? { links } : {}) };
+  const titleTrigger = triggerText ? `${triggerText} · ` : "";
+  return { title: `${name} · ${titleTrigger}${statusText}`, body, ...(links.length ? { links } : {}) };
 }
 
 /** 编辑保存后推到群里的配置摘要。只写已保存的字段，不解析指令里的业务阈值。 */
@@ -1114,6 +1127,66 @@ export function buildScheduleConfigDelivery(input: ScheduleConfigSnapshot): Deli
     : [];
   return {
     title: `${name} · ${labels.updated}`,
+    body: clampBody(lines.join("\n\n"), pack),
+    ...(links.length ? { links } : {}),
+  };
+}
+
+/**
+ * 任务启停切换通知（暂停 / 启用）。手动改开关时单独推一条，让用户确认状态变化；
+ * 与「配置更新通知」互补——配置通知只在启用任务且改了内容时发，且不覆盖启用 / 暂停本身。
+ */
+export function buildScheduleToggleDelivery(input: {
+  name?: string;
+  prompt: string;
+  enabled: boolean;
+  cron?: string;
+  onceAt?: number;
+  nextRunAt?: number;
+  locale?: string;
+  purpose?: SchedulePurpose;
+  notifyPolicy?: ScheduleNotifyPolicy;
+  conversationId?: string;
+  webOrigin?: string;
+  ownerKey?: string;
+}): DeliveryMessage {
+  const lang = deliveryLangOf(input.locale);
+  const pack = LANGS[lang];
+  const name = (String(input.name || "").trim() || String(input.prompt || "").trim() || pack.unnamed).slice(0, 40);
+  const statusText = input.enabled ? pack.resumed : pack.paused;
+  const badge = lang === "zh"
+    ? input.enabled
+      ? `<font color=#2F9E44>🟢 ${statusText}</font>`
+      : `<font color=#E5484D>🔴 ${statusText}</font>`
+    : statusText;
+  const lines = [
+    `# **${pack.task}：${name}**`,
+    `${pack.status}：${badge}`,
+  ];
+  if (input.enabled) {
+    const next = upcomingScheduleRunAt({ ...input, enabled: true }, Date.now());
+    lines.push(next ? `下次执行：${formatRunClock(next, lang)}` : "下次执行：已按频率排期");
+    if (input.notifyPolicy === "on_alert") {
+      lines.push("通知策略：仅异常时推送（正常 / 无数据不推群）。");
+    }
+  } else {
+    lines.push("任务已暂停，不再按频率自动执行。恢复请在任务卡片重新启用。");
+  }
+  const content = String(input.prompt || "").replace(/\r\n/g, "\n").trim().replace(/_/g, "＿");
+  if (content) lines.push(`任务内容：\n${content}`);
+  const origin = String(input.webOrigin || "").trim().replace(/\/+$/, "");
+  const links: DeliveryLink[] = origin && input.conversationId
+    ? [
+        {
+          title: pack.open,
+          url: `${origin}/chat?conv=${encodeURIComponent(input.conversationId)}${
+            input.ownerKey ? `&owner=${encodeURIComponent(input.ownerKey)}` : ""
+          }`,
+        },
+      ]
+    : [];
+  return {
+    title: `${name} · ${statusText}`,
     body: clampBody(lines.join("\n\n"), pack),
     ...(links.length ? { links } : {}),
   };

@@ -1,14 +1,16 @@
 # BI 护栏：业界最佳实践对齐与整改方案
 
-> 目的：解决「专名护栏误伤」——用户直接贴 SQL、或消息里提到技能名 `business-data-query` 时，BI 只读查询被硬拦（`UNSCOPED_NAME_BI_REFUSAL` 要求先 `web_search`），甚至与「必须先读技能才能用 BI」形成死锁。
+> **实施状态（2026-10-17）：方案 C 已落地**——`ownBusinessNameRefusal` 由「硬拦（要求先 web_search）」降级为 **advisory 软提示（不阻断只读 BI 查询）**，三处调用点据此不再阻断，技能闸 `ownBusinessToolRefusal` 保留硬拦。本次落地缘起于同日的端到端复现（见 `docs/agent/BI_GUARDRAIL_AUDIT_2026-10-17.md`）：用户问 `INGoogle8/INGoogle10` 渠道新增用户来源结构+同比，模型被专名护栏硬拦、web_search 无果后放弃，空手返回。
 >
-> 方法：先对齐业界最佳实践（OWASP GenAI LLM Top 10 2026、AWS Generative AI Lens、Anthropic 工具许可设计），再结合本项目多方向实测证据给出方案。
+> 目的：解决「专名护栏误伤」——用户直接贴 SQL、或消息里提到技能名 `business-data-query` 时，BI 只读查询被硬拦（旧版 `UNSCOPED_NAME_BI_REFUSAL` 要求先 `web_search`），甚至与「必须先读技能才能用 BI」形成死锁。
+>
+> 方法：先对齐业界最佳实践（OWASP LLM Top 10 2025 v1.1、AWS Generative AI Lens、Anthropic 工具许可设计），再结合本项目多方向实测证据给出方案。
 
 ---
 
 ## 一、业界最佳实践（检索依据）
 
-### 1.1 OWASP GenAI LLM Top 10（2026 版，2026-08-04 发布）
+### 1.1 OWASP LLM Top 10（2025 v1.1）
 
 | 编号 | 风险 | 与本项目的对应护栏 |
 |---|---|---|
@@ -131,8 +133,28 @@
 ---
 
 ## 附：检索来源
-- OWASP GenAI LLM Top 10（2026 版，LLM03 Excessive Agency、LLM06 Unbounded Consumption、LLM07 Misinformation）
+- OWASP LLM Top 10（2025 v1.1）：Excessive Agency、Unbounded Consumption、Misinformation
 - AWS Well-Architected「Generative AI Lens」— Excessive agency
 - Anthropic《Claude Code: Best practices for agentic coding》— 工具许可清单的保守设计原则
 - 护栏工程通识（Input/Output Validation 双层、确定性规则优先、终止权属运行时控制器、护栏自身亦为攻击面）
 - 本项目实测记录（2026-10-16~17 端到端）：SETTINGS 回归 `c168883`、方向 C 技能闸、`hasDateWindow` 判据、未执行黄色警告、BI 库实测核验（印度有效会员 741,999 等）
+
+---
+
+## 七、实施记录（2026-10-17，方案 C 落地）
+
+### 7.1 复现证据（触发本次落地）
+用户消息含内部渠道编码 `INGoogle8`/`INGoogle10`，触发 `unscopedNameTokens` → 被判为「外部专名」→ 旧版 `ownBusinessNameRefusal` 硬拦（强制先 web_search）。模型 `web_search` 无命中后放弃取数，空手返回「没取到数据」。`docs/agent/BI_GUARDRAIL_AUDIT_2026-10-17.md` 记录了完整对照（含人工手写 SQL 揭示的真实数据模型与 SQL 自身问题）。
+
+### 7.2 代码改动（chat.ts）
+- `ownBusinessNameRefusal` 返回文案由「未执行…先调用 web_search」改为 **advisory 提示**：列出未在已连接数据落到实处的名称，提示「若是外部主体先 web_search 核对；若是内部业务指标可继续取数」，并 `console.log` 记录触发（可观测 P5）。
+- 三处调用点（`chat.ts:2122 / 2841 / 3482`）**不再据此阻断**只读 BI 查询；成功执行时把提示作为 advisory 附加到工具返回文本（与 `sql-lint` 同源 fail-open）。
+- 保留：技能闸 `ownBusinessToolRefusal`（未读 `business-data-query` 技能仍硬拦，确定性流程边界，已有自愈文案）。
+
+### 7.3 文档改动
+- 本文件顶部标记方案 C 已实施。
+- `skills/business-data-query/SKILL.md` 补「被专名护栏挡住时的恢复步骤」：web_search 无命中后必须读技能并回退 BI 取数，不要据此放弃。
+
+### 7.4 回归
+- `tests/deep-agent-control.test.ts` 对 `ownBusinessNameRefusal` 的 `toContain("web_search")` / `toBeNull()` 断言仍成立。
+- 端到端复验：含 `INGoogle8/INGoogle10` 的取数消息不再被「未执行」卡死，能进入 BI 取数流程。

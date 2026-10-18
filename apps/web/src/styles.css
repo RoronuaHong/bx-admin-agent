@@ -49,6 +49,7 @@
   --surface: #ffffff;
   --border: var(--line);
   --warn: #b26a00;
+  --warn-soft: color-mix(in srgb, var(--warn) 13%, transparent);
   color-scheme: light;
 }
 
@@ -80,6 +81,7 @@ html[data-theme="dark"] {
   --surface: #191917;
   --border: var(--line);
   --warn: #e3bd75;
+  --warn-soft: color-mix(in srgb, var(--warn) 13%, transparent);
   color-scheme: dark;
 }
 

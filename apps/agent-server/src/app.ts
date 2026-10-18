@@ -51,6 +51,9 @@ import {
   reorderConversations,
   resolveConversation,
   upsertMessages,
+  SNAPSHOT_STEP_RESULT_CAP,
+  SNAPSHOT_STEP_ARGS_CAP,
+  capTail,
   type ConversationPatch,
   type PendingMessage,
   type StoredMessage,
@@ -166,6 +169,7 @@ import {
 import {
   buildScheduleConfigDelivery,
   buildScheduleDelivery,
+  buildScheduleToggleDelivery,
   deliverToChannels,
   scheduleConfigChanged,
   scheduleRunFacts,
@@ -584,16 +588,27 @@ async function persistTaskOutcome(task: ChatTask): Promise<boolean> {
   }
   const doc = await getConversation(task.conversationId);
   const existing = (doc?.messages || []) as StoredMessage[];
-  const resultOk = new Map<string, boolean>();
+  const toolResults = new Map<string, { ok: boolean; text?: string }>();
   for (const event of task.buffer) {
-    if (event.type === "tool_result") resultOk.set(event.id, event.ok);
+    if (event.type === "tool_result") toolResults.set(event.id, { ok: event.ok, text: event.text });
   }
-  const steps = task.buffer
+  // 与前端 toStored 的「最近一段保留细节」对称：服务端兜底落库也带上查询词与返回来源，
+  // 但按同样上限裁剪，避免 fetch_url 整页等超长结果无限撑大文档。
+  const steps: StoredMessage["steps"] = task.buffer
     .filter((event) => event.type === "tool_call")
-    .map((event) => ({
-      name: event.name,
-      status: resultOk.get(event.id) === false ? "error" : "ok",
-    }));
+    .map((event) => {
+      const res = toolResults.get(event.id);
+      const result = res?.text ? capTail(res.text, SNAPSHOT_STEP_RESULT_CAP) : undefined;
+      const args = event.args ? capTail(event.args, SNAPSHOT_STEP_ARGS_CAP) : undefined;
+      return {
+        id: event.id,
+        name: event.name,
+        status: res?.ok === false ? "error" : "ok",
+        ...(event.server ? { server: event.server } : {}),
+        ...(args ? { args } : {}),
+        ...(result ? { result } : {}),
+      };
+    });
   // 推理面板相关字段重建（与前端 toStored 对称）：客户端断开后由服务端代为落库，
   // 思考过程 / 任务规划必须从事件缓冲里拼回，否则刷新后推理面板内容丢失。
   let thinking = "";
@@ -686,6 +701,38 @@ async function deliverScheduleConfigUpdate(schedule: ChatSchedule): Promise<void
   console.log(`[scheduler] ${schedule.id} 配置更新已投递 ${summary.sent} 个通道`);
 }
 
+/** 任务启停切换通知（暂停 / 启用都推群）。通道失败只记日志，不影响保存。 */
+async function deliverScheduleToggle(schedule: ChatSchedule, enabled: boolean): Promise<void> {
+  const channels = loadChannels().filter((channel) => channel.enabled !== false);
+  if (!channels.length) {
+    console.warn(`[scheduler] ${schedule.id} 启停切换，但没有启用的通知通道`);
+    return;
+  }
+  const summary = await deliverToChannels(
+    channels,
+    buildScheduleToggleDelivery({
+      name: schedule.name,
+      prompt: schedule.prompt,
+      enabled,
+      cron: schedule.cron,
+      onceAt: schedule.onceAt,
+      nextRunAt: schedule.nextRunAt,
+      locale: schedule.locale,
+      purpose: schedule.purpose,
+      notifyPolicy: schedule.notifyPolicy,
+      conversationId: schedule.conversationId,
+      webOrigin: config.webOrigin,
+      ownerKey: schedule.ownerKey,
+    }),
+  );
+  if (!summary.ok) {
+    const failures = summary.results.filter((r) => !r.ok).map((r) => `${r.label}：${r.error ?? "未知错误"}`);
+    console.warn(`[scheduler] ${schedule.id} 启停通知失败：${failures.join("；") || summary.error || "未知错误"}`);
+    return;
+  }
+  console.log(`[scheduler] ${schedule.id} 启停通知已投递 ${summary.sent} 个通道`);
+}
+
 /**
  * 定时任务结果投递（钉钉 / 飞书机器人）。
  * 旁路职责：任何失败只落 lastDelivery + 日志，**不改这一期的成败**——
@@ -757,7 +804,10 @@ async function deliverScheduleResult(
         arming,
       });
       alertStatePatch = decision.nextState;
-      if (decision.kind === "skip") {
+      // 用户主动触发（手动执行 / 事件唤醒）要看这一期的结果，即便正常检查 / 无数据也要推；
+      // 自动触发才遵循「正常 / 无数据不推」，避免刷屏。两者都仍回写标记与告警状态。
+      const userTriggered = meta?.trigger === "manual" || meta?.trigger === "wake";
+      if (decision.kind === "skip" && !userTriggered) {
         // 正常 / 无数据：不推，但仍回写标记与告警状态，侧栏才能显示「已检查」。
         await patchSchedule(schedule.id, schedule.ownerKey, {
           alertState: decision.nextState,
@@ -766,7 +816,13 @@ async function deliverScheduleResult(
         return;
       }
       deliveryStatus =
-        decision.kind === "spike" ? "alert" : decision.kind === "started" ? "started" : "recovered";
+        decision.kind === "spike"
+          ? "alert"
+          : decision.kind === "started"
+            ? "started"
+            : decision.kind === "recovered"
+              ? "recovered"
+              : "success";
     }
   } else if (arming && status === "success") {
     deliveryStatus = "started";
@@ -1205,14 +1261,21 @@ export function createApp() {
       ...(body.unreadRuns !== undefined ? { unreadRuns: Number(body.unreadRuns) || 0 } : {}),
     });
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
-    // 编辑已启用任务的配置后立刻通知群：写明当前名称、用途、通知、频率、落点和任务内容。
-    // 只改未读数或暂停任务不发。发送失败不让保存失败。
-    if (
+    // 启停切换单独通知群：暂停 / 启用都推，让用户确认状态变化。与配置通知互斥——
+    // 启用同时改了其它内容时只发「已启用」，不再叠一条配置更新，避免两条撞在一起。
+    const enabledToggled = body.enabled !== undefined && before && before.enabled !== updated.enabled;
+    if (enabledToggled) {
+      await deliverScheduleToggle(updated, updated.enabled).catch((err) =>
+        console.warn(`[scheduler] ${updated.id} 启停通知失败：${String((err as Error)?.message || err)}`),
+      );
+    } else if (
       before &&
       updated.enabled &&
       before.ownerKey === updated.ownerKey &&
       scheduleConfigChanged(before, updated)
     ) {
+      // 编辑已启用任务的配置后立刻通知群：写明当前名称、用途、通知、频率、落点和任务内容。
+      // 只改未读数或暂停任务不发。发送失败不让保存失败。
       await deliverScheduleConfigUpdate(updated).catch((err) =>
         console.warn(`[scheduler] ${updated.id} 配置更新通知失败：${String((err as Error)?.message || err)}`),
       );
