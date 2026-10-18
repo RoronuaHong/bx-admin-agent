@@ -129,7 +129,7 @@ test("事故形态回放：多轮多条「不同」查询绕过单工具护栏�
       // 单工具护栏：这种形态一次都不该触发（这正是它收不住总量的证据）
       expect(repeatBudgetNotice({ toolName, perRoundCount: 1, priorCount: 0, totalOther: total - 1 })).toBeNull();
       expect(repeatEscalation({ toolName, total: 1, notifiedStep: 0 }).notice).toBeNull();
-      if (forceSynthesisByToolCallTotal(total, cap, 3)) forcedAt = total;
+      if (forceSynthesisByToolCallTotal(total, cap, 3, total)) forcedAt = total; // 事故形态每条都是取数查询，dataCalls 与 total 同步
     }
   }
   expect(forcedAt, "不同查询绕过单工具护栏，但总量上限必须在 cap 处强制收尾").toBe(cap);
@@ -153,15 +153,27 @@ test("静态接线：阶梯提醒与停止上限都真的挂在主循环上", ()
 
 /* ── 总调用预算（2026-10-16 /chat 多子问题取数事故：25 条不同 SQL 跑满轮次） ── */
 
-test("总量预算：达到上限且已有证据 → 强制收尾（不论第几轮）", () => {
-  expect(forceSynthesisByToolCallTotal(30, 30, 3)).toBe(true);
-  expect(forceSynthesisByToolCallTotal(41, 30, 12)).toBe(true); // 事故形态：41 次调用
-  // 未达上限不强制
-  expect(forceSynthesisByToolCallTotal(29, 30, 12)).toBe(false);
+test("总量预算（取数预算）：达到上限且已有证据 → 强制收尾（不论第几轮）", () => {
+  // 现在预算基于「取数类调用」(dataCalls) 而非总调用；事故形态 41 次调用都是取数 → dataCalls=41
+  expect(forceSynthesisByToolCallTotal(30, 30, 3, 30)).toBe(true);
+  expect(forceSynthesisByToolCallTotal(41, 30, 12, 41)).toBe(true); // 事故形态：41 次取数调用
+  // 取数预算未达上限不强制
+  expect(forceSynthesisByToolCallTotal(29, 30, 12, 29)).toBe(false);
   // 还没有任何证据 → 不强制（否则把探索掐死成「没数据」），交给轮次预算兜底
-  expect(forceSynthesisByToolCallTotal(41, 30, 0)).toBe(false);
+  expect(forceSynthesisByToolCallTotal(41, 30, 0, 41)).toBe(false);
   // 预算关闭（0）→ 行为完全不变
-  expect(forceSynthesisByToolCallTotal(1000, 0, 5)).toBe(false);
+  expect(forceSynthesisByToolCallTotal(1000, 0, 5, 1000)).toBe(false);
+});
+
+test("P0-B·4 预算分离：探索不挤占取数预算，探索耗尽但 0 取数不白收尾", () => {
+  // 取数预算与探索预算都未耗尽（dataCalls 小、exploreCalls 小）→ 不收尾
+  expect(forceSynthesisByToolCallTotal(2, 30, 5, 2, 5, 16)).toBe(false);
+  // 探索预算耗尽且已取过数（dataCalls>0）→ 收尾
+  expect(forceSynthesisByToolCallTotal(30, 30, 5, 3, 30, 16)).toBe(true);
+  // 探索预算耗尽但还没取过数（dataCalls=0）→ 不收尾，给最后一次取数机会
+  expect(forceSynthesisByToolCallTotal(30, 30, 5, 0, 30, 16)).toBe(false);
+  // 取数预算耗尽且有证据 → 收尾
+  expect(forceSynthesisByToolCallTotal(30, 30, 5, 30, 0, 16)).toBe(true);
 });
 
 test("事故形态回放：24 次换参数的元数据探查必须被提示（改动前完全逃过）", () => {

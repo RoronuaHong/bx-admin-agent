@@ -296,6 +296,8 @@ const DOOM_LOOP_MAX_ROUNDS = Math.max(2, Number(process.env.MCP_DOOM_LOOP_MAX ||
  * 专门治「单工具重复护栏收不住总量」——多子问题取数里模型用几十条不同查询就能跑满轮次。
  */
 const TOTAL_TOOL_CALL_CAP = Math.max(0, Math.floor(Number(process.env.MCP_MAX_TOTAL_TOOL_CALLS || 30)));
+// 探索预算上限（元数据/发现类工具独立软上限，不挤占取数预算；0 = 不启用）。
+const EXPLORE_TOOL_CALL_CAP = Math.max(0, Math.floor(Number(process.env.MCP_MAX_EXPLORE_TOOL_CALLS || 16)));
 /**
  * 跨轮重复调用的观察提示（服务端文本，只进模型上下文；执行照常放行——数据可能需要刷新）。
  * 对齐「观察 → 再决策」：不硬拦非连续的同参调用（Doom Loop 只管连续重复），但在回灌时附一句
@@ -921,13 +923,29 @@ export function shouldForceSynthesisRound(input: {
   maxRounds: number;
   forceWrapUp: boolean;
   evidenceCalls: number;
-  /** 本次运行已真实执行的工具调用累计数（判总量预算用）。 */
+  /** 本次运行已真实执行的工具调用累计数（统计/展示用，不再直接驱动收尾）。 */
   toolCallTotal?: number;
   /** 总调用预算上限（0 = 不启用）。 */
   totalToolCallCap?: number;
+  /** 取数类真实执行次数（取数预算基于它）。 */
+  dataCalls?: number;
+  /** 探索类（BI 元数据/发现）真实执行次数。 */
+  exploreCalls?: number;
+  /** 探索预算上限（0 = 不启用）。 */
+  exploreCap?: number;
 }): boolean {
-  // 总量预算命中：不论轮到哪一轮，只要有证据就摘工具强制收尾（治「收不住总量」）。
-  if (forceSynthesisByToolCallTotal(input.toolCallTotal ?? 0, input.totalToolCallCap ?? 0, input.evidenceCalls)) {
+  // 总量预算命中：取数预算耗尽且有证据 → 强制收尾；探索预算耗尽且已取过数 → 收尾；
+  // 探索耗尽但还没取过数 → 给最后一次取数机会，不收尾。
+  if (
+    forceSynthesisByToolCallTotal(
+      input.toolCallTotal ?? 0,
+      input.totalToolCallCap ?? 0,
+      input.evidenceCalls,
+      input.dataCalls ?? 0,
+      input.exploreCalls ?? 0,
+      input.exploreCap ?? 0,
+    )
+  ) {
     return true;
   }
   if (input.maxRounds <= 1 || input.round !== input.maxRounds - 1) return false;
@@ -1145,6 +1163,19 @@ export function ownBusinessToolRefusal(toolName: string, skillsRead: ReadonlySet
     "本次暂未取数、正在按技能流程准备，稍后重新取数；切勿表述成「连接失败 / 没有返回」。" +
     "主体落在外部世界时不要用本连接器，改用 web_search。"
   );
+}
+
+// BI 工具按「取数 / 探索」分类（P0-B·4：预算分离）。仅 `mcp__bi__` 域参与分类，
+// 其它域（web_search、子代理等）既不占取数预算也不占探索预算，只计入总统计。
+const BI_EXPLORE_TOOL_RE =
+  /(?:get_database_schema|get_field_values|list_databases|search_columns|list_cards|get_card|describe|information_schema|get_table|get_tables)\b/i;
+const BI_DATA_TOOL_RE = /(?:run_native_query|execute_sql|run_query|run_sql|query)\b/i;
+
+export function isBiExploreTool(name: string): boolean {
+  return name.startsWith("mcp__bi__") && BI_EXPLORE_TOOL_RE.test(name);
+}
+export function isBiDataTool(name: string): boolean {
+  return name.startsWith("mcp__bi__") && BI_DATA_TOOL_RE.test(name);
 }
 
 /**
@@ -2248,10 +2279,16 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   // 这里再挂一条**跨轮阶梯**账：记住已提示到哪一级台阶，每上一个台阶再提醒一次（默认仍不硬拦）。
   const repeatEscalatedStep = new Map<string, number>();
   let toolCallTotal = 0;
+  /** 取数类真实执行次数（占用取数预算，不含探索）。 */
+  let dataCalls = 0;
+  /** 探索类（BI 元数据/发现）真实执行次数（占用探索预算，不挤占取数）。 */
+  let exploreCalls = 0;
   /** 记一次真实执行（重复预算用；不计入被闸门拦下与同轮去重的跳过）。 */
   const noteToolCall = (name: string): void => {
     toolCallCounts.set(name, (toolCallCounts.get(name) || 0) + 1);
     toolCallTotal += 1;
+    if (isBiExploreTool(name)) exploreCalls += 1;
+    else if (isBiDataTool(name)) dataCalls += 1;
   };
   // 运行时统计（回填 usage 事件）：轮次 / 重试 / 熔断 / 协议护栏纠正（伪调用与伪出图共用一次预算）。
   let rounds = 0;
@@ -2358,6 +2395,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         evidenceCalls: groundingEvidence,
         toolCallTotal,
         totalToolCallCap: TOTAL_TOOL_CALL_CAP,
+        dataCalls,
+        exploreCalls,
+        exploreCap: EXPLORE_TOOL_CALL_CAP,
       });
     // 收敛提示（Fix 2，治 P2/P3 低效探索）：预算用到约 2/3 且已取到证据时一次性要求模型用已有
     // 结果收敛，比「最后一轮才摘工具」更早给信号，避免把整段交互耗在重复探查上。总调用预算（Fix 1）
@@ -3709,6 +3749,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       maxRounds: ctx.maxRounds,
       forceWrapUp: ctx.forceWrapUp === true,
       evidenceCalls: groundingEvidence,
+      dataCalls,
+      exploreCalls,
+      exploreCap: EXPLORE_TOOL_CALL_CAP,
     });
     if (!integrateHinted && groundingEvidence > 0 && !nextIsSynthesis && round + 1 < ctx.maxRounds) {
       conversation.push({ role: "user", content: INTEGRATE_HINT });

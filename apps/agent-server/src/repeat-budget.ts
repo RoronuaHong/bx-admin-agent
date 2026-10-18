@@ -178,11 +178,29 @@ export function repeatBudgetNotice(input: RepeatBudgetInput, opts: RepeatBudgetO
  * 为什么仍要求 `evidenceCalls > 0`：没有证据时强制收尾只会得到一句「没取到数」，
  * 那属于把探索掐死。零证据的极端情形仍由轮次预算 / Doom Loop / token 预算兜底。
  */
+/**
+ * 总调用预算：单工具护栏收不住总量（2026-10-16 客服/BI 复跑事故）。
+ *
+ * 2026-10-18 修订（对照 `docs/agent/BI_INDIA_BRAZIL_VS_WORKBUDDY_2026-10-18.md` 第 7 节 P0-B·4）：
+ * 元数据探索与取数**共用一个总预算**会让"先 schema 探查、再取数"的常规流程把取数预算耗尽——
+ * 本项目实跑 31 次调用里 28 次是元数据探索，预算耗尽后被强制总结，仅 3 次取数得到的指标也没机会展开。
+ * 故把预算拆开：
+ *   · **取数预算**（`cap`，基于 `dataCalls`）：只对真正取数/查询执行计数，探索不占它；
+ *   · **探索预算**（`exploreCap`，基于 `exploreCalls`）：元数据/发现类工具的软上限，防探索失控。
+ * 命中规则：取数预算耗尽且有证据 → 收尾；探索预算耗尽且已取过数 → 收尾；
+ * 探索预算耗尽但**还没取过数**（`dataCalls === 0`）→ 不收尾，给模型最后一次取数机会（避免白收尾）。
+ * `toolCallTotal` 仍保留用于统计/展示，不再直接驱动收尾。
+ */
 export function forceSynthesisByToolCallTotal(
   toolCallTotal: number,
   cap: number,
   evidenceCalls: number,
+  dataCalls = 0,
+  exploreCalls = 0,
+  exploreCap = 0,
 ): boolean {
-  return cap > 0 && evidenceCalls > 0 && toolCallTotal >= cap;
+  if (cap > 0 && evidenceCalls > 0 && dataCalls >= cap) return true;
+  if (exploreCap > 0 && exploreCalls >= exploreCap) return dataCalls > 0;
+  return false;
 }
 
