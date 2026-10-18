@@ -185,8 +185,8 @@ function stepSegments(step: { result?: string }): StepSegment[] {
                 >
                   <span class="mcp-dot" :class="stepClass(step.status)"></span>
                   <span class="step-name" :title="step.name">{{ toolDisplayName(step.name, uiLocale) }}</span>
-                  <span v-if="stepQuery(step)" class="step-server">「{{ stepQuery(step) }}」</span>
-                  <span v-if="showToolServer(step.name, step.server)" class="step-server">{{ step.server }}</span>
+                  <span v-if="stepQuery(step)" class="step-server" :title="stepQuery(step)">「{{ stepQuery(step) }}」</span>
+                  <span v-if="showToolServer(step.name, step.server)" class="step-server" :title="step.server">{{ step.server }}</span>
                   <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">
                     {{ stepSummary(step) }}
                   </span>
@@ -230,7 +230,7 @@ function stepSegments(step: { result?: string }): StepSegment[] {
         <div v-if="b.pending" class="confirm-card">
           <div class="confirm-text">
             {{ tx("工具调用需要确认", "This tool call needs your approval", "Esta chamada de ferramenta precisa da sua aprovação", "इस टूल कॉल को आपकी अनुमति चाहिए") }}：<b :title="b.pending.name">{{ toolDisplayName(b.pending.name, uiLocale) }}</b>
-            <span v-if="showToolServer(b.pending.name, b.pending.server)" class="step-server">{{ b.pending.server }}</span>
+            <span v-if="showToolServer(b.pending.name, b.pending.server)" class="step-server" :title="b.pending.server">{{ b.pending.server }}</span>
             <span
               v-if="b.pending.level"
               class="confirm-level"

@@ -219,7 +219,14 @@ button.step-head:disabled {
 /* 来源服务器：antd Tag 形态（发丝边框 + 低饱和底 + 小字号），
    与右侧状态药丸明确区分——原来两者同为灰色小字，扫读时完全分不开。 */
 .step-server {
-  flex: none;
+  /* 允许收缩并限制最大宽度：工具参数（如 SQL 查询）一旦很长，
+     用省略号截断而非把整行撑出气泡（原 flex:none 无截断会横向溢出）。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding: 1px 6px;
   border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
   border-radius: 5px;

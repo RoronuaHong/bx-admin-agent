@@ -2333,6 +2333,13 @@ function newConversation() {
     if (leavingState?.sending || leavingState?.controller) watchBackgroundDone(leaving);
   }
   currentId.value = "";
+  // 进入草稿态：清空上一轮残留的用户态（技能 / 连接器 / 助手模型 / 待发文件），
+  // 仅保留草稿文字（对齐「草稿再次进入保留输入」的约定），避免新建会话带上旧会话的勾选与附件。
+  blank.settings.mcpEnabled = [];
+  blank.settings.skillsEnabled = [];
+  blank.settings.modelId = "";
+  blank.pendingImages = [];
+  blank.pendingDocs = [];
   sidebarOpen.value = false; // 移动端点「新建对话」后收起抽屉
   queueScroll(true);
 }

@@ -1140,9 +1140,10 @@ export function ownBusinessToolRefusal(toolName: string, skillsRead: ReadonlySet
   if (!toolName.startsWith("mcp__bi__")) return null;
   if (skillsRead.has(OWN_BUSINESS_SKILL)) return null;
   return (
-    "未执行，不是查询失败，库里也不是没有数据。调用自有业务连接器之前要先读完 business-data-query。" +
-    "若这一轮已经读过该技能，下一轮直接再调用本工具取数，不要告诉用户连接失败或没有返回。" +
-    "主体落在外部世界时不要用这个连接器，改用 web_search。"
+    "未执行——这是工具门禁拦截，不是查询失败，库里也并不是没有数据。" +
+    "使用自有业务连接器前必须先读完整 business-data-query 技能；若本轮已读过，下一轮直接重新调用本工具取数即可。" +
+    "本次暂未取数、正在按技能流程准备，稍后重新取数；切勿表述成「连接失败 / 没有返回」。" +
+    "主体落在外部世界时不要用本连接器，改用 web_search。"
   );
 }
 
