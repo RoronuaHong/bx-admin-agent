@@ -15,6 +15,26 @@ import { withSubprocessSlot } from "./subprocess-limit.js";
 import { guardSourceLooksIntact, nodeFsGuardPreloadSource, pyFsGuardSource } from "./tool-code-fs-guard.js";
 import { lintToolCodeForDeviceLevelCount } from "./tool-code-lint.js";
 
+/**
+ * 解码子进程输出字节：先严格 UTF-8，失败回退 gb18030（GBK 超集），再失败才替换式兜底。
+ * 与 builtins.decodeShellBytes 同口径（此处内联以避免 builtins↔tool-code 循环依赖）。
+ * 中文 Windows 控制台按 GBK(cp936) 输出中文，必须兜底才能不整体乱码。
+ */
+function decodeShellBytes(buf: Buffer | string | undefined): string {
+  if (buf == null) return "";
+  if (typeof buf === "string") return buf;
+  if (!buf.length) return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    try {
+      return new TextDecoder("gb18030").decode(buf);
+    } catch {
+      return buf.toString("utf-8");
+    }
+  }
+}
+
 function capOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const head = Math.floor(maxChars * 0.6);
@@ -352,25 +372,28 @@ export async function runToolCode(opts: {
     }),
   });
 
-  let stdout = "";
-  let stderr = "";
+  let stdoutBuf: Buffer[] = [];
+  let stderrBuf: Buffer[] = [];
   let streamTruncated = false;
   let spawnError: Error | null = null;
   // 边收边掐：超过上限就停止累加并记一笔，避免「疯狂 print」在收齐前先把内存打爆。
-  const push = (cur: string, chunk: string): string => {
-    if (cur.length >= STREAM_CAPTURE_MAX) {
+  // 不调用 setEncoding：中文 Windows 下 python/node 子进程按 GBK(cp936) 输出中文，
+  // 强制 utf8 解码会整体乱码（run_command 已用 decodeShellBytes 处理，这里保持一致）。
+  // 先收字节，收齐后再用「utf8 优先、gb18030 兜底」解码。
+  const push = (cur: Buffer[], chunk: Buffer): Buffer[] => {
+    const total = cur.reduce((n, b) => n + b.length, 0);
+    if (total >= STREAM_CAPTURE_MAX) {
       streamTruncated = true;
       return cur;
     }
-    return cur + chunk.slice(0, Math.max(0, STREAM_CAPTURE_MAX - cur.length));
+    const remain = STREAM_CAPTURE_MAX - total;
+    return [...cur, chunk.subarray(0, Math.max(0, remain))];
   };
-  child.stdout?.setEncoding("utf8");
-  child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", (chunk: string) => {
-    stdout = push(stdout, chunk);
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdoutBuf = push(stdoutBuf, chunk);
   });
-  child.stderr?.on("data", (chunk: string) => {
-    stderr = push(stderr, chunk);
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrBuf = push(stderrBuf, chunk);
   });
   child.once("error", (err) => {
     spawnError = err;
@@ -401,6 +424,8 @@ export async function runToolCode(opts: {
     rmSync(scratch, { recursive: true, force: true });
   }
 
+  const stdout = decodeShellBytes(Buffer.concat(stdoutBuf));
+  const stderr = decodeShellBytes(Buffer.concat(stderrBuf));
   const captured = [stdout.trim(), stderr.trim() ? `--- stderr ---\n${stderr.trim()}` : ""].filter(Boolean).join("\n");
   // 设备级口径告警（advisory）：与 BI SQL 体检同源；命中只附提示、不改执行结果。
   const deviceWarn = lintToolCodeForDeviceLevelCount(opts.code);
