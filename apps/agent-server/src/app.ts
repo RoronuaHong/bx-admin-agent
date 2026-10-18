@@ -111,6 +111,7 @@ import { buildMetrics } from "./metrics.js";
 import { summarizeCost } from "./cost.js";
 import { hitRateLimit } from "./rate-limit.js";
 import { checkAdminToken } from "./admin-gate.js";
+import { checkFetchTarget, FETCH_DNS_FAILED } from "./web-search.js";
 import {
   garbledTextReason,
   getSchedule,
@@ -140,6 +141,7 @@ import {
 } from "./schedule-service.js";
 import {
   commitAlertFailureNotice,
+  commitAlertStaleNotice,
   decideAlertDelivery,
   decideAlertFailure,
   deliveryArmPurpose,
@@ -205,6 +207,10 @@ const RATE_CONCURRENT_PER_OWNER = Math.max(0, Number(process.env.RATE_LIMIT_CONC
  * `x-admin-token`。配套限流（0 = 关闭）压住「reload 反复 spawn 子进程」这类昂贵操作。
  */
 const ADMIN_TOKEN = String(process.env.AGENT_ADMIN_TOKEN || "").trim();
+/** 内网部署确实要接私网 MCP 时设 MCP_CUSTOM_ALLOW_PRIVATE=on。 */
+function customMcpAllowsPrivate(): boolean {
+  return /^(1|on|true|yes)$/i.test(String(process.env.MCP_CUSTOM_ALLOW_PRIVATE || "").trim());
+}
 const RATE_ADMIN_PER_MIN = Math.max(0, Number(process.env.RATE_LIMIT_ADMIN_PER_MIN ?? 30));
 /**
  * 定时任务（无人值守）的工具轮次预算，默认比交互式宽一倍：
@@ -690,7 +696,6 @@ async function deliverScheduleConfigUpdate(schedule: ChatSchedule): Promise<void
       locale: schedule.locale,
       conversationId: schedule.conversationId,
       webOrigin: config.webOrigin,
-      ownerKey: schedule.ownerKey,
     }),
   );
   if (!summary.ok) {
@@ -722,7 +727,6 @@ async function deliverScheduleToggle(schedule: ChatSchedule, enabled: boolean): 
       notifyPolicy: schedule.notifyPolicy,
       conversationId: schedule.conversationId,
       webOrigin: config.webOrigin,
-      ownerKey: schedule.ownerKey,
     }),
   );
   if (!summary.ok) {
@@ -777,6 +781,7 @@ async function deliverScheduleResult(
   let alertStatePatch: ChatSchedule["alertState"] | undefined;
   let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
   let checkIncomplete = false;
+  let staleChecks = 0;
   const arming = needsArmNotice(schedule);
   const finishedAt = meta?.finishedAt ?? Date.now();
 
@@ -794,13 +799,14 @@ async function deliverScheduleResult(
         return;
       }
       deliveryStatus = "failed";
-      checkIncomplete = !meta?.modelStatus && !text.trim();
+      checkIncomplete = !meta?.modelStatus && !parseAlertMarker(text);
     } else {
       const marker = parseAlertMarker(text);
       lastMarker = marker;
       const decision = decideAlertDelivery({
         marker,
         alertState: schedule.alertState,
+        now: finishedAt,
         arming,
       });
       alertStatePatch = decision.nextState;
@@ -815,14 +821,17 @@ async function deliverScheduleResult(
         });
         return;
       }
+      if (decision.kind === "stale") staleChecks = decision.nextState.noDataStreak || 0;
       deliveryStatus =
         decision.kind === "spike"
           ? "alert"
-          : decision.kind === "started"
-            ? "started"
-            : decision.kind === "recovered"
-              ? "recovered"
-              : "success";
+          : decision.kind === "stale"
+            ? "failed"
+            : decision.kind === "started"
+              ? "started"
+              : decision.kind === "recovered"
+                ? "recovered"
+                : "success";
     }
   } else if (arming && status === "success") {
     deliveryStatus = "started";
@@ -833,7 +842,9 @@ async function deliverScheduleResult(
   const failureState = (sent: boolean) =>
     status === "failed" && policy === "on_alert" && alertStatePatch
       ? commitAlertFailureNotice(alertStatePatch, schedule.alertState, sent)
-      : alertStatePatch;
+      : staleChecks && alertStatePatch
+        ? commitAlertStaleNotice(alertStatePatch, schedule.alertState, sent)
+        : alertStatePatch;
 
   if (!channels.length) {
     console.warn(`[scheduler] ${schedule.id} 没有启用的通知通道，跳过投递`);
@@ -856,7 +867,6 @@ async function deliverScheduleResult(
       text,
       conversationId: schedule.conversationId,
       webOrigin: config.webOrigin,
-      ownerKey: schedule.ownerKey,
       ...(charts.length ? { charts } : {}),
       ...(schedule.locale ? { locale: schedule.locale } : {}),
       ...(meta?.trigger ? { trigger: meta.trigger } : {}),
@@ -864,6 +874,7 @@ async function deliverScheduleResult(
       ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
       ...(arming ? { armed: true, purpose: deliveryArmPurpose({ purpose: schedule.purpose, notifyPolicy: policy }) } : {}),
       ...(checkIncomplete ? { checkIncomplete: true } : {}),
+      ...(staleChecks ? { staleChecks } : {}),
       ...(meta?.modelStatus ? { modelStatus: meta.modelStatus, text: modelAvailabilityNotice(meta.modelStatus) } : {}),
     }),
   );
@@ -889,6 +900,21 @@ function errorJson(c: Context, status: number, code: string, defaultMessage?: st
     ...(defaultMessage ? { message: defaultMessage } : {}),
   };
   return c.json(body, status as never);
+}
+
+/**
+ * 全局写入的管理员令牌校验。技能正文会进所有人的系统提示，自定义连接器对所有对话可见，
+ * 这两类写入即使挂在设备会话路由下也要过令牌。未配置 AGENT_ADMIN_TOKEN 时放行。
+ */
+function adminDenied(c: Context) {
+  const gate = checkAdminToken({ token: ADMIN_TOKEN, provided: c.req.header("x-admin-token") });
+  if (gate.ok) return null;
+  return errorJson(
+    c,
+    401,
+    gate.reason === "missing" ? "ADMIN_TOKEN_REQUIRED" : "ADMIN_TOKEN_INVALID",
+    gate.reason === "missing" ? "该端点需要 x-admin-token 头" : "x-admin-token 不正确",
+  );
 }
 
 function cookieOpts() {
@@ -1014,17 +1040,8 @@ export function createApp() {
     const path = c.req.path;
     // /health 留给进程探活，不带令牌也要能查。
     if (path === "/health" || path.startsWith("/chat/") || path === "/skills" || path.startsWith("/skills/")) return next();
-    const gate = checkAdminToken({ token: ADMIN_TOKEN, provided: c.req.header("x-admin-token") });
-    if (!gate.ok) {
-      return errorJson(
-        c,
-        401,
-        gate.reason === "missing" ? "ADMIN_TOKEN_REQUIRED" : "ADMIN_TOKEN_INVALID",
-        gate.reason === "missing"
-          ? "该端点需要 x-admin-token 头"
-          : "x-admin-token 不正确",
-      );
-    }
+    const denied = adminDenied(c);
+    if (denied) return denied;
     if (RATE_ADMIN_PER_MIN > 0) {
       const actor = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "local";
       const rate = hitRateLimit(`admin:${actor}`, RATE_ADMIN_PER_MIN);
@@ -1055,6 +1072,13 @@ export function createApp() {
   async function conversationNotFoundFor(c: Context, id: string): Promise<boolean> {
     const owner = c.get("owner");
     return !(await conversationOwnedBy(id, owner));
+  }
+
+  /** 读接口的守卫：本设备的对话，或定时任务的对话（IM 通知链接 `?conv=` 发在群里，群里谁点都能看）。
+   *  写接口不能用它：改名、删除、续聊仍只认主人。 */
+  async function conversationUnreadableFor(c: Context, id: string): Promise<boolean> {
+    if (!(await conversationNotFoundFor(c, id))) return false;
+    return !(await getConversation(id))?.scheduleId;
   }
 
   app.get("/health", (c) => c.json({ ok: true, release: getRelease() }));
@@ -1439,11 +1463,21 @@ export function createApp() {
   // 对话里的「重连」不走管理员接口：面板上能看见的服务器，会话就可以重连（处理器与管理端共用）。
   app.post("/chat/mcp/servers/:id/reload", reloadMcpServerById);
 
-  // 对话面板里添加远程连接器。只接受 HTTP，不接受本机命令。走会话，不走管理员令牌。
+  // 对话面板里添加远程连接器。只接受 HTTP，不接受本机命令。
+  // 连接器写进全局注册表，配了管理员令牌就要带；地址不能指向本机或私网，除非显式放开。
   app.post("/chat/mcp/custom", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const body = await readJson<{ id?: string; label?: string; url?: string; headerName?: string; headerValue?: string }>(c);
     const built = buildCustomHttpConnector(body);
     if (!built.ok) return errorJson(c, 400, "MCP_SERVER_INVALID", built.error);
+    const targetError = customMcpAllowsPrivate() ? null : await checkFetchTarget(new URL(built.server.url || ""));
+    if (targetError === FETCH_DNS_FAILED) {
+      return errorJson(c, 400, "MCP_SERVER_UNRESOLVABLE", "连接器域名解析失败，请检查地址");
+    }
+    if (targetError) {
+      return errorJson(c, 400, "MCP_SERVER_PRIVATE_TARGET", "连接器地址不能指向本机、私网或保留地址");
+    }
     const saved = upsertServer(built.server);
     void connect(saved.id);
     const session = c.get("session") as Session;
@@ -1466,6 +1500,8 @@ export function createApp() {
 
   // 只移除对话面板添加的远程连接器。系统自带和本机命令仍走管理员接口。
   app.delete("/chat/mcp/custom/:id", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const id = c.req.param("id");
     const server = getServer(id);
     if (!isRemovableCustomConnector(server, connectorSlot(id))) {
@@ -1547,6 +1583,8 @@ export function createApp() {
   });
 
   app.post("/skills", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const body = await readJson<{ dir?: string; name?: string; description?: string; roles?: string[]; body?: string }>(c);
     const result = createLocalSkill(body);
     if (!result.ok) return errorJson(c, result.status, result.code, result.error);
@@ -1555,6 +1593,8 @@ export function createApp() {
   });
 
   app.post("/skills/import", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const form = await c.req.parseBody();
     const dir = typeof form.dir === "string" ? form.dir : "";
     const file = form.file;
@@ -1579,6 +1619,8 @@ export function createApp() {
   });
 
   app.put("/skills/:dir/enabled", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const body = await readJson<{ enabled?: boolean }>(c);
     if (typeof body.enabled !== "boolean") return errorJson(c, 400, "SKILL_ENABLED_INVALID", "enabled 必须是布尔值");
     const dir = c.req.param("dir");
@@ -1589,6 +1631,8 @@ export function createApp() {
   });
 
   app.put("/skills/:dir", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const body = await readJson<{ name?: string; description?: string; roles?: string[]; body?: string }>(c);
     const result = updateLocalSkill(c.req.param("dir"), body);
     if (!result.ok) return errorJson(c, result.status, result.code, result.error);
@@ -1597,6 +1641,8 @@ export function createApp() {
   });
 
   app.delete("/skills/:dir", async (c) => {
+    const denied = adminDenied(c);
+    if (denied) return denied;
     const dir = c.req.param("dir");
     const result = deleteLocalSkill(dir);
     if (!result.ok) return errorJson(c, result.status, result.code, result.error);
@@ -1762,7 +1808,7 @@ export function createApp() {
   //    再按留档里的状态如实收口。能续的是「流的读取」，不是「这一轮的执行」（见 chat-tasks 注释）。
   app.get("/chat/task/events", async (c) => {
     const conversationId = c.req.query("conversationId") || "";
-    if (await conversationNotFoundFor(c, conversationId)) {
+    if (await conversationUnreadableFor(c, conversationId)) {
       return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "该对话没有进行中或留档期内可续传的任务");
     }
     const rawFrom = c.req.query("from") ?? c.req.header("last-event-id") ?? "0";
@@ -1849,12 +1895,12 @@ export function createApp() {
   // `lastEventSeq` = 当前事件序号上界：客户端据此判断自己的游标落后多少（也便于排障）。
   app.get("/chat/task/status", async (c) => {
     const conversationId = c.req.query("conversationId") || "";
-    const owned = await conversationOwnedBy(conversationId, c.get("owner"));
-    const task = owned ? getRunningTask(conversationId) : undefined;
-    let last = owned ? getLastTaskSummary(conversationId) : undefined;
+    const readable = !(await conversationUnreadableFor(c, conversationId));
+    const task = readable ? getRunningTask(conversationId) : undefined;
+    let last = readable ? getLastTaskSummary(conversationId) : undefined;
     // 进程重启后内存注册表为空：退回留档——「上次那一轮跑到什么状态」仍然可见（running 恒为 false），
     // 前端据此才能如实收口，而不是一律显示「没有任务」。留档仍新鲜则说明是别的实例在跑（多实例部署）。
-    if (owned && !task && !last) {
+    if (readable && !task && !last) {
       const persisted = await loadTaskForResume(conversationId);
       if (persisted) {
         const { record, canContinue } = persisted;
@@ -1933,6 +1979,11 @@ export function createApp() {
     if (body.agentId !== undefined && !hasRole(body.agentId)) {
       return errorJson(c, 400, "AGENT_ROLE_UNKNOWN", `未知 Agent 角色：${body.agentId}`);
     }
+    // 客户端可以自带 id（幂等新建），但 id 已属于别人时一律按不存在处理：
+    // createConversation 是按 id upsert，放过去就会改写对方标题并把整份对话回给调用方。
+    if (body.id && (await getConversation(body.id)) && (await conversationNotFoundFor(c, body.id))) {
+      return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    }
     const id = body.id || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const agentId = body.agentId || "generic";
     // 新对话的 MCP 启用集由角色默认决定（通用助手默认 bi）。不在这里传空数组，空数组会盖掉默认勾选。
@@ -2007,7 +2058,7 @@ export function createApp() {
   // 列表接口不带 context（体积大），切对话时用它单独取全量。
   app.get("/chat/conversations/:id", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const doc = await getConversation(id);
     if (!doc) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     // 返回时带 running：支持"刷新后仍能看到该对话在生成中"（例如另一标签页在跑）。
@@ -2062,7 +2113,7 @@ export function createApp() {
   // 导出对话 JSON（含模型上下文与任务规划；下载附件）。
   app.get("/chat/conversations/:id/export.json", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const doc = await getFullConversation(id);
     if (!doc) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const payload = JSON.stringify(doc, null, 2);
@@ -2074,7 +2125,7 @@ export function createApp() {
   // 导出对话 Markdown。
   app.get("/chat/conversations/:id/export.md", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const doc = await getFullConversation(id);
     if (!doc) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const payload = renderConversationMarkdown(doc);
@@ -2111,13 +2162,13 @@ export function createApp() {
   // ---- 对话工作区（虚拟文件系统）：文件列表与内容预览（只读 UI；写走 fs_* 工具）----
   app.get("/chat/conversations/:id/files", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     return c.json({ conversationId: id, files: fsList(id) });
   });
 
   app.get("/chat/conversations/:id/files/content", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const path = c.req.query("path") || "";
     // 大文件按行分页（与 fs_read 工具的 offset/limit 同语义：offset 从 0 起）。
     const offset = c.req.query("offset");
@@ -2132,7 +2183,7 @@ export function createApp() {
   // 与 /files/content（纯文本预览）分工：这里是二进制安全、带 Content-Disposition 的下载端点。
   app.get("/chat/conversations/:id/files/download", async (c) => {
     const id = c.req.param("id");
-    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    if (await conversationUnreadableFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     const path = c.req.query("path") || "";
     // 复用 safePath：越出工作区沙箱即拒（与 fs_* 工具同一套边界）。
     const abs = fsResolve(id, path);
@@ -2271,6 +2322,9 @@ export function createApp() {
       headers: {
         "Content-Type": image.mediaType,
         "Cache-Control": "private, max-age=604800",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        ...(image.mediaType.startsWith("image/") ? {} : { "Content-Disposition": "attachment" }),
       },
     });
   });

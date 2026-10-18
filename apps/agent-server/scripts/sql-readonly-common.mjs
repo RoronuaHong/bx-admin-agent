@@ -38,33 +38,93 @@ const DENY_PATTERNS = [/into\s+(out|dump)file/, /load_file\s*\(/, /pg_read_file\
 // （只允许读本库数据）。fail-closed 一律拒，不做"看起来像读就放行"的判断。
 //
 // 刻意**不**拒的：`values()` / `numbers()` / `input()` —— 它们只产生内联数据，不越界。
+// `*Cluster` 变体与各类对象存储 / 湖格式函数同样能读库外数据，按前缀整族拒。
 const DENY_TABLE_FUNCTIONS =
-  "url|urlCluster|remote|remoteSecure|file|hdfs|s3|mysql|postgresql|mongodb|redis|odbc|jdbc|executable";
-const DENY_TABLE_FN_RE = new RegExp(`\\b(${DENY_TABLE_FUNCTIONS})\\s*\\(`, "i");
+  "url|urlCluster|remote|remoteSecure|file|fileCluster|hdfs|hdfsCluster|s3|s3Cluster|gcs|oss|cosn|" +
+  "azureBlobStorage|azureBlobStorageCluster|iceberg|icebergS3|icebergAzure|icebergHDFS|icebergLocal|" +
+  "deltaLake|deltaLakeCluster|hudi|hudiCluster|sqlite|mysql|postgresql|mongodb|redis|odbc|jdbc|executable";
+const DENY_TABLE_FN_RE = new RegExp(
+  `\\b(${DENY_TABLE_FUNCTIONS}|s3\\w*|azure\\w*|iceberg\\w*|deltaLake\\w*|hudi\\w*|hdfs\\w*)\\s*\\(`,
+  "i",
+);
 
 const DENY_RE = new RegExp("\\b(" + DENY_KEYWORDS.join("|") + ")\\b");
 
-/** 去注释：注释里的关键字不参与判定（避免 `-- drop table` 之类被误杀）。 */
-function stripComments(sql) {
-  return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n\r]*/g, " ");
+/**
+ * 单遍扫描：把字符串 / 引号标识符换成空占位、注释换成空格。
+ * 必须单遍做：先去注释再去引号会把 `'--'` 里的内容当注释；逐个正则替换又不认识 `\'` 转义——
+ * `SELECT 'a\'' , url(...) , '\''` 在 ClickHouse/MySQL 里 url() 在引号外，正则却把它当字面量剥掉。
+ * backslashEscapes：反斜杠是否转义下一个字符（ClickHouse/MySQL 是，PostgreSQL 标准字符串不是）。
+ * 引号或块注释未闭合返回 null（fail-closed）。
+ */
+function maskLiterals(sql, backslashEscapes) {
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === "-" && next === "-") {
+      while (i < n && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+      out += " ";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      out += " ";
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const quote = ch;
+      i += 1;
+      let closed = false;
+      while (i < n) {
+        const c = sql[i];
+        if (backslashEscapes && c === "\\" && quote !== "`") {
+          i += 2;
+          continue;
+        }
+        if (c === quote) {
+          if (sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          closed = true;
+          break;
+        }
+        i += 1;
+      }
+      if (!closed) return null;
+      out += quote + quote;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 
-/** 是否「可安全放行的单条只读查询」。fail-closed：不明朗一律 false。 */
-export function isReadOnlySql(raw) {
-  if (typeof raw !== "string") return false;
-  // 脱掉字符串/标识符引号（单/双/反引号）再判定：列名或字面量恰好是保留字/含分号时，
-  // 不被误判为写操作或多语句（如 SELECT "update" FROM t）。仍 fail-closed，不明朗一律 false。
-  const sql = stripComments(raw)
-    .replace(/'[^']*'/g, "''")
-    .replace(/"[^"]*"/g, '""')
-    .replace(/`[^`]*`/g, "``")
-    .trim();
+function isReadOnlyMasked(masked) {
+  if (masked == null) return false;
+  const sql = masked.trim();
   if (!sql) return false;
   const parts = sql.split(";").map((s) => s.trim()).filter(Boolean);
   if (parts.length !== 1) return false; // 多语句一律拒绝（无正当用途）
   const lower = parts[0].toLowerCase();
   const first = lower.match(/^[a-z]+/)?.[0] || "";
   return LEADING_KEYWORDS.includes(first) && !DENY_RE.test(lower) && !DENY_PATTERNS.some((re) => re.test(lower)) && !DENY_TABLE_FN_RE.test(parts[0]);
+}
+
+/** 是否「可安全放行的单条只读查询」。fail-closed：不明朗一律 false。 */
+export function isReadOnlySql(raw) {
+  if (typeof raw !== "string") return false;
+  // 脱掉字符串/标识符引号与注释再判定：列名或字面量恰好是保留字/含分号时，
+  // 不被误判为写操作或多语句（如 SELECT "update" FROM t）。
+  // 反斜杠语义因方言而异，两种解读都必须判为只读才放行——不依赖知道下游是哪种库。
+  return isReadOnlyMasked(maskLiterals(raw, true)) && isReadOnlyMasked(maskLiterals(raw, false));
 }
 
 /** 供测试与文档引用：当前被拒的表值函数清单。 */

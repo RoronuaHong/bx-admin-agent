@@ -10,7 +10,10 @@
  *   未配置时按 `webSearchStatus()` 诚实上报「不可用」，绝不静默失败或让模型凭记忆作答；
  * - 不写死任何业务词：本模块只有协议字段名（title/url/snippet）与通用网络语义；
  * - `fetch_url` 只允许公网 http/https，阻断本机与私网地址（基础 SSRF 防护，与语言无关）。
+ *   残余风险：解析校验与真正建连之间 DNS 可被换绑（rebinding），根治需在建连层固定已校验的 IP。
  */
+import { isIP } from "node:net";
+import { lookup as dnsLookup } from "node:dns/promises";
 
 /** 一条检索结果（各 provider 归一化后的最小字段集）。 */
 export interface WebSearchHit {
@@ -262,26 +265,95 @@ export async function webSearch(query: string, count?: number): Promise<WebSearc
   }
 }
 
-/** 本机 / 私网 / 保留地址判定（fetch_url 的基础 SSRF 防护；纯网络语义，与语言无关）。 */
+function isBlockedV4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number) as [number, number];
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 169 && b === 254) return true; // 链路本地（含云元数据地址段）
+  if (a === 100 && b >= 64 && b <= 127) return true; // 运营商级 NAT
+  if (a === 198 && (b === 18 || b === 19)) return true; // 基准测试保留段
+  if (a >= 224) return true; // 组播 / 保留
+  return false;
+}
+
+/** 把 IPv6 展开成 8 组 16 位整数；非法返回 null。 */
+function expandV6(ip: string): number[] | null {
+  let text = ip;
+  const tailV4 = text.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (tailV4) {
+    const [p, q, r, s] = tailV4[1]!.split(".").map(Number) as [number, number, number, number];
+    text = `${text.slice(0, -tailV4[1]!.length)}${((p << 8) | q).toString(16)}:${((r << 8) | s).toString(16)}`;
+  }
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  const groups = [...head, ...Array(Math.max(0, fill)).fill("0"), ...tail].map((g) => parseInt(g || "0", 16));
+  return groups.length === 8 && groups.every((g) => Number.isInteger(g) && g >= 0 && g <= 0xffff) ? groups : null;
+}
+
+/** 本机 / 私网 / 保留地址判定（IP 字面量）。v4 映射、NAT64 内嵌的 v4 按内嵌地址再判一次。 */
+export function isBlockedIp(raw: string): boolean {
+  const ip = raw.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0]!;
+  const family = isIP(ip);
+  if (family === 4) return isBlockedV4(ip);
+  if (family !== 6) return true;
+  const g = expandV6(ip);
+  if (!g) return true;
+  if (g.every((x) => x === 0)) return true; // ::
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
+  const embedded = `${g[6]! >> 8}.${g[6]! & 0xff}.${g[7]! >> 8}.${g[7]! & 0xff}`;
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return isBlockedV4(embedded); // ::ffff:a.b.c.d
+  if (g.slice(0, 6).every((x) => x === 0)) return isBlockedV4(embedded); // ::a.b.c.d（已废弃的兼容写法）
+  if (g[0] === 0x64 && g[1] === 0xff9b) return isBlockedV4(embedded); // NAT64
+  if ((g[0]! & 0xfe00) === 0xfc00) return true; // fc00::/7 唯一本地
+  if ((g[0]! & 0xffc0) === 0xfe80) return true; // fe80::/10 链路本地
+  if ((g[0]! & 0xff00) === 0xff00) return true; // 组播
+  return false;
+}
+
+/** 主机名层面的拦截（不做解析）：localhost 族与私网 IP 字面量。 */
 function isBlockedHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (!host) return true;
-  if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0") return true;
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 169 && b === 254) return true; // 链路本地（含云元数据地址段）
-    if (a === 100 && b >= 64 && b <= 127) return true; // 运营商级 NAT
-    if (a >= 224) return true; // 组播 / 保留
-    return false;
-  }
-  if (host.includes(":")) return /^(fc|fd|fe80)/.test(host); // IPv6 唯一本地 / 链路本地
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (isIP(host)) return isBlockedIp(host);
   return false;
 }
+
+type HostLookup = (hostname: string) => Promise<string[]>;
+
+const systemLookup: HostLookup = async (hostname) =>
+  (await dnsLookup(hostname, { all: true, verbatim: true })).map((entry) => entry.address);
+
+/**
+ * 校验一跳抓取目标：协议、主机名、以及 DNS 解析出的**每一个**地址。
+ * 只看主机名拦不住 `127.0.0.1.nip.io` 这类解析到内网的公网域名。
+ */
+export const FETCH_DNS_FAILED = "抓取失败：域名解析失败";
+
+export async function checkFetchTarget(target: URL, lookup: HostLookup = systemLookup): Promise<string | null> {
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    return `只支持 http/https 链接（当前：${target.protocol}）`;
+  }
+  const host = target.hostname.replace(/^\[|\]$/g, "");
+  if (isBlockedHost(host)) return "出于安全考虑，不抓取本机、私网或保留地址";
+  if (isIP(host)) return null;
+  let addresses: string[];
+  try {
+    addresses = await lookup(host);
+  } catch {
+    return FETCH_DNS_FAILED;
+  }
+  if (!addresses.length || addresses.some((addr) => isBlockedIp(addr))) {
+    return "出于安全考虑，不抓取本机、私网或保留地址";
+  }
+  return null;
+}
+
+const MAX_REDIRECTS = 5;
 
 /** HTML → 纯文本：去掉不可见结构与标签，压缩空白（够用即可，不做完整 DOM 解析）。 */
 function htmlToText(html: string): { title: string; text: string } {
@@ -317,27 +389,41 @@ function htmlToText(html: string): { title: string; text: string } {
  * 抓取网页正文（只读、公网 http/https）。
  * 限制：单页 512KB / 正文 6000 字，超出截断并如实标注，避免把上下文一次性吃满。
  */
-export async function fetchPage(rawUrl: string): Promise<FetchOutcome> {
+export async function fetchPage(
+  rawUrl: string,
+  opts: { signal?: AbortSignal; lookup?: HostLookup } = {},
+): Promise<FetchOutcome> {
   let target: URL;
   try {
     target = new URL(rawUrl.trim());
   } catch {
     return { ok: false, error: "链接格式不正确" };
   }
-  if (target.protocol !== "http:" && target.protocol !== "https:") {
-    return { ok: false, error: `只支持 http/https 链接（当前：${target.protocol}）` };
-  }
-  if (isBlockedHost(target.hostname)) {
-    return { ok: false, error: "出于安全考虑，不抓取本机、私网或保留地址" };
-  }
   const config = readWebSearchConfig();
   const timeoutMs = config?.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
   try {
-    const response = await fetch(target.toString(), {
-      redirect: "follow",
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1" },
-    });
+    // 重定向手动跟随：fetch 自动跟随时跳到内网地址不会再经过校验。
+    let response: Response | null = null;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+      const blocked = await checkFetchTarget(target, opts.lookup);
+      if (blocked) return { ok: false, error: blocked };
+      response = await fetch(target.toString(), {
+        redirect: "manual",
+        signal,
+        headers: { Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1" },
+      });
+      const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+      if (!location) break;
+      await response.body?.cancel().catch(() => undefined);
+      if (hop === MAX_REDIRECTS) return { ok: false, error: `抓取失败：重定向超过 ${MAX_REDIRECTS} 次` };
+      try {
+        target = new URL(location, target);
+      } catch {
+        return { ok: false, error: "抓取失败：重定向地址格式不正确" };
+      }
+    }
+    if (!response) return { ok: false, error: "抓取失败：没有响应" };
     if (!response.ok) return { ok: false, error: `抓取失败：HTTP ${response.status}` };
     const type = (response.headers.get("content-type") || "").toLowerCase();
     if (type && !/text\/html|application\/xhtml|text\/plain|application\/json/.test(type)) {

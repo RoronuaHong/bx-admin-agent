@@ -276,6 +276,39 @@ flowchart LR
 | S-1 / S-2 | 定时运行只读白名单 + 需确认即拒；`manage_schedule create` 强制确认 | `app.ts`、`schedule-alert.ts`、`risk.ts` |
 | A-2 | `SOURCE_ERROR` 标记 + 检查失效告警 | `schedule-alert.ts`、`app.ts` |
 
+#### P0 修复状态（2026-10-18）
+
+| 编号 | 状态 | 落地方式 | 回归测试 |
+| --- | --- | --- | --- |
+| IO-1 | 已修 | `POST /chat/conversations` 带 id 时，id 已属他人返回 404，不改写不回传 | `conversation-create-ownership` |
+| IO-2 | 已修 | mediaType 只按扩展名白名单定；下载加 `nosniff`、`CSP sandbox`，非图片强制附件 | `upload-media-type` |
+| IO-3 / A-1 | 部分 | 链接只带对话 id（`?conv=`），不带设备身份，`?owner=` 已移除。目前没有鉴权体系，不加票据：定时任务的对话对持链接的人只读开放（详情、导出、文件、任务状态与事件），改名 / 删除 / 续聊仍只认主人；主人的普通对话别人读不到。**通道按 owner 归属暂缓**：通道是管理员配置的全局资源，决定等登录体系（方案 B）上线后一起做 | `task-conversation-link` |
+| IO-4 / C-6 | 已修 | 附件定界后拼进本轮 user 消息（不进 system、去掉"以附件为准"）、附件名清洗；记忆与摘要定界并移到动态段末尾；子代理拿不到也调不了 `save_memory`。`save_memory` 交互场景的确认沿用 fullAccess 决策 | `context-untrusted-injection` |
+| IO-5 | 已修 | 技能增删改导入、启停与 `/chat/mcp/custom` 增删走管理员令牌（配了 `AGENT_ADMIN_TOKEN` 才生效）；自定义连接器拒绝本机 / 私网地址（`MCP_CUSTOM_ALLOW_PRIVATE=on` 可放开）；面板添加的连接器只信 `destructiveHint` | `global-write-admin-gate` |
+| T-1 / T-2 / T-3 | 已修 | 主循环串行 / 并行、`count_list_by_time`、代码桥统一过"本次启用连接器 + 只读免确认"判定 | `mcp-scope-gate` |
+| T-4 | 已修 | 单遍字面量遮蔽（两种转义口径都要通过）+ 表函数黑名单扩充。DB 账号层封出网仍需运维侧配置 | `sql-readonly-escape-bypass` |
+| T-5 | 已修 | 手动跟随重定向逐跳校验、DNS 解析后判 IP、覆盖 v6 映射 / NAT64。DNS rebinding 剩余风险见 `web-search.ts` 文件头 | `fetch-url-ssrf` |
+| S-1 / S-2 | 已修 | 无人值守遇到需确认的调用直接拒绝；`manage_schedule` create / resume 不受 fullAccess 豁免 | `unattended-confirm-gate` |
+| A-2（含 A-3） | 已修 | 预警失败不再提前丢弃，交给 60 分钟合并发"检查没有完成"；连续 3 期 `NO_DATA` 发"检查失效"并 60 分钟节流；告警中但本期 `NO_DATA` 不加密频率 | `schedule-alert` |
+
+#### 实例实测（2026-10-18，隔离实例 8899 + 独立 Mongo 库 + 假钉钉机器人，逐项串行）
+
+全部 P0 项在运行中的实例上复测通过。实测和复查发现 7 处单测没覆盖到的问题，已修并补测试：
+
+| 项 | 实测发现 | 修复 |
+| --- | --- | --- |
+| IO-2 | 文件名 `evil.html`、声明 `image/png` 仍按 png 落盘 | 扩展名先看文件名、再看 MIME；图片校验魔数（png / jpg / webp），内容不符拒收 |
+| IO-5 | 自定义连接器域名解析失败被报成"指向私网" | 解析失败单独返回 `MCP_SERVER_UNRESOLVABLE` |
+| T-1/2/3 | 越界 MCP 调用先命中业务技能闸，提示"先读技能再重试"，诱导模型重试 | 作用域判定挪到业务技能闸之前（串行、并行、代码桥三处） |
+| T-4 | 服务端闸门对 `query` / `sql` 取"任一只读即放行"，而适配器执行的是 `query`：`{query: 恶意, sql: "SELECT 1"}` 能过服务端这一层（适配器仍拦） | 带了的 SQL 字段每个都必须只读 |
+| IO-3 | 票据只签名不加密，base64 解出来就是 ownerKey；owner cookie 就是 ownerKey 本身，等于把凭据贴在链接上 | 票据改 AES-256-GCM（加密兼防篡改），解码看不到 ownerKey |
+| IO-3 | 群里第一个点链接的人会拿到主人的完整身份，能看能改主人全部对话；其他人点进来只看到空列表 | 链接不再携带 ownerKey；任务对话对持链接的人只读开放，群里谁点都能看，看不到也改不了主人的其他对话 |
+| 数据目录 | `AGENT_DATA_DIR` 只覆盖部分数据：trace、审计、评测、对话文件、上传、模型健康、MCP 来源、RAG 仍写死仓库 `.data`，测试和隔离实例都会写进仓库 | 8 个模块统一走 `DATA_DIR`；vitest 默认用临时目录 |
+
+实测通过的行为：越权创建对话 404；伪造 `?owner=` 无效；技能 / 连接器写入无令牌 401；私网连接器拒绝；`fetch_url` 重定向到 127.0.0.1 / 169.254.169.254 / 解析到回环的域名都拦；完全访问下创建定时任务仍弹确认，拒绝后不建任务；附件里的注入指令被忽略且不写记忆；子代理拿不到 `save_memory`；BI 反斜杠转义藏 `url()` / `DROP`、字符串里的注释符、`s3Cluster` 在服务端和适配器两层都拒，正常 `SELECT` 照常返回；预警首期失败推"检查没有完成"，连续 3 期 `NO_DATA` 推"检查失效"；通知链接从两台新设备打开都能看这条任务对话，设备身份不变；读不到主人的其他对话，改名、删除、续聊都 404；隔离实例的 trace 只写自己的数据目录。
+
+剩余风险：`AGENT_ADMIN_TOKEN` 未配置时 IO-5 的令牌校验不生效（单机默认行为）；前端技能页与连接器面板还不会带 `x-admin-token`，配置令牌后这两处写入需要管理员走 API。旧的面板连接器没有 `untrustedAnnotations` 标记，需要删除重加。任务对话的 id 就是查看凭据，知道 id 的人都能读，等登录体系上线后再收紧；钉钉内置浏览器没有主人 cookie 时，主人自己点链接也只能看、不能续聊。
+
 ### P1（两周内）
 
 C-1 卸载先于截断、C-2/C-3 历史与摘要、C-5 配额计数、IO-6 链接参数、IO-7 公式注入、IO-8 出站脱敏统一、IO-9 远程图片、T-7 风险名匹配、T-8 凭据文件、T-9 参数 schema 校验、S-3 CAS + runId、S-4 时区、S-5 失败治理、S-6 心跳、A-3 失败通知、A-4 重复通知间隔。

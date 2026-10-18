@@ -8,10 +8,9 @@
 // 读取侧只服务文本语义：二进制扩展名在 `fsRead` 处明确拒绝（乱码比报错更糟）。
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DATA_DIR } from "./store-util.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FS_ROOT = resolve(__dirname, "..", ".data", "fs");
+const FS_ROOT = resolve(DATA_DIR, "fs");
 
 const MAX_FILE_BYTES = Number(process.env.FS_MAX_FILE_BYTES || 256 * 1024);
 const MAX_FILES = Number(process.env.FS_MAX_FILES || 100);

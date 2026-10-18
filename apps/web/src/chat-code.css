@@ -1,0 +1,96 @@
+/* 对话气泡里代码块的语法高亮（highlight.js 的 token 类），配色随纸感主题切换。 */
+:root {
+  --hl-comment: #8a8a80;
+  --hl-keyword: #8f3f71;
+  --hl-string: #4d7a2a;
+  --hl-number: #a5521a;
+  --hl-title: #2f5f8f;
+  --hl-attr: #8a6a12;
+  --hl-meta: #6b6b63;
+  --hl-deletion: #8f2b22;
+  --hl-addition: #2f7a48;
+}
+
+html[data-theme="dark"] {
+  --hl-comment: #7f7f77;
+  --hl-keyword: #d79bc4;
+  --hl-string: #a8c98a;
+  --hl-number: #e8a873;
+  --hl-title: #8ab8e6;
+  --hl-attr: #e3bd75;
+  --hl-meta: #a3a39a;
+  --hl-deletion: #e07a70;
+  --hl-addition: #7cc495;
+}
+
+.hljs {
+  color: var(--ink);
+  background: transparent;
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-doctag,
+.hljs-type {
+  color: var(--hl-keyword);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-symbol,
+.hljs-template-tag,
+.hljs-template-variable {
+  color: var(--hl-string);
+}
+
+.hljs-number,
+.hljs-built_in,
+.hljs-bullet,
+.hljs-link {
+  color: var(--hl-number);
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--hl-title);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-params,
+.hljs-property {
+  color: var(--hl-attr);
+}
+
+.hljs-meta,
+.hljs-tag,
+.hljs-subst {
+  color: var(--hl-meta);
+}
+
+.hljs-deletion {
+  color: var(--hl-deletion);
+}
+
+.hljs-addition {
+  color: var(--hl-addition);
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 600;
+}

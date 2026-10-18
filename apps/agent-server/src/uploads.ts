@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { DATA_DIR } from "./store-util.js";
 
 // 聊天上传落盘存储：图片（走 vision 通道）与文档附件（PDF/Word/Excel/md/txt/csv，解析后注入上下文）
 // 同库同 TTL，落盘 .data/uploads/，7 天过期，不落库。会话只引用 id，内容在请求时读盘使用。
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const UPLOAD_DIR = resolve(__dirname, "..", ".data", "uploads");
+const UPLOAD_DIR = resolve(DATA_DIR, "uploads");
 const FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_AT_ONCE = 4;
@@ -42,12 +41,24 @@ const EXT_BY_NAME: Record<string, string> = Object.fromEntries(
   Object.keys(MEDIA_BY_EXT).map((ext) => [ext, ext]),
 );
 
-/** 由浏览器给的 type / 文件名推断落盘扩展名；type 不可靠时回退到文件名后缀。 */
+/**
+ * 推断落盘扩展名。浏览器上报的 type 可伪造（evil.html + image/png），文件名带后缀时以后缀为准，
+ * 后缀不在白名单就拒收；只有没有后缀（如剪贴板粘贴）时才看 type。
+ */
 function resolveExt(name: string, type: string): string | null {
+  const base = String(name || "").split(/[\\/]/).pop() || "";
+  const dot = base.lastIndexOf(".");
+  if (dot > 0) return EXT_BY_NAME[base.slice(dot + 1).toLowerCase()] || null;
   const t = (type || "").split(";")[0].trim().toLowerCase();
-  if (ACCEPTED_EXT[t]) return ACCEPTED_EXT[t];
-  const ext = (name.split(".").pop() || "").toLowerCase();
-  return EXT_BY_NAME[ext] || null;
+  return ACCEPTED_EXT[t] || null;
+}
+
+/** 图片按文件头核对：扩展名对了但内容不是图片的，不当图片存。 */
+function imageSignatureOk(ext: string, data: Buffer): boolean {
+  if (ext === "png") return data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (ext === "jpg" || ext === "jpeg") return data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+  if (ext === "webp") return data.subarray(0, 4).toString("latin1") === "RIFF" && data.subarray(8, 12).toString("latin1") === "WEBP";
+  return true;
 }
 
 interface StoredUpload {
@@ -115,22 +126,25 @@ export async function saveUpload(file: {
   const ext = resolveExt(file.name, file.type);
   if (!ext) {
     throw new Error(
-      `不支持的文件类型：${(file.type || "").split(";")[0] || file.name || "未知"}（支持 png/jpeg/webp/pdf/docx/xlsx/md/txt/csv）`,
+      `不支持的文件类型：${file.name || (file.type || "").split(";")[0] || "未知"}（支持 png/jpeg/webp/pdf/docx/xlsx/md/txt/csv）`,
     );
   }
   if (file.size > MAX_FILE_BYTES) {
     throw new Error(`文件过大（${(file.size / 1024 / 1024).toFixed(1)}MB），单文件不超过 ${(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)}MB`);
   }
+  const data = Buffer.from(await file.arrayBuffer());
+  if (!imageSignatureOk(ext, data)) throw new Error(`文件内容不是 ${ext} 图片`);
   const id = randomUUID();
   const path = resolve(UPLOAD_DIR, `${id}.${ext}`);
   try {
     mkdirSync(UPLOAD_DIR, { recursive: true });
-    writeFileSync(path, Buffer.from(await file.arrayBuffer()));
+    writeFileSync(path, data);
   } catch (error) {
     console.error("[upload] 落盘失败:", error);
     throw new Error("文件保存失败");
   }
-  const mediaType = (file.type || "").split(";")[0].trim().toLowerCase() || MEDIA_BY_EXT[ext] || "application/octet-stream";
+  // 只认白名单扩展名对应的类型：浏览器上报的 type 可伪造（x.txt + text/html），读回时会按它当 Content-Type 同源返回。
+  const mediaType = MEDIA_BY_EXT[ext] || "application/octet-stream";
   store.set(id, { id, mediaType, size: file.size, createdAt: Date.now(), path, name: file.name || `upload.${ext}` });
   return { id, name: file.name || `upload.${ext}`, size: file.size };
 }

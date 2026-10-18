@@ -5,7 +5,7 @@
 //   - 结果带 source/title/score，供模型给出可点击来源（答案可溯源）。
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { DATA_DIR } from "../store-util.js";
 import {
   isEmbeddingEnabled,
   embedText,
@@ -14,8 +14,7 @@ import {
   type EmbeddingResult,
 } from "./embedding.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RAG_DIR = path.resolve(__dirname, "..", "..", ".data", "rag");
+const RAG_DIR = path.resolve(DATA_DIR, "rag");
 const INDEX_PATH = path.join(RAG_DIR, "index.json");
 const VECTORS_PATH = path.join(RAG_DIR, "vectors.json");
 

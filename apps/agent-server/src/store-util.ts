@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** 运行时数据目录（.data），各持久化文件以此为锚解析，避免按文件深度拼 `..` 的脆弱写法。
- *  AGENT_DATA_DIR 仅在测试 / 特殊部署下覆盖（默认走仓库内 .data，行为不变）。 */
+ *  AGENT_DATA_DIR 覆盖时，所有运行时数据（含 trace / 审计 / 评测 / 上传 / 工作区 / 知识库）都跟着走。 */
 export const DATA_DIR = process.env.AGENT_DATA_DIR
   ? resolve(process.env.AGENT_DATA_DIR)
   : resolve(dirname(fileURLToPath(import.meta.url)), "..", ".data");

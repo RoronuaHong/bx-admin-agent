@@ -225,7 +225,8 @@ export function priorTopicMessages(
   let end = dialog.length;
   if (q) {
     for (let i = dialog.length - 1; i >= 0; i -= 1) {
-      if (dialog[i]!.role === "user" && dialog[i]!.content.trim() === q) {
+      // 带附件的本轮消息是「附件定界块 + 原问题」，以原问题结尾。
+      if (dialog[i]!.role === "user" && dialog[i]!.content.trim().endsWith(q)) {
         end = i;
         break;
       }

@@ -51,22 +51,8 @@ async function parseJson(res: Response) {
   return data;
 }
 
-/** 从当前页面 URL 取 IM 通知链接带过来的 ownerKey，透传给 API 首包。
- *  钉钉/飞书 webview 不共享浏览器 cookie，靠它完成一次性设备归属回写。
- */
-function withOwnerParam(path: string): string {
-  try {
-    const owner = new URLSearchParams(window.location.search).get("owner");
-    if (!owner) return path;
-    const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}owner=${encodeURIComponent(owner)}`;
-  } catch {
-    return path;
-  }
-}
-
 async function jsonFetch(path: string, options?: RequestInit) {
-  const res = await fetch(withOwnerParam(path), {
+  const res = await fetch(path, {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...options,
@@ -101,7 +87,7 @@ export interface UploadResult {
 export async function uploadFiles(files: File[]): Promise<UploadResult[]> {
   const form = new FormData();
   for (const f of files) form.append("files", f);
-  const res = await fetch(withOwnerParam("/agent/chat/upload"), { method: "POST", credentials: "include", body: form });
+  const res = await fetch("/agent/chat/upload", { method: "POST", credentials: "include", body: form });
   const data = (await parseJson(res)) as { files: UploadResult[] };
   return data.files || [];
 }
@@ -146,7 +132,7 @@ export async function streamChat(
   signal?: AbortSignal,
   onStart?: (info: { taskId?: string }) => void,
 ): Promise<{ taskId?: string }> {
-  const res = await fetch(withOwnerParam("/agent/chat/stream"), {
+  const res = await fetch("/agent/chat/stream", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -196,7 +182,7 @@ export async function resumeChatTaskEvents(
   const from = Math.max(0, Math.floor(cursor.from) || 0);
   const taskParam = cursor.taskId ? `&taskId=${encodeURIComponent(cursor.taskId)}` : "";
   const res = await fetch(
-    withOwnerParam(`/agent/chat/task/events?conversationId=${encodeURIComponent(conversationId)}&from=${from}${taskParam}`),
+    `/agent/chat/task/events?conversationId=${encodeURIComponent(conversationId)}&from=${from}${taskParam}`,
     {
       credentials: "include",
       // 与 ?from= 同值：既保留 SSE 习惯（服务端也认这个头），也让中间层日志一眼看出在续传。
@@ -655,7 +641,7 @@ export async function importSkillFile(dir: string, file: File): Promise<SkillWri
   const form = new FormData();
   form.set("dir", dir);
   form.set("file", file);
-  const res = await fetch(withOwnerParam("/agent/skills/import"), {
+  const res = await fetch("/agent/skills/import", {
     method: "POST",
     credentials: "include",
     body: form,

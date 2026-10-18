@@ -545,13 +545,23 @@ export interface McpToolFacts {
 export function describeMcpTool(namespacedName: string): McpToolFacts | null {
   const found = findTool(namespacedName);
   if (!found) return null;
+  const annotations = trustedAnnotations(found.info.annotations, found.conn.cfg.untrustedAnnotations === true);
   return {
     serverId: found.conn.cfg.id,
     ...(found.conn.cfg.requireConfirm !== undefined ? { requireConfirm: found.conn.cfg.requireConfirm } : {}),
     ...(found.conn.cfg.toolRisks ? { toolRisks: found.conn.cfg.toolRisks } : {}),
     ...(found.conn.cfg.readOnlySqlTools ? { readOnlySqlTools: found.conn.cfg.readOnlySqlTools } : {}),
-    ...(found.info.annotations ? { annotations: found.info.annotations } : {}),
+    ...(annotations ? { annotations } : {}),
   };
+}
+
+/** 不受信的服务器只保留 destructiveHint=true：自报「更危险」可以信，自报「只读」不行。 */
+export function trustedAnnotations(
+  annotations: Record<string, unknown> | undefined,
+  untrusted: boolean,
+): Record<string, unknown> | undefined {
+  if (!annotations || !untrusted) return annotations;
+  return annotations.destructiveHint === true ? { destructiveHint: true } : undefined;
 }
 
 export interface McpCallResult {

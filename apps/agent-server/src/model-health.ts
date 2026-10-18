@@ -17,11 +17,10 @@
  * 3. 样本不足一律按 unknown 处理（排中间），既不奖赏也不惩罚，避免新模型被误排到末尾。
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { DATA_DIR } from "./store-util.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const EVAL_DIR = resolve(__dirname, "..", ".data", "eval");
+const EVAL_DIR = resolve(DATA_DIR, "eval");
 
 /** 健康度分组：可用 → 未验证 → 不稳。排序只用这三档，不做连续打分。 */
 export type HealthTier = "healthy" | "unknown" | "unhealthy";

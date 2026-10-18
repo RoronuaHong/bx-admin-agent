@@ -24,6 +24,10 @@ export interface ScheduleAlertState {
   failingSince?: number;
   /** 最近一次把失败通知发出去的时刻。满 60 分钟才允许再发一条。 */
   failNotifiedAt?: number;
+  /** 连续 NO_DATA 的期数。拿到 SPIKE / NORMAL 或执行失败即清零。 */
+  noDataStreak?: number;
+  /** 最近一次推「检查失效」的时刻，与失败通知同样 60 分钟节流。 */
+  staleNotifiedAt?: number;
 }
 
 /**
@@ -51,8 +55,9 @@ export function isConclusionGap(text: string): boolean {
 }
 
 /**
- * 没有检查结论时不推企业 IM。
- * 空正文、占位句，以及预警任务里认不出 [SPIKE]/[NORMAL]/[NO_DATA] 的失败，都不发。
+ * 报告任务没有检查结论时不推企业 IM：空正文、占位句都不发。
+ * 预警任务的失败一律交给 decideAlertFailure：检查没跑完本身就是要让人知道的事，
+ * 否则数据源挂掉时预警会静默失效。正文由调用方换成「检查没有完成」，60 分钟合并。
  * 模型状态码说明是另一类结论，仍然发。
  */
 export function shouldDeliverScheduleResult(input: {
@@ -62,11 +67,9 @@ export function shouldDeliverScheduleResult(input: {
   modelStatus?: boolean;
 }): boolean {
   if (input.modelStatus) return true;
+  if (pickNotifyPolicy(input.policy) === "on_alert" && input.status === "failed") return true;
   const body = conclusionBody(input.text);
   if (!body || isConclusionGap(body)) return false;
-  if (pickNotifyPolicy(input.policy) === "on_alert" && input.status === "failed" && !parseAlertMarker(input.text)) {
-    return false;
-  }
   return true;
 }
 
@@ -343,10 +346,13 @@ export function needsArmNotice(input: {
   return input.lastRunAt == null;
 }
 
-export type AlertDeliveryKind = "spike" | "recovered" | "skip" | "started";
+export type AlertDeliveryKind = "spike" | "recovered" | "skip" | "started" | "stale";
 
 /** 同一失败态的再通知间隔。按跑完时刻算，不按 cron 拍数。 */
 export const ALERT_FAIL_REPEAT_MS = 60 * 60_000;
+
+/** 连续这么多期 NO_DATA 就推一次「检查失效」。 */
+export const ALERT_NO_DATA_STALE_RUNS = 3;
 
 export type AlertFailureKind = "notify" | "skip";
 
@@ -412,6 +418,7 @@ export function commitAlertFailureNotice(
  * - SPIKE：每期都推。同一条异常持续破线也会再发，不做时间去重。
  * - NORMAL：告警中连续 2 期才推「已恢复」。
  * - NO_DATA / 无标记：不推；NO_DATA 打断恢复计数，但不清除 firing。
+ *   连续 ALERT_NO_DATA_STALE_RUNS 期后推「检查失效」，此后每 60 分钟最多再推一次。
  * - arming：启用后还没发过启动确认。本来会跳过的一期改成推「已启动」（不论是否破线）。
  *   已经是 SPIKE / 恢复的仍用原类型，由通知正文另附「已启动」。
  */
@@ -445,12 +452,32 @@ export function decideAlertDelivery(input: {
     return finish("skip", { firing: true, ...(lastAlertAt !== undefined ? { lastAlertAt } : {}), normalStreak: nextStreak });
   }
 
-  // NO_DATA 或无法识别：不推；打断恢复计数，保留 firing。
-  return finish("skip", {
+  // NO_DATA 或无法识别：打断恢复计数，保留 firing；持续无数据说明检查本身失效。
+  const noDataStreak = Math.max(0, Number(prev.noDataStreak) || 0) + 1;
+  const staleDue =
+    noDataStreak >= ALERT_NO_DATA_STALE_RUNS &&
+    (prev.staleNotifiedAt === undefined || now - prev.staleNotifiedAt >= ALERT_FAIL_REPEAT_MS);
+  const staleNotifiedAt = staleDue ? now : prev.staleNotifiedAt;
+  return finish(staleDue ? "stale" : "skip", {
     ...(firing ? { firing: true } : { firing: false }),
     ...(lastAlertAt !== undefined ? { lastAlertAt } : {}),
     normalStreak: 0,
+    noDataStreak,
+    ...(staleNotifiedAt !== undefined ? { staleNotifiedAt } : {}),
   });
+}
+
+/** 「检查失效」没发出去时不前移 staleNotifiedAt，下一期仍会再试。 */
+export function commitAlertStaleNotice(
+  decided: ScheduleAlertState,
+  previous: ScheduleAlertState | undefined,
+  sent: boolean,
+): ScheduleAlertState {
+  if (sent) return decided;
+  const next: ScheduleAlertState = { ...decided };
+  if (previous?.staleNotifiedAt !== undefined) next.staleNotifiedAt = previous.staleNotifiedAt;
+  else delete next.staleNotifiedAt;
+  return next;
 }
 
 /** 破线后加密检查的下限（5 分钟）。引擎自己算，不改用户存的 cron，也不交给模型改。 */
@@ -459,6 +486,7 @@ export const ALERT_MIN_TIGHT_MS = 5 * 60_000;
 /**
  * 预警的下一拍：平稳时按 cron；处于告警中或本期是 SPIKE 时，改到「名义间隔的一半」（不低于 5 分钟），
  * 且不会比 cron 的下一拍更晚。cron 表达式本身不改。非预警、或算不出 cron 下一拍时，原样返回 cron 结果。
+ * 告警中但本期 NO_DATA 不加密：取不到数时加密只会更快地烧掉额度和数据源配额。
  */
 export function alertNextRunAt(input: {
   cron: string;
@@ -470,7 +498,8 @@ export function alertNextRunAt(input: {
 }): number | undefined {
   const after = new Date(input.finishedAt + 1000);
   const cronNext = input.cronNext(input.cron, after);
-  const hot = input.purpose === "alert" && (input.marker === "SPIKE" || input.firing);
+  const hot =
+    input.purpose === "alert" && (input.marker === "SPIKE" || (input.firing && input.marker !== "NO_DATA"));
   if (!hot || cronNext === undefined) return cronNext;
   const following = input.cronNext(input.cron, new Date(cronNext));
   const interval = following !== undefined && following > cronNext ? following - cronNext : cronNext - input.finishedAt;

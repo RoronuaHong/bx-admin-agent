@@ -169,9 +169,15 @@ export function resolveToolRisk(
   return applyGrant(verdict, grantServers);
 }
 
+/** 适配器取哪个字段执行由它自己决定，所以只要带了 SQL 字段就每个都得是只读，不能「一个合格就放行」。 */
+function sqlArgsReadOnly(args?: Record<string, unknown>): boolean {
+  const fields = [args?.query, args?.sql].filter((v) => v !== undefined && v !== null);
+  return fields.length > 0 && fields.every((v) => isReadOnlySql(v));
+}
+
 function readOnlySqlOk(d: McpToolFacts, bare: string, args?: Record<string, unknown>): boolean {
   if (!d.readOnlySqlTools?.includes(bare)) return false;
-  return isReadOnlySql(args?.query) || isReadOnlySql(args?.sql);
+  return sqlArgsReadOnly(args);
 }
 
 /** 原生 SQL 工具的非只读查询判定（服务端硬拒判据）。仅对 `readOnlySqlTools` 声明的工具生效；可单测。 */
@@ -181,7 +187,7 @@ export function isNativeSqlRejected(
   args?: Record<string, unknown>,
 ): boolean {
   if (!readOnlySqlTools?.includes(bare)) return false;
-  return !(isReadOnlySql(args?.query) || isReadOnlySql(args?.sql));
+  return !sqlArgsReadOnly(args);
 }
 
 /**
@@ -227,6 +233,21 @@ export function verdictNeedsConfirm(v: RiskVerdict): boolean {
   if (v.level === "destructive") return true;
   if (!v.external) return false;
   return v.level !== "read";
+}
+
+/**
+ * 完全访问也不能免掉的确认：创建 / 恢复定时任务。
+ * 这类调用不是「做一件事」，而是登记一个以后无人值守、反复执行并对外推送的任务——
+ * 确认疲劳的论证针对的是频繁的一次性操作，不覆盖这种扩权；工具结果里的注入也正是借它持久化。
+ */
+export function confirmIgnoresFullAccess(name: string, argsJson: string): boolean {
+  if (name !== "manage_schedule") return false;
+  try {
+    const action = String((JSON.parse(argsJson || "{}") as { action?: unknown }).action || "").trim();
+    return action === "create" || action === "resume";
+  } catch {
+    return true;
+  }
 }
 
 /**

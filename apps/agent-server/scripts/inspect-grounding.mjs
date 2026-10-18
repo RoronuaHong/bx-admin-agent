@@ -13,7 +13,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const TRACE_DIR = resolve(here, "..", ".data", "traces");
+const DATA_DIR = process.env.AGENT_DATA_DIR ? resolve(process.env.AGENT_DATA_DIR) : resolve(here, "..", ".data");
+const TRACE_DIR = resolve(DATA_DIR, "traces");
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);

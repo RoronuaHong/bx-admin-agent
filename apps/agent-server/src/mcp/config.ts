@@ -23,6 +23,8 @@ export interface McpServerConfig {
   timeoutMs?: number;
   /** 该服务器的**全部**工具调用都需用户二次确认 */
   requireConfirm?: boolean;
+  /** 对话面板添加的连接器：工具自报的 readOnlyHint 不作数，未单独配置级别的工具一律按未知处理。 */
+  untrustedAnnotations?: boolean;
   /** 工具级风险覆盖（键 = 裸工具名或命名空间名，`*` = 本服务器全部未单独声明的工具；优先级高于 requireConfirm 与注解，见 src/risk.ts）。 */
   toolRisks?: Record<string, "read" | "write" | "destructive">;
   /** 命名「原生 SQL 工具」：这些工具若被定为 destructive，可在服务端按只读 SQL 判定降级免确认（见 src/risk.ts）。 */
@@ -271,6 +273,7 @@ export function buildCustomHttpConnector(input: {
     transport: "http",
     url,
     enabled: true,
+    untrustedAnnotations: true,
     ...(headerName && headerValue ? { headers: { [headerName]: headerValue } } : {}),
   };
   const invalid = validateServerInput(server);

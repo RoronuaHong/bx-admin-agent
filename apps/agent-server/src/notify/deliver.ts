@@ -19,6 +19,10 @@ import {
 } from "../schedule-alert.js";
 import { garbledTextReason, nextRunAtOf, nextRunOf } from "../schedules.js";
 import { stripUserFacingToolTrace } from "../history.js";
+/** 「打开对话」链接：群里人人都能点，只带对话 id，不带设备身份。 */
+function openChatUrl(origin: string, path: string, conversationId: string): string {
+  return `${origin}${path}?conv=${encodeURIComponent(conversationId)}`;
+}
 
 /** 正文预算（字符）：钉钉 markdown 硬限约 20000 字节、飞书约 30KB，这里留足余量。 */
 const MAX_BODY_CHARS = 3500;
@@ -101,6 +105,10 @@ interface LangPack {
   empty: string;
   /** 预警检查没跑完时的结论，替代空正文。 */
   checkIncomplete: string;
+  /** 预警连续多期取不到数据：检查本身失效，不是「一切正常」。 */
+  staleChecks: (count: number) => string;
+  /** 正文只有协议标记、没有一句话时补的说明（指引要求计数不完整时只写 [NO_DATA]）。 */
+  bareMarker: Record<AlertMarker, string>;
   /** 无标题图表的小标题（通用显示词，与业务无关）。 */
   chart: string;
   /** 图表数据区的标题：IM 渲染不了图，这里明确告诉收件人下面是图里的数字。 */
@@ -141,6 +149,12 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     empty: "（本次未产出内容）",
   /** 预警检查没跑完：不把空结论当成业务结果。原因留在任务对话里。 */
   checkIncomplete: "这次检查没有完成，没有下结论。原因在对应的任务对话里。",
+    staleChecks: (count) => `已连续 ${count} 期没有取到可核对的数据，这条预警目前起不到监控作用。请检查数据源或指令，原因在对应的任务对话里。`,
+    bareMarker: {
+      NO_DATA: "这次没有取到完整的数据，没有判断是否破线。原因在对应的任务对话里。",
+      SPIKE: "按任务指令判定为异常。详情在对应的任务对话里。",
+      NORMAL: "本次检查未破线。",
+    },
     chart: "图表",
     chartSection: (count) => `本次图表数据（${count} 张，图见对话）：`,
     rows: (total, shown) => `（表格共 ${total} 行，此处仅列前 ${shown} 行）`,
@@ -173,6 +187,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     open: "Open chat",
     empty: "(no output this run)",
     checkIncomplete: "This check did not finish, so there is no conclusion. The reason is in the task chat.",
+    staleChecks: (count) =>
+      `No verifiable data for ${count} runs in a row, so this alert is not monitoring anything right now. Check the data source or the instruction; details are in the task chat.`,
+    bareMarker: {
+      NO_DATA: "No complete data this run, so there is no verdict on the threshold. The reason is in the task chat.",
+      SPIKE: "Flagged as an anomaly under the task instruction. Details are in the task chat.",
+      NORMAL: "This check did not cross the threshold.",
+    },
     chart: "Chart",
     chartSection: (count) => `Chart data (${count}; charts live in the chat):`,
     rows: (total, shown) => `(table has ${total} rows; showing first ${shown})`,
@@ -205,6 +226,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     open: "Abrir conversa",
     empty: "(sem saída nesta execução)",
     checkIncomplete: "Esta verificação não terminou, por isso não há conclusão. O motivo está na conversa da tarefa.",
+    staleChecks: (count) =>
+      `Sem dados verificáveis há ${count} execuções seguidas; este alerta não está monitorando nada agora. Verifique a fonte de dados ou a instrução; detalhes na conversa da tarefa.`,
+    bareMarker: {
+      NO_DATA: "Não houve dados completos nesta execução, por isso não há veredito sobre o limite. O motivo está na conversa da tarefa.",
+      SPIKE: "Marcado como anomalia conforme a instrução da tarefa. Detalhes na conversa da tarefa.",
+      NORMAL: "Esta verificação não ultrapassou o limite.",
+    },
     chart: "Gráfico",
     chartSection: (count) => `Dados dos gráficos (${count}; os gráficos ficam na conversa):`,
     rows: (total, shown) => `(tabela com ${total} linhas; mostrando as primeiras ${shown})`,
@@ -237,6 +265,13 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     open: "चैट खोलें",
     empty: "(इस बार कोई आउटपुट नहीं)",
     checkIncomplete: "यह जाँच पूरी नहीं हुई, इसलिए कोई निष्कर्ष नहीं है। कारण कार्य की बातचीत में है।",
+    staleChecks: (count) =>
+      `लगातार ${count} बार जाँच योग्य डेटा नहीं मिला, इसलिए यह अलर्ट अभी कुछ भी मॉनिटर नहीं कर रहा। डेटा स्रोत या निर्देश जाँचें; विवरण कार्य की बातचीत में है।`,
+    bareMarker: {
+      NO_DATA: "इस बार पूरा डेटा नहीं मिला, इसलिए सीमा पर कोई निष्कर्ष नहीं है। कारण कार्य की बातचीत में है।",
+      SPIKE: "कार्य के निर्देश के अनुसार असामान्य माना गया। विवरण कार्य की बातचीत में है।",
+      NORMAL: "इस जाँच में सीमा पार नहीं हुई।",
+    },
     chart: "चार्ट",
     chartSection: (count) => `चार्ट डेटा (${count}; चार्ट चैट में हैं):`,
     rows: (total, shown) => `(तालिका में ${total} पंक्तियाँ; पहली ${shown} दिखाई गईं)`,
@@ -639,8 +674,6 @@ export interface ScheduleDeliveryInput {
   locale?: string;
   /** 结果所在对话的路由（缺省 /chat）；由前端路由决定，服务端不猜。 */
   chatPath?: string;
-  /** 设备 owner 标识：IM webview 通常不共享浏览器 cookie，链接里带上它才能让「打开对话」正确归属。 */
-  ownerKey?: string;
   /** 本轮产出的图表数据：IM 渲染不了图，折成文本一并推送（图本身只在对话里看）。 */
   charts?: DeliveryChart[];
   /** 千问办公执行记录：定时触发 / 手动执行 / 事件唤醒。 */
@@ -654,6 +687,8 @@ export interface ScheduleDeliveryInput {
    * 周期报告的失败仍用原文。模型状态码错误不用这个，改走 modelStatus。
    */
   checkIncomplete?: boolean;
+  /** 预警已连续这么多期 NO_DATA：正文改成「检查失效」说明。 */
+  staleChecks?: number;
   /** 全部模型都返回 402 / 429 / 500 / 502 / 503 / 504 时，状态行和标题用状态码，正文用具体原因。 */
   modelStatus?: string;
 }
@@ -676,6 +711,13 @@ function formatElapsed(ms: number, lang: DeliveryLang): string {
   if (sec < 60) return `${sec}s`;
   if (min < 60) return rem ? `${min}m ${rem}s` : `${min}m`;
   return `${Math.floor(min / 60)}h ${min % 60}m`;
+}
+
+/** 标记换成徽标后正文就只剩一个「警告」，收件人看不出发生了什么。 */
+function withBareMarkerNote(raw: string, formatted: string, pack: LangPack): string {
+  const match = stripUserFacingToolTrace(raw).trim().match(/^\[(SPIKE|NORMAL|NO_DATA)\]$/i);
+  if (!match) return formatted;
+  return `${formatted}\n\n${pack.bareMarker[match[1]!.toUpperCase() as AlertMarker]}`;
 }
 
 /**
@@ -720,10 +762,12 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
   const chartBlock = charts.length
     ? [pack.chartSection(charts.length), ...charts.flatMap((chart) => chartToLines(chart, pack))].join("\n\n")
     : "";
-  const conclusion = input.checkIncomplete
+  const conclusion = input.staleChecks
+    ? pack.staleChecks(input.staleChecks)
+    : input.checkIncomplete
     ? pack.checkIncomplete
     : input.text.trim()
-      ? formatForIm(input.text, pack)
+      ? withBareMarkerNote(input.text, formatForIm(input.text, pack), pack)
       : pack.empty;
   // 任务名放最前，并用一级标题加大（钉钉 markdown 不认 font size，# 是能变大的写法）。
   const taskHeading = `# **${pack.task}：${name}**`;
@@ -747,9 +791,7 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
     ? [
         {
           title: pack.open,
-          url: `${origin}${input.chatPath || "/chat"}?conv=${encodeURIComponent(input.conversationId)}${
-            input.ownerKey ? `&owner=${encodeURIComponent(input.ownerKey)}` : ""
-          }`,
+          url: openChatUrl(origin, input.chatPath || "/chat", input.conversationId),
         },
       ]
     : [];
@@ -871,7 +913,6 @@ export interface ScheduleConfigSnapshot {
   locale?: string;
   conversationId?: string;
   webOrigin?: string;
-  ownerKey?: string;
 }
 
 function configListKey(values?: string[]): string {
@@ -1119,9 +1160,7 @@ export function buildScheduleConfigDelivery(input: ScheduleConfigSnapshot): Deli
     ? [
         {
           title: pack.open,
-          url: `${origin}/chat?conv=${encodeURIComponent(input.conversationId)}${
-            input.ownerKey ? `&owner=${encodeURIComponent(input.ownerKey)}` : ""
-          }`,
+          url: openChatUrl(origin, "/chat", input.conversationId),
         },
       ]
     : [];
@@ -1148,7 +1187,6 @@ export function buildScheduleToggleDelivery(input: {
   notifyPolicy?: ScheduleNotifyPolicy;
   conversationId?: string;
   webOrigin?: string;
-  ownerKey?: string;
 }): DeliveryMessage {
   const lang = deliveryLangOf(input.locale);
   const pack = LANGS[lang];
@@ -1179,9 +1217,7 @@ export function buildScheduleToggleDelivery(input: {
     ? [
         {
           title: pack.open,
-          url: `${origin}/chat?conv=${encodeURIComponent(input.conversationId)}${
-            input.ownerKey ? `&owner=${encodeURIComponent(input.ownerKey)}` : ""
-          }`,
+          url: openChatUrl(origin, "/chat", input.conversationId),
         },
       ]
     : [];

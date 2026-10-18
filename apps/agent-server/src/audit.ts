@@ -3,8 +3,8 @@
 // 写失败只 console，不阻断主流程（best-effort）；凭据不落盘：参数只存脱敏摘要 + sha256。
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { DATA_DIR } from "./store-util.js";
 import { loadChannels } from "./notify/channels.js";
 import { deliverToChannels } from "./notify/deliver.js";
 import type { DeliveryMessage } from "./notify/deliver.js";
@@ -43,8 +43,7 @@ export interface AuditEvent {
   argsDigest?: string;
 }
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const AUDIT_DIR = resolve(__dirname, "..", ".data", "audit");
+const AUDIT_DIR = resolve(DATA_DIR, "audit");
 
 function monthFile(at: number): string {
   const d = new Date(at);

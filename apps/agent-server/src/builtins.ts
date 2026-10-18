@@ -320,6 +320,8 @@ export function assertBuiltinRiskCoverage(): void {
 /** 对话循环注入的只读工具桥。run_tool_code 通过它调用 MCP / 内置只读工具，明细不回灌模型。 */
 export interface BuiltinHooks {
   callTool: (name: string, args: Record<string, unknown>) => Promise<{ ok: boolean; text: string }>;
+  /** 内置工具代调 MCP 前的放行判定（作用域 + 风险）；返回拒绝原因或 null。 */
+  admitMcp?: (name: string) => string | null;
 }
 
 /** 单个内置工具的执行结果；`todos` 存在时由 chat 循环负责持久化并发 todos 事件。 */
@@ -1975,7 +1977,7 @@ export async function execBuiltin(
     case "fetch_url": {
       const url = str(args, "url").trim();
       if (!url) return { ok: false, text: "fetch_url 需要 url" };
-      const page = await fetchPage(url);
+      const page = await fetchPage(url, { signal });
       if (!page.ok) return { ok: false, text: page.error };
       const head = [page.title ? `# ${page.title}` : "", page.url].filter(Boolean).join("\n");
       const tail = page.truncated ? "\n…（正文过长已截断，可换更具体的链接）" : "";
@@ -2043,6 +2045,8 @@ export async function execBuiltin(
       if (!toolName) {
         return { ok: false, text: "count_list_by_time 需要 tool（MCP 工具全名）" };
       }
+      const admitError = hooks?.admitMcp?.(toolName);
+      if (admitError) return { ok: false, text: admitError };
       const rawArgs = args.payload;
       if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
         return { ok: false, text: "count_list_by_time 需要 payload（列表工具的调用参数，含时间窗口；不要自己翻 index）" };

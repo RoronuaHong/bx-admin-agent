@@ -582,3 +582,14 @@ test("[L] 任务名几乎全是问号时，标题和正文改用可读的「定�
   expect(msg.body.startsWith("# **任务：定时任务**")).toBe(true);
   expect(msg.body).not.toContain("????");
 });
+
+test("[BM] 正文只有协议标记时补一句说明，不让收件人只看到一个「警告」", () => {
+  const bare = buildScheduleDelivery({ prompt: "p", status: "success", text: "[NO_DATA]", conversationId: "c1" });
+  expect(bare.body).toContain("🟡 警告");
+  expect(bare.body).toContain("这次没有取到完整的数据，没有判断是否破线");
+  const en = buildScheduleDelivery({ prompt: "p", status: "alert", text: "[SPIKE]\n", conversationId: "c1", locale: "en" });
+  expect(en.body).toContain("Flagged as an anomaly");
+  const withReason = buildScheduleDelivery({ prompt: "p", status: "success", text: "[NO_DATA] 数据源超时", conversationId: "c1" });
+  expect(withReason.body).toContain("数据源超时");
+  expect(withReason.body).not.toContain("没有判断是否破线");
+});

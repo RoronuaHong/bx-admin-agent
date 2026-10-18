@@ -8,10 +8,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { SupportLabels } from "@bx/shared";
+import { DATA_DIR } from "./store-util.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 /** trace 落盘目录默认值（成本聚合消费同一份 JSONL）。 */
-export const TRACE_DIR_DEFAULT = resolve(__dirname, "..", ".data", "traces");
+export const TRACE_DIR_DEFAULT = resolve(DATA_DIR, "traces");
 /**
  * 当前生效的落盘目录。默认值单独拆出是为了**测试隔离**：
  * 测试若写真实目录，runs/rounds/spans 会被测试数据堆满，保留期清理还会把它们当孤儿删掉，

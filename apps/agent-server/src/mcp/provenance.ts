@@ -15,11 +15,10 @@
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { dirname, extname, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { loadServers, type McpServerConfig } from "./config.js";
+import { DATA_DIR } from "../store-util.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = resolve(__dirname, "..", "..", ".data", "mcp-provenance.json");
+const STORE_PATH = resolve(DATA_DIR, "mcp-provenance.json");
 
 const SCRIPT_EXT = new Set([".js", ".mjs", ".cjs", ".ts"]);
 const MAX_SCRIPT_BYTES = 1_048_576;

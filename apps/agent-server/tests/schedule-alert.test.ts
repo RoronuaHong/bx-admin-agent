@@ -3,7 +3,9 @@ import {
   alertNextRunAt,
   buildUnattendedConclusion,
   ALERT_FAIL_REPEAT_MS,
+  ALERT_NO_DATA_STALE_RUNS,
   commitAlertFailureNotice,
+  commitAlertStaleNotice,
   decideAlertDelivery,
   decideAlertFailure,
   deliveryArmPurpose,
@@ -28,6 +30,7 @@ import {
   unattendedToolDenial,
 } from "../src/schedule-alert.js";
 import { garbledTextReason, scheduleLockPid, validateTiming } from "../src/schedules.js";
+import { buildScheduleDelivery } from "../src/notify/deliver.js";
 
 test("scheduleLockPid：只认本机 owner 里的 pid", () => {
   expect(scheduleLockPid("DESKTOP-1-62232-ab12", "DESKTOP-1")).toBe(62232);
@@ -240,22 +243,26 @@ test("预警和定时报告用同一套三行，模型换过的标签会被盖�
   expect(report).not.toContain("当前会话量");
 });
 
-test("没有结论不投递；有协议标记或模型状态码才投递", () => {
+test("报告没有结论不投递；预警失败一律交给失败合并（检查失效要让人知道）", () => {
+  expect(shouldDeliverScheduleResult({ status: "failed", text: CONCLUSION_GAP_AFTER_TOOLS, policy: "always" })).toBe(
+    false,
+  );
+  expect(shouldDeliverScheduleResult({ status: "failed", text: "", policy: "always" })).toBe(false);
   expect(
     shouldDeliverScheduleResult({
       status: "failed",
       text: CONCLUSION_GAP_AFTER_TOOLS,
       policy: "on_alert",
     }),
-  ).toBe(false);
-  expect(shouldDeliverScheduleResult({ status: "failed", text: "", policy: "on_alert" })).toBe(false);
+  ).toBe(true);
+  expect(shouldDeliverScheduleResult({ status: "failed", text: "", policy: "on_alert" })).toBe(true);
   expect(
     shouldDeliverScheduleResult({
       status: "failed",
       text: "工具报错了，但没有首行标记",
       policy: "on_alert",
     }),
-  ).toBe(false);
+  ).toBe(true);
   expect(
     shouldDeliverScheduleResult({
       status: "failed",
@@ -317,6 +324,60 @@ test("decideAlertFailure：刚失败推一条，60 分钟内不重复，期满�
   const reenter = decideAlertFailure({ alertState: quiet.nextState, now: t0 + ALERT_FAIL_REPEAT_MS + 2 });
   expect(reenter.kind).toBe("notify");
   expect(reenter.nextState.failingSince).toBe(t0 + ALERT_FAIL_REPEAT_MS + 2);
+});
+
+test("持续 NO_DATA：连续 3 期推「检查失效」，60 分钟内不重复，拿到数据清零", () => {
+  const t0 = 1_700_000_000_000;
+  const one = decideAlertDelivery({ marker: "NO_DATA", now: t0 });
+  expect(one.kind).toBe("skip");
+  expect(one.nextState.noDataStreak).toBe(1);
+  const two = decideAlertDelivery({ marker: "NO_DATA", alertState: one.nextState, now: t0 + 60_000 });
+  expect(two.kind).toBe("skip");
+  const three = decideAlertDelivery({ marker: "NO_DATA", alertState: two.nextState, now: t0 + 120_000 });
+  expect(three.kind).toBe("stale");
+  expect(three.nextState.noDataStreak).toBe(ALERT_NO_DATA_STALE_RUNS);
+  expect(three.nextState.staleNotifiedAt).toBe(t0 + 120_000);
+
+  const four = decideAlertDelivery({ marker: "NO_DATA", alertState: three.nextState, now: t0 + 180_000 });
+  expect(four.kind).toBe("skip");
+  const hourLater = decideAlertDelivery({
+    marker: "NO_DATA",
+    alertState: four.nextState,
+    now: t0 + 120_000 + ALERT_FAIL_REPEAT_MS,
+  });
+  expect(hourLater.kind).toBe("stale");
+
+  const back = decideAlertDelivery({ marker: "NORMAL", alertState: hourLater.nextState, now: t0 + 2 * ALERT_FAIL_REPEAT_MS });
+  expect(back.nextState.noDataStreak).toBeUndefined();
+  expect(back.nextState.staleNotifiedAt).toBeUndefined();
+
+  const unsent = commitAlertStaleNotice(three.nextState, two.nextState, false);
+  expect(unsent.staleNotifiedAt).toBeUndefined();
+  expect(unsent.noDataStreak).toBe(3);
+});
+
+test("告警中但本期 NO_DATA 不加密检查频率", () => {
+  const cronNext = (_cron: string, after: Date) => after.getTime() - (after.getTime() % 3_600_000) + 3_600_000;
+  const finishedAt = 1_700_000_000_000;
+  const plain = cronNext("0 * * * *", new Date(finishedAt + 1000));
+  expect(
+    alertNextRunAt({ cron: "0 * * * *", finishedAt, purpose: "alert", firing: true, marker: "NO_DATA", cronNext }),
+  ).toBe(plain);
+  expect(
+    alertNextRunAt({ cron: "0 * * * *", finishedAt, purpose: "alert", firing: true, marker: "NORMAL", cronNext }),
+  ).toBeLessThanOrEqual(plain);
+});
+
+test("投递正文：持续 NO_DATA 写明检查失效", () => {
+  const msg = buildScheduleDelivery({
+    prompt: "p",
+    status: "failed",
+    text: "[NO_DATA]\n这次没有取到可核对的数据，没有下结论。",
+    conversationId: "c1",
+    staleChecks: 3,
+    at: 0,
+  });
+  expect(JSON.stringify(msg)).toContain("已连续 3 期没有取到可核对的数据");
 });
 
 test("decideAlertFailure：启动确认强制推送，并记成一次失败通知", () => {

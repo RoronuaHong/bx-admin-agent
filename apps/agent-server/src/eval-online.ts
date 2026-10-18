@@ -15,13 +15,12 @@
  * - 阈值全走环境变量，未配置用默认值。
  */
 import { existsSync, mkdirSync, appendFileSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { DATA_DIR } from "./store-util.js";
 import type { RunTrace } from "./trace.js";
 import { incCounter, observeSummary } from "./process-metrics.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const EVAL_DIR = resolve(__dirname, "..", ".data", "eval");
+const EVAL_DIR = resolve(DATA_DIR, "eval");
 
 function threshold(name: string, fallback: number): number {
   const v = Number(process.env[name]);
