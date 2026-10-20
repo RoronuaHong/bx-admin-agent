@@ -21,8 +21,10 @@ process.env.GROUNDING_VERIFY_STAGES = "single";
 const PORT = 8904;
 /** 只出现在草稿正文里的标记：用来判断「整篇草稿有没有被送进判定环节」。 */
 const DRAFT_ONLY = "MARKER-DRAFT-ONLY";
-const SUPPORTED = "共 3 条";
-const UNSUPPORTED = "共 30 条";
+// 证据内 / 证据外的断言标记。刻意用非数字型：否则会被数值一致性校验（numeric verify O3）抢先
+// 拦截并 continue，grounding 核验根本看不到草稿——那测的就是另一条确定性通道了。
+const SUPPORTED = "MARKER-SUPPORTED";
+const UNSUPPORTED = "MARKER-UNSUPPORTED";
 
 type ToolCallArg = { id: string; name: string; args?: unknown };
 
@@ -91,9 +93,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (step === 1) {
+      // 综合轮：模型给出带「证据外错误断言」的草稿（含 DRAFT_ONLY 标记），供一步式核验把整篇草稿送进判定。
       res.end(sse([textChunk(`数据核对完毕。${UNSUPPORTED}。以下为说明细节 ${DRAFT_ONLY}。`)]));
       return;
     }
+    // 有工具的非首轮（主对话正常不会再发工具，这里仅作兜底，避免对话中断）。
     res.end(sse([textChunk(`已按取到的数据核对：${SUPPORTED}。`)]));
   } else {
     res.writeHead(404);

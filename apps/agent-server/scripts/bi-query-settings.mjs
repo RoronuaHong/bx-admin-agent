@@ -30,10 +30,11 @@ export function defaultClickHouseSettings(env = process.env) {
     max_execution_time: num("BI_CH_MAX_EXECUTION_TIME", 90),
     max_bytes_before_external_group_by: num("BI_CH_EXT_GROUP_BY_BYTES", 4_000_000_000),
     max_bytes_before_external_sort: num("BI_CH_EXT_SORT_BYTES", 4_000_000_000),
-    // 结果集超阈值截断：'break' 静默截断（看板友好），或 'throw' 让超限报错而非给半截数据。
-    // 仅截断物化行数，不影响聚合正确性；P0 profile 已设，此处补齐是「P0 没做时 P1 也兜住」的双保险。
+    // 结果集超阈值截断：'break' 静默截断（看板友好但会"静默给错数"），'throw' 让超限报错而非给半截数据。
+    // 默认 'throw'（fail-loud）：静默截断会让计数/金额系统性偏小且零提示，比报错更危险（见 bi-guardrail-findings.test.ts F-P0-3）；
+    // 若确需看板友好的静默截断，运维可显式设 BI_CH_RESULT_OVERFLOW_MODE=break 还原旧行为。
     max_result_rows: num("BI_CH_MAX_RESULT_ROWS", 1_000_000),
-    result_overflow_mode: (env["BI_CH_RESULT_OVERFLOW_MODE"] || "break").toString(),
+    result_overflow_mode: (env["BI_CH_RESULT_OVERFLOW_MODE"] || "throw").toString(),
     // 超 max_execution_time 直接中断（默认 throw，显式写出更稳；根治 R3「假超时」需配合 Metabase 超时对齐，见文档 6.1）。
     timeout_overflow_mode: (env["BI_CH_TIMEOUT_OVERFLOW_MODE"] || "throw").toString(),
     // 查询前基于规划估算执行时间的硬拦：超过则执行前直接拒绝（不先跑再爆），比 fail-open lint 更前一步（文档 6.5.1）。
@@ -118,6 +119,17 @@ export function classifyUpstreamError(text) {
       "推断：查询被取消（Code 394 / 超时）——很可能因为执行太久被客户端或上游掐断。",
       "① 缩小范围、加过滤、降维度后重试；",
       "② 先用轻量聚合（count / 单列 group by）确认量级，再决定要不要取明细。",
+    ].join("\n");
+  }
+  // Code 115 / UNKNOWN_SETTING：我们自动追加的某 SETTINGS 项在目标 ClickHouse 版本不支持
+  //（如 max_estimated_execution_cost 在部分版本不存在）——与查询逻辑无关，提示去掉该项即可。
+  if (/Code:\s*115\b|UNKNOWN_SETTING/i.test(t)) {
+    return [
+      "推断：设置不被识别（Code 115 / UNKNOWN_SETTING）——我们自动追加的某个 SETTINGS 项，当前 ClickHouse 版本不支持" +
+        "（常见如 max_estimated_execution_cost 在部分版本不存在，报错里 Maybe you meant … 会给出替代项）。",
+      "① 看报错里 Maybe you meant … 的提示，改用它建议的内建设置；",
+      "② 若该项本就不支持，运维可通过环境变量 BI_CH_* 关掉对应项（置 0 或删除）后重试；",
+      "③ 该错误由护栏自身追加的 SETTINGS 引起，与你的查询逻辑无关，不必改业务 SQL。",
     ].join("\n");
   }
   return null;

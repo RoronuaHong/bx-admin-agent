@@ -19,7 +19,7 @@
 
 /**
  * @typedef {Object} SqlLintFinding
- * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"DEVICE_LEVEL_COUNT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"|"HEAVY_EXACT_AGG_NOWINDOW"|"MULTI_JOIN_UNBOUNDED"|"GROUP_BY_HIGH_DIM_NOLIMIT"} code 稳定的机器可读码，便于测试锚定与后续统计
+ * @property {"NO_WHERE"|"NO_LIMIT_ROWS"|"GROUP_BY_NO_LIMIT"|"SELECT_STAR_UNBOUNDED"|"COUNT_DISTINCT"|"DEVICE_LEVEL_COUNT"|"LIKE_LEADING_WILDCARD"|"SHOW_CREATE_TABLE"|"JOIN_WITHOUT_ON"|"IMPLICIT_CROSS_JOIN"|"NON_SARGABLE_PREDICATE"|"GROUP_BY_SELECT_MISMATCH"|"DEEP_SUBQUERY_NESTING"|"DISTINCT_WITHOUT_LIMIT"|"SENSITIVE_COLUMN"|"JOIN_DANGLING_REF"|"HEAVY_EXACT_AGG_NOWINDOW"|"MULTI_JOIN_UNBOUNDED"|"GROUP_BY_HIGH_DIM_NOLIMIT"|"UNQUOTED_STRING_LITERAL"} code 稳定的机器可读码，便于测试锚定与后续统计
  * @property {string} message 回灌给模型的可操作提示（含怎么改）
  */
 
@@ -59,7 +59,7 @@ function hasDateWindow(input) {
   // 在「只去注释、保留字符串字面量」的文本上判定——否则 stripNoise 会把 'YYYY-MM-DD' 抹成 ''，
   // 短窗口会被误判成「无时间窗」。与 lintSql 主体里 stripNoise 的口径分离。
   const sql = stripComments(String(input ?? ""));
-  const between = /\bbetween\s+'(\d{4}-\d{2}-\d{2})'\s+and\s+'(\d{4}-\d{2}-\d{2})'/i.exec(sql);
+  const between = /\bbetween\s+'(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)'\s+and\s+'(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)'/i.exec(sql);
   if (between) {
     const a = Date.parse(between[1]);
     const b = Date.parse(between[2]);
@@ -73,7 +73,9 @@ function hasDateWindow(input) {
   // 这种有界短窗误判成无上界/长窗，导致短窗裸列比较的重聚合被误报 HEAVY（2026-10-16 端到端复现）。
   const lowers = [];
   const uppers = [];
-  for (const m of sql.matchAll(/(>=|<=|>|<|=)\s*'(\d{4}-\d{2}-\d{2})'/g)) {
+  for (const m of sql.matchAll(
+    /(>=|<=|(?<!<|!)>|<|(?<!<|!)=)\s*(?:(?:toDateTime|toDate|toStartOf\w+|parseDateTime\w*|toYYYYMM\w*)\s*\(\s*)?'(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)'\s*\)?/g,
+  )) {
     const d = Date.parse(m[2]);
     if (Number.isNaN(d)) continue;
     if (m[1] === "=") {
@@ -260,7 +262,7 @@ export function lintSql(input) {
   // 精确去重大类：uniqExact(...) 与 count(DISTINCT ...) 在 ClickHouse 内都做全量精确去重，
   // 大窗/无窗时内存随去重基数线性增长，全历史宽表上极易爆库（不仅是退化变慢，更会撞内存上限）。
   // 注：count(distinct) 在小窗已由 COUNT_DISTINCT 提示「退化变慢」，此处只在「大窗/无窗」叠加「爆库」警告。
-  if ((/\buniq\s*exact\s*\(/i.test(sql) || /count\s*\(\s*distinct\s+/i.test(sql)) && longOrNoWindow) {
+  if ((/\buniq\s*exact\s*\w*\s*\(/i.test(sql) || /count\s*\(\s*distinct\s+/i.test(sql)) && longOrNoWindow) {
     findings.push({
       code: "HEAVY_EXACT_AGG_NOWINDOW",
       message:
@@ -336,6 +338,39 @@ export function lintSql(input) {
     }
   }
 
+  // 未加引号的字符串字面量（生产 Code 62 类：中文枚举未加单引号，ClickHouse 当标识符/语法错误）。
+  // 判据只用结构 + 编码：值位置出现「裸的非 ASCII 标识符」——本系统列名/别名均为 ASCII（CLS/业务词红线约束），
+  // 裸中文等非 ASCII 字符几乎必然是漏加单引号的字符串值。零业务词、不写死任何具体中文词。
+  // fail-open（提示不阻断，与全模块一致）：对齐 OWASP LLM05:2025（原 LLM02）Improper Output Handling——
+  // 把模型生成的 SQL 当成不可信输入，下发数据库前做结构校验，而非直接透传。
+  {
+    const s = stripNoise(sql);
+    const bad = new Set();
+    // IN (...) 列表项：剥掉字符串字面量后，裸中文/非 ASCII 标识符就是漏加引号的字符串值
+    for (const m of s.matchAll(/\bin\s*\(([^)]*)\)/gi)) {
+      for (const it of m[1].split(",")) {
+        const tok = it.trim();
+        if (tok && /[^\x00-\x7F]/.test(tok) && !/^[0-9.]+$/.test(tok)) bad.add(tok);
+      }
+    }
+    // 比较 RHS：col = 裸中文 / col != 裸中文 / col <> 裸中文（ASCII 裸词按列名/别名处理，不误报）
+    for (const m of s.matchAll(/(?:<>|!=|=)\s*([^\s,)=]+)/g)) {
+      const rhs = m[1].trim();
+      if (rhs && /[^\x00-\x7F]/.test(rhs) && !/^[0-9.]+$/.test(rhs) && !/^[a-z_][\w.]*\(?$/i.test(rhs)) {
+        bad.add(rhs);
+      }
+    }
+    if (bad.size) {
+      const shown = [...bad].slice(0, 5).join("、") + (bad.size > 5 ? " 等" : "");
+      findings.push({
+        code: "UNQUOTED_STRING_LITERAL",
+        message:
+          "检测到疑似未加单引号的字符串值（" + shown + "）：ClickHouse 会把裸中文/非 ASCII 标识符当成列名或语法错误处理（Code 62）。" +
+          "字符串值必须用单引号包裹，例如 movieType IN ('电影', '电视剧')；请补上引号后重试。",
+      });
+    }
+  }
+
   return findings;
 }
 
@@ -354,8 +389,8 @@ function groupByColumns(sql) {
   if (!m) return null;
   const body = m[1];
   const parts = body.split(",").map((s) => s.trim());
-  // 全是序号（GROUP BY 1,2）＝合法写法，按名判不了 → 返回 null 让调用方跳过
-  if (parts.length > 1 && parts.every((p) => /^\d+$/.test(p))) return null;
+  // 全是序号（GROUP BY 1 或 GROUP BY 1,2）＝合法写法，按名判不了 → 返回 null 让调用方跳过，避免误报
+  if (parts.every((p) => /^\d+$/.test(p))) return null;
   const out = new Set();
   for (const p of parts) {
     const c = p.replace(/[`"\s]/g, "").replace(/^[a-z_][\w$]*\./i, "").toLowerCase();

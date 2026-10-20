@@ -50,7 +50,8 @@ test("[S4] defaultClickHouseSettings：默认值与环境变量覆盖", () => {
   expect(def.max_bytes_before_external_group_by).toBe(4_000_000_000);
   expect(def.max_bytes_before_external_sort).toBe(4_000_000_000);
   expect(def.max_result_rows).toBe(1_000_000);
-  expect(def.result_overflow_mode).toBe("break");
+  // 默认 fail-loud：结果集超限报错而非静默截断（静默截断会让计数/金额系统性偏小且零提示）。
+  expect(def.result_overflow_mode).toBe("throw");
   expect(def.timeout_overflow_mode).toBe("throw");
   expect(def.max_estimated_execution_time).toBe(0); // 默认关闭，避免误杀合法大查询
 });

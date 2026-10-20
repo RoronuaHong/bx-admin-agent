@@ -145,6 +145,7 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
     "SELECT uniqExact(uid) FROM t WHERE d >= '2026-10-09'", // HEAVY_EXACT_AGG_NOWINDOW
     "SELECT a.x FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id", // MULTI_JOIN_UNBOUNDED
     "SELECT a, b, c, count() AS n FROM t GROUP BY a, b, c ORDER BY 3 DESC", // GROUP_BY_HIGH_DIM_NOLIMIT
+    "SELECT a FROM t WHERE movieType IN (电影, 电视剧) LIMIT 1", // UNQUOTED_STRING_LITERAL
   ];
   const seen = new Set(all.flatMap((sql) => lintSql(sql).map((f) => f.code)));
   const expected = [
@@ -153,7 +154,7 @@ test("[K+] 13 条判据全部有码有话（新增判据不能只进代码不进
     "IMPLICIT_CROSS_JOIN", "NON_SARGABLE_PREDICATE", "GROUP_BY_SELECT_MISMATCH",     "DEEP_SUBQUERY_NESTING",
     "SENSITIVE_COLUMN",
     "JOIN_DANGLING_REF",
-    "HEAVY_EXACT_AGG_NOWINDOW", "MULTI_JOIN_UNBOUNDED", "GROUP_BY_HIGH_DIM_NOLIMIT",
+    "HEAVY_EXACT_AGG_NOWINDOW", "MULTI_JOIN_UNBOUNDED", "GROUP_BY_HIGH_DIM_NOLIMIT", "UNQUOTED_STRING_LITERAL",
   ];
   expect([...expected].filter((c) => !seen.has(c)), "这些判据没被任何用例触发").toEqual([]);
   // 每条发现都必须带可操作提示（不能只有码没有"怎么改"）
@@ -276,4 +277,19 @@ test("[R] 资源类·count(DISTINCT) 大窗同样按精确去重判内存爆库�
   expect(codes("SELECT count(DISTINCT guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-03'")).not.toContain("HEAVY_EXACT_AGG_NOWINDOW");
   // 短窗仍走 COUNT_DISTINCT（退化变慢）提示，与 HEAVY 不冲突
   expect(codes("SELECT count(DISTINCT guid) FROM t WHERE d BETWEEN '2026-10-01' AND '2026-10-03'")).toContain("COUNT_DISTINCT");
+});
+
+test("[S] 未加引号字符串字面量（Code 62）：值位置裸中文→提示；已加引号/ASCII 列名/数字→不误报", () => {
+  // 生产真实形态：IN 列表里中文枚举漏加单引号（c5e89873 / 9046e224，ClickHouse Code 62）
+  expect(codes("SELECT a FROM t WHERE movieType IN (电影, 电视剧, 真人秀) LIMIT 1")).toContain("UNQUOTED_STRING_LITERAL");
+  // 已正确加引号 → 干净
+  expect(codes("SELECT a FROM t WHERE movieType IN ('电影', '电视剧') LIMIT 1")).not.toContain("UNQUOTED_STRING_LITERAL");
+  // 比较 RHS 裸中文
+  expect(codes("SELECT a FROM t WHERE country = 中国 LIMIT 1")).toContain("UNQUOTED_STRING_LITERAL");
+  // ASCII 裸词（列名/别名）不误报
+  expect(codes("SELECT a FROM t WHERE country = cn LIMIT 1")).not.toContain("UNQUOTED_STRING_LITERAL");
+  // 数字不误报
+  expect(codes("SELECT a FROM t WHERE v IN (1, 2, 3) LIMIT 1")).not.toContain("UNQUOTED_STRING_LITERAL");
+  // fail-open：仍照常产出其它体检项、不阻断执行（此查询有 WHERE 故 NO_WHERE 不触发，但 NO_LIMIT_ROWS 仍报）
+  expect(codes("SELECT a FROM t WHERE movieType IN (电影)")).toContain("NO_LIMIT_ROWS");
 });

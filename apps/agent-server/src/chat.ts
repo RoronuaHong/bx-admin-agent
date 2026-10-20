@@ -2054,6 +2054,8 @@ interface LoopContext {
   ownerKey?: string;
   /** 浏览器上报的 IANA 时区。count_list_by_time 没传 timeZone 时用它，不从语言猜测。 */
   timeZone?: string;
+  /** 会话语言（locale）：execBuiltin / buildSystemPrompt 按它做本地化，由 chatStream 从会话注入。 */
+  locale?: string;
   maxRounds: number;
   /** 无人值守运行（定时任务）：最后一轮不再给工具，强制模型用已经取到的数据收尾写结论。
    *  不填 = 交互式行为不变（没人在等，模型可以一路调工具到预算耗尽）。 */
@@ -2238,7 +2240,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       ctx.signal,
       codeHooks,
       ctx.timeZone,
-      conversation?.locale,
+      ctx.locale,
     );
     if (builtin) {
       if (name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, args);
@@ -2938,7 +2940,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.signal,
         codeHooks,
         ctx.timeZone,
-        conversation?.locale,
+        ctx.locale,
       );
       if (builtin) {
         if (c.name === "read_skill" && builtin.ok) rememberSkillRead(skillsRead, safeJsonParse(c.argsJson));
@@ -3544,7 +3546,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         ctx.signal,
         codeHooks,
         ctx.timeZone,
-        conversation?.locale,
+        ctx.locale,
       );
       // executed=false 表示并未真正执行（定时运行拒绝等）——不计入失败熔断。
       let executed = true;
@@ -4680,6 +4682,7 @@ export async function* chatStream(
           groundingWebOnly,
           ownerKey: opts.ownerKey,
           ...(timeZone ? { timeZone } : {}),
+          ...(conversation?.locale ? { locale: conversation.locale } : {}),
           runId: traceMeta?.runId,
           // 运行级重试预算（第 5 批 C3）：跨候选共享，见创建处注释。
           retryBudget: runRetryBudgetState,

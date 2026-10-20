@@ -26,3 +26,6 @@ apps/agent-server/mf.txt
 # agent 运行时调试日志（对话抓包 / pm2 启停输出），仅本地排查用
 .codebuddy/cc-msg-*.txt
 .codebuddy/pm2-start-*.txt
+# apps/agent-server/.codebuddy 的调试输出残留（tsc/vitest 摘要）；.codebuddy 本身是项目数据，只忽略调试 txt、不碰数据。
+apps/agent-server/.codebuddy/*-out.txt
+apps/agent-server/.codebuddy/vitest-*.txt

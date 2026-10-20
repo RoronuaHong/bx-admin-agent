@@ -520,7 +520,7 @@ test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单�
   expect(msg.body).toContain("\n\n状态：<font color=#E5484D>🔴 异常</font>");
   expect(msg.body).toContain("\n\n触发：手动执行");
   expect(msg.body).toContain("\n\n耗时：8 秒");
-  expect(msg.title).toBe("印度对话量 · 异常");
+  expect(msg.title).toBe("印度对话量 · 手动执行 · 异常");
 });
 
 test("[N] 启动确认：不论本次是否破线，正文都说明已启动，以及之后只在异常时推", () => {
@@ -534,7 +534,7 @@ test("[N] 启动确认：不论本次是否破线，正文都说明已启动，�
     trigger: "manual",
     at: Date.parse("2026-10-08T08:04:06Z"),
   });
-  expect(normal.title).toBe("印度客服对话量预警 · 预警已启动");
+  expect(normal.title).toBe("印度客服对话量预警 · 手动执行 · 预警已启动");
   expect(normal.body).toContain("预警已启动");
   expect(normal.body).toContain("之后只在异常时推送");
   expect(normal.body).toContain("🟢 正常");

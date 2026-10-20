@@ -65,10 +65,13 @@ test("过程叙述带上思考流尾部；补位正文同时包含工具摘录�
   const narration = collectWrapUpNarration("", ["前面的计划", "我拿到了航班时刻表 CZ3505"], 20);
   expect(narration.endsWith("我拿到了航班时刻表 CZ3505") || narration.includes("CZ3505")).toBe(true);
 
+  const base = buildSynthesisHint("");
   const hint = buildSynthesisHint("【fetch_url】\nCZ3505 09:15");
   expect(hint).toContain("工具不可再用");
   expect(hint).toContain("CZ3505 09:15");
-  expect(buildSynthesisHint("")).toBe(hint.split("\n\n")[0]);
+  // 空证据时返回基础提示（不带证据头与证据内容）；带证据时在基础提示后追加。
+  expect(base).not.toContain("CZ3505 09:15");
+  expect(hint.startsWith(base)).toBe(true);
 
   const user = buildWrapUpUserContent("广州到福州的直飞航班？", narration, "【fetch_url】\nCZ3505");
   expect(user).toContain("过程记录");
