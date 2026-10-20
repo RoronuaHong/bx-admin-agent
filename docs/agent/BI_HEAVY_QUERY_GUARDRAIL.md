@@ -90,7 +90,7 @@ ALTER USER metabase_user SETTINGS PROFILE bi_heavy_guard;
 max_memory_usage=8589934592,max_execution_time=120,max_bytes_before_external_group_by=4000000000,max_bytes_before_external_sort=4000000000
 ```
 
-**刻意不设** `max_bytes_to_read`：Agent 合法查询有读 6.8GB 字节的先例，行/字节上限会误杀；内存+时长已足够兜底。`result_overflow_mode='break'` 是静默截断——若该账号还被人类用于看板，可改成 `'throw'` 让超限报错而非给半截数据。
+**刻意不设** `max_bytes_to_read`：Agent 合法查询有读 6.8GB 字节的先例，行/字节上限会误杀；内存+时长已足够兜底。`result_overflow_mode` 现在默认 `'throw'`（fail-loud：超限报错而非给半截数据，避免静默给错数）；若该账号还被人类用于看板需要静默截断，运维显式设 `BI_CH_RESULT_OVERFLOW_MODE=break` 还原旧行为。
 
 预期效果：07:04 那条查询会在 8GB 处 1~2 秒内报 Code 241 快速失败（而不是吃到 28GB 挤爆整机），OvercommitTracker 不再需要"选杀"，业务流量（default 用户）不再被连坐。P0 是真正硬边界，P1 是双保险；**任何一层生效即可**。
 
@@ -155,7 +155,7 @@ WHERE user = 'metabase_user' AND event_time > now() - INTERVAL 1 DAY;
   2. `MULTI_JOIN_UNBOUNDED`：≥2 个 JOIN 且整条无时间窗 → 提示先各自过滤再 JOIN、小表放右侧；
   3. `GROUP_BY_HIGH_DIM_NOLIMIT`：`GROUP BY` 维度 ≥3 且带 `ORDER BY` 无 `LIMIT` → 提示加 `LIMIT`。
   - 时间窗判定修过一次坑：`stripNoise` 会把日期字面量抹空，导致短窗口误判成「无窗」；改为在只去注释的文本上判定。
-- `skills/business-data-query/SKILL.md` 新增「资源纪律」节，并把文档引用从不存在的 `docs/bi-sql-best-practices.md` 改指本文件。
+- `skills/business-data-query/SKILL.md` 新增「资源纪律」节；`docs/bi-sql-best-practices.md` 重建后，SKILL.md 的 SQL 写法引用已指回该权威文件（本文件不再作为 SQL 写法唯一入口）。
 
 ### 测试（已加）
 - `tests/bi-query-settings.test.ts`（7 例，含本次新增 `[S7]` 字符串值引号 + `[S4]` 扩展覆盖结果集/超时/成本字段）：SETTINGS 追加/去重/剥离/环境变量、错误分类。
@@ -248,7 +248,7 @@ max_concurrent_queries_for_user = 4;  -- metabase_user 同时最多 4 条查询
 
 ```
 max_result_rows       = 1000000,
-result_overflow_mode  = 'break',   -- 或 'throw' 若还想让超限报错
+result_overflow_mode  = 'throw',   -- 默认 fail-loud（超限报错而非给半截数据）；若需看板友好的静默截断改 BI_CH_RESULT_OVERFLOW_MODE=break
 timeout_overflow_mode = 'throw',   -- 超 max_execution_time 直接中断（默认即 throw，显式写出更稳）
 ```
 

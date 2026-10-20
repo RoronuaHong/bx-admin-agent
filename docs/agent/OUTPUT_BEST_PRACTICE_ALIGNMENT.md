@@ -16,7 +16,7 @@
 | # | 维度 | 检查项 | 最佳实践要求 | 状态 | 证据 |
 |---|---|---|---|---|---|
 | S1 | SQL | 编译期静态校验（GROUP BY/聚合/别名） | 生成即校验，错误不靠运行时静默 | ❌ | 仅 fail-open `lintSql` |
-| S2 | SQL | 静默给错数防护（截断/超行） | 触及上限必须明示 | ❌ | `result_overflow_mode='break'` 无提示 |
+| S2 | SQL | 静默给错数防护（截断/超行） | 触及上限必须明示 | ✅ | `result_overflow_mode` 默认 `'throw'`（fail-loud） |
 | S3 | SQL | 只读校验 | 写操作 fail-closed | ⚠️ | `runSql` 强拦；`execute_query` 后门绕过 |
 | S4 | SQL | 方言/版本兼容 | 非 ClickHouse 不注入 CK 语法 | ❌ | `runSql` 未判引擎 |
 | S5 | SQL | 重聚合护栏 | 高基数/长窗拦截 | ❌ | `HEAVY` 漏 `uniqExactIf` 家族 |
@@ -46,10 +46,10 @@
   CK 宽松模式下 `uniqExactIf` 内部列 `guid` 不在 GROUP BY 也可能"跑通"，返回**口径错的值**而非报错；无任何编译期拦截。
 - **目标示例**：编译期 `validateGoldGroupBy` 命中 → 返回 `verified_query_gold_group_by:<id>` 拒绝，提示"检查 SELECT 列是否都落在 GROUP BY 或聚合内"，绝不把 CK 原始异常抛给用户。
 
-### S2 ❌ 静默给错数（`result_overflow_mode='break'`）
-- **现状**：`bi-query-settings.mjs` 默认 `max_result_rows=1e6` + `result_overflow_mode='break'`；`runSql` 只按工具 `limit` 判截断，不检测 CK break、不读 `rows_truncated`。
-- **当前问题示例**：某高基数 `GROUP BY user_id` 返回 1.2M 行 → CK 静默砍到 1M，**金额/计数系统性偏小，无任何提示**——比报错更危险。
-- **目标示例**：默认改 `'throw'`；或响应头强制写"本查询触及行数上限，结果可能不完整"，并比对返回行数是否等于 `max_result_rows`。
+### S2 ✅ 静默给错数防护（默认 fail-loud）
+- **现状**：`bi-query-settings.mjs` 默认 `max_result_rows=1e6` + `result_overflow_mode='throw'`（fail-loud：触及上限直接报错而非静默截断给半截数据）；旧 `break` 静默截断行为仍可通过 `BI_CH_RESULT_OVERFLOW_MODE=break` 显式还原（看板场景）。`classifyUpstreamError` 已识别 Code 115 / UNKNOWN_SETTING（如自动追加的 `max_estimated_execution_cost` 在目标 CH 版本不支持）。
+- **原问题示例**：某高基数 `GROUP BY user_id` 返回 1.2M 行 → CK 静默砍到 1M，**金额/计数系统性偏小，无任何提示**——比报错更危险。默认改 `'throw'` 后该路径默认报错而非静默给错数。
+- **残留（非默认路径）**：`runSql` 仍只按工具 `limit` 判截断，未读 CK `rows_truncated`；若显式设 `break`，截断仍无提示。属可观测加固项，不影响默认 fail-loud 语义。
 
 ### S3 ⚠️ 只读校验（有强拦但有后门）
 - ✅：`runSql → assertSql → isReadOnlySql`（fail-closed，拦 INSERT/UPDATE/DELETE/DDL）。

@@ -121,7 +121,7 @@
 ### 批次 1：资源安全（会打挂/静默给错数，最高优先）
 - [ ] **P0-1**：`runSql` 内先取 engine，仅 ClickHouse 系才 append SETTINGS；wid 归一化上提到 `runSql` 共用
 - [ ] **P0-2**：`classifyUpstreamError` 增 `115/UNKNOWN_SETTING` 分支 → 自动不带 SETTINGS 重试一次 + 记日志回显被跳过 setting + 再失败才回落通用
-- [ ] **P0-3**：`result_overflow_mode` 默认改 `'throw'`，或响应头强制写"触及行数上限，结果可能不完整"
+- [x] **P0-3**：`result_overflow_mode` 默认改 `'throw'`（已在 `bi-query-settings.mjs` 落地；`BI_CH_RESULT_OVERFLOW_MODE=break` 可还原静默截断）
 - [ ] **P0-5**：`HEAVY` 正则扩到 `uniq\w*(?:If|Array|State|OrNull)?` 家族
 - [ ] **P1-11**：`execute_query` 纳入同一 lint/SETTINGS/只读校验链
 

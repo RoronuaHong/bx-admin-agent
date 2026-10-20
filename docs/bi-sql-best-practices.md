@@ -47,7 +47,7 @@
 
 ---
 
-## 2. 判据清单（15 条）
+## 2. 判据清单（20 条）
 
 ### 2.1 结果集有界类（最容易出事：跑得慢、结果不可控）
 
@@ -86,6 +86,17 @@
 | `COUNT_DISTINCT` | `count(DISTINCT x)` | 列式引擎上退化为全量去重；改用 `uniqExact(x)`（精确）或 `uniq(x)`（近似） |
 | `SHOW_CREATE_TABLE` | `SHOW CREATE TABLE` | 会输出建表 DDL（含引擎参数、分区键等实现细节）。查结构用 `DESCRIBE <table>` 或元数据接口 |
 
+### 2.5 资源类（重聚合 / 多表 JOIN 的内存与扫描代价，advisory 不阻断）
+
+判据只用 SQL 结构（是否精确去重、是否带时间窗、JOIN 数量、GROUP BY 维度），不含业务语义；提示不阻断执行，对齐 OWASP LLM05:2025（把模型生成的 SQL 当不可信输入，下发数据库前做结构校验）。
+
+| 码 | 触发条件 | 后果 | 改法 |
+|---|---|---|---|
+| `DEVICE_LEVEL_COUNT` | 用 `guid`（设备）做去重/计数（`uniqExact(guid)` / `count(guid)`） | 设备级宽表一号多机，按 guid 统计「用户/会员/日活人数」会系统性虚高（实测约 1.6 倍） | 统计用户/会员人数请绑定去重到账号（`uniqExact(uid)`）；若确实要统计设备数，可忽略本条 |
+| `HEAVY_EXACT_AGG_NOWINDOW` | `uniqExact(...)`（精确去重）出现在「无时间窗」或「窗口 ≥ 阈值天」的查询里 | 精确去重为每行维护去重状态，内存随去重基数线性增长，全历史宽表上极易撞服务端内存上限 | 只要趋势/看板类指标改近似 `uniq()`（误差约 1~2%）；必须精确则先收窄时间窗（1~3 天跑通再放大）或用已聚合表/现成卡片 |
+| `MULTI_JOIN_UNBOUNDED` | ≥ 2 个 `JOIN` 且整条查询没有时间窗过滤 | 每个 JOIN 放大扫描量，无范围过滤时整条链路退化为全扫 | 先对每张表在子查询里各自过滤（缩时间窗/加条件）再 JOIN，小表放 JOIN 右侧（哈希表更小） |
+| `GROUP_BY_HIGH_DIM_NOLIMIT` | `GROUP BY` 维度 ≥ 3 且带 `ORDER BY` 但没有 `LIMIT` | 高维分组中间状态规模由数据决定、不可控，ORDER BY 聚合列时易一次性拉满 | 加 `LIMIT` 截断（配合 `ORDER BY ... DESC` 取头部），或先降维到核心维度再逐步展开 |
+
 ### 2.6 敏感列提示（CLS，advisory / fail-open）
 
 | 码 | 触发条件 | 改法 |
@@ -96,7 +107,15 @@
 > 直接硬拒会误杀合理的聚合统计（例如「按邮箱域名计数」）；真要硬拒应在**数据库层只读角色**做列黑名单（见 plan §三-P0.1），本判据只负责把风险回灌给模型。
 > 元数据查询（`system.columns` 等）豁免，避免「按列名扫全集群」时误报。
 
-### 2.5 明确**不适用**行级规则的语句
+### 2.7 语法合法性类（fail-open 提示）
+
+| 码 | 触发条件 | 后果 | 改法 |
+|---|---|---|---|
+| `UNQUOTED_STRING_LITERAL` | `IN (...)` 列表项或比较 RHS 出现裸非 ASCII 标识符（如 `movieType IN (电影, 电视剧)`、`country = 中国`）；本系统列名/别名均为 ASCII，裸中文几乎必然漏加引号 | ClickHouse 把裸中文当标识符或语法错误处理（Code 62），整条查询 400 | 字符串值必须用单引号包裹：`movieType IN ('电影', '电视剧')`、`country = '中国'`；补上引号后重试 |
+
+> fail-open（提示不阻断）：对齐 OWASP LLM05:2025 Improper Output Handling——把模型生成的 SQL 当成不可信输入，下发数据库前做结构校验，而非直接透传。
+
+### 2.8 明确**不适用**行级规则的语句
 
 `SHOW TABLES` / `DESCRIBE` / `EXPLAIN` / `system.tables` / `system.columns` 这类**元数据与会话语句**
 结果集天然有界或极小，**不能**要求它们带 `WHERE` / `LIMIT`，也不对 `SELECT *`、`SELECT DISTINCT`（不加 LIMIT）报结果集有界类规则
@@ -155,10 +174,10 @@ node scripts/_audit-bi-sql.mjs
 
 | 落点 | 说明 |
 |---|---|
-| `scripts/sql-lint-common.mjs` | 15 条判据的**唯一实现**（共享单源，适配器与后续服务端复用同一份） |
+| `scripts/sql-lint-common.mjs` | 20 条判据的**唯一实现**（共享单源，适配器与后续服务端复用同一份） |
 | `scripts/metabase-mcp.mjs` · `runSql` | 执行类入口统一回灌体检结论（`run_native_query` / `execute_sql` / `query` 的 SQL 分支共用） |
 | `scripts/metabase-mcp.mjs` · `construct_query` | **执行前**就给出体检结论——「先确认口径再执行」这一环 |
-| `tests/sql-lint.test.ts` | 13 例，覆盖每条判据 + 两组反向约束（不误伤、fail-open） |
+| `tests/sql-lint.test.ts` | 25 例，覆盖每条判据 + 两组反向约束（不误伤、fail-open） |
 | `scripts/_audit-bi-sql.mjs` | 对复跑产物重新体检的审计脚本 |
 
 ## 6. 评测集（这个实例在不在里面）
