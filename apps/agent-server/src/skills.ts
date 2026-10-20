@@ -590,7 +590,7 @@ export function renderSkillIndex(role?: string | null): string {
   if (!skills.length) return "";
   const lines = skills.map((skill) => `- ${skill.dir}${skill.description ? `：${skill.description}` : ""}`);
   return [
-    "以下是可以按需加载的技能（skills）。任务命中时调用 read_skill 工具取全文，再按其中步骤执行：",
+    "以下是可以按需加载的技能（skills）。当任务需要按规范读懂项目源码里的接口、字段或名称映射（例如把界面展示的名称对应到源码里的标识符、定位某功能模块的接口）时，命中对应技能并调用 read_skill 工具取全文，再按其中步骤执行：",
     ...lines,
   ].join("\n");
 }

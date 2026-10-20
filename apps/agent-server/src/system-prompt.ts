@@ -30,7 +30,7 @@ const BASE_PERSONA = [
  * 30 字上限避免长句被当成正文。放在人设之后由 `buildSystemPrompt` 统一拼，避免角色人设各抄一遍。
  */
 const INTENT_LINE =
-  "若开启了扩展思考：用与用户相同的语言思考。第一行写「意图：你对用户请求的理解」（一行、30 字以内）；" +
+  "若开启了扩展思考：用与用户相同的语言进行**全部**内部推理（思考内容本身也应是同一语言，便于用户阅读，不要写成英文）。第一行写「意图：你对用户请求的理解」（一行、30 字以内）；" +
   "若关键用词还有多个说得通的解释、尚未确定，就在这一行注明「待确认」，不要把猜测写成结论。" +
   "之后只写会改变下一步的判断（缺哪项事实、选哪个读法、下一步做什么），不要自我辩论、不要复述规则、不要把中文请求展开成英文长文。思考会展示给用户，保持短。";
 
@@ -54,6 +54,18 @@ const SAFETY_GUARDRAIL = [
  * 各角色人设不再自带工具守则：那一度造成同一条纪律三处措辞（角色人设 / 默认人设 / 本常量）并存。
  * 编号自成一段（从 1 起），避免和上游段落的序号连号。
  */
+/**
+ * 能力使用指引（稳定前缀）：把 read_skill 的触发时机与「澄清决策独立于长期记忆偏好」显式写进系统提示。
+ * 实测踩过：模型不知道技能索引可 read_skill，且会把记忆里的「用户偏好少问」误当成本轮指令而过度放弃澄清。
+ * 不写具体业务词（红线）：用「源码里的接口/字段/名称映射」等通用表述。
+ */
+const CAPABILITY_HINT =
+  "能力使用指引：" +
+  "1. 需要规范化地读懂项目源码里的接口、字段或名称映射（例如把界面展示的名称对应到源码里的标识符、定位某功能模块的接口）时，" +
+  "不要凭记忆猜——调用 read_skill 取对应技能全文，按其步骤从源码读取真实映射与规范。" +
+  "2. 澄清决策（request_clarification）只依据当前请求本身：仅当关键用词存在两个都说得通、且会导向不同答案的读法时才问；" +
+  "是否澄清由本轮用户输入决定，不要因为长期记忆里写着「用户偏好少问」就跳过必要的澄清。";
+
 const TOOLING_RULES = [
   "工具使用纪律（仅在工具可用时生效）：",
   "1. 只依据工具返回的真实结果作答；查不到、超时或报错就如实说明，不要编造或补全数据。",
@@ -339,7 +351,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
   // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
   const role = getRole(input.role);
   // 全局安全护栏放稳定前缀最前：跨角色共享、优先级最高，且随角色前缀各自缓存（不互相击穿）。
-  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, input.tooling ? TOOLING_RULES : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
+  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, CAPABILITY_HINT, input.tooling ? TOOLING_RULES : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
     (part) => part && part.trim(),
   );
   // 记忆与摘要可能夹带工具结果里的原文：定界成数据，并放在动态段最后，不排在规则前面。

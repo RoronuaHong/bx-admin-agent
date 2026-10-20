@@ -1328,6 +1328,23 @@ button.step-head:disabled {
   line-height: 1.5;
 }
 
+.reasoning__foreign-toggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  color: var(--accent, #2f6fed);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.reasoning__foreign-toggle:hover {
+  color: var(--accent-strong, #1f4fc0);
+}
+
 .reasoning__thinking::-webkit-scrollbar {
   width: 6px;
 }

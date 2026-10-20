@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, toRef } from "vue";
+import { computed, inject, reactive, toRef } from "vue";
 import ChartCard from "./ChartCard.vue";
 import { bubbleContextKey } from "./bubble-context";
 import type { Bubble } from "../chat-types";
@@ -51,6 +51,13 @@ const {
   isStoppedBubble,
   workspaceDownloadUrl,
 } = ctx;
+
+// 思考内容与界面语言不一致时被收起（模型用英文草稿纸）。提供「展开原文」入口，避免中文用户完全看不到推理。
+const foreignOpen = reactive(new Set<number>());
+function toggleForeign(id: number) {
+  if (foreignOpen.has(id)) foreignOpen.delete(id);
+  else foreignOpen.add(id);
+}
 
 // 与 ChatPage 同款的 i18n 闭包（本地定义，避免透传）。
 const tx = (zh: string, en: string, pt = en, hi = en) =>
@@ -148,7 +155,14 @@ function stepSegments(step: { result?: string }): StepSegment[] {
             <!-- 扩展思考流：实时展示模型规划过程（已剥离显式意图行）；正文同族无衬线、限高内滚 + 流式跟底。 -->
             <pre v-if="thinkingDisplay(b)" class="reasoning__thinking">{{ thinkingDisplay(b) }}</pre>
             <p v-else-if="hasThinking(b)" class="reasoning__foreign">
-              {{ tx("内部推理与当前语言不一致，已收起", "Internal reasoning is in another language and is hidden", "O raciocínio interno está em outro idioma e foi ocultado", "आंतरिक तर्क दूसरी भाषा में है, छिपा दिया गया") }}
+              <button type="button" class="reasoning__foreign-toggle" @click="toggleForeign(b.id)">
+                {{
+                  foreignOpen.has(b.id)
+                    ? tx("收起模型原始推理", "Hide raw model reasoning", "Ocultar raciocínio bruto do modelo", "मॉडल का कच्चा तर्क छिपाएँ")
+                    : tx("内部推理与当前语言不一致，已收起（点击查看原文）", "Internal reasoning is in another language and hidden (click to view raw)", "O raciocínio interno está em outro idioma e oculto (clique para ver)", "आंतरिक तर्क दूसरी भाषा में है, छिपा हुआ (देखने के लिए क्लिक करें)")
+                }}
+              </button>
+              <pre v-if="foreignOpen.has(b.id)" class="reasoning__thinking">{{ b.thinking }}</pre>
             </p>
             <!-- 规划阶段但尚无思考流（模型不支持 thinking）：给一个「正在规划」状态，避免静默加载像卡死；
                  一旦正文开始流式（b.text 已非空）即隐藏，转为「回答中」，不再误导地停在规划态。 -->
@@ -197,7 +211,7 @@ function stepSegments(step: { result?: string }): StepSegment[] {
                 >
                   <span class="mcp-dot" :class="stepClass(step.status)"></span>
                   <span class="step-name" :title="step.name">{{ toolDisplayName(step.name, uiLocale) }}</span>
-                  <span v-if="stepQuery(step)" class="step-server" :title="stepQuery(step)">「{{ stepQuery(step) }}」</span>
+                  <span v-if="stepQuery(step)" class="step-server" :title="stepQuery(step) ?? undefined">「{{ stepQuery(step) }}」</span>
                   <span v-if="showToolServer(step.name, step.server)" class="step-server" :title="step.server">{{ step.server }}</span>
                   <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">
                     {{ step.status === "refused" ? refusalHint() : stepSummary(step) }}
