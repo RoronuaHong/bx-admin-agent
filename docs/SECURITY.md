@@ -225,6 +225,22 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 
 `src/risk.ts`（`isNativeSqlRejected` + 只读工具表）+ `src/sql-readonly.ts` 对 `mcp__bi__*` 等原生 SQL 工具做 fail-closed 只读校验，配合审计 gate——服务端判定只读 SQL 才放行，写 SQL / 改库一律拒绝。
 
+**服务端硬拒的生效前提（部署务必核对）**：`isNativeSqlRejected` 只对 `readOnlySqlTools` 声明的工具生效。BI 服务器（Metabase 适配器）必须在配置里显式登记：
+
+```json
+{
+  "id": "bi",
+  "toolRisks": { "*": "read" },
+  "readOnlySqlTools": ["run_native_query", "execute_sql", "query"]
+}
+```
+
+未登记 `readOnlySqlTools` 时，`run_native_query` 仅按 `"*": "read"` 走免确认路径，服务端 `sql-readonly` 硬拒**完全不触发**——写 SQL / 危险表函数（`url()` `file()` `s3()` `remote()` 等出网 / 读文件原语）只剩 MCP 适配器 `scripts/metabase-mcp.mjs` 的 `assertSql` 单层防守（且需配合下方账号层才真正兜底）。本地 `apps/agent-server/.data/mcp-servers.json` 已按此登记。
+
+**只读边界的两道独立防线（缺一不可）**：
+1. **代码层（纵深防御）**：`metabase-mcp.mjs` 的 `assertSql`（共用 `scripts/sql-readonly-common.mjs` 单一口径，拦截写操作与危险表函数）+ 服务端 `risk.ts` 的 `readOnlySqlTools` 硬拒（需上述配置登记才生效）。
+2. **账号层（最终兜底）**：真正的只读边界来自**数据库账号**——专用角色 + 只 `GRANT SELECT`，且 BI 用只读 Key（`BI_READONLY_API_KEY`）而非管理员 `BI_API_KEY`。代码层过滤只是纵深防御：Key 一旦泄露，攻击者可直连 Metabase API 绕过适配器；账号层 GRANT 才是最后一道不可绕过的闸。
+
 ---
 
 ## 11. 审计与可观测
@@ -281,7 +297,7 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 - [ ] 改 `.env` / 代码后重启：`pm2 delete agent-server-dev` → 确认 8787 释放 → `pm2 start ecosystem.dev.config.cjs --only agent-server-dev`。
 - [ ] 不信任网络下部署 `run_tool_code`/`run_command`/`run_script` 前，先解决 §8.4 的沙箱缺口。
 - [ ] 生产设置 `NODE_ENV=production`，并配置 `MCP_ALLOWED_COMMANDS`（未配则 stdio MCP 起不来）。需要内容级拒绝时再开 `MCP_REQUIRE_PROVENANCE=on`。
-- [ ] 生产 BI 配置 `BI_READONLY_API_KEY`。未配置时适配器拒绝连接，不会回落 `BI_API_KEY`。
+- [ ] 生产 BI 配置 `BI_READONLY_API_KEY`（未配置时适配器拒绝连接，不会回落 `BI_API_KEY`）；并在 BI MCP 服务器配置登记 `"readOnlySqlTools": ["run_native_query","execute_sql","query"]`，否则服务端原生 SQL 硬拒不生效、只剩适配器层。数据库账号须专用只读角色（`GRANT SELECT`），不能只靠代码层过滤。
 - [ ] 依赖审计进非阻断 CI；前端类型检查进非阻断 CI（巨型 SFC 结果不稳定）。
 
 ---
