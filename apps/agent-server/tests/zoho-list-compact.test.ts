@@ -61,6 +61,41 @@ test("还有下一页时，计数提示放在结果头部", () => {
   ).toContain("count_list_by_time");
 });
 
+test("compactFatListToolResult：data.data 嵌套信封也能压扁，不留肥数组", () => {
+  const fat = JSON.stringify({
+    data: {
+      url: "/api/v2/castleapp/conversations",
+      object: "list",
+      more_data_available: true,
+      data: [
+        {
+          id: "1",
+          start_time: "1790676816781",
+          visitor: { country_code: "IN", name: "x" },
+          pad: "x".repeat(3000),
+        },
+      ],
+    },
+    headers: {},
+    status: 200,
+  });
+  const slim = compactFatListToolResult("mcp__zoho-salesiq__ZohoSalesIQ_getConversationsList", fat);
+  expect(slim.length).toBeLessThan(fat.length);
+  const parsed = JSON.parse(slim);
+  expect(parsed.count).toBe(1);
+  expect(parsed.data.data[0].id).toBe("1");
+  expect(parsed.data.data[0]["visitor.country_code"]).toBe("IN");
+  expect(slim).not.toMatch(/x{200,}/);
+});
+
+test("嵌套信封的 more_data_available 也能识别为还有下一页", () => {
+  const nested = JSON.stringify({ data: { data: [{ id: "1" }], more_data_available: true } });
+  expect(withListCountHint("x", nested).startsWith("（跨页计数不要继续翻本列表")).toBe(true);
+  expect(withListCountHint("x", JSON.stringify({ data: { data: [], more_data_available: false } }))).not.toContain(
+    "count_list_by_time",
+  );
+});
+
 test("compactFatListToolResult：非列表工具原样返回", () => {
   const text = '{"ok":true}';
   expect(compactFatListToolResult("run_script", text)).toBe(text);

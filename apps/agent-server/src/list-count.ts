@@ -14,6 +14,8 @@ export const LIST_COUNT_PAGE_LIMIT = Math.min(
 );
 
 const ROW_ARRAY_KEYS = ["data", "items", "results", "records", "rows", "list", "conversations", "value", "entries"];
+/** 常见外层信封键：分页标记/游标可能挂在这一层，而不是响应顶层。 */
+const ENVELOPE_KEYS = ["data", "result", "payload", "response", "body", "value"] as const;
 const MORE_BOOL_KEYS = ["more_data_available", "has_more", "hasMore", "more"];
 const NEXT_CURSOR_KEYS = ["next_cursor", "nextCursor", "next_page_token", "nextPageToken", "next"];
 const REQUEST_CURSOR_KEYS = ["cursor", "page_token", "pageToken", "starting_after", "continuation", "continuation_token", "next_cursor"];
@@ -145,6 +147,21 @@ export function hourBucketLabel(ms: number, timeZone: string): string {
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+/** 点分路径的父对象：`data.data` → obj.data（数组所在的那一层，分页标记通常也在这一层）。 */
+function containerOfPath(obj: Record<string, unknown>, dotted: string): Record<string, unknown> | null {
+  const parts = dotted.split(".");
+  let cur: unknown = obj;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    cur = asRecord(cur)?.[parts[i]!];
+  }
+  return asRecord(cur);
+}
+
+function lastPathKey(dotted: string): string {
+  const parts = dotted.split(".");
+  return parts[parts.length - 1] || dotted;
 }
 
 function pagingNodes(obj: Record<string, unknown>): Record<string, unknown>[] {
@@ -390,39 +407,120 @@ function objectRows(value: unknown): { rows: Array<Record<string, unknown>> } | 
   return { rows };
 }
 
+export interface ListRows {
+  rows: Array<Record<string, unknown>>;
+  /** 数组在 container 里的键名（扁平键，不是点分路径）。 */
+  key: string;
+  /** 直接持有该数组的对象；分页标记/游标通常就在这一层。 */
+  container: Record<string, unknown>;
+}
+
 export function extractListRows(
   obj: Record<string, unknown>,
   rowsField?: string,
-): { rows: Array<Record<string, unknown>>; key: string } | { error: string } {
-  const named = takeRows(rowsField ? obj[rowsField] : undefined, rowsField);
-  if (named) return named;
+): ListRows | { error: string } {
+  // 模型给的 rowsField 只是提示：猜错/取不到时不要硬失败，回落到下面的自动识别。
+  if (rowsField) {
+    const named = objectRows(valueAt(obj, rowsField));
+    if (named && !("error" in named)) {
+      return {
+        rows: named.rows,
+        key: lastPathKey(rowsField),
+        container: containerOfPath(obj, rowsField) ?? obj,
+      };
+    }
+  }
   for (const key of ROW_ARRAY_KEYS) {
     if (!Array.isArray(obj[key])) continue;
     const read = objectRows(obj[key]);
     if (!read) continue;
     if ("error" in read) return read;
-    return { rows: read.rows, key };
+    return { rows: read.rows, key, container: obj };
   }
   const arrays = Object.entries(obj).filter(([, value]) => Array.isArray(value));
   if (arrays.length === 1) {
     const read = objectRows(arrays[0]![1]);
     if (!read) return { error: "返回里没有列表数组" };
     if ("error" in read) return read;
-    return { rows: read.rows, key: arrays[0]![0] };
+    return { rows: read.rows, key: arrays[0]![0], container: obj };
   }
-  return { error: "返回里没有列表数组" };
+  // 顶层没有可识别的数组时，递归下钻找数组（远程 MCP 常把列表包在 data.data 之类的外层）。
+  return pickDeepRows(deepFindRowArrays(obj));
 }
 
-function takeRows(value: unknown, field: string | undefined): { rows: Array<Record<string, unknown>>; key: string } | { error: string } | null {
-  if (!field) return null;
-  const read = objectRows(value);
-  if (!read) return { error: `返回里没有 ${field} 数组` };
-  if ("error" in read) return read;
-  return { rows: read.rows, key: field };
+/**
+ * 从下钻结果里挑一个：优先已知列表 key，且越靠近顶层越可信。
+ * 同一层出现多个候选时不静默挑一个，而是报错让调用方用 rowsField 指定。
+ */
+function pickDeepRows(
+  found: Array<{ rows: Array<Record<string, unknown>>; path: string[]; container: Record<string, unknown> }>,
+): ListRows | { error: string } {
+  if (!found.length) return { error: "返回里没有列表数组" };
+  const known = found.filter((item) => ROW_ARRAY_KEYS.includes(item.path[item.path.length - 1]!));
+  if (!known.length) {
+    if (found.length === 1) {
+      const only = found[0]!;
+      return { rows: only.rows, key: only.path[only.path.length - 1]!, container: only.container };
+    }
+    return {
+      error: `返回里有多个数组，无法确定哪个是列表（${found.map((item) => item.path.join(".")).join(" / ")}），请用 rowsField 指定`,
+    };
+  }
+  const minDepth = Math.min(...known.map((item) => item.path.length));
+  const shallowest = known.filter((item) => item.path.length === minDepth);
+  if (shallowest.length === 1) {
+    const only = shallowest[0]!;
+    return { rows: only.rows, key: only.path[only.path.length - 1]!, container: only.container };
+  }
+  return {
+    error: `返回里有多个可能的列表数组（${shallowest.map((item) => item.path.join(".")).join(" / ")}），请用 rowsField 指定`,
+  };
+}
+
+/** 递归收集响应里「元素都是对象的数组」，记录点分路径与所在容器。供顶层识别不到时兜底。 */
+function deepFindRowArrays(
+  value: unknown,
+  path: string[] = [],
+  out: Array<{ rows: Array<Record<string, unknown>>; path: string[]; container: Record<string, unknown> }> = [],
+  depth = 0,
+): typeof out {
+  if (depth > 8) return out;
+  const rec = asRecord(value);
+  if (!rec) return out;
+  for (const [key, child] of Object.entries(rec)) {
+    if (Array.isArray(child)) {
+      const read = objectRows(child);
+      if (read && !("error" in read)) out.push({ rows: read.rows, path: [...path, key], container: rec });
+    } else if (asRecord(child)) {
+      deepFindRowArrays(child, [...path, key], out, depth + 1);
+    }
+  }
+  return out;
 }
 
 function pageSizeRejected(message: string): boolean {
   return /limit invalid|invalid limit|page size|page_size|per_page|max(?:imum)? limit/i.test(message);
+}
+
+/** 首屏拿不到列表数组时的结构错误（不是鉴权/网络），可以放宽重取。 */
+function structuralListError(message: string): boolean {
+  return /返回里没有.*数组/.test(message);
+}
+
+/**
+ * 去掉字段投影（fields/field/include/columns）。上游常因投影改变响应信封——
+ * 例如数组被包到 data.data、或投影把行压成非对象——放宽投影后重取一次，属于兜底。
+ */
+export function stripFieldProjections(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => stripFieldProjections(item));
+  const rec = asRecord(value);
+  if (!rec) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(rec)) {
+    if (/^(fields|field|include|columns)$/i.test(key)) continue;
+    out[key] = stripFieldProjections(child);
+  }
+  return out;
 }
 
 /**
@@ -496,9 +594,28 @@ export function listResponseHasMore(text: string): boolean {
   }
   const obj = asRecord(parsed);
   if (!obj) return false;
-  const flag = explicitMore(obj);
-  if (flag != null) return flag;
-  return Boolean(nextCursorOf(obj));
+  // 分页标记可能挂在 data/result 等外层信封里（嵌套响应），逐层看一遍。
+  const nodes = envelopeNodes(obj);
+  for (const node of nodes) {
+    const flag = explicitMore(node);
+    if (flag != null) return flag;
+  }
+  return nodes.some((node) => Boolean(nextCursorOf(node)));
+}
+
+/** 只沿已知外层键（data/result/payload…）下钻，不扫业务对象，避免把业务布尔当分页标记。 */
+function envelopeNodes(
+  obj: Record<string, unknown>,
+  depth = 0,
+  out: Record<string, unknown>[] = [],
+): Record<string, unknown>[] {
+  if (depth > 4) return out;
+  out.push(obj);
+  for (const key of ENVELOPE_KEYS) {
+    const child = asRecord(obj[key]);
+    if (child) envelopeNodes(child, depth + 1, out);
+  }
+  return out;
 }
 
 function parsePage(
@@ -529,8 +646,10 @@ function parsePage(
   }
   const extracted = extractListRows(obj, rowsField);
   if ("error" in extracted) return { rows: [], more: false, error: extracted.error };
-  const flag = explicitMore(obj);
-  const nextCursor = nextCursorOf(obj);
+  // 分页标记/游标可能挂在列表容器（如 data.data 的外层），顶层读不到时再看容器。
+  const container = extracted.container;
+  const flag = explicitMore(obj) ?? (container !== obj ? explicitMore(container) : undefined);
+  const nextCursor = nextCursorOf(obj) ?? (container !== obj ? nextCursorOf(container) : undefined);
   const more = flag != null ? flag : Boolean(nextCursor) || extracted.rows.length >= limit;
   return { rows: extracted.rows, more, ...(nextCursor ? { nextCursor } : {}) };
 }
@@ -559,6 +678,10 @@ export async function countPagedList(
   let pageNo = 1;
   let cursor: string | undefined;
   let shrunkLimit = false;
+  // 放宽兜底：首屏结构解析失败时去掉字段投影重取一次。
+  let relaxedParse = false;
+  let argsBase = request.arguments;
+  let effectiveRowsField = request.rowsField;
   let complete = false;
   let reason = "";
   let pageRetries = 0;
@@ -569,14 +692,25 @@ export async function countPagedList(
       reason = "已取消";
       break;
     }
-    const fetched = await fetchPage(pageArgs(request.arguments, index, limit, cursor, pageNo));
+    const fetched = await fetchPage(pageArgs(argsBase, index, limit, cursor, pageNo));
     pages += 1;
-    const page = parsePage(fetched.text, fetched.isError, limit, request.rowsField);
+    const page = parsePage(fetched.text, fetched.isError, limit, effectiveRowsField);
     if (page.error) {
       if (!shrunkLimit && pages === 1 && limit > 20 && pageSizeRejected(page.error)) {
         shrunkLimit = true;
         limit = Math.max(20, Math.floor(limit / 2));
         pages = 0;
+        continue;
+      }
+      // 首屏拿不到列表数组不是鉴权/网络问题：去掉字段投影、放弃模型的 rowsField 猜测，
+      // 放宽重取一次。这是对上游响应信封变化的兜底（例：数组被包到 data.data、投影把行压成非对象）。
+      if (!relaxedParse && pages === 1 && structuralListError(page.error)) {
+        relaxedParse = true;
+        const relaxed = asRecord(stripFieldProjections(argsBase));
+        if (relaxed) argsBase = relaxed;
+        effectiveRowsField = undefined;
+        pages = 0;
+        pageRetries = 0;
         continue;
       }
       // 模型看到 complete: false 就会按无数据收束，且被要求不要再调工具。瞬时错误要在这次调用里重取。

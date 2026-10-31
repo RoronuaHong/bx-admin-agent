@@ -1740,12 +1740,10 @@ export function compactFatListToolResult(_toolName: string, text: string): strin
   const obj = parsed as Record<string, unknown>;
   const extracted = extractListRows(obj);
   if ("error" in extracted || extracted.rows.length === 0) return text;
-  const next = {
-    ...obj,
-    [extracted.key]: extracted.rows.map(slimListRow),
-    count: extracted.rows.length,
-  };
-  const slim = JSON.stringify(next);
+  // 直接替换容器里的数组：嵌套信封（data.data）也能压扁，而不是多出一个 "data.data" 键。
+  extracted.container[extracted.key] = extracted.rows.map(slimListRow);
+  obj.count = extracted.rows.length;
+  const slim = JSON.stringify(obj);
   return slim.length < text.length ? slim : text;
 }
 

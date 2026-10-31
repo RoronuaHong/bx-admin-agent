@@ -26,7 +26,13 @@ function row(id: string, start: number | string | null): Record<string, unknown>
   return item;
 }
 
-function page(rows: Array<Record<string, unknown>>, more: boolean): PageFetchResult {
+function page(rows: Array<Record<string, unknown>>, more: boolean, wrap?: "data"): PageFetchResult {
+  if (wrap === "data") {
+    return {
+      text: JSON.stringify({ data: { url: "/x", object: "list", data: rows, more_data_available: more } }),
+      isError: false,
+    };
+  }
   return { text: JSON.stringify({ data: rows, more_data_available: more }), isError: false };
 }
 
@@ -437,6 +443,88 @@ test("会话列表只保留接口接受的排序，start_time 改回 in_time", (
   expect(illegal.query_params).toMatchObject({ sort_by: "in_time", sort_order: "asc", from_time: 1 });
   const other = prepareListArgs("mcp__other__list", { query_params: { from_time: 1 } });
   expect(other.query_params).toEqual({ from_time: 1 });
+});
+
+test("Zoho 远程 MCP 把列表数组包在 data.data 里也能取到（递归下钻）", async () => {
+  // 实测 2026-10-31：Zoho SalesIQ getConversationsList 返回
+  // {"data":{"url":...,"object":"list","data":[...conversations...]}}，数组在 data.data。
+  // 顶层扫描识别不到，必须递归下钻。
+  const report = await countPagedList(request({ above: 2, timeZone: "UTC" }), async () =>
+    page(
+      [
+        { id: "a", start_time: FROM },
+        { id: "b", start_time: FROM + 3_600_000 },
+      ],
+      false,
+      "data",
+    ),
+  );
+  expect(report.complete).toBe(true);
+  expect(report.unique).toBe(2);
+  expect(report.hours).toEqual([
+    { hour: "2026-09-16 07:00", count: 1 },
+    { hour: "2026-09-16 08:00", count: 1 },
+  ]);
+});
+
+test("rowsField 支持点分路径（如 data.data）", async () => {
+  const report = await countPagedList(
+    request({ above: 1, timeZone: "UTC", rowsField: "data.data" }),
+    async () => page([{ id: "x", start_time: FROM }], false, "data"),
+  );
+  expect(report.complete).toBe(true);
+  expect(report.unique).toBe(1);
+});
+
+test("rowsField 猜错时回落到自动识别，不硬失败", async () => {
+  const report = await countPagedList(
+    request({ above: 1, timeZone: "UTC", rowsField: "nope.wrong" }),
+    async () => page([{ id: "x", start_time: FROM }], false, "data"),
+  );
+  expect(report.complete).toBe(true);
+  expect(report.unique).toBe(1);
+});
+
+test("首屏结构解析失败会去掉字段投影再放宽重取一次", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const report = await countPagedList(
+    request({ arguments: { query_params: { fields: "id,start_time", from_time: 1 } } }),
+    async (args) => {
+      seen.push(args);
+      // 第一次：投影导致取不到列表数组；第二次放宽后才返回数据。
+      if (seen.length === 1) return { text: JSON.stringify({ total: 1 }), isError: false };
+      return page([row("a", FROM)], false);
+    },
+  );
+  expect(report.complete).toBe(true);
+  expect(report.unique).toBe(1);
+  expect(seen).toHaveLength(2);
+  expect((seen[0]!.query_params as Record<string, unknown>).fields).toBe("id,start_time");
+  expect((seen[1]!.query_params as Record<string, unknown>).fields).toBeUndefined();
+});
+
+test("嵌套信封的 more_data_available 参与翻页判断", async () => {
+  const calls: number[] = [];
+  const report = await countPagedList(request({ timeZone: "UTC" }), async (args) => {
+    const index = (args.query_params as { index: number }).index;
+    calls.push(index);
+    if (index === 0) return page([row("a", FROM)], true, "data");
+    return page([row("b", FROM + 3_600_000)], false, "data");
+  });
+  expect(calls).toEqual([0, 1]);
+  expect(report.complete).toBe(true);
+  expect(report.unique).toBe(2);
+});
+
+test("同层出现多个列表候选时不猜，请用 rowsField 指定", async () => {
+  const report = await countPagedList(request(), async () => ({
+    text: JSON.stringify({
+      data: { items: [{ id: "a", start_time: FROM }], results: [{ id: "b", start_time: FROM }] },
+    }),
+    isError: false,
+  }));
+  expect(report.complete).toBe(false);
+  expect(report.reason).toContain("rowsField");
 });
 
 test("工具名拆分与未连接的列表工具如实失败", async () => {
