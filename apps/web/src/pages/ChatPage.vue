@@ -657,17 +657,6 @@ function bubbleHasAlertMarker(b: {
   );
 }
 
-/** 仅最近一条带协议标记的助手结论显示「设为数据预警」，避免历史气泡刷屏。 */
-function isLatestAlertMarkerBubble(b: { id?: number; role: string; text: string }): boolean {
-  const bubbles = current.value?.bubbles || [];
-  for (let i = bubbles.length - 1; i >= 0; i--) {
-    const cur = bubbles[i]!;
-    if (!bubbleHasAlertMarker(cur)) continue;
-    return cur === b || (b.id != null && cur.id === b.id);
-  }
-  return false;
-}
-
 /**
  * 从对话草稿预警任务指令（ChatGPT「先测后跑」）：
  * 优先取「带协议标记的助手气泡」之前最近一条用户话；否则取最近用户话。
@@ -1699,6 +1688,60 @@ const current = computed<ConvState>(() => (currentId.value ? states.get(currentI
 
 /** 输入内容变化（含切换对话）时让输入框自动长高。必须放在 current 声明之后，避免 setup 期 TDZ。 */
 watch(() => current.value.input, () => autoGrow());
+
+/** 仅最近一条带协议标记的助手结论显示「设为数据预警」，避免历史气泡刷屏。 */
+const latestAlertMarkerId = ref<number | undefined>(undefined);
+/**
+ * 只在「气泡数量变化」或「尾部气泡结束流式」时重算，不跟每次 text_delta。
+ * 之前是在模板里逐气泡调用扫描函数：父渲染因此依赖所有气泡的 text，长对话每帧 O(N²)，是卡顿主因。
+ */
+watch(
+  () => {
+    const bubbles = current.value?.bubbles || [];
+    let sig = `${bubbles.length}`;
+    const tail = Math.max(0, bubbles.length - 24);
+    for (let i = bubbles.length - 1; i >= tail; i--) {
+      const b = bubbles[i]!;
+      if (b.role === "assistant") sig += b.streaming ? "1" : "0";
+    }
+    return sig;
+  },
+  () => {
+    const bubbles = current.value?.bubbles || [];
+    let id: number | undefined;
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i]!;
+      if (bubbleHasAlertMarker(b)) {
+        id = b.id;
+        break;
+      }
+    }
+    latestAlertMarkerId.value = id;
+  },
+  { immediate: true },
+);
+
+/** 长对话只渲染最近一段：上万条消息一次性挂载会让首屏和每次 diff 都卡。 */
+const THREAD_WINDOW_STEP = 60;
+const threadWindow = ref(THREAD_WINDOW_STEP);
+watch(currentId, () => {
+  threadWindow.value = THREAD_WINDOW_STEP;
+});
+const visibleBubbles = computed(() => {
+  const all = current.value?.bubbles || [];
+  const cap = Math.min(all.length, threadWindow.value);
+  return cap >= all.length ? all : all.slice(all.length - cap);
+});
+/** 展开更早消息时保持视口不跳：按「距底部距离」回填 scrollTop。 */
+function showEarlierMessages() {
+  const el = threadEl.value;
+  const fromBottom = el ? el.scrollHeight - el.scrollTop : 0;
+  threadWindow.value += THREAD_WINDOW_STEP;
+  void nextTick(() => {
+    if (!el) return;
+    el.scrollTop = el.scrollHeight - fromBottom;
+  });
+}
 
 /**
  * 发送 ⇄ 停止是两个不同按钮（v-if 互换）：点了之后原来那个按钮从 DOM 里消失，焦点掉到 body，
@@ -6624,7 +6667,15 @@ provide(bubbleContextKey, {
           <span>{{ modelSwitchHint }}</span>
           <button type="button" class="model-switch-hint__close" :aria-label="tx('关闭', 'Dismiss', 'Fechar', 'बंद करें')" @click="modelSwitchHint = ''">×</button>
         </div>
-        <ChatBubble v-for="b in current.bubbles" :key="b.id" :bubble="b" :is-latest="isLatestAlertMarkerBubble(b)" />
+        <button
+          v-if="current.bubbles.length > visibleBubbles.length"
+          type="button"
+          class="thread-earlier"
+          @click="showEarlierMessages"
+        >
+          {{ tx("显示更早的消息", "Show earlier messages", "Mostrar mensagens anteriores", "पुराने संदेश दिखाएं") }}
+        </button>
+        <ChatBubble v-for="b in visibleBubbles" :key="b.id" :bubble="b" :is-latest="b.id === latestAlertMarkerId" />
           <!-- 回到顶部：挂在对话滚动容器内（滚动容器由组件自动识别），长对话翻久了可一键回顶；
              avoid-selector 让按钮抬到底部输入区上方，不压住输入框与发送键。
              threshold 用 120（约一个气泡高）：对话区可滚高度常常只有一两百像素（几轮对话），

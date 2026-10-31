@@ -3323,6 +3323,24 @@
   min-height: 0;
 }
 
+/* 长对话窗口化：只渲染最近一段，点此增量展开更早消息。 */
+.thread-earlier {
+  align-self: center;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.thread-earlier:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+
 .empty {
   margin: auto;
   color: var(--muted);
