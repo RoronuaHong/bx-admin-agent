@@ -153,8 +153,9 @@ test("[C] 无人值守 + 额度耗尽 → 候选整体跳过（排到下一个 U
   quotaRemaining = 0;
   const r = await run("qp-unattended", { forceWrapUp: true });
   expect(chatCalls, "额度已耗尽时不应再打模型端点").toBe(0);
-  expect(r.modelStatus, "调度侧据此把本期记 failed 并推送").toBe("429");
-  expect(r.text).toContain("429");
+  // 每日额度耗尽本质是「额度 / 余额没了」，调度侧据此把本期记 failed 并推送的状态码是 402（欠费 / 额度耗尽），不是 429 限流。
+  expect(r.modelStatus, "调度侧据此把本期记 failed 并推送").toBe("402");
+  expect(r.text).toContain("402");
 }, 30000);
 
 test("[D] 交互式 + 额度耗尽 → fail-open：照旧尝试（预检可能过期/误报，不能替用户做决定）", async () => {

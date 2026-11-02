@@ -16,7 +16,8 @@ import { fileURLToPath } from "node:url";
 import { DETAIL_HINT, detailMode, projectRows } from "../scripts/metabase-concise.mjs";
 import { LatencyWindow, deriveAdaptiveTimeoutMs } from "../scripts/adaptive-timeout.mjs";
 
-const ADAPTER = readFileSync(fileURLToPath(new URL("../scripts/metabase-mcp.mjs", import.meta.url)), "utf8");
+// 归一化行尾：脚本文件可能是 CRLF，而下面的工具块正则用 \n 锚定，\r 会卡在 { 与下一行之间导致匹配为 0。
+const ADAPTER = readFileSync(fileURLToPath(new URL("../scripts/metabase-mcp.mjs", import.meta.url)), "utf8").replace(/\r\n/g, "\n");
 
 // ── 双模式投影 ─────────────────────────────────────────────────────────────
 test("[A] detail 归一化：只有显式 detailed 给全量，其余（含缺省/乱写）一律 concise", () => {
