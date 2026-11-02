@@ -136,6 +136,35 @@ import { appendClickHouseSettings, defaultClickHouseSettings, classifyUpstreamEr
 import { createQueryCacheFromEnv } from "./bi-query-cache.mjs";
 import { buildColumnSearchSql } from "./metabase-column-search.mjs";
 
+// ---- 元数据缓存：每次 schema 探查原本都实时重拉整库 47 张表的 /database/{id}/metadata ----
+// 多轮反复探查时既撑爆上下文又打 Metabase。这里按 database_id 缓存整库元数据（带字段），TTL 内复用；
+// skip_fields 只是 API 侧的减负，本地缓存始终存全量，按需克隆裁字段，不污染缓存本体。
+const METADATA_TTL_MS = Number(process.env.BI_METADATA_TTL_MS || 120_000);
+const metadataCache = new Map(); // database_id -> { data, expires }
+
+async function getDatabaseMetadata(database_id, { skipFields = false } = {}) {
+  const key = String(database_id);
+  const hit = metadataCache.get(key);
+  const now = Date.now();
+  if (hit && hit.expires > now) {
+    const data = hit.data;
+    if (skipFields) {
+      // 浅克隆表、清空字段，等价于 API 的 skip_fields（不污染缓存本体）。
+      return {
+        ok: true,
+        status: 200,
+        data: { ...data, tables: (data.tables || []).map((t) => ({ ...t, fields: [] })) },
+      };
+    }
+    return { ok: true, status: 200, data };
+  }
+  const r = await mb(`/database/${database_id}/metadata`);
+  if (r.ok && Array.isArray(r.data?.tables)) {
+    metadataCache.set(key, { data: r.data, expires: now + METADATA_TTL_MS });
+  }
+  return r;
+}
+
 // ---- 元数据映射：写查询之前的「取证」基础 ----
 
 /** 表清单里带字段时，字段预览最多列多少个名字（够模型认路，不至于把输出撑爆）。 */
@@ -313,6 +342,7 @@ async function runSql(database_id, sql, limit = 200) {
 const READ_ONLY_TOOLS = new Set([
   "list_databases",
   "get_database_schema",
+  "get_table_relationships",
   "get_field_values",
   "search_columns", // 跨库列级检索（查 system.columns 系统目录，只读）
   "list_cards",
@@ -376,8 +406,8 @@ const TOOLS = [
     },
     async run({ database_id, table, search, include_fields, detail }) {
       const wantFields = Boolean(table) || include_fields === true;
-      // skip_fields 是官方参数：只取表清单时用它，避免一次拉回所有表的所有字段。
-      const r = await mb(`/database/${database_id}/metadata${wantFields ? "" : "?skip_fields=true"}`);
+      // 统一走带 TTL 的整库元数据缓存；skip_fields 只是 API 侧减负，本地始终存全量、按需裁字段。
+      const r = await getDatabaseMetadata(database_id, { skipFields: !wantFields });
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
       const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
       if (!tables.length) {
@@ -510,7 +540,7 @@ const TOOLS = [
       }
       const cap = Math.min(Math.max(Number(limit) || 50, 1), 500);
 
-      const r = await mb(`/database/${database_id}/metadata`);
+      const r = await getDatabaseMetadata(database_id);
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
       const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
       const needle = String(table).trim().toLowerCase();
@@ -1030,7 +1060,8 @@ const TOOLS = [
       }
       if (type === "table") {
         if (database_id == null) return json("table 类型需要提供 database_id。", true);
-        const r = await mb(`/database/${database_id}/metadata?skip_fields=true`);
+        // 走整库元数据缓存（全量），这样 hit.fields 才有内容——之前用 skip_fields=true 导致字段永远为空。
+        const r = await getDatabaseMetadata(database_id);
         if (!r.ok) return json(`[${r.status}] 未找到库 ${database_id}`, true);
         const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
         const needle = String(id).trim().toLowerCase();
@@ -1050,6 +1081,54 @@ const TOOLS = [
         });
       }
       return json(`未知资源类型：${type}`, true);
+    },
+  },
+  {
+    name: "get_table_relationships",
+    description:
+      "查看数据库里表与表之间的外键关联关系（谁引用了谁），用于写跨表 JOIN 时直接确认 ON 的左右键，" +
+      "而不是凭列名猜别的表也有同名列。返回每个表的外键边：从表.列 → 被引用的表.列。" +
+      "基于 Metabase 元数据里的 fk_target_field_id（管理员须在 Metabase 后台确认这些外键已正确定义）；" +
+      "若某张表没有任何外键，则不在结果里出现。与 search_columns 互补：本工具给「已定义的外键」，search_columns 给「按列名猜的候选列」。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）" },
+        table: { type: "string", description: "只看某张表的外键（可选；不填则返回整库关系）" },
+      },
+      required: ["database_id"],
+    },
+    async run({ database_id, table }) {
+      const r = await getDatabaseMetadata(database_id);
+      if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
+      const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
+      if (!tables.length) return json(`数据库 ${database_id} 未返回表（可能元数据未同步或该 API Key 无权限）。`);
+      const fieldIndex = buildFieldIndex(tables);
+      const edges = [];
+      for (const t of tables) {
+        for (const f of t.fields || []) {
+          if (!f.fk_target_field_id) continue;
+          const target = fieldIndex.get(f.fk_target_field_id);
+          if (!target) continue;
+          edges.push({
+            table: t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name,
+            column: f.name,
+            references: target,
+          });
+        }
+      }
+      if (table) {
+        const needle = String(table).trim().toLowerCase();
+        const matched = edges.filter((e) => e.table.toLowerCase() === needle);
+        if (!matched.length) {
+          return json(`表「${table}」没有外键（或 Metabase 未定义其 FK）。JOIN 关联键请改用 search_columns 按列名定位。`, true);
+        }
+        return json({ table: needle, relationships: matched });
+      }
+      if (!edges.length) {
+        return json("本库没有任何外键关联（Metabase 元数据里未定义 FK）。跨表关联键请改用 search_columns 按列名定位。", true);
+      }
+      return json({ database_id, relationshipCount: edges.length, relationships: edges });
     },
   },
 ];
