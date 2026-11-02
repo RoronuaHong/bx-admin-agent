@@ -272,6 +272,12 @@ type ChatEventBody =
        * 调度侧据此把定时任务如实记为 failed 并推送企业 IM（没有 error 事件，正文只是人话说明）。
        */
       modelStatus?: string;
+      /**
+       * 所有候选模型都因「额度 / 余额耗尽（402）」失败：提示文案从「切换到仍有额度的模型」
+       * 改为「所有候选模型额度均已耗尽，请充值 / 续费」——已无模型可切，再建议切换是误导。
+       * 仅在 modelStatus 为 402 且有多个候选失败时才有意义。
+       */
+      modelStatusAllExhausted?: boolean;
     }
   | { type: "done" }
   /**

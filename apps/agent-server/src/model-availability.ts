@@ -115,11 +115,35 @@ export type ModelAvailabilityStatus =
 export function modelAvailabilityStatus(failure: string | null): ModelAvailabilityStatus | null {
   const msg = String(failure || "");
   const http = msg.match(/model http (400|401|402|403|404|408|413|422|429|500|502|503|504|529)\b/i);
-  if (http) return http[1] as ModelAvailabilityStatus;
-  if (isDailyQuotaFailure(msg)) return "429";
+  if (http) {
+    const code = http[1] as ModelAvailabilityStatus;
+    // 免费额度当日耗尽常被上游标成 429，但本质是「额度 / 余额没了」而不是限流；
+    // 归到 402 才能让文案写成「欠费 / 额度耗尽」，而不是误导成「请求过于频繁」。
+    if (code === "429" && isDailyQuotaFailure(msg)) return "402";
+    return code;
+  }
   if (/模型服务暂时不可用/.test(msg)) return "503";
-  if (isQuotaFailure(msg)) return "402";
+  // 每日免费额度耗尽 / 通用额度·余额·未开通 → 统一归 402（欠费或额度耗尽），与限流 429 区分开。
+  // 旧实现把免费额度耗尽硬映射成 429，会把「额度没了」误报成「限流」，群里无从判断要不要充钱。
+  if (isDailyQuotaFailure(msg) || isQuotaFailure(msg)) return "402";
   return null;
+}
+
+/**
+ * 候选循环里每个失败候选的状态码累计后，判断是否「全部因同一个码失败」。
+ * 返回该统一码；只要有一个不同或**未归类（null/undefined）**就返回 null —— 后者很关键：
+ * 若 3 个候选里 2 个 402、1 个原因未知，绝不能误判成「全部 402 耗尽」，否则「切换到仍有额度的模型」
+ * 被换掉，反而漏掉了那个因别的原因挂掉的模型。用于在「所有模型都 402 额度耗尽」时
+ * 把提示从「切换到仍有额度的模型」改成「所有候选模型额度均已耗尽，请充值 / 续费」。
+ */
+export function uniformFailureStatus(
+  statuses: ReadonlyArray<ModelAvailabilityStatus | null | undefined>,
+): ModelAvailabilityStatus | null {
+  if (statuses.length === 0) return null;
+  const first = statuses[0];
+  // 任一候选未归类（null/undefined）或与其他候选不同，都算「没有统一码」。
+  if (!first) return null;
+  return statuses.every((s) => s === first) ? first : null;
 }
 
 /** 某个键此刻是否在冷却中（对话模型与 Jev 共用同一张表，判据一致）。 */
@@ -152,9 +176,10 @@ export function noteDailyQuotaExhausted(modelId: string, now = Date.now()): numb
   const coolingMs = dailyQuotaCooldownMs(now);
   const until = now + coolingMs;
   quotaCooldownUntil.set(modelId, until);
-  quotaCooldownStatus.set(modelId, "429");
+  // 每日免费额度耗尽本质属「额度 / 余额没了」，与 modelAvailabilityStatus 的归口一致，记 402 而非 429。
+  quotaCooldownStatus.set(modelId, "402");
   if (modelCooldownPersistenceEnabled()) {
-    void persistModelCooldown({ modelId, until, status: "429", at: now });
+    void persistModelCooldown({ modelId, until, status: "402", at: now });
   }
   return coolingMs;
 }

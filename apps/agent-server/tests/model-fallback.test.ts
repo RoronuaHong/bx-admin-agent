@@ -28,7 +28,8 @@ test("402、500、429 都立刻换模型；当日额度用尽才按日切冷却�
   expect(isDailyQuotaFailure(daily)).toBe(true);
   expect(isModelDownFailure(daily)).toBe(true);
   expect(isTransientModelError(daily)).toBe(false);
-  expect(modelAvailabilityStatus(daily)).toBe("429");
+  // 每日免费额度耗尽本质是「额度 / 余额没了」，归 402（欠费 / 额度耗尽），不再是 429 限流。
+  expect(modelAvailabilityStatus(daily)).toBe("402");
   expect(isDailyQuotaFailure("model http 429: FreeUsageLimitError")).toBe(true);
   expect(isTransientModelError(brief)).toBe(false);
   // 第 5 批 C2（§4.4 三类分层）：分钟级限流也是模型级失败——进冷却表、切候选，
@@ -42,12 +43,20 @@ test("402、500、429 都立刻换模型；当日额度用尽才按日切冷却�
   expect(isTransientModelError("model http 503: 模型服务暂时不可用")).toBe(false);
   expect(isModelDownFailure("model http 503: 模型服务暂时不可用")).toBe(false);
   expect(modelAvailabilityNotice("503")).toContain("503");
-  expect(modelAvailabilityNotice("503")).toContain("仍然失败");
+  expect(modelAvailabilityNotice("503")).toContain("请稍后重试");
   expect(modelAvailabilityNotice("429")).toContain("429");
   expect(modelAvailabilityNotice("429")).not.toContain("{");
   const raw = 'model http 402: {"error":{"message":"insufficient_quota"}}';
-  expect(partialInterruptLine(raw)).toContain("402");
-  expect(partialInterruptLine(raw)).not.toContain("insufficient_quota");
+  const partial402 = partialInterruptLine(raw);
+  expect(partial402).toContain("402");
+  // 中段失败也要说清原因 + 建议，不能只甩一个裸码（与无输出路径口径一致）。
+  expect(partial402).toContain("模型额度或余额不足");
+  expect(partial402).toContain("请充值");
+  expect(partial402).not.toContain("insufficient_quota");
+  // 所有候选都 402 额度耗尽时，中段提示也改成「全部耗尽，请充值」。
+  const partialExhausted = partialInterruptLine(raw, true);
+  expect(partialExhausted).toContain("所有候选模型额度均已耗尽，请充值 / 续费");
+  expect(partialExhausted).not.toContain("切换到仍有额度的模型");
   expect(partialInterruptLine("socket hang up")).toBe(
     `生成中断，详情见服务端日志（以上为中断前的中间结果，可能不完整）`,
   );
@@ -56,7 +65,7 @@ test("402、500、429 都立刻换模型；当日额度用尽才按日切冷却�
     expect(modelAvailabilityStatus(`model http ${code}: detail`)).toBe(code);
     expect(isTransientModelError(`model http ${code}: detail`)).toBe(false);
     expect(modelAvailabilityNotice(code)).toContain(code);
-    expect(modelAvailabilityNotice(code)).toContain("仍然失败");
+    expect(modelAvailabilityNotice(code)).toContain("这次没有完成");
   }
   expect(isModelDownFailure("model http 401: unauthorized")).toBe(true);
   expect(isModelDownFailure("model http 403: forbidden")).toBe(true);

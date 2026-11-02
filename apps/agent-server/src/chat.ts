@@ -113,6 +113,7 @@ import {
   isDailyQuotaFailure,
   isModelDownFailure,
   modelAvailabilityStatus,
+  uniformFailureStatus,
   noteDailyQuotaExhausted,
   noteDownFailure,
   quotaCooldownStatus,
@@ -249,34 +250,60 @@ export {
   type ModelAvailabilityStatus,
 } from "./model-availability.js";
 
-/** 写进任务对话和钉钉的一句说明。不带上游原文，避免把一长段 JSON 当成结论。 */
-export function modelAvailabilityNotice(status: ModelAvailabilityStatus): string {
-  const why: Record<ModelAvailabilityStatus, string> = {
-    "400": "请求不被该模型接受",
-    "401": "鉴权失败",
-    "402": "额度或权限不足",
-    "403": "没有调用权限",
-    "404": "模型不存在",
-    "408": "模型服务超时",
-    "413": "请求内容过大",
-    "422": "请求无法处理",
-    "429": "请求过于频繁",
-    "500": "模型服务异常",
-    "502": "网关暂时不可用",
-    "503": "模型服务暂时不可用",
-    "504": "模型服务超时",
-    "529": "模型服务过载",
-  };
-  return `这次没有完成：模型返回 ${status}（${why[status]}）。已尝试更换模型，仍然失败。`;
+/**
+ * 写进任务对话和钉钉的一句说明。不带上游原文，避免把一长段 JSON 当成结论。
+ * 按最佳实践（发生了什么 / 为什么 / 下一步做什么）给每个状态码「原因 + 可操作建议」，
+ * 而不是笼统一句「失败」。重点是把 402（欠费 / 额度耗尽）与 429（限流）说清楚——
+ * 群里的运维要能一眼判断「该充钱」还是「该等一会」。
+ */
+/**
+ * 每个状态码的「原因 + 可操作建议」，供正文说明复用。
+ * 单一可信来源：modelAvailabilityNotice（无输出收束）与 partialInterruptLine（中段失败）都读它，
+ * 避免两条路径把同一个码写出两种不同的说明。
+ */
+const MODEL_STATUS_INFO: Record<ModelAvailabilityStatus, { reason: string; hint: string }> = {
+  "400": { reason: "请求不被该模型接受", hint: "请检查任务指令是否被该模型支持" },
+  "401": { reason: "鉴权失败（密钥无效或过期）", hint: "请检查 API 密钥配置" },
+  "402": { reason: "模型额度或余额不足（欠费或额度耗尽）", hint: "请充值 / 续费，或切换到仍有额度的模型" },
+  "403": { reason: "没有调用权限", hint: "请确认该密钥是否开通此模型" },
+  "404": { reason: "模型不存在", hint: "请确认模型名称是否正确" },
+  "408": { reason: "模型服务超时", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "413": { reason: "请求内容过大", hint: "请精简任务指令或输入内容" },
+  "422": { reason: "请求无法处理", hint: "请检查指令格式是否符合模型要求" },
+  "429": { reason: "请求过于频繁（触发限流）", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "500": { reason: "模型服务异常", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "502": { reason: "网关暂时不可用", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "503": { reason: "模型服务暂时不可用", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "504": { reason: "模型服务超时", hint: "已尝试更换模型仍失败，请稍后重试" },
+  "529": { reason: "模型服务过载", hint: "已尝试更换模型仍失败，请稍后重试" },
+};
+
+/** 402 且「所有候选模型都额度耗尽」时的专属建议：已无模型可切，重点是充值 / 续费。 */
+const EXHAUSTED_402_HINT = "所有候选模型额度均已耗尽，请充值 / 续费";
+
+/** 取某状态码的可操作建议；402 且全耗尽时换成更贴切的版本（再建议切换是误导）。 */
+function availabilityHint(status: ModelAvailabilityStatus, allExhausted: boolean): string {
+  if (status === "402" && allExhausted) return EXHAUSTED_402_HINT;
+  return MODEL_STATUS_INFO[status].hint;
 }
 
-/** 给用户看的中断说明。认得出状态码就只写码；认不出就不要把上游 JSON 贴进气泡。 */
+/** 写进任务对话和钉钉的一句说明（无输出收束时）。不带上游原文，避免把一长段 JSON 当成结论。 */
+export function modelAvailabilityNotice(status: ModelAvailabilityStatus, allExhausted = false): string {
+  const info = MODEL_STATUS_INFO[status];
+  return `这次没有完成：模型返回 ${status}（${info.reason}）。${availabilityHint(status, allExhausted)}。`;
+}
+
+/** 给用户看的中断说明（中段失败、已有部分输出时）。认得出状态码就连原因 + 建议一起说；认不出就不要把上游 JSON 贴进气泡。 */
 export const UNCLASSIFIED_MODEL_FAILURE = "模型没有返回结果，详情见服务端日志";
 
-export function partialInterruptLine(failure: string): string {
+export function partialInterruptLine(failure: string, allExhausted = false): string {
   const status = modelAvailabilityStatus(failure);
-  const why = status ? `生成因模型返回 ${status} 中断` : "生成中断，详情见服务端日志";
-  return `${why}（以上为中断前的中间结果，可能不完整）`;
+  if (status) {
+    const info = MODEL_STATUS_INFO[status];
+    // 与 modelAvailabilityNotice 同口径：说清「哪个码 + 为什么 + 下一步」，而不是只甩一个裸码。
+    return `生成因模型返回 ${status}（${info.reason}）中断，${availabilityHint(status, allExhausted)}。（以上为中断前的中间结果，可能不完整）`;
+  }
+  return "生成中断，详情见服务端日志（以上为中断前的中间结果，可能不完整）";
 }
 
 /**
@@ -4558,6 +4585,10 @@ export async function* chatStream(
   }
   let text = "";
   let failure: string | null = null;
+  // 候选循环里每个失败候选的状态码累计：用于判断是否「所有候选都因同一状态码失败」
+  // （典型是账号额度/余额整体耗尽，连付费模型都 402），据此把提示从「切换到仍有额度的模型」改掉。
+  // 含未归类的 null——uniformFailureStatus 藉此识别「并非全同码」，避免误判成全耗尽。
+  const triedStatuses: Array<ModelAvailabilityStatus | null> = [];
   let handles: ToolHandle[] = [];
   let latestTodos: TodoItem[] | null = null;
   let clearedToolResults = 0;
@@ -4730,6 +4761,9 @@ export async function* chatStream(
       break;
     }
     failure = outcome.failure;
+    // 累计本候选的失败状态码（含未归类的 null）：供循环收束时判断「所有候选都因同一码失败」。
+    // 必须每个候选都计入——否则个别候选失败原因不一时，会被 uniformFailureStatus 误判成「全耗尽」。
+    triedStatuses.push(modelAvailabilityStatus(failure));
     // 统一记账入口（第 7 批）：判冷却时长 → 写共享冷却表 → best-effort 落盘，三步在共享模块里，
     // Jev 走同一个入口（此前这套逻辑内联在此，Jev 若各写一份必然漂移）。
     const down = noteDownFailure(m.id, failure);
@@ -4755,6 +4789,10 @@ export async function* chatStream(
     modelFallbacks += 1;
     console.log(`[chat:fallback] model ${m.label} failed (${failure.slice(0, 200)}); trying next candidate`);
   }
+
+  // 所有候选都因同一状态码失败？典型是账号额度/余额整体耗尽（连付费模型都 402）。
+  // 此时「切换到仍有额度的模型」是误导，提示要改成「所有候选模型额度均已耗尽」。
+  const allExhausted402 = uniformFailureStatus(triedStatuses) === "402";
 
   // 进程级指标（P1 可观测）+ 成本硬配额累计：一次运行记一行。
   incCounter("bx_agent_runs_total", "对话运行次数（按结果）", { status: failure ? "error" : "ok" });
@@ -4801,6 +4839,8 @@ export async function* chatStream(
     classifierFailures: classifierStats.failures,
     costTokens,
     ...(availability ? { modelStatus: availability } : {}),
+    // 所有候选都 402 额度耗尽：透传给调度侧，让钉钉/对话提示改成「全部耗尽，请充值」。
+    ...(allExhausted402 && availability === "402" ? { modelStatusAllExhausted: true } : {}),
   };
 
   if (failure) {
@@ -4828,14 +4868,14 @@ export async function* chatStream(
       }
       yield {
         type: "text",
-        text: `${text.trim()}\n\n⚠️ ${partialInterruptLine(failure)}`,
+        text: `${text.trim()}\n\n⚠️ ${partialInterruptLine(failure, allExhausted402)}`,
       };
     }
     if (!text.trim() && availability && !signal?.aborted) {
       // 定时任务靠这段正文告知 402 / 500 / 429，不把上游 JSON 写进对话。状态码同时挂在 usage
       // 事件（modelStatus）上：调度侧据此把本期记为 failed 并推送企业 IM——
       // 模型状态码失败每一期都推（用户要求：除非所有模型都不可用，否则必须有正确输出）。
-      yield { type: "text", text: modelAvailabilityNotice(availability) };
+      yield { type: "text", text: modelAvailabilityNotice(availability, allExhausted402) };
     } else if (!text.trim() && !signal?.aborted) {
       console.warn(`[chat] 未归类的模型失败：${failure.slice(0, 400)}`);
       yield {

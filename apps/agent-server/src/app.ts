@@ -566,17 +566,21 @@ function ungroundedOfTask(task: ChatTask): boolean {
 }
 
 /** 本期若因 402 / 500 / 429 收束，返回状态码。只认最后一条错误，避免把中途已换掉的模型算成本期结论。 */
-function modelAvailabilityOf(task: ChatTask): ReturnType<typeof modelAvailabilityStatus> {
+function modelAvailabilityOf(task: ChatTask): {
+  status: ReturnType<typeof modelAvailabilityStatus>;
+  allExhausted: boolean;
+} {
   for (let i = task.buffer.length - 1; i >= 0; i--) {
     const event = task.buffer[i];
     if (!event) continue;
     // 优先认 usage 的协议字段：模型不可用失败不带 error 事件（正文只是人话说明）。
     if (event.type === "usage" && event.modelStatus) {
-      return event.modelStatus as ReturnType<typeof modelAvailabilityStatus>;
+      // 所有候选都 402 额度耗尽时，让钉钉/对话提示改成「全部耗尽，请充值」而不是「切换到仍有额度的模型」。
+      return { status: event.modelStatus as ReturnType<typeof modelAvailabilityStatus>, allExhausted: Boolean(event.modelStatusAllExhausted) };
     }
-    if (event.type === "error") return modelAvailabilityStatus(event.message || "");
+    if (event.type === "error") return { status: modelAvailabilityStatus(event.message || ""), allExhausted: false };
   }
-  return null;
+  return { status: null, allExhausted: false };
 }
 
 /** 把任务收束结果写进对话 UI 消息快照（upsertMessages 是全量替换，需先读后并）。 */
@@ -760,6 +764,8 @@ async function deliverScheduleResult(
     finishedAt?: number;
     /** 全部候选模型都因该状态码失败。钉钉写明原因，不用笼统的「失败」。 */
     modelStatus?: ModelAvailabilityStatus;
+    /** 所有候选都因 402（额度/余额耗尽）失败：提示「全部耗尽，请充值」而非「切换到仍有额度的模型」。 */
+    modelStatusAllExhausted?: boolean;
   },
 ): Promise<void> {
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
@@ -875,7 +881,7 @@ async function deliverScheduleResult(
       ...(arming ? { armed: true, purpose: deliveryArmPurpose({ purpose: schedule.purpose, notifyPolicy: policy }) } : {}),
       ...(checkIncomplete ? { checkIncomplete: true } : {}),
       ...(staleChecks ? { staleChecks } : {}),
-      ...(meta?.modelStatus ? { modelStatus: meta.modelStatus, text: modelAvailabilityNotice(meta.modelStatus) } : {}),
+      ...(meta?.modelStatus ? { modelStatus: meta.modelStatus, text: modelAvailabilityNotice(meta.modelStatus, meta.modelStatusAllExhausted) } : {}),
     }),
   );
   if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
@@ -2454,7 +2460,7 @@ export function createApp() {
       await deliverScheduleResult({ ...schedule, conversationId }, final, text, charts, {
         ...runMeta,
         finishedAt,
-        ...(final === "failed" && availability ? { modelStatus: availability } : {}),
+        ...(final === "failed" && availability.status ? { modelStatus: availability.status, modelStatusAllExhausted: availability.allExhausted } : {}),
       }).catch((err) =>
         console.warn(`[scheduler] ${schedule.id} 投递异常：${String((err as Error)?.message || err)}`),
       );
