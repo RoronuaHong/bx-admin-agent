@@ -20,7 +20,7 @@ import {
 } from "./mcp/config.js";
 import { ensureSession, SESSION_COOKIE, touchSession, type Session } from "./session.js";
 import { normalizeTimeZone } from "./list-count.js";
-import { resolveOwner } from "./owner.js";
+import { ensureDefaultOwnerSeeded, resolveOwner } from "./owner.js";
 import { addMemory, clearMemory, listMemory, removeMemory } from "./memory.js";
 import { appendAudit, listAuditEvents, type AuditDecision } from "./audit.js";
 import { incCounter, renderPrometheus } from "./process-metrics.js";
@@ -1081,6 +1081,9 @@ export function createApp() {
     const session = ensureSession(sessionId);
     if (session.id !== sessionId) setCookie(c, COOKIE, session.id, cookieOpts());
     c.set("session", session);
+    // 单用户兜底种子：规范 owner 未知时先从存量对话推一次（推到即落盘，
+    // 之后 getDefaultCanonical 命中缓存，这里只剩一次轻量判断）。
+    await ensureDefaultOwnerSeeded();
     c.set("owner", resolveOwner(c));
     await next();
   };

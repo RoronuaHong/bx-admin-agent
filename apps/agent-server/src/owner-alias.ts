@@ -20,6 +20,37 @@ import { DATA_DIR, atomicWriteJson } from "./store-util.js";
 /** 别名表文件（别名 → 规范 owner）。 */
 const ALIAS_FILE = resolve(DATA_DIR, "owner-aliases.json");
 
+/**
+ * 显式规范 owner（单用户兜底的最终事实）：owner-default.json = { owner }。
+ * 为什么单独落盘：别名表只在「自愈合并」时被写入，而自愈又要求先有规范 owner——
+ * 只靠别名表推导是先有鸡还是先有蛋，规范 owner 永远出不来（IM webview / 新设备永远拿随机身份）。
+ * 种子推导（owner.ts ensureDefaultOwnerSeeded）把从存量数据认定的规范 owner 写进这里。
+ */
+const DEFAULT_FILE = resolve(DATA_DIR, "owner-default.json");
+
+/** 缓存：mtime 未变就不重读（每请求都会调用，别每次都打盘）。 */
+let defaultCache: { mtimeMs: number; owner: string | null } | null = null;
+
+function loadDefault(): string | null {
+  try {
+    const st = statSync(DEFAULT_FILE);
+    if (defaultCache && defaultCache.mtimeMs === st.mtimeMs) return defaultCache.owner;
+    const parsed = JSON.parse(readFileSync(DEFAULT_FILE, "utf-8")) as { owner?: unknown };
+    const owner = typeof parsed?.owner === "string" && parsed.owner ? parsed.owner : null;
+    defaultCache = { mtimeMs: st.mtimeMs, owner };
+    return owner;
+  } catch {
+    // 没有默认 owner 文件 = 正常情况（还没做过种子推导）。
+    return null;
+  }
+}
+
+/** 落盘显式规范 owner（种子推导 / 运维指定）。立刻生效（下一请求即按它解析）。 */
+export function setDefaultCanonical(owner: string): void {
+  atomicWriteJson(DEFAULT_FILE, { owner }, { logLabel: "owner-default" });
+  defaultCache = null;
+}
+
 /** 缓存：mtime 未变就不重读（每请求都会调用，别每次都打盘）。 */
 let cache: { mtimeMs: number; map: Map<string, string> } | null = null;
 
@@ -78,18 +109,21 @@ export function listOwnerAliases(): Record<string, string> {
 /**
  * 取「规范 owner」（数据实际归属的 key）：即别名表里被指向、且自身不是别名的那个目标。
  * 用作单用户本地兜底——无 cookie / 新设备一律回落到它，避免换 host 或清 cookie 后列表为空。
- * 别名表为空或无明确规范目标时返回 null（调用方回落到原始随机签发行为）。
+ * 别名表推不出来时回落到显式落盘的默认 owner（种子推导的产物）；
+ * 两者都没有才返回 null（调用方回落到原始随机签发行为）。
  */
 export function getDefaultCanonical(): string | null {
   const map = loadMap();
-  if (map.size === 0) return null;
-  const targets = new Set(map.values());
-  for (const t of targets) if (!map.has(t)) return t;
-  // 全部 target 自身也是 key（成环/链）：取被指向次数最多的目标作为规范。
-  const counts = new Map<string, number>();
-  for (const v of map.values()) counts.set(v, (counts.get(v) || 0) + 1);
-  let best: string | null = null;
-  let bestN = 0;
-  for (const [k, n] of counts) if (n > bestN) { bestN = n; best = k; }
-  return best;
+  if (map.size > 0) {
+    const targets = new Set(map.values());
+    for (const t of targets) if (!map.has(t)) return t;
+    // 全部 target 自身也是 key（成环/链）：取被指向次数最多的目标作为规范。
+    const counts = new Map<string, number>();
+    for (const v of map.values()) counts.set(v, (counts.get(v) || 0) + 1);
+    let best: string | null = null;
+    let bestN = 0;
+    for (const [k, n] of counts) if (n > bestN) { bestN = n; best = k; }
+    if (best) return best;
+  }
+  return loadDefault();
 }

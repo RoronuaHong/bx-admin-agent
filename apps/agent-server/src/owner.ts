@@ -5,7 +5,8 @@
 import type { Context } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import { randomUUID } from "node:crypto";
-import { canonicalOwner, getDefaultCanonical, setOwnerAlias } from "./owner-alias.js";
+import { listConversations } from "./conversations.js";
+import { canonicalOwner, getDefaultCanonical, setDefaultCanonical, setOwnerAlias } from "./owner-alias.js";
 
 export const OWNER_COOKIE = "bx_agent_oid";
 const OWNER_MAX_AGE = 60 * 60 * 24 * 365; // 1 年：设备标识要长于任何会话 TTL
@@ -44,4 +45,54 @@ export function resolveOwner(c: Context): string {
     return def;
   }
   return can;
+}
+
+// ---- 单用户兜底的「种子」：规范 owner 从存量数据里认出来 ----
+
+/**
+ * 为什么需要：自愈合并（resolveOwner）要先知道规范 owner 才能写别名表，而别名表又只在
+ * 自愈时被写入——没有种子时这是死循环：IM webview / 换设备永远拿到新随机身份，
+ * 「打开对话」深链一律 404（该对话已不存在或无权访问），列表也全空。
+ *
+ * 做什么：既没有别名表、也没有显式默认 owner 时，从存量对话推一个——
+ * 取**最近活跃**对话的 ownerKey（单用户本地部署：正在用系统的人就是数据的归属者）。
+ * 不按对话数取：库里常有历史测试残留（vitest 等），按数量会被测试 owner 抢走规范位。
+ * 落盘为规范 owner（owner-default.json）。推导只发生一次：落盘后 getDefaultCanonical
+ * 命中文件缓存，不再查存储。
+ *
+ * 失败语义：推导失败（如存储层运行期不可用）不阻断请求，下次请求重试
+ * （seeding 在 finally 里清空）；推不出（一条带 owner 的对话都没有）保持原随机签发行为。
+ */
+let seeding: Promise<void> | null = null;
+
+export async function ensureDefaultOwnerSeeded(): Promise<void> {
+  if (getDefaultCanonical()) return;
+  if (!seeding) {
+    seeding = (async () => {
+      // 不按 owner 过滤（ownerKey 缺省 = 遗留数据，对所有人可见，也不参与推导）。
+      const docs = await listConversations(undefined, true);
+      let best: string | null = null;
+      let bestLatest = 0;
+      for (const doc of docs) {
+        const o = doc.ownerKey;
+        if (!o) continue;
+        const latest = doc.updatedAt || 0;
+        if (latest > bestLatest) {
+          best = o;
+          bestLatest = latest;
+        }
+      }
+      if (best) {
+        setDefaultCanonical(best);
+        console.log(`[owner] 单用户兜底：规范 owner 取自最近活跃的存量对话，后续无 cookie / 新设备均回落到它`);
+      }
+    })()
+      .catch((err) => {
+        console.warn(`[owner] 规范 owner 种子推导失败（下次请求重试）：${String((err as Error)?.message || err)}`);
+      })
+      .finally(() => {
+        seeding = null;
+      });
+  }
+  await seeding;
 }
