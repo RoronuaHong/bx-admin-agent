@@ -70,6 +70,7 @@ import {
   createChatSchedule,
   deleteChatSchedule,
   runChatSchedule,
+  restartChatSchedule,
   deleteConversation as apiDeleteConversation,
   deleteNotifyChannel,
   duplicateConversation,
@@ -1086,6 +1087,22 @@ async function runTaskNow(id: string) {
   runningNow.value = { ...runningNow.value, [id]: true };
   try {
     const updated = await runChatSchedule(id);
+    tasks.value = tasks.value.map((x) => (x.id === updated.id ? { ...x, ...updated, runs: updated.runs || x.runs } : x));
+  } catch (err) {
+    window.alert(err instanceof Error ? err.message : String(err));
+  } finally {
+    const next = { ...runningNow.value };
+    delete next[id];
+    runningNow.value = next;
+  }
+}
+
+/** 重启任务：清掉卡在「即将执行」的陈旧请求、重新启用、并触发一期运行。 */
+async function restartTask(id: string) {
+  if (runningNow.value[id]) return;
+  runningNow.value = { ...runningNow.value, [id]: true };
+  try {
+    const updated = await restartChatSchedule(id);
     tasks.value = tasks.value.map((x) => (x.id === updated.id ? { ...x, ...updated, runs: updated.runs || x.runs } : x));
   } catch (err) {
     window.alert(err instanceof Error ? err.message : String(err));
@@ -6618,6 +6635,15 @@ provide(bubbleContextKey, {
               </button>
               <button class="notify-btn" type="button" @click.stop="toggleTask(g.schedule.id)">
                 {{ g.schedule.enabled ? tx("暂停", "Pause", "Pausar", "रोकें") : tx("启用", "Resume", "Retomar", "फिर से चलाएँ") }}
+              </button>
+              <button
+                class="notify-btn"
+                type="button"
+                :disabled="!!runningNow[g.schedule.id]"
+                :title="tx('清掉卡住的「即将执行」、重新启用并跑一期', 'Clear stuck queued state, re-enable and run once', 'Limpa estado travado, reativa e executa uma vez', 'फँसी हुई अवस्था साफ़ करें, पुनः सक्रिय करें और एक बार चलाएँ')"
+                @click.stop="restartTask(g.schedule.id)"
+              >
+                {{ tx("重启", "Restart", "Reiniciar", "पुनः आरंभ") }}
               </button>
               <button class="notify-btn" type="button" @click.stop="openTaskForm(g.schedule)">
                 {{ tx("编辑", "Edit", "Editar", "संपादित करें") }}

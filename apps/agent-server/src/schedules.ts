@@ -763,6 +763,30 @@ export async function requestScheduleRun(
   return next;
 }
 
+/**
+ * 重启：清掉可能卡在「即将执行」的陈旧请求（runRequestedAt），重新启用并补一次启动确认，
+ * 然后请求一期运行。卡死在 runRequestedAt 的任务用「立即执行」无效（requestScheduleRun 见到已置位会直接返回），
+ * 所以重启必须先抹掉 runRequestedAt。
+ */
+export async function restartSchedule(id: string, ownerKey: string): Promise<ChatSchedule | null> {
+  const prev = await getSchedule(id);
+  if (!prev || prev.ownerKey !== ownerKey) return null;
+  const next: ChatSchedule = { ...prev, enabled: true, armPending: true, runRequestedAt: undefined };
+  next.nextRunAt = nextRunAtOf(next);
+  const coll = await getColl();
+  if (!coll) {
+    const { runRequestedAt, armedNotifiedAt, ...rest } = next;
+    memory.set(id, rest);
+  } else {
+    const { runRequestedAt, armedNotifiedAt, ...rest } = next;
+    await coll.updateOne({ id }, { $set: rest, $unset: { runRequestedAt: "", armedNotifiedAt: "" } });
+  }
+  // runRequestedAt 已清除 → requestScheduleRun 才会重新置位并触发一期运行。
+  const requested = await requestScheduleRun(id, ownerKey);
+  kickScheduleLoop();
+  return requested || next;
+}
+
 /** 调度循环的「马上再扫一次」。没启动循环时是空操作（测试直接调 schedulerTick）。 */
 let kickSchedule: (() => void) | null = null;
 export function kickScheduleLoop(): void {

@@ -884,6 +884,14 @@ export async function runChatSchedule(id: string, reason?: string): Promise<Sche
   return data.schedule;
 }
 
+/** 重启任务：清掉卡在「即将执行」的陈旧请求、重新启用、并触发一期运行。 */
+export async function restartChatSchedule(id: string): Promise<ScheduleDto> {
+  const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}/restart`, {
+    method: "POST",
+  })) as { schedule: ScheduleDto };
+  return data.schedule;
+}
+
 /** 删除任务。结果会话会保留；removedConversations 恒为 0。 */
 export async function deleteChatSchedule(id: string): Promise<{ removedConversations?: number; keptConversations?: number }> {
   const data = (await jsonFetch(`/agent/chat/schedules/${encodeURIComponent(id)}`, {

@@ -121,6 +121,7 @@ import {
   pruneRunsOfConversation,
   registerActiveScheduleRun,
   requestScheduleRun,
+  restartSchedule,
   startScheduleLoop,
   unregisterActiveScheduleRun,
   validateTiming,
@@ -1358,6 +1359,13 @@ export function createApp() {
     const updated = await requestScheduleRun(c.req.param("id"), c.get("owner"), reason);
     if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
     kickScheduleLoop();
+    return c.json({ schedule: updated });
+  });
+
+  // 重启：清掉卡在「即将执行」的陈旧请求、重新启用、并触发一期运行（详见 schedules.restartSchedule）。
+  app.post("/chat/schedules/:id/restart", async (c) => {
+    const updated = await restartSchedule(c.req.param("id"), c.get("owner"));
+    if (!updated) return errorJson(c, 404, "SCHEDULE_NOT_FOUND", "定时任务不存在");
     return c.json({ schedule: updated });
   });
 
