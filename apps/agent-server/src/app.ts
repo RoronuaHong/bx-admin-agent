@@ -772,11 +772,15 @@ async function deliverScheduleResult(
     modelStatusAllExhausted?: boolean;
   },
 ): Promise<void> {
+  const arming = needsArmNotice(schedule);
   const notifyOn: ScheduleNotifyOn[] = schedule.notifyOn?.length ? schedule.notifyOn : ["success", "failed"];
-  if (!notifyOn.includes(status)) return;
+  // 启动确认是管理事件（新建 / 重新启用 / 重启），必须始终发出：
+  // 「仅异常时推」的预警 notifyOn 不含 success，否则正常一期会卡在第 776 行的早返回，启动确认被吞掉。
+  if (!arming && !notifyOn.includes(status)) return;
 
   const policy: ScheduleNotifyPolicy = pickNotifyPolicy(schedule.notifyPolicy);
   if (
+    !arming &&
     !shouldDeliverScheduleResult({
       status,
       text,
@@ -792,7 +796,6 @@ async function deliverScheduleResult(
   let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
   let checkIncomplete = false;
   let staleChecks = 0;
-  const arming = needsArmNotice(schedule);
   const finishedAt = meta?.finishedAt ?? Date.now();
 
   if (policy === "on_alert") {
