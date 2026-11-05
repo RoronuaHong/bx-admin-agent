@@ -14,7 +14,7 @@ import { fsDelete, fsEdit, fsGlob, fsGrep, fsList, fsRead, fsWrite, fsWriteBinar
 export { CHART_TYPES, GRAPH_CHART_TYPES } from "./output-schema.js";
 import { searchDingtalkDoc } from "./tools/dingtalk-doc.js";
 import { buildHtmlReport, chartSvgs, chartFallbackTables, REPORT_CSS, type ReportKpi } from "./report.js";
-import { setConversationTodos } from "./conversations.js";
+import { setConversationTodos, getConversation } from "./conversations.js";
 import { translateField } from "./label-dictionary.js";
 import {
   MAX_CLARIFY_DESC,
@@ -488,15 +488,17 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "manage_schedule",
       "创建 / 暂停 / 恢复 / 删除**定时任务**（到点自动跑一次指令，结果回投到任务专属对话，不刷当前聊天）。" +
         "最佳实践：先在普通对话里试跑一轮、确认口径，再用本工具创建；预警类请带 purpose=alert（或 notifyPolicy=on_alert）。" +
-        "action=create 时必填 prompt（到点要执行的完整指令），时间给 cron（5 段，如 `0 9 * * *` 每天 9 点）" +
-        "或 onceAt（毫秒时间戳，一次性）二者之一；可给 name 便于识别。" +
+        "action=create 时必填 prompt（到点要执行的完整指令）。**prompt 必须逐字照搬用户在对话里写下的原始指令**，" +
+        "连【数据预警】这类标题、换行、字段、阈值都不要改动；**严禁改写、摘要、翻译、精简或换成提问句式**。" +
+        "若用户已用结构化格式（如【数据预警】…）写明，直接传该段原文。" +
+        "时间给 cron（5 段，如 `0 9 * * *` 每天 9 点）或 onceAt（毫秒时间戳，一次性）二者之一；可给 name 便于识别。" +
         "action=pause / resume / delete 时需要 id（先用 list_schedules 查）。" +
         "只在用户明确要求「定时 / 每天 / 每周 / 到点提醒我 / 挂预警」时才创建；创建会弹确认卡，用户批准后才生效。",
       {
         type: "object",
         properties: {
           action: jsonType("string", "create | pause | resume | delete"),
-          prompt: jsonType("string", "action=create 时必填：到点要执行的完整指令（写法与用户直接提问一致）"),
+          prompt: jsonType("string", "action=create 时必填：到点要执行的完整指令。**必须逐字照搬用户在对话中写下的原始指令原文**，禁止改写/摘要/翻译/精简；用户已写【数据预警】等结构时直接传该段原文。"),
           cron: jsonType("string", "action=create 时的 5 段 cron 表达式，如 0 9 * * *"),
           onceAt: jsonType("number", "action=create 时的一次性执行时刻（毫秒时间戳）"),
           name: jsonType("string", "任务名（便于在列表里识别）"),
@@ -1460,6 +1462,27 @@ async function buildPdf(
  * `conversationId` 用于工作区隔离与 todos 落库；
  * `namespace` 用于知识库按角色隔离（默认 "generic"，由调用方按当前角色传入，不暴露给模型）。
  */
+/** 护栏：模型常把用户写好的结构化预警规格（【数据预警】/数据源/异常条件）改写成短版，丢字段/阈值/窗口。
+ * 若来源对话里用户原文带这些标记，返回该句原文，供 manage_schedule 创建时兜底。 */
+const ALERT_MARKER_RE = /【数据预警】|数据源\s*[:：]|异常条件\s*[:：]/;
+async function verbatimAlertSpecFromConversation(conversationId: string): Promise<string | null> {
+  try {
+    const doc = await getConversation(conversationId);
+    const msgs = (doc?.messages || []) as Array<{ role?: string; text?: string }>;
+    // 从近到远找最近一条带标记的用户原文（即用户写好的完整规格）
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m?.role === "user" && ALERT_MARKER_RE.test(String(m.text || ""))) {
+        const t = String(m.text || "").trim();
+        if (t) return t;
+      }
+    }
+  } catch {
+    /* 取不到就信任模型传入的 prompt */
+  }
+  return null;
+}
+
 export async function execBuiltin(
   name: string,
   argsJson: string,
@@ -1507,8 +1530,16 @@ export async function execBuiltin(
       if (!action) return { ok: false, text: "manage_schedule 需要 action" };
       if (!ownerKey) return { ok: false, text: "无法管理定时任务：缺少用户标识" };
       if (action === "create") {
-        const prompt = str(args, "prompt").trim();
+        let prompt = str(args, "prompt").trim();
         if (!prompt) return { ok: false, text: "创建定时任务需要 prompt（到点要执行的指令）" };
+        // 护栏：模型可能把用户写好的结构化规格改写成短版。若来源对话里用户原文带告警标记、
+        // 而模型传入的 prompt 既不含该标记、也不含原文开头，则兜底用用户那句原文，保住完整规格。
+        if (conversationId) {
+          const verbatim = await verbatimAlertSpecFromConversation(conversationId);
+          if (verbatim && !ALERT_MARKER_RE.test(prompt) && !prompt.includes(verbatim.slice(0, 10))) {
+            prompt = verbatim;
+          }
+        }
         const result = await createScheduleTask({
           ownerKey,
           prompt,

@@ -6,7 +6,7 @@ import { Cron } from "croner";
 import { type Collection } from "mongodb";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
-import { getMongoClient, MONGO_DB_NAME } from "./db.js";
+import { getMongoClient, MongoUnavailableError, MONGO_DB_NAME } from "./db.js";
 import {
   alertNextRunAt,
   type AlertMarker,
@@ -182,8 +182,11 @@ async function getColl(): Promise<Collection<ChatSchedule> | null> {
     const client = await getMongoClient();
     const db = client.db(MONGO_DB_NAME);
     return db.collection<ChatSchedule>(COLL);
-  } catch {
-    return null;
+  } catch (err) {
+    // 与 conversations 同口径：只有「冷启动就没连上」才降级内存；运行期掉线显式报错，
+    // 不能静默返回空列表（用户会以为定时任务被删了）。
+    if (err instanceof MongoUnavailableError && err.degradable) return null;
+    throw err;
   }
 }
 // ---- 跨实例分布式锁（agent-infrastructure §8「跨进程任务队列」最小必要补齐）----

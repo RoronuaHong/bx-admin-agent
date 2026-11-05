@@ -7,6 +7,9 @@
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-body);
+  /* 禁止 iOS 在横竖屏切换时自动放大字号（移动端最佳实践）。 */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 .sidebar {
@@ -3859,6 +3862,58 @@
     width: 100%;
     padding: 16px 14px;
   }
+/* 抽屉打开：滑入视口（之前缺这条，移动端点汉堡只出遮罩、侧栏始终停在屏外）。 */
+  .sidebar.open {
+    transform: translateX(0);
+  }
+/* 触摸目标 ≥40px（移动端最佳实践）：发送 / 图标按钮，避免误触。 */
+  .send,
+  .icon-btn {
+    width: 40px;
+    height: 40px;
+  }
+/* 输入框字号提到 16px：iOS 聚焦时若 <16px 会触发整页放大（移动端最佳实践）。 */
+  .field__input,
+  :deep(.field__input) {
+    font-size: 16px;
+  }
+}
+
+/* 触屏设备（无真实 hover）：集中处理「点按放大 / 双击缩放 / 长按选字」等移动端反模式。 */
+@media (hover: none) {
+  a,
+  button,
+  [role="button"],
+  input,
+  textarea,
+  select,
+  label,
+  summary {
+    /* 去掉点按时的灰色高亮块与整页双击缩放（移动端最佳实践）。 */
+    -webkit-tap-highlight-color: transparent;
+    tap-highlight-color: transparent;
+    /* 去掉 300ms 点击延迟、禁止双击缩放（单指仍可捏合缩放）。 */
+    touch-action: manipulation;
+  }
+
+  /* UI 控件长按不选中文字（输入框 / 文本域保留光标选区）。 */
+  button,
+  [role="button"],
+  a,
+  summary {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* 触屏没有真实 hover：关掉位移 / 抬升，避免点按后伪 hover 态「卡住」看起来被放大 / 位移。 */
+  .primary-btn:hover,
+  .send:hover,
+  .tools-flyout__add:hover,
+  .mcp-primary:hover,
+  .icon-btn:hover {
+    transform: none;
+    box-shadow: none;
+  }
 }
 
 /* 桌面端折叠态：侧栏收起、聊天区占满整屏（汉堡按钮负责重新展开）。 */
@@ -4033,9 +4088,11 @@
     min-width: 92px;
     max-width: 132px;
   }
-/* 触摸目标 ≥40px（移动端最佳实践）。 */
-  .send,
-  .icon-btn {
+}
+
+/* 放在文件末尾：base .hamburger(width:38px) 在它之前定义，本块靠后才能在 ≤860px 胜出（同级选择器后者优先）。 */
+@media (max-width: 860px) {
+  .hamburger {
     width: 40px;
     height: 40px;
   }

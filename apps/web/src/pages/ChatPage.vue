@@ -659,8 +659,9 @@ function bubbleHasAlertMarker(b: {
 
 /**
  * 从对话草稿预警任务指令（ChatGPT「先测后跑」）：
- * 优先取「带协议标记的助手气泡」之前最近一条用户话；否则取最近用户话。
- * 用户已写结构化【数据预警】则原样带入，否则包一层失败/短窗口纪律（不臆造工具名）。
+ * 取「带协议标记的助手气泡」之前的所有用户话，优先命中结构化【数据预警】/数据源/异常条件 的那条
+ * （用户写的完整规格），其余情况退回最近一条用户话。这样用户在规格后追加「帮我设为预警」之类
+ * 的短句，不会把前面那整段规格丢掉。命中结构化则原样带入；否则包一层失败/短窗口纪律（不臆造工具名）。
  */
 function draftAlertPromptFromChat(assistantBubble?: {
   role: string;
@@ -682,36 +683,44 @@ function draftAlertPromptFromChat(assistantBubble?: {
     }
   }
 
-  let userText = "";
+  // 锚点之前的所有用户话（从近到远）。结构化规格往往不是「紧邻锚点的那条」——
+  // 比如规格发完、助手出结论后，用户又补一句「设为预警」，要往回找那条带规格的。
+  const userMsgs: string[] = [];
   if (anchor) {
     const idx = bubbles.findIndex((b) => b === anchor || (b.id != null && (anchor as { id?: number }).id === b.id));
     const from = idx >= 0 ? idx : bubbles.length;
     for (let i = from - 1; i >= 0; i--) {
       const t = String(bubbles[i]?.text || "").trim();
-      if (bubbles[i]?.role === "user" && t) {
-        userText = t;
-        break;
-      }
+      if (bubbles[i]?.role === "user" && t) userMsgs.push(t);
     }
-  }
-  if (!userText) {
+  } else {
     for (let i = bubbles.length - 1; i >= 0; i--) {
       const t = String(bubbles[i]?.text || "").trim();
       if (bubbles[i]?.role === "user" && t) {
-        userText = t;
+        userMsgs.push(t);
         break;
       }
     }
   }
-  if (!userText) return null;
+  if (!userMsgs.length) return null;
 
-  const structured = /【数据预警】|数据源\s*[:：]|异常条件\s*[:：]/.test(userText);
-  const prompt = structured
-    ? userText
-    : `【数据预警】\n${userText}\n` +
+  const structuredRe = /【数据预警】|数据源\s*[:：]|异常条件\s*[:：]/;
+  // 完整规格通常是「最实质」的一条用户消息：优先命中结构化标记；
+  // 否则在「非闲聊短句」里取最长的一条（用户写的规格最长，「好的 / 帮我设为预警」最短，
+  // 只取最近一条会把整段规格丢掉）。都没有再退回最近一条。
+  const trivial = /^(?:好的|好|行|可以|谢谢|继续|设为预警|帮我设|创建|生成|确定|ok|yes|嗯|对)[\s\p{P}]*$/iu;
+  const substantial = userMsgs.filter((t) => t.length > 12 && !trivial.test(t.trim()));
+  const picked =
+    userMsgs.find((t) => structuredRe.test(t)) ??
+    (substantial.length
+      ? substantial.reduce((best, t) => (t.length > best.length ? t : best), substantial[0])
+      : userMsgs[0]);
+  const prompt = structuredRe.test(picked)
+    ? picked
+    : `【数据预警】\n${picked}\n` +
       `- 失败：取不到完整计数就说取不到，不要猜数、不要估算、不要出图\n` +
       `- 取数：优先短窗口（≤60 分钟）与聚合/计数；列表须最少字段、小分页`;
-  const name = userText.replace(/\s+/g, " ").slice(0, 24);
+  const name = picked.replace(/\s+/g, " ").slice(0, 24);
   const mcpServers = [...(current.value?.settings.mcpEnabled || [])];
   return { prompt, name, mcpServers };
 }
@@ -1692,8 +1701,10 @@ watch(() => current.value.input, () => autoGrow());
 /** 仅最近一条带协议标记的助手结论显示「设为数据预警」，避免历史气泡刷屏。 */
 const latestAlertMarkerId = ref<number | undefined>(undefined);
 /**
- * 只在「气泡数量变化」或「尾部气泡结束流式」时重算，不跟每次 text_delta。
+ * 只在「气泡数量变化」「尾部气泡结束流式」或「尾部结论原地长出/变更告警标记」时重算，不跟每次 text_delta。
  * 之前是在模板里逐气泡调用扫描函数：父渲染因此依赖所有气泡的 text，长对话每帧 O(N²)，是卡顿主因。
+ * 注意 sig 必须包含告警标记位：否则一条助手结论在原地补上 [SPIKE]/[NORMAL] 标记（内容更新、但未增删气泡、
+ * 流式标志也未变）时 watch 不触发，「设为数据预警」对话框入口停在原地不刷新。
  */
 watch(
   () => {
@@ -1702,7 +1713,7 @@ watch(
     const tail = Math.max(0, bubbles.length - 24);
     for (let i = bubbles.length - 1; i >= tail; i--) {
       const b = bubbles[i]!;
-      if (b.role === "assistant") sig += b.streaming ? "1" : "0";
+      if (b.role === "assistant") sig += b.streaming ? "1" : bubbleHasAlertMarker(b) ? "A" : "0";
     }
     return sig;
   },
@@ -1934,6 +1945,15 @@ function queueScrollIfCurrent(convId: string) {
 let followBottom = true;
 function nearBottom(el: HTMLElement, gap = 48): boolean {
   return el.scrollHeight - el.scrollTop - el.clientHeight < gap;
+}
+/**
+ * 「此刻用户是否贴着底部」——**必须在内容变高之前量**。
+ * 新回复/新增量会把容器撑高，之后再量到的已经不是用户原来的位置：自己长出来的那截高度
+ * 会被当成「用户已上滚」，新回复于是不滚动（页面停在原地，压根看不见刚来的回复）。
+ */
+function atBottomNow(): boolean {
+  const el = threadEl.value;
+  return followBottom && (!el || nearBottom(el));
 }
 function onThreadScroll() {
   const el = threadEl.value;
@@ -2212,11 +2232,15 @@ function applyServerThread(convId: string, full: ConversationDto, force: boolean
   if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
   const serverMessages = full.messages || [];
   if (!force && !serverThreadAhead(state.bubbles, serverMessages)) return;
+  // 先量「用户本来贴不贴底部」：内容一多 scrollHeight 就变高，此刻再量已被自己长出来的高度推翻。
+  const wasAtBottom = convId === currentId.value && atBottomNow();
   const times = messageTimes(serverMessages, full.createdAt, full.updatedAt);
   const notices = state.bubbles.filter((bubble) => bubble.role === "notice");
   state.bubbles = [...bubblesFromStored(serverMessages, times), ...notices];
   persistedCount.set(convId, toStored(state.bubbles).length);
-  if (convId === currentId.value && followBottom) queueScroll();
+  // 强制回底：forced 跳过 queueScroll 里两道「还在底部吗」的复核。
+  // 用户本来就在底部时，新回复必须自己滚进视野——否则「停在页面上看着」就永远看不到它。
+  if (wasAtBottom) queueScroll(true);
 }
 
 function tailSig(
@@ -3475,6 +3499,8 @@ interface TurnRun {
  * 把一条服务端事件应用到气泡上。分支在 chat-stream.ts，这里只接上页面自己的滚动和文案。
  */
 function applyChatEvent(run: TurnRun, event: ChatEvent): void {
+  // 事件应用**之前**先量底部位置：增量把气泡撑高之后再量就成了「用户已上滚」，跟着就断了。
+  const wasAtBottom = currentId.value === run.convId && atBottomNow();
   applyStreamEvent(run, event, {
     thinkPhaseEnd,
     thinkPhaseStart,
@@ -3488,6 +3514,8 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
       lastGoodModelId.value = id;
     },
   });
+  // 用户本来贴着底部 → 强制回底，让增量继续跟着走（流式正文要能一路看到底）。
+  if (wasAtBottom) queueScroll(true);
 }
 
 /**
@@ -3776,9 +3804,13 @@ function ensureRunPrompt(state: ConvState, userText: string, startedAt: number):
   const last = state.bubbles[state.bubbles.length - 1];
   const prev = state.bubbles[state.bubbles.length - 2];
   if (belongs(last) || (belongs(prev) && last?.role === "assistant")) return;
+  // 补这条提问会把对话撑高一大截（定时任务的正文很长）：先量「用户本来贴不贴底部」，
+  // 撑高之后强制回底——否则停在页面上的用户压根看不见这一轮从哪开始（看着像"没反应"）。
+  const wasAtBottom = state === current.value && atBottomNow();
   const prompt: Bubble = { id: ++seq, role: "user", at: startedAt, text };
   if (last?.streaming) state.bubbles.splice(state.bubbles.length - 1, 0, prompt);
   else state.bubbles.push(prompt);
+  if (wasAtBottom) queueScroll(true);
 }
 
 /**

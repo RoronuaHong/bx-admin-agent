@@ -102,6 +102,10 @@ interface LangPack {
   elapsed: string;
   at: string;
   open: string;
+  /** 下次预警 / 下次执行的标签。数据预警要在印度时间、北京时间两个时区都显示。 */
+  nextWarn: string;
+  /** 非预警任务的下次执行标签（与 nextWarn 区分语义）。 */
+  nextRun: string;
   empty: string;
   /** 预警检查没跑完时的结论，替代空正文。 */
   checkIncomplete: string;
@@ -146,6 +150,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     elapsed: "耗时",
     at: "时间",
     open: "打开对话",
+    nextWarn: "下次预警",
+    nextRun: "下次执行",
     empty: "（本次未产出内容）",
   /** 预警检查没跑完：不把空结论当成业务结果。原因留在任务对话里。 */
   checkIncomplete: "这次检查没有完成，没有下结论。原因在对应的任务对话里。",
@@ -185,6 +191,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     elapsed: "Duration",
     at: "Time",
     open: "Open chat",
+    nextWarn: "Next alert",
+    nextRun: "Next run",
     empty: "(no output this run)",
     checkIncomplete: "This check did not finish, so there is no conclusion. The reason is in the task chat.",
     staleChecks: (count) =>
@@ -224,6 +232,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     elapsed: "Duração",
     at: "Hora",
     open: "Abrir conversa",
+    nextWarn: "Próximo alerta",
+    nextRun: "Próxima execução",
     empty: "(sem saída nesta execução)",
     checkIncomplete: "Esta verificação não terminou, por isso não há conclusão. O motivo está na conversa da tarefa.",
     staleChecks: (count) =>
@@ -263,6 +273,8 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     elapsed: "अवधि",
     at: "समय",
     open: "चैट खोलें",
+    nextWarn: "अगला अलर्ट",
+    nextRun: "अगला रन",
     empty: "(इस बार कोई आउटपुट नहीं)",
     checkIncomplete: "यह जाँच पूरी नहीं हुई, इसलिए कोई निष्कर्ष नहीं है। कारण कार्य की बातचीत में है।",
     staleChecks: (count) =>
@@ -498,18 +510,23 @@ function dingtalkRequest(
     url.searchParams.set("timestamp", String(timestamp));
     url.searchParams.set("sign", dingtalkSign(channel.secret, timestamp));
   }
-  // 有链接走整体跳转 actionCard：底部一个「打开对话」按钮，点击经 dingtalk:// 在钉钉内嵌 webview 打开
-  // （pc_slide=true = PC 侧边栏，移动端是应用内浏览器），不跳系统浏览器。正文仍是 markdown。
+  // 有链接走整体跳转 actionCard：底部一个「打开对话」按钮 + 正文末尾一条纯文本链接（兜底）。
+  // singleURL 只用标准 http(s) 链接：钉钉机器人 actionCard 的 singleURL 只稳定支持 http(s)，
+  // 早年用的 `dingtalk://dingtalkclient/page/link?url=…&pc_slide=true` 在不少客户端点了没反应
+  // （侧边栏空白、无任何跳转），正是「打开对话显示不出来」的根因。换成 http(s) 后，PC 与移动端都会
+  // 在钉钉内嵌浏览器打开，可正常加载页面。正文末尾再附一条同样链接，防个别客户端不认 singleURL 按钮。
   // 无链接才退回纯 markdown。历史上 actionCard 在部分客户端会把中文按错误编码显示成乱码，但本服务发送时
   // 已显式 charset=utf-8 + 字节级 Content-Length（见 sendToChannel），乱码前提已堵，按钮卡片可放心用。
   if (links.length) {
+    const target = links[0].url.slice(0, 500);
+    const linkLine = `\n\n[${links[0].title.slice(0, 20)}](${target})`;
     const payload = {
       msgtype: "actionCard",
       actionCard: {
         title: title.slice(0, 100),
-        text: body.slice(0, 18000),
+        text: (body.slice(0, 17000) + linkLine).slice(0, 18000),
         singleTitle: links[0].title.slice(0, 20),
-        singleURL: `dingtalk://dingtalkclient/page/link?url=${encodeURIComponent(links[0].url.slice(0, 500))}&pc_slide=true`,
+        singleURL: target,
       },
     };
     return { url: url.toString(), payload };
@@ -666,8 +683,6 @@ export interface ScheduleDeliveryInput {
   status: "success" | "failed" | "alert" | "recovered" | "started";
   /** 启用后的第一期：正文前附启动说明。破线时状态仍是异常，避免把告警写成普通启动。 */
   armed?: boolean;
-  /** 报告和预警的启动说明不同：报告之后每期都推，预警之后仅异常才推。 */
-  purpose?: "report" | "alert";
   text: string;
   conversationId: string;
   webOrigin?: string;
@@ -682,6 +697,12 @@ export interface ScheduleDeliveryInput {
   durationMs?: number;
   /** 展示用时间；缺省为组装时刻。测试可传入固定值。 */
   at?: number;
+  /** 下次预警 / 下次执行的时刻；传入则在记录里用业务时区 + 北京双时区显示。 */
+  nextRunAt?: number;
+  /** 任务业务时区（IANA），如 Asia/Kolkata。决定主时区标签；缺省回落北京。 */
+  timeZone?: string;
+  /** 任务用途；alert 用「下次预警」、其余用「下次执行」。 */
+  purpose?: SchedulePurpose;
   /**
    * 预警执行失败：正文改成「检查没有完成」，不用空结论冒充业务结果。
    * 周期报告的失败仍用原文。模型状态码错误不用这个，改走 modelStatus。
@@ -774,7 +795,16 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
   const record = [
     `${pack.status}：${lang === "zh" ? alertBadgeZh(statusText) : statusText}`,
     ...(triggerText ? [`${pack.trigger}：${triggerText}`] : []),
-    `${pack.at}：${new Date(input.at ?? Date.now()).toLocaleString()}`,
+    `${pack.at}：${formatDualZoneClock(input.at ?? Date.now(), lang, input.timeZone)}`,
+    ...(input.nextRunAt !== undefined
+      ? [
+          `${(input.purpose === "alert" ? pack.nextWarn : pack.nextRun)}：${formatDualZoneClock(
+            input.nextRunAt,
+            lang,
+            input.timeZone,
+          )}`,
+        ]
+      : []),
     ...(input.durationMs !== undefined && input.durationMs >= 0
       ? [`${pack.elapsed}：${formatElapsed(input.durationMs, lang)}`]
       : []),
@@ -1000,6 +1030,50 @@ function formatRunClock(at: number, lang: DeliveryLang): string {
   return new Date(at).toLocaleString(lang === "zh" ? "zh-CN" : lang, { hour12: false });
 }
 
+/**
+ * 数据预警要在两个业务时区都把钟点写出来：印度（IST，UTC+5:30）与北京（CST，UTC+8）。
+ * 用显式 IANA 时区，不依赖服务器本地时区——否则部署在 UTC 机器上会把北京写成 UTC。
+ * 两个时区都按收件人语言渲染（仅中文用「印度时间 / 北京时间」这类标签）。
+ */
+const BEIJING_TZ = "Asia/Shanghai";
+
+function dlLocale(lang: DeliveryLang): string {
+  return lang === "zh" ? "zh-CN" : lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "hi-IN";
+}
+
+function clockInZone(at: number, tz: string, lang: DeliveryLang): string {
+  return new Date(at).toLocaleString(dlLocale(lang), { timeZone: tz, hour12: false });
+}
+
+/**
+ * 业务时区 → 给收件人看的标签。印度预警显示「印度时间」、巴西显示「巴西时间」、北京显示「北京时间」；
+ * 未知时区退化为城市名（IANA 最后一段，下划线转空格）。新增业务地区只需在此补一张表。
+ */
+const ZONE_LABELS: Record<string, Record<DeliveryLang, string>> = {
+  "Asia/Kolkata": { zh: "印度时间", en: "India", pt: "Índia", hi: "भारत" },
+  "Asia/Shanghai": { zh: "北京时间", en: "Beijing", pt: "Pequim", hi: "बीजिंग" },
+  "America/Sao_Paulo": { zh: "巴西时间", en: "Brazil", pt: "Brasil", hi: "ब्राज़ील" },
+};
+
+function businessZoneLabel(tz: string, lang: DeliveryLang): string {
+  const hit = ZONE_LABELS[tz]?.[lang];
+  if (hit) return hit;
+  const city = tz.split("/").pop()?.replace(/_/g, " ") ?? tz;
+  return lang === "zh" ? `${city}时间` : city;
+}
+
+/**
+ * 一个时刻的双时区写法：主时区取任务自身的业务时区（businessTz），副时区固定北京（运营参考时区）。
+ * 业务时区本就是北京时不重复；业务时区缺失则整体回落北京时，保证至少有时区可读。
+ * 这样印度预警自动得到「印度时间 … / 北京时间 …」，巴西任务得到「巴西时间 … / 北京时间 …」。
+ */
+export function formatDualZoneClock(at: number, lang: DeliveryLang = "zh", businessTz?: string): string {
+  const bizTz = businessTz || BEIJING_TZ;
+  const biz = `${businessZoneLabel(bizTz, lang)} ${clockInZone(at, bizTz, lang)}`;
+  if (bizTz === BEIJING_TZ) return biz;
+  return `${biz} / ${businessZoneLabel(BEIJING_TZ, lang)} ${clockInZone(at, BEIJING_TZ, lang)}`;
+}
+
 /** list_schedules 的一行。频率是中文原文，不把 cron 交给模型换算。 */
 export function formatScheduleListLine(
   schedule: {
@@ -1051,6 +1125,8 @@ type ScheduleStatusInput = {
   purpose?: SchedulePurpose;
   firing?: boolean;
   marker?: AlertMarker | null;
+  /** 业务时区（IANA）；决定主时区标签，缺省回落北京。 */
+  timeZone?: string;
 };
 
 /** 给用户看的配置原句。来自已保存的任务，不从工具结果或历史回复推断。 */
@@ -1066,8 +1142,8 @@ export function scheduleStatusSentence(schedule: ScheduleStatusInput, now = Date
   const mins = nextAt !== undefined ? Math.max(1, Math.round((nextAt - now) / 60_000)) : 0;
   const next = nextAt
     ? tightened
-      ? `下次执行：${formatRunClock(nextAt, lang)}（告警未解除，约 ${mins} 分钟后复查）。`
-      : `下次执行：${formatRunClock(nextAt, lang)}。`
+      ? `下次执行：${formatDualZoneClock(nextAt, lang, schedule.timeZone)}（告警未解除，约 ${mins} 分钟后复查）。`
+      : `下次执行：${formatDualZoneClock(nextAt, lang, schedule.timeZone)}。`
     : "";
   return `名称：${name}。状态：${status}。频率：${freq}。${next}`;
 }
@@ -1185,6 +1261,8 @@ export function buildScheduleToggleDelivery(input: {
   locale?: string;
   purpose?: SchedulePurpose;
   notifyPolicy?: ScheduleNotifyPolicy;
+  /** 业务时区（IANA）；决定主时区标签，缺省回落北京。 */
+  timeZone?: string;
   conversationId?: string;
   webOrigin?: string;
 }): DeliveryMessage {
@@ -1203,7 +1281,9 @@ export function buildScheduleToggleDelivery(input: {
   ];
   if (input.enabled) {
     const next = upcomingScheduleRunAt({ ...input, enabled: true }, Date.now());
-    lines.push(next ? `下次执行：${formatRunClock(next, lang)}` : "下次执行：已按频率排期");
+    lines.push(
+      next ? `下次执行：${formatDualZoneClock(next, lang, input.timeZone)}` : "下次执行：已按频率排期",
+    );
     if (input.notifyPolicy === "on_alert") {
       lines.push("通知策略：仅异常时推送（正常 / 无数据不推群）。");
     }

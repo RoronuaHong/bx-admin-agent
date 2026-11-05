@@ -54,7 +54,7 @@ test("[A] 加签：钉钉/飞书算法不同且可复算（钉钉需 URL 编码�
   expect(dingtalkSign(secret, ts)).not.toBe(feishuSign(secret, ts));
 });
 
-test("[B] 钉钉：无链接走 markdown；有链接走 actionCard（打开对话为按钮，dingtalk:// 内嵌打开），加签进 query", async () => {
+test("[B] 钉钉：无链接走 markdown；有链接走 actionCard（按钮与正文链接均为标准 http(s)，钉钉内嵌浏览器打开），加签进 query", async () => {
   const { calls, impl } = fakeFetch();
   await sendToChannel(channel({ secret: "S" }), { title: "T", body: "B" }, { fetchImpl: impl, now: 123 });
   const plain = calls[0]!;
@@ -74,13 +74,12 @@ test("[B] 钉钉：无链接走 markdown；有链接走 actionCard（打开对�
   };
   expect(payload.msgtype).toBe("actionCard");
   expect(payload.actionCard.singleTitle).toBe("打开");
-  // 按钮走 dingtalk://dingtalkclient/page/link：点击在钉钉内嵌 webview 打开，不跳系统浏览器
-  expect(payload.actionCard.singleURL).toBe(
-    "dingtalk://dingtalkclient/page/link?url=https%3A%2F%2Fx%2Fy&pc_slide=true",
-  );
-  // 正文仍是 markdown，且不再把链接折进正文（按钮承载跳转入口）
-  expect(payload.actionCard.text).toBe("B");
-  expect(payload.actionCard.text).not.toContain("dingtalk://");
+  // 按钮用标准 http(s) 链接：钉钉内嵌浏览器打开，避免 dingtalk:// 在部分客户端点了无反应
+  expect(payload.actionCard.singleURL).toBe("https://x/y");
+  expect(payload.actionCard.singleURL).not.toContain("dingtalk://");
+  // 正文保留原 markdown，并在末尾附一条兜底链接（客户端不认 singleURL 按钮时仍可点开）
+  expect(payload.actionCard.text).toContain("B");
+  expect(payload.actionCard.text).toContain("[打开](https://x/y)");
 });
 
 test("[C] 飞书：走交互卡片，密钥进载荷，判定 code 而非 errcode", async () => {
@@ -521,6 +520,58 @@ test("[M] 推送正文：结论在前，记录项各自成段（钉钉会把单�
   expect(msg.body).toContain("\n\n触发：手动执行");
   expect(msg.body).toContain("\n\n耗时：8 秒");
   expect(msg.title).toBe("印度对话量 · 手动执行 · 异常");
+});
+
+test("[O] 数据预警：检查时间与下次预警时间都用业务时区 + 北京双时区显示", () => {
+  const at = Date.parse("2026-10-08T08:04:06Z");
+  // 该时刻北京 16:04:06、印度 13:34:06（IST = UTC+5:30，北京 = UTC+8）。
+  const msg = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "alert",
+    text: "[SPIKE]\n最近 60 分钟 420，阈值 300",
+    conversationId: "c",
+    locale: "zh",
+    at,
+    timeZone: "Asia/Kolkata",
+    purpose: "alert",
+    nextRunAt: Date.parse("2026-10-08T08:14:06Z"),
+  });
+  expect(msg.body).toContain("时间：印度时间");
+  expect(msg.body).toContain("北京时间");
+  expect(msg.body).toContain("13:34:06"); // 印度
+  expect(msg.body).toContain("16:04:06"); // 北京
+  expect(msg.body).toContain("下次预警：印度时间");
+  expect(msg.body).toContain("13:44:06"); // 印度（下次）
+  expect(msg.body).toContain("16:14:06"); // 北京（下次）
+  // 业务时区缺失时回落北京，不强制印度；报告类任务用「下次执行」而非「下次预警」。
+  const report = buildScheduleDelivery({
+    name: "每日巡检",
+    prompt: "巡检",
+    status: "started",
+    purpose: "report",
+    text: "[NORMAL]",
+    conversationId: "c",
+    locale: "zh",
+    at,
+    nextRunAt: Date.parse("2026-10-08T08:14:06Z"),
+  });
+  expect(report.body).toContain("时间：北京时间");
+  expect(report.body).not.toContain("印度时间");
+  expect(report.body).toContain("下次执行：北京时间");
+  expect(report.body).not.toContain("下次预警");
+  // 不传 nextRunAt 时不冒出「下次执行 / 下次预警」这一行。
+  const noNext = buildScheduleDelivery({
+    name: "印度客服对话量预警",
+    prompt: "检查",
+    status: "alert",
+    text: "[NORMAL]",
+    conversationId: "c",
+    locale: "zh",
+    at,
+    timeZone: "Asia/Kolkata",
+  });
+  expect(noNext.body).not.toContain("下次预警");
 });
 
 test("[N] 启动确认：不论本次是否破线，正文都说明已启动，以及之后只在异常时推", () => {

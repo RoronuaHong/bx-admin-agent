@@ -139,6 +139,10 @@ defineExpose({ el });
   font-family: var(--font-body);
   font-size: 14px;
   line-height: 1.5;
+  /* 触屏：去掉聚焦时的高亮闪块、禁止双击缩放（与 ChatPage 移动端规则对齐）。 */
+  -webkit-tap-highlight-color: transparent;
+  tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 .prompt-input::placeholder {
@@ -168,9 +172,13 @@ defineExpose({ el });
 }
 
 /* 窄屏：提示文案先让位给输入区。 */
-@media (max-width: 720px) {
+@media (max-width: 860px) {
   .prompt-hint {
     display: none;
+  }
+  /* iOS 聚焦时若 <16px 会整页放大（移动端最佳实践）。 */
+  .prompt-input {
+    font-size: 16px;
   }
 }
 </style>

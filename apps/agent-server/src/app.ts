@@ -128,6 +128,7 @@ import {
   type ScheduleNotifyOn,
   type ScheduleRunMode,
 } from "./schedules.js";
+import { isMongoUnavailableError, reportMongoFailure, STORAGE_UNAVAILABLE } from "./db.js";
 import {
   createRunConversation,
   createScheduleTask,
@@ -177,6 +178,7 @@ import {
   scheduleRunFacts,
   scheduleStatusSentence,
   taskAsksScheduleStatus,
+  upcomingScheduleRunAt,
 } from "./notify/deliver.js";
 import { MAX_AT_ONCE, getUploadImage, saveUpload } from "./uploads.js";
 
@@ -729,6 +731,7 @@ async function deliverScheduleToggle(schedule: ChatSchedule, enabled: boolean): 
       locale: schedule.locale,
       purpose: schedule.purpose,
       notifyPolicy: schedule.notifyPolicy,
+      timeZone: schedule.timeZone,
       conversationId: schedule.conversationId,
       webOrigin: config.webOrigin,
     }),
@@ -864,6 +867,7 @@ async function deliverScheduleResult(
     }
     return;
   }
+  const nextRunAt = upcomingScheduleRunAt(schedule, meta?.finishedAt ?? Date.now());
   const summary = await deliverToChannels(
     channels,
     buildScheduleDelivery({
@@ -878,6 +882,9 @@ async function deliverScheduleResult(
       ...(meta?.trigger ? { trigger: meta.trigger } : {}),
       ...(meta?.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
       ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
+      ...(nextRunAt !== undefined ? { nextRunAt } : {}),
+      ...(schedule.timeZone ? { timeZone: schedule.timeZone } : {}),
+      ...(schedule.purpose ? { purpose: schedule.purpose } : {}),
       ...(arming ? { armed: true, purpose: deliveryArmPurpose({ purpose: schedule.purpose, notifyPolicy: policy }) } : {}),
       ...(checkIncomplete ? { checkIncomplete: true } : {}),
       ...(staleChecks ? { staleChecks } : {}),
@@ -962,7 +969,15 @@ export function createApp() {
 
   // 全局兜底错误处理：任何 handler 抛出的未捕获异常都收敛成统一的 JSON 错误，
   // 不把内部堆栈/路径泄漏给客户端（信息泄露），同时服务端留痕便于排查。
+  // Mongo 不可用单独分流：它是「存储层故障」而不是程序 bug——可恢复（重连即恢复），
+  // 且必须让调用方知道是存储不可用，别被当成服务端 bug 去查。
+  // （2026-11-05 事故：Mongo 缺凭据 → 接口一律 500 INTERNAL_ERROR，真实原因被淹没。）
   app.onError((err, c) => {
+    if (isMongoUnavailableError(err)) {
+      reportMongoFailure(err);
+      console.error(`[http] MongoDB 不可用 ${c.req.method} ${c.req.path}:`, err);
+      return errorJson(c, STORAGE_UNAVAILABLE.status, STORAGE_UNAVAILABLE.code, STORAGE_UNAVAILABLE.message);
+    }
     console.error(`[http] 未捕获异常 ${c.req.method} ${c.req.path}:`, err);
     return errorJson(c, 500, "INTERNAL_ERROR", "服务端内部错误，详情见服务端日志");
   });
@@ -2333,12 +2348,6 @@ export function createApp() {
         ...(image.mediaType.startsWith("image/") ? {} : { "Content-Disposition": "attachment" }),
       },
     });
-  });
-
-  // 全局兜底：未捕获异常统一返回 JSON 错误（而非 Hono 默认 HTML 500）。
-  app.onError((err, c) => {
-    console.error("[http] unhandled error:", err);
-    return errorJson(c, 500, "INTERNAL_ERROR", "服务器内部错误");
   });
 
   // 未知路由统一返回 JSON 404（而非 Hono 默认 HTML 404）。

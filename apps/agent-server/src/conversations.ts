@@ -10,7 +10,7 @@ import { listModels } from "./config.js";
 import { touchSession, type ChatTurn, type Session } from "./session.js";
 import { loadServers } from "./mcp/config.js";
 import { getRole } from "./roles.js";
-import { getMongoClient, MONGO_DB_NAME } from "./db.js";
+import { getMongoClient, MongoUnavailableError, MONGO_DB_NAME } from "./db.js";
 
 const COLL = "chat_conversations";
 
@@ -216,8 +216,11 @@ async function getColl(): Promise<Collection<ConversationDoc> | null> {
     const coll = db.collection<ConversationDoc>(COLL);
     await ensureIndexes(coll);
     return coll;
-  } catch {
-    return null;
+  } catch (err) {
+    // 只有「冷启动就没连上 Mongo」才降级到内存；运行期掉线/认证失效必须显式报错——
+    // 静默返回空列表会让用户以为会话丢了（数据其实还在库里），比报错危险得多。
+    if (err instanceof MongoUnavailableError && err.degradable) return null;
+    throw err;
   }
 }
 
