@@ -1,0 +1,57 @@
+# bx-admin-agent 容器编排（生产建议：把 mongo 换成外部托管 URI，并前置 HTTPS 反代/Ingress）
+services:
+  # ---- MongoDB（本地/迁移期便捷；生产请用外部托管并改 MONGO_URI）----
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---- 后端 agent-server ----
+  agent-server:
+    build:
+      context: .
+      dockerfile: apps/agent-server/Dockerfile
+    env_file: .env
+    # 容器内固定项（覆盖 .env 同名项，确保容器内监听与数据目录正确）
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      AGENT_DATA_DIR: "/data"
+    volumes:
+      - agent-data:/data
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+    expose:
+      - "8787"
+    healthcheck:
+      # 端口就绪即视为可接入（Mongo 连接失败会在业务层以 503 体现，不阻断入口）
+      test: ["CMD", "node", "-e", "require('net').connect(8787,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---- 前端 web（nginx：静态托管 + 反代 /agent）----
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      agent-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  agent-data:

@@ -1,0 +1,20 @@
+# 依赖与构建缓存（镜像内会重新安装/构建）
+node_modules
+**/node_modules
+**/dist
+
+# 日志与敏感文件（.env 绝不能进镜像；compose 用宿主机 .env 注入）
+**/logs
+**/*.log
+.env
+.env.*
+!.env.example
+
+# 测试与本地开发产物
+apps/agent-server/tests
+**/coverage
+
+# VCS 与系统文件
+.git
+.gitignore
+.DS_Store
