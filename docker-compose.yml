@@ -18,12 +18,17 @@ services:
     build:
       context: .
       dockerfile: apps/agent-server/Dockerfile
-    env_file: .env
-    # 容器内固定项（覆盖 .env 同名项，确保容器内监听与数据目录正确）
+    # 直接复用开发机已有的 .env（含全部模型配置）；该文件已被 .dockerignore 排除，不进镜像。
+    # 下方 environment 覆盖容器必需的几项，避免取到里面的本地值（如 MONGO_URI=127.0.0.0.1）。
+    env_file: apps/agent-server/.env
     environment:
       HOST: "0.0.0.0"
       PORT: "8787"
       AGENT_DATA_DIR: "/data"
+      MONGO_URI: "mongodb://mongo:27017"
+      WEB_ORIGIN: "http://localhost:8080"
+      # 管理令牌：从项目根 .env（已被 gitignore 排除）读取；根 .env 当前为占位值可启动，生产请设强随机串
+      AGENT_ADMIN_TOKEN: "${AGENT_ADMIN_TOKEN}"
     volumes:
       - agent-data:/data
     depends_on:
@@ -46,7 +51,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
     ports:
-      - "80:80"
+      - "8080:80"
     depends_on:
       agent-server:
         condition: service_healthy

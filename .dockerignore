@@ -8,7 +8,10 @@ node_modules
 **/*.log
 .env
 .env.*
+**/.env
+apps/agent-server/.env
 !.env.example
+!.env.prod.example
 
 # 测试与本地开发产物
 apps/agent-server/tests

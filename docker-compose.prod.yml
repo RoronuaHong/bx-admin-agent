@@ -1,0 +1,99 @@
+# ============================================================
+# 生产编排（单机 docker compose）
+#
+# 架构：Caddy(443, 自动 TLS) -> web(nginx 静态 + 反代 /agent) -> agent-server
+#   · 后端 agent-server 不暴露公网，仅在内部网络被 web 反代访问
+#   · MongoDB 使用外部托管（MONGO_URI），不在本编排内（生产不应把 DB 放进应用栈）
+#   · 若需本地/内网自测内置 Mongo，在文末“可选 mongo 块”取消注释并去掉 agent-server 对外部 URI 的依赖
+#
+# 启动：
+#   cp env.prod.example .env.prod
+#   # 编辑 .env.prod：填 DOMAIN / AGENT_ADMIN_TOKEN / MONGO_URI / 模型 key
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# ============================================================
+services:
+  # ---- 边缘：Caddy 终止 TLS（Let's Encrypt 自动证书），仅 80/443 对外 ----
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"   # ACME http-01 挑战所需（生产可保留；纯内网自签可改用 tls internal）
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      DOMAIN: ${DOMAIN}
+    networks: [edge, internal]
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  # ---- 前端：仅内部网络，由 Caddy 反代，不发布端口 ----
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    networks: [internal]
+    depends_on:
+      agent-server:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ---- 后端：仅内部网络，绝不发布端口 ----
+  agent-server:
+    build:
+      context: .
+      dockerfile: apps/agent-server/Dockerfile
+    env_file: .env.prod
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      AGENT_DATA_DIR: "/data"
+    volumes:
+      - agent-data:/data
+    networks: [internal]
+    restart: unless-stopped
+    # 资源上限（单机 compose 用顶层字段即可生效，防止模型调用/MCP 子进程打满机器）
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: "1.0"
+    pids_limit: 200
+    healthcheck:
+      # 端口就绪即视为可接入；Mongo 连接失败在业务层以 503 体现，不阻断入口
+      test: ["CMD", "node", "-e", "require('net').connect(8787,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+# ---- 网络：edge 对外、internal 仅内部（agent-server/web 不可被外部直连）----
+networks:
+  edge:
+  internal:
+    internal: true
+
+volumes:
+  agent-data:
+  caddy-data:
+  caddy-config:
+
+# ---- 可选：本地/内网自测用的内置 Mongo（生产请删除此块，用外部 MONGO_URI）----
+#  services:
+#    mongo:
+#      image: mongo:7
+#      volumes: [mongo-data:/data/db]
+#      healthcheck:
+#        test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+#        interval: 10s
+#        timeout: 5s
+#        retries: 5
+#        start_period: 20s
+#  volumes:
+#    mongo-data:

@@ -1,0 +1,17 @@
+# Caddy 自动 HTTPS：对外只暴露 443（80 用于 ACME 挑战）。
+# DOMAIN 来自容器环境变量（compose 注入），本地自测可设为 localhost（Caddy 用内部 CA 自签）。
+#
+# 流量策略：所有请求（含 /agent/*）统一交给 web 容器，
+# 由 web 内的 nginx 负责静态托管与 /agent 反代到 agent-server（保持与 dev 一致的同源部署）。
+{
+	{$DOMAIN:localhost}
+}
+
+encode gzip
+
+# 可选：若前端/后端需要 WebSocket，可开启（当前聊天用 SSE，无需）
+# 反向代理到内部 web（nginx 已处理 /agent 前缀剥离与 SSE 缓冲关闭）
+reverse_proxy web:80
+
+# 内网/无公网域名场景：用自签证书替代 Let's Encrypt，去掉上面 80 端口发布并改为：
+# tls internal

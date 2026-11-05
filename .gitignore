@@ -19,3 +19,6 @@ dist
 
 # 系统
 .DS_Store
+
+# IDE / agent 项目数据（含消息审计与运行日志，不纳入版本控制）
+.codebuddy/
