@@ -122,6 +122,7 @@ import {
   registerActiveScheduleRun,
   requestScheduleRun,
   restartSchedule,
+  consumeRestart,
   startScheduleLoop,
   unregisterActiveScheduleRun,
   validateTiming,
@@ -766,6 +767,8 @@ async function deliverScheduleResult(
     trigger?: "schedule" | "manual" | "wake";
     durationMs?: number;
     finishedAt?: number;
+    /** 本期由「重启」按钮触发：通知文案写明「已重启」，与普通启动确认区分。 */
+    restart?: boolean;
     /** 全部候选模型都因该状态码失败。钉钉写明原因，不用笼统的「失败」。 */
     modelStatus?: ModelAvailabilityStatus;
     /** 所有候选都因 402（额度/余额耗尽）失败：提示「全部耗尽，请充值」而非「切换到仍有额度的模型」。 */
@@ -791,7 +794,7 @@ async function deliverScheduleResult(
     console.log(`[scheduler] ${schedule.id} 没有结论，不投递`);
     return;
   }
-  let deliveryStatus: "success" | "failed" | "alert" | "recovered" | "started" = status;
+  let deliveryStatus: "success" | "failed" | "alert" | "recovered" | "started" | "restarted" = status;
   let alertStatePatch: ChatSchedule["alertState"] | undefined;
   let lastMarker: ReturnType<typeof parseAlertMarker> | undefined;
   let checkIncomplete = false;
@@ -850,6 +853,10 @@ async function deliverScheduleResult(
     deliveryStatus = "started";
   }
 
+  // 重启触发的一期：状态写成「已重启」，把「这是手动重启出来的运行」说清楚。
+  // 失败的一期保留「失败」状态（不拿重启掩盖错误），但下方仍附重启说明。
+  if (meta?.restart && deliveryStatus !== "failed") deliveryStatus = "restarted";
+
   // 通知由「通道启用」开关控制：任务到点跑完即推送所有启用通道（不再逐任务勾选）。
   const channels = loadChannels().filter((channel) => channel.enabled !== false);
   const failureState = (sent: boolean) =>
@@ -884,6 +891,7 @@ async function deliverScheduleResult(
       ...(charts.length ? { charts } : {}),
       ...(schedule.locale ? { locale: schedule.locale } : {}),
       ...(meta?.trigger ? { trigger: meta.trigger } : {}),
+      ...(meta?.restart ? { restart: true } : {}),
       ...(meta?.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
       ...(meta?.finishedAt !== undefined ? { at: meta.finishedAt } : {}),
       ...(nextRunAt !== undefined ? { nextRunAt } : {}),
@@ -896,7 +904,7 @@ async function deliverScheduleResult(
     }),
   );
   if (!summary.ok) console.warn(`[scheduler] ${schedule.id} 结果投递未全部成功：${summary.error || ""}`);
-  else console.log(`[scheduler] ${schedule.id} 结果已投递 ${summary.sent} 个通道`);
+  else console.log(`[scheduler] ${schedule.id} 结果已投递 ${summary.sent} 个通道（状态：${deliveryStatus}${meta?.restart ? " · 重启" : ""}）`);
   await patchSchedule(schedule.id, schedule.ownerKey, {
     lastDelivery: { at: summary.at, ok: summary.ok, sent: summary.sent, ...(summary.error ? { error: summary.error } : {}) },
     ...(failureState(summary.sent > 0) ? { alertState: failureState(summary.sent > 0) } : {}),
@@ -2382,6 +2390,8 @@ export function createApp() {
     const live = (await getSchedule(schedule.id)) ?? schedule;
     const wake = String(live.wakeReason || schedule.wakeReason || "").trim();
     const runTrigger = wake ? "wake" : (live.runRequestedAt ?? schedule.runRequestedAt) !== undefined ? "manual" : "schedule";
+    // 重启触发的那一期：消费一次性标记，让通知文案写成「已重启」而非普通启动确认。
+    const restart = consumeRestart(schedule.id);
     const runStartedAt = Date.now();
     const task = startTask({
       conversationId,
@@ -2471,7 +2481,7 @@ export function createApp() {
     const marker = isAlertRun ? parseAlertMarker(text) : null;
     const availability = modelAvailabilityOf(task);
     const finishedAt = Date.now();
-    const runMeta = { trigger: runTrigger as "schedule" | "manual" | "wake", durationMs: finishedAt - runStartedAt };
+    const runMeta = { trigger: runTrigger as "schedule" | "manual" | "wake", durationMs: finishedAt - runStartedAt, ...(restart ? { restart: true } : {}) };
     // 落这一期的运行记录（未读 +1、超上限的最旧几期归档）：
     // 必须在 schedulerTick 写回状态之前完成，schedulerTick 会以库里的最新值为基底合并（不会回退）。
     await recordScheduleRun(schedule, conversationId, finishedAt, final, marker || undefined, runMeta);

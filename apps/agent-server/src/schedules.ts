@@ -764,6 +764,22 @@ export async function requestScheduleRun(
 }
 
 /**
+ * 重启标记（进程内一次性）：重启触发的那一期要在渠道通知里标明「已重启」，
+ * 而不是笼统的启动确认。运行投递后由调度 runner 调 consumeRestart 清除。
+ */
+const restartFlags = new Set<string>();
+export function markRestart(id: string): void {
+  restartFlags.add(id);
+}
+export function consumeRestart(id: string): boolean {
+  if (restartFlags.has(id)) {
+    restartFlags.delete(id);
+    return true;
+  }
+  return false;
+}
+
+/**
  * 重启：清掉可能卡在「即将执行」的陈旧请求（runRequestedAt），重新启用并补一次启动确认，
  * 然后请求一期运行。卡死在 runRequestedAt 的任务用「立即执行」无效（requestScheduleRun 见到已置位会直接返回），
  * 所以重启必须先抹掉 runRequestedAt。
@@ -783,6 +799,8 @@ export async function restartSchedule(id: string, ownerKey: string): Promise<Cha
   }
   // runRequestedAt 已清除 → requestScheduleRun 才会重新置位并触发一期运行。
   const requested = await requestScheduleRun(id, ownerKey);
+  // 标注重启：这一期投递时通知文案要写成「已重启」，而非普通启动确认。
+  if (requested) markRestart(id);
   kickScheduleLoop();
   return requested || next;
 }

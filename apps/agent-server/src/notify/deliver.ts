@@ -89,6 +89,14 @@ interface LangPack {
   armedNote: string;
   /** 周期报告的启动确认：之后每期都推，不能写成「仅异常」。 */
   armedNoteReport: string;
+  /** 手动「重启」后第一期：状态行写成「已重启」，与首次启用区分。 */
+  restarted: string;
+  /** 周期报告手动重启后第一期。 */
+  restartedReport: string;
+  /** 预警手动重启确认：说明这是点「重启」触发的，不是首次启用。 */
+  restartNote: string;
+  /** 周期报告手动重启确认。 */
+  restartNoteReport: string;
   task: string;
   /** 任务名本身已不可读时的标题，避免把「??????」再推出去。 */
   unnamed: string;
@@ -140,6 +148,14 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     armedNoteReport:
       "定时任务已启动。这条消息用来确认通知群能收到。\n\n" +
       "本次结果在下面。之后每次执行都会推送。",
+    restarted: "预警已重启",
+    restartedReport: "任务已重启",
+    restartNote:
+      "预警已重启。这是手动点「重启」按钮触发的确认，不是首次启用。\n\n" +
+      "本次检查结果在下面。之后只在异常时推送；正常和无数据不推。",
+    restartNoteReport:
+      "定时任务已重启。这是手动点「重启」按钮触发的确认，不是首次启用。\n\n" +
+      "本次结果在下面。之后每次执行都会推送。",
     task: "任务",
     unnamed: "定时任务",
     status: "状态",
@@ -180,6 +196,14 @@ const LANGS: Record<DeliveryLang, LangPack> = {
       "The check result is below. Later messages go out only on alert; normal and no-data stay quiet. Two normal checks in a row send one recovery note.",
     armedNoteReport:
       "This scheduled task is now on. This message confirms the notification channel works.\n\n" +
+      "This run's result is below. Later runs are pushed every time.",
+    restarted: "Alert restarted",
+    restartedReport: "Task restarted",
+    restartNote:
+      "This alert was restarted. This is the confirmation from a manual “Restart” click, not first enablement.\n\n" +
+      "The check result is below. Later messages go out only on alert; normal and no-data stay quiet.",
+    restartNoteReport:
+      "This scheduled task was restarted. This is the confirmation from a manual “Restart” click, not first enablement.\n\n" +
       "This run's result is below. Later runs are pushed every time.",
     task: "Task",
     unnamed: "Scheduled task",
@@ -222,6 +246,14 @@ const LANGS: Record<DeliveryLang, LangPack> = {
     armedNoteReport:
       "A tarefa agendada está ativa. Esta mensagem confirma que o canal recebe.\n\n" +
       "O resultado desta execução está abaixo. As próximas execuções são enviadas sempre.",
+    restarted: "Alerta reiniciado",
+    restartedReport: "Tarefa reiniciada",
+    restartNote:
+      "O alerta foi reiniciado. Esta é a confirmação de um clique manual em “Reiniciar”, não da primeira ativação.\n\n" +
+      "O resultado desta verificação está abaixo. Depois disso, só anomalias são enviadas; normal e sem dados ficam em silêncio.",
+    restartNoteReport:
+      "A tarefa agendada foi reiniciada. Esta é a confirmação de um clique manual em “Reiniciar”, não da primeira ativação.\n\n" +
+      "O resultado desta execução está abaixo. As próximas execuções são enviadas sempre.",
     task: "Tarefa",
     unnamed: "Tarefa agendada",
     status: "Status",
@@ -262,6 +294,14 @@ const LANGS: Record<DeliveryLang, LangPack> = {
       "इस जाँच का परिणाम नीचे है। आगे केवल असामान्य पर सूचना जाएगी; सामान्य और बिना डेटा चुप रहेंगे। लगातार दो सामान्य जाँच पर एक बहाली सूचना जाएगी।",
     armedNoteReport:
       "यह निर्धारित कार्य चालू है। यह संदेश पुष्टि करता है कि सूचना चैनल पहुँच रहा है।\n\n" +
+      "इस बार का परिणाम नीचे है। आगे हर बार परिणाम भेजा जाएगा।",
+    restarted: "अलर्ट पुनः चालू",
+    restartedReport: "कार्य पुनः चालू",
+    restartNote:
+      "अलर्ट पुनः चालू किया गया। यह मैनुअल “पुनः आरंभ” क्लिक की पुष्टि है, पहली बार चालू करने की नहीं।\n\n" +
+      "इस जाँच का परिणाम नीचे है। आगे केवल असामान्य पर सूचना जाएगी; सामान्य और बिना डेटा चुप रहेंगे।",
+    restartNoteReport:
+      "यह निर्धारित कार्य पुनः चालू किया गया। यह मैनुअल “पुनः आरंभ” क्लिक की पुष्टि है, पहली बार चालू करने की नहीं।\n\n" +
       "इस बार का परिणाम नीचे है। आगे हर बार परिणाम भेजा जाएगा।",
     task: "कार्य",
     unnamed: "अनुसूचित कार्य",
@@ -403,6 +443,8 @@ const ALERT_BADGE_ZH: Record<string, string> = {
   已恢复: `<font color=#2F9E44>🟢 已恢复</font>`,
   预警已启动: `<font color=#4F7CFF>🔵 预警已启动</font>`,
   任务已启动: `<font color=#4F7CFF>🔵 任务已启动</font>`,
+  预警已重启: `<font color=#F5A623>🟠 预警已重启</font>`,
+  任务已重启: `<font color=#F5A623>🟠 任务已重启</font>`,
 };
 
 export function alertBadgeZh(label: string): string {
@@ -680,9 +722,11 @@ export type ScheduleDeliveryTrigger = "schedule" | "manual" | "wake";
 export interface ScheduleDeliveryInput {
   name?: string;
   prompt: string;
-  status: "success" | "failed" | "alert" | "recovered" | "started";
+  status: "success" | "failed" | "alert" | "recovered" | "started" | "restarted";
   /** 启用后的第一期：正文前附启动说明。破线时状态仍是异常，避免把告警写成普通启动。 */
   armed?: boolean;
+  /** 由「重启」按钮触发：正文前附重启说明，状态写成「已重启」，与普通启动确认区分。 */
+  restart?: boolean;
   text: string;
   conversationId: string;
   webOrigin?: string;
@@ -763,14 +807,18 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
       : input.status === "failed"
       ? pack.fail
       : input.status === "alert"
-        ? pack.alert
-        : input.status === "recovered"
-          ? pack.recovered
-          : input.status === "started"
-            ? reportArm
-              ? pack.startedReport
-              : pack.started
-            : pack.ok;
+      ? pack.alert
+      : input.status === "recovered"
+      ? pack.recovered
+      : input.status === "started"
+      ? reportArm
+        ? pack.startedReport
+        : pack.started
+      : input.status === "restarted"
+      ? reportArm
+        ? pack.restartedReport
+        : pack.restarted
+      : pack.ok;
   const triggerText =
     input.trigger === "manual"
       ? pack.triggerManual
@@ -810,7 +858,15 @@ export function buildScheduleDelivery(input: ScheduleDeliveryInput): DeliveryMes
       : []),
   ];
   const armedNote =
-    input.armed || input.status === "started" ? (reportArm ? pack.armedNoteReport : pack.armedNote) : "";
+    input.restart
+      ? reportArm
+        ? pack.restartNoteReport
+        : pack.restartNote
+      : input.armed || input.status === "started"
+      ? reportArm
+        ? pack.armedNoteReport
+        : pack.armedNote
+      : "";
   const body = clampBody(
     [taskHeading, ...(armedNote ? [armedNote] : []), conclusion, ...(chartBlock ? [chartBlock] : []), ...record].join("\n\n"),
     pack,
