@@ -356,3 +356,81 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 3. **评测夹具/跑分器位置（§4.4）**：放哪个目录（须明确不进 `apps/agent-server/src` 运行时）？是否接入 CI？— 强调：不改 `eval-online.ts`。
 4. **B 项 FK 核查责任人（§4.1）**：谁在 Metabase 后台逐条确认 18 条 FK（尤其 `elt_film_order` 自引用与 `action.action→action_config.id`）？
 5. **「问题-表」窄图暴露形态（§4.2）**：作为新 MCP resource 还是新 tool 暴露？由 MCP 侧实现细节定，Agent 无感。
+
+---
+
+## 10. P0 FK 核查清单（18 条，供人工签字）
+
+> 本清单由 §1.1 的 18 条关联关系整理而成，**纯只读梳理，未对 BI Metabase 做任何改动**。请具备 Metabase Admin 权限且熟悉业务的人员在 `Admin → Data Model → 主库` 逐条核对：子表列的语义类型是否为 Foreign Key、且指向的父表/字段是否正确；并在「核查结果」列签字（✅ 正确 / ❌ 错配需修正 / 备注）。
+
+| # | 子表.列 | → 父表.字段 | 关系类型 | 重点核对 | 核查结果（✅/❌/备注） |
+|---|---|---|---|---|---|
+| 1 | elt_user_group.ugId | elt_user_group_config._id | N:1 | | |
+| 2 | elt_user_group_ex.ugId | elt_user_group_config._id | N:1 | 与 #1 同指配置表，确认两子表都正确 | |
+| 3 | elt_ul_activity.userGroupId | elt_user_group_config._id | N:1 | 与 #4 同表不同义（user vs preUser），确认指向 | |
+| 4 | elt_ul_activity.preUserGroupId | elt_user_group_config._id | N:1 | ⚠️ preUserGroup 语义易混，重点确认 | |
+| 5 | elt_user_vip_recharge_log.uid | elt_user_vip_info.uid | N:1 | | |
+| 6 | elt_user_vip_recharge_log.orderId | elt_film_order._id | N:1 | ⚠️ 命名不直白（充值表 orderId 指订单），重点确认 | |
+| 7 | elt_film_order.uid | elt_film_user._id | N:1 | | |
+| 8 | elt_film_order.movieId | elt_film_movie._id | N:1 | 主干边，已自测可 join（T2） | |
+| 9 | elt_film_order.activityId | elt_ul_activity._id | N:1 | ⚠️ 命名不直白，确认指向 activity 而非其他 | |
+| 10 | elt_film_order.srcOrderId | elt_film_order._id | 自引用 N:1 | ⚠️ 自引用方向易配反 | |
+| 11 | elt_film_order.preOrderId | elt_film_order._id | 自引用 N:1 | ⚠️ 自引用方向易配反 | |
+| 12 | elt_film_movie_episode.movieId | elt_film_movie._id | N:1 | | |
+| 13 | elt_film_movie_category_content.movieCategoryId | elt_film_movie_category._id | N:1 | 命名较长，确认列名 | |
+| 14 | elt_watch_detail.mid | elt_film_movie._id | N:1 | | |
+| 15 | elt_watch_detail.eid | elt_film_movie_episode._id | N:1 | | |
+| 16 | elt_ul_activity_device.activityId | elt_ul_activity._id | N:1 | ⚠️ activityId 同时出现在 activity/device，确认指 device→activity | |
+| 17 | elt_user_full.uid | elt_film_user._id | N:1 | 与 #7 同父表不同子表，确认 | |
+| 18 | action.action | action_config.id | N:1 | ⚠️ 命名不直白（action 表.action → action_config.id） | |
+
+**重点核对汇总（6 条高风险）**：#4 preUserGroupId、#6 充值表 orderId、#9 activityId(订单侧)、#10/#11 两条自引用、#16 device.activityId、#18 action.action。建议优先核对这几条。
+
+#### 10.1 自动核对结果（只读 join 验证，2026-11-10，未改 Metabase）
+
+> 方法：对每条边执行 `SELECT 1 ... INNER JOIN ... LIMIT 1`（`elt_film_order` 边加 `createdTime >= '2026-11-01'` 限定），仅只读 SELECT。✅=可连且有匹配数据；⚠️=可执行但 0 匹配（子表值在主表找不到对应行，需人工判断是稀疏/悬空/父表空）；❌=无法执行。
+
+| # | 边 | 结果 | 说明 |
+|---|---|---|---|
+| 1 | elt_user_group.ugId→elt_user_group_config._id | ✅ | 可连有数据 |
+| 2 | elt_user_group_ex.ugId→elt_user_group_config._id | ✅ | 可连有数据 |
+| 3 | elt_ul_activity.userGroupId→elt_user_group_config._id | ⚠️ | 0 匹配，配置行可能为空或 ID 空间不符 |
+| 4 | elt_ul_activity.preUserGroupId→elt_user_group_config._id | ⚠️ | 0 匹配（高风险，preUserGroup 语义） |
+| 5 | elt_user_vip_recharge_log.uid→elt_user_vip_info.uid | ✅ | 可连有数据 |
+| 6 | elt_user_vip_recharge_log.orderId→elt_film_order._id | ✅ | 可连有数据（高风险边，命名不直白但正确） |
+| 7 | elt_film_order.uid→elt_film_user._id | ✅ | 可连有数据 |
+| 8 | elt_film_order.movieId→elt_film_movie._id | ✅ | 可连有数据（T2 已证） |
+| 9 | elt_film_order.activityId→elt_ul_activity._id | ⚠️ | 0 匹配（高风险，仅优惠活动订单有值） |
+| 10 | elt_film_order.srcOrderId→elt_film_order._id | ⚠️ | 0 匹配；T3 显示 23,905 条非空前值却无对应父订单，疑原订单已清理 |
+| 11 | elt_film_order.preOrderId→elt_film_order._id | ✅ | 可连有数据 |
+| 12 | elt_film_movie_episode.movieId→elt_film_movie._id | ✅ | 可连有数据 |
+| 13 | elt_film_movie_category_content.movieCategoryId→elt_film_movie_category._id | ⚠️ | 0 匹配，类目行可能为空 |
+| 14 | elt_watch_detail.mid→elt_film_movie._id | ✅ | 可连有数据 |
+| 15 | elt_watch_detail.eid→elt_film_movie_episode._id | ✅ | 可连有数据 |
+| 16 | elt_ul_activity_device.activityId→elt_ul_activity._id | ⚠️ | 0 匹配（高风险，activityId 同名字段） |
+| 17 | elt_user_full.uid→elt_film_user._id | ✅ | 可连有数据 |
+| 18 | action.action→action_config.id | ❌ | 400；`action`/`action_config` 表在当前 Key 不可见（印度板块权限限制），无法验证，需更广权限人员核查 |
+
+**结论**：18 条边中 **11 条 ✅ 可直接信任**；**6 条 ⚠️ 需人工判断**（多为稀疏/父表空/悬空，未必是错配）；**1 条 ❌ 当前权限下无法验证**（#18，表不在可见范围）。本核对属*技术可连性*验证，**不替代业务正确性签字**（§10 原清单仍由人工在 Admin 确认）。
+
+#### 10.2 深挖诊断（6 条 ⚠️ 根因，2026-11-10，未改 Metabase）
+
+> 对 6 条「能跑通但 0 匹配」的边，额外探 **父表行数 P / 子表非null引用数 C / 原始 join / 字符串化 join**。J_cast 也为 0 → **排除类型不匹配**（非 Text/数值导致），根因是**引用数据缺失**。
+
+| # | 边 | 父表行数 P | 子表非null C | J_raw | J_cast | 根因判定 |
+|---|---|---|---|---|---|---|
+| 3 | elt_ul_activity.userGroupId→elt_user_group_config._id | 68 | **0** | 0 | 0 | 子列全空（死 FK，从未写入，未使用） |
+| 4 | elt_ul_activity.preUserGroupId→elt_user_group_config._id | 68 | **0** | 0 | 0 | 子列全空（死 FK） |
+| 9 | elt_film_order.activityId→elt_ul_activity._id | **0** | 563,834 | 0 | 0 | 父表 `elt_ul_activity` 返回 0 行 → 56万引用悬空 |
+| 10 | elt_film_order.srcOrderId→elt_film_order._id（自引用） | 32,210,110 | 563,834（非0仅 23,905） | 0 | 0 | 56万非null 但无任一对应父订单 → 原订单疑似已清理或 srcOrderId 为跨库订单号 |
+| 13 | elt_film_movie_category_content.movieCategoryId→elt_film_movie_category._id | 748 | **0** | 0 | 0 | 子列全空（死 FK） |
+| 16 | elt_ul_activity_device.activityId→elt_ul_activity._id | **0** | 108,944,655 | 0 | 0 | 父表 `elt_ul_activity` 返回 0 行 → 1.08亿引用悬空 |
+
+**深挖结论**：
+- **#3 / #4 / #13：子表 FK 列全空**——FK 已配但业务从未写入，属"死字段"，低风险；建议在 Metabase Admin 确认这些列是否还需保留，避免误导模型去 join 空关系。
+- **#9 / #16：父表 `elt_ul_activity` 为空（0 行）**——1.08 亿设备活动 + 56 万订单的 `activityId` 全部指向空表，是**实质性数据模型问题**：活动数据疑似未同步 / 存错表 / FK 目标表配错。须人工核查 `elt_ul_activity` 是否真为空、活动数据实际落点。
+- **#10：自引用悬空**——56 万非null `srcOrderId`（仅 23,905 非0）无任一对应父订单 `_id`，原订单疑似已清理或该字段是跨库订单号；须人工确认语义。
+- **稳定性**：18 条边 join 验证共跑 **3 轮完全一致**，结论确定，非偶发。
+- **#18**：`action`/`action_config` 在当前 Key 下不可见（4 探针全 400），维持"权限外、无法验证"，需更广权限人员核查。
+
+**最终交付**：P0 从"18 条盲核"收敛为——**11 条已证可信 / 6 条定位到具体根因（3 死字段 + 2 父表空 + 1 自引用悬空）/ 1 条越权待查**。人工只需在 Admin 复核这 7 条并决策（保留死字段？补活动数据？修正跨库引用？），其余 11 条可直接签字。本核对仍属*技术可连性*验证，**不替代业务正确性签字**。
