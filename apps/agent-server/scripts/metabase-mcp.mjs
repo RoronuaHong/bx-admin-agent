@@ -130,6 +130,7 @@ function asList(data) {
 // fail-closed：不明朗一律拒绝。局限：这是代码层约束；Key 一旦泄露、攻击者直连 Metabase API
 // 即可绕过。真正的只读边界仍须 DB/账号层 GRANT SELECT。
 import { assertSql, buildQueryFeedback, renderFeedbackLine } from "./bi-query-guard.mjs";
+import { buildValueSearchSql, dimensionColumnsFromMeta } from "./bi-value-search.mjs";
 // 静态体检（查表/聚合语句的效率实践）：与只读判定同一个「共享单源」思路——两侧共用一份，
 // 杜绝漂移。fail-open，只提示不拦（误杀合法探索语句比慢一点更糟）。
 import { lintSql, lintSummary } from "./sql-lint-common.mjs";
@@ -142,10 +143,18 @@ import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, norma
 import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
 import { buildCaliberGraph, buildCaliberContext, tableSearchText } from "./bi-caliber-graph.mjs";
 import { evalHiddenTools, evalGateRefusal, heldOutCardIds, hideHeldOut } from "./bi-eval-holdout.mjs";
-import { approvedEntries, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary } from "./bi-semantic.mjs";
+import { approvedEntries, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary, metricDefinitions } from "./bi-semantic.mjs";
 
 // P1.1 实测取值缓存：get_database_schema(with_values=true) 跨调用复用，TTL 由 bi-mschema-values.mjs 管。
 const liveValueCache = createLiveValueCache();
+
+// 2.7：get_golden_set 仅在评测 / 开发环境宣告，生产不暴露评测夹具（避免泄漏原卡片 SQL）。
+// 评测模式（BI_EVAL_HOLDOUT_FILE 已设）、显式 BI_GOLDEN_SET_ENABLED=1，或 NODE_ENV 非 production 时可见。
+function goldenSetEnabled() {
+  if (process.env.BI_EVAL_HOLDOUT_FILE) return true;
+  if (process.env.BI_GOLDEN_SET_ENABLED === "1") return true;
+  return ["development", "test", "dev"].includes(String(process.env.NODE_ENV || "").toLowerCase());
+}
 
 // 口径语义图缓存（P3）：图构建依赖 buildGoldenSet（自身有 TTL 缓存），这里再包一层避免每次工具调用重建共现图。
 // known 每次调用都是新 Set，按内容（而非引用）作缓存键。评测模式有留出卡片时不走缓存：缓存里是全量图。
@@ -378,6 +387,7 @@ const READ_ONLY_TOOLS = new Set([
   "construct_query", // 仅构造/校验查询，不执行
   "read_resource", // 仅读取资产元数据
   "get_metric_definitions", // 读本地口径词典
+  "search_values", // 按值搜索：跨维度列取真实字面值（只读系统目录/事实表，带护栏）
 ]);
 // 说明：execute_sql / query 也走只读闸门（runSql），但它们执行「任意 SQL」，
 // 与 run_native_query 同理不在此名单——是否放行由服务端风险策略（toolRisks / 未知兜底）决定，
@@ -421,8 +431,8 @@ const TOOLS = [
       "② 再本工具传 table=<表名> 取该表字段级定义。" +
       "mode 选 mschema 时输出紧凑 M-Schema Markdown（外键指向显性标出、取值域内联、业务描述前置），是 text2sql 首选呈现；" +
       "default 为原 JSON 输出（兼容旧消费方）。" +
-      "mschema + table 时可选 with_values=true：对枚举类字段额外跑取样查询，用实测去重值（标 live）覆盖 description 里可能过期的手写枚举，" +
-      "代价是首拉延迟上升，默认关闭（ClickHouse 后端不填 fingerprint 取值域，本项对症 doc T4/S9）。" +
+      "mschema + table 时 with_values 默认 true：对枚举类字段额外跑取样查询，用实测去重值（标 live）覆盖 description 里可能过期的手写枚举，" +
+      "代价是首拉延迟上升（约 +1s/表，5min 缓存后 ≈1ms），但能根除过期枚举风险（doc T4/S9）；可显式传 false 关闭。" +
       DETAIL_HINT,
     inputSchema: {
       type: "object",
@@ -439,7 +449,7 @@ const TOOLS = [
         },
         with_values: {
           type: "boolean",
-          description: "仅 mode=mschema 且指定 table 时生效：对枚举类字段额外跑取样查询，用实测去重值覆盖描述里可能过期的枚举；默认 false，开启会增加首拉延迟",
+          description: "仅 mode=mschema 且指定 table 时生效：对枚举类字段额外跑取样查询，用实测去重值覆盖描述里可能过期的枚举；默认 true（最佳实践，根除过期枚举），传 false 可关闭，开启会增加首拉延迟",
         },
         max_value_fields: {
           type: "number",
@@ -479,7 +489,7 @@ const TOOLS = [
           }
           let valueOverrides = null;
           let liveNote = "";
-          if (with_values === true) {
+          if (with_values !== false) {
             // P1.1：只对枚举候选字段取样查询；任何失败都回落原 M-Schema，不影响本次 schema 输出。
             const { overrides, stats } = await fillLiveValues({
               mb,
@@ -584,7 +594,9 @@ const TOOLS = [
       "查的是后端系统目录（system.columns），任意 database_id 连接都看得到全集群列，不需要逐库翻 schema。" +
       "在写跨表 JOIN / 聚合之前先用它定位关联列，而不是凭一张表的字段名猜别的表也有同名列。" +
       "定位到表后，再用 get_database_schema(table=<表名>, mode=mschema) 取该表的字段级 M-Schema 定义（外键/取值域/业务描述前置）。" +
-      "pattern 是列名或注释的子串（不区分大小写），不要带通配符。",
+      "除系统目录外，本工具还会匹配 Metabase 字段描述（业务口径词，如「归因」「国籍」），并把命中的表与 Metabase 白名单比对：" +
+      "命中但不在白名单内的表会标「Metabase 未暴露」（可能已隐藏或属其它库，模型不应直接引用）。" +
+      "pattern 是列名或注释/描述的子串（不区分大小写），不要带通配符。",
     inputSchema: {
       type: "object",
       properties: {
@@ -595,9 +607,155 @@ const TOOLS = [
       required: ["database_id", "pattern"],
     },
     async run({ database_id, pattern, limit }) {
-      const built = buildColumnSearchSql(pattern, { limit });
+      const wid = Number(database_id || process.env.METABASE_DATABASE_ID || 2);
+      const pat = String(pattern || "").trim();
+      const n = Number(limit) > 0 ? Number(limit) : 200;
+      const built = buildColumnSearchSql(pat, { limit: n });
       if (!built.ok) return json(built.error, true);
-      return runSql(database_id, built.sql, Number(limit) > 0 ? Number(limit) : 200);
+      // 主结果：system.columns 列名/注释命中（经 runSql：只读护栏 + 缓存 + 结构化反馈行）。
+      const main = await runSql(wid, built.sql, n);
+      const mainText = main?.content?.[0]?.text ?? "";
+
+      // 2.3：白名单（Metabase 已暴露表）+ 字段描述检索，与暴露范围对齐。
+      const meta = await getDatabaseMetadata(wid);
+      const known = new Set();
+      const descMatches = [];
+      if (meta.ok && Array.isArray(meta.data?.tables)) {
+        for (const t of meta.data.tables) {
+          const fq = t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name;
+          known.add(fq);
+          known.add(t.name);
+          for (const f of t.fields || []) {
+            if (f.description && f.description.toLowerCase().includes(pat.toLowerCase())) {
+              descMatches.push({ table: fq, field: f.name, description: f.description });
+            }
+          }
+        }
+      }
+
+      // 取 system.columns 命中表的去重清单（结构化），标注「Metabase 未暴露」的表。
+      const safe = pat.replace(/\\/g, "\\\\").replace(/'/g, "''").slice(0, 100);
+      const tblSql =
+        `SELECT DISTINCT database, table FROM system.columns ` +
+        `WHERE (name ILIKE '%${safe}%' OR comment ILIKE '%${safe}%') ORDER BY database, table`;
+      const unexposed = [];
+      const tcheck = assertSql(tblSql, { glossary: loadGlossary() });
+      if (tcheck.ok) {
+        const tr = await mb("/dataset", {
+          method: "POST",
+          body: { database: wid, type: "native", native: { query: appendClickHouseSettings(tcheck.sql, defaultClickHouseSettings()) } },
+          query: true,
+        });
+        if (tr.ok && Array.isArray(tr.data?.data?.rows)) {
+          for (const row of tr.data.data.rows) {
+            const [db, tbl] = row;
+            if (!known.has(tbl) && !known.has(`${db}.${tbl}`)) unexposed.push(`${db}.${tbl}`);
+          }
+        }
+      }
+
+      const parts = [mainText];
+      if (descMatches.length) {
+        const lines = descMatches
+          .slice(0, 60)
+          .map((m) => `- ${m.table}.${m.field}：${m.description.slice(0, 120)}`);
+        parts.push(
+          `-- Metabase 字段描述命中（业务描述，库内真实列；可再用 get_database_schema 取该表定义） --\n${lines.join("\n")}`,
+        );
+      }
+      if (unexposed.length) {
+        parts.push(
+          `⚠️ 以下命中表不在 Metabase 白名单（未暴露给 BI，模型不应直接引用，可能已隐藏或属其它库；白名单内真实表才能经 MCP 取数）：\n` +
+            unexposed.slice(0, 60).map((t) => `- ${t}`).join("\n"),
+        );
+      }
+      return json(parts.join("\n\n"), main.isError);
+    },
+  },
+  {
+    name: "search_values",
+    description:
+      "按值搜索：把「业务词 → 库内真实字面值」映射成可检索资产（对齐 Genie 值字典 / Cortex 字面值检索）。" +
+      "模型写过滤 / 分组 / 维度条件前，先用本工具拿到列里的真实取值，而不是凭业务词猜——" +
+      "例如问到「IN8」「FoxA」时，库内真实值可能是 INGoogle8 / FoxA 等，猜值会导致 valueMatch 失分。" +
+      "不传 table/field 时，自动扫描 Metabase 中标记为维度的列（应用码 / 事件名 / 素材 / 归因 等，最多 20 列）进行匹配；" +
+      "传 table+field 可缩小到单列。返回命中列及其去重值，写 SQL 时用这些值。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: {
+          type: "number",
+          description: "Metabase 数据库 id，不传用 METABASE_DATABASE_ID 或默认 2",
+        },
+        pattern: {
+          type: "string",
+          description: "要找的字面子串（不区分大小写），例如 IN8、FoxA、注册",
+        },
+        table: {
+          type: "string",
+          description: "可选：限定到某张表（schema.table 或 table），配合 field 使用",
+        },
+        field: {
+          type: "string",
+          description: "可选：限定到某个字段（仅当同时传 table 时生效）",
+        },
+        limit: {
+          type: "number",
+          description: "每列最多返回的取值数，默认 20，最大 200",
+        },
+      },
+      required: ["pattern"],
+    },
+    async run({ database_id, pattern, table, field, limit }) {
+      const wid = Number(database_id || process.env.METABASE_DATABASE_ID || 2);
+      const n = Number(limit) > 0 ? Math.min(Number(limit), 200) : 20;
+      let columns = [];
+      if (table && field) {
+        columns = [{ table, field }];
+      } else {
+        const meta = await getDatabaseMetadata(wid);
+        columns = dimensionColumnsFromMeta(meta, { max: 20 });
+      }
+      if (!columns.length) {
+        return json("未找到可检索的维度列；请显式传 table + field 指定列。", false);
+      }
+      const results = [];
+      for (const col of columns) {
+        const built = buildValueSearchSql(col.table, col.field, pattern, { limit: n });
+        if (!built.ok) continue;
+        // 执行经只读护栏 + 资源限制（与 runSql 同款设置），SQL 由本工具内部生成（安全只读）。
+        const check = assertSql(built.sql, { glossary: loadGlossary() });
+        if (!check.ok) continue;
+        const tr = await mb("/dataset", {
+          method: "POST",
+          body: {
+            database: wid,
+            type: "native",
+            native: { query: appendClickHouseSettings(check.sql, defaultClickHouseSettings()) },
+          },
+          query: true,
+        });
+        if (tr.ok && Array.isArray(tr.data?.data?.rows)) {
+          const vals = tr.data.data.rows
+            .map((row) => row[0])
+            .filter((v) => v != null && v !== "")
+            .map((v) => String(v).slice(0, 200));
+          if (vals.length) results.push({ table: col.table, field: col.field, values: vals });
+        }
+      }
+      if (!results.length) {
+        return json(
+          `未在任何维度列中找到匹配「${pattern}」的真实取值。可换更具体的词，或显式传 table + field 缩小到单列。`,
+          false,
+        );
+      }
+      const body = results
+        .map((r) => `### ${r.table}.${r.field}\n` + r.values.map((v) => `- ${v}`).join("\n"))
+        .join("\n\n");
+      return json(
+        `库内真实取值（写过滤 / 分组 / 维度条件时用这些，不要凭业务词猜）：\n\n${body}`,
+        false,
+      );
     },
   },
   {
@@ -1418,7 +1576,8 @@ const TOOLS = [
     description:
       "查业务已确认的指标口径（已支付订单、收入金额、时区、国家维度、用户去重主键等的唯一定义与标准 SQL 片段）。" +
       "写涉及这些指标的 SQL 前先查：口径以这里为准，现成卡片与之冲突时按这里写，并在回答里说明。" +
-      "query 按指标名或别名过滤，不传返回全部。",
+      "query 按指标名或别名过滤，不传返回全部。" +
+      "返回可能带 ambiguities（同一指标有多种已确认口径及候选项）；本工具只给信号、不替调用方选口径，是否向用户确认由调用方决定。",
     inputSchema: {
       type: "object",
       properties: {
@@ -1426,16 +1585,8 @@ const TOOLS = [
       },
     },
     async run({ query }) {
-      const entries = approvedEntries(loadGlossary());
-      if (!entries.length) return json("当前没有业务已确认的指标口径。", true);
-      const q = String(query || "").trim().toLowerCase();
-      const hit = q
-        ? entries.filter((e) => [e.name, e.id, ...(e.aliases || [])].some((s) => String(s).toLowerCase().includes(q)))
-        : entries;
-      if (!hit.length) return json(`没有匹配「${query}」的已确认口径。已确认：${entries.map((e) => e.name).join("、")}`, true);
-      return json({
-        definitions: hit.map(({ id, name, aliases, definition, sql, notes, owner, approvedAt }) => ({ id, name, aliases, definition, sql, notes, owner, approvedAt })),
-      });
+      const { value, isError } = metricDefinitions(loadGlossary(), query);
+      return json(value, isError);
     },
   },
 ];
@@ -1459,6 +1610,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (hidden.size) console.error(`[bi-metabase] 评测模式隐藏工具: ${[...hidden].join(", ")}`);
   // 口径词典还没有业务确认的条目时不宣告，避免模型拿到一个永远返回空的工具。
   if (!approvedEntries(loadGlossary()).length) hidden.add("get_metric_definitions");
+  // 2.7：生产环境不暴露评测夹具 get_golden_set（避免泄漏原卡片 SQL）。
+  if (!goldenSetEnabled()) hidden.add("get_golden_set");
   return {
     tools: TOOLS.filter((t) => !hidden.has(t.name)).map(({ name, description, inputSchema }) => ({
       name,
@@ -1482,6 +1635,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (refusal) {
     console.error(`[bi-metabase] tool=${name} 评测留出拒绝`);
     return json(refusal, true);
+  }
+  // 2.7：生产环境即使被直接调用 get_golden_set 也拒绝（纵深防御，与 ListTools 隐藏一致）。
+  if (name === "get_golden_set" && !goldenSetEnabled()) {
+    console.error(`[bi-metabase] tool=get_golden_set 非评测/开发环境拒绝`);
+    return json("get_golden_set 仅在评测 / 开发环境可用（设 BI_EVAL_HOLDOUT_FILE 或 BI_GOLDEN_SET_ENABLED=1，或 NODE_ENV 非 production）。", true);
   }
   try {
     const res = await tool.run(req.params.arguments || {});

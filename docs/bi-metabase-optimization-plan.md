@@ -94,7 +94,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 核查 `metabase-mcp.mjs` 已确认对外工具（均为 MCP 层，Agent 仅调用）：
 
-> 2026-11-12 注：下表是 11-10 评估时的快照，行号已失效。当前共 22 个工具，新增的有 `get_cards_for_table`、`get_related_cards`、`get_golden_set`、`get_join_examples`、`get_caliber_context`、`get_metric_definitions`（仅有已批准口径时宣告），以及 `search`、`execute_query`、`execute_sql`、`query`、`construct_query`、`read_resource`、`list_dashboards`、`get_dashboard`。工具面的问题见 §11.11。
+> 2026-11-12 注（当日复核至 23 个）：下表是 11-10 评估时的快照，行号已失效。`TOOLS` 当前共 **23 个**工具，新增的有 `get_cards_for_table`、`get_related_cards`、`get_golden_set`（仅评测 / 开发环境宣告）、`get_join_examples`、`get_caliber_context`、`get_metric_definitions`（仅有已批准口径时宣告）、`search_values`（按值搜索，2.5），以及 `search`、`execute_query`、`execute_sql`、`query`、`construct_query`、`read_resource`、`list_dashboards`、`get_dashboard`。工具面的问题见 §11.11；工具规范见 `docs/agent/bi-mcp.md` §3。
 
 | MCP 工具 | 现状 | 与本评估的关系 |
 |---|---|---|
@@ -609,7 +609,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 > **本节是「接下来做什么」的唯一入口**。§0–§11.8 保留评估过程与证据，这里只列当前状态与下一步。
 > 边界不变（§0）：只动 `bi-metabase` MCP 层，`apps/agent-server/src/**`（含 `eval-online.ts`）、prompt、模型调用一律未改。
-> 工作区状态：11-12 以来的改动（含本轮）**均未提交**，最后提交为 `4bab839`（P3）。
+> 工作区状态（2026-11-12 复核）：本节写下时改动均未提交、最后提交为 `4bab839`（P3）；此后 HEAD 前进到 `50f98c5`（14:31，`feat(bi): 评测与语义层脚本/测试补全 + 文档同步`，41 文件）；`50f98c5` 之后的改动已随本轮 `feat(bi): 歧义信号、按值搜索修复与进度文档补全` 提交（含 3 个未跟踪文件的 `git add`）。现状以 `docs/bi-metabase-todo.md` 的进度记录与 `git status` 为准。
 > **留一法评测模式下的全量重跑尚未执行**；所有端到端数字（ValidSQL / JoinCorrect / EX）仍来自 11-11 无防泄题的旧报告，只能作参考。
 
 #### A. 已实施（代码 + 离线验证）
@@ -645,7 +645,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 - 统计：按题配对，单轮精确 McNemar、多轮按题重抽样 bootstrap，同时报 pass^k；92 题 Wilson 区间约 ±10 个百分点，**差距小于 10 个点不足以下结论**。
 - 成本：约 400–600 次模型调用、2–2.5 小时，需重启 8787（当前服务正常运行中）。
 - 同时观察：`cardTablesFromSql` 改变 `get_cards_for_table` / `get_related_cards` / 口径图输出后的影响，以及 `get_caliber_context` 对 JoinCorrect 的提升是否成立。
-- 重跑前建议先把 11-12 未提交的改动整理提交，保证报告对得上代码版本（本仓库不自动提交）。
+- 重跑前需确认报告对应的代码版本已入库；阶段 0 已于 2026-11-12 完成提交，之后若有新改动仍须先提交（本仓库不自动提交）。
 
 #### D. 待人工（非代码可完成）
 
@@ -780,3 +780,18 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 验证：全量 `npx vitest run` 131 文件 / 914 测试通过（BI 相关 18 文件 / 149 测试）；真实 BI 只读冒烟（stdio 直连）：工具 21 个、口径检索附 SQL 与文本分、卡片执行带反馈行、透传列放行、按 `ipCountryCode` 分组仍拒。
 
 仍待业务：第 1 项②（IN8 / FOXA 等与 `INGoogle5` / `FoxA` 的对应关系）、第 2 项（默认应用范围）、`device_ip_country` 是否保留、`member_stock` 两种写法以哪个为准、第 7 项清单在 Metabase 里补描述。仍待开发（需拍板后做）：第 1 项③按值搜索工具、第 6 项 `search_columns` 匹配 Metabase 描述、第 8 项歧义信号、第 9 项 `get_golden_set` 仅评测宣告。
+
+> 进展更新（2026-11-12 下午）：上面「仍待开发」四项的**代码均已落地**（2.5 / 2.3 / 2.6 / 2.7），2.2 检索文本也已完成离线复验；后续进度以 `docs/bi-metabase-todo.md` 的进度记录为准。本行是当时的收口快照，「仍待业务」的拍板项依然有效。
+
+**同日下午补记（落地明细；逐项证据与阻塞项见 `docs/bi-metabase-todo.md`）**
+
+| 项 | 落点 | 验证 / 剩余 |
+|---|---|---|
+| 2.3 描述匹配 | `metabase-mcp.mjs` 的 `search_columns` | 匹配 Metabase 字段描述；白名单外表标「Metabase 未暴露」 |
+| 2.5 按值搜索 | `bi-value-search.mjs`（纯函数）+ `search_values` 工具 | 新增 7 例回归；续查修复 `schema.table` 被整批拒绝、`type/Category` 死分支；**真实 BI 冒烟未做（本环境无凭据）** |
+| 2.6 歧义信号 | 词典 5 条 `ambiguous` + `bi-semantic.mjs` 的 `ambiguityFor` / `metricDefinitions` + 工具接线 | 只给信号、草稿不泄漏；真实词典批准态 dry-run 固化为 2 例回归；**当前全 `draft`，线上零变化** |
+| 2.7 评测夹具收口 | `goldenSetEnabled()` | `ListTools` 隐藏 + `CallTool` 纵深拒绝 |
+| 2.2 检索文本复验 | `bi-caliber-eval.mjs` | 留一法 recall@3/5/12 = 0.801 / 0.871 / 0.968，与本节记录一致 |
+| 1.1 默认值同步 | `metabase-mcp.mjs` | `with_values` 默认开启；`docs/agent/bi-mcp.md` §3 已同步 |
+
+全量回归 **180 文件 / 928 用例全绿**、`tsc --noEmit` 0 错误。阶段 3 A/B 用户 2026-11-12 明确**暂时不重跑**，故 2.4 的 token / 轮数净影响仍无端到端结论。

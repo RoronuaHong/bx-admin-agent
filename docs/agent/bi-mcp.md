@@ -21,14 +21,18 @@
 | 工具 | 作用 | 只读性 |
 |---|---|---|
 | `list_databases` | 列出可用数据库 | 只读（元数据） |
-| `get_database_schema` | 某库的表/字段结构（`mode=mschema` 出紧凑 M-Schema；`with_values=true` 可选补实测取值域，默认关闭、会增加首拉延迟） | 只读（元数据） |
+| `get_database_schema` | 某库的表/字段结构（`mode=mschema` 出紧凑 M-Schema；`with_values` **默认开启**（2026-11-12 起）补实测取值域，可显式传 `false` 关闭；首次取表多约 1s，缓存后 ≈1ms） | 只读（元数据） |
 | `get_field_values` | 取字段真实取值域（取证、避免把真实取值当脏数据） | 只读（元数据） |
 | `list_cards` / `get_card` | 列出/获取已保存提问（含其 SQL 与口径） | 只读（元数据） |
 | `list_dashboards` / `get_dashboard` | 列出/获取仪表盘（卡片数组 `dashcards`） | 只读（元数据） |
 | `search` | 按关键字搜卡片/仪表盘/表 | 只读（元数据） |
 | `run_native_query` | 在指定库执行原生 SQL（SELECT/WITH/SHOW/EXPLAIN 等），返回行列文本（默认 200 行，超长截断） | **受服务端只读闸约束（见 §4）** |
+| `search_values` | 按业务词检索白名单维度列的库内真实字面值（对齐值字典；2026-11-12 新增） | 只读（内部生成 SQL，经只读闸 + 口径闸） |
+| `get_metric_definitions` | 查业务已确认的口径定义；命中歧义时附候选项与另一口径定义 | 只读（本地词典） |
 
-> 除 `run_native_query` 外，其余工具均为只读元数据/数据集查询，声明 `readOnlyHint: true`（服务端风险判定第 4 条据此免确认）。
+> 上表是**核心工具节选**；`TOOLS` 当前共 **23 个**工具，完整清单以 `scripts/metabase-mcp.mjs` 为准（2026-11-12 核）。
+> `get_golden_set` 仅评测 / 开发环境宣告；`get_metric_definitions` 仅在词典有 `approved` 条目时宣告（当前词典全为 `draft`，故线上不出现）。
+> 除 `run_native_query` 外，表内其余工具均为只读元数据/数据集查询，声明 `readOnlyHint: true`（服务端风险判定第 4 条据此免确认）。
 
 ## 4. 只读安全模型（sql-readonly 闸）
 

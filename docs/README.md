@@ -125,6 +125,12 @@
 - **状态**：✅ 现行（2026-11-12 建立，事实以该时点代码为准；文中优化项**均未实施**）。
 - **注意**：与主题文档冲突时以各主题现行文档为准；实施优化后回写该文状态行与 §3 冲突清单。
 
+### BI Metabase 专题（2026-11-12）
+- **[bi-metabase-optimization-plan.md](./bi-metabase-optimization-plan.md)**：§11.9 是「接下来做什么」的唯一入口，§0–§11.8 保留评估过程与证据；文内历史「工作区状态」行已按 2026-11-12 复核更新。
+- **[bi-metabase-todo.md](./bi-metabase-todo.md)**：**进度唯一载体**——当日进度记录、阶段 0–4 勾选，以及「待对齐 / 阻塞项」B1–B5（需业务 / 管理员 / 用户结论或资源，逐项附核验证据）。
+- **[bi-metabase-decisions.md](./bi-metabase-decisions.md)**：阶段 1 决策建议书（待拍板快照），顶部已标注未签字状态与当时口径。
+- **注意**：三份文档冲突时以 `bi-metabase-todo.md` 的进度记录为准；改动只落 `apps/agent-server/scripts/*.mjs` 与 `bi-semantic/*.json`，`src/**`、prompt、技能、模型调用不动。
+
 ---
 
 ## 二、计划留档（决策背景；文内 ❌ 多为「改前现状」）

@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import {
+  ambiguityFor,
   approvedEntries,
   buildFkHealth,
   checkCaliber,
@@ -9,6 +10,7 @@ import {
   filterValues,
   loadFkHealth,
   loadGlossary,
+  metricDefinitions,
   parseFkEdge,
 } from "../scripts/bi-semantic.mjs";
 import { renderTableMSchema } from "../scripts/metabase-mschema.mjs";
@@ -136,4 +138,112 @@ test("时区：服务器默认时区与约定一致时，不写时区不算冲�
   expect(implicit.passed).toEqual(["tz"]);
   const kolkata = checkCaliber("SELECT count() FROM t WHERE toDate(createdTime, 'Asia/Kolkata') = '2026-01-01'", tz);
   expect(kolkata.violations.map((v) => v.id)).toEqual(["tz"]);
+});
+
+const ambiguityGlossary = {
+  entries: [
+    {
+      id: "country_dimension",
+      name: "账号国家",
+      aliases: ["国家", "国籍"],
+      status: "approved",
+      definition: "账号注册国",
+      sql: "GROUP BY u.countryCode",
+      ambiguous: {
+        question: "问的是账号注册国还是设备 IP 国？",
+        candidates: [
+          { id: "country_dimension", label: "账号注册国", hint: "u.countryCode" },
+          { id: "device_ip_country", label: "设备 IP 国", hint: "a.ipCountryCode" },
+        ],
+      },
+    },
+    { id: "device_ip_country", name: "设备 IP 所在国", aliases: ["设备分布"], status: "approved", definition: "设备 IP 国" },
+    { id: "revenue_amount", name: "收入金额", aliases: ["流水"], status: "approved", definition: "金额口径" },
+    { id: "draft_one", name: "草稿口径", status: "draft", definition: "未拍板" },
+  ],
+};
+
+test("歧义信号：结构完整才输出；悬空 id、缺问题、候选不足一律不算歧义", () => {
+  const entry = ambiguityGlossary.entries[0];
+  expect(ambiguityFor(entry, ambiguityGlossary)?.candidates.length).toBe(2);
+  expect(ambiguityFor(ambiguityGlossary.entries[2], ambiguityGlossary)).toBeNull();
+  expect(ambiguityFor({ ambiguous: { question: "", candidates: [{ label: "A" }, { label: "B" }] } }, ambiguityGlossary)).toBeNull();
+  expect(
+    ambiguityFor({ ambiguous: { question: "选哪个？", candidates: [{ id: "missing", label: "A" }, { label: "B" }] } }, ambiguityGlossary),
+  ).toBeNull();
+  // 线上口径：候选项指向的条目还没批准时，不能把草稿口径当成一个可选口径告诉模型
+  const oneApproved = { entries: [entry, { id: "device_ip_country", status: "draft" }] };
+  expect(ambiguityFor(entry, oneApproved, { approvedOnly: true })).toBeNull();
+  expect(ambiguityFor(entry, oneApproved)).not.toBeNull();
+});
+
+test("口径定义投影：只给已批准条目；命中歧义时把另一口径的定义一并补齐", () => {
+  const r = metricDefinitions(ambiguityGlossary, "国家");
+  expect(r.isError).toBe(false);
+  const value = r.value as any;
+  expect(value.definitions.map((d: { id: string }) => d.id)).toEqual(["country_dimension", "device_ip_country"]);
+  expect(value.ambiguities).toHaveLength(1);
+  expect(value.ambiguities[0].candidates).toHaveLength(2);
+  expect(value.definitions[0].ambiguous.question).toMatch(/设备/);
+  // 只给信号：投影里不含任何「替调用方选定口径」的字段
+  expect(value.ambiguities[0].choice).toBeUndefined();
+});
+
+test("口径定义投影：无批准 / 无命中 / 无歧义时不泄漏草稿与空字段", () => {
+  expect(metricDefinitions(loadGlossary(), "").isError).toBe(true);
+  expect(metricDefinitions(ambiguityGlossary, "不存在的词").isError).toBe(true);
+  const plain = metricDefinitions(ambiguityGlossary, "流水");
+  const value = plain.value as any;
+  expect(value.definitions.map((d: { id: string }) => d.id)).toEqual(["revenue_amount"]);
+  expect(value.ambiguities).toBeUndefined();
+  expect(value.definitions[0].ambiguous).toBeUndefined();
+});
+
+test("真实词典：歧义候选项引用不悬空，当前全草稿时线上无信号", () => {
+  const real = loadGlossary()!;
+  const ids = new Set(real.entries.map((e: { id: string }) => e.id));
+  const withAmbiguity = real.entries.filter((e: { ambiguous?: unknown }) => e.ambiguous);
+  expect(withAmbiguity.length).toBeGreaterThanOrEqual(5);
+  for (const e of withAmbiguity) {
+    expect(e.ambiguous.question.length).toBeGreaterThan(0);
+    expect(e.ambiguous.candidates.length).toBeGreaterThanOrEqual(2);
+    for (const c of e.ambiguous.candidates) if (c.id) expect(ids.has(c.id)).toBe(true);
+    expect(ambiguityFor(e, real)).not.toBeNull();
+  }
+});
+
+test("真实词典批准态 dry-run：不改仓库文件，只输出获批口径 + 歧义信号 + 补齐另一口径，草稿零泄漏", () => {
+  const real = loadGlossary()!;
+  const clone = JSON.parse(JSON.stringify(real));
+  for (const e of clone.entries) {
+    if (e.id === "country_dimension" || e.id === "device_ip_country") {
+      e.status = "approved";
+      e.owner = "dry-run";
+      e.approvedAt = "2026-11-12";
+    }
+  }
+  // 「注册国」只命中 country_dimension；device_ip_country 应作为歧义候选项被补齐，而不是靠 query 命中。
+  const r = metricDefinitions(clone, "注册国");
+  expect(r.isError).toBe(false);
+  const value = r.value as any;
+  expect(value.definitions.map((d: { id: string }) => d.id)).toEqual(["country_dimension", "device_ip_country"]);
+  expect(value.ambiguities.map((a: { id: string }) => a.id)).toEqual(["country_dimension"]);
+  expect(value.ambiguities[0].candidates).toHaveLength(2);
+  expect(value.definitions.some((d: { id: string }) => d.id === "paid_order")).toBe(false);
+});
+
+test("只批准歧义的一方时不输出信号（另一口径仍是草稿，不能当候选告诉模型）", () => {
+  const clone = JSON.parse(JSON.stringify(loadGlossary()));
+  for (const e of clone.entries) {
+    if (e.id === "country_dimension") {
+      e.status = "approved";
+      e.owner = "dry-run";
+      e.approvedAt = "2026-11-12";
+    }
+  }
+  const r = metricDefinitions(clone, "注册国");
+  const value = r.value as any;
+  expect(value.definitions.map((d: { id: string }) => d.id)).toEqual(["country_dimension"]);
+  expect(value.ambiguities).toBeUndefined();
+  expect(value.definitions[0].ambiguous).toBeUndefined();
 });

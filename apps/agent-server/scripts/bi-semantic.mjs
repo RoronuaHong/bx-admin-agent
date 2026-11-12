@@ -96,6 +96,58 @@ export function glossaryTableTerms(glossary, { statuses = ["approved"] } = {}) {
   return out;
 }
 
+/** 歧义信号（第 8 项）：只给信号，不替调用方选口径。候选项 id 必须指向词典里存在的条目；
+ *  approvedOnly 时还要已批准，避免把草稿口径泄漏到线上。少于 2 个候选项不构成歧义。 */
+export function ambiguityFor(entry, glossary, { approvedOnly = false } = {}) {
+  const raw = entry?.ambiguous;
+  if (!raw || typeof raw.question !== "string" || !raw.question.trim() || !Array.isArray(raw.candidates)) return null;
+  const byId = new Map((glossary?.entries || []).map((e) => [e.id, e]));
+  const candidates = raw.candidates
+    .filter((c) => c && typeof c.label === "string" && c.label.trim())
+    .filter((c) => !c.id || (byId.has(c.id) && (!approvedOnly || byId.get(c.id).status === "approved")))
+    .map((c) => ({
+      ...(c.id ? { id: c.id } : {}),
+      label: c.label,
+      ...(c.hint ? { hint: String(c.hint) } : {}),
+    }));
+  return candidates.length >= 2 ? { question: raw.question, candidates } : null;
+}
+
+/** get_metric_definitions 的输出投影（纯函数，适配器只负责包装成 MCP 响应）。
+ *  线上只给已批准口径；命中条目带歧义时，一并补齐候选项里已批准的口径定义，
+ *  让调用方一次看到全部可选口径。是否向用户确认由调用方决定，这里不改任何判定。 */
+export function metricDefinitions(glossary, query) {
+  const entries = approvedEntries(glossary);
+  if (!entries.length) return { value: "当前没有业务已确认的指标口径。", isError: true };
+  const q = String(query || "").trim().toLowerCase();
+  const hit = q
+    ? entries.filter((e) => [e.name, e.id, ...(e.aliases || [])].some((s) => String(s).toLowerCase().includes(q)))
+    : entries;
+  if (!hit.length) return { value: `没有匹配「${query}」的已确认口径。已确认：${entries.map((e) => e.name).join("、")}`, isError: true };
+
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const defOf = (e) => {
+    const { id, name, aliases, definition, sql, notes, owner, approvedAt } = e;
+    const ambiguous = ambiguityFor(e, glossary, { approvedOnly: true });
+    return { id, name, aliases, definition, sql, notes, owner, approvedAt, ...(ambiguous ? { ambiguous } : {}) };
+  };
+  const definitions = hit.map(defOf);
+  const seen = new Set(hit.map((e) => e.id));
+  const ambiguities = [];
+  for (const e of hit) {
+    const ambiguous = ambiguityFor(e, glossary, { approvedOnly: true });
+    if (!ambiguous) continue;
+    ambiguities.push({ id: e.id, name: e.name, ...ambiguous });
+    for (const c of ambiguous.candidates) {
+      const other = c.id && !seen.has(c.id) ? byId.get(c.id) : null;
+      if (!other) continue;
+      seen.add(c.id);
+      definitions.push(defOf(other));
+    }
+  }
+  return { value: { definitions, ...(ambiguities.length ? { ambiguities } : {}) }, isError: false };
+}
+
 const stripComments = (sql) => String(sql || "").replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
 const refsTable = (sql, table) => new RegExp(`\\b${bare(table)}\\b`, "i").test(sql);
 

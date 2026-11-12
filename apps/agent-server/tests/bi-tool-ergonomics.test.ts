@@ -132,8 +132,9 @@ test("[I] 超时与延迟口径：成功才进样本、执行类调用才计入�
   // 成功延迟采样只在 query 类调用上，且只记成功（res.ok）
   expect(ADAPTER).toContain("if (query && res.ok) queryLatency.record");
   // 执行类调用带 query: true：get_field_values 的聚合查询 + runSql（run_native_query / execute_sql /
-  // query 的原生 SQL 分支共用）+ runCard（execute_query / query 的卡片分支共用），共 3 处。
-  expect(ADAPTER.match(/query: true/g) || []).toHaveLength(3);
+  // query 的原生 SQL 分支共用）+ runCard（execute_query / query 的卡片分支共用）+
+  // search_columns 内部未暴露表核查（system.columns DISTINCT）+ search_values 取真实取值，共 5 处。
+  expect(ADAPTER.match(/query: true/g) || []).toHaveLength(5);
   expect(ADAPTER).toContain("async function runCard(");
   // 上限与派生都在
   expect(ADAPTER).toContain("BI_TIMEOUT_MAX_MS");
@@ -388,4 +389,18 @@ test("[P] 工具角色不能靠自定义 MCP 注解声明（SDK 会剥掉未声�
     /passthrough|looseObject|catchall/.test(segment),
     "SDK 若开始允许额外注解字段，本条前提失效——决策点护栏可以改用注解通道，届时请更新此用例与文档",
   ).toBe(false);
+});
+
+test("[U] 歧义信号只给信号：工具委托纯函数投影，描述不替调用方选口径", () => {
+  // 适配器 import 即连 stdio，测不了 run 的返回值，所以逻辑放 bi-semantic.mjs（纯函数、可单测），
+  // 这里用静态断言锁住「工具确实接线」，防止字段加进词典了但模型永远看不到。
+  const at = ADAPTER.indexOf('name: "get_metric_definitions"');
+  expect(at, "适配器里找不到 get_metric_definitions").toBeGreaterThan(-1);
+  const section = ADAPTER.slice(at, ADAPTER.indexOf("const server = new Server", at));
+  expect(section, "get_metric_definitions 未委托 metricDefinitions 纯函数").toContain("metricDefinitions(loadGlossary(), query)");
+  expect(section, "描述未声明 ambiguities 信号").toContain("ambiguities");
+  expect(section, "描述未写明「由调用方决定是否追问」").toContain("是否向用户确认由调用方决定");
+  const semantic = readFileSync(fileURLToPath(new URL("../scripts/bi-semantic.mjs", import.meta.url)), "utf8");
+  expect(semantic).toContain("export function ambiguityFor(");
+  expect(semantic).toContain("export function metricDefinitions(");
 });

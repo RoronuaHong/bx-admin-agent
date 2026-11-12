@@ -172,7 +172,10 @@ if (opt.rescore) {
   process.exit(0);
 }
 
-let cases = golden.cases.filter((c) => c.expected_sql);
+// 1.3 准入检查：引用库里已不存在的表（unverifiedTableStatus 含 "missing"）的样例无法执行，退出评测基线，
+// 以免污染 JoinCorrect/EX 统计（与 bi-golden-bootstrap.mjs 的准入检查一致）。
+const hasMissingTable = (c) => Object.values(c.unverifiedTableStatus || {}).includes("missing");
+let cases = golden.cases.filter((c) => c.expected_sql && !hasMissingTable(c));
 if (opt.caseId != null) cases = cases.filter((c) => c.id === opt.caseId);
 if (opt.skip.size) cases = cases.filter((c) => !opt.skip.has(c.id));
 

@@ -3,7 +3,7 @@
   "version": 1,
   "updatedAt": "2026-11-12",
   "status": "draft",
-  "howToApprove": "业务负责人逐条确认：把 status 改为 approved，填 owner 与 approvedAt；有分歧就改 definition / check 再批。只有 approved 的条目会经 MCP 工具 get_metric_definitions 提供给模型、并作为 get_caliber_context 的检索词；draft 只用于离线审计（scripts/bi-caliber-audit.mjs）与评测打分。enforce 决定查询闸门怎么处理已批准条目的冲突：reject = 拒绝执行并给出约定口径，warn = 照常执行、在结果里提示，不写 = 不拦。country_dimension、member_stock 在查询闸门里有同 id 的内置硬拒规则，批准后改由本文件接管（批准时若把 enforce 改成 warn 或删掉，闸门就不再硬拒）。改完需重启 agent-server。",
+  "howToApprove": "业务负责人逐条确认：把 status 改为 approved，填 owner 与 approvedAt；有分歧就改 definition / check 再批。只有 approved 的条目会经 MCP 工具 get_metric_definitions 提供给模型、并作为 get_caliber_context 的检索词；draft 只用于离线审计（scripts/bi-caliber-audit.mjs）与评测打分。enforce 决定查询闸门怎么处理已批准条目的冲突：reject = 拒绝执行并给出约定口径，warn = 照常执行、在结果里提示，不写 = 不拦。country_dimension、member_stock 在查询闸门里有同 id 的内置硬拒规则，批准后改由本文件接管（批准时若把 enforce 改成 warn 或删掉，闸门就不再硬拒）。改完需重启 agent-server。条目可带 ambiguous（question + candidates）：get_metric_definitions 会附上歧义信号与候选项定义，但只给信号、不代调用方选口径；候选项 id 指向别的条目时，那条也须 approved 才会输出信号。",
   "entries": [
     {
       "id": "paid_order",
@@ -61,6 +61,13 @@
       "approvedAt": null,
       "enforce": "reject",
       "definition": "按账号所属国家拆分取 film_report.elt_user_full.countryCode（电话国家码，91=印度、55=巴西）。问的是设备所在地（投流、设备分布）时见 device_ip_country。",
+      "ambiguous": {
+        "question": "问的是「账号注册国」还是「设备登录 IP 所在国」？两者不是同一列，需确认后选用，并在交付里写明所用口径。",
+        "candidates": [
+          { "id": "country_dimension", "label": "账号注册国", "hint": "elt_user_full.countryCode" },
+          { "id": "device_ip_country", "label": "设备 IP 所在国", "hint": "elt_app_params.ipCountryCode" }
+        ]
+      },
       "sql": "JOIN film_report.elt_user_full u ON ... ，按 u.countryCode 分组",
       "check": {
         "type": "dimension_source",
@@ -89,6 +96,13 @@
       "owner": null,
       "approvedAt": null,
       "definition": "按设备登录 IP 推断的国家：film_report.elt_app_params.ipCountryCode（经 guid 关联）。用于投流、设备分布类问题；与账号注册国（country_dimension）不是同一口径，交付时必须写明用的是哪个。",
+      "ambiguous": {
+        "question": "问的是「账号注册国」还是「设备登录 IP 所在国」？两者不是同一列，需确认后选用，并在交付里写明所用口径。",
+        "candidates": [
+          { "id": "country_dimension", "label": "账号注册国", "hint": "elt_user_full.countryCode" },
+          { "id": "device_ip_country", "label": "设备 IP 所在国", "hint": "elt_app_params.ipCountryCode" }
+        ]
+      },
       "sql": "JOIN film_report.elt_app_params a ON a.guid = <事实表>.guid，按 a.ipCountryCode 分组",
       "check": null,
       "basis": "卡片写法：#120、#126（设备分布）与 #121、#125（会员国籍）都按 elt_app_params.ipCountryCode 分组。",
@@ -106,6 +120,13 @@
       "owner": null,
       "approvedAt": null,
       "definition": "账号类指标（会员、付费用户）按 uid 去重；设备类指标（新设备、投放归因）按 guid 去重；交付时必须写明用的是哪个。",
+      "ambiguous": {
+        "question": "「用户数」按账号还是按设备去重？账号类指标与设备类指标不是同一个数，需按问题语义选用并写明。",
+        "candidates": [
+          { "label": "账号口径", "hint": "uniqExact(uid)" },
+          { "label": "设备口径", "hint": "uniqExact(guid)" }
+        ]
+      },
       "sql": "uniqExact(uid) / uniqExact(guid)",
       "check": null,
       "basis": "Agent 技能规定未指定时默认按账号 uniqExact(uid)；卡片里 count(distinct) 绝大多数按 guid。",
@@ -122,6 +143,13 @@
       "owner": null,
       "approvedAt": null,
       "definition": "当前存量：elt_user_vip_info 中 vipType = 2 AND endDate > now()，按 uniqExact(uid) 计。历史某日存量不能用 startDate/endDate 反推，须用开通流水重建。",
+      "ambiguous": {
+        "question": "问的是「当前在册存量」还是「历史某日存量」？后者不能用有效期字段反推，须用开通流水重建。",
+        "candidates": [
+          { "label": "当前存量", "hint": "vipType = 2 AND endDate > now()，uniqExact(uid)" },
+          { "label": "历史某日存量", "hint": "用开通流水重建，不用 startDate/endDate 反推" }
+        ]
+      },
       "sql": "SELECT uniqExact(uid) FROM film_report.elt_user_vip_info WHERE vipType = 2 AND endDate > now()",
       "enforce": "reject",
       "check": {
@@ -143,10 +171,53 @@
       "owner": null,
       "approvedAt": null,
       "definition": "窗口内第一次成为会员的账号（uniqExact(uid)）。首充（rechargeType = 3 AND isFirst = 1）包含断后回流的老会员，不等于新增会员。",
+      "ambiguous": {
+        "question": "问的是「首次成为会员的账号」还是「首次付费（首充）」？首充包含断后回流的老会员，两者不相等。",
+        "candidates": [
+          { "label": "新增会员", "hint": "窗口内首次成为会员的 uniqExact(uid)" },
+          { "label": "首充", "hint": "rechargeType = 3 AND isFirst = 1，含回流老会员" }
+        ]
+      },
       "sql": null,
       "check": null,
       "basis": "Agent 技能「新增会员 ≠ 首次付费（首充）」。",
       "openQuestions": ["卡片里的「首单 / 首充」类口径是付费转化口径，是否需要在名称上与「新增会员」区分？"]
+    },
+    {
+      "id": "app_channel",
+      "name": "应用 / 渠道码实体别名",
+      "aliases": ["渠道码", "应用码", "包名", "IN8", "FOXA", "INGoogle5"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "业务口语里的应用 / 渠道简称 ↔ 库内 apkChannel / channel 字段真实取值的映射。模型写过滤条件前应先解析成库内字面值，而不是按简称猜（valueMatch 失分最大来源：IN8 实际是 INGoogle8、FOXA 实际是 FoxA）。动态发现可用 search_values 工具；本条目把高频映射固化，待业务补全并确认后批准。",
+      "sql": null,
+      "check": null,
+      "valueAliases": [
+        { "term": "IN8", "literal": "INGoogle8", "column": "apkChannel", "note": "示例，待业务确认是否还有 INGoogle5 / INGoogle6 等" },
+        { "term": "FOXA", "literal": "FoxA", "column": "apkChannel", "note": "示例，待业务确认" }
+      ],
+      "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样里 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。",
+      "openQuestions": [
+        "完整映射表：哪些业务简称对应哪些库内 apkChannel / channel 值？是否还有其它应用（Disney+ / Netflix 等）？",
+        "同一简称是否跨多张表有不同取值？映射是否按表区分？"
+      ]
+    },
+    {
+      "id": "default_app_scope",
+      "name": "印度板块默认应用范围",
+      "aliases": ["默认范围", "默认看哪个应用", "默认口径范围"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "部分金样题目隐含了范围条件（如 #64 默认看 FoxA、#96 过滤 INGoogle5），题目本身未写。该范围是否作为印度板块的默认应用范围进词典，还是补进题目本身？待业务确认。",
+      "sql": null,
+      "check": null,
+      "basis": "金样 #64、#96 隐含范围条件，评测在考「猜题」而非 text2sql 能力。",
+      "openQuestions": [
+        "印度板块默认看哪个应用 / 渠道？是否就是 FoxA / INGoogle5 系列？",
+        "该默认范围是否对所有印度板块问题生效，还是仅特定题目？"
+      ]
     }
   ]
 }

@@ -89,7 +89,14 @@ const rpc = (method, params) =>
 
   // 期望表归一化（裸名补 schema、剔 CTE、标白名单外表），与 bi-golden-normalize.mjs 同一逻辑。
   if (tables.length) {
-    const cases = payload.cases.map((c) => normalizeGoldenCase(c, knownDoc));
+    let cases = payload.cases.map((c) => normalizeGoldenCase(c, knownDoc));
+    // 1.3 准入检查：引用库里已不存在的表（unverifiedTableStatus 含 "missing"，见 bi-known-tables.json 的 tableAudit.missing）
+    // 的样例无法执行，退出黄金集，避免污染评测基线。
+    const missingCases = cases.filter((c) => Object.values(c.unverifiedTableStatus || {}).includes("missing"));
+    if (missingCases.length) {
+      cases = cases.filter((c) => !Object.values(c.unverifiedTableStatus || {}).includes("missing"));
+      console.log(`准入检查：退出引用失效表的 ${missingCases.length} 例（${missingCases.map((c) => "#" + c.id).join(", ")}），基线从 ${payload.cases.length} 例降为 ${cases.length} 例`);
+    }
     fs.writeFileSync(outPath, JSON.stringify({ ...payload, cases, normalizedAt: new Date().toISOString() }, null, 2));
     const unverified = cases.filter((c) => c.unverifiedTables?.length).length;
     console.log(`期望表已归一化；含白名单外表 ${unverified} 例（见各例 unverifiedTables）`);
