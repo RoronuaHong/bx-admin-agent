@@ -23,7 +23,7 @@
 - ✅ **2.7** `get_golden_set` 仅评测/开发环境宣告：新增 `goldenSetEnabled()`，`ListTools` 隐藏 + `CallTool` 纵深拒绝。生产不再泄漏评测夹具。
 - ✅ **2.3** `search_columns` 增强：除 system.columns 外，匹配 **Metabase 字段描述**，并标 `⚠️ Metabase 未暴露` 的表。
 - ✅ **2.5** 按值搜索工具：新建 `scripts/bi-value-search.mjs`（纯函数可单测）+ 新工具 `search_values`，把"业务词 → 库内真实字面值"做成可检索资产（治 valueMatch 失分）。
-- ✅ **1.4 代码接线已确认存在**：`bi-query-guard.mjs` 的 `checkCaliber` 本就读已批准词典、内置硬规则在对应 `id` 批准后自动让位——**无需再写代码**，只待业务批准词典条目。
+- ✅ **1.4 代码接线已确认存在**：`bi-query-guard.mjs` 的 `checkCaliber` 本就读已批准词典、内置硬规则在对应 `id` 批准后自动让位——**无需再写代码**。**D1 国家维度拆分已于 2026-11-12 由技术侧按建议结论批准落地**（`country_dimension`/`device_ip_country` 改 `approved`、`ipCountryCode` 移出 `country_dimension.forbidden`），`owner` 为验证占位 `verify-demo`，待业务正式签批替换。
 - ✅ **1.5** 起草 `app_channel` 实体别名条目（`caliber-glossary.json`，含 IN8↔INGoogle8 / FOXA↔FoxA 示例，`status:draft`，待业务补全映射）+ 配套 `search_values` 工具（2.5）。
 - ✅ **1.6** 起草 `default_app_scope` 条目（印度板块默认应用范围，`status:draft`，待业务确认）。
 - ✅ **2.2** 口径图检索文本（代码原已落地，今日复验）：`bi-caliber-graph.mjs` 的 `tableSearchText`（表/字段描述）+ `glossaryTableTerms`（已批准别名）、IDF 加权 `textWeight=1`、元数据工具面 `metabase-mcp.mjs` 的 `tableTexts` 组装；离线夹具 `bi-known-tables.json` 的 `tableTexts` 已在位。今日重跑留一法确认召回不降（数字见上方追加验证）。
@@ -57,13 +57,13 @@
 |---|---|---|---|
 | A1 | ✅ **0.1 提交（已完成）** | 用户 2026-11-12 明确授权后已随 `feat(bi): 歧义信号、按值搜索修复与进度文档补全` 提交，含 3 个未跟踪文件的 `git add` | — |
 | A2 | **阶段 3 A/B** | 暂缓中；恢复需模型额度 + 重启 8787 许可，且先完成 D 组拍板（A1 已完成，§3.6） | 2.4 内联 SQL 的 token / 轮数净影响无端到端结论 |
-| A3 | **另开需求** | 技能层引用 `search_values`、安全闸门关键词误判评审（B5）是否立项 | 工具可能「已注册但 0 调用」；`ipCountryCode` 取值检索仍被闸门拒 |
+| A3 | **另开需求** | 技能层引用 `search_values`、安全闸门关键词误判评审（B5）是否立项 | 工具可能「已注册但 0 调用」；`ipCountryCode` 查询已随 D1 解锁（见 B2），但 `search_values` 实际调用/命中仍待观测 |
 
-### D. 需业务 owner（词典 10 条全 draft、17 条 openQuestions，按解锁价值排序）
+### D. 需业务 owner（词典 10 条，D1 已 approved、其余 draft；17 条 openQuestions，按解锁价值排序）
 
 | # | 要定的事 | 现状 / 证据 | 定了解锁什么 |
 |---|---|---|---|
-| D1 | **国家维度拆分**：批准 `device_ip_country`、把 `ipCountryCode` 移出 `country_dimension.forbidden` | 闸门内置硬拒仍生效；#120/#121/#125/#126 的 SQL 都含 `ipCountryCode` | 4 题可跑 + 2.1 线上口径 + 2.6 歧义信号（**优先级最高**） |
+| D1 | **国家维度拆分**：批准 `device_ip_country`、把 `ipCountryCode` 移出 `country_dimension.forbidden`（**技术侧已按建议结论落地，见进度记录**） | `country_dimension`/`device_ip_country` 已 `approved`，`ipCountryCode` 已移出 `country_dimension.forbidden`，闸门内置硬拒已让位；`owner` 为验证占位 `verify-demo`，**待业务正式签批替换** | 已解锁 #120/#121/#125/#126（4 题可跑）+ 2.1 线上口径 + 2.6 歧义信号（护栏 networkCountryIso 等仍生效） |
 | D2 | **已支付订单** `orderStatus IN (3,6)` | #46/#473 实测只用 6 | 定 3/6 含义、历史卡片怎么处理 |
 | D3 | **收入金额** `sum(changeAmount)` | #121/#125 实测用 `amount` | 定单位/币种与卡片是否改 |
 | D4 | **报表时区** | Asia/Shanghai vs Asia/Kolkata | 影响全部日切卡片 |
@@ -97,7 +97,7 @@
 
 ### ⏸ B2 需业务 owner 拍板（口径语义）
 
-- **1.4 词典 10 条**：`caliber-glossary.json` 实为 **10 条全 `draft` / owner 全 null / approved 0**（8 条口径 + 今日新增 `app_channel`、`default_app_scope`），共 **17 条 `openQuestions`** 待答；`country_dimension` / `member_stock` 带 `enforce: reject`；今日新增的 5 条 `ambiguous` 只是数据、尚未生效。`scripts/bi-query-guard.mjs` 的 `BUILTIN_RULES` 仍是两条内置硬拒，只有同 id 条目 `approved` 后才让位——**#120/#121/#125/#126（SQL 实测均含 `ipCountryCode`）当前确实跑不出来**。需 owner 逐条 `status→approved`、填 owner/approvedAt；国家拆分还须把 `ipCountryCode` 移出 `country_dimension.forbidden` 并批准 `device_ip_country`。批准后才解锁 2.1 线上口径、2.6 歧义信号，以及 `get_metric_definitions` 的工具宣告（当前无 approved 条目，工具不宣告）。
+- **1.4 词典 10 条**：`caliber-glossary.json` 共 **10 条 / 17 条 `openQuestions`**（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已于 2026-11-12 由技术侧按建议结论落地**：`country_dimension` 与 `device_ip_country` 均 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、`device_ip_country` 补白名单 `allowed=[ipCountryCode]` + `enforce:reject`；`owner` 为验证占位 `verify-demo` / `approvedAt=2026-11-12`，**待业务正式签批替换**。其余 8 条仍 `draft` / owner null。`scripts/bi-query-guard.mjs` 的 `BUILTIN_RULES` 仍是两条内置硬拒，但 `country_dimension` 已 `approved` → 内置国家硬拒已让位，**#120/#121/#125/#126（SQL 含 `ipCountryCode`）现已能跑出**；`member_stock` 的内置规则仍生效（其 id 未批准）。已批准条目经 `get_metric_definitions` 宣告、并作为 `get_caliber_context` 检索词（2.1 / 2.6 已生效）。其余口径仍待 owner 逐条 `status→approved`、填 owner/approvedAt。
 - **1.4 附属矛盾：会员存量两处口径打架**。闸门内置提示写「`vipType=2` 且 `startDate<=统计日` 且 `endDate>=统计日`，逐日扫描」，词典 `member_stock` 写「历史某日存量不能用 startDate/endDate 反推，须用开通流水重建」。已记在 `openQuestions`；技术侧不能替业务选一个，本轮原样保留。
 - **1.5 实体别名**：`app_channel.valueAliases` 只有 **2 条示例**（IN8→INGoogle8、FOXA→FoxA，note 明写「示例，待业务确认」），不是完整映射。金样实测 #64 期望 SQL 含 `FoxA`、#96 含 `INGoogle5`、#120 含 `INGoogle8` 且用 `apkChannel`。`search_values` 工具已就位，但完整映射（是否按表区分）须业务给。
 - **1.6 默认应用范围**：#64 / #96 期望 SQL 分别带 `FoxA` / `INGoogle5` 过滤，题目正文未写。须定「进词典作默认口径」还是「补进题目」，否则评测在考猜题。
@@ -137,7 +137,7 @@
 
 ---
 
-## 阶段 1 — 业务拍板（⏸ B1/B2：需管理员与业务 owner；10 条词典全 draft、FK 未签字）
+## 阶段 1 — 业务拍板（⏸ B1/B2：需管理员与业务 owner；词典 10 条中 D1 已 approved、其余 draft，FK 未签字）
 
 - [x] **1.1** ✅（已落地：默认开启）`with_values` 是否线上默认开启：开 → 换真·实测取值域，代价约 +1s/表首拉（缓存后 ≈1ms）；不开 → §4.3-2 过期枚举风险仍在，调用方可显式开启。
 - [ ] **1.2** 5 张 Metabase 隐藏表是否请管理员暴露（`user_preference_actions_report` / `elt_sport_activity_guess` / `elt_sport_activity_winner` / `watch_log` / `user_watch_movie_activity_log`）：暴露后可补进 `tables` 白名单、7 例金样正常评 JoinCorrect（⏸ B1 核验：实际 8 例引用，扣掉同时引用失效表的 #74 后净 7 例）。

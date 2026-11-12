@@ -113,21 +113,26 @@ test("checkCaliber：不适用的规则不计入（按状态分组算结算率�
   expect(passthrough.violations.find((v) => v.id === "country_dimension")).toBeUndefined();
 });
 
-test("口径词典：只把 approved 条目提供给线上；当前草稿全部未批", () => {
+test("口径词典：approved 条目才提供给线上（D1 后含双国家维度）", () => {
   expect(approvedEntries(glossary).map((e) => e.id)).toEqual(["approved_one"]);
   const real = loadGlossary();
   expect(real?.entries.length).toBeGreaterThan(0);
-  expect(approvedEntries(real)).toEqual([]);
-  for (const e of real!.entries) expect(e.openQuestions?.length).toBeGreaterThan(0);
+  const approved = approvedEntries(real).map((e) => e.id);
+  expect(approved).toEqual(expect.arrayContaining(["country_dimension", "device_ip_country"])); // D1 验收前提
+  // 仍是草稿的条目不得进入线上口径，且应带待业务回答的问题
+  for (const e of real!.entries) {
+    if (e.status !== "approved") expect((e.openQuestions?.length ?? 0)).toBeGreaterThan(0);
+  }
 });
 
-test("口径审计：真实卡片里能找出已支付订单 / 收入金额 / 国家维度的冲突", () => {
+test("口径审计：真实卡片里能找出已支付订单 / 收入金额的冲突（D1 后国家维度放行 ipCountryCode，不再判冲突）", () => {
   const rules = auditCards(golden.cases, loadGlossary());
   const byId = Object.fromEntries(rules.map((r) => [r.id, r]));
   expect(byId.paid_order.conflict.map((c: { id: number }) => c.id).sort()).toEqual([46, 473]);
   expect(byId.revenue_amount.conflict.map((c: { id: number }) => c.id).sort()).toEqual([121, 125]);
-  expect(byId.country_dimension.conflict.length).toBeGreaterThan(0);
-  expect(byId.country_dimension.agree).toEqual([]);
+  // D1 解锁：ipCountryCode 已移出 country_dimension.forbidden，含它的卡片不再判国家维度冲突；
+  // 护栏（networkCountryIso 等代理列）仍在，但金样中无此类卡片，故此处无冲突。
+  expect(byId.country_dimension.conflict).toEqual([]);
   expect(byId.report_timezone.conflict).toEqual([]);
 });
 
@@ -190,7 +195,9 @@ test("口径定义投影：只给已批准条目；命中歧义时把另一口�
 });
 
 test("口径定义投影：无批准 / 无命中 / 无歧义时不泄漏草稿与空字段", () => {
-  expect(metricDefinitions(loadGlossary(), "").isError).toBe(true);
+  const draftAll = JSON.parse(JSON.stringify(loadGlossary()));
+  for (const e of draftAll.entries) e.status = "draft"; // 隔离 D1 批准态，单独验证「无批准」分支
+  expect(metricDefinitions(draftAll, "").isError).toBe(true);
   expect(metricDefinitions(ambiguityGlossary, "不存在的词").isError).toBe(true);
   const plain = metricDefinitions(ambiguityGlossary, "流水");
   const value = plain.value as any;
@@ -234,13 +241,14 @@ test("真实词典批准态 dry-run：不改仓库文件，只输出获批口径
 
 test("只批准歧义的一方时不输出信号（另一口径仍是草稿，不能当候选告诉模型）", () => {
   const clone = JSON.parse(JSON.stringify(loadGlossary()));
+  // 复位真实批准态：D1 已让双国家维度 approved，这里强制回 draft 再只批准一方
   for (const e of clone.entries) {
-    if (e.id === "country_dimension") {
-      e.status = "approved";
-      e.owner = "dry-run";
-      e.approvedAt = "2026-11-12";
-    }
+    if (e.id === "country_dimension" || e.id === "device_ip_country") e.status = "draft";
   }
+  const cd = clone.entries.find((e) => e.id === "country_dimension")!;
+  cd.status = "approved";
+  cd.owner = "dry-run";
+  cd.approvedAt = "2026-11-12";
   const r = metricDefinitions(clone, "注册国");
   const value = r.value as any;
   expect(value.definitions.map((d: { id: string }) => d.id)).toEqual(["country_dimension"]);

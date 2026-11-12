@@ -25,8 +25,8 @@ default: true
 
 以下是从本数据源反复踩坑后确认的事实，违反它们会直接给出错误结论，请当作硬性前提：
 
-- **国家/地区维度不在活跃、会员事实表里**：`elt_active_guid`、`elt_user_vip_info`、`elt_user_vip_recharge_log` 等**没有国家/地区列**。用户维表 `elt_user_full` 才有 `countryCode`（电话国家码，如 91=印度、55=巴西）与 `ipCountryCode`。**要按国家拆任何指标，必须按关联键把事实表 JOIN 到 `elt_user_full` 取国家（关联键先 `DESCRIBE` 确认）**，不要因为事实表本身没国家列就写"按国家取不到"。
-- **国家维度只认 `elt_user_full.countryCode`，不要用替代列**：库里另有几个"看着像国家"的字段会把口径带偏——`elt_app_params.countryCode` 是**累计设备明细**口径（基数远大于活跃口径、同一设备可多行，拿来算日活会虚高）；`ipCountryCode` / `networkCountryIso` / `localeIso3Country` 是 IP 与网络推断，与账号注册国不一致；`elt_film_user.country` **实测全为空**。按国家拆指标一律走 `elt_user_full.countryCode`（91=印度、55=巴西、92=巴基斯坦、52=墨西哥、880=孟加拉）。
+- **国家有两个口径，先分清再用**：① 账号注册国 = `elt_user_full.countryCode`（电话国家码，如 91=印度、55=巴西、92=巴基斯坦、52=墨西哥、880=孟加拉）——默认按国家拆任何指标走这个；② 设备 IP 所在国 = `elt_app_params.ipCountryCode`（经 guid 关联）——**已批准为独立维度**，仅用于投流 / 设备分布类问题，与注册国不是同一口径，交付时务必写明用的是哪个。用户维表 `elt_user_full` 才有 `countryCode`；设备参数表 `elt_app_params` 另有 `ipCountryCode`。**要按国家拆任何指标，必须按关联键把事实表 JOIN 到对应维表取国家（关联键先 `DESCRIBE` 确认）**，不要因为事实表本身没国家列就写"按国家取不到"。
+- **替代列不能当国家口径**：库里另有几个"看着像国家"的字段会把口径带偏——`elt_app_params.countryCode` 是**累计设备明细**口径（基数远大于活跃口径、同一设备可多行，拿来算日活会虚高）；`networkCountryIso` / `localeIso3Country` 是网络 / 语言区域推断；`elt_film_user.country` **实测全为空**。这些都不是 sanctioned 的国家口径，不要用；只有上面①②是已批准维度。
 - **会员"退订/流失"先探到期列，再下结论**：不要凭"没看到退订事件表"就断言答不了。先 `DESCRIBE` / `get_database_schema` 看 `elt_user_vip_info` 是否带到期/结束时间列（如 `vipEndTime` / `expireTime`）；若有，可据此定义"到期时间已过且充值日志里无后续续费"的流失人群。只有确认既无到期列、也无任何续费/取消事件流，才写"本源无法直接给出退订人群"。
 - **会员存量分两类口径，别混**：
   - **当前存量（查询时刻）**：`elt_user_vip_info` 中 `vipType = 2 AND endDate > now()`，账号去重 `uniqExact(uid)`；`status = 0` 实测不起作用，可不加。会员表**一号一条**（`count() = uniqExact(uid)`），服务账号极少数需排除。
@@ -94,7 +94,7 @@ LIMIT 100
 - **ISO 语言 / 地区代码直接识别，不自作翻译或猜测映射**：`te-IN` / `ta-IN` / `ml-IN` 等代码按原值处理与呈现；缺代码 ↔ 中文释义映射时，保留原代码并标注「未确认中文名」，不要编造中文名或自行翻译。
 - **报告语言跟随用户提问语言**：用户用中文问就用中文交付，用英文 / 本地语言问就相应语言交付；数据里的本地语言代码（如 `te-IN`）保留原值并附简短中文释义，不要整篇机器翻译导致代码失真。
 - **非中文（含本地语言）提问同样适用本技能全部纪律**：数据 100% 忠于给定口径、歧义说明清楚，不因提问语言不同而放松。
-- **地区字段口径仍以 `countryCode` 为准**：`localeIso3Country` / `ipCountryCode` / `networkCountryIso` 是推断口径（见「本连接器已知事实」），与注册国不一致，不要因名称含 locale / country 就当作语言或国家口径混用。
+- **地区字段口径**：`localeIso3Country` / `networkCountryIso` 是推断口径、与注册国不一致，不要混用；`ipCountryCode` 是已批准的独立「设备 IP 所在国」维度（`elt_app_params.ipCountryCode`），仅用于设备 / 投流场景，与注册国（`elt_user_full.countryCode`）是两个口径，交付时写明用的是哪个。
 
 ## 注意
 

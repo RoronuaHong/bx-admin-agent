@@ -56,9 +56,9 @@
       "id": "country_dimension",
       "name": "账号国家 / 国籍维度",
       "aliases": ["国家", "国籍", "地区", "按国家拆分", "注册国"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-12",
       "enforce": "reject",
       "definition": "按账号所属国家拆分取 film_report.elt_user_full.countryCode（电话国家码，91=印度、55=巴西）。问的是设备所在地（投流、设备分布）时见 device_ip_country。",
       "ambiguous": {
@@ -74,7 +74,6 @@
         "allowed": ["elt_user_full.countryCode"],
         "forbidden": [
           "elt_app_params.countryCode",
-          "elt_app_params.ipCountryCode",
           "elt_app_params.networkCountryIso",
           "elt_app_params.localeIso3Country",
           "elt_user_full.ipCountryCode",
@@ -83,18 +82,16 @@
       },
       "basis": "Agent 技能 skills/business-data-query/SKILL.md「国家维度只认 elt_user_full.countryCode，不要用替代列」。",
       "openQuestions": [
-        "现有「国籍」类卡片（如 #125、#121、#486）全部用 elt_app_params 上的 IP / 网络 / 语言区域推断列，没有一张用 elt_user_full.countryCode。这是业务有意（投流看设备所在地），还是历史写法？",
-        "如果两种都需要，是否拆成两个口径：账号注册国（elt_user_full.countryCode）与设备所在地（elt_app_params.ipCountryCode，草稿见 device_ip_country）？若拆，本条批准时要把 elt_app_params.ipCountryCode 从 forbidden 移出，否则查询闸门会继续拒绝设备所在地的查询。",
-        "查询闸门当前（内置规则）对任何含 ipCountryCode / networkCountryIso 的 SQL 一律拒绝，所以 #120、#121、#125、#126 的卡片口径在 Agent 里跑不出来。"
+        "D1 已批准「注册国（elt_user_full.countryCode）/ 设备国（elt_app_params.ipCountryCode）」并存双维度；#486 等仍用其它代理列的卡片，是否迁移到设备国口径需业务确认。"
       ]
     },
     {
       "id": "device_ip_country",
       "name": "设备 IP 所在国",
       "aliases": ["设备所在国", "IP 国家", "设备分布", "投流地区", "登录地"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-12",
       "definition": "按设备登录 IP 推断的国家：film_report.elt_app_params.ipCountryCode（经 guid 关联）。用于投流、设备分布类问题；与账号注册国（country_dimension）不是同一口径，交付时必须写明用的是哪个。",
       "ambiguous": {
         "question": "问的是「账号注册国」还是「设备登录 IP 所在国」？两者不是同一列，需确认后选用，并在交付里写明所用口径。",
@@ -104,11 +101,11 @@
         ]
       },
       "sql": "JOIN film_report.elt_app_params a ON a.guid = <事实表>.guid，按 a.ipCountryCode 分组",
-      "check": null,
+      "check": { "type": "dimension_source", "allowed": ["elt_app_params.ipCountryCode"] },
+      "enforce": "reject",
       "basis": "卡片写法：#120、#126（设备分布）与 #121、#125（会员国籍）都按 elt_app_params.ipCountryCode 分组。",
-      "notes": "Agent 技能认为该列匹配稀疏、与注册国不一致，不应当作国家口径；是否作为独立维度保留待业务确认。",
+      "notes": "与注册国（country_dimension）并存为独立维度；其合法列 ipCountryCode 已从 country_dimension.forbidden 移出，避免闸门拒设备国查询。",
       "openQuestions": [
-        "「设备所在地」是否是业务需要的独立维度？是的话批准本条，并同步调整 country_dimension 的 forbidden。",
         "elt_app_params 同一设备可多行，按 IP 国家计数时按 guid 去重是否足够？"
       ]
     },

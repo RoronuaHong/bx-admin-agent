@@ -2,7 +2,7 @@
 
 > 来源：`docs/bi-metabase-optimization-plan.md` §3 / §11.9-B / §11.10 / §11.11 调研结论 + `docs/bi-metabase-todo.md` 阶段 1
 > 生成：2026-11-12；状态：待业务/技术拍板（本节给"建议结论"，不擅自改业务语义）
-> ⏸ **对齐状态（2026-11-12 核验，见 `docs/bi-metabase-todo.md`「待对齐 / 阻塞项」B1/B2）**：业务拍板项**全部未签字**——`caliber-glossary.json` 10 条全 `draft`、owner 全 null；`fk-signoff.json` 仍 `PENDING_HUMAN_SIGNOFF`、18 条 signoff 全空。
+> ⏸ **对齐状态（2026-11-12 核验，见 `docs/bi-metabase-todo.md`「待对齐 / 阻塞项」B1/B2）**：业务拍板项**除 D1 国家维度拆分外全部未签字**——`caliber-glossary.json` 10 条中 `country_dimension`/`device_ip_country` 已由技术侧按建议结论 `approved`（`owner` 为验证占位 `verify-demo`，待业务正式签批替换），其余 8 条仍 `draft`、owner null；`fk-signoff.json` 仍 `PENDING_HUMAN_SIGNOFF`、18 条 signoff 全空。
 > 本文是「建议结论」快照：1.1 / 1.3 已按建议落地，1.5② / 2.7 / 2.3 等「技术侧可并行推进」项也已落地；文内「8 条」「grep 0 命中」是当时口径（现为 10 条、已有 2 条示例映射 + `search_values`）。**现状以进度文档为准，业务结论仍待拍板**。
 > 核查依据（已逐文件核对属实）：`bi-semantic/caliber-glossary.json`、`scripts/bi-mschema-values.mjs`、`scripts/metabase-mcp.mjs`、`tests/bi-known-tables.json`、`tests/bi-golden-set.json`
 
@@ -41,10 +41,10 @@
 
 ## 决策 1.4 — 口径词典 8 条逐条拍板
 
-- **现状**：`caliber-glossary.json` 8 条全 `draft`、owner 全 `null`；`country_dimension`/`member_stock` 即使 draft 也写 `enforce:reject`，且查询闸门有**同 id 内置硬拒规则** → `ipCountryCode` 类查询（#120/#121/#125/#126）当前在 Agent 里跑不出来。
+- **现状**：`caliber-glossary.json` 共 10 条（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已由技术侧按本建议结论①落地**（2026-11-12）：`country_dimension`/`device_ip_country` 已 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、闸门内置国家硬拒已让位，**#120/#121/#125/#126 现已能在 Agent 跑出**；`owner` 为验证占位 `verify-demo`，待业务正式签批。`member_stock` 仍 `draft` 且带 `enforce:reject`，其内置硬拒规则仍在生效。其余口径仍 `draft`、owner null。
 - **最佳实践**：语义层为唯一真相源（dbt / Cortex 语义模型）；维度冲突用**具名维度**而非一刀切禁（Genie 的具名指标/维度）。
 - **建议结论**（按优先级，需业务 owner 逐条 `status→approved`）：
-  1. ✅ **国家维度拆成两个具名维度**：`country_dimension`（账号注册国 `elt_user_full.countryCode`）与 `device_ip_country`（设备 IP 国 `elt_app_params.ipCountryCode`）。批准 `device_ip_country` 后，把 `ipCountryCode` 从 `country_dimension.forbidden` 移出，并让闸门在两条都批准后**改读词典**（不再内置硬拒）。这是当前 4 题必失分的根因，优先定。
+  1. ✅ **国家维度拆成两个具名维度**：`country_dimension`（账号注册国 `elt_user_full.countryCode`）与 `device_ip_country`（设备 IP 国 `elt_app_params.ipCountryCode`）。批准 `device_ip_country` 后，把 `ipCountryCode` 从 `country_dimension.forbidden` 移出，并让闸门在两条都批准后**改读词典**（不再内置硬拒）。这是当前 4 题必失分的根因，优先定。**（已于 2026-11-12 由技术侧按此结论落地，`owner` 为验证占位 `verify-demo`，待业务正式签批替换；实例验证 10/10 通过，见 `docs/bi-metabase-todo.md` 进度记录）**
   2. ✅ **已支付订单**：`orderStatus IN (3,6)`（多数卡片写法）批准；状态 3/6 含义请业务在 `openQuestions` 里回填。
   3. ✅ **收入金额**：`sum(changeAmount)` 批准；`amount` 单位/币种请业务确认（#125/#121 用 `amount` 的卡片据此改或标例外）。
   4. ✅ **报表时区**：`Asia/Shanghai` 批准（已只读证实服务器默认时区等同；是否改加尔各答需业务定，影响全部卡片日切）。
