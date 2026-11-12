@@ -3,7 +3,8 @@
 > 生成时间：2026-11-10（v4，已确认范围边界：仅 BI MCP 层能力增强，不改 Agent 部分；对齐 2025–2026 线上最佳实践）
 > 数据来源：Metabase REST API（`https://bi.vmovs.com`，等价于 `bi-metabase` MCP 元数据接口，使用项目 `.env` 中 `BI_API_KEY` 实测）＋ `apps/agent-server/scripts/metabase-mcp.mjs` 源码核查
 > 关联文档：`docs/agent/bi-mcp.md`、`docs/agent/RAG_INGESTION_PLAN.md`、`apps/agent-server/src/eval-online.ts`
-> 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题基线已跑（ValidSQL/EX 96.9%、JoinCorrect 59.8%，区间 60–69%，见 §11.7）；**P3 已实施**（口径层语义图 `bi-caliber-graph.mjs` + `get_caliber_context` 工具，见 §11.8）；**P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `tests/bi-fk-signoff.json` 待人工核查）
+> 补充进展（2026-11-12）：黄金集 97 题已改写为自然语言提问、白名单外 7 张表已只读查证、P1.1 惰性取值充实已实施（`with_values` 默认关闭）、线上卡片→表索引已剔除外键显示映射表、P3 A/B 评测开关 `BI_EVAL_DISABLE_CALIBER` 已就绪；**留一法评测模式下的全量重跑仍未执行**，所有端到端数字仍来自 11-11 旧报告。
+> 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题旧基线 v3 口径 + 归一化后金样重评：ValidSQL 96.9%、JoinCorrect 63.0%（最终 SQL）～84.8%（所有尝试并集）、EX 不可评；旧轮无留一法防泄题，仅作参考，见 §11.7；评测模式与 P3 离线检索评测已就绪，见 §11.8；**P3 已实施**（口径层语义图 `bi-caliber-graph.mjs` + `get_caliber_context` 工具，见 §11.8）；**P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `apps/agent-server/bi-semantic/fk-signoff.json` 待人工核查，核对结论已回灌到外键输出；口径一致性复核与口径词典草稿见 §11.10，待业务拍板；对齐最佳实践的差距清单见 §11.11）
 
 ---
 
@@ -92,6 +93,8 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 ## 2. MCP 现状能力清单（源码核查，避免评估失准）
 
 核查 `metabase-mcp.mjs` 已确认对外工具（均为 MCP 层，Agent 仅调用）：
+
+> 2026-11-12 注：下表是 11-10 评估时的快照，行号已失效。当前共 22 个工具，新增的有 `get_cards_for_table`、`get_related_cards`、`get_golden_set`、`get_join_examples`、`get_caliber_context`、`get_metric_definitions`（仅有已批准口径时宣告），以及 `search`、`execute_query`、`execute_sql`、`query`、`construct_query`、`read_resource`、`list_dashboards`、`get_dashboard`。工具面的问题见 §11.11。
 
 | MCP 工具 | 现状 | 与本评估的关系 |
 |---|---|---|
@@ -349,7 +352,16 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 ---
 
-## 9. 待确认决策
+## 9. 待确认决策（2026-11-10 评估阶段，状态已收敛）
+
+> **【2026-11-12 更新】以下 5 项是评估阶段提出的待确认问题，现已随实施落地或收敛；当前待决事项一律以 §11.9 为准。**
+> 1. GraphRAG 路线 → 已按「先窄图（P2）、后语义层（P3）」实施，schema 层不上 GraphRAG；
+> 2. M-Schema 输出变更 → 已按「新增 `mode=mschema`、保留默认 JSON 过渡」实施；
+> 3. 评测夹具/跑分器位置 → 落 `apps/agent-server/tests/` 与 `scripts/`，未进 `src`，未接入 CI，`eval-online.ts` 未改；
+> 4. FK 核查责任人 → **仍未定**，技术核对已完成（`apps/agent-server/bi-semantic/fk-signoff.json`），签字待人工（§11.9-D）；
+> 5. 窄图暴露形态 → 以新 MCP tool 暴露（`get_cards_for_table` / `get_related_cards`），Agent 无感。
+>
+> 以下保留原始问题表述，供追溯。
 
 1. **GraphRAG 路线（§4.2）**：是否认同"先窄图（问题-表图，零 LLM 成本）、后语义层、以评测 recall@k<70% 为闸门"？默认不上全量图。
 2. **M-Schema 输出变更（§4.3）**：是否同意 `get_database_schema` 格式变更？建议新增 M-Schema 模式、保留旧输出过渡。
@@ -472,7 +484,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 用临时 cliente 把 `metabase-mcp.mjs` 当 stdio MCP server 拉起（env 沿用 `.env` 的 `BI_BASE_URL`/`BI_API_KEY`），直接 `tools/call get_database_schema(mode:"mschema")`，对照真实元数据：
 
 - **M-Schema 渲染在真实 BI 上正确**：`# Database: 主库 (clickhouse) [DB_ID: 2]`、`#Table film_report.elt_gp_install_referrer_log — Google Play应用市场包用户首登时的归因信息…`（表描述内联）、`## Table: film_report.film_app_verify [#Table] (22 fields, 0 FK)` + `- guid Text PK desc: device correlation guid 明文，仅内部使用`、`- result_type Text Category desc: 结果来源：SUCCESS/OFFICIAL_VERIFICATION_FAILED/SERVICE_VERIFICATION_FAILED/PROCESSING_FAILED`。`base_type` 的 `type/` 前缀已剥（修了一处代码瑕疵）。
-- **`list_databases` 仅 1 个库**：`db=2 主库 (clickhouse)`，58 张表（`film_report.*` / `gather.*` / `metabase_upload.*`）。**事故复跑里 `elt_film_order` 那套业务表当前不在此 Metabase 连接内**（实例/连接可能已变）。
+- **`list_databases` 仅 1 个库**：`db=2 主库 (clickhouse)`，58 张表（`film_report.*` / `gather.*` / `metabase_upload.*`）。~~事故复跑里 `elt_film_order` 那套业务表当前不在此 Metabase 连接内~~（2026-11-12 更正：`film_report.elt_film_order` 在 58 张白名单内，黄金集与评测大量使用，此句作废）。
 - **⚠️ 取值域内联 0 命中**：逐库下钻（含 `film_app_verify` 等明显 `Text Category` 枚举字段）共抽到的 `values:[...]` 字段数 = **0**。**根因：本 ClickHouse 数仓的 Metabase 未填充 `fingerprint.type.values`**。枚举值实际写在字段 *description* 里（如 `result_type … desc: 结果来源：SUCCESS/…`），M-Schema 的 description 内联（300 字）已把它们带出。
 
 **结论**：
@@ -480,7 +492,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 - §11.2/§11.3 原先写的「取值域从 `fingerprint.type.values` 真实内联」**在本 BI 上不成立**，已订正：真实取值域兜底来自 `description` 内联；`fingerprint` 路径仅在 Metabase 真正填充值的后端（多为 PG/MySQL）生效。
 - 文本 2sql 准确率提升**已由 P2 的黄金集 + `bi-eval-runner.mjs` 量化**（§11.7）：抽样 3 例全部 valid/ex/join=true，确认 schema→SQL 链路在真实 BI 上通顺；全量 97 题基线可在有模型额度时一键跑出。
 
-### 11.4 下一步（待实施 / 进行中）
+### 11.4 下一步（2026-11-10 历史快照；当前状态与下一步一律见 §11.9）
 
 - **P2（全部已实施）**：「问题-表」窄图工具 + 黄金集（97 题，`tests/bi-golden-set.json`）+ `bi-eval-runner.mjs` 三维评分，均已于 2026-11-10 真实 BI 验证（见 §11.6/§11.7）。下一步为 P3（条件）或 P4。
 - **P3（条件）**：仅当 P2 跑分显示 recall@k<70% 时上口径层 LazyGraphRAG（§4.2-2）。
@@ -497,29 +509,274 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 ### 11.7 P2 黄金集 + 三维跑分器（2026-11-10 已实施 + 真实 BI 验证）
 
 - **黄金集已落盘**：`scripts/bi-golden-bootstrap.mjs` 从 97 张卡片抽 `{id, question=卡片名, expected_sql=编译后原生SQL, tables}` 落 `tests/bi-golden-set.json`（纯元数据，零 LLM，97 例 / 96 带 SQL）。**遗留**：卡片名是标题而非标准自然语言提问，作为 eval 提示偏弱——真实评测建议后续把 `question` 改写为自然语言（见 §11.8）。
-- **`bi-eval-runner.mjs`（已落地）**：加载黄金集 → 逐例经真实 `agent-server` 的 `/chat/stream`（BI MCP 已启用）驱动模型生成并执行 SQL → 从 `tool_result.text` 抽「实际执行的 SQL」→ 三维评分（§4.4）：`ValidSQL`（有 BI 查询工具成功执行）/ `EX`（返回非空行）/ `JoinCorrect`（生成 SQL 用到的表 ⊇ 期望表）。支持 `--limit N` / `--case ID` / `--dry`（仅校验评分函数）/ `--out report.json`。
-- **真实 BI 验证（全量 96 例基线，2026-11-11 跑完）**：逐例经模型跑分（节流：每例独立进程 + `--gap 15` + `--resume` 断点续跑），结果 **ValidSQL 93/96 (96.9%)、EX 93/96 (96.9%)、JoinCorrect 55/92 (59.8%)，0 error**。模型正确抽得期望表（如 `film_report.elt_new_guid`+`elt_gp_install_referrer_log`、`elt_film_order` 等），证明 schema→SQL 链路在真实 BI 上**通畅（ValidSQL/EX 近满分）**。
-- **两次独立跑分的波动**：同日另一次完整 96 例跑分为 ValidSQL 95/96 (98.9%)、JoinCorrect 65/94 (69.1%)。两次 join 正确率在 **60%–69%** 间波动——反映模型在「选对表」上的不稳定性，但**中枢都远低于 ValidSQL 的 ~98%**。
-- **核心结论（量化 §3-C 风险）**：表选择正确率仅 **~60%（区间 60%–69%，且不稳定）**——约 1/3 查询虽能跑出数据却**用错了表**（静默错误），正是 §3-C 警示的「高分但无用」。该值**已跌破 §5 P3 的 recall@k<70% 触发阈值**，是立项口径层 LazyGraphRAG（§4.2-2）的直接依据。
-- **白名单求交（a，已落地）**：runner 加载 `tests/bi-known-tables.json`（58 张真实表，由 bootstrap 从 `get_database_schema` 导出）过滤 `usedTables`/`expectedTables` 的 CTE 名与表别名噪声（`od`/`u`/`m5`/`new_dev` 等），`filterKnownTables` 对空白名单 fail-open。修正了早期 #486 等复杂 SQL 的抽取噪声（join 判定不再被别名干扰）；#125 经复核是**模型真实用错表**（缺 `elt_app_params`/`elt_fo_ap_src`），非抽取误判。
+- **`bi-eval-runner.mjs`（已落地，评分口径 v3）**：加载黄金集 → 逐例经真实 `agent-server` 的 `/chat/stream`（BI MCP 已启用）驱动模型 → **逐次记录取数工具调用**（工具名 / SQL / 卡片 id / 成败 / 行数，按 `tool_call.id` 配对参数与结果）→ 评分（纯函数在 `scripts/bi-eval-score.mjs`）：
+  - `ValidSQL`：有取数成功（含多轮自我修正后跑通）；另报 `firstAttemptOk`（第一次就成功）与 `attempts`（尝试次数）。
+  - `EX`：返回非空行。行数取自结果文本末尾的 `-- [feedback]` 机读行；结果被服务端按 `MCP_MAX_TOOL_RESULT_CHARS` 截尾时算非空（空结果不可能超长）；拿不到行数记未知、不进分母。**不是 BIRD/Spider 意义上「结果集与金样一致」的 EX**。
+  - `JoinCorrect`：**最终 SQL**（最后一条成功的取数 SQL；DESCRIBE/SHOW 不算）用到的表 ⊇ 期望表；表名任一方不带 schema 时按裸名比对。另报 `joinCorrectAny`（所有尝试取并集的旧口径，作上界）、表召回 / 精确率、`missingTables`。只判覆盖、不查 join 键与过滤条件，是必要非充分条件。
+  - `cardShortcut`：最后一次成功取数走的是执行已保存卡片（`execute_query` / 带 `question_id` 的 `query`），join 不评、单独计数。
+  - 所有比率附 n 与 Wilson 95% 区间；期望表含白名单外表的用例（`expectedIncomplete`）另报 `joinCorrectComplete`。
+  - `executed:false` 的取数结果（同轮重复被跳过 / 安全闸门拒绝 / 暂缓，服务端根本没执行）不计入 `attempts`，单独记 `skippedCalls`，汇总报 `skippedCallsTotal`。评测模式的拒绝属于真实执行后的失败（`executed` 为真、`ok=false`），照常计入尝试。
+  - 参数：`--limit N` / `--case ID` / `--dry`（期望 SQL 当生成 SQL，自检评分函数）/ `--rescore 报告`（不调模型、按当前口径重评；v1/v2 旧报告无逐次记录，用抽到的 SQL 序列近似）/ `--out report.json`。
+- **评测防泄题（留一法，2026-11-12）**：题目 = 卡片标题，而 BI 工具能按标题 `search` 到原卡片、`get_card` 读其 SQL、`execute_query` 直接执行，`get_golden_set` 更是整包返回期望 SQL；`get_caliber_context` / `get_join_examples` 也由同一批卡片构建。runner 每例把「本例卡片 + 孪生卡片（编译后 SQL 或标题相同）」写进留出文件；agent-server 以 `BI_EVAL_HOLDOUT_FILE=<同一绝对路径>` 启动时，BI MCP 进入评测模式（`scripts/bi-eval-holdout.mjs`）：不宣告并拒绝 `get_golden_set`；按 id 读/跑留出卡片的调用（`get_card` / `get_related_cards` / `execute_query` / `query` / `construct_query` / `read_resource type=card`）被拒；`list_cards` / `search` / 仪表盘 / `get_cards_for_table` / 关联卡片 / join 样例的输出剔除留出卡片；口径图用剔除后的卡片现建（缓存只存全量图）。报告里 `leaks`（尝试取留出内容）与 `evalModeSeen`（见到拒绝标记）用于核查；汇总 `leaked` = 尝试了但没被拦的用例数。**`BI_EVAL_HOLDOUT_FILE` 只能在评测时于命令行设置，不得写进 `.env`**（MCP 进程会加载 `.env`，写进去生产也会进入评测模式；`.env.example` 已加同样的注释，2026-11-12 核查两份 `.env` 均未配置）。
+- **评测模式与事件流核实（2026-11-12，不调模型）**：
+  1. 进程级冒烟：以 stdio 直接拉起 `metabase-mcp.mjs`，设 `BI_EVAL_HOLDOUT_FILE` 时 `tools/list` 为 20 个工具、不含 `get_golden_set`；`get_golden_set`、`get_card(125)`、`execute_query(999)`、`query(question_id=125)`、`read_resource(type=card,id=125)` 全部返回 `[eval-holdout]` 拒绝（`isError`），拒绝发生在访问 BI 之前。不设该变量时 21 个工具、`get_golden_set` 照常宣告。
+  2. agent-server 的 `/chat/stream` 是逐行 JSON（NDJSON），透传原始事件：`tool_call.args` 是未脱敏的参数 JSON 字符串、`tool_result` 带同一个 `id` 与 `executed`，runner 按 `id` 配对成立；截断标记文案与 `chat.ts` 的 `truncateResult` 一致；`BI_*` 环境变量会透传给 MCP 子进程。
+- **真实 BI 验证（全量 96 例基线，2026-11-11 跑完，报告 `.data/bi-eval-full.json`）**：逐例经模型跑分（节流：每例独立进程 + `--gap 15` + `--resume` 断点续跑），0 error。v1 评分口径报 ValidSQL 93/96、EX 93/96、JoinCorrect 55/92 (59.8%)。
+- **评分口径 v2 更正（2026-11-12）**：复核 v1 报告发现两处评分 bug——
+  1. **JoinCorrect 误判 16 例**：黄金集期望表有的是裸名（`elt_film_order`），模型 SQL 抽出的都带 schema（`film_report.elt_film_order`），v1 用字符串精确比对，同一张表被判不同（#39/#42/#51/#77/#80 等 16 例）。v2 按裸名比对后重评：**JoinCorrect 71/92 (77.2%)**（`.data/bi-eval-full.rescored.json`）。分母 92 = 96 − 3 例模型未执行任何查询（#99/#116/#121）− 1 例期望表 `elt_ul_user_full` 不在白名单（#338）。
+  2. **EX 恒等于 ValidSQL**：SSE 的 `tool_result` 不带行数，v1 回退为「有文本就记 1 行」，821 次执行 rows 全为 1，EX 实际未生效。v2 改为解析结果文本的 `[feedback]` 行，拿不到行数记未知、不并入分母。**v1 报告的行数不可恢复，EX 需按 v2 口径重跑模型才有数**。
+  - 原记载的「同日另一次 98.9% / 69.1%」在仓库内无对应报告（唯一另一份日志 `.data/logs/bi-eval-full.out.log`，11-10，旧口径，终值 ValidSQL 88.5% / JoinCorrect 68.6%），不作为基线引用。
+- **评分口径 v3 更正（2026-11-12）**：v2 仍把一个用例里**所有尝试**（平均 8.6 次、最多 29 次取数，含失败与 LIMIT 试探）的表取并集再判覆盖，试得越多越容易「蒙对」。v3 按最终 SQL 判定，并修正 runner 两处漏抓：SSE 的 `tool_call.args` 是 JSON 字符串（旧代码只认数组/对象，失败执行的 SQL 全丢）；`query` / `execute_query` 不匹配旧的工具名正则（卡片执行不可见）。v3 口径重评同一报告（`.data/bi-eval-full.rescored.json`；旧报告无逐次记录，按抽到的 SQL 序列近似；期望表用下文归一化后的金样，含外键显示映射剔除）：
+
+  | 指标 | 值 | 95% 区间 |
+  |---|---|---|
+  | ValidSQL | 93/96 (96.9%) | 91.2–98.9% |
+  | 首次即成功 | 72/96 (75.0%) | 65.5–82.6% |
+  | JoinCorrect（最终 SQL） | 58/92 (63.0%) | 52.8–72.2% |
+  | JoinCorrect（剔除期望表不全的 10 例） | 56/83 (67.5%) | 56.8–76.6% |
+  | JoinCorrectAny（并集，上界） | 78/92 (84.8%) | 76.1–90.7% |
+  | 表召回均值 / 精确率均值 | 0.759 / 0.916 | — |
+  | EX | 旧报告不可评（行数未记录） | — |
+
+  真实表选择正确率落在 63.0%（下界：只认最终那条 SQL，对「分多步查询再汇总」的回答偏严）与 84.8%（上界）之间，两个区间不重叠。剔除外键显示映射前是 53/92 (57.6%) ～ 71/92 (77.2%)，差的 5 例（下界）/ 7 例（上界）全部来自 `elt_ul_activity`（见下）。
+- **核心结论（量化 §3-C 风险）**：按最终 SQL 有 34 例没用齐期望表，其中 20 例在某次试探里用过、最终 SQL 却丢了——「试对了又丢掉」是最大的一类失败。缺得最多的表：`elt_film_order`（10 例）、`elt_watch_detail`（8）、`gather`（7）、归因表 `elt_gp_install_referrer_log`（7）/`elt_fo_ap_src`（5）、`elt_app_params`（5）、`elt_new_guid`（5）。#125 原记为「模型真实漏表」，2026-11-12 更正为**口径冲突**：模型按 Agent 技能的书面规定用 `elt_user_full.countryCode` 拆国籍，卡片用的是 `elt_app_params.ipCountryCode`（设备 IP 推断），JoinCorrect 惩罚的恰好是遵守规定的那一方，见 §11.10。下界 63.0% 低于 §5 P3 的 70% 触发阈值、上界 84.8% 高于它——阈值判断取决于口径，需在评测模式下重跑后定论。
+- **`elt_ul_activity` 漏表 9 例是金样过严，不是模型盲区（2026-11-12 逐例核对）**：#60/#62/#63/#64/#67/#85/#86/#87/#484 的金样 SQL 里，`elt_ul_activity` 都只出现在「会员订单表」模型内部的同一段 `LEFT JOIN (SELECT … FROM film_report.elt_ul_activity) AS elt_ul_activity__via__activityId ON elt_film_order.activityId = …_id`——这是 Metabase 的外键显示映射（`activityId` 设置为显示活动名）自动编译出来的，只为取 `name` 列；而外层查询的 SELECT / WHERE / GROUP BY 从没用过这一列（9 例各 32 处引用，全部在这段子查询内）。对照模型的最终 SQL（如 #60 `elt_film_order JOIN elt_app_params ON guid` 按地区计数），口径与金样一致。已在归一化里剔除这类表（见下）。
+- **评测有效性风险（旧报告）**：11-11 那轮没有留一法，模型可按标题找到原卡片；当时 runner 也没记录工具调用，**无法回溯泄题程度**。旧报告的数字只能作参考，P3 前后对比必须两边都在评测模式下重跑。
+- **白名单求交（a，已落地）**：runner 加载 `tests/bi-known-tables.json`（58 张真实表，由 bootstrap 从 `get_database_schema` 导出）过滤 `usedTables`/`expectedTables` 的 CTE 名与表别名噪声（`od`/`u`/`m5`/`new_dev` 等），`filterKnownTables` 对空白名单 fail-open。修正了早期 #486 等复杂 SQL 的抽取噪声（join 判定不再被别名干扰）；#125 不是抽取误判；它是技能与卡片的国家口径冲突（见 §11.10），不应算作模型用错表。
+- **黄金集期望表归一化（2026-11-12）**：`normalizeGoldenCase`（`metabase-card-graph.mjs`）按当前抽表规则从 `expected_sql` 重抽、白名单内唯一对应的裸名补成 `schema.table`、剔除 CTE 名；bootstrap 落盘时自动执行，`scripts/bi-golden-normalize.mjs [--check]` 可离线重做（27/97 例期望表写法有变化，白名单内真实表集合 0 例变化）。抽表同时修正：ClickHouse `ARRAY JOIN w.movieTags` 展开的是数组列，不再被当成表。白名单外、又不是 CTE 的名字记进 `unverifiedTables`，共 10 例：`elt_ul_user_full`（#179/#338）、`user_preference_actions_report`（#57/#70/#71/#72/#74）、`elt_sport_activity_guess`+`elt_sport_activity_winner`（#111）、`watch_log`（#473）、`view_ul_user_nopay`（#74）、`film_report.user_watch_movie_activity_log`（#65）。它们在金样 SQL 里是真实引用（非 CTE），但不在 58 张白名单中。2026-11-12 用当前 key 经 MCP `search`（`models=["table"]`，只读）逐个查，7 张表**全部无命中**（对照组 `elt_ul_activity` 能搜到，说明搜索本身正常）；Metabase 搜索不返回隐藏表，因此只能判断「当前 key 不可见」，分不清是隐藏表、已下线还是没权限。#338 的期望表只有 `elt_ul_user_full` 一张，因此 join 不可评。
+- **同日续查已定性（只读 SQL，不依赖管理员）**：`SELECT database, name FROM system.tables`（192 张）比对 `/api/database/2/metadata`（58 张），7 张表结论分两类——
+  - **5 张库里存在、Metabase 未暴露（`existHidden`）**：`film_report.user_preference_actions_report`、`film_report.elt_sport_activity_guess`、`film_report.elt_sport_activity_winner`、`film_report.watch_log`、`film_report.user_watch_movie_activity_log`。模型通过任何 MCP 工具都发现不了它们，**故不并入 `tables` 白名单**（并进去只会让 join 分母多出必错的题），由评分的 `joinCorrectComplete` 单独剔除。
+  - **2 张库里也不存在（`missing`）**：`elt_ul_user_full`、`view_ul_user_nopay`（`system.tables` 里只有 `elt_user_full`/`_history`/`_tmp`，无任何 `nopay` 表）——金样 SQL 引用了失效/改名的表，涉及 #338/#179/#74 三例。
+  - 结论落 `tests/bi-known-tables.json` 的 `tableAudit`（含查证方法与日期），`normalizeGoldenCase` 自动给 10 例标 `unverifiedTableStatus`（`existHidden`/`missing`）；bootstrap 重导白名单时会保留 `tableAudit`。**剩余决策**：引用 `missing` 表的 3 例是否退出黄金集（会改变 96 例基线口径），以及是否请管理员在 Metabase 暴露那 5 张隐藏表——两者都需你拍板，本轮未改评测样本集。
+- **外键显示映射剔除（2026-11-12）**：`unusedRemapTables(sql)`（`metabase-card-graph.mjs`）识别 Metabase 编译出的 `LEFT JOIN (SELECT … FROM T) AS \`T__via__fk\``，当映射出的列（`T__via__fk__xxx`）只在定义处出现、且 T 没有别的 FROM/JOIN 引用时，判 T 对结果无贡献；`normalizeGoldenCase` 把这类表从 `tables` 移到 `remapOnlyTables`（可追溯）。全集只命中上面 9 例的 `elt_ul_activity`，无误伤。口径图由金样 `tables` 构建，同步去掉了「订单表 ↔ `elt_ul_activity`」这条假共现边。线上的卡片→表索引（`get_cards_for_table` 等，`getCardTables`）仍用不剔除的 `extractTables`，是否也剔除待定：剔除后「按表找卡片」不会再把 9 张订单类卡片挂到 `elt_ul_activity` 名下，更准确，但这会改变线上工具输出，留到评测模式重跑时一并验证。白名单来自 `get_database_schema`，不受影响。
 - **已知限制**：
-  1. SSE 的 `tool_call` 事件不携带参数（服务端脱敏），故生成 SQL 取自 `tool_result.text` 里的「实际执行的 SQL」；仅当模型实际执行了查询才有 join 评分，纯文本回答的 case 记 valid=false。
+  1. 生成 SQL 优先取成功结果里回显的「实际执行的 SQL」（只读闸门处理后），失败执行取 `tool_call.args` 里的 SQL；纯文本回答、没调用取数工具的 case 记 valid=false。
   2. **上游限流**：同一 `agent-server` 进程连续跑 ≥3 例会被上游（模型 API）限流——表现为前 2 例通过后第 3+ 例 `terminated`/`fetch failed`。**规避**：每例独立进程 + 间隔（已验证 `--case` 间隔 12s 可 12/12 通过）；全量 97 题必须节流（如每例新进程 + sleep），否则会大面积误报 ERROR。
-  3. **join 评分对复杂 SQL 过匹配**：`extractTables` 的 `FROM/JOIN` 正则会把别名/列名（如 `od`/`u`/`m5`）误判为表，导致 #486/#125 等复杂 SQL 的 `usedTables` 含噪声、`join` 偶发误判为 false。改进方向：抽表后与已知 schema 表名白名单求交（而非自由匹配）；当前 join 维度为 best-effort。
+  3. **join 评分对复杂 SQL 过匹配**：`extractTables` 的 `FROM/JOIN` 正则会把别名/列名（如 `od`/`u`/`m5`）误判为表，导致 #486/#125 等复杂 SQL 的 `usedTables` 含噪声、`join` 偶发误判为 false。已通过白名单求交缓解（见上）；schema 前缀不一致导致的误判已在 v2 口径修正，回归测试 `tests/bi-eval-score.test.ts`。
 
 ### 11.8 遗留与后续
 
-- **黄金集 `question` 改写（提升 eval 信度）**：当前 `question` 取自卡片名（标题），作为模型提示偏弱；建议后续人工/半自动改写为自然语言提问，再跑回归基线（验证 P3 改动是否提升 JoinCorrect）。
-- **全量基线（已完成）**：`node scripts/bi-eval-runner.mjs --resume --gap 12` 已跑完 96 例（0 error），ValidSQL/EX 98.9%、JoinCorrect 69.1%，报告存 `.data/bi-eval-full.json`，可作为后续回归基线。
-- **P3（已实施）**：全量 JoinCorrect≈59.8%（区间 60–69%）已跌破 recall@k<70% 阈值 → 已立项并落地口径层 LazyGraphRAG 语义层（§4.2-2），范围严格限定口径层；落地后需重跑基线验证 JoinCorrect 提升（见 §11.9）。
+- **黄金集 `question` 改写（2026-11-12 已实施）**：97 题逐条改写为自然语言问句，落 `tests/bi-golden-questions.json`（保留标题里的日期/素材名/版本/维度/业务术语，不新增金样 SQL 之外的约束）。原卡片名保留在 golden-set 的 `cardTitle`，留一法孪生识别改用它；`applyGoldenQuestions` 在 bootstrap 与 `bi-golden-normalize.mjs` 共用、幂等，`--check` 会校验题目是否已生效（现为 0 例变化）。配套修正：`buildCaliberGraph` 的卡片节点文本优先 `name || cardTitle || question`，即**图仍由业务卡片标题构成、改写后的问句只作检索输入**，与线上 `get_caliber_context`（图来自 BI 实时卡片名）保持一致；否则图会用改写题建索引，与线上口径资产不一致、单测也会失去意义。改写后重跑 P3 离线检索（留一、top12）：口径图全命中 92/95 (96.8%)、朴素基线 89/95 (93.7%)、不留一 95/95 (100%)——口径图相对朴素基线的优势由约 +1 点变为 +3.1 点，检索有效性结论不变；端到端 JoinCorrect 仍须按 A/B 重跑验证。
+- **全量基线（旧，仅参考）**：11-11 跑完 96 例（0 error），报告存 `.data/bi-eval-full.json`；v3 口径重评见 §11.7。该轮无留一法、无逐次记录，**不作为 P3 前后对比的基线**。
+- **P3 前后对比（待做；统计方法按此，执行命令以本节「重跑评测操作步骤」与 §11.9-C 为准）**：
+  1. agent-server 以 `BI_EVAL_HOLDOUT_FILE=<apps/agent-server/.data/bi-eval-holdout.json 的绝对路径>` 启动（命令行设置，不写 `.env`）；
+  2. 关闭 / 开启 `get_caliber_context` 各跑 96 例，每边 2–3 轮；核对汇总里 `leaked = 0`、`evalModeSeen` 有出现；
+  3. 按题配对比较：单轮用精确 McNemar（只看不一致的题），多轮用按题重抽样的配对 bootstrap；同时报 pass^k（k 轮全对）。92 题的 Wilson 区间宽约 ±10 个百分点，差距小于 10 个点时单轮结果不足以下结论。
+- **P3 离线检索评测（2026-11-12，不调模型）**：`node scripts/bi-caliber-eval.mjs [--top N]` 用留一法评 `get_caliber_context` 推荐的表对期望表的召回，并与「不看问题、按卡片引用次数推前 N 张」的朴素基线对比（95 题）：
+
+  | 推荐表数 | 口径图召回（留一） | 朴素基线召回 | 口径图召回（不留一，含泄题） |
+  |---|---|---|---|
+  | 12（线上默认） | 96.8%（全命中 92/95） | 95.8% | 100% |
+  | 8 | 94.5% | 84.1% | 98.7% |
+  | 5 | 84.5% | 61.0% | 93.6% |
+  | 3 | 79.2% | 51.2% | 90.1% |
+
+  （外键显示映射剔除后重算；剔除前留一召回 12/5/3 张为 96.6% / 83.8% / 77.8%。）结论：① 推前 3–5 张时口径图比朴素基线高 24–28 个点，检索是有效的；② **线上推 12 张（58 张表的约 1/5）时与朴素基线几乎持平**，精确率仅 16%，区分度被稀释；③ 不留一会把召回抬高约 10 个点。
+  **注意：本表是题目改写前的历史值，勿与改写后复测混用。** 2026-11-12 黄金集 `question` 改写后复测（见本节首条）：top12 留一全命中 92/95 (96.8%)、朴素基线 89/95 (93.7%)、不留一 95/95 (100%)；口径图相对朴素基线的优势由约 +1 点变为 +3.1 点，检索有效性结论不变。
+- **口径图输出分层（2026-11-12 已实施）**：没有把 `topTables` 收到 5——那样会丢掉约 1/8 的必需表（召回 96.8% → 84.5%）。改为只分层不截断：`buildCaliberContext` 的 `tables` 每项加 `tier`，前 `primaryTables`（默认 5）张为 `primary`、其余为 `candidate`，工具说明提示模型优先用 primary、覆盖不了问题时再看 candidate。离线召回不变；对端到端 JoinCorrect 的影响要在评测模式重跑时验证。下文旧的端到端示例（「观影过AK2」命中 #100/#101/#102）是在包含这些卡片的图上检索的，只能说明索引能召回已有卡片，不能说明对新问题的效果。
+- **P3（已实施）**：立项时依据 v1 口径的 59.8%（含误判）。v3 口径下端到端 JoinCorrect 在 63.0%–84.8% 之间、离线检索有效（见上），P3 保留；它针对的正是失败集中的「该 join 什么表」问题（订单表、观影表、归因表等）。端到端提升仍须按上面流程重跑验证。
+- **口径图两处修正（2026-11-12）**：`joinHints` 的「最多 8 条」截断此前没生效（`sort().slice()` 的返回值被丢弃）；`getCaliberGraph` 的缓存键比较的是 `known` Set 的引用，每次调用都新建 Set，缓存从未命中——改为按内容作键。
 - **P3 技术实现（口径层语义图）**：`bi-caliber-graph.mjs` 从 97 卡片 SQL + 58 真实表白名单构建「表/卡片」共现图（节点=表+卡片，边=卡片用表、表共现于同卡、卡片共享表），`buildCaliberContext(query)` 用关键词命中 + 图遍历返回「该用的表 + 常一起 join 的表 + 可参考现成卡片」。MCP 工具 `get_caliber_context` 把该上下文喂给模型，使其在写多表 SQL 前先拿到精准表清单，直接改善 JoinCorrect。near-zero 成本：无 embedding 预计算，仅图遍历 + 关键词匹配；TTL 缓存避免重复构建。
   - **实现要点**：表名 canonical 归一化以 golden 自带 `schema.table` 为优先（消除白名单裸名与 golden 带 schema 名的节点分裂）；白名单仅用于过滤 CTE 别名/列名噪声（fail-open）；共现边权重=同卡共现次数，检索时按 direct×2+co 排序。
   - **验证**：`tests/bi-caliber-graph.test.ts` 6 例单测全过（含归一化/边界）；真实 BI 端到端验证 `get_caliber_context`——「观影过AK2」精准命中 #100/#101/#102 并推荐 `film_report.elt_watch_detail`+`elt_gp_install_referrer_log`、「会员存量」正确推荐 `elt_app_params`/`elt_fo_ap_src`，表名全为 canonical 形式。
   - **待验证**：JoinCorrect 提升需在 eval harness 中让模型调用 `get_caliber_context` 后重跑 96 例基线（见遗留项）。
+- **P3 A/B 工具开关（2026-11-12 已实施）**：原先「关闭 / 开启 `get_caliber_context` 各跑」缺少可复现的关闭方式。现新增评测专用开关 `BI_EVAL_DISABLE_CALIBER=1`（命令行临时设置，与 `BI_EVAL_HOLDOUT_FILE` 一样**不得写进 `.env`**）：设了之后 BI MCP 在 `tools/list` 不宣告 `get_caliber_context`，硬调也会被评测闸门拒绝（对照组）；不设则口径图可用（实验组）。**仅在评测模式下生效**，误配进生产不会关掉线上工具；`mcpChildEnv` 按 `BI_` 前缀透传给 MCP 子进程。runner 增加 `--arm caliber-on|caliber-off` 把实验组标签写进报告 `meta`（标签只记录、不控制 MCP，重评时沿用原 meta），避免两份报告分不清归属。
+- **重跑评测操作步骤（尚未执行，需要时按此做）**：
+  1. 离线自检：`npx vitest run tests/bi- tests/metabase`；`node scripts/bi-golden-normalize.mjs --check` 应报 0 例变化；`node scripts/bi-eval-runner.mjs --dry --limit 5` 核对评分函数。
+  2. 启动 agent-server 时在**命令行**设置 `BI_EVAL_HOLDOUT_FILE=<apps/agent-server/.data/bi-eval-holdout.json 的绝对路径>`（PowerShell：`$env:BI_EVAL_HOLDOUT_FILE="D:\…\bi-eval-holdout.json"; pnpm dev`），runner 用同一路径（默认即此路径，或同样设该变量）。跑对照组时**同一个命令行**再设 `$env:BI_EVAL_DISABLE_CALIBER="1"`，换组需重启 agent-server（MCP 子进程随服务启动）。
+  3. 先跑 `--case 125` 一例：报告里应有 `evalModeSeen` 或 `leaks` 为空、`meta.arm` 与实际开关一致；若模型尝试取原卡片却没被拦（`leaked > 0`），说明两边路径不一致，停下排查。
+  4. 全量：`node scripts/bi-eval-runner.mjs --gap 15 --resume --arm caliber-on --out .data/bi-eval-caliber-on.json`（对照组换 `--arm caliber-off` + 另一个 `--out`）；每边 2–3 轮，按上面「P3 前后对比」做配对检验。
+  5. 跑完关闭 agent-server、清掉这两个环境变量；runner 会在每例结束和异常退出时清空留出文件。
+- **仍需人工 / 未做的事**：
+  1. 白名单外 7 张表的存在性**已只读查证完毕**（5 张库里存在但 Metabase 隐藏、2 张库里不存在，见 §11.7）；仍待拍板：是否请管理员暴露那 5 张隐藏表、以及引用失效表的 3 例（#338/#179/#74）是否退出黄金集。
+  2. 真正的结果集 EX（与金样结果比对）按决定暂缓；当前 EX 只表示「返回非空」。
+  3. 黄金集 `question` **已改写完毕**（见上）；若业务口径变化，后续只需更新 `tests/bi-golden-questions.json` 再跑 `bi-golden-normalize.mjs`。
+  4. 线上卡片→表索引**已剔除**未使用的外键显示映射表（2026-11-12，`cardTablesFromSql` 复用 `unusedRemapTables`，单测覆盖「外层用到映射列时保留」；见 §11.7）。9 张订单类卡片不再挂到 `elt_ul_activity` 名下。同轮把 `buildGoldenSet` 也统一到 `cardTablesFromSql`——此前线上 `get_caliber_context` / `get_join_examples` 用 `extractTables` 保留了「订单表 ↔ `elt_ul_activity`」的假共现边，而离线评测读的是已剔除的 golden 文件，两边口径不一致。这会改变 `get_cards_for_table` / `get_related_cards` / 口径图的线上输出，端到端影响仍待 A/B 重跑时观察。
+  5. 所有端到端数字都来自 11-11 那轮无防泄题的旧报告；评测模式下的新基线要重跑模型才有。
 - **P4（已实施）**：few-shot join 样例库（`get_join_examples` + `scripts/bi-join-examples.mjs`）、查询校验闭环固化（`scripts/bi-query-guard.mjs`，§4.3-5）均已 2026-11-11 落地并带单测。
-- **P0（人工）**：§10 的 18 条 FK 核查已整理为可签字清单 `tests/bi-fk-signoff.json`（技术核对结论收敛），仍待 Metabase Admin 权限人员签字（含 §10.1/§10.2 已定位的 7 条根因复核）。
+- **P0（人工）**：§10 的 18 条 FK 核查已整理为可签字清单 `apps/agent-server/bi-semantic/fk-signoff.json`（技术核对结论收敛），仍待 Metabase Admin 权限人员签字（含 §10.1/§10.2 已定位的 7 条根因复核）。
 
-### 11.5 残留风险与 P1.1 候选（取值域真实性）
+### 11.5 残留风险与 P1.1 实施（取值域真实性）
 
-- **残留风险**：当字段 description 里写的枚举是**过期**的（§4.3 T4 的原场景：`clientType` 描述为 `{1,2,4,6}` 但真实是 `{0,1,4,5}`），而本 BI 又不提供 `fingerprint.type.values` 纠偏，则 M-Schema 内联的 description 会**把过期枚举喂给模型**——这正是 §4.3-2 想解决的痛点，当前在本 ClickHouse 后端**未能根除**。
-- **P1.1（可选，需你拍板）**：为 `mode:"mschema"` 增加**惰性取值充实**——仅对 `semantic_type ∈ {Category, Enum, State, Status}` 或描述里疑似含枚举的字段，在 schema 拉取时**按需调一次 `get_field_values`**（带缓存、限低基数字段、限并发），用真实去重值覆盖 description 里的枚举。代价：schema 首拉延迟上升（按字段数线性、仅枚举字段），但换来 §4.3-2 的真·实测取值域。若你接受这个延迟，我可以接着做 P1.1；否则维持现状（description 兜底），并在 §4.3-2 标注「ClickHouse 后端枚举以描述为据，可能过期」。
+- **残留风险**：当字段 description 里写的枚举是**过期**的（§4.3 T4 的原场景：`clientType` 描述为 `{1,2,4,6}` 但真实是 `{0,1,4,5}`），而本 BI 又不提供 `fingerprint.type.values` 纠偏，则 M-Schema 内联的 description 会**把过期枚举喂给模型**——这正是 §4.3-2 想解决的痛点。默认路径（`with_values=false`）下在本 ClickHouse 后端**仍未根除**；显式开启 P1.1 的 `with_values=true` 后可由实测取值覆盖描述而根除（见下）。
+- **P1.1（2026-11-12 已实施；默认关闭，线上零额外延迟）**：`get_database_schema(mode="mschema", table=…, with_values=true)` 触发惰性取值充实，`max_value_fields` 控制预算（默认 8、上限 20）。实现拆成 `scripts/bi-mschema-values.mjs`（候选筛选 + 取样 DISTINCT + TTL 缓存 + 并发/预算护栏）与 `metabase-mschema.mjs`（实测值标 `(live)`，优先级高于指纹与可能过期的描述枚举）；单字段失败只回落、不影响整表输出。护栏：默认关闭、仅表级生效、标识符白名单、每字段取样 ≤20 万行 / ≤30 个去重值、并发 ≤3、跨调用缓存 5 分钟。
+  - **真实 BI 验证（只读，stdio 直连 `film_report.film_app_verify`）**：关闭时输出无 `(live)`、零额外查询；开启时 3 个 Category 字段全部拿到实测值，且**再次证明描述枚举过期**——`result_type` 描述只列 4 种 `SUCCESS/OFFICIAL_VERIFICATION_FAILED/SERVICE_VERIFICATION_FAILED/PROCESSING_FAILED`，实测多出 `VERIFICATION_SKIPPED`；`reason` 实测 10 个原因码、`verification_path` 实测 3 种。首拉 1030ms（含 2 字段查询），同参数二次调用 1ms（缓存命中 2/2），库级输出不触发查询。
+  - **残留决策**：默认仍走 description 兜底；是否把 `with_values` 在线上默认打开（代价约 +1s/表首拉、缓存后 ≈1ms）待拍板。未打开前 §4.3-2 的「ClickHouse 后端枚举以描述为据，可能过期」风险仍在，调用方可按需显式开启。
+
+---
+
+### 11.9 当前状态与待决事项（2026-11-12 收口）
+
+> **本节是「接下来做什么」的唯一入口**。§0–§11.8 保留评估过程与证据，这里只列当前状态与下一步。
+> 边界不变（§0）：只动 `bi-metabase` MCP 层，`apps/agent-server/src/**`（含 `eval-online.ts`）、prompt、模型调用一律未改。
+> 工作区状态：11-12 以来的改动（含本轮）**均未提交**，最后提交为 `4bab839`（P3）。
+> **留一法评测模式下的全量重跑尚未执行**；所有端到端数字（ValidSQL / JoinCorrect / EX）仍来自 11-11 无防泄题的旧报告，只能作参考。
+
+#### A. 已实施（代码 + 离线验证）
+
+| 项 | 落地 | 当前状态 |
+|---|---|---|
+| P0 FK 技术核对 | `apps/agent-server/bi-semantic/fk-signoff.json` + §10.1/§10.2 | 11 可信 / 6 根因定位 / 1 越权；**人工签字待办** |
+| P1 M-Schema | `metabase-mschema.mjs` + `get_database_schema(mode=mschema)` | 新增可选模式，默认仍是旧 JSON，消费方无感 |
+| P1.1 惰性取值 | `bi-mschema-values.mjs` + `with_values` / `max_value_fields` | **默认关闭**，真实 BI 只读验证通过（§11.5） |
+| P2 窄图 + 黄金集 + 跑分器 | `metabase-card-graph.mjs` / `tests/bi-golden-set.json` / `bi-eval-runner.mjs` | 评分口径 v3；防泄题留一法 + `--arm` 已就绪 |
+| P3 口径图 | `bi-caliber-graph.mjs` + `get_caliber_context`；A/B 开关 `BI_EVAL_DISABLE_CALIBER` | 离线检索有效；**端到端提升未验证** |
+| P4 收尾 | `bi-join-examples.mjs` / `bi-query-guard.mjs` | 已带单测 |
+| 黄金集 97 题改写 | `tests/bi-golden-questions.json` + `cardTitle` | 已生效，`--check` 0 变化；留一法按 `cardTitle` 认孪生 |
+| 白名单外 7 张表查证 | `bi-known-tables.json` 的 `tableAudit` + `unverifiedTableStatus` | 5 张库里存在但 Metabase 隐藏 / 2 张库里不存在（§11.7） |
+| 抽表口径统一 | `cardTablesFromSql`（`getCardTables` + `buildGoldenSet`） | 剔除未使用的 FK 显示映射表，线上工具与离线金样一致 |
+| 外键问题边标注 | `bi-semantic.mjs` + `bi-semantic/fk-signoff.json` | `get_table_relationships` / M-Schema 对 7 条核对未通过的外键标 `verified=false` + 说明（§11.10） |
+| 口径词典草稿 + 审计 + 评测口径检查 | `bi-semantic/caliber-glossary.json` / `bi-caliber-audit.mjs` / 评分口径 v4 | 8 条草稿口径**全部待业务拍板**；`get_metric_definitions` 只提供已批准条目，当前不宣告（§11.10） |
+| 最佳实践差距项（第一批） | 评分口径 v5（`valueMatch` / `goldBlocked`）、`bi-metadata-gaps.mjs`、`runCard` 反馈行、口径图表检索文本、`get_caliber_context` 内联 SQL、闸门读词典 | 见 §11.11-6；闸门在词典批准前行为不变 |
+
+离线验证基线：`npx vitest run tests/bi- tests/metabase tests/mcp-adapter-syntax.test.ts` → **18 文件 / 149 测试通过**（含 `sql-readonly-consistency`；全量 131 文件 / 914 测试），lint 0；`bi-golden-normalize.mjs --check` 0 例变化；`bi-eval-runner.mjs --dry` 自检通过；真实 BI 只读 stdio 冒烟（工具列表三态、A/B 拒绝、`with_values` 开关与缓存）全部通过。
+
+#### B. 待拍板（4 项，建议按此顺序定）
+
+1. **`with_values` 是否线上默认开启**：开 → 换真·实测取值域，代价约 +1s/表首拉（缓存后 ≈1ms）；不开 → §4.3-2 的过期枚举风险仍在，调用方可显式开启。
+2. **5 张隐藏表是否请 Metabase 管理员暴露**：暴露后可补进 `tables` 白名单、7 例金样正常评 JoinCorrect；不暴露则维持现状，由 `joinCorrectComplete` 剔除。
+3. **引用失效表的 3 例（#338/#179/#74）是否退出黄金集**：退出会把基线从 96 例改为 93 例，历史数字不可直接比较。
+4. **口径词典 8 条草稿逐条拍板**（§11.10 的问题清单）：至少先定已支付订单、收入金额、时区、国家维度四条，评测的口径检查才有统一标准。
+5. **是否启动 A/B 全量重跑**：见 C；建议 1–4 定稿后再启动，否则题目 / 样本 / 工具输出 / 口径标准还会变，新基线很快作废。
+
+#### C. 待重跑（唯一能给出端到端结论的动作）
+
+- 流程：§11.8「重跑评测操作步骤」（命令行设 `BI_EVAL_HOLDOUT_FILE`，对照组再加 `BI_EVAL_DISABLE_CALIBER=1`，两者**都不得写进 `.env`**）；先 `--case 125` 核对 `leaked=0`，再两边各 2–3 轮全量 `--gap 15 --resume`。
+- 统计：按题配对，单轮精确 McNemar、多轮按题重抽样 bootstrap，同时报 pass^k；92 题 Wilson 区间约 ±10 个百分点，**差距小于 10 个点不足以下结论**。
+- 成本：约 400–600 次模型调用、2–2.5 小时，需重启 8787（当前服务正常运行中）。
+- 同时观察：`cardTablesFromSql` 改变 `get_cards_for_table` / `get_related_cards` / 口径图输出后的影响，以及 `get_caliber_context` 对 JoinCorrect 的提升是否成立。
+- 重跑前建议先把 11-12 未提交的改动整理提交，保证报告对得上代码版本（本仓库不自动提交）。
+
+#### D. 待人工（非代码可完成）
+
+- P0：`apps/agent-server/bi-semantic/fk-signoff.json` 的 18 条 FK 由具备 Metabase Admin 权限且熟悉业务的人员签字，重点是 §10.2 已定位的 7 条（3 死字段 / 2 父表空 / 1 自引用悬空 / 1 越权 #18）。
+- B-2 的 5 张隐藏表是否暴露，需管理员在 Admin → Table Metadata 决策（技术侧已只读查证完毕）。
+- 口径词典需要一位业务负责人（owner）逐条确认并在 `caliber-glossary.json` 里把 `status` 改为 `approved`；冲突卡片（§11.10）是否修改，由卡片作者决定。
+
+#### E. 已决定暂缓 / 明确不做
+
+- 真·结果集 EX（与金样结果集比对）：当前 EX 只表示「返回非空行」。
+- 全量 GraphRAG 语义层：schema 层已有确定性 18 边 FK 图，口径层窄图离线检索有效，不需要 LLM 抽实体/关系（依据见 §11.10-4）。
+- `eval-online.ts` 及 Agent 侧任何改动：超出本文档范围（§0）。
+
+### 11.10 口径一致性、Schema 图与 GraphRAG 复核（2026-11-12）
+
+> 起因：对照 `docs/engineering-optimization-review.md` 复核「Metabase 数据多 / 口径不一致 / Schema 图 / GraphRAG」四个问题。那份评审只覆盖前端、构建、CI 与文档对齐，**不含 BI**，本节是 BI 侧的对应结论。本轮未调模型、未改 Agent（含 `skills/business-data-query/SKILL.md`）。
+
+#### 1. 数据多：大体解决
+
+已落地：`get_database_schema` 默认只给表清单、传 `table` 才给字段；M-Schema 紧凑格式；两阶段定位提示；口径图只推 12 张表且前 5 张标 `primary`；ClickHouse 单查询 90 秒中断、结果上限 100 万行、超长结果截断。剩两个「默认关闭」：M-Schema 不是默认格式（模型要主动传 `mode=mschema`，用没用旧报告查不到，新 runner 记录工具参数，重跑后可见）；`with_values` 默认关，ClickHouse 上枚举只能信描述，而描述已证实会过期。
+
+#### 2. 口径不一致：此前没有解决，本轮补了诊断与机制，口径取值待业务拍板
+
+- **诊断**：所谓「口径图」实际是**表共现图**，回答「该用哪些表」，不回答「同一指标怎么算」；MCP 脚本里此前没有任何口径定义。Agent 技能里有一段散文形式的口径知识（国家维度、会员存量、新增会员、默认按 uid 去重），MCP 读不到、也不可测。
+- **卡片之间、卡片与技能之间都有冲突**（`node scripts/bi-caliber-audit.mjs`，离线扫 96 张带 SQL 的卡片）：
+
+  | 口径 | 一致 | 冲突 |
+  |---|---|---|
+  | 已支付订单（状态 3 或 6） | 26 张 | #46、#473 只用 6；按状态分组算结算率的 #44/#45/#47 不过滤，不算冲突 |
+  | 收入金额（`changeAmount`，字段描述明确要求） | 4 张 | #125、#121 用 `SUM(amount)` |
+  | 时区（按 `Asia/Shanghai` 解释） | 85 张 | 0 张。29 张手写 SQL 没写时区，但只读查询 `SELECT timezone()` 证实服务器默认时区就是 `Asia/Shanghai`，结果等价（初版把它们误判为冲突，已修正） |
+  | 国家维度（技能规定只认 `elt_user_full.countryCode`） | 0 张 | 4 张按 `elt_app_params.ipCountryCode` 分组：#125、#121（「国籍」）与 #126、#120（「设备分布」） |
+  | 用户去重主键 | — | 技能默认 `uid`；卡片 `count(distinct)` 17 张按 `guid`、1 张按 `uid`（无法机检，只做定义） |
+
+  Metabase 元数据里 `orderStatus` / `orderType` 没有任何字段描述，状态 3 与 6 的含义只能由业务方确认。
+- **#125 更正**：模型按技能用 `elt_user_full.countryCode` 拆国籍，卡片用 `elt_app_params.ipCountryCode`；此前把它记为「模型真实漏表」不成立，是口径冲突。
+- **口径词典草稿**（`apps/agent-server/bi-semantic/caliber-glossary.json`）：已支付订单、收入金额、报表时区、账号国家维度、设备 IP 所在国（§11.11 新增）、用户去重主键、会员存量、新增会员共 8 条，**全部 `status: draft`**。每条写明依据（卡片多数写法 / 字段描述 / Agent 技能）和需要业务方回答的问题（`openQuestions`），已支付订单、收入金额、时区、账号国家、会员存量 5 条带可机检规则。冲突证据由审计脚本现场算，不手写进词典。
+- **线上提供方式**：新 MCP 工具 `get_metric_definitions` **只返回 `approved` 条目**；没有批准条目时不在 `tools/list` 里宣告（当前即如此，线上零变化）。进程级冒烟：草稿状态 21 个工具不含它；临时批准一条后出现，且只返回那一条；文件已还原。批准后需重启 agent-server（或 MCP 重载），工具列表才会刷新。
+
+#### 3. Schema 图：已优化，本轮补上「核对结论回灌」
+
+外键核对清单移到运行时目录 `apps/agent-server/bi-semantic/fk-signoff.json`（原 `tests/bi-fk-signoff.json`；MCP 不读 `tests/` 下的评测夹具）。`get_table_relationships` 对核对未通过的 7 条外键加 `verified: false` 与 `healthNote`（父表为空 / 子列从未写入 / 自引用悬空 / 越权无法核对），并附总提示；M-Schema 在对应 FK 后加 `[FK 核对未通过：…]`。11 条可信的外键输出不变。真实元数据冒烟：18 条里正好标出 7 条，`elt_film_order` 上标了 `activityId`、`srcOrderId`，`movieId`、`preOrderId` 不受影响。人工签字后在清单里填 `signoff.decision`，标注会改为「人工结论：…」。
+
+#### 4. GraphRAG：不需要
+
+- schema 层有确定性 18 边外键图；口径层用零 LLM 成本的共现图，问题改写为自然语言后留一法召回：前 5 张 86.1%、前 12 张 96.8%（热门基线前 5 张 61.0%），没触发「召回 < 70% 才上图」的闸门。
+- 真正的瓶颈不在检索：34 例 JoinCorrect 失败里 20 例是「试对了又丢掉」（推理与答案组装）；另一类是口径定义（语义层问题）。微软式 GraphRAG 的强项是对大量非结构化文本做全局归纳，两类都不对路。业界对口径问题的通行做法是语义层 / 指标定义（Metabase Metrics & Models、dbt Semantic Layer、Snowflake Cortex Analyst 的语义模型）加「已认可查询」（Cortex Analyst 的 Verified Queries、Databricks Genie 的 trusted assets 与 instructions）——本轮的口径词典与 `get_metric_definitions` 是它在 MCP 层的最小形态。
+
+#### 5. 评测补上口径维度（评分口径 v4）
+
+`scoreCase` 按词典里可机检的规则（含草稿）查**最终 SQL**：`caliberOk`（无适用规则为 null）、`caliberViolations`；汇总报 `caliberOk` 与按规则分列的 `caliberByRule`（单条规则冲突多时不淹没其它口径）；报告 `meta.glossary` 记词典版本与状态，草稿口径下的结论只作参考。时区规则带 `serverTimezone`：不写时区按服务器默认时区解释，与约定一致即不算冲突，只有显式写了别的时区（如 `Asia/Kolkata`）才算。旧报告 v4 重评（时区规则修正后）：
+
+| 规则 | 模型最终 SQL：检查 / 冲突 | 卡片自身（`--dry`）：检查 / 冲突 |
+|---|---|---|
+| 时区 | 73 / 0 | 85 / 0 |
+| 已支付订单 | 18 / 3（#46、#57、#85） | 28 / 2 |
+| 收入金额 | 7 / 3（#125、#44、#85） | 6 / 2 |
+| 国家维度 | 1 / 0（#125 用了 `elt_user_full`） | 4 / 4 |
+| **合计 `caliberOk`** | **68/73（93.2%）** | **80/86（93.0%）** |
+
+模型 SQL 里 5 例冲突（#125、#46、#57、#44、#85），JoinCorrect 为真但口径冲突的 2 例。初版报的「caliberOk 21/73、36 例表对口径错」是时区误判造成的，已作废。#46 是模型照抄卡片的 `{6}`——卡片自己与草稿口径不一致，所以**口径要先拍板，评测才有统一标准**。
+
+#### 6. 默认开关建议（待拍板，未改）
+
+- **M-Schema 设为传 `table` 时的默认格式**：Agent 侧没有代码解析 `get_database_schema` 的 JSON（`src/` 只按工具名匹配），改默认不会弄坏代码，影响只在模型行为上。建议先看重跑报告里模型实际传了什么 `mode`，若多数没传，再改默认并在下一轮 A/B 观察。
+- **`with_values`**：维持默认关。代价是每张表首拉约 +1 秒（缓存 5 分钟后约 1 毫秒），收益只在枚举过滤类问题上；建议等重跑后统计「过滤条件取值不存在 → 空结果」的次数再决定。
+
+#### 7. 仍待业务 / 人工
+
+1. 词典 8 条逐条拍板（尤其状态 3/6 的含义、`amount` 的单位、日切是否改加尔各答、「国籍」是账号注册国还是设备所在地、按 `guid` 去重的卡片是不是设备口径）。
+2. 冲突卡片（#46、#473、#125、#121、#120、#126）是否修改，由卡片作者决定；改了之后重跑 `bi-golden-bootstrap.mjs` 与审计脚本。
+3. 外键清单的人工签字（§11.9-D）。
+
+### 11.11 对齐最佳实践的差距复核（2026-11-12，目标：text2sql 更准）
+
+> 方法：逐项对照代码与离线数据（旧报告 `.data/bi-eval-full.rescored.json`、黄金集、真实元数据只读查询），不调模型。参照的业界做法：CHESS（值检索 + schema 裁剪）、DAIL-SQL / 动态 few-shot（按相似度取「问题 → SQL」样例）、Snowflake Cortex Analyst（语义模型、sample values、Verified Queries、歧义时追问）、Databricks Genie（trusted assets、instructions、值字典）、Metabase Metrics & Models、dbt Semantic Layer、Anthropic《Writing effective tools for agents》（工具少而不重叠）、CHASE-SQL / XiYan-SQL（多候选生成 + 选择）。
+
+**一句话结论**：表选择与 Schema 呈现已基本对齐；剩下最大的准确率缺口是**取值链接**（问题里的渠道、素材、事件名对应到库里的具体值），现有指标完全没量到它；其次是口径规则散落三处、互相打架。GraphRAG 仍不需要。
+
+#### 1. 本轮已修（离线、零线上影响）
+
+- **时区规则误判**：只读查询证实 ClickHouse 服务器默认时区与 Metabase `results_timezone` 都是 `Asia/Shanghai`，不写时区与显式写上海等价。规则加 `serverTimezone` 后，模型时区冲突 50 → 0、卡片 29 → 0；`caliberOk` 由 21/73 修正为 68/73，「表对但口径错」由 36 例修正为 2 例（§11.10-5 已同步）。
+- 文档过时处：§2 工具表补注（现 22 个工具）、§11.3「业务表不在连接内」作废。
+
+#### 2. 新发现，按对准确率的影响排序
+
+| # | 问题 | 证据 | 对齐的做法 | 建议 | 改线上？ |
+|---|---|---|---|---|---|
+| 1 | **取值链接缺失**，且没有指标 | 96 题里 51 题的金样 SQL 按字符串值过滤（`INGoogle5`、`FoxA`、`VIP_intro_pageview`、素材 ObjectId 等）；旧报告可评的 48 题里，模型最终 SQL 把这些值**全部写对的只有 15 题（31%）**。JoinCorrect 与口径检查都量不到 | CHESS 值检索；Cortex Analyst 的 sample values 与字面值检索；Genie 值字典 | ① 评分加 `valueMatch`（金样过滤值是否出现在最终 SQL，纯离线）；② 口径词典加「实体别名」类条目（如 IN8、FOXA 对应的应用/渠道取值，**需业务确认**）；③ 新工具按值搜索：只对白名单维度列（应用、渠道、事件名、素材）缓存去重值，按问题里的词模糊匹配 | ①否 ②③是 |
+| 2 | **黄金集题目隐含了范围条件** | 如 #64「会员订阅按地区、设备、套餐包的分布」，金样只算 `FoxA`；#96「Facebook 素材 Akhanda 2」，金样过滤 `INGoogle5`。题里没说，模型只能猜 | 评测题须自包含；隐含范围要么写进题，要么作为默认口径写进语义层 | 业务确认「印度板块默认看哪个应用」：是默认口径就进词典，不是就把范围补进题目。否则评测在考「猜题」 | 否 |
+| 3 | **口径规则三处来源、互相打架** | ① Agent 技能文字；② `bi-query-guard.mjs` 硬编码拒绝 `ipCountryCode`、`vipExpireDay`；③ 口径词典草稿。查询闸门会直接拒绝含 `ipCountryCode` 的 SQL，所以 #120/#121/#125/#126（按设备 IP 国家统计）的金样口径**永远跑不出来**，这 4 题在评测里必失分 | 语义层是唯一真相源（dbt / Cortex 语义模型） | 词典作为唯一来源：闸门改为读已批准条目里 `enforce: "reject"` 的规则；「国家」拆成两个具名维度（账号注册国 `elt_user_full.countryCode`、设备 IP 国 `elt_app_params.ipCountryCode`），而不是一刀禁掉；评测给这 4 题打标单列。技能文字改为引用 `get_metric_definitions` 属于 Agent 侧，需你同意 | 是 |
+| 4 | **已认可查询没有内联给模型** | `get_caliber_context` 只返回命中卡片的 id、名称、表，SQL 要模型再调 `get_card`；34 例 JoinCorrect 失败里 20 例是「试对了又丢掉」 | Cortex Verified Queries；DAIL-SQL 按相似度取「问题 → SQL」样例 | `get_caliber_context` 直接附前 1–2 张命中卡片的 SQL（截断约 1500 字），并提示「按此改写，不要从零写」；需 A/B 验证，token 会增加 | 是 |
+| 5 | **口径图检索只看卡片名 + 表名** | 中文问题与英文表名几乎匹配不上；58 张表的中文表描述、207 个字段描述、词典别名都没进索引，与卡片不像的新问题只能靠热门度 | 两阶段 schema linking 用描述做检索；业务词典做词法替换 | 把表描述与词典别名加进口径图的匹配文本；用 `bi-caliber-eval.mjs` 离线验证召回（不调模型），召回不降再上线 | 是 |
+| 6 | `search_columns` 与白名单口径不一致 | 只查 ClickHouse `system.columns` 的列名和注释（192 张表，含 Metabase 隐藏的 5 张与其它库），而业务描述在 Metabase 里，查不到 | 检索与暴露范围一致 | 同时匹配 Metabase 字段描述；对不在 58 张白名单里的表标「Metabase 未暴露」 | 是 |
+| 7 | 元数据源头缺口 | `orderStatus` / `orderType` 没有任何描述；描述里的枚举已证实会过期（`clientType`、`result_type`） | 在语义源头修，LLM 起草描述、人工审 | 从卡片 SQL 统计「最常用但没描述的列」，出一张清单给业务在 Metabase Data Model 里补；这是每次查询都受益的改动 | 否（改 Metabase） |
+| 8 | 歧义没有信号 | 「国籍」有两种口径、「新用户」按什么时间算等，MCP 不告诉调用方「这里有歧义」 | Cortex Analyst / Genie 遇歧义追问 | 词典条目加 `ambiguous` 与候选项，`get_metric_definitions` 返回时带上；是否追问由 Agent 决定 | 是（只加信号） |
+| 9 | 工具面偏宽 | 22 个工具，其中 5 个执行入口功能重叠（`run_native_query`、`execute_sql`、`query`、`construct_query`、`execute_query`）；评测用的 `get_golden_set` 在生产也宣告 | 工具少而不重叠，描述互斥 | 先把 `get_golden_set` 改为仅评测 / 开发环境宣告；合并执行入口会影响 `src/chat.ts` 与 `decision-guardrail.ts` 的工具名匹配，属 Agent 侧，只记录 | 是 |
+| 10 | 执行卡片的结果没有反馈行 | `execute_query` 与 `query(question_id)` 不输出 `-- [feedback]`，卡片捷径的行数与空结果不可评、也没有结构化信号 | 执行反馈闭环 | 两处补上 `buildQueryFeedback` | 是（只追加一行） |
+
+#### 3. 评测体系的差距
+
+- **真·结果集 EX**：仍按决定暂缓。但上表第 1、2 项说明，只有结果集比对能完整抓到「值写错 / 范围漏写」；金样卡片都能执行，至少聚合类题目可以先做。
+- **题源单一**：97 题全部来自卡片，而卡片同时也是检索语料，所以必须靠留一法防泄题，也不代表真实用户的问法。业界做法是「评测飞轮」：从线上对话抽真实问题、把失败案例转成新题。建议请业务标注 20–30 道真实问题作为第二套集合。
+- **反馈沉淀**：用户确认正确的查询沉淀为已认可查询（Cortex 的 verified query 建议、Genie 的 trusted assets），目前没有通道，列为后续。
+
+#### 4. 明确不在 MCP 层做（记录，供 Agent 侧参考）
+
+多候选生成 + 选择（CHASE-SQL、XiYan-SQL）、自一致性投票、重试预算与「同错两次即降级」的编排、是否追问用户——都属于调用方编排，超出 §0 范围。MCP 侧已提供结构化反馈信号，第 8 项再补歧义信号。
+
+#### 5. 建议顺序
+
+1. 先做纯离线、不改线上的：第 1 项①（`valueMatch` 指标）、第 7 项（缺描述列清单）、第 10 项（反馈行，只追加）。
+2. 业务拍板：第 2 项（默认应用范围）、第 3 项（国家拆两个维度）、§11.10 的 8 条口径、第 1 项②的实体别名。
+3. 拍板后改线上：第 3 项（闸门读词典）、第 5、6 项（检索文本）、第 4 项（内联卡片 SQL）、第 1 项③（按值搜索），再按 §11.9-C 做 A/B 重跑；第 4 项和第 1 项③会改变 token 与调用轮数，必须用 A/B 看净收益。
+
+#### 6. 本轮实施结果（2026-11-12，未调模型；旧报告按评分口径 v5 重评）
+
+| 项 | 落地 | 结果 |
+|---|---|---|
+| 第 1 项① 过滤值指标 | `bi-eval-score.mjs`：`filterLiterals` + `valueMatch` / `missingValues`（评分口径 v5，区分大小写） | 金样 96 题中 51 题带业务过滤值；旧报告模型把值全部写对 **15/48（31.3%，95% 区间 19.9–45.3%）**；JoinCorrect 为真的 24 题里仍有 10 题值写错。漏得最多的是应用 / 渠道码（`INGoogle5` 11 题、`FoxA` 4 题）、埋点事件名、素材 id |
+| 第 7 项 缺描述列清单 | `scripts/bi-metadata-gaps.mjs`（只读拉元数据）→ `.data/bi-metadata-gaps.json` | 781 个字段只有 207 个有描述；卡片用到却没描述的列 187 个。前列：`elt_film_order.orderStatus`（31 张卡片）、`elt_watch_detail.movieType`（25）、`elt_new_guid.channel`（21）、`elt_film_order.orderType`（20）、`elt_gp_install_referrer_log.channel` / `elt_watch_detail.channel`（18）、`gather.eventName`（17）、`elt_film_order.amount`（12）。`channel`、`eventName` 正是第 1 项过滤值所在的列，补描述与取值说明可同时缓解取值链接 |
+| 第 10 项 卡片执行反馈行 | `metabase-mcp.mjs` 新增 `runCard`，`execute_query` 与 `query(question_id)` 共用，结果末尾附 `-- [feedback]` | 真实 BI 冒烟通过；评分对卡片捷径的行数改由反馈行读取 |
+| 第 5 项 检索文本 | `bi-caliber-graph.mjs`：`tableSearchText`（表描述 + 字段描述）+ 已批准口径别名（`glossaryTableTerms`），IDF 加权，`textWeight` 默认 1；离线夹具 `bi-known-tables.json` 新增 `tableTexts`（`bi-metadata-gaps.mjs` 导出，bootstrap 保留） | 留一法召回：前 3 张 78.5% → **80.1%**、前 5 张 86.1% → **87.1%**、前 12 张 96.8% 不变，精确率 16.0% → 15.3%；权重 ≥ 2 开始下降。只用描述文本（不用卡片）前 5 张仅 36.7%，低于热门基线 61.0%——元数据太稀疏（58 张表只有 3 张有表描述），这也是第 7 项要补描述的理由 |
+| 第 4 项 内联卡片 SQL | `get_caliber_context` 给前 2 张命中卡片附 `sql`（每张 ≤ 1500 字），`BI_CALIBER_INLINE_SQL=0` 关闭（A/B 对照用，命令行设置） | 真实 BI 冒烟：「IN8 的日活设备分布」命中 #120、#126 并附 SQL。对 token 与轮数的净影响待 A/B |
+| 第 3 项 闸门读词典 | `bi-query-guard.mjs`：内置两条硬规则按 id 对应词典条目，同 id 条目**批准后**由词典接管；`enforce: reject / warn / 不拦`；`bi-semantic.mjs` 新增 `forbidden_tokens` 规则；词典新增 `device_ip_country` 草稿，`country_dimension`、`member_stock` 标 `enforce: reject`（草稿，未生效） | **当前词典无批准条目，线上拦截行为与之前一致**；唯一的行为修正是内置国家规则先剥离 Metabase 透传投影，#59、#486 这类只透传不分组的 SQL 不再被误拒（外层引用照样拒）。评分新增 `goldBlocked` 与 `joinCorrectReachable` |
+
+新发现（实施中查出）：
+
+- **金样被线上闸门拒绝的有 6 题**，而不是预想的 4 题：#120、#121、#125、#126 是国家口径冲突；#55、#179 是**只读检查的关键词黑名单误判**——#55 的 SQL 里有列别名 `as call`，#179 用了 ClickHouse 函数 `truncate`（且带 Metabase 模板变量，本身也不能原样执行）。`sql-readonly-common.mjs` 与服务端 `src/sql-readonly.ts` 共用、属安全闸门，本轮**未改**；`replace(`、`set`、`load`、`copy` 等同类词在列名 / 函数名里也会误判，是否改为「只在语句级关键词位置判定」需单独评审。剔除这 6 题后旧报告 JoinCorrect 为 **57/87（65.5%，55.1–74.7%）**。
+- **会员存量口径在代码里自相矛盾**：闸门内置提示写「vipType=2 且 startDate<=统计日 且 endDate>=统计日，逐日扫描」，词典（来自 Agent 技能）写「历史某日存量不能用 startDate/endDate 反推，须用开通流水重建」，已写进 `member_stock.openQuestions`。
+
+验证：全量 `npx vitest run` 131 文件 / 914 测试通过（BI 相关 18 文件 / 149 测试）；真实 BI 只读冒烟（stdio 直连）：工具 21 个、口径检索附 SQL 与文本分、卡片执行带反馈行、透传列放行、按 `ipCountryCode` 分组仍拒。
+
+仍待业务：第 1 项②（IN8 / FOXA 等与 `INGoogle5` / `FoxA` 的对应关系）、第 2 项（默认应用范围）、`device_ip_country` 是否保留、`member_stock` 两种写法以哪个为准、第 7 项清单在 Metabase 里补描述。仍待开发（需拍板后做）：第 1 项③按值搜索工具、第 6 项 `search_columns` 匹配 Metabase 描述、第 8 项歧义信号、第 9 项 `get_golden_set` 仅评测宣告。

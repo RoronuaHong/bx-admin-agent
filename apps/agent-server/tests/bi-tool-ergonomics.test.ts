@@ -132,8 +132,9 @@ test("[I] 超时与延迟口径：成功才进样本、执行类调用才计入�
   // 成功延迟采样只在 query 类调用上，且只记成功（res.ok）
   expect(ADAPTER).toContain("if (query && res.ok) queryLatency.record");
   // 执行类调用带 query: true：get_field_values 的聚合查询 + runSql（run_native_query / execute_sql /
-  // query 的原生 SQL 分支共用）+ execute_query / query 的卡片分支，共 4 处。
-  expect(ADAPTER.match(/query: true/g) || []).toHaveLength(4);
+  // query 的原生 SQL 分支共用）+ runCard（execute_query / query 的卡片分支共用），共 3 处。
+  expect(ADAPTER.match(/query: true/g) || []).toHaveLength(3);
+  expect(ADAPTER).toContain("async function runCard(");
   // 上限与派生都在
   expect(ADAPTER).toContain("BI_TIMEOUT_MAX_MS");
   expect(ADAPTER).toContain("deriveAdaptiveTimeoutMs({");

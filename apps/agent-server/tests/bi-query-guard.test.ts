@@ -38,6 +38,51 @@ test("口径护栏：国家维度代理列 / 会员存量快照被硬拒，且�
   expect(checkCaliber("SELECT 1").ok).toBe(true);
 });
 
+test("口径护栏：Metabase 透传投影（`t`.`ipCountryCode` AS `ipCountryCode`）不算用了该列，外层再引用仍拒", () => {
+  const inner = "SELECT `film_report`.`elt_app_params`.`ipCountryCode` AS `ipCountryCode`, `film_report`.`elt_app_params`.`guid` AS `guid` FROM `film_report`.`elt_app_params`";
+  expect(assertSql(`SELECT count(DISTINCT guid) FROM (${inner}) t`).ok).toBe(true);
+  expect(assertSql(`SELECT ipCountryCode, count() FROM (${inner}) t GROUP BY ipCountryCode`).ok).toBe(false);
+});
+
+test("口径护栏以词典为准：同 id 条目批准后内置规则让位，enforce 决定拒绝 / 提示 / 放行", () => {
+  const sql = "SELECT a.ipCountryCode, count() FROM film_report.elt_app_params a GROUP BY 1";
+  const country = (enforce?: string) => ({
+    entries: [
+      {
+        id: "country_dimension",
+        name: "账号国家",
+        status: "approved",
+        definition: "取 elt_user_full.countryCode",
+        ...(enforce ? { enforce } : {}),
+        check: { type: "dimension_source", allowed: ["elt_user_full.countryCode"], forbidden: ["elt_app_params.ipCountryCode"] },
+      },
+    ],
+  });
+  expect(assertSql(sql, { glossary: { entries: [{ ...country("reject").entries[0], status: "draft" }] } }).ok).toBe(false);
+  const rejected = assertSql(sql, { glossary: country("reject") });
+  expect(rejected.ok).toBe(false);
+  expect(rejected.error).toMatch(/账号国家/);
+  const warned = assertSql(sql, { glossary: country("warn") });
+  expect(warned.ok).toBe(true);
+  expect(warned.warnings[0]).toMatch(/口径提示（账号国家）/);
+  expect(assertSql(sql, { glossary: country() })).toMatchObject({ ok: true, warnings: [] });
+
+  const stock = {
+    entries: [
+      {
+        id: "member_stock",
+        name: "会员存量",
+        status: "approved",
+        enforce: "reject",
+        definition: "elt_user_vip_info",
+        check: { type: "forbidden_tokens", all: ["elt_user_full_history", "vipExpireDay"] },
+      },
+    ],
+  };
+  expect(assertSql("SELECT uid FROM elt_user_full_history WHERE vipExpireDay > 0", { glossary: stock }).error).toMatch(/会员存量/);
+  expect(assertSql("SELECT uid FROM elt_user_full_history", { glossary: stock }).ok).toBe(true);
+});
+
 test("空 SQL 被拒", () => {
   expect(assertSql("").ok).toBe(false);
   expect(assertSql(null).ok).toBe(false);

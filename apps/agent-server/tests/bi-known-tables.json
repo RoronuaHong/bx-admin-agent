@@ -63,5 +63,63 @@
     "metabase_upload.mid_minority_lang_users",
     "metabase_upload.mid_vip_funnel_daily",
     "metabase_upload.upload_test"
-  ]
+  ],
+  "tableAudit": {
+    "checkedAt": "2026-11-12",
+    "method": "只读 SQL 查 system.tables（192 张）与 GET /api/database/2/metadata（58 张）比对；当前 BI_API_KEY",
+    "note": "existHidden = 库里存在但 Metabase 未暴露，模型无从发现，故不并入 tables 白名单；missing = 库里已不存在，金样 SQL 引用了失效表。两类表所在的 10 例由评分的 joinCorrectComplete 单独剔除。",
+    "existHidden": [
+      "film_report.user_preference_actions_report",
+      "film_report.elt_sport_activity_guess",
+      "film_report.elt_sport_activity_winner",
+      "film_report.watch_log",
+      "film_report.user_watch_movie_activity_log"
+    ],
+    "missing": [
+      "elt_ul_user_full",
+      "view_ul_user_nopay"
+    ]
+  },
+  "tableTexts": {
+    "film_report.film_app_verify": "device correlation guid 明文，仅内部使用 渠道标识 判定原因码，TRUSTED 表示可信 结果来源：SUCCESS/OFFICIAL_VERIFICATION_FAILED/SERVICE_VERIFICATION_FAILED/PROCESSING_FAILED 验证路径：OFFICIAL/LEGACY/UNKNOWN 官方 verifier：SUCCESS/FAILED/NOT_APPLICABLE/NOT_REACHED 服务验证：SUCCESS/FAILED/NOT_REACHED 是否可信 判定时间，UTC 毫秒精度 应用包名（一次一包，失败记录可为尽力解析的诊断事实，空包集合记 NULL） 应用包版本（失败记录可为尽力解析的诊断事实，空包集合记 NULL） 客户端 Android SDK_INT，缺失时为 NULL Android Key Attestation 版本；无 attestation extension 或未取得时为 NULL 官方 attestation SecurityLevel，验证失败时为 NULL 官方 attestation VerifiedBootState，验证失败时为 NULL 官方 attestation 的设备锁定状态，验证失败时为 NULL 客户端 proof 原文；仅官方与服务均成功时为 NULL 客户端提交的原始证书链，保持提交顺序；双成功时为空数组 尽力解析的 APK 签名 SHA256 集合；双成功时为空数组 CertPathValidatorException reason；包装异常时从 cause 链提取可用具体值 风险流水行标识；不作为强制唯一键 服务端写入时间",
+    "film_report.film_app_verify_blocklist_reason": "允许后续事件在 latest_state 中建立 BLOCKED 状态的判定原因",
+    "film_report.film_app_verify_latest_state": "device correlation guid 明文，仅内部使用",
+    "film_report.elt_gp_install_referrer_log": "Google Play应用市场包用户首登时的归因信息，即install referrer信息，存储按创建时间每天一个分区，按排序键去重。\n注意事项：\n1、同一个设备同一天可能会有多条记录。 设备唯一标识 install referrer信息",
+    "film_report.elt_user_guid": "当一台设备登录了一个账号，设备和账号就会建立一种关联关系，本表记录近6个月的关联关系。最后一次登录时间超过6个月的自动删除关联。\n可以通过此关联查询：\n1、账号被哪些设备使用\n2、设备使用过哪些账号 账号的唯一标识",
+    "film_report.elt_user_group": "设备唯一标识",
+    "film_report.elt_user_group_ex": "设备唯一标识",
+    "film_report.elt_user_group_config": "人群包唯一标识 单位：天 单位：天",
+    "film_report.elt_ul_activity": "本表包含用户分层优惠活动的配置信息。 活动的唯一标识 定义用户多少天内只能参与一次 能够参与活动的渠道列表 活动参与后的倒计时，单位：小时 映射关系：1：首页，2：影片详情页，3：个人中心，4：会员购买页 映射关系：10：首充，20：回归 映射关系：10：单个优惠，20：多个优惠 列表元素为元组，元组第1个元素：首页弹窗图片，元组第2个元素：影片详情页弹窗图片，元组第3个元素：优惠价格，元组第4个元素：原价，元组第5个元素：会员月数，元组第6个元素：月数不足1月，启用天数配置，元组第7个元素：是否主优惠 需满足前置人群包才可参与活动",
+    "film_report.elt_user_vip_recharge_log": "关联的账号ID 关联的订单ID payType，支付类型 关联的兑换码ID",
+    "film_report.elt_user_vip_info": "账号ID唯一标识 只有值为2是Premium会员标识，其他值为非会员标识 只有值为0是正常状态，其他值为非正常状态",
+    "film_report.elt_film_order": "订单的唯一标识 可作为人数统计维度的标识 仅订单类型为兑换码兑换时有效。 映射关系：1:安卓，2:iOS，4:H5，6:安卓TV 仅订单类型为优惠活动时有效。 换算成印度卢比的订单金额；计算和统计应使用此字段 核心的时间过滤字段 仅订单类型为会员升级套餐时有效 下单App的版本号 仅订单状态为已结算时有效。",
+    "gather.gather": "设备唯一标识 映射关系：1:安卓，2:iOS，4:H5，6:安卓TV 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 根据事件名称和埋点事件配置表的参数映射关系，来确定本字段存储的值的意义 账号唯一标识",
+    "gather.event_config": "作为唯一标识 如：影片ID:ext1 表示的是影片ID存储在埋点事件表的ext1列中。",
+    "film_report.elt_film_movie_category_content": "专辑内容唯一标识",
+    "film_report.elt_film_movie_category": "专辑唯一标识",
+    "film_report.elt_film_movie": "影片的唯一标识 更新到第几集集",
+    "film_report.elt_film_movie_video_play_error": "用户ID 影片ID 剧集ID 错误码 路径 设备型号 设备内存 设备系统版本 处理状态 检查结果 发生时间 发生日期 设备ID（旧） App版本 渠道ID CDN域名 是否在线上报 错误信息 报错的位置(秒数) 场景类型(1:在线播放错误 2:离线播放错误) 网络类型 ISP 额外信息，JSON串",
+    "film_report.elt_callback_guid": "设备的唯一标识",
+    "film_report.elt_new_guid": "设备的唯一标识",
+    "film_report.elt_active_guid": "设备的唯一标识",
+    "film_report.elt_channel_new_90_guid": "设备的唯一标识",
+    "film_report.elt_channel_new_guid": "设备的唯一标识",
+    "film_report.elt_old_guid": "设备的唯一标识",
+    "film_report.elt_film_app_channel": "渠道的唯一标识 映射关系：0：不开启；1：仅广告；2：仅会员；3：广告+会员",
+    "film_report.elt_ul_activity_device": "唯一标识 设备唯一标识 映射关系：10：有效，40：完成 状态为完成时有效，完成订单的下单用户 状态为完成时有效，完成订单的订单ID",
+    "film_report.elt_ap_callback_log": "设备唯一标识",
+    "film_report.elt_watch_summary": "设备唯一标识",
+    "film_report.elt_user_active": "设备唯一标识 单位：秒",
+    "film_report.elt_active_guid_2": "设备唯一标识",
+    "film_report.elt_ap_channel": "设备唯一标识",
+    "film_report.elt_user_full": "设备唯一标识 映射关系：mobile：手机，tablet：平板，tv：电视，car：车载，watch：手表 apk包类型 2G/3G/WIFI等 移动网络国家代码 3字母的ISO标准 3字母的ISO标准 设备是否有Root权限 是否使用网络代理 设备是否处于调试模式 是否模拟器 是否使用模拟位置 是否使用VPN 是否允许推送 请求带的语言参数 IP信息中的国家编码 IP信息中的区域名称 IP信息中的城市 IP信息中的ISP App安装时间，时间戳，毫秒 App数据目录最后修改时间，时间戳，毫秒 设备累计活跃天数",
+    "gather.action": "核心时间过滤字段 设备唯一标识 账号唯一标识 映射关系：1:安卓，2:iOS，4:H5，6:安卓TV 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义 根据行为ID和行为配置表的参数映射关系，来确定本字段存储的值的意义",
+    "film_report.elt_film_user": "账号唯一标识 如印度为91，中国为86 映射关系：0：未初始化，1：正常，2：冻结，3：设备过载，4：注销 映射关系：0：未知，1：男，2：女 映射关系：0：解禁，1：禁言 映射关系：0：未知，1：Android，2：iOS，4：H5，6：Android TV 映射关系：0：普通，1：测试，2：提审专用",
+    "gather.action_config_detail_entry_dict": "作为字典的key 作为字典的value",
+    "gather.action_config": "行为ID",
+    "film_report.elt_app_params": "设备唯一标识 Google广告ID 数字版权标识ID firebase标识ID firebase推送token 自定义的设备ID 基带版本 md5签名 sha1签名 sha256签名 apk包类型 单位毫秒 2G/3G/WIFI等 GSM/CDMA等 移动网络国家代码 3字母的ISO标准 3字母的ISO标准 基站编号 sim卡数量 Sim卡移动用户身份 Sim卡序列号 Sim卡手机号 Sim卡国家代码 Sim卡运营商名称 设备是否有Root权限 是否使用网络代理 设备是否处于调试模式 是否模拟器 是否使用模拟位置 是否使用VPN 是否可以邀请，新设备默认为true，存量设备为null则为false 邀请备注 曾用IP，保留最近5个 距离App启动的毫秒数 是否允许推送 请求带的语言参数 IP信息中的国家编码 IP信息中的区域名称 IP信息中的大区域编码 App安装时间，时间戳，毫秒 App数据目录最后修改时间，时间戳，毫秒",
+    "film_report.elt_fo_ap_src": "设备唯一标识",
+    "film_report.elt_watch_detail_lang_dict": "DICTIONARY的key DICTIONARY的value",
+    "film_report.elt_invite_invitee": "受邀者的设备唯一标识 受邀者的UID 单位毫秒 时间戳，单位毫秒"
+  }
 }

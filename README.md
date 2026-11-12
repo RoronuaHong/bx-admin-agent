@@ -43,7 +43,7 @@ pnpm dev:web
 | 命令 | 作用 |
 |---|---|
 | `pnpm dev` | 并行起前后端 |
-| `pnpm test` | 跑 `apps/agent-server` 的 vitest（**零外部依赖**，Mongo 不可用会自动降级内存存储） |
+| `pnpm test` | 跑 `apps/agent-server` 的 vitest（Mongo 冷启动连不上会降级内存存储；**定时任务相关用例需要 MongoDB**，CI 由 `mongo:7` service 提供） |
 | `pnpm type-check` | web `vue-tsc` + server `tsc --noEmit` |
 | `pnpm build` | 构建前端 |
 
@@ -63,18 +63,19 @@ pnpm dev:web
 
 完整清单与注释见 `apps/agent-server/.env.example`。
 
-## 4. 内置工具（24 个，恒注入，与是否勾选 MCP 无关）
+## 4. 内置工具（30 个，恒注入，与是否勾选 MCP 无关）
 
-`builtins.ts` 的 `BUILTIN_RISK` 登记表是唯一口径：
+`apps/agent-server/src/builtins.ts` 的 `BUILTIN_RISK` 登记表是唯一口径（现行 30 条登记 / 30 个工具定义；其中 28 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 主循环内处理）：
 
 - **工作区文件**：`fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `fs_delete`（删除**走确认闸门**：不可逆）
 - **定时任务**：`list_schedules`（只读）`manage_schedule`（创建 / 暂停 / 恢复 / 删除，**走确认闸门**——会产生无人值守周期运行）
 - **产物交付**：`export_data`（xlsx / csv / json / md / docx / pdf / html / txt）
 - **图表**：`render_chart`（前端本地渲染，数据不出本机）
 - **规划与委派**：`write_todos` `task`（子代理，独立上下文、只回摘要）
-- **知识与检索**：`read_skill` `search_tools` `search_knowledge` `knowledge_sources` `web_search` `fetch_url`
+- **知识与检索**：`read_skill` `search_tools` `search_knowledge` `knowledge_sources` `web_search` `fetch_url` `search_dingtalk_doc`（钉钉文档只读检索，凭证缺失时返回配置指引）
 - **记忆**：`save_memory` `recall_memory` `record_watched_movies`
-- **交互与执行**：`request_clarification` `run_command`（destructive / external，走确认闸门）
+- **交互与执行**：`request_clarification` `run_command` `run_script`（后两者 destructive / external，**走确认闸门**）`image_gen`（外部生图服务，结果写工作区）
+- **服务端组合 / 程序化调用**：`count_list_by_time` `run_tool_code` `salesiq_chat_brief`（只读，明细不进上下文）
 
 > **附件会落工作区**：聊天里上传的文档（pdf/docx/xlsx/md/txt/csv）除解析进上下文外，
 > 会同步一份到 `uploads/`，可用 `fs_read` 取回原文、`export_data` 加工导出（`docs/artifact-delivery-plan.md` §16）。

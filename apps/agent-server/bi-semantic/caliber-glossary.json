@@ -1,0 +1,152 @@
+{
+  "title": "BI 口径词典（指标单一定义）",
+  "version": 1,
+  "updatedAt": "2026-11-12",
+  "status": "draft",
+  "howToApprove": "业务负责人逐条确认：把 status 改为 approved，填 owner 与 approvedAt；有分歧就改 definition / check 再批。只有 approved 的条目会经 MCP 工具 get_metric_definitions 提供给模型、并作为 get_caliber_context 的检索词；draft 只用于离线审计（scripts/bi-caliber-audit.mjs）与评测打分。enforce 决定查询闸门怎么处理已批准条目的冲突：reject = 拒绝执行并给出约定口径，warn = 照常执行、在结果里提示，不写 = 不拦。country_dimension、member_stock 在查询闸门里有同 id 的内置硬拒规则，批准后改由本文件接管（批准时若把 enforce 改成 warn 或删掉，闸门就不再硬拒）。改完需重启 agent-server。",
+  "entries": [
+    {
+      "id": "paid_order",
+      "name": "已支付订单",
+      "aliases": ["付费订单", "成功订单", "订阅订单", "支付成功"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "film_report.elt_film_order 中 orderStatus IN (3, 6) 的订单。",
+      "sql": "orderStatus IN (3, 6)",
+      "check": { "type": "filter_set", "table": "elt_film_order", "column": "orderStatus", "values": [3, 6] },
+      "basis": "卡片多数写法（引用订单表并按状态过滤的卡片里绝大多数用 3 或 6）。",
+      "notes": "按状态分组计算结算率（分母是全部订单）的卡片不过滤状态，不算冲突。",
+      "openQuestions": [
+        "orderStatus 3 和 6 各代表什么？Metabase 元数据里该字段没有描述。",
+        "只用 6 的卡片（如 #46、#473）是另一个口径（例如只算已完成 / 已发放权益），还是历史写法？"
+      ]
+    },
+    {
+      "id": "revenue_amount",
+      "name": "收入金额",
+      "aliases": ["金额", "收入", "流水", "GMV", "付费金额"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "汇总 film_report.elt_film_order.changeAmount（换算成印度卢比的订单金额）。",
+      "sql": "sum(changeAmount)",
+      "check": { "type": "sum_column", "table": "elt_film_order", "column": "changeAmount", "forbidden": ["amount"] },
+      "basis": "Metabase 字段描述：changeAmount「换算成印度卢比的订单金额；计算和统计应使用此字段」。",
+      "openQuestions": [
+        "amount 的单位与币种是什么？用 SUM(amount) 的卡片（如 #125、#121）是否需要改成 changeAmount？"
+      ]
+    },
+    {
+      "id": "report_timezone",
+      "name": "报表时区",
+      "aliases": ["日切", "按天", "当天", "自然日"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "时间过滤与按日分桶按 Asia/Shanghai 解释。服务器默认时区即 Asia/Shanghai，不写时区等价；推荐显式写出，例如 toTimeZone(createdTime, 'Asia/Shanghai')、parseDateTimeBestEffort('2026-01-01', 'Asia/Shanghai')，避免换部署后漂移。",
+      "sql": "toTimeZone(<时间列>, 'Asia/Shanghai')",
+      "check": { "type": "timezone", "timezone": "Asia/Shanghai", "others": ["Asia/Kolkata", "UTC"], "serverTimezone": "Asia/Shanghai" },
+      "basis": "卡片多数写法（Metabase 编译出的 SQL 统一带 Asia/Shanghai）。2026-11-12 只读查询 SELECT timezone() 返回 Asia/Shanghai，Metabase results_timezone 同为 Asia/Shanghai，所以不写时区的卡片与显式写上海时区结果一致。",
+      "openQuestions": [
+        "印度业务的日切是否应该用 Asia/Kolkata？两者差 2.5 小时，会改变每天的归属。若改用加尔各答，现有全部卡片都要改。"
+      ]
+    },
+    {
+      "id": "country_dimension",
+      "name": "账号国家 / 国籍维度",
+      "aliases": ["国家", "国籍", "地区", "按国家拆分", "注册国"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "enforce": "reject",
+      "definition": "按账号所属国家拆分取 film_report.elt_user_full.countryCode（电话国家码，91=印度、55=巴西）。问的是设备所在地（投流、设备分布）时见 device_ip_country。",
+      "sql": "JOIN film_report.elt_user_full u ON ... ，按 u.countryCode 分组",
+      "check": {
+        "type": "dimension_source",
+        "allowed": ["elt_user_full.countryCode"],
+        "forbidden": [
+          "elt_app_params.countryCode",
+          "elt_app_params.ipCountryCode",
+          "elt_app_params.networkCountryIso",
+          "elt_app_params.localeIso3Country",
+          "elt_user_full.ipCountryCode",
+          "elt_film_user.country"
+        ]
+      },
+      "basis": "Agent 技能 skills/business-data-query/SKILL.md「国家维度只认 elt_user_full.countryCode，不要用替代列」。",
+      "openQuestions": [
+        "现有「国籍」类卡片（如 #125、#121、#486）全部用 elt_app_params 上的 IP / 网络 / 语言区域推断列，没有一张用 elt_user_full.countryCode。这是业务有意（投流看设备所在地），还是历史写法？",
+        "如果两种都需要，是否拆成两个口径：账号注册国（elt_user_full.countryCode）与设备所在地（elt_app_params.ipCountryCode，草稿见 device_ip_country）？若拆，本条批准时要把 elt_app_params.ipCountryCode 从 forbidden 移出，否则查询闸门会继续拒绝设备所在地的查询。",
+        "查询闸门当前（内置规则）对任何含 ipCountryCode / networkCountryIso 的 SQL 一律拒绝，所以 #120、#121、#125、#126 的卡片口径在 Agent 里跑不出来。"
+      ]
+    },
+    {
+      "id": "device_ip_country",
+      "name": "设备 IP 所在国",
+      "aliases": ["设备所在国", "IP 国家", "设备分布", "投流地区", "登录地"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "按设备登录 IP 推断的国家：film_report.elt_app_params.ipCountryCode（经 guid 关联）。用于投流、设备分布类问题；与账号注册国（country_dimension）不是同一口径，交付时必须写明用的是哪个。",
+      "sql": "JOIN film_report.elt_app_params a ON a.guid = <事实表>.guid，按 a.ipCountryCode 分组",
+      "check": null,
+      "basis": "卡片写法：#120、#126（设备分布）与 #121、#125（会员国籍）都按 elt_app_params.ipCountryCode 分组。",
+      "notes": "Agent 技能认为该列匹配稀疏、与注册国不一致，不应当作国家口径；是否作为独立维度保留待业务确认。",
+      "openQuestions": [
+        "「设备所在地」是否是业务需要的独立维度？是的话批准本条，并同步调整 country_dimension 的 forbidden。",
+        "elt_app_params 同一设备可多行，按 IP 国家计数时按 guid 去重是否足够？"
+      ]
+    },
+    {
+      "id": "user_dedup_key",
+      "name": "用户数去重主键",
+      "aliases": ["用户数", "人数", "去重", "UV"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "账号类指标（会员、付费用户）按 uid 去重；设备类指标（新设备、投放归因）按 guid 去重；交付时必须写明用的是哪个。",
+      "sql": "uniqExact(uid) / uniqExact(guid)",
+      "check": null,
+      "basis": "Agent 技能规定未指定时默认按账号 uniqExact(uid)；卡片里 count(distinct) 绝大多数按 guid。",
+      "notes": "是否该按账号还是设备取决于问题本身，无法从 SQL 机检，只做定义与交付标注。",
+      "openQuestions": [
+        "按 guid 去重的卡片（多为新用户、投放类）是否就是设备口径？是否同意「账号类 uid、设备类 guid」的划分？"
+      ]
+    },
+    {
+      "id": "member_stock",
+      "name": "会员存量",
+      "aliases": ["会员数", "在册会员", "有效会员"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "当前存量：elt_user_vip_info 中 vipType = 2 AND endDate > now()，按 uniqExact(uid) 计。历史某日存量不能用 startDate/endDate 反推，须用开通流水重建。",
+      "sql": "SELECT uniqExact(uid) FROM film_report.elt_user_vip_info WHERE vipType = 2 AND endDate > now()",
+      "enforce": "reject",
+      "check": {
+        "type": "forbidden_tokens",
+        "all": ["elt_user_full_history", "vipExpireDay"],
+        "message": "用了 elt_user_full_history.vipExpireDay 的设备级快照算会员（覆盖不全、无账号去重）"
+      },
+      "basis": "Agent 技能「会员存量分两类口径，别混」，以及「不要用 elt_user_full_history.vipExpireDay > 0 这类设备级快照替代」。",
+      "openQuestions": [
+        "是否与财务 / 运营报表的会员数一致？",
+        "查询闸门内置规则的提示写的是「vipType=2 且 startDate<=统计日 且 endDate>=统计日，按日存量逐日扫描该表」，与本条「历史某日存量不能用 startDate/endDate 反推」矛盾，以哪个为准？"
+      ]
+    },
+    {
+      "id": "new_member",
+      "name": "新增会员",
+      "aliases": ["新会员", "会员净增"],
+      "status": "draft",
+      "owner": null,
+      "approvedAt": null,
+      "definition": "窗口内第一次成为会员的账号（uniqExact(uid)）。首充（rechargeType = 3 AND isFirst = 1）包含断后回流的老会员，不等于新增会员。",
+      "sql": null,
+      "check": null,
+      "basis": "Agent 技能「新增会员 ≠ 首次付费（首充）」。",
+      "openQuestions": ["卡片里的「首单 / 首充」类口径是付费转化口径，是否需要在名称上与「新增会员」区分？"]
+    }
+  ]
+}

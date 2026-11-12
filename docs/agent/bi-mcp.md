@@ -21,7 +21,7 @@
 | 工具 | 作用 | 只读性 |
 |---|---|---|
 | `list_databases` | 列出可用数据库 | 只读（元数据） |
-| `get_database_schema` | 某库的表/字段结构（`skip_fields` 控制粒度） | 只读（元数据） |
+| `get_database_schema` | 某库的表/字段结构（`mode=mschema` 出紧凑 M-Schema；`with_values=true` 可选补实测取值域，默认关闭、会增加首拉延迟） | 只读（元数据） |
 | `get_field_values` | 取字段真实取值域（取证、避免把真实取值当脏数据） | 只读（元数据） |
 | `list_cards` / `get_card` | 列出/获取已保存提问（含其 SQL 与口径） | 只读（元数据） |
 | `list_dashboards` / `get_dashboard` | 列出/获取仪表盘（卡片数组 `dashcards`） | 只读（元数据） |

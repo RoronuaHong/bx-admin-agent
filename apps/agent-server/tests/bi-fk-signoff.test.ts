@@ -23,7 +23,7 @@ type Checklist = {
 };
 
 const data: Checklist = JSON.parse(
-  readFileSync(fileURLToPath(new URL("./bi-fk-signoff.json", import.meta.url)), "utf8"),
+  readFileSync(fileURLToPath(new URL("../bi-semantic/fk-signoff.json", import.meta.url)), "utf8"),
 );
 
 test("18 条边齐全、id 1..18 连续无重复、每条都有边定义与证据", () => {

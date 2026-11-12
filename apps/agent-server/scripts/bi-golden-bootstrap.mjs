@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeGoldenCase, applyGoldenQuestions } from "./metabase-card-graph.mjs";
 
 const repo = path.dirname(fileURLToPath(import.meta.url)); // apps/agent-server/scripts
 const root = path.join(repo, ".."); // apps/agent-server
@@ -44,6 +45,11 @@ const rpc = (method, params) =>
   let parsed;
   try { parsed = JSON.parse(text); } catch { console.error("解析失败：", text.slice(0, 300)); process.exit(1); }
   const payload = { generatedAt: new Date().toISOString(), databaseId, total: parsed.total, withSql: parsed.withSql, cases: parsed.cases };
+  // 卡片标题只是标题，用作模型提示太弱且容易被按标题搜回原卡片。应用自然语言改写稿，
+  // 原卡片名留作 cardTitle 供留一法识别孪生卡片；映射不存在时保持原样。
+  const qPath = path.join(root, "tests", "bi-golden-questions.json");
+  const qMap = fs.existsSync(qPath) ? JSON.parse(fs.readFileSync(qPath, "utf8")).questions || {} : {};
+  payload.cases = applyGoldenQuestions(payload.cases, qMap);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(payload, null, 2));
   console.log(`黄金集已落盘: ${outPath}`);
@@ -68,8 +74,26 @@ const rpc = (method, params) =>
   }
   const knownPath = path.join(root, "tests", "bi-known-tables.json");
   const tables = [...known].sort();
-  fs.writeFileSync(knownPath, JSON.stringify({ generatedAt: new Date().toISOString(), databaseIds: dbIds, total: tables.length, tables }, null, 2));
+  // tableAudit 是人工/只读 SQL 查证的结论，tableTexts 由 bi-metadata-gaps.mjs 导出，重新导出表清单时都不能冲掉。
+  const prev = fs.existsSync(knownPath) ? JSON.parse(fs.readFileSync(knownPath, "utf8")) : {};
+  const knownDoc = {
+    generatedAt: new Date().toISOString(),
+    databaseIds: dbIds,
+    total: tables.length,
+    tables,
+    ...(prev.tableAudit ? { tableAudit: prev.tableAudit } : {}),
+    ...(prev.tableTexts ? { tableTexts: prev.tableTexts } : {}),
+  };
+  fs.writeFileSync(knownPath, JSON.stringify(knownDoc, null, 2));
   console.log(`真实表名白名单已落盘: ${knownPath}（${tables.length} 张表，来自 ${dbIds.length} 个库）`);
+
+  // 期望表归一化（裸名补 schema、剔 CTE、标白名单外表），与 bi-golden-normalize.mjs 同一逻辑。
+  if (tables.length) {
+    const cases = payload.cases.map((c) => normalizeGoldenCase(c, knownDoc));
+    fs.writeFileSync(outPath, JSON.stringify({ ...payload, cases, normalizedAt: new Date().toISOString() }, null, 2));
+    const unverified = cases.filter((c) => c.unverifiedTables?.length).length;
+    console.log(`期望表已归一化；含白名单外表 ${unverified} 例（见各例 unverifiedTables）`);
+  }
   child.stdin.end();
   setTimeout(() => { child.kill(); process.exit(0); }, 200);
 })().catch((e) => { console.error("ERROR:", e); process.exit(1); });

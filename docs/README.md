@@ -24,7 +24,7 @@
 - **覆盖**：§1–2 断链核查 · §4 形态判定（内置/MCP/Skill/定时任务）· §10 v2 格式扩展 · §11 报告式导出 + 手写 HTML 零外链护栏 · §12 全对话审计与上下文工程全链路对照 · §13 `run_command` 治理 · §14 配置热重载缓存失效键。
 - **现行落点**：`export_data`（8 种格式，`builtins.ts`）· 下载端点（`app.ts` `GET .../files/download`）· `artifact` 事件（`packages/shared`）· `fs_write` 写 `.html` 下发卡片 · `externalRefHint` · `wrapUpWith`（轮次耗尽补位收尾）· `repeatCallHint` + `executedSigRounds` · `appendRoundTrace` · `decodeShellBytes` / `truncateShellOutput`。
 - **状态**：✅ 现行（2026-09-24 复核，顶部主状态表 13 项）。
-- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**2026-09-24 全部落地**——`fs_delete` 见 §15、上传附件进工作区见 §16、定时任务工具化见 §17。以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **27** 条登记（**25** 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理）——2026-09-28 复核更正，早期「24 个 / 22 个」口径作废；第 5 项 `run_script` / `image_gen` **已落地**并纳入统一交付物护栏（§11.8 / `DELIVERABLE_GUARDRAILS.md`；早期「维持暂缓」口径作废，2026-09-28 复核更正）。
+- **注意**：第 4 项（`fs_delete` / 上传入工作区 / 定时任务工具化）**2026-09-24 全部落地**——`fs_delete` 见 §15、上传附件进工作区见 §16、定时任务工具化见 §17。以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准，内置工具共 **30** 条登记 / 30 个工具定义（**28** 个在 `execBuiltin` 分发，`task` / `search_tools` 在 `chat.ts` 循环内处理）——2026-11-12 复核更正，早期「24 个 / 22 个」与「27 条 / 25 个」口径均作废；第 5 项 `run_script` / `image_gen` **已落地**并纳入统一交付物护栏（§11.8 / `DELIVERABLE_GUARDRAILS.md`；早期「维持暂缓」口径作废，2026-09-28 复核更正）。
 
 ### [mcp-guide.md](./mcp-guide.md)
 - **定位**：MCP 连接与内置服务器的**权威口径**（其它 MCP 文档与它冲突时以本文为准）。
@@ -51,7 +51,7 @@
 - **定位**：bi（Metabase）取数通道上 **SQL 怎么写** 的权威口径——13 条判据、改法示例、实测审计数据、实现坑。
 - **覆盖**：两道闸门的分工（只读 fail-closed vs 写法体检 fail-open）· 四类判据（结果集有界 / 扫描代价 / **正确性** / 引擎实践）· 元数据语句的例外 · 审计脚本与局限。
 - **现行落点**：`scripts/sql-lint-common.mjs`（判据唯一实现）· `scripts/sql-readonly-common.mjs`（只读）· `scripts/metabase-mcp.mjs` 的 `runSql` / `construct_query`（回灌）· `skills/business-data-query/SKILL.md` 的「SQL 怎么写」。
-- **回归**：`tests/sql-lint.test.ts`（13 例，含不误伤与 fail-open 反向约束）· 审计 `scripts/_audit-bi-sql.mjs`。
+- **回归**：`tests/sql-lint.test.ts`（13 例，含不误伤与 fail-open 反向约束）· 现行回归入口统一为 `pnpm test`。原审计脚本 `scripts/_audit-bi-sql.mjs` 已不在仓库（2026-11-12 核对），勿再照抄其命令。
 - **评测集**：`tests/fixtures/text2sql-bi-cases.json`（6 case，零业务词，每个 case 绑定真实测试名）+ `tests/text2sql-eval-fixture.test.ts`（fixture 不腐化门禁：绑定必须存在 + 零业务词自检）。
 - **状态**：🆕 2026-10-15 新建。
 
@@ -65,7 +65,7 @@
 - **定位**：取数类对话「零进展 23 分钟」事故复盘（2026-10-14，run `run_c284e83d`）+ 对标 4 篇权威原文的分步修复计划 + 评测集固化方案。**只讲韧性 / 收敛 / 资源治理**；取数正确性与只读安全见上一份文档。
 - **核心结论**：28 轮预算从未出现综合轮（0 次）→ 48 次外部工具调用 7 次失败 → 45 条结果被卸载成句柄 → 静默 627s 被看门狗收口 → 落兜底句。对标 Anthropic 上下文工程 / 工具设计、AWS 超时重试预算、OpenRouter 配额口径共 4 篇，给出 P0×3 / P1×5 / P2×3 修复项，每项含验收与回滚开关。
 - **评测集**：L0 case 定义已落 `apps/agent-server/tests/fixtures/stall-incident-cases.json`（10 个 case，**零业务词**、public/private 分层）；L1 确定性回归进 `pnpm test`；L3 扩在线评测维度。
-- **状态**：🆕 2026-10-14 新建；**第 1 批 + 第 2 批修复已实施**。`tsc` 0 错误；全量 87 文件 577 用例全绿。第 1 批（P0-1 配额冷却对齐 UTC 日切 / P0-3 候选链健康度优先 / P1-5 流内错误识别 + 工具失败文案可操作化，落地记录见 §5「第 1 批实施记录」）。第 2 批（P2-1 工具错误分类 + span 补齐并发批 / P1-1 熔断改滑动窗口错误率 / P1-2 同工具重复预算 / P1-4 中止时受控收尾，落地记录见 §5「第 2 批实施记录」）。第 3 批（P1-3 子代理状态契约、P0-2 冷却落盘、P2-2 评测扩维、P2-3）**仍为待办**。
+- **状态**：🆕 2026-10-14 新建；**第 1～11 批修复全部已实施**（2026-10-14 至 2026-10-15）。`tsc` 0 错误；全量 98 文件 653 用例全绿（含真实端到端复跑，见 §5「第 9 批实施记录」）。各批落地明细见 §5 实施记录：第 1 批（P0-1/P0-3/P1-5）、第 2 批（P2-1/P1-1/P1-2/P1-4）、第 3 批（P1-3 子代理状态契约 / P0-2 冷却落盘 / P2-2 评测扩维 / P2-3）、第 4 批（task span / 轮级 mode / 异常检测）、第 5 批（C1–C4 候选链与重试治理）、第 6 批（concise/detailed + 自适应超时）、第 7 批（Jev 统一治理）、第 8 批（卸载 recall 优先 + key 轮换入预算）、第 9 批（真实复跑 + 适配器语法门禁）、第 10 批（重复提醒跨轮阶梯）、第 11 批（对齐 Micro-compact 安全子集）。**§7 的「真实复跑验证」项已于 2026-11-10 全部闭环**（见 §7.1）：L4 探索效率（总工具调用 83→40、单点最大重复 32→30）、`[chat:compact]` 压缩日志（真实长轨迹里 13 次压缩、卸载但清空 0、keep 硬下限守住）、**客服 Jev 路**（真实 `/support` 复跑，`classifierCalls=1` 且 `classifier_health=PASS`，Jev 四项分类均正确）三者均验证通过。复跑脚本 `scripts/_stall-replay.mjs`（BI 路）与 `scripts/_jev-replay.mjs`（客服路）均已补回（§9 当时临时脚本从未入仓）。此次事故的全部修复与遗留验证项已闭合。
 - **注意**：与 `text2sql-text2api-plan.md` §3.2「语句超时默认 30s」不冲突——那份证明"外部调用必须有界"，本份补上"超时/反复失败之后模型与运行该怎么处置"。
 
 ### [conversation-state-plan.md](./conversation-state-plan.md)
@@ -118,6 +118,12 @@
 ### [movie-mobile-ui-plan.md](./movie-mobile-ui-plan.md)
 - **定位**：影视移动端 UI 方案。
 - **状态**：✅ 现行（2026-09-24 已核对关键声明与代码一致：`MoviePage.vue` 存在、`isMovieMode` 全仓库 0 处、`getApiErrorCode`/`foldAgentBlocks`/`theme.ts` 优雅降级/`styles.css` forced-colors/`ModelSelect` aria-label 均吻合）。
+
+### [engineering-optimization-review.md](./engineering-optimization-review.md)
+- **定位**：2026-11-12 全仓**工程现状对齐 + 全局优化清单**（P0–P3 分级、证据、落地路线与验收）。属工程治理评审，**不是设计方案**，不改变各主题文档的权威口径。
+- **覆盖**：口径基准表（内置工具数量 / 测试外部依赖 / 测试规模 / `any` 分布 / 路由注册数等）· 文档冲突与处置 · 优化空间 · 现状基线 · 待确认项。
+- **状态**：✅ 现行（2026-11-12 建立，事实以该时点代码为准；文中优化项**均未实施**）。
+- **注意**：与主题文档冲突时以各主题现行文档为准；实施优化后回写该文状态行与 §3 冲突清单。
 
 ---
 

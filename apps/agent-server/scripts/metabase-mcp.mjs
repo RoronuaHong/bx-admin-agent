@@ -137,21 +137,34 @@ import { appendClickHouseSettings, defaultClickHouseSettings, classifyUpstreamEr
 import { createQueryCacheFromEnv } from "./bi-query-cache.mjs";
 import { buildColumnSearchSql } from "./metabase-column-search.mjs";
 import { renderTableMSchema, renderDatabaseMSchema } from "./metabase-mschema.mjs";
+import { createLiveValueCache, fillLiveValues } from "./bi-mschema-values.mjs";
 import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, normalizeKnownTables } from "./metabase-card-graph.mjs";
 import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
-import { buildCaliberGraph, buildCaliberContext } from "./bi-caliber-graph.mjs";
+import { buildCaliberGraph, buildCaliberContext, tableSearchText } from "./bi-caliber-graph.mjs";
+import { evalHiddenTools, evalGateRefusal, heldOutCardIds, hideHeldOut } from "./bi-eval-holdout.mjs";
+import { approvedEntries, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary } from "./bi-semantic.mjs";
+
+// P1.1 实测取值缓存：get_database_schema(with_values=true) 跨调用复用，TTL 由 bi-mschema-values.mjs 管。
+const liveValueCache = createLiveValueCache();
 
 // 口径语义图缓存（P3）：图构建依赖 buildGoldenSet（自身有 TTL 缓存），这里再包一层避免每次工具调用重建共现图。
+// known 每次调用都是新 Set，按内容（而非引用）作缓存键。评测模式有留出卡片时不走缓存：缓存里是全量图。
 const CALIBER_TTL_MS = 5 * 60 * 1000;
-let _caliberCache = { ts: 0, databaseId: null, known: null, graph: null };
-async function getCaliberGraph(mb, databaseId, known) {
+// get_caliber_context 附 SQL 的命中卡片数（0 = 不附，用于 A/B 对照）与每张的字符上限。
+const CALIBER_INLINE_SQL = /^\d+$/.test(String(process.env.BI_CALIBER_INLINE_SQL ?? "").trim())
+  ? Number(process.env.BI_CALIBER_INLINE_SQL)
+  : 2;
+const CALIBER_SQL_CHARS = 1500;
+let _caliberCache = { ts: 0, key: null, graph: null };
+async function getCaliberGraph(mb, databaseId, known, tableTexts = {}) {
   const now = Date.now();
-  if (_caliberCache.graph && _caliberCache.databaseId === databaseId && _caliberCache.known === known && now - _caliberCache.ts < CALIBER_TTL_MS) {
-    return _caliberCache.graph;
-  }
   const g = await buildGoldenSet(mb);
-  const graph = buildCaliberGraph(g.cases, { knownTables: known });
-  _caliberCache = { ts: now, databaseId, known, graph };
+  const hidden = heldOutCardIds();
+  if (hidden.size) return buildCaliberGraph(g.cases.filter((c) => !hidden.has(Number(c.id))), { knownTables: known, tableTexts });
+  const key = `${databaseId}|${[...known].sort().join(",")}|${Object.keys(tableTexts).length}`;
+  if (_caliberCache.graph && _caliberCache.key === key && now - _caliberCache.ts < CALIBER_TTL_MS) return _caliberCache.graph;
+  const graph = buildCaliberGraph(g.cases, { knownTables: known, tableTexts });
+  _caliberCache = { ts: now, key, graph };
   return graph;
 }
 
@@ -248,7 +261,7 @@ function renderCell(value) {
 // 执行渲染 + 结构化反馈信号集中在此；任何「执行 SQL」的入口都必须经它，
 // 不允许再各自内联一份（那正是 src/sql-readonly-common.mjs 注释里警示的漂移来源）。
 async function runSql(database_id, sql, limit = 200) {
-  const check = assertSql(sql);
+  const check = assertSql(sql, { glossary: loadGlossary() });
   if (!check.ok) {
     // 校验拒绝也产出机读信号：errorKind=VALIDATION_REJECTED，可重试（改 SQL 后重试）。
     const fb = buildQueryFeedback({ ok: false, errorKind: "VALIDATION_REJECTED", hint: check.error });
@@ -308,12 +321,40 @@ async function runSql(database_id, sql, limit = 200) {
   // 静态体检结论回灌（fail-open：照常执行，但把"可以怎么改"一并给模型，让它下次写对）。
   // 不静默改写 SQL——改写等于替模型猜口径；只提示。
   const lint = lintSummary(lintSql(check.sql));
+  // 已批准口径里 enforce=warn 的冲突：照常返回数据，但把约定口径一并告诉模型。
+  const caliberWarn = check.warnings?.length ? check.warnings.join("\n") : "";
   // 结构化反馈信号（§3-E）：错误类型 / 是否空结果 / 行列数 / 截断 / 可重试性，供消费方做执行反馈自校正。
   const feedback = buildQueryFeedback({ ok: true, cols, rows, truncated });
-  const result = json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}\n\n${renderFeedbackLine(feedback)}`);
+  const head = [caliberWarn, lint].filter(Boolean).join("\n\n");
+  const result = json(`${head ? `${head}\n\n` : ""}${echo}\n\n${lines.join("\n")}\n\n${renderFeedbackLine(feedback)}`);
   // 结果缓存去重（文档 6.5.2）：成功结果才入缓存，失败路径不缓存。
   queryCache.set(database_id, check.sql, limit, result);
   return result;
+}
+
+// 执行已保存卡片（execute_query / query 传 question_id 共用）：与 runSql 一样在末尾附结构化反馈行。
+async function runCard(question_id, parameters, limit = 200) {
+  const body = { ignore_cache: false, ...(Array.isArray(parameters) ? { parameters } : {}) };
+  const r = await mb(`/card/${question_id}/query`, { method: "POST", body, query: true });
+  if (!r.ok) {
+    const upstream = JSON.stringify(r.data);
+    const fb = buildQueryFeedback({ ok: false, upstreamText: upstream });
+    return json(`[${r.status}] ${upstream}\n\n${renderFeedbackLine(fb)}`, true);
+  }
+  const payload = r.data?.data;
+  if (!payload || !Array.isArray(payload.cols)) {
+    const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
+    const fb = buildQueryFeedback({ ok: false, errorKind: "NO_RESULT", hint: "卡片未返回结果：稍后重试或检查卡片。" });
+    return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或检查卡片。\n\n${renderFeedbackLine(fb)}`, true);
+  }
+  const cols = payload.cols.map((c) => c.display_name || c.name);
+  const allRows = Array.isArray(payload.rows) ? payload.rows : [];
+  const truncated = allRows.length > limit;
+  const rows = allRows.slice(0, limit);
+  const lines = [cols.join("\t")];
+  for (const row of rows) lines.push(row.map(renderCell).join("\t"));
+  if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
+  return json(`${lines.join("\n")}\n\n${renderFeedbackLine(buildQueryFeedback({ ok: true, cols, rows, truncated }))}`);
 }
 
 /**
@@ -336,6 +377,7 @@ const READ_ONLY_TOOLS = new Set([
   "execute_query", // 执行已保存卡片（只读结果）
   "construct_query", // 仅构造/校验查询，不执行
   "read_resource", // 仅读取资产元数据
+  "get_metric_definitions", // 读本地口径词典
 ]);
 // 说明：execute_sql / query 也走只读闸门（runSql），但它们执行「任意 SQL」，
 // 与 run_native_query 同理不在此名单——是否放行由服务端风险策略（toolRisks / 未知兜底）决定，
@@ -379,6 +421,8 @@ const TOOLS = [
       "② 再本工具传 table=<表名> 取该表字段级定义。" +
       "mode 选 mschema 时输出紧凑 M-Schema Markdown（外键指向显性标出、取值域内联、业务描述前置），是 text2sql 首选呈现；" +
       "default 为原 JSON 输出（兼容旧消费方）。" +
+      "mschema + table 时可选 with_values=true：对枚举类字段额外跑取样查询，用实测去重值（标 live）覆盖 description 里可能过期的手写枚举，" +
+      "代价是首拉延迟上升，默认关闭（ClickHouse 后端不填 fingerprint 取值域，本项对症 doc T4/S9）。" +
       DETAIL_HINT,
     inputSchema: {
       type: "object",
@@ -393,10 +437,18 @@ const TOOLS = [
           enum: ["default", "mschema"],
           description: "default=原 JSON 输出；mschema=紧凑 M-Schema Markdown（含取值域，text2sql 首选）。默认 default",
         },
+        with_values: {
+          type: "boolean",
+          description: "仅 mode=mschema 且指定 table 时生效：对枚举类字段额外跑取样查询，用实测去重值覆盖描述里可能过期的枚举；默认 false，开启会增加首拉延迟",
+        },
+        max_value_fields: {
+          type: "number",
+          description: "with_values=true 时最多实测几个枚举字段，默认 8、上限 20；用于自行控制延迟预算",
+        },
       },
       required: ["database_id"],
     },
-    async run({ database_id, table, search, include_fields, detail, mode }) {
+    async run({ database_id, table, search, include_fields, detail, mode, with_values, max_value_fields }) {
       const wantFields = Boolean(table) || include_fields === true;
       // 统一走带 TTL 的整库元数据缓存；skip_fields 只是 API 侧减负，本地始终存全量、按需裁字段。
       const r = await getDatabaseMetadata(database_id, { skipFields: !wantFields });
@@ -425,7 +477,27 @@ const TOOLS = [
               true,
             );
           }
-          return json(renderTableMSchema(dbName, database_id, dbEngine, hit, fieldIndex));
+          let valueOverrides = null;
+          let liveNote = "";
+          if (with_values === true) {
+            // P1.1：只对枚举候选字段取样查询；任何失败都回落原 M-Schema，不影响本次 schema 输出。
+            const { overrides, stats } = await fillLiveValues({
+              mb,
+              databaseId: database_id,
+              table: hit,
+              maxFields: max_value_fields,
+              cache: liveValueCache,
+            });
+            valueOverrides = overrides;
+            liveNote = `\n\n<!-- live-values: 候选 ${stats.candidates} / 实测 ${stats.succeeded} / 缓存命中 ${stats.fromCache} / 无值或失败 ${stats.noValues}；每字段取样上限 20 万行、最多 30 个去重值 -->`;
+          }
+          const fkHealth = loadFkHealth();
+          const fkNotes = new Map();
+          for (const f of hit.fields || []) {
+            const h = f.fk_target_field_id ? fkHealthFor(fkHealth, hit.name, f.name) : null;
+            if (h) fkNotes.set(f.name, h.note);
+          }
+          return json(renderTableMSchema(dbName, database_id, dbEngine, hit, fieldIndex, valueOverrides, fkNotes) + liveNote);
         }
         const matched = search
           ? tables.filter((t) => String(t.name || "").toLowerCase().includes(String(search).toLowerCase()))
@@ -692,7 +764,7 @@ const TOOLS = [
     async run({ search, limit = 50, detail } = {}) {
       const r = await mb("/card");
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
-      let rows = asList(r.data).map((c) => ({
+      let rows = hideHeldOut(asList(r.data)).map((c) => ({
         id: c.id,
         name: c.name,
         database: c.database_id,
@@ -760,12 +832,15 @@ const TOOLS = [
         : Array.isArray(r.data?.ordered_cards)
           ? r.data.ordered_cards
           : [];
-      const cards = raw.map((dc) => ({
-        card_id: dc.card?.id ?? dc.card_id ?? null,
-        name: dc.card?.name ?? dc.visualization_settings?.text ?? null,
-        visualization: dc.card?.display ?? null,
-        ...(dc.dashboard_tab_id ? { tab: dc.dashboard_tab_id } : {}),
-      }));
+      const cards = hideHeldOut(
+        raw.map((dc) => ({
+          card_id: dc.card?.id ?? dc.card_id ?? null,
+          name: dc.card?.name ?? dc.visualization_settings?.text ?? null,
+          visualization: dc.card?.display ?? null,
+          ...(dc.dashboard_tab_id ? { tab: dc.dashboard_tab_id } : {}),
+        })),
+        "card_id",
+      );
       // concise：card_id/name（够定位去 get_card）；detailed 才带可视化类型与分页 tab。
       const p = projectRows(cards, { detail, keys: ["card_id", "name"], cap: 40, hint: "可视化类型请传 detail=detailed" });
       return json({
@@ -855,7 +930,7 @@ const TOOLS = [
     async run({ table, database_id, limit = 20, rebuild = false }) {
       const index = await buildCardTableIndex(mb, { databaseId: database_id ?? null, force: !!rebuild });
       if (index.error) return json(index.error, true);
-      const cards = cardsForTable(index, table).slice(0, Math.max(1, Number(limit) || 20));
+      const cards = hideHeldOut(cardsForTable(index, table)).slice(0, Math.max(1, Number(limit) || 20));
       if (!cards.length) {
         return json(`没有已保存提问引用表「${table}」。可用 search 或 get_database_schema 看表结构后自行写 SQL。`);
       }
@@ -888,14 +963,15 @@ const TOOLS = [
       if (index.error) return json(index.error, true);
       const res = relatedCards(index, card_id);
       if (!res) return json(`未找到卡片 ${card_id}（可能不在该 database_id 下，或不在此 Metabase 实例）。`, true);
-      if (!res.related.length) {
+      const related = hideHeldOut(res.related);
+      if (!related.length) {
         return json(
           `卡片「${res.self.name}」(id=${card_id}) 未解析到底表，或没有其它卡片与之共享表。用 get_card(detail=detailed) 看它的 SQL。`,
         );
       }
       return json({
         card: { id: res.self.id, name: res.self.name, tables: res.self.tables },
-        relatedQuestions: res.related.slice(0, Math.max(1, Number(limit) || 15)).map((c) => ({
+        relatedQuestions: related.slice(0, Math.max(1, Number(limit) || 15)).map((c) => ({
           id: c.id,
           name: c.name,
           sharedTables: c.sharedTables,
@@ -963,8 +1039,7 @@ const TOOLS = [
       );
       const g = await buildGoldenSet(mb);
       if (g.error) return json(g.error, true);
-      const cards = g.cases
-        .filter((c) => c.expected_sql)
+      const cards = hideHeldOut(g.cases.filter((c) => c.expected_sql))
         .map((c) => ({ id: c.id, name: c.question || c.name, sql: c.expected_sql }));
       const idx = buildJoinExamples(cards, known);
       const hits = joinExamplesForTable(idx, table, Math.max(1, Number(limit) || 3));
@@ -993,7 +1068,7 @@ const TOOLS = [
     name: "get_caliber_context",
     description:
       "口径语义检索（P3，§4.2-2）：给定自然语言问题/指标名，从既有卡片口径（真实 SQL + 表共现图）检索出「该用的表 + 常一起 join 的表 + 可参考的现成卡片」。" +
-      "写多表 SQL 前先查它，直接拿到精准表清单与 join 启发，避免选错表（静默错误，约占 1/3 查询）。" +
+      "写多表 SQL 前先查它，直接拿到精准表清单与 join 启发，避免选错表（跑通了但口径错的静默错误）。" +
       "检索基于口径层小图（共现边 + 关键词命中），零 embedding 成本；结果仅供参考，外键仍需核实。",
     inputSchema: {
       type: "object",
@@ -1006,16 +1081,37 @@ const TOOLS = [
     },
     async run({ query, limit = 5, database_id } = {}) {
       const wid = Number(database_id || process.env.METABASE_DATABASE_ID || 2);
-      const meta = await getDatabaseMetadata(wid, { skipFields: true });
-      const known = normalizeKnownTables(
-        meta.ok && Array.isArray(meta.data?.tables)
-          ? meta.data.tables.map((t) => (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name))
-          : [],
-      );
+      const meta = await getDatabaseMetadata(wid);
+      const metaTables = meta.ok && Array.isArray(meta.data?.tables) ? meta.data.tables : [];
+      const qualified = (t) => (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name);
+      const known = normalizeKnownTables(metaTables.map(qualified));
+      // 表检索文本：字段/表描述 + 已批准口径的名称与别名（草稿不进线上）。
+      const tableTexts = {};
+      for (const t of metaTables) {
+        const text = tableSearchText(t);
+        if (text) tableTexts[qualified(t).toLowerCase()] = text;
+      }
+      for (const [bareName, terms] of Object.entries(glossaryTableTerms(loadGlossary()))) {
+        const k = Object.keys(tableTexts).find((x) => x.split(".").pop() === bareName) || bareName;
+        tableTexts[k] = `${tableTexts[k] || ""} ${terms}`.trim();
+      }
       const g = await buildGoldenSet(mb);
       if (g.error) return json(g.error, true);
-      const graph = await getCaliberGraph(mb, wid, known);
+      const graph = await getCaliberGraph(mb, wid, known, tableTexts);
       const ctx = buildCaliberContext(graph, query, { k: Math.max(1, Number(limit) || 5) });
+      // 已认可查询内联：前几张命中卡片直接附 SQL，省一轮 get_card，也让模型照着现成口径改写而非从零写。
+      if (CALIBER_INLINE_SQL > 0) {
+        const sqlById = new Map(g.cases.map((c) => [Number(c.id), c.expected_sql]));
+        ctx.matchedCards = ctx.matchedCards.map((c, i) => {
+          const sql = i < CALIBER_INLINE_SQL ? sqlById.get(Number(c.id)) : null;
+          if (!sql) return c;
+          const clipped = sql.length > CALIBER_SQL_CHARS;
+          return { ...c, sql: clipped ? `${sql.slice(0, CALIBER_SQL_CHARS)}\n…（已截断，完整 SQL 用 get_card detail=detailed）` : sql };
+        });
+        if (ctx.matchedCards.some((c) => c.sql)) {
+          ctx.note += " 带 sql 的卡片是已保存的现成查询：问题与它一致时照它改写（改日期、维度、过滤值），不要从零写；不一致的部分再按 schema 补。";
+        }
+      }
       return json(ctx);
     },
   },
@@ -1041,14 +1137,20 @@ const TOOLS = [
       if (Array.isArray(models)) for (const item of models) qs.append("models", String(item));
       const r = await mb(`/search?${qs.toString()}`);
       if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
-      const rows = asList(r.data).map((x) => ({
+      const all = asList(r.data);
+      // 只有卡片类结果（card / dataset / metric）的 id 是卡片 id，表 / 仪表盘等同号 id 不能误删。
+      const cardLike = (x) => ["card", "dataset", "metric"].includes(x.model ?? x.model_name);
+      const visibleCards = new Set(hideHeldOut(all.filter(cardLike)));
+      const kept = all.filter((x) => !cardLike(x) || visibleCards.has(x));
+      const rows = kept.map((x) => ({
         model: x.model ?? x.model_name,
         id: x.id,
         name: x.name,
         ...(x.database_name ? { database: x.database_name } : {}),
         ...(x.table_name ? { table: x.table_name } : {}),
       }));
-      return json({ total: r.data?.total ?? rows.length, results: rows.slice(0, limit) });
+      const dropped = all.length - kept.length;
+      return json({ total: (r.data?.total ?? all.length) - dropped, results: rows.slice(0, limit) });
     },
   },
   {
@@ -1071,22 +1173,7 @@ const TOOLS = [
       required: ["question_id"],
     },
     async run({ question_id, parameters, limit = 200 }) {
-      const body = { ignore_cache: false, ...(Array.isArray(parameters) ? { parameters } : {}) };
-      const r = await mb(`/card/${question_id}/query`, { method: "POST", body, query: true });
-      if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
-      const payload = r.data?.data;
-      if (!payload || !Array.isArray(payload.cols)) {
-        const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
-        return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或检查卡片。`, true);
-      }
-      const cols = payload.cols.map((c) => c.display_name || c.name);
-      const allRows = Array.isArray(payload.rows) ? payload.rows : [];
-      const truncated = allRows.length > limit;
-      const rows = allRows.slice(0, limit);
-      const lines = [cols.join("\t")];
-      for (const row of rows) lines.push(row.map(renderCell).join("\t"));
-      if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
-      return json(lines.join("\n"));
+      return runCard(question_id, parameters, limit);
     },
   },
   {
@@ -1124,24 +1211,7 @@ const TOOLS = [
       },
     },
     async run({ question_id, database_id, sql, parameters, limit = 200 }) {
-      if (question_id != null) {
-        const body = { ignore_cache: false, ...(Array.isArray(parameters) ? { parameters } : {}) };
-        const r = await mb(`/card/${question_id}/query`, { method: "POST", body, query: true });
-        if (!r.ok) return json(`[${r.status}] ${JSON.stringify(r.data)}`, true);
-        const payload = r.data?.data;
-        if (!payload || !Array.isArray(payload.cols)) {
-          const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
-          return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或检查卡片。`, true);
-        }
-        const cols = payload.cols.map((c) => c.display_name || c.name);
-        const allRows = Array.isArray(payload.rows) ? payload.rows : [];
-        const truncated = allRows.length > limit;
-        const rows = allRows.slice(0, limit);
-        const lines = [cols.join("\t")];
-        for (const row of rows) lines.push(row.map(renderCell).join("\t"));
-        if (truncated) lines.push(`…(已截断，共 ${allRows.length} 行，仅显示前 ${limit} 行)`);
-        return json(lines.join("\n"));
-      }
+      if (question_id != null) return runCard(question_id, parameters, limit);
       if (database_id != null && sql != null) return runSql(database_id, sql, limit);
       return json("请提供 question_id（执行已保存提问），或 database_id + sql（执行原生 SQL）。", true);
     },
@@ -1174,7 +1244,7 @@ const TOOLS = [
         });
       }
       if (sql != null) {
-        const check = assertSql(sql);
+        const check = assertSql(sql, { glossary: loadGlossary() });
         if (!check.ok) return json(check.error, true);
         // 校验阶段就把体检结论给出来：这是「执行前确认口径」的关键一环，
         // 模型在这里看到问题比自己执行后才发现要便宜得多。
@@ -1185,6 +1255,7 @@ const TOOLS = [
           type: "native",
           native: { query: check.sql },
           ...(lint ? { lint } : {}),
+          ...(check.warnings?.length ? { caliberWarnings: check.warnings } : {}),
           note: "已校验为只读，可直接交给 execute_sql / run_native_query 执行。",
         });
       }
@@ -1243,7 +1314,7 @@ const TOOLS = [
           id: r.data.id,
           name: r.data.name,
           tabs: (r.data.tabs || []).length,
-          cards: raw.map((dc) => ({ card_id: dc.card?.id ?? dc.card_id ?? null, name: dc.card?.name ?? null })),
+          cards: hideHeldOut(raw.map((dc) => ({ card_id: dc.card?.id ?? dc.card_id ?? null, name: dc.card?.name ?? null })), "card_id"),
         });
       }
       if (type === "collection") {
@@ -1308,31 +1379,63 @@ const TOOLS = [
       const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
       if (!tables.length) return json(`数据库 ${database_id} 未返回表（可能元数据未同步或该 API Key 无权限）。`);
       const fieldIndex = buildFieldIndex(tables);
+      const fkHealth = loadFkHealth();
       const edges = [];
       for (const t of tables) {
         for (const f of t.fields || []) {
           if (!f.fk_target_field_id) continue;
           const target = fieldIndex.get(f.fk_target_field_id);
           if (!target) continue;
+          const h = fkHealthFor(fkHealth, t.name, f.name);
           edges.push({
             table: t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name,
             column: f.name,
             references: target,
+            ...(h ? { verified: false, healthNote: h.note } : {}),
           });
         }
       }
+      const healthHint = (list) =>
+        list.some((e) => e.verified === false)
+          ? { note: "verified=false 的外键经技术核对有问题（见 healthNote），按它 JOIN 可能得到 0 行；先用 search_columns 找别的关联键或换来源。" }
+          : {};
       if (table) {
         const needle = String(table).trim().toLowerCase();
         const matched = edges.filter((e) => e.table.toLowerCase() === needle);
         if (!matched.length) {
           return json(`表「${table}」没有外键（或 Metabase 未定义其 FK）。JOIN 关联键请改用 search_columns 按列名定位。`, true);
         }
-        return json({ table: needle, relationships: matched });
+        return json({ table: needle, relationships: matched, ...healthHint(matched) });
       }
       if (!edges.length) {
         return json("本库没有任何外键关联（Metabase 元数据里未定义 FK）。跨表关联键请改用 search_columns 按列名定位。", true);
       }
-      return json({ database_id, relationshipCount: edges.length, relationships: edges });
+      return json({ database_id, relationshipCount: edges.length, relationships: edges, ...healthHint(edges) });
+    },
+  },
+  {
+    name: "get_metric_definitions",
+    description:
+      "查业务已确认的指标口径（已支付订单、收入金额、时区、国家维度、用户去重主键等的唯一定义与标准 SQL 片段）。" +
+      "写涉及这些指标的 SQL 前先查：口径以这里为准，现成卡片与之冲突时按这里写，并在回答里说明。" +
+      "query 按指标名或别名过滤，不传返回全部。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "指标名或别名关键词（如「收入」「已支付」），可选" },
+      },
+    },
+    async run({ query }) {
+      const entries = approvedEntries(loadGlossary());
+      if (!entries.length) return json("当前没有业务已确认的指标口径。", true);
+      const q = String(query || "").trim().toLowerCase();
+      const hit = q
+        ? entries.filter((e) => [e.name, e.id, ...(e.aliases || [])].some((s) => String(s).toLowerCase().includes(q)))
+        : entries;
+      if (!hit.length) return json(`没有匹配「${query}」的已确认口径。已确认：${entries.map((e) => e.name).join("、")}`, true);
+      return json({
+        definitions: hit.map(({ id, name, aliases, definition, sql, notes, owner, approvedAt }) => ({ id, name, aliases, definition, sql, notes, owner, approvedAt })),
+      });
     },
   },
 ];
@@ -1349,14 +1452,22 @@ for (const name of READ_ONLY_TOOLS) {
   }
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS.map(({ name, description, inputSchema }) => ({
-    name,
-    description,
-    inputSchema,
-    ...(READ_ONLY_TOOLS.has(name) ? { annotations: READ_ONLY_ANNOTATIONS } : {}),
-  })),
-}));
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // 评测模式下隐藏会泄题的 get_golden_set；BI_EVAL_DISABLE_CALIBER=1 时再隐藏 get_caliber_context，
+  // 用于 P3 口径图 A/B 的对照组。两者都只在评测模式生效，生产误配不会关掉线上工具。
+  const hidden = evalHiddenTools();
+  if (hidden.size) console.error(`[bi-metabase] 评测模式隐藏工具: ${[...hidden].join(", ")}`);
+  // 口径词典还没有业务确认的条目时不宣告，避免模型拿到一个永远返回空的工具。
+  if (!approvedEntries(loadGlossary()).length) hidden.add("get_metric_definitions");
+  return {
+    tools: TOOLS.filter((t) => !hidden.has(t.name)).map(({ name, description, inputSchema }) => ({
+      name,
+      description,
+      inputSchema,
+      ...(READ_ONLY_TOOLS.has(name) ? { annotations: READ_ONLY_ANNOTATIONS } : {}),
+    })),
+  };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const name = String(req.params.name || "");
@@ -1366,6 +1477,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (!tool) {
     console.error(`[bi-metabase] tool=${name} 未知工具`);
     return json(`未知工具：${name}`, true);
+  }
+  const refusal = evalGateRefusal(name, req.params.arguments || {});
+  if (refusal) {
+    console.error(`[bi-metabase] tool=${name} 评测留出拒绝`);
+    return json(refusal, true);
   }
   try {
     const res = await tool.run(req.params.arguments || {});

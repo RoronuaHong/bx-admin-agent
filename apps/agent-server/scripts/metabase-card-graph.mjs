@@ -15,7 +15,8 @@ const CARD_INDEX_TTL_MS = Number(process.env.BI_CARD_INDEX_TTL_MS || 300_000);
 
 // 从 SQL 抽 FROM/JOIN 的表引用（含 schema.table）。跳过子查询（FROM 后紧跟 ( 不匹配），
 // 因为要求 FROM\s+ 后必须是 \w 开头标识符。逗号连接只取首个，足够「发现」用途。
-const FROM_JOIN = /\b(?:FROM|JOIN)\s+([`"]?[\w]+[`"]?)(?:\.([`"]?[\w]+[`"]?))?/gi;
+// ClickHouse 的 `[LEFT] ARRAY JOIN col` 展开的是数组列而不是表，排除。
+const FROM_JOIN = /\b(?:FROM|(?<!\bARRAY\s{1,20})JOIN)\s+([`"]?[\w]+[`"]?)(?:\.([`"]?[\w]+[`"]?))?/gi;
 
 function normalizeTable(s) {
   if (!s) return null;
@@ -64,6 +65,108 @@ export function filterKnownTables(tables, known) {
   return arr.filter((t) => known.has(t) || known.has(t.split(".").pop()));
 }
 
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Metabase 外键显示映射（FK remapping，如 activityId 显示为活动名）编译出的
+ * `LEFT JOIN (SELECT … FROM T) AS \`T__via__fk\``：只为取显示列。若映射出的列
+ * （`T__via__fk__xxx`）在 SQL 里只出现在定义处、外层从没用过，T 对结果没有贡献。
+ * 返回只以这种方式出现的表（规范化名）。
+ */
+export function unusedRemapTables(sql) {
+  if (typeof sql !== "string" || !sql.includes("__via__")) return [];
+  const aliases = new Set([...sql.matchAll(/`(\w+__via__\w+?)`\s+ON\b/g)].map((m) => m[1]));
+  const unused = new Map();
+  for (const alias of aliases) {
+    const projected = [...sql.matchAll(new RegExp(`\`(${escapeRe(alias)}__\\w+)\``, "g"))].map((m) => m[1]);
+    if (projected.some((p) => sql.split(`\`${p}\``).length - 1 >= 2)) continue;
+    const src = sql.match(new RegExp(`FROM\\s+([\`"]?\\w+[\`"]?(?:\\.[\`"]?\\w+[\`"]?)?)\\s*\\)\\s*AS\\s+\`${escapeRe(alias)}\``));
+    const t = src && normalizeTable(src[1]);
+    if (t) unused.set(t, (unused.get(t) || 0) + 1);
+  }
+  const out = [];
+  for (const [t, n] of unused) {
+    let total = 0;
+    for (const m of sql.matchAll(FROM_JOIN)) if (normalizeTable(m[2] ? `${m[1]}.${m[2]}` : m[1]) === t) total++;
+    if (total === n) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 黄金集期望表归一化：白名单里能唯一对应的裸表名补成 `schema.table`；SQL 里定义的 CTE 名剔除；
+ * 剩下既不在白名单、又不是 CTE 的名字记进 unverifiedTables（多为 Metabase 隐藏表或已下线表），
+ * 这些用例的期望表可能不全，评分时单列。只经未使用的外键显示映射引入的表剔除，记进 remapOnlyTables。
+ * knownList：bi-known-tables.json 的 tables（带 schema 的全名）。
+ */
+export function normalizeGoldenCase(c, knownList) {
+  const full = (Array.isArray(knownList) ? knownList : knownList?.tables || []).map(normalizeTable).filter(Boolean);
+  const fullSet = new Set(full);
+  const byBare = new Map();
+  for (const t of full) {
+    const bare = t.split(".").pop();
+    byBare.set(bare, byBare.has(bare) ? null : t); // null = 多个 schema 同名，不敢补
+  }
+  const sql = typeof c.expected_sql === "string" ? c.expected_sql : "";
+  const isCte = (name) => new RegExp(`(?:\\bwith\\s+|,\\s*)\`?${name}\`?\\s+as\\s*\\(`, "i").test(sql);
+  const tables = [];
+  const unverified = [];
+  const remapOnly = new Set(unusedRemapTables(sql));
+  // 有编译后 SQL 就按当前抽表规则重抽（抽表规则修正能回灌到黄金集），否则沿用落盘时的 tables。
+  for (const raw of sql ? extractTables(sql) : c.tables || []) {
+    const t = normalizeTable(raw);
+    if (!t || remapOnly.has(t)) continue;
+    if (fullSet.has(t)) tables.push(t);
+    else if (!t.includes(".") && byBare.get(t)) tables.push(byBare.get(t));
+    else if (!t.includes(".") && isCte(t)) continue;
+    else {
+      tables.push(t);
+      unverified.push(t);
+    }
+  }
+  const out = { ...c, tables: [...new Set(tables)] };
+  if (unverified.length) {
+    out.unverifiedTables = [...new Set(unverified)];
+    // 白名单外表的查证结论（tests/bi-known-tables.json 的 tableAudit）：区分「库里存在但 Metabase 隐藏」与「库里已不存在」。
+    const audit = Array.isArray(knownList) ? {} : knownList?.tableAudit || {};
+    const inList = (list, t) => (list || []).some((x) => normalizeTable(x).split(".").pop() === t.split(".").pop());
+    out.unverifiedTableStatus = Object.fromEntries(
+      out.unverifiedTables.map((t) => [t, inList(audit.missing, t) ? "missing" : inList(audit.existHidden, t) ? "existHidden" : "unknown"]),
+    );
+  } else {
+    delete out.unverifiedTables;
+    delete out.unverifiedTableStatus;
+  }
+  if (remapOnly.size) out.remapOnlyTables = [...remapOnly];
+  else delete out.remapOnlyTables;
+  return out;
+}
+
+/**
+ * 应用自然语言改写稿：question 换成改写后的提问，原卡片名保留在 cardTitle。
+ * 留一法要靠卡片标题识别「同口径多份」的孪生卡片，题目改写后原名不能丢。
+ * 幂等：重复执行不会把已改写的 question 再当原标题存一遍。
+ */
+export function applyGoldenQuestions(cases, questions) {
+  const map = questions && typeof questions === "object" ? questions : {};
+  return (cases || []).map((c) => {
+    const out = { ...c, cardTitle: c.cardTitle ?? c.question };
+    const q = map[String(c.id)];
+    if (typeof q === "string" && q.trim()) out.question = q.trim();
+    return out;
+  });
+}
+
+/**
+ * 卡片 SQL 的底表：剔除「只为 FK 显示映射、外层从未使用」的表（unusedRemapTables）。
+ * 金样期望表归一化早已这么做（§11.7 的 9 例 elt_ul_activity），这里让线上「按表找卡片」索引
+ * 与它一致，避免 9 张订单类卡片被错误挂到 elt_ul_activity 名下。纯函数，便于单测。
+ */
+export function cardTablesFromSql(sql) {
+  const remapOnly = new Set(unusedRemapTables(sql || ""));
+  return extractTables(sql || "").filter((t) => !remapOnly.has(t));
+}
+
 // 取单卡片的底表：原生卡片直接读 native.query；MBQL 卡片 POST /dataset/native 编译成 SQL 再抽。
 export async function getCardTables(mb, cardId) {
   const r = await mb(`/card/${cardId}?legacy-mbql=true`);
@@ -79,7 +182,7 @@ export async function getCardTables(mb, cardId) {
     });
     if (compiled.ok && typeof compiled.data?.query === "string") sql = compiled.data.query;
   }
-  return extractTables(sql || "");
+  return cardTablesFromSql(sql);
 }
 
 // 取单卡片的原生 SQL（用于黄金集的 expected_sql）：原生卡片直接读 native.query；MBQL 走 /dataset/native 编译。
@@ -122,7 +225,10 @@ export async function buildGoldenSet(mb, { databaseId = null, force = false } = 
     const enriched = await Promise.all(
       slice.map(async (c) => {
         const sql = await getCardSql(mb, c.id).catch(() => null);
-        return { ...c, expected_sql: sql, tables: sql ? extractTables(sql) : [] };
+        // 与线上卡片→表索引、金样归一化同一口径：剔除未使用的 FK 显示映射表，
+        // 否则线上 get_caliber_context / get_join_examples 会带着「订单表 ↔ elt_ul_activity」的假共现边，
+        // 而离线评测用的是已剔除的 golden 文件，两边不一致。
+        return { ...c, expected_sql: sql, tables: sql ? cardTablesFromSql(sql) : [] };
       }),
     );
     cases.push(...enriched);

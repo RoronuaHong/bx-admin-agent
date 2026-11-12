@@ -5,8 +5,9 @@
 // 设计依据：docs/bi-metabase-optimization-plan.md §4.3（M-Schema + 取值域内联 + 业务语义前置）。
 //
 // 关键取舍：
-//  - 取值域从 Metabase fingerprint.type.values 直接抽取（低基数字段才带），**不发起额外 API 调用**，
-//    化解「描述里的枚举会过期 / 模型猜取值」两类错误（doc T4 / S9）。
+//  - 默认路径：取值域从 Metabase fingerprint.type.values 抽取（低基数字段才带），**零额外 API 调用**。
+//    本仓库 ClickHouse 后端不填该指纹，故回落到描述内联；P1.1 提供可选的 with_values=true，
+//    由 bi-mschema-values.mjs 只对枚举候选字段惰性补实测取值，覆盖描述里过期的手写枚举（doc §11.5 / T4 / S9）。
 //  - 描述前置高亮（最长 300 字，比默认 JSON 的 200 更宽容），因为金额口径、时间字段用途等
 //    业务规则藏在描述里，最易被模型忽略（doc T1 / S7）。
 //  - FK 指向解析成 "表.字段" 人读引用；自引用显式标 (self)，直接喂多表 join（doc §1.1 两条自引用边）。
@@ -37,6 +38,36 @@ export function valueHints(field) {
   return uniq;
 }
 
+/**
+ * P1.1 惰性取值充实的候选字段：只有「看起来像枚举」的字段才值得额外跑一次查询，
+ * 避免对 781 个字段全量取值撑爆延迟。指纹里已有真实取值的不重复查。
+ * 线索 = 语义类型（Category/Enum/State/Status/Boolean）或描述里的手写枚举映射
+ * （如「映射关系：1:安卓，2:iOS」「结果来源：SUCCESS/FAILED」「0=否,1=是」）。
+ */
+export function isEnumCandidate(field) {
+  const sem = String(field?.semantic_type || "").replace(/^type\//, "");
+  if (/^(category|enum|state|status|boolean)$/i.test(sem)) return true;
+  const desc = String(field?.description || "");
+  if (!desc) return false;
+  return /\d\s*[:：=]\s*\S|映射关系|枚举|取值[:：]|状态[:：]|[a-z0-9_]+\/[a-z0-9_]+/i.test(desc);
+}
+
+function enumScore(field) {
+  const sem = String(field?.semantic_type || "").replace(/^type\//, "");
+  return /^(category|enum|state|status|boolean)$/i.test(sem) ? 2 : 1;
+}
+
+/** 按「语义类型明确 > 仅描述线索」排序，最多取 max 个（上限 20），由调用方控制延迟预算。 */
+export function pickEnumFields(fields, max = 8) {
+  const cap = Math.min(Math.max(Number(max) || 0, 0), 20);
+  if (!cap) return [];
+  return (Array.isArray(fields) ? fields : [])
+    .filter((f) => !valueHints(f) && isEnumCandidate(f))
+    .slice()
+    .sort((a, b) => enumScore(b) - enumScore(a))
+    .slice(0, cap);
+}
+
 function isPk(field) {
   return field?.semantic_type === "type/PK" || field?.pk === true;
 }
@@ -45,7 +76,7 @@ function fkTarget(field, fieldIndex) {
   return field?.fk_target_field_id ? fieldIndex.get(field.fk_target_field_id) : null;
 }
 
-function renderMSchemaField(field, fieldIndex, currentTable) {
+function renderMSchemaField(field, fieldIndex, currentTable, valueOverrides, fkNotes) {
   const pk = isPk(field);
   const fk = fkTarget(field, fieldIndex);
   const selfRef = fk && currentTable && String(fk).startsWith(`${currentTable}.`);
@@ -54,17 +85,23 @@ function renderMSchemaField(field, fieldIndex, currentTable) {
   const parts = [`- ${field.name}`, base];
   if (pk) parts.push("PK");
   if (fk) parts.push(`FK → ${fk}${selfRef ? " (self)" : ""}`);
+  if (fk && fkNotes instanceof Map && fkNotes.has(field.name)) parts.push(`[FK 核对未通过：${fkNotes.get(field.name)}]`);
   if (field.semantic_type && field.semantic_type !== "type/PK")
     parts.push(field.semantic_type.replace(/^type\//, ""));
   let line = parts.join("  ").replace(/\s+/g, " ").trim();
-  const values = valueHints(field);
-  if (values) line += `  values: [${values.map((v) => JSON.stringify(v)).join(", ")}]`;
+  // 实测取值优先于 fingerprint，也优先于 description 里可能过期的手写枚举（doc §11.5 / T4）。
+  const live = valueOverrides instanceof Map && valueOverrides.has(field.name);
+  const values = live ? valueOverrides.get(field.name) : valueHints(field);
+  if (Array.isArray(values) && values.length) line += `  values: [${values.map((v) => JSON.stringify(v)).join(", ")}]${live ? " (live)" : ""}`;
   if (field.description) line += `  desc: ${clipText(field.description, 300)}`;
   return line;
 }
 
-/** 单表 M-Schema（含所有字段）。 */
-export function renderTableMSchema(databaseName, databaseId, engine, table, fieldIndex) {
+/**
+ * 单表 M-Schema（含所有字段）。valueOverrides: Map<字段名, 实测去重值[]>，P1.1 可选传入；
+ * fkNotes: Map<字段名, 说明>，技术核对未通过的外键在 FK 后标注。
+ */
+export function renderTableMSchema(databaseName, databaseId, engine, table, fieldIndex, valueOverrides = null, fkNotes = null) {
   const fields = Array.isArray(table.fields) ? table.fields : [];
   const fkCount = fields.filter((f) => f.fk_target_field_id).length;
   const name = table.schema && table.schema !== "public" ? `${table.schema}.${table.name}` : table.name;
@@ -73,7 +110,9 @@ export function renderTableMSchema(databaseName, databaseId, engine, table, fiel
     `## Table: ${name}  [#Table]  (${fields.length} fields, ${fkCount} FK)`,
   ];
   if (table.description) lines.push(`> ${clipText(table.description, 200)}`);
-  for (const f of fields) lines.push(renderMSchemaField(f, fieldIndex, table.name));
+  const liveCount = valueOverrides instanceof Map ? [...valueOverrides.values()].filter((v) => Array.isArray(v) && v.length).length : 0;
+  if (liveCount) lines.push(`> 取值域标 (live) 的 ${liveCount} 个字段来自实测去重值（取样最多 20 万行），优先级高于 description 里的手写枚举（可能过期）。`);
+  for (const f of fields) lines.push(renderMSchemaField(f, fieldIndex, table.name, valueOverrides, fkNotes));
   return lines.join("\n");
 }
 

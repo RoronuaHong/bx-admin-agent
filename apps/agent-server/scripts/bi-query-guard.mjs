@@ -2,35 +2,63 @@
 // 「执行前硬校验」与「执行后结构化反馈信号」收敛为纯函数单一可信来源，可回归测试、杜绝漂移。
 // MCP 侧只提供信号；执行反馈自校正循环由消费方编排，不越界到 Agent。
 import { isReadOnlySql } from "./sql-readonly-common.mjs";
+import { checkCaliber as checkGlossary } from "./bi-semantic.mjs";
 
 // ---- 执行前：口径护栏 ----
 // 拦截已知会产出错误业务结论的取数方式。弱模型会无视 skill 里的软性提示，
 // 故此处做硬拒绝（与只读校验同一失败通道，fail-closed），逼模型改用正确口径，
 // 而不是替它改写 SQL（改写等于猜口径，且会掩盖模型的能力缺口）。
-export function checkCaliber(sql) {
-  // ① 国家维度：禁止用 IP/网络代理列，必须用 elt_user_full.countryCode
-  if (/\bipcountrycode\b/i.test(sql) || /\bnetworkcountryiso\b/i.test(sql)) {
-    return {
-      ok: false,
-      error:
-        "口径错误：国家维度不能用 ipCountryCode / networkCountryIso 这类代理列（来自 elt_app_params 关联，匹配稀疏、语义是「登录 IP 所在国」而非「账号所属国」）。" +
-        "请改用 elt_user_full.countryCode（数值口径：91=印度、55=巴西），无需 JOIN elt_app_params，直接按该列分组即可。",
-    };
+//
+// 口径的唯一来源是 bi-semantic/caliber-glossary.json：已批准（approved）且 enforce=reject 的条目在这里硬拒，
+// enforce=warn 的只在结果里提示。下面两条是词典落地前的内置规则，按 id 与词典条目对应；
+// 词典里同 id 的条目一旦批准，内置规则即让位（拒不拒、怎么判都以词典为准）。
+// Metabase 关联表时把整张表的列原样透传（`t`.`col` AS `col`），只透传不算用了该列；外层再引用照样命中。
+const stripPassthrough = (sql) => sql.replace(/(?:`?\w+`?\.)*`(\w+)`\s+AS\s+`\1`/g, " ");
+
+const BUILTIN_RULES = [
+  {
+    id: "country_dimension",
+    test: (sql) => {
+      const s = stripPassthrough(sql);
+      return /\bipcountrycode\b/i.test(s) || /\bnetworkcountryiso\b/i.test(s);
+    },
+    error:
+      "口径错误：国家维度不能用 ipCountryCode / networkCountryIso 这类代理列（来自 elt_app_params 关联，匹配稀疏、语义是「登录 IP 所在国」而非「账号所属国」）。" +
+      "请改用 elt_user_full.countryCode（数值口径：91=印度、55=巴西），无需 JOIN elt_app_params，直接按该列分组即可。",
+  },
+  {
+    id: "member_stock",
+    test: (sql) => /\belt_user_full_history\b/i.test(sql) && /\bvipexpireday\b/i.test(sql),
+    error:
+      "口径错误：会员存量不能用 elt_user_full_history.vipExpireDay>0 的设备级快照（会漏算/多算、且无去重账号语义，趋势必然失真）。" +
+      "请改用 elt_user_vip_info 的「去重账号」口径：vipType=2 且 startDate<=统计日 且 endDate>=统计日，uniqExact(uid) 得当日有效会员数；按日存量需逐日扫描该表。",
+  },
+];
+
+/**
+ * 口径护栏。返回 { ok, error?, warnings }。
+ * glossary 缺省或没有已批准条目时，行为与内置规则完全一致。
+ */
+export function checkCaliber(sql, { glossary = null } = {}) {
+  const approved = (glossary?.entries || []).filter((e) => e.status === "approved");
+  const owned = new Set(approved.map((e) => e.id));
+  for (const rule of BUILTIN_RULES) {
+    if (!owned.has(rule.id) && rule.test(sql)) return { ok: false, error: rule.error, warnings: [] };
   }
-  // ② 会员存量：禁止用 elt_user_full_history.vipExpireDay>0 的设备级快照替代会员表
-  if (/\belt_user_full_history\b/i.test(sql) && /\bvipexpireday\b/i.test(sql)) {
-    return {
-      ok: false,
-      error:
-        "口径错误：会员存量不能用 elt_user_full_history.vipExpireDay>0 的设备级快照（会漏算/多算、且无去重账号语义，趋势必然失真）。" +
-        "请改用 elt_user_vip_info 的「去重账号」口径：vipType=2 且 startDate<=统计日 且 endDate>=统计日，uniqExact(uid) 得当日有效会员数；按日存量需逐日扫描该表。",
-    };
+  const warnings = [];
+  for (const e of approved) {
+    if (e.enforce !== "reject" && e.enforce !== "warn") continue;
+    const v = checkGlossary(sql, { entries: [e] }, { statuses: ["approved"] }).violations[0];
+    if (!v) continue;
+    const msg = `口径${e.enforce === "reject" ? "错误" : "提示"}（${e.name}）：${v.detail}。约定口径：${e.definition}`;
+    if (e.enforce === "reject") return { ok: false, error: msg, warnings: [] };
+    warnings.push(msg);
   }
-  return { ok: true };
+  return { ok: true, warnings };
 }
 
 // 只读硬校验 + 多语句拦截 + 口径护栏，单一实现防漂移。fail-closed：不明朗一律拒绝。
-export function assertSql(input) {
+export function assertSql(input, { glossary = null } = {}) {
   const sql = String(input ?? "").trim().replace(/;+\s*$/, "");
   if (!sql) return { ok: false, error: "SQL 为空。" };
   // 多语句判定只看「引号外 / 注释外」的分号，与 src/sql-readonly.ts 口径对齐，避免误杀合法单条查询。
@@ -44,9 +72,9 @@ export function assertSql(input) {
   if (!isReadOnlySql(sql)) {
     return { ok: false, error: "只接受只读查询（SELECT / WITH / SHOW / EXPLAIN 等），写操作（INSERT/UPDATE/DELETE/DROP/…）被拒绝。" };
   }
-  const caliber = checkCaliber(sql);
+  const caliber = checkCaliber(sql, { glossary });
   if (!caliber.ok) return { ok: false, error: caliber.error };
-  return { ok: true, sql };
+  return { ok: true, sql, warnings: caliber.warnings };
 }
 
 // ---- 执行后：结构化反馈信号（§3-E 执行反馈自校正的机读输入）----
