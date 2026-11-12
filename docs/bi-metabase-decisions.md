@@ -41,11 +41,11 @@
 
 ## 决策 1.4 — 口径词典 8 条逐条拍板
 
-- **现状**：`caliber-glossary.json` 共 10 条（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已由技术侧按本建议结论①落地**（2026-11-12）：`country_dimension`/`device_ip_country` 已 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、闸门内置国家硬拒已让位，**#120/#121/#125/#126 现已能在 Agent 跑出**；`owner` 为验证占位 `verify-demo`，待业务正式签批。`member_stock` 仍 `draft` 且带 `enforce:reject`，其内置硬拒规则仍在生效。其余口径仍 `draft`、owner null。
+- **现状**：`caliber-glossary.json` 共 10 条（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已由技术侧按本建议结论①落地**（2026-11-12）：`country_dimension`/`device_ip_country` 已 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、闸门内置国家硬拒已让位，**#120/#121/#125/#126 现已能在 Agent 跑出**；`owner` 为验证占位 `verify-demo`，待业务正式签批。`member_stock` 仍 `draft` 且带 `enforce:reject`，其内置硬拒规则仍在生效。**D2 已支付订单亦由技术侧按结论②落地**（`paid_order` 已 `approved`、`enforce` 留空=软上线，偏离口径仅离线审计标红、查询闸不硬拒也不告警），`owner` 同为验证占位 `verify-demo`，待业务正式签批。其余口径仍 `draft`、owner null。
 - **最佳实践**：语义层为唯一真相源（dbt / Cortex 语义模型）；维度冲突用**具名维度**而非一刀切禁（Genie 的具名指标/维度）。
 - **建议结论**（按优先级，需业务 owner 逐条 `status→approved`）：
   1. ✅ **国家维度拆成两个具名维度**：`country_dimension`（账号注册国 `elt_user_full.countryCode`）与 `device_ip_country`（设备 IP 国 `elt_app_params.ipCountryCode`）。批准 `device_ip_country` 后，把 `ipCountryCode` 从 `country_dimension.forbidden` 移出，并让闸门在两条都批准后**改读词典**（不再内置硬拒）。这是当前 4 题必失分的根因，优先定。**（已于 2026-11-12 由技术侧按此结论落地，`owner` 为验证占位 `verify-demo`，待业务正式签批替换；实例验证 10/10 通过，见 `docs/bi-metabase-todo.md` 进度记录）**
-  2. ✅ **已支付订单**：`orderStatus IN (3,6)`（多数卡片写法）批准；状态 3/6 含义请业务在 `openQuestions` 里回填。
+  2. ✅ **已支付订单**：`orderStatus IN (3,6)`（多数卡片写法）批准；状态 3/6 含义请业务在 `openQuestions` 里回填。**（已于 2026-11-12 由技术侧按此结论落地，`owner` 为验证占位 `verify-demo`，软上线不拦——偏离口径仅离线审计标红、查询闸不硬拒也不告警；实例验证 5/5 通过，见 `docs/bi-metabase-todo.md` 进度记录）**
   3. ✅ **收入金额**：`sum(changeAmount)` 批准；`amount` 单位/币种请业务确认（#125/#121 用 `amount` 的卡片据此改或标例外）。
   4. ✅ **报表时区**：`Asia/Shanghai` 批准（已只读证实服务器默认时区等同；是否改加尔各答需业务定，影响全部卡片日切）。
   5. ⏳ 其余 4 条（device_ip_country 同上、user_dedup_key、member_stock、new_member）随业务确认进度批准；`member_stock` 内置规则与词典"历史存量不能反推"矛盾，以词典为准、修正内置提示。

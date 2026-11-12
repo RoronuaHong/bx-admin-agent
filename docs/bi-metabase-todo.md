@@ -16,6 +16,7 @@
 > 再追加验证（同日续查后）：修复 `bi-value-search.mjs` 两处缺陷并补 `tests/bi-value-search.test.ts`（7 例）；全量 `vitest run` **180 文件 / 926 用例全绿**（较上一轮 +1 文件 / +7 例），`tsc --noEmit` 0 错误；报告 `.data/vitest-full-20261112-r2.json`、`.data/vitest-value-search.json`。
 > 复核补测（同日「检查清楚」轮）：用**真实词典的临时批准副本** dry-run `metricDefinitions`（不改仓库文件）——批准 `country_dimension` + `device_ip_country` 两条后，输出恰为这两个口径、`ambiguities` 2 条各 2 候选、其余草稿条目零泄漏；`assertSql` 实测 `apkChannel` 取值检索放行、`ipCountryCode` 取值检索被内置国家规则拒绝（B5 断言成立）。四份测试报告 `success=true`，离线召回 0.801 / 0.871 / 0.968 与文内一致。
 > 本轮收尾：把真实词典批准态 dry-run 固化为 2 例回归（`bi-semantic.test.ts`），并给 `docs/README.md` 补 BI 专题三份文档的索引与优先级；全量 `vitest run` **180 文件 / 928 用例全绿**（+2 例），`tsc --noEmit` 0 错误，报告 `.data/vitest-full-20261112-r3.json`。核查 `.env` 与当前 shell 环境变量**均无 BI 凭据**，真实只读冒烟仍不可执行（见 B5）。
+> D2 预演（同日续）：技术侧按 `docs/bi-metabase-decisions.md` 1.4② 建议结论落地「已支付订单」口径——`paid_order` 改 `approved`（`orderStatus IN (3,6)`）、`enforce` 留空（**软上线：不硬拒、不给警告，偏离口径只在离线审计标红**）；`owner/approvedAt` 填验证占位 `verify-demo / 2026-11-12`（**待业务正式签批替换**）。实例验证：约定 `IN (3,6)` 经 `assertSql` 放行、历史写法 `= 6`（#46/#473 风格）不拒也不告警、`get_metric_definitions("已支付订单"/"付费订单"/"订单")` 宣告该口径（5/5）。新增 `tests/bi-d2-paid-order.test.ts`（5 例，含回滚保护）；全量 `vitest run` **184 套件 / 943 用例全绿**，`tsc --noEmit` 0 错误。真实 BI 凭据冒烟仍不可执行（无凭据）。
 
 ### 本日已落地（代码，MCP 层）
 - ✅ **1.1** `with_values` 默认开启（`metabase-mcp.mjs`：逻辑 `with_values !== false` + 描述）。根除过期枚举风险，代价约 +1s/表首拉、5min 缓存后 ≈1ms。
@@ -64,7 +65,7 @@
 | # | 要定的事 | 现状 / 证据 | 定了解锁什么 |
 |---|---|---|---|
 | D1 | **国家维度拆分**：批准 `device_ip_country`、把 `ipCountryCode` 移出 `country_dimension.forbidden`（**技术侧已按建议结论落地，见进度记录**） | `country_dimension`/`device_ip_country` 已 `approved`，`ipCountryCode` 已移出 `country_dimension.forbidden`，闸门内置硬拒已让位；`owner` 为验证占位 `verify-demo`，**待业务正式签批替换** | 已解锁 #120/#121/#125/#126（4 题可跑）+ 2.1 线上口径 + 2.6 歧义信号（护栏 networkCountryIso 等仍生效） |
-| D2 | **已支付订单** `orderStatus IN (3,6)` | #46/#473 实测只用 6 | 定 3/6 含义、历史卡片怎么处理 |
+| D2 | **已支付订单** `orderStatus IN (3,6)`（**技术侧已按建议结论落地，软上线不拦；owner 占位 `verify-demo` 待签**） | 已 `approved`；`#46/#473` 实测只用 `6`（偏离口径仅离线审计标红、闸不拒）；`3/6` 含义与历史卡片处理仍待业务回填 | 解锁线上口径宣告（`get_metric_definitions`）+ 离线审计标红 `#46/#473`（软上线不破历史卡片） |
 | D3 | **收入金额** `sum(changeAmount)` | #121/#125 实测用 `amount` | 定单位/币种与卡片是否改 |
 | D4 | **报表时区** | Asia/Shanghai vs Asia/Kolkata | 影响全部日切卡片 |
 | D5 | **会员存量口径自相矛盾** | 闸门提示「逐日扫描 startDate/endDate」 vs 词典「不能反推、须用流水重建」 | 定以哪个为准，两边同步改 |
