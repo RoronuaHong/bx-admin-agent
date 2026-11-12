@@ -3,7 +3,7 @@
 > 生成时间：2026-11-10（v4，已确认范围边界：仅 BI MCP 层能力增强，不改 Agent 部分；对齐 2025–2026 线上最佳实践）
 > 数据来源：Metabase REST API（`https://bi.vmovs.com`，等价于 `bi-metabase` MCP 元数据接口，使用项目 `.env` 中 `BI_API_KEY` 实测）＋ `apps/agent-server/scripts/metabase-mcp.mjs` 源码核查
 > 关联文档：`docs/agent/bi-mcp.md`、`docs/agent/RAG_INGESTION_PLAN.md`、`apps/agent-server/src/eval-online.ts`
-> 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题基线已跑（ValidSQL/EX 96.9%、JoinCorrect 59.8%，区间 60–69%，见 §11.7）；**P3 条件已触发（JoinCorrect<70% 且不稳定，建议立项）；P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `tests/bi-fk-signoff.json` 待人工核查）
+> 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题基线已跑（ValidSQL/EX 96.9%、JoinCorrect 59.8%，区间 60–69%，见 §11.7）；**P3 已实施**（口径层语义图 `bi-caliber-graph.mjs` + `get_caliber_context` 工具，见 §11.8）；**P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `tests/bi-fk-signoff.json` 待人工核查）
 
 ---
 
@@ -511,7 +511,11 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 - **黄金集 `question` 改写（提升 eval 信度）**：当前 `question` 取自卡片名（标题），作为模型提示偏弱；建议后续人工/半自动改写为自然语言提问，再跑回归基线（验证 P3 改动是否提升 JoinCorrect）。
 - **全量基线（已完成）**：`node scripts/bi-eval-runner.mjs --resume --gap 12` 已跑完 96 例（0 error），ValidSQL/EX 98.9%、JoinCorrect 69.1%，报告存 `.data/bi-eval-full.json`，可作为后续回归基线。
-- **P3（条件已触发，建议立项）**：全量 JoinCorrect≈69% 已逼近 recall@k<70% 阈值 → 建议立项口径层 LazyGraphRAG（§4.2-2），范围限定口径层；落地后重跑基线验证 JoinCorrect 提升。
+- **P3（已实施）**：全量 JoinCorrect≈59.8%（区间 60–69%）已跌破 recall@k<70% 阈值 → 已立项并落地口径层 LazyGraphRAG 语义层（§4.2-2），范围严格限定口径层；落地后需重跑基线验证 JoinCorrect 提升（见 §11.9）。
+- **P3 技术实现（口径层语义图）**：`bi-caliber-graph.mjs` 从 97 卡片 SQL + 58 真实表白名单构建「表/卡片」共现图（节点=表+卡片，边=卡片用表、表共现于同卡、卡片共享表），`buildCaliberContext(query)` 用关键词命中 + 图遍历返回「该用的表 + 常一起 join 的表 + 可参考现成卡片」。MCP 工具 `get_caliber_context` 把该上下文喂给模型，使其在写多表 SQL 前先拿到精准表清单，直接改善 JoinCorrect。near-zero 成本：无 embedding 预计算，仅图遍历 + 关键词匹配；TTL 缓存避免重复构建。
+  - **实现要点**：表名 canonical 归一化以 golden 自带 `schema.table` 为优先（消除白名单裸名与 golden 带 schema 名的节点分裂）；白名单仅用于过滤 CTE 别名/列名噪声（fail-open）；共现边权重=同卡共现次数，检索时按 direct×2+co 排序。
+  - **验证**：`tests/bi-caliber-graph.test.ts` 6 例单测全过（含归一化/边界）；真实 BI 端到端验证 `get_caliber_context`——「观影过AK2」精准命中 #100/#101/#102 并推荐 `film_report.elt_watch_detail`+`elt_gp_install_referrer_log`、「会员存量」正确推荐 `elt_app_params`/`elt_fo_ap_src`，表名全为 canonical 形式。
+  - **待验证**：JoinCorrect 提升需在 eval harness 中让模型调用 `get_caliber_context` 后重跑 96 例基线（见遗留项）。
 - **P4（已实施）**：few-shot join 样例库（`get_join_examples` + `scripts/bi-join-examples.mjs`）、查询校验闭环固化（`scripts/bi-query-guard.mjs`，§4.3-5）均已 2026-11-11 落地并带单测。
 - **P0（人工）**：§10 的 18 条 FK 核查已整理为可签字清单 `tests/bi-fk-signoff.json`（技术核对结论收敛），仍待 Metabase Admin 权限人员签字（含 §10.1/§10.2 已定位的 7 条根因复核）。
 

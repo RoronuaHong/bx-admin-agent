@@ -139,6 +139,21 @@ import { buildColumnSearchSql } from "./metabase-column-search.mjs";
 import { renderTableMSchema, renderDatabaseMSchema } from "./metabase-mschema.mjs";
 import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, normalizeKnownTables } from "./metabase-card-graph.mjs";
 import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
+import { buildCaliberGraph, buildCaliberContext } from "./bi-caliber-graph.mjs";
+
+// 口径语义图缓存（P3）：图构建依赖 buildGoldenSet（自身有 TTL 缓存），这里再包一层避免每次工具调用重建共现图。
+const CALIBER_TTL_MS = 5 * 60 * 1000;
+let _caliberCache = { ts: 0, databaseId: null, known: null, graph: null };
+async function getCaliberGraph(mb, databaseId, known) {
+  const now = Date.now();
+  if (_caliberCache.graph && _caliberCache.databaseId === databaseId && _caliberCache.known === known && now - _caliberCache.ts < CALIBER_TTL_MS) {
+    return _caliberCache.graph;
+  }
+  const g = await buildGoldenSet(mb);
+  const graph = buildCaliberGraph(g.cases, { knownTables: known });
+  _caliberCache = { ts: now, databaseId, known, graph };
+  return graph;
+}
 
 // ---- 元数据缓存：每次 schema 探查原本都实时重拉整库 47 张表的 /database/{id}/metadata ----
 // 多轮反复探查时既撑爆上下文又打 Metabase。这里按 database_id 缓存整库元数据（带字段），TTL 内复用；
@@ -972,6 +987,36 @@ const TOOLS = [
         })),
         note: "以上为真实已保存提问验证过的 join 路径。优先用 execute_query / get_card(detail=detailed) 复用现成提问；确需自写 SQL 时照此 join 路径，别猜外键。",
       });
+    },
+  },
+  {
+    name: "get_caliber_context",
+    description:
+      "口径语义检索（P3，§4.2-2）：给定自然语言问题/指标名，从既有卡片口径（真实 SQL + 表共现图）检索出「该用的表 + 常一起 join 的表 + 可参考的现成卡片」。" +
+      "写多表 SQL 前先查它，直接拿到精准表清单与 join 启发，避免选错表（静默错误，约占 1/3 查询）。" +
+      "检索基于口径层小图（共现边 + 关键词命中），零 embedding 成本；结果仅供参考，外键仍需核实。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "自然语言问题/指标名，如「观影过AK2 的拉新用户」" },
+        limit: { type: "number", description: "返回的相关卡片数（默认 5）" },
+        database_id: { type: "number", description: "白名单数据库 id；缺省用 METABASE_DATABASE_ID（默认 2）" },
+      },
+      required: ["query"],
+    },
+    async run({ query, limit = 5, database_id } = {}) {
+      const wid = Number(database_id || process.env.METABASE_DATABASE_ID || 2);
+      const meta = await getDatabaseMetadata(wid, { skipFields: true });
+      const known = normalizeKnownTables(
+        meta.ok && Array.isArray(meta.data?.tables)
+          ? meta.data.tables.map((t) => (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name))
+          : [],
+      );
+      const g = await buildGoldenSet(mb);
+      if (g.error) return json(g.error, true);
+      const graph = await getCaliberGraph(mb, wid, known);
+      const ctx = buildCaliberContext(graph, query, { k: Math.max(1, Number(limit) || 5) });
+      return json(ctx);
     },
   },
   {
