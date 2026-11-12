@@ -123,18 +123,22 @@ function asList(data) {
   return [];
 }
 
-// ---- 只读 SQL 硬校验（纵深防御，口径来自单一可信来源 scripts/sql-readonly-common.mjs）----
+// ---- 查询校验闭环（纵深防御 + 结构化反馈信号，§4.3-5）----
 // 即便本适配器拿到的是管理员 Key，也只转发只读查询——把「贴只读标签的核武器」风险降到最低。
-// 判定逻辑不再在此内联：直接 import 服务端那一份**唯一**实现，两侧物理共用同一段代码，杜绝漂移。
-// 首词白名单 + 全文黑名单 + 危险构造（写文件 / 读文件 / 改库配置）。fail-closed：不明朗一律拒绝。
-// 局限：这是代码层约束；Key 一旦泄露、攻击者直连 Metabase API 即可绕过。真正的只读边界仍须 DB/账号层 GRANT SELECT。
-import { isReadOnlySql } from "./sql-readonly-common.mjs";
+// 只读判定（服务端唯一实现 sql-readonly-common.mjs）、口径护栏、多语句拦截、执行反馈信号
+// 统一收敛到 bi-query-guard.mjs 纯函数模块：可单测、两侧物理共用同一段代码，杜绝漂移。
+// fail-closed：不明朗一律拒绝。局限：这是代码层约束；Key 一旦泄露、攻击者直连 Metabase API
+// 即可绕过。真正的只读边界仍须 DB/账号层 GRANT SELECT。
+import { assertSql, buildQueryFeedback, renderFeedbackLine } from "./bi-query-guard.mjs";
 // 静态体检（查表/聚合语句的效率实践）：与只读判定同一个「共享单源」思路——两侧共用一份，
 // 杜绝漂移。fail-open，只提示不拦（误杀合法探索语句比慢一点更糟）。
 import { lintSql, lintSummary } from "./sql-lint-common.mjs";
 import { appendClickHouseSettings, defaultClickHouseSettings, classifyUpstreamError } from "./bi-query-settings.mjs";
 import { createQueryCacheFromEnv } from "./bi-query-cache.mjs";
 import { buildColumnSearchSql } from "./metabase-column-search.mjs";
+import { renderTableMSchema, renderDatabaseMSchema } from "./metabase-mschema.mjs";
+import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, normalizeKnownTables } from "./metabase-card-graph.mjs";
+import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
 
 // ---- 元数据缓存：每次 schema 探查原本都实时重拉整库 47 张表的 /database/{id}/metadata ----
 // 多轮反复探查时既撑爆上下文又打 Metabase。这里按 database_id 缓存整库元数据（带字段），TTL 内复用；
@@ -225,55 +229,16 @@ function renderCell(value) {
 }
 
 // ---- 取数执行核心（run_native_query / execute_sql / query 共用，单一实现防漂移）----
-// 只读硬校验 + 多语句拦截 + 执行渲染集中在此；任何「执行 SQL」的入口都必须经它，
+// 只读硬校验 / 多语句拦截 / 口径护栏由 bi-query-guard.mjs 的 assertSql 统一提供；
+// 执行渲染 + 结构化反馈信号集中在此；任何「执行 SQL」的入口都必须经它，
 // 不允许再各自内联一份（那正是 src/sql-readonly-common.mjs 注释里警示的漂移来源）。
-// 口径护栏：拦截已知会产出错误业务结论的取数方式。弱模型会无视 skill 里的软性提示，
-// 故此处做硬拒绝（与只读校验同一失败通道，fail-closed），逼模型改用正确口径，
-// 而不是替它改写 SQL（改写等于猜口径，且会掩盖模型的能力缺口）。
-function checkCaliber(sql) {
-  // ① 国家维度：禁止用 IP/网络代理列，必须用 elt_user_full.countryCode
-  if (/\bipcountrycode\b/i.test(sql) || /\bnetworkcountryiso\b/i.test(sql)) {
-    return {
-      ok: false,
-      error:
-        "口径错误：国家维度不能用 ipCountryCode / networkCountryIso 这类代理列（来自 elt_app_params 关联，匹配稀疏、语义是「登录 IP 所在国」而非「账号所属国」）。" +
-        "请改用 elt_user_full.countryCode（数值口径：91=印度、55=巴西），无需 JOIN elt_app_params，直接按该列分组即可。",
-    };
-  }
-  // ② 会员存量：禁止用 elt_user_full_history.vipExpireDay>0 的设备级快照替代会员表
-  if (/\belt_user_full_history\b/i.test(sql) && /\bvipexpireday\b/i.test(sql)) {
-    return {
-      ok: false,
-      error:
-        "口径错误：会员存量不能用 elt_user_full_history.vipExpireDay>0 的设备级快照（会漏算/多算、且无去重账号语义，趋势必然失真）。" +
-        "请改用 elt_user_vip_info 的「去重账号」口径：vipType=2 且 startDate<=统计日 且 endDate>=统计日，uniqExact(uid) 得当日有效会员数；按日存量需逐日扫描该表。",
-    };
-  }
-  return { ok: true };
-}
-
-function assertSql(input) {
-  const sql = String(input ?? "").trim().replace(/;+\s*$/, "");
-  if (!sql) return { ok: false, error: "SQL 为空。" };
-  // 多语句判定只看「引号外 / 注释外」的分号，与 src/sql-readonly.ts 口径对齐，避免误杀合法单条查询。
-  const bare = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--[^\n\r]*/g, " ")
-    .replace(/'[^']*'/g, "''")
-    .replace(/"[^"]*"/g, '""')
-    .replace(/`[^`]*`/g, "``");
-  if (bare.includes(";")) return { ok: false, error: "不接受多语句：一次只能执行一条 SQL。" };
-  if (!isReadOnlySql(sql)) {
-    return { ok: false, error: "只接受只读查询（SELECT / WITH / SHOW / EXPLAIN 等），写操作（INSERT/UPDATE/DELETE/DROP/…）被拒绝。" };
-  }
-  const caliber = checkCaliber(sql);
-  if (!caliber.ok) return { ok: false, error: caliber.error };
-  return { ok: true, sql };
-}
-
 async function runSql(database_id, sql, limit = 200) {
   const check = assertSql(sql);
-  if (!check.ok) return json(check.error, true);
+  if (!check.ok) {
+    // 校验拒绝也产出机读信号：errorKind=VALIDATION_REJECTED，可重试（改 SQL 后重试）。
+    const fb = buildQueryFeedback({ ok: false, errorKind: "VALIDATION_REJECTED", hint: check.error });
+    return json(`${check.error}\n\n${renderFeedbackLine(fb)}`, true);
+  }
   // 查询级资源护栏（P1）：在执行 SQL 末尾追加 SETTINGS（聚合/排序超阈值落盘、服务端超时掐断）。
   // 这是第二道保险——即使 DBA 还没给 metabase_user 配 profile（P0），我们自己的查询也自带边界。
   // 不改写 SQL 语义：原 SQL 仍用于回显与静态体检，只有发往 ClickHouse 的那份带 SETTINGS。
@@ -300,7 +265,8 @@ async function runSql(database_id, sql, limit = 200) {
       "③ 加上明确的过滤条件缩小扫描范围。",
       "同一句原样重试不会成功；改不动就在回答里如实说明这个口径查不出来。",
     ].join("\n");
-    return json(`[${r.status}] 查询被上游拒绝：${upstream}\n\n${guidance}`, true);
+    const fb = buildQueryFeedback({ ok: false, upstreamText: upstream, hint: guidance });
+    return json(`[${r.status}] 查询被上游拒绝：${upstream}\n\n${guidance}\n\n${renderFeedbackLine(fb)}`, true);
   }
   const payload = r.data?.data;
   if (!payload || !Array.isArray(payload.cols)) {
@@ -308,13 +274,13 @@ async function runSql(database_id, sql, limit = 200) {
     const classified = classifyUpstreamError(`${upstreamErr} ${JSON.stringify(r.data?.error ?? "")}`);
     // Metabase 偶尔把错误包进 200 响应的 error 字段（而非 4xx），这里补一道识别。
     if (upstreamErr) {
-      return json(
-        `[${r.status}] 查询未返回结果：${upstreamErr}\n\n${classified ?? "本次没有拿到数据。缩小查询范围或稍后重试；若反复失败，在回答里如实说明这个口径查不出来。"}`,
-        true,
-      );
+      const text = `[${r.status}] 查询未返回结果：${upstreamErr}\n\n${classified ?? "本次没有拿到数据。缩小查询范围或稍后重试；若反复失败，在回答里如实说明这个口径查不出来。"}`;
+      const fb = buildQueryFeedback({ ok: false, upstreamText: upstreamErr, hint: classified });
+      return json(`${text}\n\n${renderFeedbackLine(fb)}`, true);
     }
     const state = r.data?.status ? `status=${r.data.status}` : "响应中缺少 data.cols";
-    return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或缩小查询范围。`, true);
+    const fb = buildQueryFeedback({ ok: false, errorKind: "NO_RESULT", hint: "响应缺少 data.cols：稍后重试或缩小查询范围。" });
+    return json(`查询未返回结果（${state}，HTTP ${r.status}）。请稍后重试或缩小查询范围。\n\n${renderFeedbackLine(fb)}`, true);
   }
   const cols = payload.cols.map((c) => c.display_name || c.name);
   const allRows = Array.isArray(payload.rows) ? payload.rows : [];
@@ -327,7 +293,9 @@ async function runSql(database_id, sql, limit = 200) {
   // 静态体检结论回灌（fail-open：照常执行，但把"可以怎么改"一并给模型，让它下次写对）。
   // 不静默改写 SQL——改写等于替模型猜口径；只提示。
   const lint = lintSummary(lintSql(check.sql));
-  const result = json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}`);
+  // 结构化反馈信号（§3-E）：错误类型 / 是否空结果 / 行列数 / 截断 / 可重试性，供消费方做执行反馈自校正。
+  const feedback = buildQueryFeedback({ ok: true, cols, rows, truncated });
+  const result = json(`${lint ? `${lint}\n\n` : ""}${echo}\n\n${lines.join("\n")}\n\n${renderFeedbackLine(feedback)}`);
   // 结果缓存去重（文档 6.5.2）：成功结果才入缓存，失败路径不缓存。
   queryCache.set(database_id, check.sql, limit, result);
   return result;
@@ -392,6 +360,10 @@ const TOOLS = [
     description:
       "查看数据库的表结构。默认只返回表清单（可用 search 过滤表名，带表描述）；指定 table 时返回该表的字段" +
       "（name / type / 描述 / 语义类型 / 外键指向 / 去重值个数）。写查询前用它确认表名、字段名与字段语义，不要凭字段名猜。" +
+      "两阶段取数（text2sql 最佳实践）：① 先用 search_columns 按列名/注释定位跨表关联列；" +
+      "② 再本工具传 table=<表名> 取该表字段级定义。" +
+      "mode 选 mschema 时输出紧凑 M-Schema Markdown（外键指向显性标出、取值域内联、业务描述前置），是 text2sql 首选呈现；" +
+      "default 为原 JSON 输出（兼容旧消费方）。" +
       DETAIL_HINT,
     inputSchema: {
       type: "object",
@@ -399,12 +371,17 @@ const TOOLS = [
         database_id: { type: "number", description: "数据库 id（来自 list_databases）" },
         table: { type: "string", description: "表名（精确匹配，可写 schema.table）；给了就返回该表字段" },
         search: { type: "string", description: "按表名子串过滤（不区分大小写），仅在未指定 table 时生效" },
-        include_fields: { type: "boolean", description: "表清单里是否附带字段名预览（默认 false；表多时不要开）" },
+        include_fields: { type: "boolean", description: "表清单里是否附带字段名预览（默认 false；表多时不要开）。mschema 模式下忽略" },
         detail: { type: "string", enum: ["concise", "detailed"], description: DETAIL_HINT },
+        mode: {
+          type: "string",
+          enum: ["default", "mschema"],
+          description: "default=原 JSON 输出；mschema=紧凑 M-Schema Markdown（含取值域，text2sql 首选）。默认 default",
+        },
       },
       required: ["database_id"],
     },
-    async run({ database_id, table, search, include_fields, detail }) {
+    async run({ database_id, table, search, include_fields, detail, mode }) {
       const wantFields = Boolean(table) || include_fields === true;
       // 统一走带 TTL 的整库元数据缓存；skip_fields 只是 API 侧减负，本地始终存全量、按需裁字段。
       const r = await getDatabaseMetadata(database_id, { skipFields: !wantFields });
@@ -412,6 +389,33 @@ const TOOLS = [
       const tables = Array.isArray(r.data?.tables) ? r.data.tables : [];
       if (!tables.length) {
         return json(`数据库 ${database_id} 未返回表（可能元数据未同步或该 API Key 无权限）。`);
+      }
+      // M-Schema 模式：紧凑 Markdown 呈现（外键显性、取值域内联、业务描述前置），text2sql 首选。
+      // 旧 JSON 输出保持默认行为，消费方无感过渡（doc §4.3 / §7 P1）。
+      if (mode === "mschema") {
+        const fieldIndex = buildFieldIndex(tables);
+        const dbName = r.data?.name || "主库";
+        const dbEngine = r.data?.engine || "";
+        if (table) {
+          const needle = String(table).trim().toLowerCase();
+          const hit = tables.find((t) => {
+            const bare = String(t.name || "").toLowerCase();
+            const qualified = `${t.schema ? `${t.schema}.` : ""}${t.name}`.toLowerCase();
+            return bare === needle || qualified === needle;
+          });
+          if (!hit) {
+            const names = tables.map((t) => t.name).slice(0, 40);
+            return json(
+              `未找到表「${table}」。同库表名（前 40）：${names.join(", ")}${tables.length > 40 ? ` …共 ${tables.length} 张` : ""}`,
+              true,
+            );
+          }
+          return json(renderTableMSchema(dbName, database_id, dbEngine, hit, fieldIndex));
+        }
+        const matched = search
+          ? tables.filter((t) => String(t.name || "").toLowerCase().includes(String(search).toLowerCase()))
+          : tables;
+        return json(renderDatabaseMSchema(dbName, database_id, dbEngine, tables, matched, search));
       }
       if (table) {
         const needle = String(table).trim().toLowerCase();
@@ -492,6 +496,7 @@ const TOOLS = [
       "再写 JOIN/聚合 SQL 取数，而不是凭表名猜。" +
       "查的是后端系统目录（system.columns），任意 database_id 连接都看得到全集群列，不需要逐库翻 schema。" +
       "在写跨表 JOIN / 聚合之前先用它定位关联列，而不是凭一张表的字段名猜别的表也有同名列。" +
+      "定位到表后，再用 get_database_schema(table=<表名>, mode=mschema) 取该表的字段级 M-Schema 定义（外键/取值域/业务描述前置）。" +
       "pattern 是列名或注释的子串（不区分大小写），不要带通配符。",
     inputSchema: {
       type: "object",
@@ -812,6 +817,160 @@ const TOOLS = [
         display: card.display,
         queryType: dq.type ?? card.query_type,
         ...(sql ? { sql } : { query: dq }),
+      });
+    },
+  },
+  {
+    name: "get_cards_for_table",
+    description:
+      "「问题-表」窄图：给定一张表，返回引用了它的已保存提问（卡片）清单（id / name / 集合）。" +
+      "写查询前先用它看看「有没有现成提问已经算过这张表」——能直接复用 execute_query 就不要重写 SQL。" +
+      "用法：table 可写 schema.table 或裸表名；建索引会拉取全库卡片 SQL（首次较慢，之后按缓存复用）。" +
+      DETAIL_HINT,
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: { type: "string", description: "表名（schema.table 或裸表名）" },
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）；不传则搜所有库" },
+        limit: { type: "number", description: "最多返回条数（默认 20）" },
+        rebuild: { type: "boolean", description: "是否强制重建卡片→表索引（默认 false，用缓存）" },
+      },
+      required: ["table"],
+    },
+    async run({ table, database_id, limit = 20, rebuild = false }) {
+      const index = await buildCardTableIndex(mb, { databaseId: database_id ?? null, force: !!rebuild });
+      if (index.error) return json(index.error, true);
+      const cards = cardsForTable(index, table).slice(0, Math.max(1, Number(limit) || 20));
+      if (!cards.length) {
+        return json(`没有已保存提问引用表「${table}」。可用 search 或 get_database_schema 看表结构后自行写 SQL。`);
+      }
+      return json({
+        table,
+        matchedQuestions: cards.map((c) => ({ id: c.id, name: c.name, collection: c.collection, database: c.database })),
+        note: "优先用 execute_query 复用这些现成提问；确需自写 SQL 时，这些提问的 SQL 可用 get_card(detail=detailed) 参考。",
+      });
+    },
+  },
+  {
+    name: "get_related_cards",
+    description:
+      "「问题-表」窄图：给定一张卡片（已保存提问），返回与它共享底表的其它卡片（按共享表数排序）。" +
+      "多表 join 场景尤其有用——先找到「已经算过这些表」的现成提问，复用其 SQL 比从零写 join 更稳。" +
+      "建索引会拉取全库卡片 SQL（首次较慢，之后按缓存复用）。" +
+      DETAIL_HINT,
+    inputSchema: {
+      type: "object",
+      properties: {
+        card_id: { type: "number", description: "卡片 id（来自 list_cards / search）" },
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）；不传则搜所有库" },
+        limit: { type: "number", description: "最多返回条数（默认 15）" },
+        rebuild: { type: "boolean", description: "是否强制重建卡片→表索引（默认 false，用缓存）" },
+      },
+      required: ["card_id"],
+    },
+    async run({ card_id, database_id, limit = 15, rebuild = false }) {
+      const index = await buildCardTableIndex(mb, { databaseId: database_id ?? null, force: !!rebuild });
+      if (index.error) return json(index.error, true);
+      const res = relatedCards(index, card_id);
+      if (!res) return json(`未找到卡片 ${card_id}（可能不在该 database_id 下，或不在此 Metabase 实例）。`, true);
+      if (!res.related.length) {
+        return json(
+          `卡片「${res.self.name}」(id=${card_id}) 未解析到底表，或没有其它卡片与之共享表。用 get_card(detail=detailed) 看它的 SQL。`,
+        );
+      }
+      return json({
+        card: { id: res.self.id, name: res.self.name, tables: res.self.tables },
+        relatedQuestions: res.related.slice(0, Math.max(1, Number(limit) || 15)).map((c) => ({
+          id: c.id,
+          name: c.name,
+          sharedTables: c.sharedTables,
+        })),
+        note: "这些卡片已算过共享表，优先复用其 SQL（get_card detail=detailed 取原生 SQL）或 execute_query 直接跑。",
+      });
+    },
+  },
+  {
+    name: "get_golden_set",
+    description:
+      "导出「问题-表」黄金集：从已保存提问抽 {id, question=卡片名, expected_sql=编译后原生SQL, tables}，用于 bi-eval-runner 三维评分（§4.4）。" +
+      "纯元数据、零 LLM。本工具只返回内容，落盘由调用方决定（见 scripts/bi-golden-bootstrap.mjs）。" +
+      DETAIL_HINT,
+    inputSchema: {
+      type: "object",
+      properties: {
+        database_id: { type: "number", description: "数据库 id（来自 list_databases）；不传则所有库" },
+        limit: { type: "number", description: "最多返回条数（默认全部）" },
+      },
+    },
+    async run({ database_id, limit } = {}) {
+      const g = await buildGoldenSet(mb, { databaseId: database_id ?? null });
+      if (g.error) return json(g.error, true);
+      const cases = limit ? g.cases.slice(0, Math.max(1, Number(limit) || 9999)) : g.cases;
+      const withSql = cases.filter((c) => c.expected_sql).length;
+      return json({
+        total: g.cases.length,
+        withSql,
+        note: "expected_sql 为卡片编译后的原生 SQL（期望答案）；question 为卡片名（天然自然语言提问）。bi-eval-runner 用其跑三维评分。",
+        cases: cases.map((c) => ({
+          id: c.id,
+          question: c.name,
+          database: c.database,
+          tables: c.tables,
+          expected_sql: c.expected_sql,
+        })),
+      });
+    },
+  },
+  {
+    name: "get_join_examples",
+    description:
+      "few-shot join 样例库（§4.3-4）：给定一张表，返回真实已保存提问里用到它的多表 JOIN 写法（自然语言意图 + 涉及表 + JOIN 类型/ON 条件片段）。" +
+      "写多表 SQL 前先查它——照着已验证的 join 路径写，比猜外键/关联列更稳；尤其适合 elt_film_order 这类多关联表。" +
+      "样例取自卡片编译后的原生 SQL，按真实 schema 表名白名单过滤掉 CTE 名/别名噪声。" +
+      DETAIL_HINT,
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: { type: "string", description: "表名（schema.table 或裸表名），如 film_report.elt_film_order" },
+        database_id: { type: "number", description: "用于取真实表名白名单的数据库 id；缺省用 METABASE_DATABASE_ID（默认 2）" },
+        limit: { type: "number", description: "最多返回样例数（默认 3）" },
+      },
+      required: ["table"],
+    },
+    async run({ table, database_id, limit = 3 } = {}) {
+      const wid = Number(database_id || process.env.METABASE_DATABASE_ID || 2);
+      // 白名单来自真实元数据（带 TTL 缓存）：确保样例里的 join 目标是真实表，而非 SQL 里的 CTE 名/别名。
+      const meta = await getDatabaseMetadata(wid, { skipFields: true });
+      const known = normalizeKnownTables(
+        meta.ok && Array.isArray(meta.data?.tables)
+          ? meta.data.tables.map((t) => (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name))
+          : [],
+      );
+      const g = await buildGoldenSet(mb);
+      if (g.error) return json(g.error, true);
+      const cards = g.cases
+        .filter((c) => c.expected_sql)
+        .map((c) => ({ id: c.id, name: c.question || c.name, sql: c.expected_sql }));
+      const idx = buildJoinExamples(cards, known);
+      const hits = joinExamplesForTable(idx, table, Math.max(1, Number(limit) || 3));
+      if (!hits.length) {
+        return json(`没有找到引用表「${table}」的多表 JOIN 现成提问（库内 join 样例共 ${idx.total} 条）。可用 get_card / execute_query 找现成提问，或用 get_table_relationships 看外键后自行写。`);
+      }
+      return json({
+        table,
+        totalJoinExamples: idx.total,
+        matched: hits.length,
+        examples: hits.map((e) => ({
+          cardId: e.cardId,
+          question: e.question,
+          tables: e.tables,
+          joins: e.joins.slice(0, 4).map((j) => ({
+            type: j.type,
+            table: j.table,
+            on: (j.on || j.snippet).trim().slice(0, 160),
+          })),
+        })),
+        note: "以上为真实已保存提问验证过的 join 路径。优先用 execute_query / get_card(detail=detailed) 复用现成提问；确需自写 SQL 时照此 join 路径，别猜外键。",
       });
     },
   },

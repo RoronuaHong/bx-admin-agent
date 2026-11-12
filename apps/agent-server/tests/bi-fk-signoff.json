@@ -1,0 +1,186 @@
+{
+  "generatedAt": "2026-11-10",
+  "source": "docs/bi-metabase-optimization-plan.md §10 / §10.2",
+  "title": "BI 18 条 FK 关系人工核查签字清单",
+  "method": "对每条边执行只读 SELECT 1 ... INNER JOIN ... LIMIT 1（elt_film_order 边加 createdTime >= '2026-11-01' 限定），并对 6 条 0 匹配边补探父表行数 P / 子表非 null 引用数 C / 原始 join / 字符串化 join。18 条边共跑 3 轮结果完全一致。",
+  "scope": "技术可连性验证（能否 JOIN 上、是否有匹配数据、根因定位）。不替代业务正确性签字。",
+  "status": "PENDING_HUMAN_SIGNOFF",
+  "requiredRole": "Metabase Admin 权限人员 + 业务数据负责人",
+  "summary": {
+    "total": 18,
+    "verified": 11,
+    "needsDecision": 6,
+    "outOfScope": 1
+  },
+  "rootCauseLegend": {
+    "DEAD_FK_COLUMN": "FK 已配但子表列全空（业务从未写入）；低风险，建议确认是否保留该列以免误导模型去 join 空关系",
+    "EMPTY_PARENT_TABLE": "父表 elt_ul_activity 返回 0 行，导致大量引用悬空；实质性数据模型问题，需查活动数据落点",
+    "DANGLING_SELF_REF": "自引用列大量非 null 但无任一对应父订单；疑似原订单已清理或该列是跨库订单号",
+    "PERMISSION_OUT_OF_SCOPE": "表在当前 API Key 下不可见（400），无法验证；需更广权限人员核查"
+  },
+  "edges": [
+    {
+      "id": 1,
+      "edge": "elt_user_group.ugId → elt_user_group_config._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 2,
+      "edge": "elt_user_group_ex.ugId → elt_user_group_config._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 3,
+      "edge": "elt_ul_activity.userGroupId → elt_user_group_config._id",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 68 行 / 子表非 null 引用 0 条；J_raw=0, J_cast=0（已排除类型不匹配）",
+      "rootCause": "DEAD_FK_COLUMN",
+      "decisionPrompt": "该 FK 列从未写入，是否仍需保留？若保留，建议在 Metabase 元数据中标注死字段，避免模型误 join。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 4,
+      "edge": "elt_ul_activity.preUserGroupId → elt_user_group_config._id",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 68 行 / 子表非 null 引用 0 条；J_raw=0, J_cast=0（高风险，preUserGroup 语义）",
+      "rootCause": "DEAD_FK_COLUMN",
+      "decisionPrompt": "同 #3，且 preUserGroup 语义需业务确认是否有历史含义；是否保留/标注死字段？",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 5,
+      "edge": "elt_user_vip_recharge_log.uid → elt_user_vip_info.uid",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 6,
+      "edge": "elt_user_vip_recharge_log.orderId → elt_film_order._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据（高风险边：命名不直白但已证正确）",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 7,
+      "edge": "elt_film_order.uid → elt_film_user._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 8,
+      "edge": "elt_film_order.movieId → elt_film_movie._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据（§4.5 T2 已证）",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 9,
+      "edge": "elt_film_order.activityId → elt_ul_activity._id",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 elt_ul_activity 返回 0 行 / 子表非 null 引用 563,834 条；J_raw=0, J_cast=0",
+      "rootCause": "EMPTY_PARENT_TABLE",
+      "decisionPrompt": "56 万订单 activityId 悬空：请核查 elt_ul_activity 是否真为空、活动数据实际落在哪张表、FK 目标表是否配错。属实质性数据模型问题，优先级最高。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 10,
+      "edge": "elt_film_order.srcOrderId → elt_film_order._id（自引用）",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 32,210,110 行 / 子表 563,834 条非 null（其中仅 23,905 条非 0）；J_raw=0, J_cast=0",
+      "rootCause": "DANGLING_SELF_REF",
+      "decisionPrompt": "56 万非 null srcOrderId 无任一对应父订单：请确认该字段是跨库订单号，还是原订单已清理；并确认是否应继续作为 FK 暴露给模型。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 11,
+      "edge": "elt_film_order.preOrderId → elt_film_order._id（自引用）",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据（与 #10 同为自引用，但此边有效）",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 12,
+      "edge": "elt_film_movie_episode.movieId → elt_film_movie._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 13,
+      "edge": "elt_film_movie_category_content.movieCategoryId → elt_film_movie_category._id",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 748 行 / 子表非 null 引用 0 条；J_raw=0, J_cast=0",
+      "rootCause": "DEAD_FK_COLUMN",
+      "decisionPrompt": "类目 FK 列全空：确认是否保留/标注死字段，避免模型误 join 空关系。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 14,
+      "edge": "elt_watch_detail.mid → elt_film_movie._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 15,
+      "edge": "elt_watch_detail.eid → elt_film_movie_episode._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 16,
+      "edge": "elt_ul_activity_device.activityId → elt_ul_activity._id",
+      "status": "NEEDS_DECISION",
+      "evidence": "JOIN 可执行但 0 匹配；父表 elt_ul_activity 返回 0 行 / 子表非 null 引用 108,944,655 条；J_raw=0, J_cast=0",
+      "rootCause": "EMPTY_PARENT_TABLE",
+      "decisionPrompt": "1.08 亿设备活动引用全部悬空：与 #9 同一根因（elt_ul_activity 空表），请一并核查活动数据落点与 FK 配置。优先级最高。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 17,
+      "edge": "elt_user_full.uid → elt_film_user._id",
+      "status": "VERIFIED",
+      "evidence": "可连且有匹配数据",
+      "rootCause": null,
+      "decisionPrompt": null,
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    },
+    {
+      "id": 18,
+      "edge": "action.action → action_config.id",
+      "status": "OUT_OF_SCOPE",
+      "evidence": "4 个探针全返回 400；action / action_config 表在当前 BI API Key 下不可见（印度板块权限限制）",
+      "rootCause": "PERMISSION_OUT_OF_SCOPE",
+      "decisionPrompt": "需具更广权限的 Metabase Admin 人员重新验证此边；当前环境无法给出技术结论。",
+      "signoff": { "reviewer": null, "decision": null, "at": null }
+    }
+  ],
+  "signoffInstructions": "11 条 VERIFIED 可直接签字；6 条 NEEDS_DECISION 需按 decisionPrompt 逐条给出业务决策（保留/移除死字段、活动数据落点、跨库订单号语义）；1 条 OUT_OF_SCOPE 需更广权限人员补验。签字请填写每条 edge.signoff 的 reviewer / decision / at，并把顶层 status 改为 SIGNED_OFF。本清单仅固化技术核对结论，业务正确性由签字人负责。"
+}

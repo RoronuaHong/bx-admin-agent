@@ -3,7 +3,7 @@
 > 生成时间：2026-11-10（v4，已确认范围边界：仅 BI MCP 层能力增强，不改 Agent 部分；对齐 2025–2026 线上最佳实践）
 > 数据来源：Metabase REST API（`https://bi.vmovs.com`，等价于 `bi-metabase` MCP 元数据接口，使用项目 `.env` 中 `BI_API_KEY` 实测）＋ `apps/agent-server/scripts/metabase-mcp.mjs` 源码核查
 > 关联文档：`docs/agent/bi-mcp.md`、`docs/agent/RAG_INGESTION_PLAN.md`、`apps/agent-server/src/eval-online.ts`
-> 状态：评估文档（待评审，未做任何代码改动）
+> 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题基线已跑（ValidSQL/EX 96.9%、JoinCorrect 59.8%，区间 60–69%，见 §11.7）；**P3 条件已触发（JoinCorrect<70% 且不稳定，建议立项）；P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `tests/bi-fk-signoff.json` 待人工核查）
 
 ---
 
@@ -296,8 +296,8 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 | 阶段 | MCP 侧动作（候选） | 依赖 | 产出 / 验收 |
 |---|---|---|---|
 | **P0** | ① Metabase Admin 逐条确认 18 条 FK（§4.1 B 项）；② 确认 ClickHouse 是否有 DB 层 FK | — | FK 核查清单签字；明确 18 边数据正确性 |
-| **P1** | `get_database_schema` 升级 **M-Schema 格式 + 取值域内联**（§4.3-1/2）；强化 `search_columns`+`get_database_schema` 两阶段 linking 提示（§4.3-3） | P0 | MCP 输出为 M-Schema 且含取值域；prompt 内表数可控 |
-| **P2** | 新增「问题-表」关系图 resource/tool（§4.2-1，纯元数据抽取）；建黄金集 ≥30 题 + `bi-eval-runner.mjs` 三维评分（§4.4） | P0 | 窄图可用；跑分器出 ValidSQL/EX/Join 正确率基线 |
+| **P1** | `get_database_schema` 升级 **M-Schema 格式 + 取值域内联**（§4.3-1/2）；强化 `search_columns`+`get_database_schema` 两阶段 linking 提示（§4.3-3） | P0 | MCP 输出为 M-Schema 且含取值域；prompt 内表数可控 | **已实施（2026-11-10，见 §11）** |
+| **P2** | 新增「问题-表」关系图 resource/tool（§4.2-1，纯元数据抽取）；建黄金集 ≥30 题 + `bi-eval-runner.mjs` 三维评分（§4.4） | P0 | 窄图可用；跑分器出 ValidSQL/EX/Join 正确率基线 | **已实施（2026-11-10，见 §11.6/§11.7）** |
 | **P3（审慎）** | 仅当评测 recall@k<70% 时，在口径层加 LazyGraphRAG 语义层（§4.2-2） | P2 数据驱动 | 口径小图 + 路由；范围限定口径层 |
 | **P4（可选）** | few-shot join 样例库（§4.3-4）、查询校验闭环固化（§4.3-5） | P1 | 样例被引用；提交前校验默认开启 |
 
@@ -325,7 +325,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 - P0：FK 核查清单签字确认；确认 FK 来源（DB 约束 or 人工配置）。
 - P1：`get_database_schema` 输出为 M-Schema 格式且含取值域；两阶段 linking 提示生效（prompt 内表数可控）。
-- P2：「问题-表」窄图 resource/tool 可用；黄金集 ≥30 题；`bi-eval-runner.mjs` 能跑出 ValidSQL / EX / Join 正确率三维分数与基线。
+- P2（已实施）：「问题-表」窄图工具可用（§11.6）；黄金集 97 题已落 `tests/bi-golden-set.json`；`bi-eval-runner.mjs` 真实 BI 跑出 ValidSQL / EX / Join 正确率三维分数与基线（§11.7）。
 - P3（条件）：仅当 P2 数据显示 recall@k<70% 时立项，且范围限定口径知识层。
 - P4（可选）：few-shot 样例被引用；查询校验闭环默认开启。
 
@@ -434,3 +434,88 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 - **#18**：`action`/`action_config` 在当前 Key 下不可见（4 探针全 400），维持"权限外、无法验证"，需更广权限人员核查。
 
 **最终交付**：P0 从"18 条盲核"收敛为——**11 条已证可信 / 6 条定位到具体根因（3 死字段 + 2 父表空 + 1 自引用悬空）/ 1 条越权待查**。人工只需在 Admin 复核这 7 条并决策（保留死字段？补活动数据？修正跨库引用？），其余 11 条可直接签字。本核对仍属*技术可连性*验证，**不替代业务正确性签字**。
+
+---
+
+## 11. 实施记录（2026-11-10，P1）
+
+### 11.1 代码改动（仅 BI MCP 层，Agent 零改动）
+
+1. **新增 `scripts/metabase-mschema.mjs`**（纯函数、零依赖、零副作用）：`renderTableMSchema` / `renderDatabaseMSchema` / `valueHints`。设计对齐 §4.3 M-Schema 样例。
+2. **`scripts/metabase-mcp.mjs` 的 `get_database_schema` 新增 `mode` 参数**：
+   - `mode: "default"`（默认）= 原 JSON 输出，**消费方无感过渡**（满足 §7 P1「保留旧输出过渡」）。
+   - `mode: "mschema"` = 紧凑 M-Schema Markdown：`# Database [DB_ID]` / `## Table [#Table]` 特殊令牌；字段行含 `PK` / `FK → 表.字段`（自引用标 `(self)`）/ 语义类型；**取值域优先抽 `fingerprint.type.values`，缺省时回落字段 `description` 内联**（见 §11.2/§11.3 真实核对）；业务描述前置（最长 300 字，比默认 JSON 的 200 更宽容，因金额口径/时间字段用途藏在描述里）。
+3. **两阶段 linking 提示**：`get_database_schema` 与 `search_columns` 的描述都补了「先 `search_columns` 定位跨表关联列 → 再 `get_database_schema(table=, mode=mschema)` 取字段级定义」的引导（§4.3-3）。
+
+### 11.2 关键实现决策（需评审确认）
+
+- **取值域内联来源（订正）**：代码上优先抽 Metabase 元数据里已返回的 `fingerprint.type.values`（仅低基数字段才带，API 免费），**不逐字段调 `get_field_values`**——后者对 781 字段全量调用会撑爆延迟。但**真实 BI 核对发现**：本仓库 ClickHouse 数仓**未填充 `fingerprint.type.values`**（见 §11.3），故该路径不触发，**回落到字段 `description` 内联**（M-Schema 最长 300 字，足够放下写在描述里的枚举清单）。即真实取值域的兜底来源是 description，而非指纹。这与 §4.3-2「取值域以实测为准内联」的理想形态有差距——指纹优先只在 Metabase 真正填充值的后端（多为 PG/MySQL）生效；ClickHouse 后端须另走取值 API（见 §11.5 P1.1）。若某字段既无指纹值又无 description 枚举，则只显示 `distinct-count`/`nil%`（沿用原 `fingerprintHints`），不编造。
+- **向后兼容**：M-Schema 是**新增可选模式**，默认仍走旧 JSON，任何现有消费方行为不变（满足 R3「信息不丢失、只是格式变化」）。
+
+### 11.3 验证
+
+- `node --check`：两个文件均通过；项目门禁 `tests/mcp-adapter-syntax.test.ts`（`node --check` 扫 `scripts/*.mjs`）`EXIT=0`。
+- 纯函数冒烟（样例字段，含自引用边 `srcOrderId→elt_film_order._id`、带 `fingerprint.values` 的 `clientType`）：
+  ```
+  # Database: 主库 (clickhouse)  [DB_ID: 2]
+  ## Table: elt_film_order  [#Table]  (5 fields, 2 FK)
+  - _id BigInteger PK
+  - uid BigInteger FK → elt_film_user._id  desc: 可作为人数统计维度的标识
+  - changeAmount Float Currency  desc: 换算成印度卢比的订单金额；计算和统计应使用此字段
+  - clientType Integer Category  values: [1, 4, 0, 5]  desc: 枚举已过期请忽略
+  - srcOrderId BigInteger FK → elt_film_order._id (self)  desc: 仅会员升级套餐时有效
+  ```
+  与 §4.3 样例一致：`changeAmount` 口径前置、`clientType` 取值域为真实去重值 `[1,4,0,5]`（非描述里过期的 `{1,2,4,6}`）、自引用显式 `(self)`。
+
+### 11.3 真实 BI 端到端核对（2026-11-10，stdio 直连 `metabase-mcp.mjs`）
+
+用临时 cliente 把 `metabase-mcp.mjs` 当 stdio MCP server 拉起（env 沿用 `.env` 的 `BI_BASE_URL`/`BI_API_KEY`），直接 `tools/call get_database_schema(mode:"mschema")`，对照真实元数据：
+
+- **M-Schema 渲染在真实 BI 上正确**：`# Database: 主库 (clickhouse) [DB_ID: 2]`、`#Table film_report.elt_gp_install_referrer_log — Google Play应用市场包用户首登时的归因信息…`（表描述内联）、`## Table: film_report.film_app_verify [#Table] (22 fields, 0 FK)` + `- guid Text PK desc: device correlation guid 明文，仅内部使用`、`- result_type Text Category desc: 结果来源：SUCCESS/OFFICIAL_VERIFICATION_FAILED/SERVICE_VERIFICATION_FAILED/PROCESSING_FAILED`。`base_type` 的 `type/` 前缀已剥（修了一处代码瑕疵）。
+- **`list_databases` 仅 1 个库**：`db=2 主库 (clickhouse)`，58 张表（`film_report.*` / `gather.*` / `metabase_upload.*`）。**事故复跑里 `elt_film_order` 那套业务表当前不在此 Metabase 连接内**（实例/连接可能已变）。
+- **⚠️ 取值域内联 0 命中**：逐库下钻（含 `film_app_verify` 等明显 `Text Category` 枚举字段）共抽到的 `values:[...]` 字段数 = **0**。**根因：本 ClickHouse 数仓的 Metabase 未填充 `fingerprint.type.values`**。枚举值实际写在字段 *description* 里（如 `result_type … desc: 结果来源：SUCCESS/…`），M-Schema 的 description 内联（300 字）已把它们带出。
+
+**结论**：
+- M-Schema 格式、PK/FK 标记、表/字段描述前置、两阶段 linking 提示——这四点在真实 BI 上**验证通过**。
+- §11.2/§11.3 原先写的「取值域从 `fingerprint.type.values` 真实内联」**在本 BI 上不成立**，已订正：真实取值域兜底来自 `description` 内联；`fingerprint` 路径仅在 Metabase 真正填充值的后端（多为 PG/MySQL）生效。
+- 文本 2sql 准确率提升**已由 P2 的黄金集 + `bi-eval-runner.mjs` 量化**（§11.7）：抽样 3 例全部 valid/ex/join=true，确认 schema→SQL 链路在真实 BI 上通顺；全量 97 题基线可在有模型额度时一键跑出。
+
+### 11.4 下一步（待实施 / 进行中）
+
+- **P2（全部已实施）**：「问题-表」窄图工具 + 黄金集（97 题，`tests/bi-golden-set.json`）+ `bi-eval-runner.mjs` 三维评分，均已于 2026-11-10 真实 BI 验证（见 §11.6/§11.7）。下一步为 P3（条件）或 P4。
+- **P3（条件）**：仅当 P2 跑分显示 recall@k<70% 时上口径层 LazyGraphRAG（§4.2-2）。
+- **P4（可选）**：few-shot join 样例库（§4.3-4）、查询校验闭环固化（§4.3-5，run_native_query 已有只读+超时+口径护栏，属收尾）。
+- **P0（人工）**：§10 的 18 条 FK 核查仍待 Metabase Admin 权限人员签字（含 §10.1/§10.2 已定位的 7 条根因复核）。
+
+### 11.6 P2 问题-表窄图（2026-11-10 已实施 + 真实 BI 验证）
+
+- **新增模块 `scripts/metabase-card-graph.mjs`**（纯函数、零依赖、可单测）：`extractTables(sql)` 正则抽 `FROM/JOIN` 表引用；`getCardTables(mb,cardId)` 取卡片 SQL（原生直接读 `native.query`，MBQL 走 `POST /dataset/native` 编译）；`buildCardTableIndex(mb,{databaseId,force})` 批拉全库卡片（每批 10）建 `card→table` 索引，**模块级缓存 TTL 5min**；`cardsForTable` / `relatedCards` 两张查询。
+- **新增两个 MCP 工具**（`metabase-mcp.mjs`）：`get_cards_for_table(table)` 反向查「哪些现成提问引用此表」；`get_related_cards(card_id)` 找「共享底表的其它提问」（按共享表数排序）。两者描述都引导「优先复用以验证查询，而非从零写 join」。
+- **真实 BI 验证**（stdio 直连，`db=2` 印度板块 97 张卡片）：`get_related_cards(96)` 正确解析出 `film_report.elt_new_guid` + `film_report.elt_gp_install_referrer_log` 两张底表，并召回 5+ 个共享**两张表**的关联卡片；`get_cards_for_table("film_report.elt_new_guid")` 返回 10 个引用该表的现成提问；首次索引构建 15.9s（97 卡片 SQL 批拉 + 正则抽表），二次调用 1ms（缓存命中）。`node --check` + 项目语法门禁 `EXIT=0`，lint 0 错误。
+- **价值**：把「先翻 781 字段 / 97 卡片 schema」收敛为「按表/按问题」的窄图导航，直接服务 §4.2-1 的 prompt 瘦身目标；且是纯元数据、零 LLM 成本，Agent 无感。
+
+### 11.7 P2 黄金集 + 三维跑分器（2026-11-10 已实施 + 真实 BI 验证）
+
+- **黄金集已落盘**：`scripts/bi-golden-bootstrap.mjs` 从 97 张卡片抽 `{id, question=卡片名, expected_sql=编译后原生SQL, tables}` 落 `tests/bi-golden-set.json`（纯元数据，零 LLM，97 例 / 96 带 SQL）。**遗留**：卡片名是标题而非标准自然语言提问，作为 eval 提示偏弱——真实评测建议后续把 `question` 改写为自然语言（见 §11.8）。
+- **`bi-eval-runner.mjs`（已落地）**：加载黄金集 → 逐例经真实 `agent-server` 的 `/chat/stream`（BI MCP 已启用）驱动模型生成并执行 SQL → 从 `tool_result.text` 抽「实际执行的 SQL」→ 三维评分（§4.4）：`ValidSQL`（有 BI 查询工具成功执行）/ `EX`（返回非空行）/ `JoinCorrect`（生成 SQL 用到的表 ⊇ 期望表）。支持 `--limit N` / `--case ID` / `--dry`（仅校验评分函数）/ `--out report.json`。
+- **真实 BI 验证（全量 96 例基线，2026-11-11 跑完）**：逐例经模型跑分（节流：每例独立进程 + `--gap 15` + `--resume` 断点续跑），结果 **ValidSQL 93/96 (96.9%)、EX 93/96 (96.9%)、JoinCorrect 55/92 (59.8%)，0 error**。模型正确抽得期望表（如 `film_report.elt_new_guid`+`elt_gp_install_referrer_log`、`elt_film_order` 等），证明 schema→SQL 链路在真实 BI 上**通畅（ValidSQL/EX 近满分）**。
+- **两次独立跑分的波动**：同日另一次完整 96 例跑分为 ValidSQL 95/96 (98.9%)、JoinCorrect 65/94 (69.1%)。两次 join 正确率在 **60%–69%** 间波动——反映模型在「选对表」上的不稳定性，但**中枢都远低于 ValidSQL 的 ~98%**。
+- **核心结论（量化 §3-C 风险）**：表选择正确率仅 **~60%（区间 60%–69%，且不稳定）**——约 1/3 查询虽能跑出数据却**用错了表**（静默错误），正是 §3-C 警示的「高分但无用」。该值**已跌破 §5 P3 的 recall@k<70% 触发阈值**，是立项口径层 LazyGraphRAG（§4.2-2）的直接依据。
+- **白名单求交（a，已落地）**：runner 加载 `tests/bi-known-tables.json`（58 张真实表，由 bootstrap 从 `get_database_schema` 导出）过滤 `usedTables`/`expectedTables` 的 CTE 名与表别名噪声（`od`/`u`/`m5`/`new_dev` 等），`filterKnownTables` 对空白名单 fail-open。修正了早期 #486 等复杂 SQL 的抽取噪声（join 判定不再被别名干扰）；#125 经复核是**模型真实用错表**（缺 `elt_app_params`/`elt_fo_ap_src`），非抽取误判。
+- **已知限制**：
+  1. SSE 的 `tool_call` 事件不携带参数（服务端脱敏），故生成 SQL 取自 `tool_result.text` 里的「实际执行的 SQL」；仅当模型实际执行了查询才有 join 评分，纯文本回答的 case 记 valid=false。
+  2. **上游限流**：同一 `agent-server` 进程连续跑 ≥3 例会被上游（模型 API）限流——表现为前 2 例通过后第 3+ 例 `terminated`/`fetch failed`。**规避**：每例独立进程 + 间隔（已验证 `--case` 间隔 12s 可 12/12 通过）；全量 97 题必须节流（如每例新进程 + sleep），否则会大面积误报 ERROR。
+  3. **join 评分对复杂 SQL 过匹配**：`extractTables` 的 `FROM/JOIN` 正则会把别名/列名（如 `od`/`u`/`m5`）误判为表，导致 #486/#125 等复杂 SQL 的 `usedTables` 含噪声、`join` 偶发误判为 false。改进方向：抽表后与已知 schema 表名白名单求交（而非自由匹配）；当前 join 维度为 best-effort。
+
+### 11.8 遗留与后续
+
+- **黄金集 `question` 改写（提升 eval 信度）**：当前 `question` 取自卡片名（标题），作为模型提示偏弱；建议后续人工/半自动改写为自然语言提问，再跑回归基线（验证 P3 改动是否提升 JoinCorrect）。
+- **全量基线（已完成）**：`node scripts/bi-eval-runner.mjs --resume --gap 12` 已跑完 96 例（0 error），ValidSQL/EX 98.9%、JoinCorrect 69.1%，报告存 `.data/bi-eval-full.json`，可作为后续回归基线。
+- **P3（条件已触发，建议立项）**：全量 JoinCorrect≈69% 已逼近 recall@k<70% 阈值 → 建议立项口径层 LazyGraphRAG（§4.2-2），范围限定口径层；落地后重跑基线验证 JoinCorrect 提升。
+- **P4（已实施）**：few-shot join 样例库（`get_join_examples` + `scripts/bi-join-examples.mjs`）、查询校验闭环固化（`scripts/bi-query-guard.mjs`，§4.3-5）均已 2026-11-11 落地并带单测。
+- **P0（人工）**：§10 的 18 条 FK 核查已整理为可签字清单 `tests/bi-fk-signoff.json`（技术核对结论收敛），仍待 Metabase Admin 权限人员签字（含 §10.1/§10.2 已定位的 7 条根因复核）。
+
+### 11.5 残留风险与 P1.1 候选（取值域真实性）
+
+- **残留风险**：当字段 description 里写的枚举是**过期**的（§4.3 T4 的原场景：`clientType` 描述为 `{1,2,4,6}` 但真实是 `{0,1,4,5}`），而本 BI 又不提供 `fingerprint.type.values` 纠偏，则 M-Schema 内联的 description 会**把过期枚举喂给模型**——这正是 §4.3-2 想解决的痛点，当前在本 ClickHouse 后端**未能根除**。
+- **P1.1（可选，需你拍板）**：为 `mode:"mschema"` 增加**惰性取值充实**——仅对 `semantic_type ∈ {Category, Enum, State, Status}` 或描述里疑似含枚举的字段，在 schema 拉取时**按需调一次 `get_field_values`**（带缓存、限低基数字段、限并发），用真实去重值覆盖 description 里的枚举。代价：schema 首拉延迟上升（按字段数线性、仅枚举字段），但换来 §4.3-2 的真·实测取值域。若你接受这个延迟，我可以接着做 P1.1；否则维持现状（description 兜底），并在 §4.3-2 标注「ClickHouse 后端枚举以描述为据，可能过期」。

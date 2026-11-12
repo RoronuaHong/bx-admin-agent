@@ -208,7 +208,11 @@ test("[T] search_columns 接进工具面且被技能引用：锁住「新工具 
 
 test("[M] 取数核心单一实现：runSql 被 run_native_query / execute_sql / query 复用，只读校验只在 assertSql", () => {
   expect(ADAPTER).toContain("async function runSql(");
-  expect(ADAPTER).toContain("function assertSql(");
+  // §4.3-5：assertSql 收拢到 bi-query-guard.mjs（纯函数、可单测、单一可信来源），
+  // 适配器只 import，不再内联第二份判定逻辑——意图不变，位置外移。
+  expect(ADAPTER).toContain('from "./bi-query-guard.mjs"');
+  const guard = readFileSync(fileURLToPath(new URL("../scripts/bi-query-guard.mjs", import.meta.url)), "utf8");
+  expect(guard).toContain("export function assertSql(");
   // run_native_query 委托给 runSql（不重复内联只读校验 + 执行渲染）
   const rnq = ADAPTER.slice(ADAPTER.indexOf('name: "run_native_query"'), ADAPTER.indexOf('name: "list_cards"'));
   expect(rnq).toContain("return runSql(");

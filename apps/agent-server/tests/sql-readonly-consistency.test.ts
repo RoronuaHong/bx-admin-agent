@@ -91,8 +91,12 @@ test("MCP 适配器未再内联 isReadOnlySql（唯一来源必须是 common 模
   expect(src).not.toMatch(/function\s+isReadOnlySql\s*\(/);
   expect(src).not.toMatch(/const\s+RO_LEADING\s*=/);
   expect(src).not.toMatch(/const\s+RO_DENY\s*=/);
-  // 必须是从单一源 import。
-  expect(src).toContain('import { isReadOnlySql } from "./sql-readonly-common.mjs"');
+  // §4.3-5 起，执行前校验收拢到 bi-query-guard.mjs：适配器 import assertSql（间接），
+  // guard 必须直接 import 单一源——链路上仍然物理只有一份判定逻辑。
+  expect(src).toContain('from "./bi-query-guard.mjs"');
+  const guardSrc = readFileSync(fileURLToPath(new URL("../scripts/bi-query-guard.mjs", import.meta.url)), "utf8");
+  expect(guardSrc).toContain('import { isReadOnlySql } from "./sql-readonly-common.mjs"');
+  expect(guardSrc).not.toMatch(/function\s+isReadOnlySql\s*\(/);
 });
 
 // ---- 失败文案的可操作性（2026-10-14 事故复盘 §5 P1-5②）----
