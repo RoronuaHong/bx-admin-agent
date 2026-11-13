@@ -123,10 +123,10 @@
 
 ## 附录 B — 业务拍板与最佳实践定稿（2026-11-13）
 
-业务对 D4/D5/D6 给出明确拍板，其余按最佳实践收口；结果已回填 `caliber-glossary.json`（8/9 条目 `approved`，仅 `app_channel` 仍 `draft`）。
+业务对 D4/D5/D6 给出明确拍板，其余按最佳实践收口；结果已回填 `caliber-glossary.json`（9/10 条目 `approved`，仅 `app_channel` 仍 `draft`；`report_timezone` 复查补批准）。
 
 ### B.1 业务明确拍板
-- **D4 报表时区**：北京时区 `Asia/Shanghai`（库内 / 服务器默认）与 `Asia/Kolkata`（印度板「当天」自然日归属）**两个都要**，按板块选用并写明。已更新 `report_timezone.definition` 与 `check.timezone`。
+- **D4 报表时区**：北京时区 `Asia/Shanghai`（库内 / 服务器默认）与 `Asia/Kolkata`（印度板「当天」自然日归属）**两个都要**，按板块选用并写明。已更新 `report_timezone.definition`/`sql` 与 `check.timezone`，并批准为 `approved`。
 - **D5 会员存量**：**取数据库数据即可**——以 `elt_user_vip_info` 为唯一口径（当前存量 `vipType=2 AND endDate>now()`、`uniqExact(uid)`；历史某日存量用开通流水重建、不用有效期反推）。据此把 `member_stock` 改 `approved`，并**修复** `scripts/bi-query-guard.mjs:29-35` 的内置提示（原写"逐日扫描 startDate/endDate"与词典矛盾，现改为与词典一致：当前存量 `endDate>now()`、历史存量用流水重建）。
 - **D6 用户去重主键**：账号类 `uid` 与设备类 `guid` **都要**，按语义选用并写明。`user_dedup_key` 改 `approved`。
 
@@ -139,7 +139,7 @@
 - **D7 实体别名**：品牌级渠道名已确认为别名（India 11 / Brazil 6，`useChannel.ts:3-44`）；库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名的完整映射待从 `getPakageOptions` API 补全，故 `app_channel` 仍 `draft`。
 
 ### B.3 现状
-- 已 `approved`（8）：`paid_order`、`revenue_amount`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`。
-- 仍 `draft`（1）：`app_channel`（等后端补全 `apkChannel` 全映射）。
+- 已 `approved`（9）：`paid_order`、`revenue_amount`、`report_timezone`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`。
+- 仍 `draft`（1）：`app_channel`（等后端补全 `apkChannel` 全映射）。（复查 2026-11-13：`report_timezone` 原漏批，本次补批准为 `approved`——D5/D6 已批、D4 应一致；无 enforce，仅线上口径宣告，离线审计早已按 check 校验。）
 - 所有 `owner` 为验证占位 `verify-demo`，待业务正式签批替换。
 - 验证：相关测试 6 套件 / 38 例全绿；改完需重启 agent-server 使词典生效。
