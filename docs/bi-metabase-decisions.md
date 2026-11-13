@@ -2,7 +2,7 @@
 
 > 来源：`docs/bi-metabase-optimization-plan.md` §3 / §11.9-B / §11.10 / §11.11 调研结论 + `docs/bi-metabase-todo.md` 阶段 1
 > 生成：2026-11-12；状态：待业务/技术拍板（本节给"建议结论"，不擅自改业务语义）
-> ⏸ **对齐状态（2026-11-12 核验，见 `docs/bi-metabase-todo.md`「待对齐 / 阻塞项」B1/B2）**：业务拍板项**除 D1 国家维度拆分外全部未签字**——`caliber-glossary.json` 10 条中 `country_dimension`/`device_ip_country` 已由技术侧按建议结论 `approved`（`owner` 为验证占位 `verify-demo`，待业务正式签批替换），其余 8 条仍 `draft`、owner null；`fk-signoff.json` 仍 `PENDING_HUMAN_SIGNOFF`、18 条 signoff 全空。
+> ⏸ **对齐状态（2026-11-12 核验，见 `docs/bi-metabase-todo.md`「待对齐 / 阻塞项」B1/B2）**：业务拍板项**除 D1 国家维度拆分外全部未签字**——`caliber-glossary.json` 10 条中 `country_dimension`/`device_ip_country` 已由技术侧按建议结论 `approved`（`owner` 为验证占位 `verify-demo`，待业务正式签批替换），其余 8 条仍 `draft`、owner null；`fk-signoff.json` 仍 `PENDING_HUMAN_SIGNOFF`、18 条 signoff 全空。**（现状更正：2026-11-13 业务拍板 + 最佳实践收口后，10/10 已全部 `approved`，`owner` 仍为 `verify-demo` 占位、待业务正式签批替换，见附录 B。）**
 > 本文是「建议结论」快照：1.1 / 1.3 已按建议落地，1.5② / 2.7 / 2.3 等「技术侧可并行推进」项也已落地；文内「8 条」「grep 0 命中」是当时口径（现为 10 条、已有 2 条示例映射 + `search_values`）。**现状以进度文档为准，业务结论仍待拍板**。
 > 核查依据（已逐文件核对属实）：`bi-semantic/caliber-glossary.json`、`scripts/bi-mschema-values.mjs`、`scripts/metabase-mcp.mjs`、`tests/bi-known-tables.json`、`tests/bi-golden-set.json`
 
@@ -41,9 +41,9 @@
 
 ## 决策 1.4 — 口径词典 8 条逐条拍板
 
-- **现状**：`caliber-glossary.json` 共 10 条（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已由技术侧按本建议结论①落地**（2026-11-12）：`country_dimension`/`device_ip_country` 已 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、闸门内置国家硬拒已让位，**#120/#121/#125/#126 现已能在 Agent 跑出**；`owner` 为验证占位 `verify-demo`，待业务正式签批。`member_stock` 仍 `draft` 且带 `enforce:reject`，其内置硬拒规则仍在生效。**D2 已支付订单亦由技术侧按结论②落地**（`paid_order` 已 `approved`、`enforce` 留空=软上线，偏离口径仅离线审计标红、查询闸不硬拒也不告警），`owner` 同为验证占位 `verify-demo`，待业务正式签批。其余口径仍 `draft`、owner null。
+- **现状**：`caliber-glossary.json` 共 10 条（8 条口径 + `app_channel`、`default_app_scope`）。**D1 国家维度拆分已由技术侧按本建议结论①落地**（2026-11-12）：`country_dimension`/`device_ip_country` 已 `approved`、`ipCountryCode` 已移出 `country_dimension.forbidden`、闸门内置国家硬拒已让位，**#120/#121/#125/#126 现已能在 Agent 跑出**；`owner` 为验证占位 `verify-demo`，待业务正式签批。`member_stock` 仍 `draft` 且带 `enforce:reject`，其内置硬拒规则仍在生效。**D2 已支付订单亦由技术侧按结论②落地**（`paid_order` 已 `approved`、`enforce` 留空=软上线，偏离口径仅离线审计标红、查询闸不硬拒也不告警），`owner` 同为验证占位 `verify-demo`，待业务正式签批。**（现状更正：2026-11-13 业务拍板 + 最佳实践收口后，10/10 已全部 `approved`，`owner` 均为 `verify-demo` 占位、待业务正式签批替换，见附录 B。）**
 - **最佳实践**：语义层为唯一真相源（dbt / Cortex 语义模型）；维度冲突用**具名维度**而非一刀切禁（Genie 的具名指标/维度）。
-- **建议结论**（按优先级，需业务 owner 逐条 `status→approved`）：
+- **建议结论**（按优先级，需业务 owner 逐条 `status→approved`；**2026-11-13 已全部 `approved`，见附录 B**）：
   1. ✅ **国家维度拆成两个具名维度**：`country_dimension`（账号注册国 `elt_user_full.countryCode`）与 `device_ip_country`（设备 IP 国 `elt_app_params.ipCountryCode`）。批准 `device_ip_country` 后，把 `ipCountryCode` 从 `country_dimension.forbidden` 移出，并让闸门在两条都批准后**改读词典**（不再内置硬拒）。这是当前 4 题必失分的根因，优先定。**（已于 2026-11-12 由技术侧按此结论落地，`owner` 为验证占位 `verify-demo`，待业务正式签批替换；实例验证 10/10 通过，见 `docs/bi-metabase-todo.md` 进度记录）**
   2. ✅ **已支付订单**：`orderStatus IN (3,6)`（多数卡片写法）批准；状态 3/6 含义请业务在 `openQuestions` 里回填。**（已于 2026-11-12 由技术侧按此结论落地，`owner` 为验证占位 `verify-demo`，软上线不拦——偏离口径仅离线审计标红、查询闸不硬拒也不告警；实例验证 5/5 通过，见 `docs/bi-metabase-todo.md` 进度记录）**
   3. ✅ **收入金额**：`sum(changeAmount)` 批准；`amount` 单位/币种请业务确认（#125/#121 用 `amount` 的卡片据此改或标例外）。
@@ -106,7 +106,7 @@
 
 ### A.2 发现并定位的内部矛盾（需修，非业务决策）
 
-- **`member_stock` 闸门提示与词典自相矛盾**：本仓库 `apps/agent-server/scripts/bi-query-guard.mjs:29-35` 的 `member_stock` 内置规则 `error` 写"请改用 elt_user_vip_info… **vipType=2 且 startDate<=统计日 且 endDate>=统计日**，uniqExact(uid)…**按日存量需逐日扫描该表**"。而词典 `member_stock` 条目明确"**历史某日存量不能用 startDate/endDate 反推、须用开通流水重建**"。两者直接冲突。`member_stock` 仍 `draft` → 该内置提示仍生效，会引导模型用反推法。
+- **`member_stock` 闸门提示与词典自相矛盾**：本仓库 `apps/agent-server/scripts/bi-query-guard.mjs:29-35` 的 `member_stock` 内置规则 `error` 写"请改用 elt_user_vip_info… **vipType=2 且 startDate<=统计日 且 endDate>=统计日**，uniqExact(uid)…**按日存量需逐日扫描该表**"。而词典 `member_stock` 条目明确"**历史某日存量不能用 startDate/endDate 反推、须用开通流水重建**"。两者直接冲突。（**已在 2026-11-13 口径定稿中消解**：`member_stock` 已 `approved`，且 `bi-query-guard.mjs:33-34` 内置提示已改为与词典一致——明确"历史某日存量不能用有效期字段(startDate/endDate)反推，须用开通流水重建（逐日扫描有效期会得到错误结果）"，原矛盾已不存在。）
 - **处置建议**：以词典为准，修正内置提示（去掉"逐日扫描 startDate/endDate"、改为"历史某日存量须用开通流水重建"），或先核实 `elt_user_vip_info` 是否保留历史行再定。属代码层修复，不依赖业务拍板。
 
 ### A.3 仍为纯业务拍板（代码无法回答）

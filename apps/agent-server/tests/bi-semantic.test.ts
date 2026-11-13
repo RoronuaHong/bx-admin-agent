@@ -220,6 +220,22 @@ test("口径定义投影：app_channel 的 valueAliases 一并输出（别名上
   expect(app.valueAliases.some((a: { term: string; literal: string }) => a.term === "FOXA" && a.literal === "FoxA")).toBe(true);
 });
 
+test("口径定义投影：编码型口径（paid_order/member_stock/new_member）的 valueAliases 一并输出", () => {
+  const real = loadGlossary()!;
+  const paid = metricDefinitions(real, "订单").value.definitions.find((d: { id: string }) => d.id === "paid_order");
+  expect(paid).toBeDefined();
+  expect(paid.valueAliases.some((a: { term: string; literal: string; column: string }) => a.term === "支付成功" && a.literal === "3" && a.column === "orderStatus")).toBe(true);
+  expect(paid.valueAliases.some((a: { term: string; literal: string }) => a.term === "已结算" && a.literal === "6")).toBe(true);
+  const mem = metricDefinitions(real, "会员").value.definitions.find((d: { id: string }) => d.id === "member_stock");
+  expect(mem?.valueAliases?.some((a: { term: string; literal: string }) => a.term === "会员" && a.literal === "2")).toBe(true);
+  const nm = metricDefinitions(real, "新增会员").value.definitions.find((d: { id: string }) => d.id === "new_member");
+  expect(nm?.valueAliases?.some((a: { term: string; literal: string }) => a.term === "首充" && a.literal === "3")).toBe(true);
+  const cd = metricDefinitions(real, "国家").value.definitions.find((d: { id: string }) => d.id === "country_dimension");
+  expect(cd?.valueAliases?.some((a: { term: string; literal: string; column: string }) => a.term === "印度" && a.literal === "91" && a.column === "countryCode")).toBe(true);
+  const dip = metricDefinitions(real, "投流").value.definitions.find((d: { id: string }) => d.id === "device_ip_country");
+  expect(dip?.valueAliases?.some((a: { term: string; literal: string; column: string }) => a.term === "巴西" && a.literal === "55" && a.column === "ipCountryCode")).toBe(true);
+});
+
 test("真实词典：歧义候选项引用不悬空，当前全草稿时线上无信号", () => {
   const real = loadGlossary()!;
   const ids = new Set(real.entries.map((e: { id: string }) => e.id));

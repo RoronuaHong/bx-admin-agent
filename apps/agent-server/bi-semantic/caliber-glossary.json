@@ -33,6 +33,14 @@
       "openQuestions": [
         "已确认 3=支付成功、6=已结算（出处 bx-film-admin-in2 src/utils/type.ts ORDER_STATUS + tran10.ts:539-544）；剩：已支付订单应含 3 仅 / 6 仅 / 两者？见 decisions.md 附录 A。",
         "只用 6 的卡片（如 #46、#473）是另一个口径（例如只算已完成 / 已发放权益），还是历史写法？"
+      ],
+      "valueAliases": [
+        { "term": "支付成功", "literal": "3", "column": "orderStatus", "note": "orderStatus=3（ORDER_STATUS，type.ts:66）；已支付订单口径 IN(3,6)" },
+        { "term": "已结算", "literal": "6", "column": "orderStatus", "note": "orderStatus=6；已支付口径含 3 与 6" },
+        { "term": "未支付", "literal": "1", "column": "orderStatus", "note": "orderStatus=1" },
+        { "term": "支付中", "literal": "2", "column": "orderStatus", "note": "orderStatus=2" },
+        { "term": "支付失败", "literal": "4", "column": "orderStatus", "note": "orderStatus=4" },
+        { "term": "支付超时", "literal": "5", "column": "orderStatus", "note": "orderStatus=5" }
       ]
     },
     {
@@ -138,6 +146,12 @@
       "basis": "Agent 技能 skills/business-data-query/SKILL.md「国家维度只认 elt_user_full.countryCode，不要用替代列」。",
       "openQuestions": [
         "D1 已批准双维度并存；按最佳实践，#486 等仍用代理列的卡片应迁移到对应口径（注册国→elt_user_full.countryCode / 设备国→elt_app_params.ipCountryCode），不再用 networkCountryIso 等代理列。迁移由卡片侧执行。"
+      ],
+      "valueAliases": [
+        { "term": "印度", "literal": "91", "column": "countryCode", "note": "countryCode 为电话国家码数值（bi-query-guard.mjs:27：91=印度、55=巴西）" },
+        { "term": "巴西", "literal": "55", "column": "countryCode", "note": "55=巴西（电话国家码）" },
+        { "term": "巴基斯坦", "literal": "92", "column": "countryCode", "note": "92=巴基斯坦（电话国家码）" },
+        { "term": "孟加拉", "literal": "880", "column": "countryCode", "note": "880=孟加拉（电话国家码）" }
       ]
     },
     {
@@ -181,6 +195,12 @@
       "notes": "与注册国（country_dimension）并存为独立维度；其合法列 ipCountryCode 已从 country_dimension.forbidden 移出，避免闸门拒设备国查询。",
       "openQuestions": [
         "已按最佳实践定：elt_app_params 同一设备多行，按 IP 国家计数时按 guid 去重足够（设备口径以 guid 为键）；与账号口径 uid 并存，交付须写明所用口径。"
+      ],
+      "valueAliases": [
+        { "term": "印度", "literal": "91", "column": "ipCountryCode", "note": "ipCountryCode 为电话国家码数值（同 country_dimension 编码：91=印度、55=巴西）" },
+        { "term": "巴西", "literal": "55", "column": "ipCountryCode", "note": "55=巴西" },
+        { "term": "巴基斯坦", "literal": "92", "column": "ipCountryCode", "note": "92=巴基斯坦" },
+        { "term": "孟加拉", "literal": "880", "column": "ipCountryCode", "note": "880=孟加拉" }
       ]
     },
     {
@@ -256,6 +276,10 @@
       "openQuestions": [
         "已确认：以 elt_user_vip_info 为唯一口径（取数据库数据即可），与财务 / 运营报表的一致性以本口径为准。当前存量 vipType=2 AND endDate>now()、uniqExact(uid)；历史某日存量用开通流水重建、不用有效期反推。",
         "【已修复】bi-query-guard.mjs:29-35 的 member_stock 内置提示原写'逐日扫描 startDate/endDate'与本条矛盾，已改为一致（当前存量用 endDate>now()、历史存量用流水重建）。见 decisions 附录 A。"
+      ],
+      "valueAliases": [
+        { "term": "会员", "literal": "2", "column": "vipType", "note": "vipType=2 即会员（VIP_TYPES，type.ts:55）；会员存量过滤 vipType=2 AND endDate>now()" },
+        { "term": "非会员", "literal": "0", "column": "vipType", "note": "vipType=0 即非会员（VIP_TYPES，type.ts:55）" }
       ]
     },
     {
@@ -287,6 +311,10 @@
       "basis": "Agent 技能「新增会员 ≠ 首次付费（首充）」。",
       "openQuestions": [
         "已按最佳实践定：'新增会员'=窗口内首次成为会员的 uniqExact(uid)；'首单 / 首充'=付费转化口径(rechargeType=3 AND isFirst=1)，含回流老会员。两者在交付名称与口径上必须区分，不可混用。"
+      ],
+      "valueAliases": [
+        { "term": "首充", "literal": "3", "column": "rechargeType", "note": "rechargeType=3 为首充类（词典 new_member 引用 rechargeType=3 AND isFirst=1）；注意首充≠新增会员" },
+        { "term": "首单", "literal": "3", "column": "rechargeType", "note": "首单/首充口径 rechargeType=3 AND isFirst=1" }
       ]
     },
     {
