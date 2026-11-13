@@ -206,6 +206,20 @@ test("口径定义投影：无批准 / 无命中 / 无歧义时不泄漏草稿�
   expect(value.definitions[0].ambiguous).toBeUndefined();
 });
 
+test("口径定义投影：app_channel 的 valueAliases 一并输出（别名上线，模型写 SQL 前可解析口语↔字面）", () => {
+  const real = loadGlossary()!;
+  const r = metricDefinitions(real, "应用"); // 命中 app_channel（name/aliases 含「应用」「渠道码」）
+  expect(r.isError).toBe(false);
+  const value = r.value as any;
+  const app = value.definitions.find((d: { id: string }) => d.id === "app_channel");
+  expect(app).toBeDefined();
+  expect(Array.isArray(app.valueAliases)).toBe(true);
+  expect(app.valueAliases.length).toBeGreaterThan(0);
+  // 已验证项必须出现：IN8→INGoogle8、FoxA→FoxA、品牌名即字面
+  expect(app.valueAliases.some((a: { term: string; literal: string }) => a.term === "IN8" && a.literal === "INGoogle8")).toBe(true);
+  expect(app.valueAliases.some((a: { term: string; literal: string }) => a.term === "FOXA" && a.literal === "FoxA")).toBe(true);
+});
+
 test("真实词典：歧义候选项引用不悬空，当前全草稿时线上无信号", () => {
   const real = loadGlossary()!;
   const ids = new Set(real.entries.map((e: { id: string }) => e.id));
