@@ -61,15 +61,16 @@ export function evalHiddenTools(env = process.env) {
 
 let cache = { key: null, ids: new Set() };
 
-/** 当前留出的卡片 id 集合；按 mtime+size 缓存，文件没变不重复解析。读不到返回空集（fail-open：不隐藏任何卡片）。 */
+/** 当前留出的卡片 id 集合；按文件内容缓存，文件没变不重复解析。读不到返回空集（fail-open：不隐藏任何卡片）。
+ *  注意：不能只用 mtimeMs+size 作缓存键——快速连续两次写入可能落在同一毫秒、且负载字节数恰好相等（如 {caseId:1,cardIds:[1,2]} 与 {caseId:null,cardIds:[]}），会误命中旧缓存。 */
 export function heldOutCardIds(env = process.env) {
   const file = env[HOLDOUT_ENV];
   if (!file) return new Set();
   try {
-    const { mtimeMs, size } = fs.statSync(file);
-    const key = `${file}|${mtimeMs}|${size}`;
+    const raw = fs.readFileSync(file, "utf8");
+    const key = `${file}::${raw}`;
     if (cache.key === key) return cache.ids;
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    const data = JSON.parse(raw);
     const ids = new Set((Array.isArray(data.cardIds) ? data.cardIds : []).map(Number).filter(Number.isFinite));
     cache = { key, ids };
     return ids;

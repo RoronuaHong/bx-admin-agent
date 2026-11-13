@@ -127,9 +127,13 @@ export function metricDefinitions(glossary, query) {
 
   const byId = new Map(entries.map((e) => [e.id, e]));
   const defOf = (e) => {
-    const { id, name, aliases, definition, sql, notes, owner, approvedAt } = e;
+    const { id, name, aliases, definition, sql, notes, owner, approvedAt, valueAliases } = e;
     const ambiguous = ambiguityFor(e, glossary, { approvedOnly: true });
-    return { id, name, aliases, definition, sql, notes, owner, approvedAt, ...(ambiguous ? { ambiguous } : {}) };
+    return {
+      id, name, aliases, definition, sql, notes, owner, approvedAt,
+      ...(valueAliases?.length ? { valueAliases } : {}),
+      ...(ambiguous ? { ambiguous } : {}),
+    };
   };
   const definitions = hit.map(defOf);
   const seen = new Set(hit.map((e) => e.id));
