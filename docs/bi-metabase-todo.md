@@ -136,6 +136,40 @@
 - ⏸ **只读闸门口径冲突（需单独评审）**：显式用 `search_values` 查 `ipCountryCode` 等列的取值时，生成的 `SELECT DISTINCT … ILIKE` 会被 `bi-query-guard.mjs` 的国家维度内置硬拒规则拦下（该规则本意是拦「按 IP 国分组统计」，不是拦「查这列有哪些值」），工具随后静默跳过该列。`checkCaliber` 属安全闸门，§11.11 已把关键词误判列为需单独评审项，本轮不改。（2026-11-12 实测：`apkChannel` 生成的 SQL 过闸门、`ipCountryCode` 的被拒，断言成立。）
 - ⏸ **`get_metric_definitions` 的注记待批准后再补**：`.env` 的 `toolNotes` 目前没有该工具条目；当前工具不宣告、无影响，等 1.4 批准后随 Agent 侧需求一并补。
 
+### 外部签字交接包（技术侧已备，待人工签批；⏸ 不代签，2026-11-13 整理）
+
+> 所有 MCP 层代码（P0–P4 + §11.11 差距项 1–10）已落地（见上「本日已落地」与进度记录）。以下为闭环所需、但**必须外部签字 / 资源**的项。技术侧已把结论与推荐动作整理好，签字人按推荐回填 `signoff` / `status` / `owner` 即可，无需重做技术核对。
+
+#### 1. FK 18 条签字（P0 / E2）— 负责：Metabase Admin + 业务数据负责人
+- 现状：`fk-signoff.json` 顶层 `PENDING_HUMAN_SIGNOFF`；18 条边技术核对（只读 JOIN 探针）3 轮完全一致。
+- **11 条 `VERIFIED`**（#1/#2/#5/#6/#7/#8/#11/#12/#14/#15/#17）：可连且有匹配数据 → **推荐直接签字**。
+- **6 条 `NEEDS_DECISION`**（技术侧推荐动作）：
+  - #3 / #4（`elt_ul_activity.userGroupId` / `preUserGroupId` → `elt_user_group_config._id`）：`DEAD_FK_COLUMN`（列全空，从未写入）→ 推荐在 Metabase 标死字段或移除该 FK，避免模型误 join 空关系；#4 另需业务确认 `preUserGroup` 历史语义。
+  - #9 / #16（`elt_film_order.activityId` / `elt_ul_activity_device.activityId` → `elt_ul_activity._id`）：`EMPTY_PARENT_TABLE`（父表 0 行，56 万订单 + 1.08 亿设备活动引用悬空）→ **优先级最高**，核查 `elt_ul_activity` 是否真为空、活动数据实际落点、FK 目标表是否配错。
+  - #10（`elt_film_order.srcOrderId` 自引用）：`DANGLING_SELF_REF`（56 万非 null 无对应父单）→ 确认是跨库订单号还是原单已清理，决定是否继续作 FK 暴露给模型。
+  - #13（`elt_film_movie_category_content.movieCategoryId` → `elt_film_movie_category._id`）：`DEAD_FK_COLUMN` → 同 #3 处理。
+- **1 条 `OUT_OF_SCOPE`**（#18 `action.action` → `action_config.id`）：当前 API Key 下不可见（探针全 400）→ 需更广权限 Admin 重验。
+- 签字方式：填每条 `signoff.reviewer/decision/at`，顶层 `status→SIGNED_OFF`。
+
+#### 2. 词典 owner 签批（Item 2 / 1.4）— 负责：业务 owner
+- 现状：10/10 条目已 `approved`（技术侧按建议结论落地），`owner` 全为占位 `verify-demo`，共 **17 条 `openQuestions`**。
+- 需业务做：① 把 10 个 `owner` 换成真实负责人；② 回填 17 条 `openQuestions`（主干口径已定，剩细节：paid_order 取 3 仅/6 仅/两者 + #46/#473 处理、revenue_amount 确认 #125/#121 用 INR→`changeAmount`、member_stock 历史存量重建方式等）。
+- 不回填不影响线上（已 approved、工具已宣告），仅影响"正式背书"。
+
+#### 3. 5 张隐藏表暴露（B1 / E1）— 负责：Metabase Admin
+- `bi-known-tables.json` 的 `tableAudit.existHidden=5`（`user_preference_actions_report` / `elt_sport_activity_guess` / `elt_sport_activity_winner` / `watch_log` / `user_watch_movie_activity_log`），另 2 张库里已不存在（#74 同时引用失效表 `view_ul_user_nopay`）。
+- 推荐：Admin 在 Admin → Table Metadata 决定暴露或标 `deprecated`；**暴露后**把 5 张补进 `tables` 白名单 → 黄金集净 7 例（扣 #74）可评 JoinCorrect。不暴露则维持 `joinCorrectComplete` 剔除。
+
+#### 4. Metabase 列描述缺口（§11.11-7）— 负责：业务在 Data Model 补
+- `bi-metadata-gaps.json`：781 字段仅 207 有描述；卡片用到却无描述的 187 列。前列（补描述 + 取值说明可直接缓解取值链接）：`elt_film_order.orderStatus`(31 卡)、`elt_watch_detail.movieType`(25)、`elt_new_guid.channel`(21)、`elt_film_order.orderType`(20)、`channel` 类(18)、`gather.eventName`(17)、`elt_film_order.amount`(12)。
+- 推荐：按前列优先级在 Metabase Data Model 补描述；本地 `search_columns` 已能匹配这些描述（§2.3 / §11.11-6）。
+
+#### 5. BI 凭据冒烟（E3）— 负责：运维
+- 注入 `BI_READONLY_API_KEY` → 可跑 2.3 / 2.5 真实只读 SQL 冒烟（当前本环境无凭据，无法执行）。
+
+#### 6. A/B 全量重跑（B3）— 用户已暂缓（本次不做）
+- 恢复需模型额度 + 重启 8787 许可，且先完成 1–5 签字（尤其 FK / owner），否则新基线很快作废。这是唯一能"证明优化提分"的环节。
+
 ---
 
 ## 阶段 0 — 收尾（✅ 2026-11-12 已提交）
