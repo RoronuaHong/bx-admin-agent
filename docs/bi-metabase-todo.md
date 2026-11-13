@@ -118,7 +118,7 @@
 
 | 出处 | 文内说法 | 核验到的现状 |
 |---|---|---|
-| `docs/bi-metabase-decisions.md` §1.4 | 「口径词典 8 条」 | 词典现 **10 条**（8 条口径 + 1.5/1.6 两条），仍全 `draft` |
+| `docs/bi-metabase-decisions.md` §1.4 | 「口径词典 8 条」 | 词典现 **10 条**（8 条口径 + 1.5/1.6 两条），**2026-11-13 已 10/10 全部 `approved`**（`owner` 仍 `verify-demo` 占位，待业务签批） |
 | 同上 §1.5 | 「完全没有映射（grep 0 命中）」 | 已有 `app_channel.valueAliases` 2 条示例 + `search_values` 工具；**完整映射**仍待业务 |
 | 同上 §「技术侧可并行推进」 | 列 1.5② / 1.3 / 2.7 / 2.3 为待推进 | 四项**均已落地**（见本文进度记录） |
 | `bi-metabase-optimization-plan.md` §11 与本文 | 96 题 / 97 例 / 96→93 | `tests/bi-golden-set.json` 仍是 **97 cases**（未删题）：#485 无 `expected_sql` → 96 可评；`bi-eval-runner.mjs` 的 `hasMissingTable` 再滤掉 `unverifiedTableStatus` 含 `missing` 的 3 例（#338/#179/#74）→ 93 基线。靠 `bi-golden-bootstrap.mjs` 准入检查与 runner 运行时跳过实现，**不是删题** |
