@@ -17,6 +17,7 @@
 > 复核补测（同日「检查清楚」轮）：用**真实词典的临时批准副本** dry-run `metricDefinitions`（不改仓库文件）——批准 `country_dimension` + `device_ip_country` 两条后，输出恰为这两个口径、`ambiguities` 2 条各 2 候选、其余草稿条目零泄漏；`assertSql` 实测 `apkChannel` 取值检索放行、`ipCountryCode` 取值检索被内置国家规则拒绝（B5 断言成立）。四份测试报告 `success=true`，离线召回 0.801 / 0.871 / 0.968 与文内一致。
 > 本轮收尾：把真实词典批准态 dry-run 固化为 2 例回归（`bi-semantic.test.ts`），并给 `docs/README.md` 补 BI 专题三份文档的索引与优先级；全量 `vitest run` **180 文件 / 928 用例全绿**（+2 例），`tsc --noEmit` 0 错误，报告 `.data/vitest-full-20261112-r3.json`。核查 `.env` 与当前 shell 环境变量**均无 BI 凭据**，真实只读冒烟仍不可执行（见 B5）。
 > D2 预演（同日续）：技术侧按 `docs/bi-metabase-decisions.md` 1.4② 建议结论落地「已支付订单」口径——`paid_order` 改 `approved`（`orderStatus IN (3,6)`）、`enforce` 留空（**软上线：不硬拒、不给警告，偏离口径只在离线审计标红**）；`owner/approvedAt` 填验证占位 `verify-demo / 2026-11-12`（**待业务正式签批替换**）。实例验证：约定 `IN (3,6)` 经 `assertSql` 放行、历史写法 `= 6`（#46/#473 风格）不拒也不告警、`get_metric_definitions("已支付订单"/"付费订单"/"订单")` 宣告该口径（5/5）。新增 `tests/bi-d2-paid-order.test.ts`（5 例，含回滚保护）；全量 `vitest run` **184 套件 / 943 用例全绿**，`tsc --noEmit` 0 错误。真实 BI 凭据冒烟仍不可执行（无凭据）。
+> 口径溯源（2026-11-13）：去生产前端 `bx-film-admin-in2` 核验 D1–D9 的 `openQuestions` 权威答案，结果记入 `docs/bi-metabase-decisions.md` 附录 A。代码可证——D2 `orderStatus`：3=支付成功、6=已结算（`src/utils/type.ts:66`）；D3 订单同时有 `amount`/`changeAmount` 两字段、前端用 `changeAmount`（INR，`order.d.ts:12,22`）；D7/D8 印度板默认渠道集 `channelsIndia`（11 个）、巴西板 `channelsBrazil`（6 个，`useChannel.ts:3-44`）；D1 渠道包按 `countryCode` 归属国家；D5 前端会员口径 vipType=2 & endDate>now() 与词典一致。**定位 1 处内部矛盾**：`bi-query-guard.mjs:29-35` 的 `member_stock` 内置提示写"逐日扫描 startDate/endDate"，与词典"历史存量不能反推"冲突（`member_stock` 仍 draft→提示仍生效），建议以词典为准修提示。D4/D5 对账/D6 划分/new_member 命名/#486 迁移仍为纯业务拍板；库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名的完整映射在 `getPakageOptions` API（前端动态取），待后端/Metabase 取全。真实 BI 凭据冒烟仍不可执行（无凭据）。
 
 ### 本日已落地（代码，MCP 层）
 - ✅ **1.1** `with_values` 默认开启（`metabase-mcp.mjs`：逻辑 `with_values !== false` + 描述）。根除过期枚举风险，代价约 +1s/表首拉、5min 缓存后 ≈1ms。
@@ -65,13 +66,13 @@
 | # | 要定的事 | 现状 / 证据 | 定了解锁什么 |
 |---|---|---|---|
 | D1 | **国家维度拆分**：批准 `device_ip_country`、把 `ipCountryCode` 移出 `country_dimension.forbidden`（**技术侧已按建议结论落地，见进度记录**） | `country_dimension`/`device_ip_country` 已 `approved`，`ipCountryCode` 已移出 `country_dimension.forbidden`，闸门内置硬拒已让位；`owner` 为验证占位 `verify-demo`，**待业务正式签批替换** | 已解锁 #120/#121/#125/#126（4 题可跑）+ 2.1 线上口径 + 2.6 歧义信号（护栏 networkCountryIso 等仍生效） |
-| D2 | **已支付订单** `orderStatus IN (3,6)`（**技术侧已按建议结论落地，软上线不拦；owner 占位 `verify-demo` 待签**） | 已 `approved`；`#46/#473` 实测只用 `6`（偏离口径仅离线审计标红、闸不拒）；`3/6` 含义与历史卡片处理仍待业务回填 | 解锁线上口径宣告（`get_metric_definitions`）+ 离线审计标红 `#46/#473`（软上线不破历史卡片） |
-| D3 | **收入金额** `sum(changeAmount)` | #121/#125 实测用 `amount` | 定单位/币种与卡片是否改 |
+| D2 | **已支付订单** `orderStatus IN (3,6)`（**技术侧已按建议结论落地，软上线不拦；owner 占位 `verify-demo` 待签**） | 已 `approved`；`#46/#473` 实测只用 `6`（偏离口径仅离线审计标红、闸不拒）；**`3=支付成功`/`6=已结算` 已确认（见 decisions 附录 A）**；剩：取 3 仅/6 仅/两者 + #46/#473 处理 | 解锁线上口径宣告（`get_metric_definitions`）+ 离线审计标红 `#46/#473`（软上线不破历史卡片） |
+| D3 | **收入金额** `sum(changeAmount)` | 已确认订单有 `amount` 与 `changeAmount` 两字段（`order.d.ts:12,22`），`changeAmount`=换算 INR（前端展示用）、`amount` 疑似原始币种（单位未注）；`currencyType` 为数值币种码；#121/#125 用 `amount` | 定 `amount` 确切单位/币种（后端确认）；#125/#121 是否改 `changeAmount` |
 | D4 | **报表时区** | Asia/Shanghai vs Asia/Kolkata | 影响全部日切卡片 |
-| D5 | **会员存量口径自相矛盾** | 闸门提示「逐日扫描 startDate/endDate」 vs 词典「不能反推、须用流水重建」 | 定以哪个为准，两边同步改 |
+| D5 | **会员存量口径自相矛盾（已定位）** | 【已定位】`bi-query-guard.mjs:29-35` 内置 `member_stock` 提示确写"vipType=2 且 startDate<=统计日 且 endDate>=统计日，逐日扫描"，与词典"历史存量不能反推"冲突；`member_stock` 仍 draft→内置提示仍生效。前端会员口径 vipType=2 & endDate>now()（`UserVipInfo.configs.tsx:59-64`）与词典当前存量一致 | 修内置提示以词典为准（或先核实 `elt_user_vip_info` 是否保留历史行）；对齐后批准 `member_stock` |
 | D6 | **用户去重 / 新增会员** | uid vs guid；新增会员 ≠ 首充 | 定口径划分与命名 |
-| D7 | **实体别名完整映射** | 现只 2 条示例（IN8→INGoogle8、FOXA→FoxA）；#64 `FoxA`、#96 `INGoogle5`、#120 `INGoogle8` | valueMatch 31% 的主要缺口 |
-| D8 | **默认应用范围** | #64 / #96 题目没写范围却带过滤 | 定「进词典」还是「补进题目」，否则评测在考猜题 |
+| D7 | **实体别名完整映射** | 品牌级渠道名已确认（`useChannel.ts:3-44`）：India 板=GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok，Brazil 板=Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic；`FOXA→FoxA` 已验证。库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名完整映射在 `getPakageOptions` API（前端动态取），待后端/Metabase 取全 | valueMatch 大幅提升（品牌名可直接解析）；补全 `apkChannel` 映射后 `INGoogle` 类也能解 |
+| D8 | **默认应用范围（已答）** | 【已答】印度板默认渠道集=`channelsIndia`（`useChannel.ts:22-35`）：GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok（含 total），非"FoxA/INGoogle5 系列"窄集；按 `country` 全局切换 | 可把该印度渠道集定为 `default_app_scope` 进词典（消除 #64/#96 猜题）；或补进题目 |
 | D9 | **冲突卡片** | #46/#473/#125/#121/#120/#126 与词典草稿冲突 | 由卡片作者决定是否改 |
 
 ### E. 需管理员 / 环境

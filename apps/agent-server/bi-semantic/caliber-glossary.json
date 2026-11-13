@@ -1,7 +1,7 @@
 {
   "title": "BI 口径词典（指标单一定义）",
   "version": 1,
-  "updatedAt": "2026-11-12",
+  "updatedAt": "2026-11-13",
   "status": "draft",
   "howToApprove": "业务负责人逐条确认：把 status 改为 approved，填 owner 与 approvedAt；有分歧就改 definition / check 再批。只有 approved 的条目会经 MCP 工具 get_metric_definitions 提供给模型、并作为 get_caliber_context 的检索词；draft 只用于离线审计（scripts/bi-caliber-audit.mjs）与评测打分。enforce 决定查询闸门怎么处理已批准条目的冲突：reject = 拒绝执行并给出约定口径，warn = 照常执行、在结果里提示，不写 = 不拦。country_dimension、member_stock 在查询闸门里有同 id 的内置硬拒规则，批准后改由本文件接管（批准时若把 enforce 改成 warn 或删掉，闸门就不再硬拒）。改完需重启 agent-server。条目可带 ambiguous（question + candidates）：get_metric_definitions 会附上歧义信号与候选项定义，但只给信号、不代调用方选口径；候选项 id 指向别的条目时，那条也须 approved 才会输出信号。",
   "entries": [
@@ -18,7 +18,7 @@
       "basis": "卡片多数写法（引用订单表并按状态过滤的卡片里绝大多数用 3 或 6）。",
       "notes": "按状态分组计算结算率（分母是全部订单）的卡片不过滤状态，不算冲突。",
       "openQuestions": [
-        "orderStatus 3 和 6 各代表什么？Metabase 元数据里该字段没有描述。",
+        "已确认 3=支付成功、6=已结算（出处 bx-film-admin-in2 src/utils/type.ts ORDER_STATUS + tran10.ts:539-544）；剩：已支付订单应含 3 仅 / 6 仅 / 两者？见 decisions.md 附录 A。",
         "只用 6 的卡片（如 #46、#473）是另一个口径（例如只算已完成 / 已发放权益），还是历史写法？"
       ]
     },
@@ -34,7 +34,7 @@
       "check": { "type": "sum_column", "table": "elt_film_order", "column": "changeAmount", "forbidden": ["amount"] },
       "basis": "Metabase 字段描述：changeAmount「换算成印度卢比的订单金额；计算和统计应使用此字段」。",
       "openQuestions": [
-        "amount 的单位与币种是什么？用 SUM(amount) 的卡片（如 #125、#121）是否需要改成 changeAmount？"
+        "已确认订单同时有 amount 与 changeAmount 两字段（order.d.ts:12,22），changeAmount=换算成印度卢比（前端展示用，configs.data.tsx:176-179），amount 疑似原始币种、单位未注；currencyType 为数值币种码。剩：amount 确切单位/币种需后端确认；#125/#121 若意图 INR 收入应改 changeAmount。见 decisions.md 附录 A。"
       ]
     },
     {
@@ -157,7 +157,7 @@
       "basis": "Agent 技能「会员存量分两类口径，别混」，以及「不要用 elt_user_full_history.vipExpireDay > 0 这类设备级快照替代」。",
       "openQuestions": [
         "是否与财务 / 运营报表的会员数一致？",
-        "查询闸门内置规则的提示写的是「vipType=2 且 startDate<=统计日 且 endDate>=统计日，按日存量逐日扫描该表」，与本条「历史某日存量不能用 startDate/endDate 反推」矛盾，以哪个为准？"
+        "【已定位内部矛盾】本仓库 bi-query-guard.mjs:29-35 的 member_stock 内置提示确写'vipType=2 且 startDate<=统计日 且 endDate>=统计日，逐日扫描'，与本条'历史某日存量不能用 startDate/endDate 反推'冲突；member_stock 仍 draft→内置提示仍生效。建议以词典为准修内置提示（或先核实 elt_user_vip_info 是否保留历史行）。见 decisions.md 附录 A。"
       ]
     },
     {
@@ -196,7 +196,7 @@
       ],
       "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样里 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。",
       "openQuestions": [
-        "完整映射表：哪些业务简称对应哪些库内 apkChannel / channel 值？是否还有其它应用（Disney+ / Netflix 等）？",
+        "品牌级渠道名已确认（useChannel.ts:3-44）：India 板=GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok，Brazil 板=Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic；FOXA→FoxA 已验证。库内 apkChannel/packageName（如 INGoogle8）↔ 品牌名的完整映射在 getPakageOptions API（前端动态取），需后端/Metabase 取全。见 decisions.md 附录 A。",
         "同一简称是否跨多张表有不同取值？映射是否按表区分？"
       ]
     },
@@ -212,7 +212,7 @@
       "check": null,
       "basis": "金样 #64、#96 隐含范围条件，评测在考「猜题」而非 text2sql 能力。",
       "openQuestions": [
-        "印度板块默认看哪个应用 / 渠道？是否就是 FoxA / INGoogle5 系列？",
+        "已确认印度板默认渠道集=channelsIndia（useChannel.ts:22-35）：GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok（含 total），非'FoxA/INGoogle5 系列'窄集；按 country 全局切换。见 decisions.md 附录 A。",
         "该默认范围是否对所有印度板块问题生效，还是仅特定题目？"
       ]
     }

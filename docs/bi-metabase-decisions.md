@@ -86,3 +86,35 @@
 - ✅ **2.3 `search_columns` 匹配 Metabase 描述 + 对白名单外表标「未暴露」**：已落地。
 
 > 逐项证据与剩余待办见 `docs/bi-metabase-todo.md` 的进度记录与「待对齐 / 阻塞项」B1–B5。
+
+---
+
+## 附录 A — 口径答案溯源（生产前端 `bx-film-admin-in2`，2026-11-13 核验）
+
+**目的**：D1–D9 的 `openQuestions` 多数"Metabase 元数据没描述"，但业务字段的权威定义在运营后台前端（`src/utils/type.ts` 常量、各视图 `configs.data.tsx`、`*.d.ts` 类型、i18n 文案）里。**以下为代码可证的事实**；仍标"剩：业务拍板"的是策略/对账类决策，代码无法替答。
+
+### A.1 已找到权威答案（代码可证）
+
+| 条目 | 发现 | 出处 | 剩：业务拍板 |
+|---|---|---|---|
+| **D2 `orderStatus`** | `ORDER_STATUS` 常量：`1=未支付 2=支付中` **`3=支付成功`** `4=支付失败 5=支付超时` **`6=已结算`**。`IN(3,6)` = 支付成功 或 已结算 | `bx-film-admin-in2/src/utils/type.ts:66` + `src/locales/lang/zh-CN/tran10.ts:539-544` | 已支付订单 = 3 仅 / 6 仅 / 两者？（决定 #46/#473 是否要扩到 3） |
+| **D3 `amount` vs `changeAmount`** | 订单同时有 `amount`（数值）与 `changeAmount`（数值）两字段 + `currencyType`（数值币种码）；前端金额列用 `changeAmount` 展示（两位小数 floor） | `src/views/vip/multiActive/order.d.ts:12,22`；`src/views/vipOrder/configs.data.tsx:176-179` | `amount` 的确切单位/币种需后端确认；#125/#121 若意图 INR 收入应改 `changeAmount` |
+| **D7 / D8 渠道与应用** | `ChannelType` 品牌级渠道名全集；**印度板默认集 `channelsIndia`**（GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok，含 total 汇总位）；巴西板 `channelsBrazil`（Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic）；按 `country` 全局切换。`FOXA→FoxA` 已验证 FoxA 是真实渠道名 | `src/views/publicity/configUtils/useChannel.ts:3-44`；`src/utils/sysconfig.ts` | 库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名的**完整**映射在 `getPakageOptions` API（前端动态取，见 `useGooglePakageOption.ts`），需后端/Metabase 取全 |
+| **D1 国家维度（佐证）** | 渠道包按 `countryCode`/`countryName`/`currencySymbol` 归属国家；India/Brazil 双板，PakA/BD 渠道挂在印度板下（呼应词典 92=巴基斯坦、880=孟加拉）。`elt_user_full.countryCode` 数值口径（91=印度、55=巴西）与前端分板一致 | `src/components2/common/channel/useChannelPkg.d.ts`；`useChannel.ts` | #486 等仍用代理列的卡片是否迁移到设备国口径（卡片级决策） |
+| **D5 会员存量（部分 + 发现矛盾）** | 前端会员口径：`vipType=2`（`VIP_TYPES`，`type.ts:55`）且 `endDate`="有效期至"（`UserVipInfo.configs.tsx:59-64,99-112`）→ 与词典"当前存量 vipType=2 AND endDate>now()"一致。`rechargeType` 枚举 0–12，3 为首充类（词典 `new_member` 引用 `rechargeType=3 AND isFirst=1`） | 同上 + `UserVipInfo.configs.tsx:9-23` | 见 A.2 内部矛盾；会员数是否与财务/运营报表一致（跨系统对账） |
+| **D6 `uid` vs `guid`** | 订单类型 `OrderRecord` 同时有 `uid`（账号）与设备/包维度字段，`guid` 为设备级；代码侧证实"账号类 uid、设备类 guid"划分 | `order.d.ts:5,20`；词典 `device_ip_country` join 用 `a.guid = 事实表.guid` | 是否同意该划分（语义决策） |
+
+### A.2 发现并定位的内部矛盾（需修，非业务决策）
+
+- **`member_stock` 闸门提示与词典自相矛盾**：本仓库 `apps/agent-server/scripts/bi-query-guard.mjs:29-35` 的 `member_stock` 内置规则 `error` 写"请改用 elt_user_vip_info… **vipType=2 且 startDate<=统计日 且 endDate>=统计日**，uniqExact(uid)…**按日存量需逐日扫描该表**"。而词典 `member_stock` 条目明确"**历史某日存量不能用 startDate/endDate 反推、须用开通流水重建**"。两者直接冲突。`member_stock` 仍 `draft` → 该内置提示仍生效，会引导模型用反推法。
+- **处置建议**：以词典为准，修正内置提示（去掉"逐日扫描 startDate/endDate"、改为"历史某日存量须用开通流水重建"），或先核实 `elt_user_vip_info` 是否保留历史行再定。属代码层修复，不依赖业务拍板。
+
+### A.3 仍为纯业务拍板（代码无法回答）
+
+- **D4 报表时区**：应否改 `Asia/Kolkata`（差 2.5h，改变每天归属）——策略决策；服务器/Metabase 实测默认 `Asia/Shanghai`（已记于词典 `report_timezone.basis`）。
+- **D5 第一问**：会员数是否与财务/运营报表一致——跨系统对账。
+- **D6**：是否同意"账号类 uid、设备类 guid"划分——语义决策。
+- **`new_member` 命名**：首单/首充是否需在名称上与"新增会员"区分——命名决策。
+- **`country_dimension` #486 迁移** / **`device_ip_country` guid 去重**：卡片级 / schema 确认（join 已用 guid，见词典）。
+
+> 溯源来源目录：`D:/Code/bx-film-admin-in2`（运营后台前端 Vue3 + TS）。核验人：技术侧；核验日：2026-11-13。
