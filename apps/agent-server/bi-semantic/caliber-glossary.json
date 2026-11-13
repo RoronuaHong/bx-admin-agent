@@ -8,13 +8,26 @@
     {
       "id": "paid_order",
       "name": "已支付订单",
-      "aliases": ["付费订单", "成功订单", "订阅订单", "支付成功"],
+      "aliases": [
+        "付费订单",
+        "成功订单",
+        "订阅订单",
+        "支付成功"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-12",
       "definition": "film_report.elt_film_order 中 orderStatus IN (3, 6) 的订单。",
       "sql": "orderStatus IN (3, 6)",
-      "check": { "type": "filter_set", "table": "elt_film_order", "column": "orderStatus", "values": [3, 6] },
+      "check": {
+        "type": "filter_set",
+        "table": "elt_film_order",
+        "column": "orderStatus",
+        "values": [
+          3,
+          6
+        ]
+      },
       "basis": "卡片多数写法（引用订单表并按状态过滤的卡片里绝大多数用 3 或 6）。",
       "notes": "按状态分组计算结算率（分母是全部订单）的卡片不过滤状态，不算冲突。",
       "openQuestions": [
@@ -25,13 +38,26 @@
     {
       "id": "revenue_amount",
       "name": "收入金额",
-      "aliases": ["金额", "收入", "流水", "GMV", "付费金额"],
+      "aliases": [
+        "金额",
+        "收入",
+        "流水",
+        "GMV",
+        "付费金额"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
       "definition": "汇总 film_report.elt_film_order.changeAmount（换算成印度卢比的订单金额）。",
       "sql": "sum(changeAmount)",
-      "check": { "type": "sum_column", "table": "elt_film_order", "column": "changeAmount", "forbidden": ["amount"] },
+      "check": {
+        "type": "sum_column",
+        "table": "elt_film_order",
+        "column": "changeAmount",
+        "forbidden": [
+          "amount"
+        ]
+      },
       "basis": "Metabase 字段描述：changeAmount「换算成印度卢比的订单金额；计算和统计应使用此字段」。",
       "openQuestions": [
         "已按最佳实践定：收入统一用 changeAmount（换算 INR），#125/#121 若意图 INR 收入应改 changeAmount；保留 amount 仅当明确要原始币种且须标注币种。amount 确切币种由后端确认，但收入口径已锁定 changeAmount。见 decisions 附录 A。"
@@ -40,13 +66,26 @@
     {
       "id": "report_timezone",
       "name": "报表时区",
-      "aliases": ["日切", "按天", "当天", "自然日"],
+      "aliases": [
+        "日切",
+        "按天",
+        "当天",
+        "自然日"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
       "definition": "时间过滤与按日分桶支持双时区：库内 / 服务器默认 Asia/Shanghai（不写时区等价）；**印度板块对外报表与「当天」自然日归属须用 Asia/Kolkata**（本地时区，与上海差 2.5h）。两个时区都要支持，按板块选用并写明所用时区。推荐显式写出：toTimeZone(createdTime, 'Asia/Kolkata')（印度板）/ toTimeZone(createdTime, 'Asia/Shanghai')（其它），避免换部署后漂移。",
       "sql": "toTimeZone(<时间列>, 'Asia/Kolkata')（印度板）/ toTimeZone(<时间列>, 'Asia/Shanghai')（其它）",
-      "check": { "type": "timezone", "timezone": "Asia/Shanghai", "others": ["Asia/Kolkata", "UTC"], "serverTimezone": "Asia/Shanghai" },
+      "check": {
+        "type": "timezone",
+        "timezone": "Asia/Shanghai",
+        "others": [
+          "Asia/Kolkata",
+          "UTC"
+        ],
+        "serverTimezone": "Asia/Shanghai"
+      },
       "basis": "卡片多数写法（Metabase 编译出的 SQL 统一带 Asia/Shanghai）。2026-11-12 只读查询 SELECT timezone() 返回 Asia/Shanghai，Metabase results_timezone 同为 Asia/Shanghai，所以不写时区的卡片与显式写上海时区结果一致。",
       "openQuestions": [
         "已确认双时区：北京时区 Asia/Shanghai（库内 / 服务器默认）与 Asia/Kolkata（印度板块「当天」归属）都要支持。剩：印度板块卡片是否统一显式写 Asia/Kolkata（最佳实践：是，避免自然日漂移）。"
@@ -55,7 +94,13 @@
     {
       "id": "country_dimension",
       "name": "账号国家 / 国籍维度",
-      "aliases": ["国家", "国籍", "地区", "按国家拆分", "注册国"],
+      "aliases": [
+        "国家",
+        "国籍",
+        "地区",
+        "按国家拆分",
+        "注册国"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-12",
@@ -64,14 +109,24 @@
       "ambiguous": {
         "question": "问的是「账号注册国」还是「设备登录 IP 所在国」？两者不是同一列，需确认后选用，并在交付里写明所用口径。",
         "candidates": [
-          { "id": "country_dimension", "label": "账号注册国", "hint": "elt_user_full.countryCode" },
-          { "id": "device_ip_country", "label": "设备 IP 所在国", "hint": "elt_app_params.ipCountryCode" }
+          {
+            "id": "country_dimension",
+            "label": "账号注册国",
+            "hint": "elt_user_full.countryCode"
+          },
+          {
+            "id": "device_ip_country",
+            "label": "设备 IP 所在国",
+            "hint": "elt_app_params.ipCountryCode"
+          }
         ]
       },
       "sql": "JOIN film_report.elt_user_full u ON ... ，按 u.countryCode 分组",
       "check": {
         "type": "dimension_source",
-        "allowed": ["elt_user_full.countryCode"],
+        "allowed": [
+          "elt_user_full.countryCode"
+        ],
         "forbidden": [
           "elt_app_params.countryCode",
           "elt_app_params.networkCountryIso",
@@ -88,7 +143,13 @@
     {
       "id": "device_ip_country",
       "name": "设备 IP 所在国",
-      "aliases": ["设备所在国", "IP 国家", "设备分布", "投流地区", "登录地"],
+      "aliases": [
+        "设备所在国",
+        "IP 国家",
+        "设备分布",
+        "投流地区",
+        "登录地"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-12",
@@ -96,12 +157,25 @@
       "ambiguous": {
         "question": "问的是「账号注册国」还是「设备登录 IP 所在国」？两者不是同一列，需确认后选用，并在交付里写明所用口径。",
         "candidates": [
-          { "id": "country_dimension", "label": "账号注册国", "hint": "elt_user_full.countryCode" },
-          { "id": "device_ip_country", "label": "设备 IP 所在国", "hint": "elt_app_params.ipCountryCode" }
+          {
+            "id": "country_dimension",
+            "label": "账号注册国",
+            "hint": "elt_user_full.countryCode"
+          },
+          {
+            "id": "device_ip_country",
+            "label": "设备 IP 所在国",
+            "hint": "elt_app_params.ipCountryCode"
+          }
         ]
       },
       "sql": "JOIN film_report.elt_app_params a ON a.guid = <事实表>.guid，按 a.ipCountryCode 分组",
-      "check": { "type": "dimension_source", "allowed": ["elt_app_params.ipCountryCode"] },
+      "check": {
+        "type": "dimension_source",
+        "allowed": [
+          "elt_app_params.ipCountryCode"
+        ]
+      },
       "enforce": "reject",
       "basis": "卡片写法：#120、#126（设备分布）与 #121、#125（会员国籍）都按 elt_app_params.ipCountryCode 分组。",
       "notes": "与注册国（country_dimension）并存为独立维度；其合法列 ipCountryCode 已从 country_dimension.forbidden 移出，避免闸门拒设备国查询。",
@@ -112,7 +186,12 @@
     {
       "id": "user_dedup_key",
       "name": "用户数去重主键",
-      "aliases": ["用户数", "人数", "去重", "UV"],
+      "aliases": [
+        "用户数",
+        "人数",
+        "去重",
+        "UV"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
@@ -120,8 +199,14 @@
       "ambiguous": {
         "question": "「用户数」按账号还是按设备去重？账号类指标与设备类指标不是同一个数，需按问题语义选用并写明。",
         "candidates": [
-          { "label": "账号口径", "hint": "uniqExact(uid)" },
-          { "label": "设备口径", "hint": "uniqExact(guid)" }
+          {
+            "label": "账号口径",
+            "hint": "uniqExact(uid)"
+          },
+          {
+            "label": "设备口径",
+            "hint": "uniqExact(guid)"
+          }
         ]
       },
       "sql": "uniqExact(uid) / uniqExact(guid)",
@@ -135,7 +220,11 @@
     {
       "id": "member_stock",
       "name": "会员存量",
-      "aliases": ["会员数", "在册会员", "有效会员"],
+      "aliases": [
+        "会员数",
+        "在册会员",
+        "有效会员"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
@@ -143,15 +232,24 @@
       "ambiguous": {
         "question": "问的是「当前在册存量」还是「历史某日存量」？后者不能用有效期字段反推，须用开通流水重建。",
         "candidates": [
-          { "label": "当前存量", "hint": "vipType = 2 AND endDate > now()，uniqExact(uid)" },
-          { "label": "历史某日存量", "hint": "用开通流水重建，不用 startDate/endDate 反推" }
+          {
+            "label": "当前存量",
+            "hint": "vipType = 2 AND endDate > now()，uniqExact(uid)"
+          },
+          {
+            "label": "历史某日存量",
+            "hint": "用开通流水重建，不用 startDate/endDate 反推"
+          }
         ]
       },
       "sql": "SELECT uniqExact(uid) FROM film_report.elt_user_vip_info WHERE vipType = 2 AND endDate > now()",
       "enforce": "reject",
       "check": {
         "type": "forbidden_tokens",
-        "all": ["elt_user_full_history", "vipExpireDay"],
+        "all": [
+          "elt_user_full_history",
+          "vipExpireDay"
+        ],
         "message": "用了 elt_user_full_history.vipExpireDay 的设备级快照算会员（覆盖不全、无账号去重）"
       },
       "basis": "Agent 技能「会员存量分两类口径，别混」，以及「不要用 elt_user_full_history.vipExpireDay > 0 这类设备级快照替代」。",
@@ -163,7 +261,10 @@
     {
       "id": "new_member",
       "name": "新增会员",
-      "aliases": ["新会员", "会员净增"],
+      "aliases": [
+        "新会员",
+        "会员净增"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
@@ -171,55 +272,468 @@
       "ambiguous": {
         "question": "问的是「首次成为会员的账号」还是「首次付费（首充）」？首充包含断后回流的老会员，两者不相等。",
         "candidates": [
-          { "label": "新增会员", "hint": "窗口内首次成为会员的 uniqExact(uid)" },
-          { "label": "首充", "hint": "rechargeType = 3 AND isFirst = 1，含回流老会员" }
+          {
+            "label": "新增会员",
+            "hint": "窗口内首次成为会员的 uniqExact(uid)"
+          },
+          {
+            "label": "首充",
+            "hint": "rechargeType = 3 AND isFirst = 1，含回流老会员"
+          }
         ]
       },
       "sql": null,
       "check": null,
       "basis": "Agent 技能「新增会员 ≠ 首次付费（首充）」。",
-      "openQuestions": ["已按最佳实践定：'新增会员'=窗口内首次成为会员的 uniqExact(uid)；'首单 / 首充'=付费转化口径(rechargeType=3 AND isFirst=1)，含回流老会员。两者在交付名称与口径上必须区分，不可混用。"]
+      "openQuestions": [
+        "已按最佳实践定：'新增会员'=窗口内首次成为会员的 uniqExact(uid)；'首单 / 首充'=付费转化口径(rechargeType=3 AND isFirst=1)，含回流老会员。两者在交付名称与口径上必须区分，不可混用。"
+      ]
     },
     {
       "id": "app_channel",
       "name": "应用 / 渠道码实体别名",
-      "aliases": ["渠道码", "应用码", "包名", "IN8", "FOXA", "INGoogle5", "GoGo", "India", "Peacock", "Cinegato", "Onda", "MOBMAX"],
+      "aliases": [
+        "渠道码",
+        "应用码",
+        "包名",
+        "apkChannel",
+        "渠道名",
+        "应用名",
+        "INGoogle",
+        "BRGoogle",
+        "GoGo",
+        "India",
+        "FoxA",
+        "Cinegato",
+        "FilmeTela",
+        "Zapéx",
+        "MOBMAX",
+        "Peacock"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",
-      "definition": "业务口语里的应用 / 渠道名 ↔ 库内 `elt_app_params.apkChannel` 真实取值的映射。模型写 `apkChannel = '...'` 过滤前，必须先把业务名解析成库内字面值，绝不能按简称猜（valueMatch 失分最大来源：IN8 实际是 INGoogle8、FOXA 实际是 FoxA）。印度板品牌集 = channelsIndia（GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok），巴西板 = channelsBrazil（Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic），出处 useChannel.ts:3-44；这些品牌名本身即 apkChannel 字面值（FoxA 已验证）。Google 系渠道按编号区分（INGoogle5/INGoogle8…），金样 #74 期望 INGoogle8。解析不确定的应用名时，优先用 search_values 工具查 `elt_app_params.apkChannel` 的真实取值再写过滤，不要臆造 INx 编号。",
+      "definition": "业务口语里的应用 / 渠道名 ↔ 库内 `elt_app_params.apkChannel` 真实取值的映射。经运营后台 API（`/v1.9.9/packageitem/getOptionList` 与 `/v0.1/appversion/channel/getOptionList`，2026-11-13 实拉）确认：`apkChannel` 实际等于后台的 **channelName**（不是安卓 packageName）。模型写 `apkChannel = '...'` 过滤前，必须先把业务名解析成库内字面值，绝不能按简称猜（valueMatch 失分最大来源：IN8 实际是 INGoogle8、FOXA 实际是 FoxA）。\n\nGoogle 系渠道（最高频失分点）：印度板为 `INGoogle1`~`INGoogle9`、`INGoogle11`~`INGoogle16`（**无 INGoogle10**）；巴西板为 `BRGoogle1`~`BRGoogle19` + `BRGoogleTV`。口语 `IN N` / `BR N` 即对应 `INGoogleN` / `BRGoogleN`，切勿臆造编号（尤其不要编出 INGoogle10 / BRGoogle20+）。\n\n品牌级渠道名本身即 `apkChannel` 字面值（印度板：GoGo/India/IndiaA/India2/IndiaDownload/IndiaTV/FoxA/Peacock/PakA/MOBMAX/BD/Wowlok/Fresh/Tiger2/Vega…；巴西板：Cinegato/Cinegato2/Cinegato3/CinegatoA/CinegatoOrganic/CinegatoTV/FilmeTela/FilmeTelaA/FilmeTelaIOS/DoramaK/Zapéx/ZapéxPro/ZapéxTV/ZingaCine/TepiCine/TepiCineTV/VerôFlix/LuzeiroTV/…）。完整取值见下方 valueAliases（已按后台实拉全量枚举）；解析不确定时优先用 search_values 查 `elt_app_params.apkChannel` 再写过滤。",
       "sql": null,
       "check": null,
       "valueAliases": [
-        { "term": "IN8", "literal": "INGoogle8", "column": "apkChannel", "note": "已验证：金样 #74 期望 apkChannel='INGoogle8'；口语 IN8 ↔ 库内 INGoogle8" },
-        { "term": "FOXA", "literal": "FoxA", "column": "apkChannel", "note": "已验证：FoxA 即真实 apkChannel 字面值（金样出现 4 次）" },
-        { "term": "INGoogle5", "literal": "INGoogle5", "column": "apkChannel", "note": "金样出现 11 次；Google 系按编号区分，完整编号集需 search_values 或 getPakageOptions 确认" },
-        { "term": "GoGo", "literal": "GoGo", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "India", "literal": "India", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "IndiaA", "literal": "IndiaA", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "India2", "literal": "India2", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "Peacock", "literal": "Peacock", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "IndiaTV", "literal": "IndiaTV", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "PakA", "literal": "PakA", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "MOBMAX", "literal": "MOBMAX", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "BD", "literal": "BD", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "Wowlok", "literal": "Wowlok", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
-        { "term": "Cinegato", "literal": "Cinegato", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
-        { "term": "FilmeTela", "literal": "FilmeTela", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
-        { "term": "CinegatoOrganic", "literal": "CinegatoOrganic", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
-        { "term": "OndaPaid", "literal": "OndaPaid", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
-        { "term": "OndaOrganic", "literal": "OndaOrganic", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" }
+        {
+          "term": "IN1",
+          "literal": "INGoogle1",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN1 ↔ INGoogle1（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN2",
+          "literal": "INGoogle2",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN2 ↔ INGoogle2（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN3",
+          "literal": "INGoogle3",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN3 ↔ INGoogle3（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN4",
+          "literal": "INGoogle4",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN4 ↔ INGoogle4（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN5",
+          "literal": "INGoogle5",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN5 ↔ INGoogle5（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN6",
+          "literal": "INGoogle6",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN6 ↔ INGoogle6（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN7",
+          "literal": "INGoogle7",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN7 ↔ INGoogle7（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN8",
+          "literal": "INGoogle8",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN8 ↔ INGoogle8（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN9",
+          "literal": "INGoogle9",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN9 ↔ INGoogle9（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN11",
+          "literal": "INGoogle11",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN11 ↔ INGoogle11（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN12",
+          "literal": "INGoogle12",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN12 ↔ INGoogle12（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN13",
+          "literal": "INGoogle13",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN13 ↔ INGoogle13（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN14",
+          "literal": "INGoogle14",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN14 ↔ INGoogle14（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN15",
+          "literal": "INGoogle15",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN15 ↔ INGoogle15（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "IN16",
+          "literal": "INGoogle16",
+          "column": "apkChannel",
+          "note": "印度板 Google 渠道：口语 IN16 ↔ INGoogle16（切勿臆造编号，无 INGoogle10）"
+        },
+        {
+          "term": "BD",
+          "literal": "BD",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "FoxA",
+          "literal": "FoxA",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "FOXA",
+          "literal": "FoxA",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道：口语 FOXA（大写）↔ 库内字面 FoxA"
+        },
+        {
+          "term": "Fresh",
+          "literal": "Fresh",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "GoGo",
+          "literal": "GoGo",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "India",
+          "literal": "India",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "India2",
+          "literal": "India2",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "IndiaA",
+          "literal": "IndiaA",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "IndiaDownload",
+          "literal": "IndiaDownload",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "IndiaTV",
+          "literal": "IndiaTV",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "MOBMAX",
+          "literal": "MOBMAX",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "PakA",
+          "literal": "PakA",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Peacock",
+          "literal": "Peacock",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Tiger2",
+          "literal": "Tiger2",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Vega",
+          "literal": "Vega",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Wowlok",
+          "literal": "Wowlok",
+          "column": "apkChannel",
+          "note": "印度板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "BR1",
+          "literal": "BRGoogle1",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR1 ↔ BRGoogle1"
+        },
+        {
+          "term": "BR2",
+          "literal": "BRGoogle2",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR2 ↔ BRGoogle2"
+        },
+        {
+          "term": "BR3",
+          "literal": "BRGoogle3",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR3 ↔ BRGoogle3"
+        },
+        {
+          "term": "BR4",
+          "literal": "BRGoogle4",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR4 ↔ BRGoogle4"
+        },
+        {
+          "term": "BR5",
+          "literal": "BRGoogle5",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR5 ↔ BRGoogle5"
+        },
+        {
+          "term": "BR6",
+          "literal": "BRGoogle6",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR6 ↔ BRGoogle6"
+        },
+        {
+          "term": "BR7",
+          "literal": "BRGoogle7",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR7 ↔ BRGoogle7"
+        },
+        {
+          "term": "BR8",
+          "literal": "BRGoogle8",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR8 ↔ BRGoogle8"
+        },
+        {
+          "term": "BR9",
+          "literal": "BRGoogle9",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR9 ↔ BRGoogle9"
+        },
+        {
+          "term": "BR10",
+          "literal": "BRGoogle10",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR10 ↔ BRGoogle10"
+        },
+        {
+          "term": "BR11",
+          "literal": "BRGoogle11",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR11 ↔ BRGoogle11"
+        },
+        {
+          "term": "BR12",
+          "literal": "BRGoogle12",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR12 ↔ BRGoogle12"
+        },
+        {
+          "term": "BR13",
+          "literal": "BRGoogle13",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR13 ↔ BRGoogle13"
+        },
+        {
+          "term": "BR14",
+          "literal": "BRGoogle14",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR14 ↔ BRGoogle14"
+        },
+        {
+          "term": "BR15",
+          "literal": "BRGoogle15",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR15 ↔ BRGoogle15"
+        },
+        {
+          "term": "BR16",
+          "literal": "BRGoogle16",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR16 ↔ BRGoogle16"
+        },
+        {
+          "term": "BR17",
+          "literal": "BRGoogle17",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR17 ↔ BRGoogle17"
+        },
+        {
+          "term": "BR18",
+          "literal": "BRGoogle18",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR18 ↔ BRGoogle18"
+        },
+        {
+          "term": "BR19",
+          "literal": "BRGoogle19",
+          "column": "apkChannel",
+          "note": "巴西板 Google 渠道：口语 BR19 ↔ BRGoogle19"
+        },
+        {
+          "term": "BRTV",
+          "literal": "BRGoogleTV",
+          "column": "apkChannel",
+          "note": "巴西板 Google TV 渠道"
+        },
+        {
+          "term": "BRTepicineTV",
+          "literal": "BRTepicineTV",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "BRZapexTV",
+          "literal": "BRZapexTV",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Cinegato",
+          "literal": "Cinegato",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Cinegato2",
+          "literal": "Cinegato2",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Cinegato3",
+          "literal": "Cinegato3",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "CinegatoA",
+          "literal": "CinegatoA",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "CinegatoOrganic",
+          "literal": "CinegatoOrganic",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "CinegatoTV",
+          "literal": "CinegatoTV",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "DoramaK",
+          "literal": "DoramaK",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "FilmeTela",
+          "literal": "FilmeTela",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "FilmeTelaA",
+          "literal": "FilmeTelaA",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "FilmeTelaIOS",
+          "literal": "FilmeTelaIOS",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "New_Chanel",
+          "literal": "New_Chanel",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Test",
+          "literal": "Test",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "Zapex",
+          "literal": "Zapex",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        },
+        {
+          "term": "ZapexiOS",
+          "literal": "ZapexiOS",
+          "column": "apkChannel",
+          "note": "巴西板品牌渠道（品牌名即 apkChannel 字面）"
+        }
       ],
-      "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。品牌集来自 useChannel.ts:3-44（India 11 / Brazil 6）。getPakageOptions API 返回 projectName/channelName/packageName，前端动态取；本环境无 BI 凭据/无网络，未拉取全量，Google 系完整编号以 search_values 为准。",
+      "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。2026-11-13 经运营后台 API 实拉（/v1.9.9/packageitem/getOptionList + /v0.1/appversion/channel/getOptionList，dev 账号 admin 登录换 token）确认：apkChannel 实即后台 channelName（非安卓 packageName）。印度板 Google = INGoogle1-9,11-16（无10）；巴西板 Google = BRGoogle1-19 + BRGoogleTV；品牌渠道（印度 GoGo/India/IndiaA/India2/IndiaDownload/IndiaTV/FoxA/Peacock/PakA/MOBMAX/BD/Wowlok/Fresh/Tiger2/Vega；巴西 Cinegato 系列/FilmeTela 系列/Zapéx 系列/TepiCine/DoramaK/VerôFlix/LuzeiroTV/…）本身即 apkChannel 字面。完整 67 条已枚举进 valueAliases。",
       "openQuestions": [
-        "Google 系渠道完整编号集（INGoogle5/INGoogle8 之外是否还有 INGoogle6/7…）需从 getPakageOptions API 或 CH `SELECT DISTINCT apkChannel FROM elt_app_params` 拉全量确认（本环境无 BI 凭据/无网络，未拉取）；当前仅固化已验证项 + 品牌名集，其余以 search_values 动态发现。",
-        "同一简称是否跨多张表有不同取值？映射是否按表区分？（当前别名按 elt_app_params.apkChannel 固化）"
+        "Google 系完整编号已于 2026-11-13 通过运营后台 API 实拉确认（印度 INGoogle1-9,11-16 无10；巴西 BRGoogle1-19+BRGoogleTV），不再依赖推测。",
+        "同一渠道名是否跨多张表有不同取值？当前别名按 elt_app_params.apkChannel（=后台 channelName）固化；后台返回另含 packageName（安卓包名）与本列无关，已排除。"
       ]
     },
     {
       "id": "default_app_scope",
       "name": "印度板块默认应用范围",
-      "aliases": ["默认范围", "默认看哪个应用", "默认口径范围"],
+      "aliases": [
+        "默认范围",
+        "默认看哪个应用",
+        "默认口径范围"
+      ],
       "status": "approved",
       "owner": "verify-demo",
       "approvedAt": "2026-11-13",

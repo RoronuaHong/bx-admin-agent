@@ -136,10 +136,10 @@
 - **new_member 命名**：'新增会员'=窗口内首次成为会员的 `uniqExact(uid)`；'首单 / 首充'=付费转化口径 `rechargeType=3 AND isFirst=1`（含回流老会员），两者在名称与口径上必须区分。`new_member` 改 `approved`。
 - **D1 #486 迁移**：仍用代理列的卡片应迁移到对应口径（注册国→`elt_user_full.countryCode` / 设备国→`elt_app_params.ipCountryCode`），不再用 `networkCountryIso` 等代理列。
 - **device_ip_country guid 去重**：`elt_app_params` 同一设备多行按 `guid` 去重足够（设备口径以 `guid` 为键）。
-- **D7 实体别名**：品牌级渠道名已确认为别名（India 11 / Brazil 6，`useChannel.ts:3-44`）；`app_channel` 已用已验证品牌名集（India 11 / Brazil 6，品牌名即 `apkChannel` 字面，FoxA 已验证）+ Google 系编号（`INGoogle5`/`INGoogle8` 金样已验证）固化并改 `approved`；Google 系完整编号集待从 `getPakageOptions` API 或 CH `DISTINCT apkChannel` 补全（本环境无凭据/无网络未拉取），其余以 `search_values` 动态发现。
+- **D7 实体别名**：2026-11-13 经运营后台 API（`/v1.9.9/packageitem/getOptionList` + `/v0.1/appversion/channel/getOptionList`，dev 账号 admin 登录换 token）实拉全量确认：`apkChannel` 实即后台 `channelName`（非安卓 `packageName`）。印度板 Google = `INGoogle1`-`9`,`11`-`16`（**无 10**）；巴西板 Google = `BRGoogle1`-`19` + `BRGoogleTV`；品牌渠道本身即 `apkChannel` 字面（India GoGo/India/IndiaA/India2/IndiaDownload/IndiaTV/FoxA/Peacock/PakA/MOBMAX/BD/Wowlok/Fresh/Tiger2/Vega；Brazil Cinegato/FilmeTela/Zapéx/TepiCine 等系列）。`app_channel` 已 `approved`，67 条已验证映射枚举进 `valueAliases`。
 
 ### B.3 现状
 - 已 `approved`（10）：`paid_order`、`revenue_amount`、`report_timezone`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`、`app_channel`。
-- 无 `draft`：10/10 全部 `approved`。（复查 2026-11-13：`report_timezone` 原漏批已补批准；本轮 `app_channel` 用已验证品牌名集 + Google 编号固化并批准——仅 Google 系完整编号待从 `getPakageOptions` / CH `DISTINCT apkChannel` 补全，运行时以 `search_values` 兜底。）
+- 无 `draft`：10/10 全部 `approved`。（复查 2026-11-13：`report_timezone` 原漏批已补批准；本轮 `app_channel` 经运营后台 API 实拉全量验证（`apkChannel`=后台 `channelName`，非安卓包名；印度板 `INGoogle1`-`9`,`11`-`16` 无10、巴西板 `BRGoogle1`-`19`+`BRGoogleTV`、品牌渠道即字面），67 条枚举进 `valueAliases`，运行时 `search_values` 仍兜底未知取值。）
 - 所有 `owner` 为验证占位 `verify-demo`，待业务正式签批替换。
 - 验证：相关测试 6 套件 / 38 例全绿；改完需重启 agent-server 使词典生效。
