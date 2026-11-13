@@ -172,6 +172,51 @@
 
 ---
 
+## 全局收口评估（2026-11-13，基于方案 P0–P4 + §11.11 差距项 1–10）
+
+### 1. 完成度
+
+| 维度 | 完成度 | 说明 |
+|---|---|---|
+| 计划内 MCP 层代码交付 | **~100%** | P1–P4 + §11.11 差距项 1–10 的代码项全部落地（仅 #7 的 Metabase 侧补描述、#9 的执行入口合并明确出 §0 范围） |
+| 目标达成（text2sql 提分） | **0%（未验证）** | B3 A/B 重跑被暂缓，无"优化后"量化数字；旧基线 JoinCorrect 63–84.8%、valueMatch 31% 仍是唯一参考 |
+| 治理闭环 | **0%** | FK 0/18 签字、词典 10 个 owner 全占位、5 张隐藏表未决 |
+| 综合工程侧收口 | **~90–95%** | 剩的全是外部签字，非代码未写 |
+
+> 结论：该写的代码 100% 写完；但"优化是否有效"与"是否正式生效"都没闭环。
+
+### 2. 已优化（已交付）
+
+- **Schema 呈现 / 数据多**：M-Schema 紧凑格式 + 取值域内联 + 两阶段 linking；口径图只推 12 张表（前 5 标 primary）；ClickHouse 90s 中断 / 100 万行上限 / 超长截断。
+- **取值链接（头号准确率缺口）**：编码型 `valueAliases` 扩到 6 条目 / 85 条（orderStatus / vipType / rechargeType / 国家码 / 渠道 / 设备 IP 国）；`search_values` 按值搜索工具；接入 `get_caliber_context`（静态双路径：检索到的列 + query 命中口径）。
+- **口径一致性**：口径词典 10/10 `approved` + `get_metric_definitions` 工具；闸门读词典；国家拆双维度（`country_dimension` / `device_ip_country`），不再一刀切禁 `ipCountryCode`。
+- **已认可查询 / Schema 图 / 检索**：`get_caliber_context` 内联前 2 张命中卡片 SQL；FK 核对结论回灌（7 条标 `verified=false` + `healthNote`）；检索文本加入表/字段描述 + 已批准别名（留一法 recall@5 86→87%）。
+- **工具面 / 评测体系**：`get_golden_set` 仅评测环境宣告；`runCard` 反馈行；`search_columns` 匹配 Metabase 描述；`valueMatch` / `goldBlocked` / `joinCorrectReachable` 指标；白名单求交、期望表归一化、`sql-readonly-consistency` 测试。
+
+### 3. 做漏 / 未做（非代码缺失，卡住或被否）
+
+| 项 | 状态 | 卡在 |
+|---|---|---|
+| P0 FK 18 条签字 | 0 签字 | Metabase Admin + 业务 |
+| B3 A/B 全量重跑 | 用户暂缓 | 模型额度 + 重启 8787 |
+| B1 5 张隐藏表暴露 | 未决 | Metabase Admin |
+| Item 2 owner 签批（10 占位 + 17 openQuestions） | 技术 approved，无背书 | 业务 owner |
+| E3 BI 凭据冒烟 | 无凭据 | 运维 |
+| §11.11-#7 补列描述 | 仅诊断清单 | Admin 在 Data Model 改 |
+| §11.11-#9 执行入口合并 | 出范围（Agent 侧） | — |
+| B 闸门误伤修复 / C SKILL.md 引用 | **用户否决** | — |
+| 真·结果集 EX | 方案本身"暂缓"，非漏做 | — |
+
+### 4. 负面影响（无功能回退；三类代价/风险）
+
+1. **Token 成本增加未验证**：`get_caliber_context` 现多返回 `valueAliases` + `note` 且内联卡片 SQL——为提分所加，但净收益未跑 A/B，等于"加了开销、没证明值"（方案 §11.11 明确要求 A/B 验证）。
+2. **"已批准"但无正式背书**：10/10 设 `approved` 后 `get_metric_definitions` 现会在 `tools/list` 宣告（之前 draft 时不宣告）、闸门按词典执行——技术上已生效，但 owner 仍 `verify-demo` 占位，属技术侧单方面替业务签字，治理上"先斩后奏"。
+3. **最大缺口仍悬而未决**：valueMatch 31% 是方案定位的头号短板，机制建了但没重跑证明从 31% 提上去；优化最想解决的点目前只有"解法"没有"结果"。
+
+> 功能侧：全量 18 文件 / 168 例通过，lint 0，无回退。真正的负作用是——花了成本加了上下文与工具，却因 A/B 没跑，既没证明提分、也没排除 token 浪费；补 A/B 重跑是唯一的顺气步骤。
+
+---
+
 ## 阶段 0 — 收尾（✅ 2026-11-12 已提交）
 
 - [x] **0.1** ✅ 用户 2026-11-12 明确授权后已提交（`feat(bi): 歧义信号、按值搜索修复与进度文档补全`），含 3 个未跟踪文件的 `git add`；提交前全量 180 文件 / 928 用例全绿、`tsc --noEmit` 0 错误。评测报告现可对上代码版本。
