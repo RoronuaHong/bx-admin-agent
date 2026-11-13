@@ -31,7 +31,7 @@ const BUILTIN_RULES = [
     test: (sql) => /\belt_user_full_history\b/i.test(sql) && /\bvipexpireday\b/i.test(sql),
     error:
       "口径错误：会员存量不能用 elt_user_full_history.vipExpireDay>0 的设备级快照（会漏算/多算、且无去重账号语义，趋势必然失真）。" +
-      "请改用 elt_user_vip_info 的「去重账号」口径：vipType=2 且 startDate<=统计日 且 endDate>=统计日，uniqExact(uid) 得当日有效会员数；按日存量需逐日扫描该表。",
+      "请改用 elt_user_vip_info 的「去重账号」口径（直接取数据库数据）：当前存量取 vipType=2 且 endDate>now()、uniqExact(uid)；历史某日存量不能用有效期字段(startDate/endDate)反推，须用开通流水重建（逐日扫描有效期会得到错误结果）。",
   },
 ];
 

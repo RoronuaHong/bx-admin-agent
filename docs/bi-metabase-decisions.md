@@ -118,3 +118,28 @@
 - **`country_dimension` #486 迁移** / **`device_ip_country` guid 去重**：卡片级 / schema 确认（join 已用 guid，见词典）。
 
 > 溯源来源目录：`D:/Code/bx-film-admin-in2`（运营后台前端 Vue3 + TS）。核验人：技术侧；核验日：2026-11-13。
+
+---
+
+## 附录 B — 业务拍板与最佳实践定稿（2026-11-13）
+
+业务对 D4/D5/D6 给出明确拍板，其余按最佳实践收口；结果已回填 `caliber-glossary.json`（8/9 条目 `approved`，仅 `app_channel` 仍 `draft`）。
+
+### B.1 业务明确拍板
+- **D4 报表时区**：北京时区 `Asia/Shanghai`（库内 / 服务器默认）与 `Asia/Kolkata`（印度板「当天」自然日归属）**两个都要**，按板块选用并写明。已更新 `report_timezone.definition` 与 `check.timezone`。
+- **D5 会员存量**：**取数据库数据即可**——以 `elt_user_vip_info` 为唯一口径（当前存量 `vipType=2 AND endDate>now()`、`uniqExact(uid)`；历史某日存量用开通流水重建、不用有效期反推）。据此把 `member_stock` 改 `approved`，并**修复** `scripts/bi-query-guard.mjs:29-35` 的内置提示（原写"逐日扫描 startDate/endDate"与词典矛盾，现改为与词典一致：当前存量 `endDate>now()`、历史存量用流水重建）。
+- **D6 用户去重主键**：账号类 `uid` 与设备类 `guid` **都要**，按语义选用并写明。`user_dedup_key` 改 `approved`。
+
+### B.2 最佳实践收口（业务授权"按最佳实践做"）
+- **D3 收入金额**：统一用 `changeAmount`（换算 INR），`revenue_amount` 改 `approved`；#125/#121 若意图 INR 收入应改 `changeAmount`，保留 `amount` 仅当明确原始币种且标注。`bi-known-tables.json` 印证 `elt_film_order.changeAmount`="换算成印度卢比的订单金额"。
+- **D8 默认应用范围**：印度板默认 = `channelsIndia` 全渠道集（GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok），对所有未显式写范围的问题生效；巴西板 = `channelsBrazil`。`default_app_scope` 改 `approved`。
+- **new_member 命名**：'新增会员'=窗口内首次成为会员的 `uniqExact(uid)`；'首单 / 首充'=付费转化口径 `rechargeType=3 AND isFirst=1`（含回流老会员），两者在名称与口径上必须区分。`new_member` 改 `approved`。
+- **D1 #486 迁移**：仍用代理列的卡片应迁移到对应口径（注册国→`elt_user_full.countryCode` / 设备国→`elt_app_params.ipCountryCode`），不再用 `networkCountryIso` 等代理列。
+- **device_ip_country guid 去重**：`elt_app_params` 同一设备多行按 `guid` 去重足够（设备口径以 `guid` 为键）。
+- **D7 实体别名**：品牌级渠道名已确认为别名（India 11 / Brazil 6，`useChannel.ts:3-44`）；库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名的完整映射待从 `getPakageOptions` API 补全，故 `app_channel` 仍 `draft`。
+
+### B.3 现状
+- 已 `approved`（8）：`paid_order`、`revenue_amount`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`。
+- 仍 `draft`（1）：`app_channel`（等后端补全 `apkChannel` 全映射）。
+- 所有 `owner` 为验证占位 `verify-demo`，待业务正式签批替换。
+- 验证：相关测试 6 套件 / 38 例全绿；改完需重启 agent-server 使词典生效。

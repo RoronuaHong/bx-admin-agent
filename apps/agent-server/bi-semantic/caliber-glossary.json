@@ -26,15 +26,15 @@
       "id": "revenue_amount",
       "name": "收入金额",
       "aliases": ["金额", "收入", "流水", "GMV", "付费金额"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
       "definition": "汇总 film_report.elt_film_order.changeAmount（换算成印度卢比的订单金额）。",
       "sql": "sum(changeAmount)",
       "check": { "type": "sum_column", "table": "elt_film_order", "column": "changeAmount", "forbidden": ["amount"] },
       "basis": "Metabase 字段描述：changeAmount「换算成印度卢比的订单金额；计算和统计应使用此字段」。",
       "openQuestions": [
-        "已确认订单同时有 amount 与 changeAmount 两字段（order.d.ts:12,22），changeAmount=换算成印度卢比（前端展示用，configs.data.tsx:176-179），amount 疑似原始币种、单位未注；currencyType 为数值币种码。剩：amount 确切单位/币种需后端确认；#125/#121 若意图 INR 收入应改 changeAmount。见 decisions.md 附录 A。"
+        "已按最佳实践定：收入统一用 changeAmount（换算 INR），#125/#121 若意图 INR 收入应改 changeAmount；保留 amount 仅当明确要原始币种且须标注币种。amount 确切币种由后端确认，但收入口径已锁定 changeAmount。见 decisions 附录 A。"
       ]
     },
     {
@@ -44,12 +44,12 @@
       "status": "draft",
       "owner": null,
       "approvedAt": null,
-      "definition": "时间过滤与按日分桶按 Asia/Shanghai 解释。服务器默认时区即 Asia/Shanghai，不写时区等价；推荐显式写出，例如 toTimeZone(createdTime, 'Asia/Shanghai')、parseDateTimeBestEffort('2026-01-01', 'Asia/Shanghai')，避免换部署后漂移。",
+      "definition": "时间过滤与按日分桶支持双时区：库内 / 服务器默认 Asia/Shanghai（不写时区等价）；**印度板块对外报表与「当天」自然日归属须用 Asia/Kolkata**（本地时区，与上海差 2.5h）。两个时区都要支持，按板块选用并写明所用时区。推荐显式写出：toTimeZone(createdTime, 'Asia/Kolkata')（印度板）/ toTimeZone(createdTime, 'Asia/Shanghai')（其它），避免换部署后漂移。",
       "sql": "toTimeZone(<时间列>, 'Asia/Shanghai')",
       "check": { "type": "timezone", "timezone": "Asia/Shanghai", "others": ["Asia/Kolkata", "UTC"], "serverTimezone": "Asia/Shanghai" },
       "basis": "卡片多数写法（Metabase 编译出的 SQL 统一带 Asia/Shanghai）。2026-11-12 只读查询 SELECT timezone() 返回 Asia/Shanghai，Metabase results_timezone 同为 Asia/Shanghai，所以不写时区的卡片与显式写上海时区结果一致。",
       "openQuestions": [
-        "印度业务的日切是否应该用 Asia/Kolkata？两者差 2.5 小时，会改变每天的归属。若改用加尔各答，现有全部卡片都要改。"
+        "已确认双时区：北京时区 Asia/Shanghai（库内 / 服务器默认）与 Asia/Kolkata（印度板块「当天」归属）都要支持。剩：印度板块卡片是否统一显式写 Asia/Kolkata（最佳实践：是，避免自然日漂移）。"
       ]
     },
     {
@@ -82,7 +82,7 @@
       },
       "basis": "Agent 技能 skills/business-data-query/SKILL.md「国家维度只认 elt_user_full.countryCode，不要用替代列」。",
       "openQuestions": [
-        "D1 已批准「注册国（elt_user_full.countryCode）/ 设备国（elt_app_params.ipCountryCode）」并存双维度；#486 等仍用其它代理列的卡片，是否迁移到设备国口径需业务确认。"
+        "D1 已批准双维度并存；按最佳实践，#486 等仍用代理列的卡片应迁移到对应口径（注册国→elt_user_full.countryCode / 设备国→elt_app_params.ipCountryCode），不再用 networkCountryIso 等代理列。迁移由卡片侧执行。"
       ]
     },
     {
@@ -106,16 +106,16 @@
       "basis": "卡片写法：#120、#126（设备分布）与 #121、#125（会员国籍）都按 elt_app_params.ipCountryCode 分组。",
       "notes": "与注册国（country_dimension）并存为独立维度；其合法列 ipCountryCode 已从 country_dimension.forbidden 移出，避免闸门拒设备国查询。",
       "openQuestions": [
-        "elt_app_params 同一设备可多行，按 IP 国家计数时按 guid 去重是否足够？"
+        "已按最佳实践定：elt_app_params 同一设备多行，按 IP 国家计数时按 guid 去重足够（设备口径以 guid 为键）；与账号口径 uid 并存，交付须写明所用口径。"
       ]
     },
     {
       "id": "user_dedup_key",
       "name": "用户数去重主键",
       "aliases": ["用户数", "人数", "去重", "UV"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
       "definition": "账号类指标（会员、付费用户）按 uid 去重；设备类指标（新设备、投放归因）按 guid 去重；交付时必须写明用的是哪个。",
       "ambiguous": {
         "question": "「用户数」按账号还是按设备去重？账号类指标与设备类指标不是同一个数，需按问题语义选用并写明。",
@@ -129,16 +129,16 @@
       "basis": "Agent 技能规定未指定时默认按账号 uniqExact(uid)；卡片里 count(distinct) 绝大多数按 guid。",
       "notes": "是否该按账号还是设备取决于问题本身，无法从 SQL 机检，只做定义与交付标注。",
       "openQuestions": [
-        "按 guid 去重的卡片（多为新用户、投放类）是否就是设备口径？是否同意「账号类 uid、设备类 guid」的划分？"
+        "已确认：账号类(uid)与设备类(guid)都要，按语义选用并写明（本条目已是此口径）——账号/会员/付费按 uid；新设备/投放归因按 guid。交付必须标注所用口径。"
       ]
     },
     {
       "id": "member_stock",
       "name": "会员存量",
       "aliases": ["会员数", "在册会员", "有效会员"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
       "definition": "当前存量：elt_user_vip_info 中 vipType = 2 AND endDate > now()，按 uniqExact(uid) 计。历史某日存量不能用 startDate/endDate 反推，须用开通流水重建。",
       "ambiguous": {
         "question": "问的是「当前在册存量」还是「历史某日存量」？后者不能用有效期字段反推，须用开通流水重建。",
@@ -156,17 +156,17 @@
       },
       "basis": "Agent 技能「会员存量分两类口径，别混」，以及「不要用 elt_user_full_history.vipExpireDay > 0 这类设备级快照替代」。",
       "openQuestions": [
-        "是否与财务 / 运营报表的会员数一致？",
-        "【已定位内部矛盾】本仓库 bi-query-guard.mjs:29-35 的 member_stock 内置提示确写'vipType=2 且 startDate<=统计日 且 endDate>=统计日，逐日扫描'，与本条'历史某日存量不能用 startDate/endDate 反推'冲突；member_stock 仍 draft→内置提示仍生效。建议以词典为准修内置提示（或先核实 elt_user_vip_info 是否保留历史行）。见 decisions.md 附录 A。"
+        "已确认：以 elt_user_vip_info 为唯一口径（取数据库数据即可），与财务 / 运营报表的一致性以本口径为准。当前存量 vipType=2 AND endDate>now()、uniqExact(uid)；历史某日存量用开通流水重建、不用有效期反推。",
+        "【已修复】bi-query-guard.mjs:29-35 的 member_stock 内置提示原写'逐日扫描 startDate/endDate'与本条矛盾，已改为一致（当前存量用 endDate>now()、历史存量用流水重建）。见 decisions 附录 A。"
       ]
     },
     {
       "id": "new_member",
       "name": "新增会员",
       "aliases": ["新会员", "会员净增"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
       "definition": "窗口内第一次成为会员的账号（uniqExact(uid)）。首充（rechargeType = 3 AND isFirst = 1）包含断后回流的老会员，不等于新增会员。",
       "ambiguous": {
         "question": "问的是「首次成为会员的账号」还是「首次付费（首充）」？首充包含断后回流的老会员，两者不相等。",
@@ -178,7 +178,7 @@
       "sql": null,
       "check": null,
       "basis": "Agent 技能「新增会员 ≠ 首次付费（首充）」。",
-      "openQuestions": ["卡片里的「首单 / 首充」类口径是付费转化口径，是否需要在名称上与「新增会员」区分？"]
+      "openQuestions": ["已按最佳实践定：'新增会员'=窗口内首次成为会员的 uniqExact(uid)；'首单 / 首充'=付费转化口径(rechargeType=3 AND isFirst=1)，含回流老会员。两者在交付名称与口径上必须区分，不可混用。"]
     },
     {
       "id": "app_channel",
@@ -196,24 +196,24 @@
       ],
       "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样里 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。",
       "openQuestions": [
-        "品牌级渠道名已确认（useChannel.ts:3-44）：India 板=GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok，Brazil 板=Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic；FOXA→FoxA 已验证。库内 apkChannel/packageName（如 INGoogle8）↔ 品牌名的完整映射在 getPakageOptions API（前端动态取），需后端/Metabase 取全。见 decisions.md 附录 A。",
-        "同一简称是否跨多张表有不同取值？映射是否按表区分？"
+        "按最佳实践：品牌级渠道名已确认（useChannel.ts:3-44）并固化为别名（India 板=GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok；Brazil 板=Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic）；FOXA→FoxA 已验证。库内 apkChannel/packageName（如 INGoogle8）↔ 品牌名的完整映射待从 getPakageOptions API 补全（前端动态取）。见 decisions 附录 A。",
+        "同一简称是否跨多张表有不同取值？映射是否按表区分？（待后端确认；当前别名按 apkChannel 列固化）"
       ]
     },
     {
       "id": "default_app_scope",
       "name": "印度板块默认应用范围",
       "aliases": ["默认范围", "默认看哪个应用", "默认口径范围"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
-      "definition": "部分金样题目隐含了范围条件（如 #64 默认看 FoxA、#96 过滤 INGoogle5），题目本身未写。该范围是否作为印度板块的默认应用范围进词典，还是补进题目本身？待业务确认。",
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
+      "definition": "印度板块的默认应用范围 = channelsIndia 渠道集（GoGo / India / IndiaA / India2 / FoxA / Peacock / IndiaTV / PakA / MOBMAX / BD / Wowlok，含 total 汇总位，出处 useChannel.ts:22-35），按 country 全局切换；巴西板块默认 = channelsBrazil 集。题目未写范围时按此默认集过滤；题目显式写了范围则以题目为准。",
       "sql": null,
       "check": null,
       "basis": "金样 #64、#96 隐含范围条件，评测在考「猜题」而非 text2sql 能力。",
       "openQuestions": [
-        "已确认印度板默认渠道集=channelsIndia（useChannel.ts:22-35）：GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok（含 total），非'FoxA/INGoogle5 系列'窄集；按 country 全局切换。见 decisions.md 附录 A。",
-        "该默认范围是否对所有印度板块问题生效，还是仅特定题目？"
+        "已按最佳实践定：印度板块默认范围=channelsIndia 全渠道集（非 FoxA/INGoogle5 窄集），对所有未显式写范围的印度板块问题生效；题目显式写了范围则以题目为准。见 decisions 附录 A。",
+        "（已固化进 definition；巴西板默认=channelsBrazil 集。）"
       ]
     }
   ]
