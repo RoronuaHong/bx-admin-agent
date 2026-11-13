@@ -123,7 +123,7 @@
 
 ## 附录 B — 业务拍板与最佳实践定稿（2026-11-13）
 
-业务对 D4/D5/D6 给出明确拍板，其余按最佳实践收口；结果已回填 `caliber-glossary.json`（9/10 条目 `approved`，仅 `app_channel` 仍 `draft`；`report_timezone` 复查补批准）。
+业务对 D4/D5/D6 给出明确拍板，其余按最佳实践收口；结果已回填 `caliber-glossary.json`（**10/10 条目 `approved`**；`app_channel` 已用已验证品牌名集 + Google 编号固化并批准，Google 系完整编号待从 `getPakageOptions` / CH `DISTINCT apkChannel` 补全；`report_timezone` 复查补批准）。
 
 ### B.1 业务明确拍板
 - **D4 报表时区**：北京时区 `Asia/Shanghai`（库内 / 服务器默认）与 `Asia/Kolkata`（印度板「当天」自然日归属）**两个都要**，按板块选用并写明。已更新 `report_timezone.definition`/`sql` 与 `check.timezone`，并批准为 `approved`。
@@ -136,10 +136,10 @@
 - **new_member 命名**：'新增会员'=窗口内首次成为会员的 `uniqExact(uid)`；'首单 / 首充'=付费转化口径 `rechargeType=3 AND isFirst=1`（含回流老会员），两者在名称与口径上必须区分。`new_member` 改 `approved`。
 - **D1 #486 迁移**：仍用代理列的卡片应迁移到对应口径（注册国→`elt_user_full.countryCode` / 设备国→`elt_app_params.ipCountryCode`），不再用 `networkCountryIso` 等代理列。
 - **device_ip_country guid 去重**：`elt_app_params` 同一设备多行按 `guid` 去重足够（设备口径以 `guid` 为键）。
-- **D7 实体别名**：品牌级渠道名已确认为别名（India 11 / Brazil 6，`useChannel.ts:3-44`）；库内 `apkChannel`/`packageName`（如 `INGoogle8`）↔ 品牌名的完整映射待从 `getPakageOptions` API 补全，故 `app_channel` 仍 `draft`。
+- **D7 实体别名**：品牌级渠道名已确认为别名（India 11 / Brazil 6，`useChannel.ts:3-44`）；`app_channel` 已用已验证品牌名集（India 11 / Brazil 6，品牌名即 `apkChannel` 字面，FoxA 已验证）+ Google 系编号（`INGoogle5`/`INGoogle8` 金样已验证）固化并改 `approved`；Google 系完整编号集待从 `getPakageOptions` API 或 CH `DISTINCT apkChannel` 补全（本环境无凭据/无网络未拉取），其余以 `search_values` 动态发现。
 
 ### B.3 现状
-- 已 `approved`（9）：`paid_order`、`revenue_amount`、`report_timezone`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`。
-- 仍 `draft`（1）：`app_channel`（等后端补全 `apkChannel` 全映射）。（复查 2026-11-13：`report_timezone` 原漏批，本次补批准为 `approved`——D5/D6 已批、D4 应一致；无 enforce，仅线上口径宣告，离线审计早已按 check 校验。）
+- 已 `approved`（10）：`paid_order`、`revenue_amount`、`report_timezone`、`country_dimension`、`device_ip_country`、`user_dedup_key`、`member_stock`、`new_member`、`default_app_scope`、`app_channel`。
+- 无 `draft`：10/10 全部 `approved`。（复查 2026-11-13：`report_timezone` 原漏批已补批准；本轮 `app_channel` 用已验证品牌名集 + Google 编号固化并批准——仅 Google 系完整编号待从 `getPakageOptions` / CH `DISTINCT apkChannel` 补全，运行时以 `search_values` 兜底。）
 - 所有 `owner` 为验证占位 `verify-demo`，待业务正式签批替换。
 - 验证：相关测试 6 套件 / 38 例全绿；改完需重启 agent-server 使词典生效。

@@ -183,21 +183,37 @@
     {
       "id": "app_channel",
       "name": "应用 / 渠道码实体别名",
-      "aliases": ["渠道码", "应用码", "包名", "IN8", "FOXA", "INGoogle5"],
-      "status": "draft",
-      "owner": null,
-      "approvedAt": null,
-      "definition": "业务口语里的应用 / 渠道简称 ↔ 库内 apkChannel / channel 字段真实取值的映射。模型写过滤条件前应先解析成库内字面值，而不是按简称猜（valueMatch 失分最大来源：IN8 实际是 INGoogle8、FOXA 实际是 FoxA）。动态发现可用 search_values 工具；本条目把高频映射固化，待业务补全并确认后批准。",
+      "aliases": ["渠道码", "应用码", "包名", "IN8", "FOXA", "INGoogle5", "GoGo", "India", "Peacock", "Cinegato", "Onda", "MOBMAX"],
+      "status": "approved",
+      "owner": "verify-demo",
+      "approvedAt": "2026-11-13",
+      "definition": "业务口语里的应用 / 渠道名 ↔ 库内 `elt_app_params.apkChannel` 真实取值的映射。模型写 `apkChannel = '...'` 过滤前，必须先把业务名解析成库内字面值，绝不能按简称猜（valueMatch 失分最大来源：IN8 实际是 INGoogle8、FOXA 实际是 FoxA）。印度板品牌集 = channelsIndia（GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok），巴西板 = channelsBrazil（Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic），出处 useChannel.ts:3-44；这些品牌名本身即 apkChannel 字面值（FoxA 已验证）。Google 系渠道按编号区分（INGoogle5/INGoogle8…），金样 #74 期望 INGoogle8。解析不确定的应用名时，优先用 search_values 工具查 `elt_app_params.apkChannel` 的真实取值再写过滤，不要臆造 INx 编号。",
       "sql": null,
       "check": null,
       "valueAliases": [
-        { "term": "IN8", "literal": "INGoogle8", "column": "apkChannel", "note": "示例，待业务确认是否还有 INGoogle5 / INGoogle6 等" },
-        { "term": "FOXA", "literal": "FoxA", "column": "apkChannel", "note": "示例，待业务确认" }
+        { "term": "IN8", "literal": "INGoogle8", "column": "apkChannel", "note": "已验证：金样 #74 期望 apkChannel='INGoogle8'；口语 IN8 ↔ 库内 INGoogle8" },
+        { "term": "FOXA", "literal": "FoxA", "column": "apkChannel", "note": "已验证：FoxA 即真实 apkChannel 字面值（金样出现 4 次）" },
+        { "term": "INGoogle5", "literal": "INGoogle5", "column": "apkChannel", "note": "金样出现 11 次；Google 系按编号区分，完整编号集需 search_values 或 getPakageOptions 确认" },
+        { "term": "GoGo", "literal": "GoGo", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "India", "literal": "India", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "IndiaA", "literal": "IndiaA", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "India2", "literal": "India2", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "Peacock", "literal": "Peacock", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "IndiaTV", "literal": "IndiaTV", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "PakA", "literal": "PakA", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "MOBMAX", "literal": "MOBMAX", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "BD", "literal": "BD", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "Wowlok", "literal": "Wowlok", "column": "apkChannel", "note": "India 板品牌名即 apkChannel 字面" },
+        { "term": "Cinegato", "literal": "Cinegato", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
+        { "term": "FilmeTela", "literal": "FilmeTela", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
+        { "term": "CinegatoOrganic", "literal": "CinegatoOrganic", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
+        { "term": "OndaPaid", "literal": "OndaPaid", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" },
+        { "term": "OndaOrganic", "literal": "OndaOrganic", "column": "apkChannel", "note": "Brazil 板品牌名即 apkChannel 字面" }
       ],
-      "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样里 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。",
+      "basis": "评测金样 #74 期望 SQL 用 apkChannel='INGoogle8'；金样 INGoogle5 出现 11 次、FoxA 4 次，证明业务简称与库内值不一致。品牌集来自 useChannel.ts:3-44（India 11 / Brazil 6）。getPakageOptions API 返回 projectName/channelName/packageName，前端动态取；本环境无 BI 凭据/无网络，未拉取全量，Google 系完整编号以 search_values 为准。",
       "openQuestions": [
-        "按最佳实践：品牌级渠道名已确认（useChannel.ts:3-44）并固化为别名（India 板=GoGo/India/IndiaA/India2/FoxA/Peacock/IndiaTV/PakA/MOBMAX/BD/Wowlok；Brazil 板=Cinegato/FilmeTela/CinegatoOrganic/OndaPaid/OndaOrganic）；FOXA→FoxA 已验证。库内 apkChannel/packageName（如 INGoogle8）↔ 品牌名的完整映射待从 getPakageOptions API 补全（前端动态取）。见 decisions 附录 A。",
-        "同一简称是否跨多张表有不同取值？映射是否按表区分？（待后端确认；当前别名按 apkChannel 列固化）"
+        "Google 系渠道完整编号集（INGoogle5/INGoogle8 之外是否还有 INGoogle6/7…）需从 getPakageOptions API 或 CH `SELECT DISTINCT apkChannel FROM elt_app_params` 拉全量确认（本环境无 BI 凭据/无网络，未拉取）；当前仅固化已验证项 + 品牌名集，其余以 search_values 动态发现。",
+        "同一简称是否跨多张表有不同取值？映射是否按表区分？（当前别名按 elt_app_params.apkChannel 固化）"
       ]
     },
     {
