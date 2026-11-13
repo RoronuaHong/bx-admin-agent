@@ -152,6 +152,39 @@ export function metricDefinitions(glossary, query) {
   return { value: { definitions, ...(ambiguities.length ? { ambiguities } : {}) }, isError: false };
 }
 
+/**
+ * B5：把已批准口径的取值字典（valueAliases）挑出来，供 get_caliber_context 一并带回，
+ * 让模型选完表即拿到「业务词→库内字面值」映射，不必再单独调 get_metric_definitions，
+ * 也不必触发 live SQL（静态别名，避开国家列在 read-only 闸门的口径冲突）。
+ *
+ * 两条来源：
+ *  1) 列相关：retrievedColumns（本轮检索到的表所带列，小写集合）命中的口径别名列——上下文相关、最精准；
+ *  2) 指标名/别名精确命中：query 直接命中某已批准口径（走 metricDefinitions），无论列检索是否命中。
+ * retrievedColumns 为空时只走第 2 条（不把全部 80+ 条别名无差别塞进上下文）。
+ * 返回去重后的 [{ term, literal, column, note }]。
+ */
+export function caliberValueAliases(glossary, query, retrievedColumns) {
+  const cols = retrievedColumns instanceof Set ? retrievedColumns : new Set((retrievedColumns || []).map((c) => String(c).toLowerCase()));
+  const out = new Map();
+  const add = (va) => {
+    if (!va || !va.column || !va.term) return;
+    const key = `${va.term}|${va.literal}|${va.column}`;
+    if (!out.has(key)) out.set(key, { term: va.term, literal: va.literal, column: va.column, note: va.note });
+  };
+  if (cols.size) {
+    for (const e of approvedEntries(glossary)) {
+      for (const va of e.valueAliases || []) {
+        if (cols.has(String(va.column).toLowerCase())) add(va);
+      }
+    }
+  }
+  const md = metricDefinitions(glossary, query);
+  if (!md.isError && md.value && Array.isArray(md.value.definitions)) {
+    for (const d of md.value.definitions) for (const va of d.valueAliases || []) add(va);
+  }
+  return [...out.values()];
+}
+
 const stripComments = (sql) => String(sql || "").replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
 const refsTable = (sql, table) => new RegExp(`\\b${bare(table)}\\b`, "i").test(sql);
 

@@ -80,7 +80,7 @@
 
 ## 技术侧在拍板前可并行推进（✅ 2026-11-12 四项均已落地，本表转实施记录）
 
-- ✅ **1.5② 按值搜索工具（2.5）**：`scripts/bi-value-search.mjs` + `search_values` 工具已落地并补 7 例回归；续查修掉 `schema.table` 被整批拒绝、`type/Category` 判定永不命中两个缺陷。**「等词典批准后再接入 `get_caliber_context`」仍属拍板后动作，未做**。
+- ✅ **1.5② 按值搜索工具（2.5）**：`scripts/bi-value-search.mjs` + `search_values` 工具已落地并补 7 例回归；续查修掉 `schema.table` 被整批拒绝、`type/Category` 判定永不命中两个缺陷。**「词典批准后接入 `get_caliber_context`」已完成（2026-11-13）：新增纯函数 `caliberValueAliases`，按「本轮检索到的表所带列 + query 精确命中的已批准口径」双路径把 `valueAliases` 一并带回，纯静态、不触发 live SQL，避开国家列在 read-only 闸门的口径冲突（B5 单列评审项，本轮不动）。**
 - ✅ **1.3 黄金集准入检查**：`bi-golden-bootstrap.mjs` 加准入检查、`bi-eval-runner.mjs` 同步跳过，基线 96 → 93。
 - ✅ **2.7 `get_golden_set` 仅评测 / 开发环境宣告**：`goldenSetEnabled()` 隐藏 + `CallTool` 纵深拒绝，生产不再暴露评测夹具。
 - ✅ **2.3 `search_columns` 匹配 Metabase 描述 + 对白名单外表标「未暴露」**：已落地。

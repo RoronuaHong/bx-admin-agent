@@ -12,6 +12,7 @@ import {
   loadGlossary,
   metricDefinitions,
   parseFkEdge,
+  caliberValueAliases,
 } from "../scripts/bi-semantic.mjs";
 import { renderTableMSchema } from "../scripts/metabase-mschema.mjs";
 import { auditCards } from "../scripts/bi-caliber-audit.mjs";
@@ -234,6 +235,22 @@ test("口径定义投影：编码型口径（paid_order/member_stock/new_member�
   expect(cd?.valueAliases?.some((a: { term: string; literal: string; column: string }) => a.term === "印度" && a.literal === "91" && a.column === "countryCode")).toBe(true);
   const dip = metricDefinitions(real, "投流").value.definitions.find((d: { id: string }) => d.id === "device_ip_country");
   expect(dip?.valueAliases?.some((a: { term: string; literal: string; column: string }) => a.term === "巴西" && a.literal === "55" && a.column === "ipCountryCode")).toBe(true);
+});
+
+test("caliberValueAliases：列相关 + 指标名命中双路径", () => {
+  const real = loadGlossary()!;
+  // 1) 列相关：只回检索到的列所带的取值别名（countryCode / orderStatus 命中，apkChannel 不命中）。
+  const byCol = caliberValueAliases(real, "随便", new Set(["countrycode", "orderstatus"]));
+  expect(byCol.some((a) => a.column === "countryCode" && a.term === "印度" && a.literal === "91")).toBe(true);
+  expect(byCol.some((a) => a.column === "orderStatus" && a.term === "支付成功" && a.literal === "3")).toBe(true);
+  expect(byCol.some((a) => a.column === "apkChannel")).toBe(false);
+  // retrievedColumns 为空时只走指标名精确命中路径。
+  const empty = caliberValueAliases(real, "已支付订单", new Set());
+  expect(empty.every((a) => a.column === "orderStatus")).toBe(true);
+  expect(empty.some((a) => a.term === "支付成功" && a.literal === "3")).toBe(true);
+  // 自然语言不命中任何口径名时（且无列），返回空。
+  const none = caliberValueAliases(real, "观影过AK2 的拉新用户", new Set());
+  expect(none.length).toBe(0);
 });
 
 test("真实词典：歧义候选项引用不悬空，当前全草稿时线上无信号", () => {

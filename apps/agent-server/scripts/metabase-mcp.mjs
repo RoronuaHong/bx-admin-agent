@@ -143,7 +143,7 @@ import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, norma
 import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
 import { buildCaliberGraph, buildCaliberContext, tableSearchText } from "./bi-caliber-graph.mjs";
 import { evalHiddenTools, evalGateRefusal, heldOutCardIds, hideHeldOut } from "./bi-eval-holdout.mjs";
-import { approvedEntries, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary, metricDefinitions } from "./bi-semantic.mjs";
+import { approvedEntries, caliberValueAliases, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary, metricDefinitions } from "./bi-semantic.mjs";
 
 // P1.1 实测取值缓存：get_database_schema(with_values=true) 跨调用复用，TTL 由 bi-mschema-values.mjs 管。
 const liveValueCache = createLiveValueCache();
@@ -1227,7 +1227,8 @@ const TOOLS = [
     description:
       "口径语义检索（P3，§4.2-2）：给定自然语言问题/指标名，从既有卡片口径（真实 SQL + 表共现图）检索出「该用的表 + 常一起 join 的表 + 可参考的现成卡片」。" +
       "写多表 SQL 前先查它，直接拿到精准表清单与 join 启发，避免选错表（跑通了但口径错的静默错误）。" +
-      "检索基于口径层小图（共现边 + 关键词命中），零 embedding 成本；结果仅供参考，外键仍需核实。",
+      "检索基于口径层小图（共现边 + 关键词命中），零 embedding 成本；结果仅供参考，外键仍需核实。" +
+      "返回还会附带「取值字典」：已批准口径里与本轮检索到的表所带列相关的 valueAliases（如 countryCode=91 印度、orderStatus=3 支付成功），写过滤/分组/维度条件前先照此映射，别臆造编码。",
     inputSchema: {
       type: "object",
       properties: {
@@ -1268,6 +1269,24 @@ const TOOLS = [
         });
         if (ctx.matchedCards.some((c) => c.sql)) {
           ctx.note += " 带 sql 的卡片是已保存的现成查询：问题与它一致时照它改写（改日期、维度、过滤值），不要从零写；不一致的部分再按 schema 补。";
+        }
+      }
+      // B5（词典已 10/10 approved，解卡）：把取值字典（valueAliases）一并带回。只回与本轮检索到的表所带列
+      // 相关的取值，避免无差别塞入全部别名；同时并入按 query 精确命中的已批准口径。纯静态，不触发 live SQL，
+      // 故不触碰国家列在 read-only 闸门的口径冲突（B5 单列评审项，本轮不动）。
+      {
+        const retrievedTables = new Set((ctx.tables || []).map((t) => String(t.table || "").toLowerCase()));
+        const retrievedColumns = new Set();
+        for (const t of metaTables) {
+          const key = (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name).toLowerCase();
+          if (!retrievedTables.has(key)) continue;
+          for (const f of t.fields || []) if (f.name) retrievedColumns.add(f.name.toLowerCase());
+        }
+        const valueAliases = caliberValueAliases(loadGlossary(), query, retrievedColumns);
+        if (valueAliases.length) {
+          ctx.valueAliases = valueAliases;
+          const cols = [...new Set(valueAliases.map((v) => v.column))].join("、");
+          ctx.note += ` 取值字典（已批准口径）含 ${valueAliases.length} 条「业务词→库内字面值」映射，按列（${cols}）：写过滤/分组/维度条件前先照此映射，勿臆造编码（如 91=印度、3=支付成功）。`;
         }
       }
       return json(ctx);
