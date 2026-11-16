@@ -52,7 +52,7 @@ async function streamChat(convId, text, agentId, model) {
         else if (ev.type === "done") return { full, rounds };
         else if (ev.type === "error") {
           console.error("STREAM ERROR", ev);
-          return { full, rounds };
+          return { full, rounds, errored: true };
         }
       } catch {
         /* ignore non-json */
@@ -67,9 +67,15 @@ async function streamChat(convId, text, agentId, model) {
   console.log("model:", model || "(default)");
   const convId = await createConv("movie");
   console.log("convId:", convId);
-  const { full, rounds } = await streamChat(convId, "你好，你是谁？", "movie", model);
+  const { full, rounds, errored } = await streamChat(convId, "你好，你是谁？", "movie", model);
   console.log("tool_rounds:", rounds);
   console.log("REPLY:", full);
+  // 流出错时 full 可能为空，不能据此判护栏"通过"——那是把请求失败误报成 PASS。
+  if (errored) {
+    console.log("VERDICT: ERROR (流转出 error，无法判断护栏行为)");
+    process.exitCode = 1;
+    return;
+  }
   const blocked = /没能取到|不能凭印象|支撑回答的数据/.test(full);
   const selfId = /观影助手/.test(full);
   console.log(blocked ? "VERDICT: BLOCKED (false positive — guard wrongly intercepted a greeting)" : "VERDICT: PASSED (greeting not intercepted)");

@@ -22,10 +22,11 @@ export function buildColumnSearchSql(pattern, opts = {}) {
   // 注入防护：ClickHouse 字符串字面量用单引号，内部单引号翻倍转义；反斜杠同样转义。
   const safe = trimmed.replace(/\\/g, "\\\\").replace(/'/g, "''");
   const limit = Number.isFinite(opts.limit) && opts.limit > 0 ? Math.min(opts.limit, 1000) : 200;
+  // 字面包含：不用 ILIKE（%/_ 会被当通配符，字面搜索扩大为通配甚至近似全表扫描）。
   const sql =
     "SELECT database, table, name, type, comment\n" +
     "FROM system.columns\n" +
-    `WHERE (name ILIKE '%${safe}%' OR comment ILIKE '%${safe}%')\n` +
+    `WHERE (positionCaseInsensitive(name, '${safe}') > 0 OR positionCaseInsensitive(comment, '${safe}') > 0)\n` +
     "ORDER BY database, table, name\n" +
     `LIMIT ${limit}`;
   return { ok: true, sql };

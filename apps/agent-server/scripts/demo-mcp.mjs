@@ -24,24 +24,27 @@ const TOOLS = [
   },
 ];
 
-const server = new Server({ name: "demo-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args = {} } = req.params || {};
-  if (name !== "demo_greet") {
-    return { content: [{ type: "text", text: JSON.stringify({ error: `未知工具 ${name}` }) }], isError: true };
-  }
-  const message = String(args.message || "").trim();
-  const now = new Date().toISOString();
-  const result = {
-    greeting: `你好，这是来自 demo 连接器的问候（${now}）`,
-    echoed: message,
-    note: "本工具为只读演示工具，不接触任何真实数据",
-  };
-  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-});
+// 无状态 HTTP：每个请求新建 Server 实例（SDK 的 Server.connect 在已有 transport 时会抛 "Already connected"，
+// 复用同一个实例会让重叠的第二个请求失败）。
+function makeServer() {
+  const server = new Server({ name: "demo-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: args = {} } = req.params || {};
+    if (name !== "demo_greet") {
+      return { content: [{ type: "text", text: JSON.stringify({ error: `未知工具 ${name}` }) }], isError: true };
+    }
+    const message = String(args.message || "").trim();
+    const now = new Date().toISOString();
+    const result = {
+      greeting: `你好，这是来自 demo 连接器的问候（${now}）`,
+      echoed: message,
+      note: "本工具为只读演示工具，不接触任何真实数据",
+    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  });
+  return server;
+}
 
 const httpServer = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/mcp") {
@@ -58,7 +61,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => transport.close().catch(() => {}));
-    await server.connect(transport);
+    await makeServer().connect(transport);
     await transport.handleRequest(req, res, body);
     return;
   }

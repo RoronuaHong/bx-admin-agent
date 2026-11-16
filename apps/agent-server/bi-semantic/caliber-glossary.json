@@ -1,8 +1,8 @@
 {
   "title": "BI 口径词典（指标单一定义）",
   "version": 1,
-  "updatedAt": "2026-11-13",
-  "status": "draft",
+  "updatedAt": "2026-11-16",
+  "status": "approved",
   "howToApprove": "业务负责人逐条确认：把 status 改为 approved，填 owner 与 approvedAt；有分歧就改 definition / check 再批。只有 approved 的条目会经 MCP 工具 get_metric_definitions 提供给模型、并作为 get_caliber_context 的检索词；draft 只用于离线审计（scripts/bi-caliber-audit.mjs）与评测打分。enforce 决定查询闸门怎么处理已批准条目的冲突：reject = 拒绝执行并给出约定口径，warn = 照常执行、在结果里提示，不写 = 不拦。country_dimension、member_stock 在查询闸门里有同 id 的内置硬拒规则，批准后改由本文件接管（批准时若把 enforce 改成 warn 或删掉，闸门就不再硬拒）。改完需重启 agent-server。条目可带 ambiguous（question + candidates）：get_metric_definitions 会附上歧义信号与候选项定义，但只给信号、不代调用方选口径；候选项 id 指向别的条目时，那条也须 approved 才会输出信号。",
   "entries": [
     {
@@ -88,11 +88,15 @@
       "check": {
         "type": "timezone",
         "timezone": "Asia/Shanghai",
+        "timezones": [
+          "Asia/Shanghai",
+          "Asia/Kolkata"
+        ],
         "others": [
-          "Asia/Kolkata",
           "UTC"
         ],
-        "serverTimezone": "Asia/Shanghai"
+        "serverTimezone": "Asia/Shanghai",
+        "note": "D4 双时区：机器规则只校验是否使用约定时区之一；印度板「当天」归属须用 Asia/Kolkata，板块归属按 definition 由调用方判断，机器不代选。"
       },
       "basis": "卡片多数写法（Metabase 编译出的 SQL 统一带 Asia/Shanghai）。2026-11-12 只读查询 SELECT timezone() 返回 Asia/Shanghai，Metabase results_timezone 同为 Asia/Shanghai，所以不写时区的卡片与显式写上海时区结果一致。",
       "openQuestions": [

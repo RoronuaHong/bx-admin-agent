@@ -10,15 +10,15 @@ export const FK_SIGNOFF_FILE = path.join(SEMANTIC_DIR, "fk-signoff.json");
 export const GLOSSARY_FILE = path.join(SEMANTIC_DIR, "caliber-glossary.json");
 
 const fileCache = new Map();
-// 按 mtime+size 缓存；文件缺失或损坏时返回 null（fail-open：不标注、不提供词典，不影响原工具输出）。
+// 按文件内容缓存：mtime+size 在同毫秒、同长度改写时会碰撞（holdout 模块已有同样教训），
+// 批准口径或改 enforce 后必须立即读到新内容。文件缺失或损坏时返回 null（fail-open）。
 function readJsonCached(file) {
   try {
-    const st = fs.statSync(file);
-    const key = `${st.mtimeMs}:${st.size}`;
+    const raw = fs.readFileSync(file, "utf8");
     const hit = fileCache.get(file);
-    if (hit && hit.key === key) return hit.data;
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    fileCache.set(file, { key, data });
+    if (hit && hit.key === raw) return hit.data;
+    const data = JSON.parse(raw);
+    fileCache.set(file, { key: raw, data });
     return data;
   } catch {
     return null;
@@ -120,8 +120,25 @@ export function metricDefinitions(glossary, query) {
   const entries = approvedEntries(glossary);
   if (!entries.length) return { value: "当前没有业务已确认的指标口径。", isError: true };
   const q = String(query || "").trim().toLowerCase();
+  // 命中强度：整词精确 > 长问题包含短别名 > 短查询被长别名包含（兼容旧行为）。
+  // 之前只做「别名.includes(query)」，真实长问题永远不命中，B5 的第二条取值来源形同虚设。
+  const strength = (e) => {
+    let best = 0;
+    for (const raw of [e.name, e.id, ...(e.aliases || [])]) {
+      const term = String(raw || "").toLowerCase();
+      if (!term) continue;
+      if (term === q) best = Math.max(best, 3);
+      else if (term.length >= 3 && q.includes(term)) best = Math.max(best, 2);
+      else if (term.includes(q)) best = Math.max(best, 1);
+    }
+    return best;
+  };
   const hit = q
-    ? entries.filter((e) => [e.name, e.id, ...(e.aliases || [])].some((s) => String(s).toLowerCase().includes(q)))
+    ? entries
+        .map((e) => ({ e, score: strength(e) }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map((x) => x.e)
     : entries;
   if (!hit.length) return { value: `没有匹配「${query}」的已确认口径。已确认：${entries.map((e) => e.name).join("、")}`, isError: true };
 
@@ -159,7 +176,7 @@ export function metricDefinitions(glossary, query) {
  *
  * 两条来源：
  *  1) 列相关：retrievedColumns（本轮检索到的表所带列，小写集合）命中的口径别名列——上下文相关、最精准；
- *  2) 指标名/别名精确命中：query 直接命中某已批准口径（走 metricDefinitions），无论列检索是否命中。
+ *  2) 指标名/别名命中：query 精确、或长问题包含短别名（走 metricDefinitions 的命中强度），无论列检索是否命中。
  * retrievedColumns 为空时只走第 2 条（不把全部 80+ 条别名无差别塞进上下文）。
  * 返回去重后的 [{ term, literal, column, note }]。
  */
@@ -229,14 +246,18 @@ const CHECKS = {
   },
   // 有时间过滤或按日分桶时，按约定时区解释。不写时区时按服务器默认时区解释：
   // serverTimezone 与约定一致则等价，不判冲突；未配置 serverTimezone 时要求显式写出。
-  timezone({ timezone, others = [], serverTimezone = null }, sql) {
+  timezone({ timezone, timezones = [], others = [], serverTimezone = null }, sql) {
     const s = stripComments(sql);
-    const timeish = /'\d{4}-\d{2}-\d{2}/.test(s) || /\b(toDate|toStartOf\w+|toYYYYMM\w*|formatDateTime)\s*\(/i.test(s);
+    const timeish = /'\d{4}-\d{2}-\d{2}/.test(s) || /\b(toDate|toStartOf\w+|toYYYYMM\w*|formatDateTime|toTimeZone)\s*\(/i.test(s);
     if (!timeish) return null;
-    const other = others.find((tz) => s.includes(tz));
-    if (other) return { ok: false, detail: `用了 ${other}，约定为 ${timezone}` };
-    if (s.includes(timezone) || serverTimezone === timezone) return { ok: true };
-    return { ok: false, detail: `未写时区（按服务器默认时区${serverTimezone ? ` ${serverTimezone}` : ""}解释），约定为 ${timezone}` };
+    // timezones 支持 D4 双时区（definition 与机器规则同源）；没写时回退到旧的单 timezone 字段。
+    const allowed = timezones.length ? timezones : [timezone].filter(Boolean);
+    const label = allowed.join(" / ");
+    const bad = others.find((tz) => s.includes(tz) && !allowed.includes(tz));
+    if (bad) return { ok: false, detail: `用了 ${bad}，约定为 ${label}` };
+    if (allowed.some((tz) => s.includes(tz))) return { ok: true };
+    if (serverTimezone && allowed.includes(serverTimezone)) return { ok: true };
+    return { ok: false, detail: `未写约定时区（按服务器默认时区${serverTimezone ? ` ${serverTimezone}` : ""}解释），约定为 ${label}` };
   },
   // 几个标识符同时出现即判冲突（如「设备级快照表 + 会员到期天数列」拼出的会员存量）；不全出现不适用。
   forbidden_tokens({ all = [], message = null }, sql) {
@@ -254,7 +275,8 @@ const CHECKS = {
     };
     const bad = forbidden.filter(hit);
     const good = allowed.filter(hit);
-    if (bad.length && !good.length) return { ok: false, detail: `维度取自 ${bad.join(" / ")}，约定为 ${allowed.join(" / ")}` };
+    // 只要用了禁用维度就判冲突：混合写法（合法列也出现）不能算合规，否则 enforce:reject 可被绕过。
+    if (bad.length) return { ok: false, detail: `维度取自 ${bad.join(" / ")}，约定为 ${allowed.join(" / ")}` };
     return good.length ? { ok: true } : null;
   },
 };

@@ -19,7 +19,7 @@
 //   YAPI_CALL_LOGIN_PASSWORD 业务后台密码
 //   YAPI_CALL_LOGIN_PATH_<id>  该项目的登录接口路径（POST，仅适配器内部调用，模型无法触发）
 //   YAPI_CALL_LOGIN_FIELD_<id> 登录请求体里的账号字段名（默认 loginName）
-//   YAPI_CALL_AUTH_SCHEME  可选：bearer | raw，固定 Authorization 写法（默认先 Bearer，401 自动换裸 token 再试）
+//   YAPI_CALL_AUTH_SCHEME  可选：bearer | raw，固定 Authorization 写法（默认先裸 token，失败自动换 Bearer 再试）
 //   YAPI_CALL_TIMEOUT_MS   可选：调用超时（默认 15000）
 // 安全约束：call_api **只发 GET**（工具本身不提供 method 参数）；若路径在文档里是写操作接口，直接拒绝。
 //          唯一的非 GET 请求是适配器内部的自动登录（换 token），不暴露成工具。
@@ -366,12 +366,18 @@ function authStyles(projectId) {
   return [AUTH_RAW, AUTH_BEARER];
 }
 
-const normPath = (p) =>
-  String(p || "")
-    .split("?")[0]
-    .trim()
-    .replace(/\/+$/, "")
-    .toLowerCase();
+const normPath = (p) => {
+  // 与 new URL() 的归一化对齐：去 query/hash、解析 .. 与 .，否则 /v1/x/../order/delete 可绕过文档路径比对。
+  const s = String(p || "").split(/[?#]/)[0].trim().replace(/\/+$/, "");
+  if (!s.startsWith("/")) return s.toLowerCase();
+  const out = [];
+  for (const seg of s.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg.toLowerCase());
+  }
+  return "/" + out.join("/");
+};
 
 const TOOLS = [
   {
@@ -547,15 +553,27 @@ const TOOLS = [
       if (!apiPath) return json("path 不能为空", true);
 
       // 文档里若标注为非 GET，这里直接拒绝：本工具只做只读调用。
+      // docMenuError：拉不到文档就无法证明该路径是 GET，fail-closed 拒绝（原来 catch→[] 静默放行写接口）。
       const target = normPath(apiPath);
-      const cats = await projectMenu(pid).catch(() => []);
+      let cats;
+      try {
+        cats = await projectMenu(pid);
+      } catch (e) {
+        return json(`无法读取项目 ${pid} 的接口文档，不能确认 ${apiPath} 是只读 GET，已拒绝调用：${String((e && e.message) || e)}`, true);
+      }
+      let documented = false;
       for (const c of cats) {
         for (const a of c.apis) {
           if (normPath(a.path) !== target || !a.method) continue;
+          documented = true;
           if (a.method !== "GET") {
             return json(`已拒绝：文档里该接口是 ${a.method}（写操作），本工具只允许 GET。`, true);
           }
         }
+      }
+      // 文档里有分类但找不到该路径：无法证明它是 GET，拒绝；完全无文档的旧项目保持原行为（照旧只发 GET）。
+      if (!documented && cats.length) {
+        return json(`已拒绝：接口文档里没有 ${apiPath}，无法确认它是只读 GET。`, true);
       }
 
       const base = await callBaseFor(pid);

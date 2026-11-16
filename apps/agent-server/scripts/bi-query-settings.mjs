@@ -64,7 +64,9 @@ function alreadyHasSettings(sql) {
     .replace(/'(?:[^'\\]|\\.)*'/g, "''")
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     .replace(/`(?:[^`\\]|\\.)*`/g, "``");
-  return /\bsettings\b/i.test(stripped);
+  // 只认 SETTINGS key=value 子句（ClickHouse 语法）：裸的 settings 标识符/列/函数调用都不算已声明，
+  // 否则 SELECT settings FROM t 会让资源护栏跳过追加，慢查询失去上限保护。
+  return /\bsettings\b\s+[a-z_][\w]*\s*=/i.test(stripped);
 }
 
 export function appendClickHouseSettings(sql, settings) {

@@ -20,8 +20,10 @@ export function makeQueryCache({ ttlMs = 60_000, maxEntries = 200, enabled = tru
   const store = new Map(); // key -> { expires, payload }
 
   function keyOf(database_id, sql, limit) {
-    // 折叠空白并 trim，使「仅空白差异」的同一 SQL 也能命中；limit 不同视为不同查询。
-    return `${database_id} ${Number(limit) || 0} ${String(sql ?? "").replace(/\s+/g, " ").trim()}`;
+    // 不能全局折叠空白：字符串字面量里的空白是语义（name='A  B' ≠ name='A B'），折叠会让不同查询命中同一份结果。
+    // 只 trim 首尾与统一换行，字面量原样保留。
+    const normalized = String(sql ?? "").replace(/\r\n?/g, "\n").trim();
+    return `${database_id} ${Number(limit) || 0} ${normalized}`;
   }
 
   function get(database_id, sql, limit) {

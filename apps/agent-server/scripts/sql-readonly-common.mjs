@@ -65,11 +65,17 @@ function maskLiterals(sql, backslashEscapes) {
     const ch = sql[i];
     const next = sql[i + 1];
     if (ch === "-" && next === "-") {
-      while (i < n && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
-      out += " ";
-      continue;
+      // MySQL 里 `--` 后必须跟空白才是注释；`SELECT 1--0; DROP TABLE t` 在 MySQL 是算术+多语句，
+      // 不能一律吞成注释（否则分号检测漏掉第二条语句）。只在后随空白时才当注释。
+      if (i + 2 >= n || /\s/.test(sql[i + 2])) {
+        while (i < n && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+        out += " ";
+        continue;
+      }
     }
     if (ch === "/" && next === "*") {
+      // MySQL 可执行注释 `/*! ... */`（及 MariaDB `/*M! ... */`）会执行体内 SQL，不能当普通注释剥离。
+      if (sql[i + 2] === "!" || (sql[i + 2] === "M" && sql[i + 3] === "!")) return null;
       const end = sql.indexOf("*/", i + 2);
       if (end < 0) return null;
       i = end + 2;
@@ -118,9 +124,24 @@ function isReadOnlyMasked(masked) {
   return LEADING_KEYWORDS.includes(first) && !DENY_RE.test(lower) && !DENY_PATTERNS.some((re) => re.test(lower)) && !DENY_TABLE_FN_RE.test(parts[0]);
 }
 
+/**
+ * 引号包裹的函数名绕过：maskLiterals 把反引号/双引号标识符换成空占位，`` `url`(`` 就躲过了表函数黑名单。
+ * MySQL/ClickHouse 允许用引号包住标识符当函数名调用，因此需在原文上单独拦「引号名 + 紧接左括号」。
+ * 单引号字符串（SELECT 'url(http://x)'）是数据，不在此列，仍按字面量脱敏后放行。
+ */
+function hasQuotedDangerousFn(raw) {
+  const re = /[`"]([a-z_][\w]*)[`"]\s*\(/gi;
+  let m;
+  while ((m = re.exec(raw))) {
+    if (DENY_TABLE_FN_RE.test(`${m[1]}(`) || DENY_PATTERNS.some((p) => p.test(`${m[1]}(`))) return true;
+  }
+  return false;
+}
+
 /** 是否「可安全放行的单条只读查询」。fail-closed：不明朗一律 false。 */
 export function isReadOnlySql(raw) {
   if (typeof raw !== "string") return false;
+  if (hasQuotedDangerousFn(raw)) return false;
   // 脱掉字符串/标识符引号与注释再判定：列名或字面量恰好是保留字/含分号时，
   // 不被误判为写操作或多语句（如 SELECT "update" FROM t）。
   // 反斜杠语义因方言而异，两种解读都必须判为只读才放行——不依赖知道下游是哪种库。

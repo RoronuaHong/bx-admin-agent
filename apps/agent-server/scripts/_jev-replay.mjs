@@ -23,11 +23,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = path.dirname(fileURLToPath(import.meta.url));
-const traceDir =
+let traceDir =
   process.env.AGENT_DATA_DIR != null
     ? path.join(process.env.AGENT_DATA_DIR, "traces")
     : path.join(repo, "..", ".data", "traces");
-const base = process.env.AGENT_BASE_URL || "http://127.0.0.1:8787";
+let base = process.env.AGENT_BASE_URL || "http://127.0.0.1:8787";
 
 const DEFAULT_PROMPT =
   "帮我处理一个访客会话：访客问他的订单退款什么时候到账。" +
@@ -146,10 +146,13 @@ async function main() {
       for (const line of fs.readFileSync(sf, "utf8").split("\n")) {
         const o = safeJson(line);
         if (!o) continue;
-        const op = o["gen_ai.operation.name"] || o.operationName || "";
-        if (/classif/i.test(op) || o.gen_ai?.operation?.name === "classify") {
+        // 真实 span 把这两个字段写在 attrs 里（src/jev.ts），顶层取不到会让 classifySpans 恒为 0。
+        const attrs = o.attrs || {};
+        // src/jev.ts 写的是扁平键 "gen_ai.operation.name": "classify"，不是嵌套 gen_ai.operation.name。
+        const op = attrs["gen_ai.operation.name"] || o["gen_ai.operation.name"] || o.operationName || "";
+        if (/classif/i.test(op)) {
           classifySpans += 1;
-          if (o["error.type"]) classifyFailSpans += 1;
+          if (attrs["error.type"] || o["error.type"]) classifyFailSpans += 1;
         }
       }
     }
@@ -169,8 +172,13 @@ async function main() {
   if (classifierCalls !== null) console.log(`classifierCalls  : ${classifierCalls}（usage→RunTrace）`);
   if (classifierFailures !== null) {
     console.log(`classifierFail  : ${classifierFailures}`);
-    const rate = classifierCalls ? classifierFailures / classifierCalls : 0;
-    console.log(`classifier_health: ${rate <= 0.2 ? "PASS(≤0.2)" : "FAIL(>0.2)"}（阈值 EVAL_MAX_CLASSIFIER_FAIL_RATE=0.2）`);
+    // 没调用过不等于健康：与 src/eval-online.ts 同口径，classifierCalls=0 报 N/A 而不是 PASS。
+    const rate = classifierCalls ? classifierFailures / classifierCalls : null;
+    console.log(
+      rate === null
+        ? "classifier_health: N/A（本次 classifierCalls=0，未调用不代表健康）"
+        : `classifier_health: ${rate <= 0.2 ? "PASS(≤0.2)" : "FAIL(>0.2)"}（阈值 EVAL_MAX_CLASSIFIER_FAIL_RATE=0.2）`,
+    );
   }
   console.log(`工具调用         : ${toolCalls.length} 次（${toolCalls.slice(0, 6).join(", ")}${toolCalls.length > 6 ? "…" : ""}）`);
   console.log(`error 事件       : ${errors.length} 条`);

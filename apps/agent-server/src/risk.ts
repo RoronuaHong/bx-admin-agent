@@ -102,7 +102,11 @@ export function resolveToolRisk(
     return applyGrant(verdict, grantServers);
   }
 
-  const bare = namespacedName.slice(MCP_PREFIX.length).split("__").pop() || namespacedName;
+  // 用 serverId 精确切前缀：工具原名编码后仍可能含 "__"（如 a__b），split("__").pop() 会把它截掉，
+  // 导致 SQL 工具名匹配不上 readOnlySqlTools 清单、服务端硬拒被静默跳过。
+  const bare = namespacedName.startsWith(`${MCP_PREFIX}${described.serverId}__`)
+    ? namespacedName.slice(MCP_PREFIX.length + described.serverId.length + 2)
+    : namespacedName.slice(MCP_PREFIX.length).split("__").pop() || namespacedName;
   // 通配 "*"：本服务器全部未单独声明的工具按同一级别处理（如纯生成类服务器整体定 read）。
   const toolOverride =
     described.toolRisks?.[bare] ?? described.toolRisks?.[namespacedName] ?? described.toolRisks?.["*"];
@@ -115,27 +119,16 @@ export function resolveToolRisk(
 
   let verdict: RiskVerdict;
   if (toolOverride === "read" || toolOverride === "write" || toolOverride === "destructive") {
-    if (sqlRejected) {
-      verdict = {
-        ...base,
-        level: "destructive",
-        unknown: false,
-        deny: true,
-        reason: `该工具（${bare}）为原生 SQL 工具，服务端判定本次为非只读查询，按只读策略拒绝执行`,
-        source: "sql-readonly",
-      };
-    } else {
-      verdict = {
-        ...base,
-        level: downgraded ? "read" : toolOverride,
-        unknown: false,
-        deny: false,
-        reason: downgraded
-          ? "该工具为原生 SQL 工具，服务端判定本次为只读查询"
-          : `工具级配置将该操作定为 ${toolOverride}`,
-        source: downgraded ? "sql-readonly" : "tool-config",
-      };
-    }
+    verdict = {
+      ...base,
+      level: downgraded ? "read" : toolOverride,
+      unknown: false,
+      deny: false,
+      reason: downgraded
+        ? "该工具为原生 SQL 工具，服务端判定本次为只读查询"
+        : `工具级配置将该操作定为 ${toolOverride}`,
+      source: downgraded ? "sql-readonly" : "tool-config",
+    };
   } else if (described.requireConfirm) {
     verdict = {
       ...base,
@@ -165,14 +158,32 @@ export function resolveToolRisk(
     }
   }
 
+  // 原生 SQL 服务端硬拒：对所有分支统一生效（含注解/未声明级别），不受会话只读授权影响。
+  // 之前只在 toolOverride 分支判，工具注册表没配 override 时这道纵深防御被静默跳过。
+  if (sqlRejected) {
+    return {
+      ...verdict,
+      level: "destructive",
+      unknown: false,
+      deny: true,
+      reason: `该工具（${bare}）为原生 SQL 工具，服务端判定本次为非只读查询，按只读策略拒绝执行`,
+      source: "sql-readonly",
+    };
+  }
   // 会话级只读授权：仅对「未声明级别」且同服务器的工具生效（第 8 条）。
   return applyGrant(verdict, grantServers);
 }
 
-/** 适配器取哪个字段执行由它自己决定，所以只要带了 SQL 字段就每个都得是只读，不能「一个合格就放行」。 */
+/**
+ * 适配器取哪个字段执行由它自己决定，所以只要带了 SQL 字段就每个都得是只读，不能「一个合格就放行」。
+ * query 工具支持只传 question_id 执行已保存卡片（无原生 SQL，适配器侧是 runCard），服务端不应因此硬拒。
+ */
 function sqlArgsReadOnly(args?: Record<string, unknown>): boolean {
   const fields = [args?.query, args?.sql].filter((v) => v !== undefined && v !== null);
-  return fields.length > 0 && fields.every((v) => isReadOnlySql(v));
+  if (fields.length === 0) {
+    return args?.question_id !== undefined && args?.question_id !== null;
+  }
+  return fields.every((v) => isReadOnlySql(v));
 }
 
 function readOnlySqlOk(d: McpToolFacts, bare: string, args?: Record<string, unknown>): boolean {

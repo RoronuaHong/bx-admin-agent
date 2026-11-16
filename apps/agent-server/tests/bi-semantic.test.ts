@@ -302,3 +302,40 @@ test("只批准歧义的一方时不输出信号（另一口径仍是草稿，�
   expect(value.ambiguities).toBeUndefined();
   expect(value.definitions[0].ambiguous).toBeUndefined();
 });
+
+test("时区：双时区定义下 Kolkata/Shanghai 都合规，UTC 违规；toTimeZone 写法也检查", () => {
+  const g = {
+    entries: [{
+      id: "report_timezone", status: "approved",
+      check: {
+        type: "timezone", timezone: "Asia/Shanghai",
+        timezones: ["Asia/Shanghai", "Asia/Kolkata"], others: ["UTC"], serverTimezone: "Asia/Shanghai",
+      },
+    }],
+  };
+  expect(checkCaliber("SELECT count() FROM t WHERE toTimeZone(createdTime, 'Asia/Kolkata') >= today()", g).violations).toEqual([]);
+  expect(checkCaliber("SELECT count() FROM t WHERE toDate(createdTime, 'Asia/Shanghai') = '2026-01-01'", g).violations).toEqual([]);
+  const utc = checkCaliber("SELECT count() FROM t WHERE toDate(createdTime, 'UTC') = '2026-01-01'", g);
+  expect(utc.violations.map((v: { id: string }) => v.id)).toEqual(["report_timezone"]);
+});
+
+test("维度来源：禁用列与合法列同时出现仍判冲突（混合写法不能绕过 reject）", () => {
+  const g = {
+    entries: [{
+      id: "country_dimension", status: "approved",
+      check: { type: "dimension_source", allowed: ["elt_user_full.countryCode"], forbidden: ["elt_app_params.ipCountryCode"] },
+    }],
+  };
+  const mixed = checkCaliber("SELECT u.countryCode, count() FROM film_report.elt_user_full u JOIN film_report.elt_app_params a ON u.guid = a.guid GROUP BY u.countryCode, a.ipCountryCode", g);
+  expect(mixed.violations.map((v: { id: string }) => v.id)).toEqual(["country_dimension"]);
+  expect(checkCaliber("SELECT u.countryCode, count() FROM film_report.elt_user_full u GROUP BY u.countryCode", g).violations).toEqual([]);
+});
+
+test("口径命中：长自然语言问题包含短别名时也能命中（B5 第二路径）", () => {
+  const real = loadGlossary()!;
+  const r = metricDefinitions(real, "已支付订单的订单金额按天统计");
+  expect(r.isError).toBe(false);
+  expect((r.value as any).definitions.map((d: { id: string }) => d.id)).toContain("paid_order");
+  const aliases = caliberValueAliases(real, "已支付订单的订单金额按天统计", new Set());
+  expect(aliases.some((a) => a.column === "orderStatus" && a.literal === "3")).toBe(true);
+});

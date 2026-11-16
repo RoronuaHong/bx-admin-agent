@@ -232,8 +232,11 @@ export async function ingest(inputs: IngestInput[]): Promise<number> {
     const ns = input.namespace || "generic";
     const chunks = chunkText(input.text);
     chunks.forEach((text, i) => {
+      // namespace 编进 id：同名 source 可存在于多个 namespace，id 不含 ns 会互相覆盖（docs 与向量都串）。
+      // generic 不改写，保持既有索引兼容。
+      const idBase = ns && ns !== "generic" ? `${ns}:${input.id}` : input.id;
       added.push({
-        id: `${input.id}#${i}`,
+        id: `${idBase}#${i}`,
         title: input.title,
         source: input.source,
         text,
@@ -282,16 +285,27 @@ async function buildVectors(docs: RagDoc[]): Promise<void> {
   }
 }
 
-/** 删除某个来源（含其全部切片），返回删除条数。 */
-export function removeSource(source: string): number {
+/**
+ * 删除某个来源（含其全部切片），返回删除条数。
+ * namespace 给定时只删本命名空间的切片：同名来源可存在于多个 namespace（如 generic/movie），
+ * 默认轮清理不能把别的 namespace 的语料一起删掉。
+ */
+export function removeSource(source: string, namespace?: string): number {
   const idx = loadIndex();
+  // 与 listSources/search 同口径：专属 namespace 尚无语料时回落到 generic，否则清理会一条都删不掉还打印"已清理"。
+  const ns = namespace ? effectiveNamespace(namespace) : "";
   const before = idx.docs.length;
-  const docs = idx.docs.filter((d) => d.source !== source);
+  const hit = new Set<string>();
+  const docs = idx.docs.filter((d) => {
+    if (d.source !== source) return true;
+    if (ns && !matchesNamespace(d, ns)) return true;
+    hit.add(d.id);
+    return false;
+  });
   saveIndex({ updatedAt: Date.now(), docs });
   const cache = loadVectors();
-  if (cache) {
-    const prefix = `${source}#`;
-    for (const k of Object.keys(cache.vectors)) if (k.startsWith(prefix)) delete cache.vectors[k];
+  if (cache && hit.size) {
+    for (const id of hit) delete cache.vectors[id];
     saveVectors();
   }
   return before - docs.length;

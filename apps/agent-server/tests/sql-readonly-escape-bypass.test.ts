@@ -37,6 +37,23 @@ test("Cluster / 对象存储 / 湖格式表函数整族拒绝", () => {
   }
 });
 
+test("引号包裹的函数名不能绕过表函数/危险函数黑名单", () => {
+  for (const sql of [
+    "SELECT * FROM `url`('http://169.254.169.254/latest/meta-data/')",
+    'SELECT * FROM "url"(\'http://169.254.169.254/\')',
+    "SELECT `load_file`('/etc/passwd')",
+  ]) {
+    expect(isReadOnlySql(sql), sql).toBe(false);
+  }
+});
+
+test("MySQL 可执行注释 /*! 与 -- 无空白不能绕过", () => {
+  expect(isReadOnlySql("SELECT /*! load_file('/etc/passwd') */")).toBe(false);
+  expect(isReadOnlySql("SELECT 1--0; DROP TABLE t")).toBe(false);
+  // 合法的 -- 注释（后随空白）仍要与普通查询一样放行
+  expect(isReadOnlySql("SELECT 1 -- 合法注释\n")).toBe(true);
+});
+
 test("正常的双写引号与含关键字的字面量仍放行", () => {
   for (const sql of [
     "SELECT 'it''s' AS a",

@@ -42,7 +42,8 @@ function walk(dir, out = []) {
 
 const files = walk(root).filter((f) => parsers.isSupportedExt(path.extname(f)));
 const skipped = walk(root).length - files.length;
-const hashes = full ? new Map() : sourceHashes();
+// 指纹也按 namespace 取：否则 --namespace movie 入库后，默认 generic 轮会命中 movie 的 hash 而跳过入库。
+const hashes = full ? new Map() : sourceHashes(namespace);
 
 let added = 0;
 let unchanged = 0;
@@ -64,7 +65,7 @@ for (const abs of files) {
     continue;
   }
   // 变更文件：先清掉旧切片（切片数可能变少，残留会污染检索）。
-  removeSource(rel);
+  removeSource(rel, namespace);
   // 文档级权限：从 frontmatter 就近声明（owners/roles 块列表）；没声明 = 公开（向后兼容老文档）。
   const acl = parsers.extractAclFromFrontmatter(raw);
   const n = await ingest([
@@ -76,13 +77,14 @@ for (const abs of files) {
   );
 }
 
-// 磁盘上已删除的来源：清理索引残留。
+// 磁盘上已删除的来源：只清理本 namespace 的残留。
+// 用 listSources(namespace) 枚举：默认轮不能把 --namespace movie 入库的来源当"磁盘已删除"清掉。
 const onDisk = new Set(files.map((abs) => path.relative(root, abs).split(path.sep).join("/")));
 let removed = 0;
-for (const src of listSources()) {
+for (const src of listSources(namespace)) {
   if (!onDisk.has(src.source)) {
-    removed += removeSource(src.source);
-    console.log(`[rag] 清理已删除来源 ${src.source}`);
+    removed += removeSource(src.source, namespace);
+    console.log(`[rag] 清理已删除来源 ${src.source}（namespace=${namespace}）`);
   }
 }
 

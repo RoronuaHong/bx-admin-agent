@@ -8,16 +8,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { normalizeKnownTables, filterKnownTables } from "./metabase-card-graph.mjs";
-import { buildCaliberGraph, buildCaliberContext } from "./bi-caliber-graph.mjs";
+import { buildCaliberGraph, buildCaliberContext, buildTableTexts } from "./bi-caliber-graph.mjs";
+import { loadGlossary } from "./bi-semantic.mjs";
 import { sameTable, wilson } from "./bi-eval-score.mjs";
 import { holdoutCardIds } from "./bi-eval-holdout.mjs";
 
-const RANK_CUTS = [3, 5, 8, 12];
+const DEFAULT_RANK_CUTS = [3, 5, 8, 12];
+// --top N 截断后，大于 N 的 recall@cut 没有意义（offered 只有 N 条，指标会虚高成 recall@N）。
+const rankCutsFor = (topTables) => DEFAULT_RANK_CUTS.filter((n) => n <= topTables);
 const round = (x) => (x == null ? null : Math.round(x * 1000) / 1000);
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
 
 /** 单题：推荐表（按排名）对期望表的覆盖。 */
-export function scoreRetrieval(expected, offered) {
+export function scoreRetrieval(expected, offered, cuts = DEFAULT_RANK_CUTS) {
   const hitAt = (n) => expected.filter((t) => offered.slice(0, n).some((o) => sameTable(t, o))).length;
   const hit = hitAt(offered.length);
   const offeredHit = offered.filter((o) => expected.some((t) => sameTable(t, o))).length;
@@ -25,7 +28,7 @@ export function scoreRetrieval(expected, offered) {
     recall: hit / expected.length,
     allHit: hit === expected.length,
     precision: offered.length ? offeredHit / offered.length : 0,
-    recallAt: Object.fromEntries(RANK_CUTS.map((n) => [n, hitAt(n) / expected.length])),
+    recallAt: Object.fromEntries(cuts.map((n) => [n, hitAt(n) / expected.length])),
     missing: expected.filter((t) => !offered.some((o) => sameTable(t, o))),
   };
 }
@@ -41,6 +44,7 @@ export function evaluateCaliberRetrieval(
 ) {
   const known = normalizeKnownTables(knownList);
   const opts = { knownTables: [...known], tableTexts };
+  const cuts = rankCutsFor(topTables);
   const fullGraph = leaveOneOut ? null : buildCaliberGraph(cases, opts);
   const rows = [];
   for (const c of cases) {
@@ -54,7 +58,7 @@ export function evaluateCaliberRetrieval(
       retriever === "popularity"
         ? [...graph.tableNodes.values()].sort((a, b) => b.cardCount - a.cardCount).slice(0, topTables).map((t) => t.table)
         : buildCaliberContext(graph, c.question, { k, topTables, ...(textWeight != null ? { textWeight } : {}) }).tables.map((t) => t.table);
-    rows.push({ id: c.id, question: c.question, expected, offered, hidden: [...hidden], ...scoreRetrieval(expected, offered) });
+    rows.push({ id: c.id, question: c.question, expected, offered, hidden: [...hidden], ...scoreRetrieval(expected, offered, cuts) });
   }
   const allHit = rows.filter((r) => r.allHit).length;
   const ci = wilson(allHit, rows.length);
@@ -68,7 +72,7 @@ export function evaluateCaliberRetrieval(
       recallMean: round(mean(rows.map((r) => r.recall))),
       allHit: { rate: rows.length ? round(allHit / rows.length) : null, count: `${allHit}/${rows.length}`, ci95: ci ? ci.map(round) : null },
       precisionMean: round(mean(rows.map((r) => r.precision))),
-      recallAt: Object.fromEntries(RANK_CUTS.map((n) => [n, round(mean(rows.map((r) => r.recallAt[n])))])),
+      recallAt: Object.fromEntries(cuts.map((n) => [n, round(mean(rows.map((r) => r.recallAt[n])))])),
       emptyRetrievals: rows.filter((r) => !r.offered.length).length,
     },
     rows,
@@ -84,8 +88,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const out = val("--out", path.join(root, ".data", "bi-caliber-eval.json"));
   const golden = JSON.parse(fs.readFileSync(path.join(root, "tests", "bi-golden-set.json"), "utf8"));
   const known = JSON.parse(fs.readFileSync(path.join(root, "tests", "bi-known-tables.json"), "utf8"));
-  // 与线上一致：表检索文本取自 bi-known-tables.json 的 tableTexts（bi-metadata-gaps.mjs 导出）。
-  const tableTexts = known.tableTexts || {};
+  // 与线上一致：落盘元数据表文本 + 已批准口径别名，走与线上同一个 buildTableTexts（草稿不进）。
+  const tableTexts = buildTableTexts(null, loadGlossary(), known.tableTexts || {});
   const loo = evaluateCaliberRetrieval(golden.cases, known, { leaveOneOut: true, k, topTables, tableTexts });
   const leaky = evaluateCaliberRetrieval(golden.cases, known, { leaveOneOut: false, k, topTables, tableTexts });
   const popularity = evaluateCaliberRetrieval(golden.cases, known, { leaveOneOut: true, k, topTables, retriever: "popularity", tableTexts });

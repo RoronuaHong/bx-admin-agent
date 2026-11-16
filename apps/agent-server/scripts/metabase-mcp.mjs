@@ -141,9 +141,9 @@ import { renderTableMSchema, renderDatabaseMSchema } from "./metabase-mschema.mj
 import { createLiveValueCache, fillLiveValues } from "./bi-mschema-values.mjs";
 import { buildCardTableIndex, cardsForTable, relatedCards, buildGoldenSet, normalizeKnownTables } from "./metabase-card-graph.mjs";
 import { buildJoinExamples, joinExamplesForTable } from "./bi-join-examples.mjs";
-import { buildCaliberGraph, buildCaliberContext, tableSearchText } from "./bi-caliber-graph.mjs";
+import { buildCaliberGraph, buildCaliberContext, buildTableTexts } from "./bi-caliber-graph.mjs";
 import { evalHiddenTools, evalGateRefusal, heldOutCardIds, hideHeldOut } from "./bi-eval-holdout.mjs";
-import { approvedEntries, caliberValueAliases, fkHealthFor, glossaryTableTerms, loadFkHealth, loadGlossary, metricDefinitions } from "./bi-semantic.mjs";
+import { approvedEntries, caliberValueAliases, fkHealthFor, loadFkHealth, loadGlossary, metricDefinitions } from "./bi-semantic.mjs";
 
 // P1.1 实测取值缓存：get_database_schema(with_values=true) 跨调用复用，TTL 由 bi-mschema-values.mjs 管。
 const liveValueCache = createLiveValueCache();
@@ -170,7 +170,8 @@ async function getCaliberGraph(mb, databaseId, known, tableTexts = {}) {
   const g = await buildGoldenSet(mb);
   const hidden = heldOutCardIds();
   if (hidden.size) return buildCaliberGraph(g.cases.filter((c) => !hidden.has(Number(c.id))), { knownTables: known, tableTexts });
-  const key = `${databaseId}|${[...known].sort().join(",")}|${Object.keys(tableTexts).length}`;
+  // 键必须含 tableTexts 的内容：只数键数量会让词典别名/表描述变更被缓存吃掉 5 分钟，A/B 两 arm 也可能串味。
+  const key = `${databaseId}|${[...known].sort().join(",")}|${JSON.stringify(tableTexts)}`;
   if (_caliberCache.graph && _caliberCache.key === key && now - _caliberCache.ts < CALIBER_TTL_MS) return _caliberCache.graph;
   const graph = buildCaliberGraph(g.cases, { knownTables: known, tableTexts });
   _caliberCache = { ts: now, key, graph };
@@ -720,12 +721,16 @@ const TOOLS = [
         return json("未找到可检索的维度列；请显式传 table + field 指定列。", false);
       }
       const results = [];
+      const skipped = [];
       for (const col of columns) {
         const built = buildValueSearchSql(col.table, col.field, pattern, { limit: n });
         if (!built.ok) continue;
         // 执行经只读护栏 + 资源限制（与 runSql 同款设置），SQL 由本工具内部生成（安全只读）。
         const check = assertSql(built.sql, { glossary: loadGlossary() });
-        if (!check.ok) continue;
+        if (!check.ok) {
+          skipped.push({ table: col.table, field: col.field, reason: check.error || "未通过只读闸门" });
+          continue;
+        }
         const tr = await mb("/dataset", {
           method: "POST",
           body: {
@@ -743,9 +748,12 @@ const TOOLS = [
           if (vals.length) results.push({ table: col.table, field: col.field, values: vals });
         }
       }
+      const skippedNote = skipped.length
+        ? `以下列被只读闸门跳过：${skipped.map((s) => `${s.table}.${s.field}（${s.reason}）`).join("；")}。`
+        : "";
       if (!results.length) {
         return json(
-          `未在任何维度列中找到匹配「${pattern}」的真实取值。可换更具体的词，或显式传 table + field 缩小到单列。`,
+          `未在任何维度列中找到匹配「${pattern}」的真实取值。可换更具体的词，或显式传 table + field 缩小到单列。${skippedNote}`,
           false,
         );
       }
@@ -753,7 +761,7 @@ const TOOLS = [
         .map((r) => `### ${r.table}.${r.field}\n` + r.values.map((v) => `- ${v}`).join("\n"))
         .join("\n\n");
       return json(
-        `库内真实取值（写过滤 / 分组 / 维度条件时用这些，不要凭业务词猜）：\n\n${body}`,
+        `库内真实取值（写过滤 / 分组 / 维度条件时用这些，不要凭业务词猜）：\n\n${body}${skippedNote ? `\n\n${skippedNote}` : ""}`,
         false,
       );
     },
@@ -1244,23 +1252,18 @@ const TOOLS = [
       const metaTables = meta.ok && Array.isArray(meta.data?.tables) ? meta.data.tables : [];
       const qualified = (t) => (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name);
       const known = normalizeKnownTables(metaTables.map(qualified));
-      // 表检索文本：字段/表描述 + 已批准口径的名称与别名（草稿不进线上）。
-      const tableTexts = {};
-      for (const t of metaTables) {
-        const text = tableSearchText(t);
-        if (text) tableTexts[qualified(t).toLowerCase()] = text;
-      }
-      for (const [bareName, terms] of Object.entries(glossaryTableTerms(loadGlossary()))) {
-        const k = Object.keys(tableTexts).find((x) => x.split(".").pop() === bareName) || bareName;
-        tableTexts[k] = `${tableTexts[k] || ""} ${terms}`.trim();
-      }
+      // 表检索文本：字段/表描述 + 已批准口径的名称与别名（草稿不进线上）；与离线评测共用 buildTableTexts。
+      const tableTexts = buildTableTexts(metaTables, loadGlossary());
       const g = await buildGoldenSet(mb);
       if (g.error) return json(g.error, true);
       const graph = await getCaliberGraph(mb, wid, known, tableTexts);
       const ctx = buildCaliberContext(graph, query, { k: Math.max(1, Number(limit) || 5) });
+      const hidden = heldOutCardIds();
+      const visibleCases = hidden.size ? hideHeldOut(g.cases, "id") : g.cases;
       // 已认可查询内联：前几张命中卡片直接附 SQL，省一轮 get_card，也让模型照着现成口径改写而非从零写。
+      // 泄题防线：只能用过滤后的 cases；之前用全量 g.cases，留出卡片的 expected_sql 会被原样回灌给模型。
       if (CALIBER_INLINE_SQL > 0) {
-        const sqlById = new Map(g.cases.map((c) => [Number(c.id), c.expected_sql]));
+        const sqlById = new Map(visibleCases.map((c) => [Number(c.id), c.expected_sql]));
         ctx.matchedCards = ctx.matchedCards.map((c, i) => {
           const sql = i < CALIBER_INLINE_SQL ? sqlById.get(Number(c.id)) : null;
           if (!sql) return c;

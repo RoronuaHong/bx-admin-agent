@@ -3480,8 +3480,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           callId: call.id,
           tool: call.name,
           ...(verdict.serverId ? { serverId: verdict.serverId } : {}),
-          signal: ctx.signal,
-        });
+        }, ctx.signal);
         const argSummary = summarizeArgsForConfirm(call.argsJson);
         // 只读授权勾选：仅「未声明级别」的外部服务器工具可提供（写/破坏性永不适用）。
         const canGrantRead = Boolean(verdict.unknown && verdict.serverId && ctx.allowWrite);
@@ -3612,8 +3611,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               sessionId: ctx.sessionId || "",
               conversationId: ctx.conversationId,
               callId: call.id,
-              signal: ctx.signal,
-            });
+            }, ctx.signal);
             yield {
               type: "clarification_required",
               id: call.id,

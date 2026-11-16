@@ -34,15 +34,17 @@ export function deriveAdaptiveTimeoutMs(opts) {
   const floor = Math.max(500, configured || 30_000);
   const cap = Number(opts?.maxMs) > 0 ? Number(opts.maxMs) : Number.POSITIVE_INFINITY;
   const factor = Math.max(1, Number(opts?.factor) || 2);
-  const percentile = Math.min(0.99, Math.max(0.5, Number(opts?.percentile) || 0.95));
+  const percentile = Math.min(0.999, Math.max(0.5, Number(opts?.percentile) || 0.95));
   const minSamples = Math.max(1, Number(opts?.minSamples) || 5);
   const valid = (Array.isArray(opts?.samples) ? opts.samples : [])
     .filter((n) => Number.isFinite(n) && n > 0)
     .sort((a, b) => a - b);
-  if (valid.length < minSamples) return Math.min(floor, cap);
+  // 冷启动与有样本时一致：都受 floor..cap 夹逼；cap<floor 是配置矛盾，以 floor 为准（保底优先）。
+  const clamp = (x) => (cap < floor ? floor : Math.max(floor, Math.min(x, cap)));
+  if (valid.length < minSamples) return clamp(floor);
   const idx = Math.min(valid.length - 1, Math.floor(valid.length * percentile));
   const derived = Math.ceil(valid[idx] * factor);
-  return Math.max(floor, Math.min(derived, cap));
+  return clamp(derived);
 }
 
 /** 进程内成功延迟环形缓冲：只记成功调用的耗时，供派生函数消费。 */

@@ -41,7 +41,9 @@ export function projectRows(rows, opts) {
         return out;
       })
     : list;
-  const cap = Math.max(1, Math.floor(opts.cap));
+  // cap 缺省时不截断（detailed 语义），不能让 NaN 把 projection 静默切成空数组。
+  const hasCap = Number.isFinite(opts?.cap);
+  const cap = hasCap ? Math.max(1, Math.floor(opts.cap)) : projected.length;
   const limited = projected.slice(0, cap);
   const truncated = projected.length > cap;
   return {

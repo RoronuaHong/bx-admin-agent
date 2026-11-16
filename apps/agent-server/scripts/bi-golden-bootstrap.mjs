@@ -30,11 +30,23 @@ child.stdout.on("data", (d) => {
     if (!line) continue;
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
-    if (msg.id != null && pending.has(msg.id)) { const fn = pending.get(msg.id); pending.delete(msg.id); fn(msg); }
+    if (msg.id != null && pending.has(msg.id)) { const { done } = pending.get(msg.id); pending.delete(msg.id); done(msg); }
   }
 });
 const rpc = (method, params) =>
-  new Promise((res) => { const myId = ++id; pending.set(myId, res); send({ jsonrpc: "2.0", id: myId, method, params }); });
+  new Promise((resolve, reject) => {
+    const myId = ++id;
+    const timer = setTimeout(() => {
+      if (pending.delete(myId)) reject(new Error(`RPC ${method} 超时（30s）：子进程未响应，拒绝静默落盘`));
+    }, 30_000);
+    pending.set(myId, {
+      done: (msg) => { clearTimeout(timer); resolve(msg); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
+    send({ jsonrpc: "2.0", id: myId, method, params });
+  });
+child.on("error", (e) => { for (const p of pending.values()) p.reject(e); pending.clear(); });
+child.on("exit", (code) => { for (const p of pending.values()) p.reject(new Error(`子进程退出 code=${code}`)); pending.clear(); });
 
 (async () => {
   await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "bootstrap", version: "1" } });
@@ -60,18 +72,20 @@ const rpc = (method, params) =>
   const ld = await rpc("tools/call", { name: "list_databases", arguments: { detail: "detailed" } });
   let dbIds = [];
   try { dbIds = (JSON.parse(textOf(ld)).databases || []).map((d) => d.id).filter((x) => x != null); }
-  catch { console.warn("[warn] list_databases 解析失败，白名单将为空"); }
+  catch { throw new Error("list_databases 解析失败：拒绝在空白名单下落盘未归一化基线"); }
+  if (!dbIds.length) throw new Error("list_databases 返回空库列表：拒绝在空白名单下落盘未归一化基线");
   const known = new Set();
   for (const dbId of dbIds) {
     const s = await rpc("tools/call", { name: "get_database_schema", arguments: { database_id: dbId, detail: "detailed" } });
-    try {
-      const obj = JSON.parse(textOf(s));
-      for (const t of obj.tables || []) {
-        const name = typeof t === "string" ? t : t?.table || t?.name;
-        if (name) known.add(String(name).replace(/[`"]/g, "").trim().toLowerCase());
-      }
-    } catch { console.warn(`[warn] db=${dbId} 表清单解析失败，跳过`); }
+    let obj;
+    try { obj = JSON.parse(textOf(s)); }
+    catch { throw new Error(`db=${dbId} 表清单解析失败：拒绝在残缺白名单下落盘未归一化基线`); }
+    for (const t of obj.tables || []) {
+      const name = typeof t === "string" ? t : t?.table || t?.name;
+      if (name) known.add(String(name).replace(/[`"]/g, "").trim().toLowerCase());
+    }
   }
+  if (!known.size) throw new Error("白名单为空：拒绝落盘未归一化基线");
   const knownPath = path.join(root, "tests", "bi-known-tables.json");
   const tables = [...known].sort();
   // tableAudit 是人工/只读 SQL 查证的结论，tableTexts 由 bi-metadata-gaps.mjs 导出，重新导出表清单时都不能冲掉。
@@ -88,19 +102,17 @@ const rpc = (method, params) =>
   console.log(`真实表名白名单已落盘: ${knownPath}（${tables.length} 张表，来自 ${dbIds.length} 个库）`);
 
   // 期望表归一化（裸名补 schema、剔 CTE、标白名单外表），与 bi-golden-normalize.mjs 同一逻辑。
-  if (tables.length) {
-    let cases = payload.cases.map((c) => normalizeGoldenCase(c, knownDoc));
-    // 1.3 准入检查：引用库里已不存在的表（unverifiedTableStatus 含 "missing"，见 bi-known-tables.json 的 tableAudit.missing）
-    // 的样例无法执行，退出黄金集，避免污染评测基线。
-    const missingCases = cases.filter((c) => Object.values(c.unverifiedTableStatus || {}).includes("missing"));
-    if (missingCases.length) {
-      cases = cases.filter((c) => !Object.values(c.unverifiedTableStatus || {}).includes("missing"));
-      console.log(`准入检查：退出引用失效表的 ${missingCases.length} 例（${missingCases.map((c) => "#" + c.id).join(", ")}），基线从 ${payload.cases.length} 例降为 ${cases.length} 例`);
-    }
-    fs.writeFileSync(outPath, JSON.stringify({ ...payload, cases, normalizedAt: new Date().toISOString() }, null, 2));
-    const unverified = cases.filter((c) => c.unverifiedTables?.length).length;
-    console.log(`期望表已归一化；含白名单外表 ${unverified} 例（见各例 unverifiedTables）`);
+  let cases = payload.cases.map((c) => normalizeGoldenCase(c, knownDoc));
+  // 1.3 准入检查：引用库里已不存在的表（unverifiedTableStatus 含 "missing"，见 bi-known-tables.json 的 tableAudit.missing）
+  // 的样例无法执行，退出黄金集，避免污染评测基线。
+  const missingCases = cases.filter((c) => Object.values(c.unverifiedTableStatus || {}).includes("missing"));
+  if (missingCases.length) {
+    cases = cases.filter((c) => !Object.values(c.unverifiedTableStatus || {}).includes("missing"));
+    console.log(`准入检查：退出引用失效表的 ${missingCases.length} 例（${missingCases.map((c) => "#" + c.id).join(", ")}），基线从 ${payload.cases.length} 例降为 ${cases.length} 例`);
   }
+  fs.writeFileSync(outPath, JSON.stringify({ ...payload, cases, normalizedAt: new Date().toISOString() }, null, 2));
+  const unverified = cases.filter((c) => c.unverifiedTables?.length).length;
+  console.log(`期望表已归一化；含白名单外表 ${unverified} 例（见各例 unverifiedTables）`);
   child.stdin.end();
   setTimeout(() => { child.kill(); process.exit(0); }, 200);
 })().catch((e) => { console.error("ERROR:", e); process.exit(1); });

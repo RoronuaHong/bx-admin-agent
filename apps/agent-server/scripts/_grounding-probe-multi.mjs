@@ -34,7 +34,7 @@ async function streamChat(conv, text, agentId, model) {
         if (ev.type === "text") full += ev.text;
         else if (ev.type === "tool_call") rounds++;
         else if (ev.type === "done") { const blocked = /没能取到|支撑回答的数据|不能凭印象|没取得任何数据源|本次没有取得/.test(full); return { full, rounds, blocked }; }
-        else if (ev.type === "error") { console.error("STREAM ERROR", ev); return { full, rounds, blocked: false }; }
+        else if (ev.type === "error") { console.error("STREAM ERROR", ev); return { full, rounds, errored: true }; }
       } catch {}
     }
   }
@@ -59,10 +59,12 @@ const SCENARIOS = [
   let pass = 0, fail = 0;
   for (const s of SCENARIOS) {
     const conv = await createConv(s.agentId);
-    const { full, rounds, blocked } = await streamChat(conv, s.text, s.agentId, model);
+    const { full, rounds, blocked, errored } = await streamChat(conv, s.text, s.agentId, model);
     const empty = full.trim().length === 0;
     let verdict;
-    if (blocked) verdict = "FAIL(被误拦成没取到数据)";
+    // 流出错优先于其它判据：出错前已有部分文本时 full 非空，否则会被误算成 PASS。
+    if (errored) verdict = "ERROR(流转出 error，结论无效)";
+    else if (blocked) verdict = "FAIL(被误拦成没取到数据)";
     else if (empty) verdict = "FAIL(空回复)";
     else verdict = "PASS";
     if (verdict.startsWith("PASS")) pass++; else fail++;

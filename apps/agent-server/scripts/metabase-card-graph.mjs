@@ -241,7 +241,8 @@ export async function buildGoldenSet(mb, { databaseId = null, force = false } = 
 // 建整库卡片→表索引。databaseId 给定时只纳入该库卡片。并发批拉卡片以压低首调延迟。
 export async function buildCardTableIndex(mb, { databaseId = null, force = false } = {}) {
   const now = Date.now();
-  if (!force && _indexCache.index && _indexCache.databaseId === (databaseId ?? _indexCache.databaseId) && now - _indexCache.ts < CARD_INDEX_TTL_MS) {
+  // 缓存命中必须精确比较 databaseId：null 表示整库，不能用 ?? 回退成缓存自己的值（那样恒真、跨库串味）。
+  if (!force && _indexCache.index && _indexCache.databaseId === databaseId && now - _indexCache.ts < CARD_INDEX_TTL_MS) {
     return _indexCache.index;
   }
   const r = await mb("/card");

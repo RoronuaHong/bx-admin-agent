@@ -181,9 +181,12 @@ export function lintSql(input) {
       message: "SHOW CREATE TABLE 输出建表 DDL（含实现细节）：查结构请用 DESCRIBE <table> 或元数据接口",
     });
   }
-  // 笛卡尔积：JOIN 无 ON = 笛卡尔积（行数相乘）。
-  if ((sql.match(/\bjoin\b/gi) || []).length > 0 && !/\bon\b/i.test(sql)) {
-    findings.push({ code: "JOIN_WITHOUT_ON", message: "JOIN 没有 ON 条件：这是笛卡尔积，行数会相乘" });
+  // 笛卡尔积：逐个 JOIN 检查，只要有一个 JOIN 没有对应 ON 就报。
+  // 旧版只判「整条 SQL 出现过 ON」，A JOIN B ON … JOIN C（C 无 ON）会漏报。
+  const joinCount = (sql.match(/\bjoin\b/gi) || []).length;
+  const onCount = (sql.match(/\bon\b/gi) || []).length;
+  if (joinCount > 0 && onCount < joinCount) {
+    findings.push({ code: "JOIN_WITHOUT_ON", message: `有 ${joinCount} 个 JOIN 但只有 ${onCount} 个 ON：缺 ON 的 JOIN 是笛卡尔积，行数会相乘` });
   }
   // 逗号隐式交叉连接：FROM a, b —— 老写法，同样是笛卡尔积但连 JOIN 都没有，最容易漏看。
   if (!meta && /\bfrom\s+[a-z_][\w$]*[.`"]?[\w$]*[^\s]*,\s*[a-z_][\w$]*/i.test(sql)) {
@@ -272,7 +275,6 @@ export function lintSql(input) {
     });
   }
   // 多表 JOIN 且整体无时间窗：每个 JOIN 都放大扫描，无范围过滤时整条链路全扫。
-  const joinCount = (sql.match(/\bjoin\b/gi) || []).length;
   if (!meta && joinCount >= 2 && longOrNoWindow) {
     findings.push({
       code: "MULTI_JOIN_UNBOUNDED",

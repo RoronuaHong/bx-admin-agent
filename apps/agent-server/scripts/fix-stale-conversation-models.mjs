@@ -23,7 +23,7 @@ await client.connect();
 const coll = client.db(dbName).collection("chat_conversations");
 
 const stale = await coll
-  .find({ model: { $type: "string", $ne: "", $ne: "auto" } })
+  .find({ model: { $type: "string", $nin: ["", "auto"] } })
   .project({ id: 1, title: 1, model: 1 })
   .toArray();
 const bad = stale.filter((doc) => !valid.has(String(doc.model || "").trim()));

@@ -32,7 +32,7 @@ async function post(path, body, withCookie) {
         if (ev.type === "text") { full += ev.text; console.log(`[text] len=${ev.text.length}`); }
         else if (ev.type === "tool_call") console.log(`[tool_call] ${ev.name || ""}`);
         else if (ev.type === "tool_result") console.log(`[tool_result] ${String(ev.text || "").slice(0, 60)}`);
-        else if (ev.type === "confirmation_required") console.log(`[confirm] ${ev.callId}`);
+        else if (ev.type === "confirmation_required") console.log(`[confirm] ${ev.id}`);
         else if (ev.type === "done") console.log(`[done] full_len=${full.length}`);
         else if (ev.type === "error") console.log(`[ERROR] ${JSON.stringify(ev).slice(0, 300)}`);
         else console.log(`[${ev.type}]`);

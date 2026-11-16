@@ -77,7 +77,8 @@ describe("rag 命名空间回落（读路径回落、写路径不回落）", () 
     const n = await ingest([{ id: "x.md", title: "T", source: "x.md", text: "内容一", hash: "h1", namespace: "support" }]);
     expect(n).toBe(1);
     const raw = JSON.parse(fs.readFileSync(path.join(dir, "index.json"), "utf8"));
-    const doc = raw.docs.find((d: { id: string }) => d.id === "x.md#0");
+    // 非 generic 的切片 id 带 namespace 前缀：同名 source 跨 namespace 不再互相覆盖。
+    const doc = raw.docs.find((d: { id: string }) => d.id === "support:x.md#0");
     expect(doc.namespace).toBe("support");
     // 历史未打 namespace 字段的文档归 generic：由 matchesNamespace 的向后兼容分支承担（[A] 隐式覆盖）
   });

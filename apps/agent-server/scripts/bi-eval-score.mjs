@@ -221,8 +221,10 @@ const round = (x) => (x == null ? null : Math.round(x * 1000) / 1000);
 
 export function summarize(results) {
   const real = results.filter((r) => !r.selfCheck && !r.error);
-  const scored = results.filter((r) => !r.error); // --dry 自检条目也参与打分，便于核对评分函数
-  const rate = (key, pool = scored) => {
+  const selfChecks = results.filter((r) => r.selfCheck && !r.error);
+  // 能力指标一律用 real 池：--dry 自检条目是人为构造的，混进分母会抬高通过率，
+  // 且与 leaked / cardShortcuts（一直用 real）口径不一致。自检条数单列，便于核对评分函数。
+  const rate = (key, pool = real) => {
     const known = pool.filter((r) => r[key] !== null && r[key] !== undefined);
     const ok = known.filter((r) => r[key]).length;
     const ci = wilson(ok, known.length);
@@ -233,15 +235,16 @@ export function summarize(results) {
       unknown: pool.length - known.length,
     };
   };
-  const complete = scored.filter((r) => !r.expectedIncomplete);
+  const complete = real.filter((r) => !r.expectedIncomplete);
   const mean = (key) => {
-    const xs = scored.map((r) => r[key]).filter((x) => typeof x === "number");
+    const xs = real.map((r) => r[key]).filter((x) => typeof x === "number");
     return xs.length ? round(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
   };
   return {
     scorerVersion: SCORER_VERSION,
     total: results.length,
     realRuns: real.length,
+    selfChecks: selfChecks.length,
     errors: results.filter((r) => r.error).length,
     valid: rate("valid"),
     firstAttemptOk: rate("firstAttemptOk"),
@@ -249,15 +252,15 @@ export function summarize(results) {
     joinCorrect: rate("joinCorrect"),
     // 去掉期望表里含白名单外表的用例（期望表可能不全，判分偏宽）后的 JoinCorrect
     joinCorrectComplete: rate("joinCorrect", complete),
-    expectedIncomplete: scored.length - complete.length,
+    expectedIncomplete: real.length - complete.length,
     // 金样口径会被线上闸门拒绝的题（模型照着做也跑不通）单列，另报剔除后的 JoinCorrect
-    goldBlocked: scored.filter((r) => r.goldBlocked).length,
-    joinCorrectReachable: rate("joinCorrect", scored.filter((r) => !r.goldBlocked)),
+    goldBlocked: real.filter((r) => r.goldBlocked).length,
+    joinCorrectReachable: rate("joinCorrect", real.filter((r) => !r.goldBlocked)),
     joinCorrectAny: rate("joinCorrectAny"),
     caliberOk: rate("caliberOk"),
     valueMatch: rate("valueMatch"),
     // 按规则分列：单条规则（如时区）冲突多时不至于淹没其它口径
-    caliberByRule: scored.reduce((acc, r) => {
+    caliberByRule: real.reduce((acc, r) => {
       const bump = (id, key) => {
         acc[id] ||= { checked: 0, violated: 0 };
         acc[id].checked++;
@@ -273,8 +276,9 @@ export function summarize(results) {
     // executed=false 的执行类调用（同轮重复 / 闸门拒绝 / 暂缓）不计入 attempts，单独计数
     skippedCallsTotal: real.reduce((s, r) => s + (r.skippedCalls || 0), 0),
     cardShortcuts: real.filter((r) => r.cardShortcut).length,
-    // 尝试取留出卡片 / 黄金集的用例数；其中 MCP 没拦（未见 [eval-holdout] 拒绝）的才是真泄题
+    // 尝试取留出卡片 / 黄金集的用例数；只有「该次调用自己」收到 [eval-holdout] 才算被拦，
+    // 不能用全局 evalModeSeen——模型调过任一带标记的工具就把后续真实泄题抹成 0。
     leakAttempts: real.filter((r) => r.leaks?.length).length,
-    leaked: real.filter((r) => r.leaks?.length && !r.evalModeSeen).length,
+    leaked: real.filter((r) => r.leaks?.some((l) => !l.blocked)).length,
   };
 }

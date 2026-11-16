@@ -6,6 +6,7 @@
 // 节点：表（白名单 schema.table）、卡片（id/name/tables）。
 // 边：card→table（用到的表）、table↔table（共现于同一卡片，权重=共现次数）、card↔card（共享表）。
 import { normalizeKnownTables } from "./metabase-card-graph.mjs";
+import { glossaryTableTerms } from "./bi-semantic.mjs";
 
 const CJK = /[一-龥]+/g;
 
@@ -31,6 +32,23 @@ function overlap(a, b) {
 export function tableSearchText(table) {
   const parts = [table?.description, ...(table?.fields || []).map((f) => f?.description)];
   return parts.filter((s) => typeof s === "string" && s.trim()).join(" ").slice(0, 4000);
+}
+
+/** 线上与离线共用的表检索文本：元数据描述 + 已批准口径的名称/别名（草稿不进）。 */
+export function buildTableTexts(tables, glossary = null, baseTexts = null) {
+  const qualified = (t) => (t?.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t?.name);
+  // baseTexts：离线评测读到的已落盘元数据文本（bi-known-tables.json.tableTexts），与线上同源。
+  const texts = { ...(baseTexts || {}) };
+  for (const t of tables || []) {
+    const text = tableSearchText(t);
+    const key = qualified(t);
+    if (text && key) texts[key.toLowerCase()] = text;
+  }
+  for (const [bareName, terms] of Object.entries(glossaryTableTerms(glossary))) {
+    const k = Object.keys(texts).find((x) => x.split(".").pop() === bareName) || bareName;
+    texts[k] = `${texts[k] || ""} ${terms}`.trim();
+  }
+  return texts;
 }
 
 // 从黄金集卡片构建口径图。cards: [{id, name/cardTitle/question, expected_sql, tables}]。
@@ -210,6 +228,7 @@ export function buildCaliberContext(graph, query, { k = 5, topTables = 12, prima
   const seen = new Set(topCards.map((c) => c.card.id));
   const relatedCards = [];
   for (const { card } of topCards) {
+    if (relatedCards.length >= 5) break; // 上限要在外层也判：内层 break 只出内层，默认 k=5 时会返回 9 条
     const co = graph.cardCo.get(card.id);
     if (!co) continue;
     for (const [id, w] of co) {

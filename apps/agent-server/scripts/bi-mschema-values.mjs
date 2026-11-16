@@ -89,7 +89,8 @@ export async function fillLiveValues({
       if (Array.isArray(v) && v.length) {
         overrides.set(f.name, v);
         stats.succeeded++;
-      } else if (v === null) {
+      } else {
+        // 空数组（DISTINCT 无结果）和异常 null 一样都是「没有可选值」，都要计入，否则 attempted 与分母不自洽。
         stats.noValues++;
       }
     });

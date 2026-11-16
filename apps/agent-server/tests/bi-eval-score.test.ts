@@ -182,7 +182,7 @@ test("summarize：只在已知样本上算分母，附 Wilson 区间；期望表
   const s = summarize([
     { id: 1, valid: true, ex: true, joinCorrect: true, firstAttemptOk: true, attempts: 1, skippedCalls: 2 },
     { id: 2, valid: true, ex: null, joinCorrect: false, firstAttemptOk: false, attempts: 3, expectedIncomplete: true, skippedCalls: 1 },
-    { id: 3, valid: false, ex: false, joinCorrect: null, firstAttemptOk: false, attempts: 0, leaks: [{ tool: "get_golden_set" }], evalModeSeen: true },
+    { id: 3, valid: false, ex: false, joinCorrect: null, firstAttemptOk: false, attempts: 0, leaks: [{ tool: "get_golden_set", blocked: true }], evalModeSeen: true },
   ]);
   expect(s.valid.count).toBe("2/3");
   expect(s.ex.count).toBe("1/2");
@@ -194,4 +194,27 @@ test("summarize：只在已知样本上算分母，附 Wilson 区间；期望表
   expect(s.leakAttempts).toBe(1);
   expect(s.leaked).toBe(0);
   expect(s.joinCorrect.ci95).toHaveLength(2);
+});
+
+test("leaked：按单次调用是否收到拦截标记判定，全局 evalModeSeen 不抹平真实泄题", () => {
+  const s = summarize([
+    { id: 1, valid: true, leaks: [{ tool: "get_golden_set", blocked: true }], evalModeSeen: true },
+    { id: 2, valid: true, leaks: [{ tool: "get_card", cardId: 96, blocked: false }], evalModeSeen: true },
+  ]);
+  expect(s.leakAttempts).toBe(2);
+  expect(s.leaked).toBe(1);
+});
+
+test("summarize：自检条目不进能力指标分母，单列 selfChecks", () => {
+  const s = summarize([
+    { id: 1, valid: true, ex: true, joinCorrect: true, firstAttemptOk: true, attempts: 1 },
+    { id: 2, valid: false, ex: false, joinCorrect: false, firstAttemptOk: false, attempts: 1, selfCheck: true },
+  ]);
+  expect(s.total).toBe(2);
+  expect(s.realRuns).toBe(1);
+  expect(s.selfChecks).toBe(1);
+  expect(s.valid.count).toBe("1/1");
+  expect(s.ex.count).toBe("1/1");
+  expect(s.joinCorrect.count).toBe("1/1");
+  expect(s.caliberByRule).toEqual({});
 });

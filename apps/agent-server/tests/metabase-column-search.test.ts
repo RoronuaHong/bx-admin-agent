@@ -32,7 +32,7 @@ test("参数注入安全：单引号被翻倍转义，恶意文本整体落在 L
   expect(sql).toContain("x''; DROP TABLE system.columns; --");
   // 注：isReadOnlySql 的引号剥离是正则启发式，对 '' 转义偏保守（会误判为多条），
   // 但 ClickHouse 把 '' 解析为一个引号，原意仍是单条 SELECT；真实放行口径见测试1的良性 case。
-  expect(sql).toMatch(/ILIKE '%x''; DROP TABLE system\.columns; --%'/);
+  expect(sql).toContain("positionCaseInsensitive(name, 'x''; DROP TABLE system.columns; --')");
 });
 
 test("空 pattern 被拒；limit 被夹到合法范围", () => {
@@ -48,7 +48,7 @@ test("空 pattern 被拒；limit 被夹到合法范围", () => {
 test("SQL 形态通用、跨库、列名子串匹配，不写死任何业务词", () => {
   const { sql } = buildColumnSearchSql("cancel_reason");
   expect(sql).toContain("FROM system.columns");
-  expect(sql).toContain("name ILIKE '%cancel_reason%' OR comment ILIKE '%cancel_reason%'");
+  expect(sql).toContain("positionCaseInsensitive(name, 'cancel_reason') > 0 OR positionCaseInsensitive(comment, 'cancel_reason') > 0");
   expect(sql).toContain("ORDER BY database, table, name");
   // 断言没有任何业务表名/指标名被写死。
   expect(sql).not.toMatch(/unsubscribe|churn|retention|gmv|profit/i);

@@ -57,6 +57,8 @@ if (fs.existsSync(knownPath)) {
 // 会把留出卡片内容带给模型的调用：取黄金集，或按 id 取/执行留出卡片。评测模式开着时这些会被 MCP 拒绝，
 // 记下来用于核查（evalModeSeen=false 且 leaks 非空 = 这一例确实泄题了）。
 function leakOf(tool, a, heldOut) {
+  // get_caliber_context 的内联 SQL 已在服务端按 holdout 过滤，本身不再是泄题调用，不能记进来；
+  // 否则每次正常调用都会变成 leakAttempts，且若它带拦截标记还会全局抹平其它真实泄题。
   if (tool === "get_golden_set") return { tool };
   const id = cardIdArg(tool, a);
   if (id != null && heldOut.has(Number(id))) return { tool, cardId: Number(id) };
@@ -108,10 +110,14 @@ async function runOneCase(question, model, heldOut) {
         calls.set(ev.id, { name: ev.name, args: ev.args });
         tools.push(tool);
         const leak = leakOf(tool, a, heldOut);
-        if (leak) leaks.push(leak);
+        if (leak) leaks.push({ ...leak, id: ev.id, blocked: false });
       }
       if (ev.type === "tool_result") {
-        if (typeof ev.text === "string" && ev.text.includes(HOLDOUT_MARK)) evalModeSeen = true;
+        if (typeof ev.text === "string" && ev.text.includes(HOLDOUT_MARK)) {
+          evalModeSeen = true;
+          // 只标记「这次调用」被拦截：别的调用带标记不代表本例的泄题也消失了
+          for (const l of leaks) if (l.id === ev.id) l.blocked = true;
+        }
         if (!isExecutionTool(ev.name)) continue;
         // executed=false：同轮重复被跳过 / 安全闸门拒绝 / 暂缓，服务端根本没执行，不算一次尝试。
         if (ev.executed === false) skippedCalls++;

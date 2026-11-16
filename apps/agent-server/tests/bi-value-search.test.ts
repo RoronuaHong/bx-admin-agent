@@ -32,11 +32,11 @@ const META = {
   },
 };
 
-test("裸表名：拼出单表去重 ILIKE 查询，默认 LIMIT 20", () => {
+test("裸表名：拼出单表字面包含查询，默认 LIMIT 20", () => {
   const r = buildValueSearchSql("elt_app_params", "apkChannel", "IN8");
   expect(r.ok).toBe(true);
   expect(r.sql).toContain("FROM `elt_app_params`");
-  expect(r.sql).toContain("`apkChannel` ILIKE '%IN8%'");
+  expect(r.sql).toContain("positionCaseInsensitive(`apkChannel`, 'IN8') > 0");
   expect(r.sql).toMatch(/LIMIT 20$/);
 });
 
@@ -55,11 +55,18 @@ test("schema.table：两段分别加反引号；多段/注入一律拒绝", () =
 
 test("pattern：空值拒绝、单引号/反斜杠转义、超长截断；limit 有上限", () => {
   expect(buildValueSearchSql("t", "f", "  ").ok).toBe(false);
-  expect(buildValueSearchSql("t", "f", "O'Brien").sql).toContain("%O''Brien%");
-  expect(buildValueSearchSql("t", "f", "a\\b").sql).toContain("%a\\\\b%");
-  expect(buildValueSearchSql("t", "f", "x".repeat(200)).sql).toContain(`%${"x".repeat(100)}%`);
+  expect(buildValueSearchSql("t", "f", "O'Brien").sql).toContain("positionCaseInsensitive(`f`, 'O''Brien') > 0");
+  expect(buildValueSearchSql("t", "f", "a\\b").sql).toContain("positionCaseInsensitive(`f`, 'a\\\\b') > 0");
+  expect(buildValueSearchSql("t", "f", "x".repeat(200)).sql).toContain(`'${"x".repeat(100)}'`);
   expect(buildValueSearchSql("t", "f", "x", { limit: 999 }).sql).toMatch(/LIMIT 200$/);
   expect(buildValueSearchSql("t", "f", "x", { limit: 0 }).sql).toMatch(/LIMIT 20$/);
+});
+
+test("pattern 里的 %/_ 按字面处理，不再被 ILIKE 当通配符", () => {
+  const r = buildValueSearchSql("t", "f", "50%_VIP");
+  expect(r.ok).toBe(true);
+  expect(r.sql).toContain("positionCaseInsensitive(`f`, '50%_VIP') > 0");
+  expect(r.sql).not.toContain("ILIKE");
 });
 
 test("生成的 SQL 能过自己的只读闸门（否则工具会静默跳过所有列）", () => {

@@ -27,11 +27,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = path.dirname(fileURLToPath(import.meta.url));
-const traceDir =
+let traceDir =
   process.env.AGENT_DATA_DIR != null
     ? path.join(process.env.AGENT_DATA_DIR, "traces")
     : path.join(repo, "..", ".data", "traces");
-const base = process.env.AGENT_BASE_URL || "http://127.0.0.1:8787";
+let base = process.env.AGENT_BASE_URL || "http://127.0.0.1:8787";
 
 const ACCIDENT_RUN = "run_c284e83d-e327-458c-ae6c-52de5a0d8bb1";
 const args = process.argv.slice(2);
@@ -121,10 +121,13 @@ async function main() {
   if (!mcpId) {
     const list = await api("/chat/mcp/servers", "GET");
     const servers = list.json?.available || list.json?.servers || [];
-    const bi = servers.find(
-      (s) => s.slot === "builtin" && /bi|metabase|business|数仓|分析/.test(String(s.id + " " + (s.label || ""))),
-    );
-    mcpId = bi?.id || (Array.isArray(servers) && servers[0]?.id);
+    // 响应里没有 slot 字段（slot 只在 hub.ts 内部），用 id/label 关键词识别 BI 连接器。
+    const bi = servers.find((s) => /bi|metabase|business|数仓|分析/i.test(String(s.id + " " + (s.label || ""))));
+    // 找不到就留空并明确报错：退回 servers[0] 会在无关连接器上跑出误导性的验收结论。
+    if (!bi && servers.length) {
+      console.warn("[stall-replay] 未找到 BI 连接器，已列出的:", servers.map((s) => s.id).join(", "));
+    }
+    mcpId = bi?.id;
   }
   if (mcpId) {
     const en = await api("/chat/mcp/servers", "PUT", { conversationId: convId, enabled: [mcpId] });
@@ -182,10 +185,14 @@ async function main() {
       if (ev.type === "tool_result")
         toolResults.push({ name: ev.name, ok: ev.ok, text: (ev.text || "").slice(0, 160) });
       if (ev.type === "error") {
-        errors.push(ev.text || JSON.stringify(ev).slice(0, 200));
-        if (is429Notice(ev.text)) notice429.push(ev.text);
+        // 服务端 error 事件字段是 message / error.defaultMessage，不是 text（src/chat.ts）。
+        const msg = ev.message || ev.error?.defaultMessage || ev.text || "";
+        errors.push(msg || JSON.stringify(ev).slice(0, 200));
+        if (is429Notice(msg)) notice429.push(msg);
       }
-      if ((ev.type === "notice" || ev.type === "model_notice") && is429Notice(ev.text)) notice429.push(ev.text);
+      if ((ev.type === "notice" || ev.type === "model_notice") && is429Notice(ev.text || ev.message)) {
+        notice429.push(ev.text || ev.message);
+      }
     }
   }
   const elapsedMs = Date.now() - start;

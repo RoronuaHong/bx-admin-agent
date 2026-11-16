@@ -32,7 +32,8 @@ export function buildValueSearchSql(table, field, pattern, opts = {}) {
   const limit = Number.isFinite(opts.limit) && opts.limit > 0 ? Math.min(opts.limit, 200) : 20;
   const [schema, name] = parts.length === 2 ? parts : [null, parts[0]];
   const tQual = schema ? `\`${schema}\`.\`${name}\`` : `\`${name}\``;
-  const sql = `SELECT DISTINCT \`${f}\` AS v FROM ${tQual} WHERE \`${f}\` ILIKE '%${safe}%' AND \`${f}\` != '' LIMIT ${limit}`;
+  // 字面包含：不用 ILIKE（pattern 里的 %/_ 会被当通配符，字面搜索扩大为通配甚至近似全表扫描）。
+  const sql = `SELECT DISTINCT \`${f}\` AS v FROM ${tQual} WHERE positionCaseInsensitive(\`${f}\`, '${safe}') > 0 AND \`${f}\` != '' LIMIT ${limit}`;
   return { ok: true, sql, table: t, field: f };
 }
 

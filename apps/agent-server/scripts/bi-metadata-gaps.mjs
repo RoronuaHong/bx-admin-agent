@@ -83,11 +83,13 @@ if (isMain) {
 
   const knownPath = path.join(root, "tests", "bi-known-tables.json");
   const knownDoc = JSON.parse(fs.readFileSync(knownPath, "utf8"));
-  const tableTexts = {};
+  // 与 bootstrap 一致：单次单库导出不能冲掉其它库已落盘的表文本。
+  const tableTexts = { ...(knownDoc.tableTexts || {}) };
+  let updated = 0;
   for (const t of meta.tables || []) {
     const text = tableSearchText(t);
-    if (text) tableTexts[(t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name).toLowerCase()] = text;
+    if (text) { tableTexts[(t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name).toLowerCase()] = text; updated++; }
   }
   fs.writeFileSync(knownPath, JSON.stringify({ ...knownDoc, tableTexts }, null, 2));
-  console.log(`表检索文本已写入 ${knownPath}（${Object.keys(tableTexts).length} 张表有描述文本）`);
+  console.log(`表检索文本已写入 ${knownPath}（本次更新 ${updated} 张，累计 ${Object.keys(tableTexts).length} 张有描述文本）`);
 }

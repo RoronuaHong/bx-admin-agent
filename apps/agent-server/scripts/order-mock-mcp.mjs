@@ -127,7 +127,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params || {};
   switch (name) {
     case "order_search": {
-      let list = ORDERS;
+      // 文档说「全部缺省返回最近订单」：先按 created_at 降序，再套过滤，避免依赖插入顺序。
+      let list = [...ORDERS].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
       if (args.order_id) list = list.filter((o) => o.order_id === String(args.order_id).trim());
       if (args.user_id) list = list.filter((o) => o.user_id === String(args.user_id).trim());
       if (args.status) list = list.filter((o) => o.status === String(args.status).trim().toLowerCase());

@@ -23,6 +23,10 @@ export function auditCards(cases, glossary) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const outIdx = args.indexOf("--out");
+  if (outIdx >= 0 && !args[outIdx + 1]) {
+    console.error("--out 需要一个路径参数");
+    process.exit(2);
+  }
   const out = path.resolve(root, outIdx >= 0 ? args[outIdx + 1] : ".data/bi-caliber-audit.json");
   const golden = JSON.parse(fs.readFileSync(path.join(root, "tests", "bi-golden-set.json"), "utf8"));
   const glossary = loadGlossary();

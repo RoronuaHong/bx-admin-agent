@@ -18,12 +18,16 @@ const qMap = fs.existsSync(questionsPath) ? JSON.parse(fs.readFileSync(questions
 const source = applyGoldenQuestions(golden.cases, qMap);
 let changed = 0;
 let questionChanged = 0;
-const cases = source.map((c, i) => {
+const normalized = source.map((c, i) => {
   const n = normalizeGoldenCase(c, known);
   if (JSON.stringify(n.tables) !== JSON.stringify(c.tables) || JSON.stringify(n.unverifiedTables) !== JSON.stringify(c.unverifiedTables)) changed++;
   if (c.question !== golden.cases[i].question || c.cardTitle !== golden.cases[i].cardTitle) questionChanged++;
   return n;
 });
+// 与 bootstrap 同一准入逻辑：剔除引用失效表（tableAudit.missing）的样例，避免离线归一化反向污染基线。
+const missingCases = normalized.filter((c) => Object.values(c.unverifiedTableStatus || {}).includes("missing"));
+const cases = missingCases.length ? normalized.filter((c) => !Object.values(c.unverifiedTableStatus || {}).includes("missing")) : normalized;
+if (missingCases.length) console.log(`准入检查：退出引用失效表的 ${missingCases.length} 例（${missingCases.map((c) => "#" + c.id).join(", ")}）`);
 const unverified = cases.filter((c) => c.unverifiedTables?.length);
 console.log(`期望表有变化 ${changed}/${cases.length} 例；问题改写有变化 ${questionChanged} 例；含白名单外表 ${unverified.length} 例：`);
 for (const c of unverified) console.log(`  #${c.id} ${c.question} → ${c.unverifiedTables.join(", ")}`);
