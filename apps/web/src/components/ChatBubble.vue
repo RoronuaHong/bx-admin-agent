@@ -123,7 +123,9 @@ function stepSegments(step: { result?: string }): StepSegment[] {
 </script>
 
 <template>
-  <div class="row" :class="b.role">
+  <!-- data-bubble-id：对话大纲浮层（docs/conversation-outline-panel-plan.md）的跳转锚点；
+       值是运行时序号（不落库），只在本页面会话内寻址。tabindex="-1" 供跳转后落焦，不进 Tab 序列。 -->
+  <div class="row" :class="b.role" :data-bubble-id="b.id" tabindex="-1">
     <p v-if="b.role === 'notice'" class="model-switch">{{ b.text }}</p>
     <!-- has-chart：带图表的气泡要给确定宽度（否则气泡按文字收缩，图表卡片的百分比宽度会塌成窄条）。 -->
     <div v-else class="bubble-wrap" :class="{ 'has-chart': !!b.charts?.length }">

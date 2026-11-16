@@ -12,6 +12,7 @@ import {
 } from "vue";
 import { useRouter } from "vue-router";
 import BackToTop from "../components/BackToTop.vue";
+import ConversationOutline from "../components/ConversationOutline.vue";
 import ModelSelect from "../components/ModelSelect.vue";
 import PromptBox from "../components/PromptBox.vue";
 import ToolsSearch from "../components/ToolsSearch.vue";
@@ -1783,6 +1784,68 @@ function showEarlierMessages() {
     el.scrollTop = el.scrollHeight - fromBottom;
   });
 }
+
+/* —— 对话大纲浮层（docs/conversation-outline-panel-plan.md）：右缘悬浮面板列出本会话的用户指令，点击跳转。 —— */
+interface OutlineItem {
+  id: number;
+  label: string;
+}
+const OUTLINE_LABEL_MAX = 48;
+/**
+ * 大纲条目文案：压平空白、超长截断；纯图片消息给占位（沿用待发队列「仅图片」的占位惯例）。
+ */
+function outlineLabel(b: Bubble): string {
+  const raw = (b.text || "").replace(/\s+/g, " ").trim();
+  if (raw) return raw.length > OUTLINE_LABEL_MAX ? `${raw.slice(0, OUTLINE_LABEL_MAX)}…` : raw;
+  const n = b.images?.length ?? 0;
+  if (n) return tx(`图片 ×${n}`, `Images ×${n}`, `Imagens ×${n}`, `छवियाँ ×${n}`);
+  return tx("（无文本）", "(no text)", "(sem texto)", "(कोई पाठ नहीं)");
+}
+/**
+ * 大纲派生：只读 user 气泡的 text、其余气泡只读 role。
+ * computed 依赖是细粒度的——助手气泡流式追加 text 不会触碰这里的依赖，面板在生成全程零重算零抖动；
+ * 新增/删除气泡（含用户新消息）才会使它更新。
+ */
+const conversationOutline = computed<OutlineItem[]>(() => {
+  const out: OutlineItem[] = [];
+  for (const b of current.value?.bubbles ?? []) {
+    if (b.role !== "user") continue;
+    out.push({ id: b.id, label: outlineLabel(b) });
+  }
+  return out;
+});
+
+/** 大纲面板开关与当前高亮项。切换会话先清高亮，防止上一会话的残影。 */
+const outlineOpen = ref(false);
+const activeOutlineId = ref<number | null>(null);
+watch(currentId, () => {
+  activeOutlineId.value = null;
+});
+
+/** 跳转目标的窗口余量：让目标行进窗后再多留几条上下文，避免它贴在窗口边缘。 */
+const OUTLINE_WINDOW_MARGIN = 20;
+
+/**
+ * 大纲跳转：目标在渲染窗口（最近 60 条）之外时先扩窗，再 scrollIntoView + 落焦。
+ * 不强制回底——向上跳后 nearBottom() 自然置 followBottom=false，流式增量不会把用户拽回底部，
+ * 滚回底部附近即自动恢复跟随（onThreadScroll 既有逻辑）。
+ */
+function jumpToOutline(id: number) {
+  const all = current.value?.bubbles ?? [];
+  const index = all.findIndex((b) => b.id === id);
+  if (index < 0) return; // 运行时序号失效（HMR/刷新后 seq 重编）时静默忽略
+  const need = all.length - index;
+  if (need > threadWindow.value) threadWindow.value = need + OUTLINE_WINDOW_MARGIN;
+  if (isMobile.value) outlineOpen.value = false; // 移动端跳转后收起面板，不遮刚滚到的内容
+  void nextTick(() => {
+    const el = threadEl.value?.querySelector<HTMLElement>(`[data-bubble-id="${id}"]`);
+    if (!el) return;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    el.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+    el.focus({ preventScroll: true }); // 行有 tabindex="-1"，落焦避免面板收起后焦点悬空
+  });
+}
+
 
 /**
  * 发送 ⇄ 停止是两个不同按钮（v-if 互换）：点了之后原来那个按钮从 DOM 里消失，焦点掉到 body，
@@ -6769,6 +6832,18 @@ provide(bubbleContextKey, {
              threshold 用 120（约一个气泡高）：对话区可滚高度常常只有一两百像素（几轮对话），
              沿用页面级的 240 会几乎不出现。 -->
         <BackToTop :threshold="120" avoid-selector=".composer" focus-target=".thread" />
+
+        <!-- 对话大纲浮层（docs/conversation-outline-panel-plan.md）：右缘悬浮，列出本会话用户指令，点击跳转。
+             移动端打开侧栏抽屉时隐藏：抽屉 z-60 与本浮层同档且 DOM 靠后，同 z 会盖住遮罩，直接隐藏最稳。
+             跳转逻辑在页面（要扩 threadWindow + 滚动 .thread），组件只管展示与高亮跟踪。 -->
+        <ConversationOutline
+          v-show="!(isMobile && sidebarOpen)"
+          v-model:open="outlineOpen"
+          :items="conversationOutline"
+          :active-id="activeOutlineId"
+          @jump="jumpToOutline"
+          @active="activeOutlineId = $event"
+        />
 
       </div>
 
