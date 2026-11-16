@@ -74,6 +74,8 @@ export interface ChatStreamHost<T extends StreamReply> {
   stickThinkingToBottom(): void;
   scheduleConfirmExpiry(reply: T, expiresInMs?: number): void;
   localizeError(token: LocalizedToken | undefined, fallback: string): string;
+  /** 任务被抢占 / 中止时追加到气泡末尾的本地化标记（与主动 Stop 文案一致）。 */
+  localizeStopMarker(): string;
   openReasoning(id: number): void;
   closeReasoning(id: number): void;
   rememberModel(id: string): void;
@@ -229,6 +231,22 @@ export function applyStreamEvent<T extends StreamReply>(
       toolResultsCleared: event.toolResultsCleared,
       toolResultsOffloaded: event.toolResultsOffloaded,
     };
+  } else if (event.type === "cancelled") {
+    // 任务被抢占 / 用户中止（服务端 cancelTask 发 cancelled 事件）：把对应气泡标记「已停止」。
+    // 增量分支（text_delta / subagent_delta 等）不检查 sawTerminal，故旧 run 在 abort 后由模型生成的
+    // wrapup 文本（abortedRun 说明「哪些没查完」）仍会正常渲染，不会被判终态而吞掉（§14.9 R33）。
+    run.sawTerminal = true;
+    reply.streaming = false;
+    interruptRunning(reply);
+    // 清掉仍挂着的确认/澄清卡，否则会残留（§14.3 R35）。
+    reply.pending = null;
+    reply.clarification = null;
+    const marker = host.localizeStopMarker();
+    if (!reply.text.endsWith(marker)) {
+      reply.text = reply.text ? `${reply.text}\n\n${marker}` : marker;
+    }
+    host.thinkPhaseEnd(reply);
+    host.closeReasoning(reply.id);
   } else if (event.type === "done") {
     run.sawTerminal = true;
     reply.text = dedupeRepeats(reply.text);

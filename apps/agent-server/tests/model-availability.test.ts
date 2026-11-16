@@ -33,10 +33,21 @@ test("免费额度耗尽即便被上游标成 429 也归 402", () => {
   expect(modelAvailabilityStatus("model http 429 free-models-per-day limit reached")).toBe("402");
 });
 
+test("Zen FreeUsageLimitError（免费档日限额）无论被标 429/403/400 都归 402", () => {
+  const detail = '{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models work in OpenCode"}}';
+  expect(modelAvailabilityStatus(`model http 429: ${detail}`)).toBe("402");
+  expect(modelAvailabilityStatus(`model http 403: ${detail}`)).toBe("402");
+  expect(modelAvailabilityStatus(`model http 400: ${detail}`)).toBe("402");
+  // 空格文案形态（无错误类型字段）同样认。
+  expect(modelAvailabilityStatus("model http 400: Free usage limit reached")).toBe("402");
+});
+
 test("真实限流 429 仍是 429，不会被误判成额度耗尽", () => {
   expect(modelAvailabilityStatus("model http 429 Rate limit exceeded")).toBe("429");
   // 没带 model http 前缀、也不含额度 / 余额词 → 认不出，回落 null（交 unclassified 文案）。
   expect(modelAvailabilityStatus("Too many requests")).toBeNull();
+  // 真正的权限 403（载荷里没有免费额度措辞）保持原码。
+  expect(modelAvailabilityStatus("model http 403 Forbidden")).toBe("403");
 });
 
 test("通用额度 / 余额 / 未开通归 402，权限类 401 / 403 保持原码", () => {

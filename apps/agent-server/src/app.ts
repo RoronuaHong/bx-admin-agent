@@ -1790,19 +1790,33 @@ export function createApp() {
         touchSession(session);
       }
 
-      // 对话级并发保护：同一对话已有任务在跑 → 409，前端据此把消息转入待发队列（排队语义）。
-      if (isTaskRunning(conversationId)) {
-        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
-      }
-      // 入口限流（§5/§13）：每 owner 每分钟次数 + 每 owner 并发任务数；429 带 Retry-After。
+      // 抢占判定（先判定、不立即取消）：同一对话已有任务在跑时，是否可由新消息接管。
+      // - 无人值守（定时任务）运行：不抢占，退回 409 排队语义（§12.4 R07）。
+      // - 其余（含另一标签页占用）：抢占——取消旧任务并由新任务接管（Interrupt 档，见 §4）。
+      const preemptTarget = getRunningTask(conversationId);
+      const canPreempt = !!preemptTarget && !preemptTarget.unattended;
+      // 入口限流（§5/§13）：每 owner 每分钟次数；429 带 Retry-After。
+      // 重要：限流在「任何取消之前」（§12.3 R06）——被 429 拒绝时旧任务不应被取消。
       const owner = c.get("owner");
       const rate = hitRateLimit(`stream:${owner}`, RATE_STREAM_PER_MIN);
       if (!rate.allowed) {
         c.header("Retry-After", String(rate.retryAfterSec));
         return errorJson(c, 429, "CHAT_RATE_LIMITED", `发起太频繁，请 ${rate.retryAfterSec} 秒后再试`);
       }
-      if (RATE_CONCURRENT_PER_OWNER > 0 && countRunningForOwner(owner) >= RATE_CONCURRENT_PER_OWNER) {
-        return errorJson(c, 429, "CHAT_CONCURRENT_LIMITED", `同时运行的对话数已达上限（${RATE_CONCURRENT_PER_OWNER}），请稍候`);
+      // 并发上限：抢占同对话只是「替换」而非「新增」并发，故计数时排除 preemptTarget。
+      if (RATE_CONCURRENT_PER_OWNER > 0) {
+        const concurrentExcludingPreempt = countRunningForOwner(owner) - (canPreempt ? 1 : 0);
+        if (concurrentExcludingPreempt >= RATE_CONCURRENT_PER_OWNER) {
+          return errorJson(c, 429, "CHAT_CONCURRENT_LIMITED", `同时运行的对话数已达上限（${RATE_CONCURRENT_PER_OWNER}），请稍候`);
+        }
+      }
+      // 不可抢占（定时任务 / 并发达上限外的占用）：保留原 409 排队语义。
+      if (preemptTarget && !canPreempt) {
+        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
+      }
+      // 所有校验通过 → 执行抢占（取消旧任务并发 cancelled 事件）+ 开新任务。
+      if (canPreempt) {
+        cancelTask(conversationId);
       }
       const task = startTask({ conversationId, userText: text, ownerKey: owner });
       const timeZone = normalizeTimeZone(body.timeZone) || normalizeTimeZone(session.preferences?.timeZone);
@@ -2396,6 +2410,7 @@ export function createApp() {
     const task = startTask({
       conversationId,
       userText: wake ? `【事件唤醒】${wake}\n\n${live.prompt}` : live.prompt,
+      unattended: true,
     });
     // 登记本期的 abort 控制器，供删除任务时即时中断（见 schedules.ts 的 abortActiveScheduleRun）。
     registerActiveScheduleRun(schedule.id, task.abort);

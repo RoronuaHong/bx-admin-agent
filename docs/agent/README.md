@@ -1,4 +1,6 @@
 > ⚠️ **历史快照 · 与当前代码已脱节**：本目录文档描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本目录文档仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
+>
+> **2026-11-13 清理**：仅删除 `docs/audit/` 下 3 个无引用的调试截图（`chat-broken-style*.png`）；其余历史文档（含被现行文档引用、或被 `yapi-mcp.md` 主张为活跃 MCP 契约的 `AGENT_CHARTER` / `CHAT_FLOW` / `PC_STRUCTURE_AND_OUTPUT_TYPES` / `WORKFLOW_CLARIFICATION_GATE` / `PROMPT_ARCHITECTURE` / `PORTAL_*` / `CAPABILITY_MATCH` / `MULTI_AGENT_ARCHITECTURE` / `A2A_INTEGRATION` / `VIEWING_ASSISTANT_AGENT` / `ENTERPRISE_ROADMAP` / `VERIFY_SCENARIOS`，以及旧归档内部互链的上述文件）全部保留；下方文件表已与其对齐。
 
 # Agent 文档目录（唯一来源）
 

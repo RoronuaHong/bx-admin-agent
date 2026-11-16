@@ -67,8 +67,10 @@ async function getColl(): Promise<Collection<TaskRecord> | null> {
 const memory = new Map<string, TaskRecord>();
 
 function memPut(record: TaskRecord, newEvents: ChatEvent[]): void {
-  const merged = [...(memory.get(record.conversationId)?.events || []), ...newEvents];
-  const events = merged.slice(-TASK_EVENTS_CAP);
+  // 被抢占后「当前任务」已换：不同 taskId 的留档不复用对方 events，否则 seq 跨任务冲突、replayRecord 按 seq 去重会吞事件（§12.1 R02）。
+  const existing = memory.get(record.conversationId);
+  const base = existing && existing.taskId === record.taskId ? (existing.events || []) : [];
+  const events = [...base, ...newEvents].slice(-TASK_EVENTS_CAP);
   memory.set(record.conversationId, { ...record, events });
 }
 
@@ -126,7 +128,9 @@ export async function flushTask(record: TaskRecord, pendingEvents: ChatEvent[]):
   if (!coll) return true;
   try {
     await coll.updateOne(
-      { _id: record.conversationId } as never,
+      // taskId CAS：抢占后新任务已占用该对话留档时，旧任务的迟到写因 taskId 不匹配被拒绝（返回未命中），
+      // 不会用「已取消」反向覆盖正在跑的新任务（§12.1 R03）。调用时序保证新任务首 flush 早于旧任务 late flush。
+      { _id: record.conversationId, taskId: record.taskId } as never,
       {
         $set: {
           taskId: record.taskId,

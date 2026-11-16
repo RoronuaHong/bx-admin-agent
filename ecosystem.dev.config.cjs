@@ -49,6 +49,9 @@ module.exports = {
       error_file: path.join(WEB_DIR, "logs/web-dev.err.log"),
       time: true,
       env: {
+        // 同 agent-server-dev：IDE/扩展注入的 preload 会让 vite 清缓存时走 safe-delete shim，
+        // 在 Windows 上 spawnSync 超时（ETIMEDOUT）→ dev server 启动直接失败并无限重启。
+        NODE_OPTIONS: "",
         NODE_ENV: "development",
       },
     },

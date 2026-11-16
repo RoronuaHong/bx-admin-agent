@@ -37,30 +37,52 @@ interface TicketRecord extends ConfirmationRequest {
 const tickets = new Map<string, TicketRecord>();
 const DEFAULT_TIMEOUT_MS = Number(process.env.MCP_CONFIRM_TIMEOUT_MS || 120_000);
 
-/** 登记等待器并签发票据（两类共用：票据一次性、与会话绑定、超时按拒绝）。 */
-function registerTicket(input: ConfirmationRequest, kind: PendingKind): {
+/** 登记等待器并签发票据（两类共用：票据一次性、与会话绑定、超时按拒绝）。
+ *  `signal` 用于抢占/取消：父任务被 abort 时立即按「拒绝」收束（与超时口径一致，
+ *  只是立即生效），避免 chatStream 协程永久挂在 `await wait`（见 chat-preempt-plan.md §14.3 R05/R31）。
+ */
+function registerTicket(
+  input: ConfirmationRequest,
+  kind: PendingKind,
+  signal?: AbortSignal,
+): {
   ticket: string;
   timeoutMs: number;
   wait: Promise<ConfirmOutcome>;
 } {
   const ticket = `cfm_${randomUUID()}`;
   const wait = new Promise<ConfirmOutcome>((resolve) => {
+    const settleReject = () => {
+      clearTimeout(timer);
+      tickets.delete(ticket);
+      resolve({ confirmed: false, timedOut: false });
+    };
     const timer = setTimeout(() => {
       tickets.delete(ticket);
       resolve({ confirmed: false, timedOut: true });
     }, DEFAULT_TIMEOUT_MS);
     tickets.set(ticket, { ...input, kind, ticket, createdAt: Date.now(), resolve, timer });
+    if (signal) {
+      if (signal.aborted) {
+        settleReject();
+        return;
+      }
+      signal.addEventListener("abort", settleReject, { once: true });
+    }
   });
   return { ticket, timeoutMs: DEFAULT_TIMEOUT_MS, wait };
 }
 
 /** 登记等待器并签发票据；调用方把 ticket 放进 confirmation_required 事件。 */
-export function requestConfirmation(input: ConfirmationRequest): {
+export function requestConfirmation(
+  input: ConfirmationRequest,
+  signal?: AbortSignal,
+): {
   ticket: string;
   timeoutMs: number;
   wait: Promise<ConfirmOutcome>;
 } {
-  return registerTicket(input, "confirm");
+  return registerTicket(input, "confirm", signal);
 }
 
 /** 结构化澄清的等待器（工具 request_clarification）：用户从选项里选，或超时 / 跳过。 */
@@ -68,8 +90,8 @@ export function requestClarification(input: {
   sessionId: string;
   conversationId: string;
   callId: string;
-}): { ticket: string; timeoutMs: number; wait: Promise<ConfirmOutcome> } {
-  return registerTicket({ ...input, tool: "(clarify)" }, "clarify");
+}, signal?: AbortSignal): { ticket: string; timeoutMs: number; wait: Promise<ConfirmOutcome> } {
+  return registerTicket({ ...input, tool: "(clarify)" }, "clarify", signal);
 }
 
 /**

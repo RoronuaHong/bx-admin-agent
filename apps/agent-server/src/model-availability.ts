@@ -64,7 +64,9 @@ function isQuotaFailure(failure: string | null): boolean {
  * 其它 429 走分钟级短冷却档（上面 modelDownCooldownMs 分流），两者互不覆盖。
  */
 export function isDailyQuotaFailure(failure: string | null): boolean {
-  return /free-models-per-day|freeusagelimit|openrouter_free_tier_daily|free[_ -]?tier.{0,40}daily|当日.{0,12}(额度|限额)|免费额度/i.test(
+  // free[\s_-]?usage[\s_-]?limit 同时认 Zen 的驼峰错误类型 FreeUsageLimitError 与空格文案
+  // "Free usage limit reached"（2026-11-16 起免费档日限额的新措辞）。
+  return /free-models-per-day|free[\s_-]?usage[\s_-]?limit|openrouter_free_tier_daily|free[_ -]?tier.{0,40}daily|当日.{0,12}(额度|限额)|免费额度/i.test(
     String(failure || ""),
   );
 }
@@ -117,9 +119,10 @@ export function modelAvailabilityStatus(failure: string | null): ModelAvailabili
   const http = msg.match(/model http (400|401|402|403|404|408|413|422|429|500|502|503|504|529)\b/i);
   if (http) {
     const code = http[1] as ModelAvailabilityStatus;
-    // 免费额度当日耗尽常被上游标成 429，但本质是「额度 / 余额没了」而不是限流；
-    // 归到 402 才能让文案写成「欠费 / 额度耗尽」，而不是误导成「请求过于频繁」。
-    if (code === "429" && isDailyQuotaFailure(msg)) return "402";
+    // 免费额度当日耗尽（Zen FreeUsageLimitError / OpenRouter free_tier_daily 等）会被上游
+    // 标成 429、403 甚至 400，但本质都是「当日额度没了」而不是限流 / 权限问题；
+    // 归到 402 才能让文案写成「欠费 / 额度耗尽」，而不是误导成「请求过于频繁」或「无权限」。
+    if (isDailyQuotaFailure(msg)) return "402";
     return code;
   }
   if (/模型服务暂时不可用/.test(msg)) return "503";

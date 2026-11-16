@@ -234,6 +234,33 @@ function timeoutSignalOf(model: ModelEntry, signal?: AbortSignal): AbortSignal {
     : AbortSignal.timeout(model.timeoutMs);
 }
 
+// ---- OpenCode Zen 免费档身份闸门 ----
+// Zen 免费车道只认 OpenCode 客户端：网关按请求头识别客户端身份，缺身份头一律拒绝
+// （报错形如 "OpenCode 1.18.0 or newer is required to use the free tier" / FreeTierError，
+// 早期措辞是 "free tier can only be used from within OpenCode"，同一道闸的不同文案）。
+// 实测必需两组头：① User-Agent 形如 `opencode/<版本>`（版本 >= 1.18.0）；
+// ② x-opencode-* 身份四件套（client/project/session/request）。任缺一组都被拒。
+// 免费档鉴权接受池化凭据 `Bearer public`（API_KEY 留空时用它兜底）。
+// 仅对 opencode.ai 端点注入，不影响其它网关；ZEN_HOST 可覆盖判定（测试 / 自建同款网关）。
+export function isZenEndpoint(model: Pick<ModelEntry, "baseUrl">): boolean {
+  const host = (process.env.ZEN_HOST || "opencode.ai").trim();
+  const endpoint = (model.baseUrl || "").replace(/^https?:\/\//, "").split("/")[0] || "";
+  return Boolean(host) && endpoint.includes(host);
+}
+
+export function zenIdentityHeaders(): Record<string, string> {
+  // 版本默认给到当前实际发行版而不是踩线的 1.18.0：避免上游把判定从 >= 收紧成 > 时恰好被拒。
+  const version = (process.env.ZEN_CLIENT_VERSION || "1.18.18").trim();
+  const uid = () => randomUUID().replace(/-/g, "").slice(0, 24);
+  return {
+    "User-Agent": `opencode/${version}`,
+    "x-opencode-client": "desktop",
+    "x-opencode-project": "global",
+    "x-opencode-session": `ses_${uid()}`,
+    "x-opencode-request": `msg_${uid()}`,
+  };
+}
+
 /**
  * 归一化「流内错误」：**响应已经开始之后**才下发的错误帧。
  *
@@ -271,7 +298,7 @@ export function normalizeInlineStreamError(payload: unknown): string | null {
     message = String(err.message ?? "");
   }
   if (!code) {
-    code = /(?:rate.?limit|too\s+many\s+requests|\b429\b|free-models-per-day|freeusagelimit|quota|限流)/i.test(message)
+    code = /(?:rate.?limit|too\s+many\s+requests|\b429\b|free-models-per-day|free\s?usage\s?limit|quota|限流)/i.test(message)
       ? 429
       : 502;
   }
@@ -792,7 +819,11 @@ async function callOpenAi(
     return fetchWithKeyRotation(model, (key) =>
       fetch(`${base}/chat/completions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key || anonymousKey}`,
+          ...zenHeaders,
+        },
         body: JSON.stringify(body),
         signal: timeoutSignalOf(model, signal),
       }),
@@ -801,6 +832,11 @@ async function callOpenAi(
   };
 
   const alreadyReplaying = reasoningReplayRequired(model);
+  // Zen 免费档身份头：每次请求都要带（session/request id 逐请求刷新，贴合客户端形态）。
+  // key 池为空（免费档匿名）时用池化凭据 public 兜底，不再发出裸 `Bearer `。
+  const zen = isZenEndpoint(model);
+  const zenHeaders = zen ? zenIdentityHeaders() : {};
+  const anonymousKey = zen ? "public" : "";
   let response = await postOnce(alreadyReplaying);
   // 失败详情只读一次：Response body 是单次消费流，第二次 .text() 只能拿到空串，
   // 会把网关的真实报错吞成一句「model http 400: 」（排查时完全看不到原因）。

@@ -1281,8 +1281,18 @@ interface ConvState {
   bubbles: Bubble[];
   input: string;
   sending: boolean;
-  /** 该对话自己的中断句柄；「停止」只作用于它，不是全局中断。 */
-  controller: AbortController | null;
+  /** 并发运行中的轮次计数：放开「流式期间发送」（抢占）后同一对话可同时有多轮，sending 由它推导。 */
+  runCount: number;
+  /**
+   * 本轮发送周期内发生过并发（runCount 曾 >1）。增量落库水位假设「同一时刻只有一条 reply 在流式更新」，
+   * 并发时被打破：先收束者把水位推到「含对方半截」，后收束者若只回写末条，中间项 reply 的终态就落不库。
+   * 并发过的对话在并发收束期间一律全量落库（见 runTurn finally），runCount 归零后复位。
+   */
+  hadConcurrent: boolean;
+  /** 该对话所有活跃轮次的中断句柄；「停止」中止全部（抢占语义下旧轮次也在列表里）。 */
+  controllers: AbortController[];
+  /** 同步派发标志：防止并发双击导致同一条消息开两个 run（R08）。 */
+  dispatching: boolean;
   pendingImages: UploadResult[];
   /** 待发的文档附件（PDF / Word / Excel / md / txt / csv）：随消息发 attachments，由服务端解析后注入上下文。 */
   pendingDocs: UploadResult[];
@@ -1299,7 +1309,10 @@ function blankState(): ConvState {
     bubbles: [],
     input: "",
     sending: false,
-    controller: null,
+    runCount: 0,
+    hadConcurrent: false,
+    controllers: [],
+    dispatching: false,
     pendingImages: [],
     pendingDocs: [],
     error: "",
@@ -1946,7 +1959,7 @@ let scrollQueued = false;
 let scrollForce = false;
 
 const canSend = computed(
-  () => Boolean(current.value.input.trim() || current.value.pendingImages.length) && !current.value.sending,
+  () => Boolean(current.value.input.trim() || current.value.pendingImages.length || current.value.pendingDocs.length),
 );
 
 /** 气泡更新时是否要跟随滚动：只有"正在看的这个对话"才滚，后台流不抢滚动条。 */
@@ -2323,7 +2336,7 @@ async function syncOpenConversation(convId: string) {
  * 必须显式传对话 id 与气泡：本轮结束时可能已经切到别的对话（后台流），
  * 用 currentId 会把 A 的内容写进 B。
  */
-async function persist(convId: string, list: Bubble[]) {
+async function persist(convId: string, list: Bubble[], forceFull = false) {
   if (!convId) return;
   const stored = toStored(list);
   const title = list.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
@@ -2331,7 +2344,12 @@ async function persist(convId: string, list: Bubble[]) {
   const serverLen = conversations.value.find((c) => c.id === convId)?.messages?.length ?? 0;
   const prev = persistedCount.get(convId) ?? serverLen;
   try {
-    if (stored.length < prev) {
+    if (forceFull) {
+      // 并发多 run 抢占：增量水位假设「同一时刻只有一条 reply 在流式更新」，并发下被打破——
+      // 先收束者把水位推到「含对方半截」，后收束者若只回写末条，中间项 reply 的终态就永远落不库。
+      // 全量写以本地 bubbles（UI 真相源）覆盖服务端，顺带清掉增量竞态写出的半截/重复；并发归零后恢复增量。
+      await saveConversationMessages(convId, stored, { title, full: true });
+    } else if (stored.length < prev) {
       // 长度回退（如清空对话）：全量替换。
       await saveConversationMessages(convId, stored, { title, full: true });
     } else if (stored.length === prev) {
@@ -2365,7 +2383,7 @@ function selectConversation(conv: ConversationDto) {
   if (leaving && leaving !== conv.id) {
     modelSwitchHint.value = "";
     const leavingState = states.get(leaving);
-    if (leavingState?.sending || leavingState?.controller) watchBackgroundDone(leaving);
+    if (leavingState?.sending || (leavingState?.controllers?.length ?? 0) > 0) watchBackgroundDone(leaving);
   }
   currentId.value = conv.id;
   sidebarOpen.value = false; // 移动端选中对话后收起抽屉
@@ -2414,7 +2432,7 @@ function newConversation() {
   const leaving = currentId.value;
   if (leaving) {
     const leavingState = states.get(leaving);
-    if (leavingState?.sending || leavingState?.controller) watchBackgroundDone(leaving);
+    if (leavingState?.sending || (leavingState?.controllers?.length ?? 0) > 0) watchBackgroundDone(leaving);
   }
   currentId.value = "";
   // 进入草稿态：清空上一轮残留的用户态（技能 / 连接器 / 助手模型 / 待发文件），
@@ -2889,7 +2907,7 @@ async function removeConversation(id: string) {
   if (!conv) return;
   const wasCurrent = currentId.value === id;
   // 只中断这个对话自己的流，其它对话不受影响。
-  states.get(id)?.controller?.abort();
+  states.get(id)?.controllers?.forEach((c) => c.abort());
   states.delete(id);
   conversations.value = conversations.value.filter((c) => c.id !== id);
   scheduleUndoDelete(conv, index, wasCurrent);
@@ -3263,7 +3281,7 @@ async function closeOtherConversations(keepId: string) {
   // 归档对话不在「其它对话」之列：归档本就是把它收起来，批量关闭不该连带删掉看不见的对话。
   const others = conversations.value.filter((c) => c.id !== keepId && !c.archived);
   for (const c of others) {
-    states.get(c.id)?.controller?.abort();
+    states.get(c.id)?.controllers?.forEach((c) => c.abort());
     states.delete(c.id);
     try {
       if (c.id) await apiDeleteConversation(c.id);
@@ -3443,42 +3461,43 @@ async function drainQueue(convId: string, ok: boolean) {
 
 async function send() {
   const state = current.value;
-  let convId = currentId.value;
-  const text = state.input.trim();
-  if (!text && !state.pendingImages.length && !state.pendingDocs.length) return;
-  followBottom = true; // 用户发送：无条件回底（新一轮回复从底部开始展示）
-  if (!convId) {
-    // 草稿态首条消息：此刻才创建会话入列表（对齐 CodeBuddy）；失败则保留输入不丢内容。
-    convId = await createConvFromDraft(text);
-    if (!convId) return;
-  }
-  if (state.sending) {
-    // 排队语义：同一对话在生成时，新消息进待发队列（服务端 409 是并发标签页的兜底）。
-    await enqueueMessage(
-      convId,
-      text,
-      state.pendingImages.map((i) => i.id),
-      state.pendingDocs.map((i) => i.id),
-    );
+  // R08：同步原子标志——并发双击 / 同步双触发时，第二次调用在 runTurn 同步置位 sending 之前就看到 dispatching 而返回，
+  // 避免同一条消息开两个 run（双流）。runTurn 同步部分会把 state.sending 置 true 后再释放本标志。
+  if (state.dispatching) return;
+  state.dispatching = true;
+  let released = false;
+  try {
+    let convId = currentId.value;
+    const text = state.input.trim();
+    if (!text && !state.pendingImages.length && !state.pendingDocs.length) return;
+    followBottom = true; // 用户发送：无条件回底（新一轮回复从底部开始展示）
+    if (!convId) {
+      // 草稿态首条消息：此刻才创建会话入列表（对齐 CodeBuddy）；失败则保留输入不丢内容。
+      convId = await createConvFromDraft(text);
+      if (!convId) return;
+    }
+    // 放开后不再排队（§4 Interrupt 档）：直接开新 run 抢占旧生成。runTurn 内部同步部分会把 sending 置位，
+    // 此后并发的发送会被 sending 守卫、正确地再开一个 run（抢占），而非重复开同一轮。
+    const images = state.pendingImages.slice();
+    const docs = state.pendingDocs.slice();
     state.input = "";
     state.pendingImages = [];
     state.pendingDocs = [];
     queueScroll(true);
-    return;
+    // 同步启动 runTurn 到它的第一个 await（此刻 state.sending 已置 true），随后释放 dispatching：
+    const turn = runTurn(
+      convId,
+      text,
+      images.map((i) => i.id),
+      images.map((i) => ({ id: i.id, name: i.name })),
+      docs.map((i) => i.id),
+    );
+    state.dispatching = false;
+    released = true;
+    await turn;
+  } finally {
+    if (!released && current.value) current.value.dispatching = false;
   }
-  const images = state.pendingImages.slice();
-  const docs = state.pendingDocs.slice();
-  // 发送后清空输入框与待发附件（仅在这条「用户主动发送」路径清；出队/立即发送走各自入参，不碰当前输入）。
-  state.input = "";
-  state.pendingImages = [];
-  state.pendingDocs = [];
-  await runTurn(
-    convId,
-    text,
-    images.map((i) => i.id),
-    images.map((i) => ({ id: i.id, name: i.name })),
-    docs.map((i) => i.id),
-  );
 }
 
 /** 断线续传的重试策略：指数退避（对齐「可恢复流」的客户端自动重连），退避耗尽才如实宣告中断。 */
@@ -3525,6 +3544,8 @@ function applyChatEvent(run: TurnRun, event: ChatEvent): void {
     stickThinkingToBottom,
     scheduleConfirmExpiry,
     localizeError: (token, fallback) => localizeToken(uiLocale.value, token, fallback),
+    localizeStopMarker: () =>
+      tx("（已停止生成）", " (stopped)", "(geração interrompida)", "(उत्पादन रोक दिया गया)"),
     openReasoning: openReasoningPanel,
     closeReasoning: closeReasoningPanel,
     rememberModel: (id) => {
@@ -3577,12 +3598,8 @@ async function runTurn(
   docIds: string[] = [],
 ) {
   const state = stateOf(convId);
-  if (state.sending) {
-    // 并发兜底（例如另一标签页正在生成同对话）：入队而不是报错，消息不丢。
-    // 图片与文档附件都必须带上：漏传 docIds 会让「排队才发的那条」静默丢附件（正文在、文件没了）。
-    await enqueueMessage(convId, text, imageIds, docIds);
-    return;
-  }
+  // 抢占语义（§4 Interrupt 档）：同一对话正在生成时，新发送直接开新 run，不进队列。
+  // 多轮可并发（runCount 驱动 sending），旧轮次收到 cancelled 事件后其气泡显示「已停止生成」。
   const sentAt = Date.now();
   state.bubbles.push({
     id: ++seq,
@@ -3607,7 +3624,10 @@ async function runTurn(
   state.bubbles.push(reply);
   // 流式开始即展开推理面板：loading 期直接显示「正在规划…」，避免只剩空白/圆点像卡死。
   openReasoning.add(reply.id);
+  state.runCount += 1;
   state.sending = true;
+  // 抢占意味着与现存 run 并发：标记后本周期内每次收束都全量落库（增量水位在并发下会漏中间项的终态）。
+  if (state.runCount > 1) state.hadConcurrent = true;
   state.error = "";
   // 新一轮从底部开始：用户可能正停在历史上方，Enter 发送必须回到最底（不受 240px 跟随阈值限制）。
   if (currentId.value === convId) queueScroll(true);
@@ -3618,7 +3638,7 @@ async function runTurn(
   const chosenModel = selected === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(selected);
   // 中断句柄存进「该对话自己的」状态：切到别的对话后按停止不会误伤这一条。
   const controller = new AbortController();
-  state.controller = controller;
+  state.controllers.push(controller);
 
   // 本轮上下文：事件处理与续传共用同一个对象（游标 lastSeq 随事件推进）。
   const run: TurnRun = { convId, reply, state, chosenModel, sawTerminal: false, lastSeq: 0 };
@@ -3687,14 +3707,18 @@ async function runTurn(
     // 异常退出（停止/断连/报错）也要把开着的思考段关掉，耗时才不会丢。
     thinkPhaseEnd(reply);
   } finally {
-    state.sending = false;
-    state.controller = null;
+    state.runCount = Math.max(0, state.runCount - 1);
+    state.sending = state.runCount > 0;
+    state.controllers = state.controllers.filter((c) => c !== controller);
     // auto 模式：本轮失败则把该模型记入黑名单（下次解析跳过），成功则清除其失败标记。
     // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 后台继续 / 中断 / 无进展收口 都不算。
     if (reply.error && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode || "")) failedModelIds.value.add(chosenModel);
     else failedModelIds.value.delete(chosenModel);
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
-    await persist(convId, state.bubbles);
+    // 曾并发过（hadConcurrent）则本周期收束一律全量落库：本地 bubbles 是 UI 真相源，
+    // 全量替换把增量竞态写出的「半截中间项 / 重复提问」一并修正；并发归零后恢复正常增量。
+    await persist(convId, state.bubbles, state.hadConcurrent);
+    if (state.runCount === 0) state.hadConcurrent = false;
     queueScrollIfCurrent(convId);
     // 出队决策：停止 / 中断 / 出错 / 已再入队 / 仍有待确认 → 停下等用户，不自动发下一条
     // （中断的轮次连接已经不可靠，接着发下一条大概率也失败，交给用户决定）。
@@ -3706,7 +3730,7 @@ async function runTurn(
  *  执行与推送解耦后，断开连接不再中止生成——必须显式调取消端点。 */
 function stop() {
   const convId = currentId.value;
-  current.value.controller?.abort();
+  for (const c of current.value.controllers) c.abort();
   if (convId) void cancelChatTask(convId).catch(() => undefined);
 }
 
@@ -3872,8 +3896,11 @@ async function attachRunningTask(convId: string): Promise<void> {
     ...(status.task?.id ? { taskId: status.task.id } : {}),
   };
   const controller = new AbortController();
-  fresh.controller = controller;
+  fresh.controllers.push(controller);
+  fresh.runCount += 1;
   fresh.sending = true;
+  // 与 runTurn 同口径：attach 时若已有别的 run 在跑（罕见，入口有 sending/streaming 守卫），同样标记并发。
+  if (fresh.runCount > 1) fresh.hadConcurrent = true;
   try {
     const attached = await resumeChatTaskEvents(
       convId,
@@ -3892,12 +3919,15 @@ async function attachRunningTask(convId: string): Promise<void> {
     // 网络不通 / 用户按了停止：留下气泡并如实说明这一轮没能拿到终态（不假装还在跑）。
     await settleInterruptedRun(run);
   } finally {
-    fresh.sending = false;
-    fresh.controller = null;
+    fresh.runCount = Math.max(0, fresh.runCount - 1);
+    fresh.sending = fresh.runCount > 0;
+    fresh.controllers = fresh.controllers.filter((c) => c !== controller);
     reply.streaming = false;
     thinkPhaseEnd(reply);
     openReasoning.delete(reply.id);
-    await persist(convId, fresh.bubbles);
+    // 与 runTurn finally 同口径：并发周期内全量落库，归零后复位。
+    await persist(convId, fresh.bubbles, fresh.hadConcurrent);
+    if (fresh.runCount === 0) fresh.hadConcurrent = false;
     queueScrollIfCurrent(convId);
   }
 }
@@ -3944,7 +3974,7 @@ async function sendQueueItemNow(index: number) {
   const rest = state.queue.filter((_, i) => i !== index);
   state.queue = rest;
   if (state.sending) {
-    state.controller?.abort();
+    for (const c of state.controllers) c.abort();
     void cancelChatTask(convId).catch(() => undefined);
     // 等流真正收束（sending 翻转）再发，否则会被自己的并发保护再次入队。
     for (let i = 0; i < 20 && state.sending; i += 1) {

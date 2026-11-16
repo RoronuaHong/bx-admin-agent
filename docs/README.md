@@ -131,6 +131,42 @@
 - **[bi-metabase-decisions.md](./bi-metabase-decisions.md)**：阶段 1 决策建议书（待拍板快照），顶部已标注未签字状态与当时口径。
 - **注意**：三份文档冲突时以 `bi-metabase-todo.md` 的进度记录为准；改动只落 `apps/agent-server/scripts/*.mjs` 与 `bi-semantic/*.json`，`src/**`、prompt、技能、模型调用不动。
 
+### [SECURITY.md](./SECURITY.md)
+- **定位**：安全态势**权威文档**——已落地控制项、默认部署假设、加固清单与诚实标注的已知局限。
+- **关联**：各维度设计见 `agent-infrastructure.md` §5。
+- **状态**：✅ 现行。
+
+### [BEST_PRACTICE_ALIGNMENT.md](./BEST_PRACTICE_ALIGNMENT.md)
+- **定位**：功能与业界最佳实践（OWASP LLM/ASI/Agentic Skills、OTel GenAI、Anthropic 等）逐条对照的**缺口清单 SSOT**。
+- **关联**：安全细节见 `SECURITY.md`；各维度设计见 `agent-infrastructure.md`。
+- **状态**：✅ 现行。
+
+### [DELIVERABLE_GUARDRAILS.md](./DELIVERABLE_GUARDRAILS.md)
+- **定位**：所有「产出可下载/可查看文件」内置工具的统一护栏基线，由 `artifact-delivery-plan.md` §11 提炼复用。
+- **状态**：✅ 现行。
+
+### [grounding-verify-alignment.md](./grounding-verify-alignment.md)
+- **定位**：`src/grounding.ts` 事后核验部分与公开最佳实践（CoVe / Self-RAG / FActScore）的对照对齐。
+- **状态**：✅ 已落地（2026-09-30）。
+
+### [chat-preempt-plan.md](./chat-preempt-plan.md)
+- **定位**：对话抢占式生成（Chat Preempt）P0 实施与验收记录（确认等待协程泄漏 / 校验顺序 / 定时任务豁免 / 并发双发等）。
+- **状态**：✅ 现行（2026-11-13 重建，聚焦落地与验收）。
+
+### [cross-role-restore-scoping.md](./cross-role-restore-scoping.md)
+- **定位**：跨角色会话恢复按角色收窄，修复「跨角色会话被自动恢复拉到错误角色页面」。
+- **状态**：✅ 现行（v1，2026-10-13）。
+
+### [verification-plan-20261019.md](./verification-plan-20261019.md)
+- **定位**：多场景多实例全链路验证矩阵（时延 / 质量 / 记忆 / 上下文 / 全工具 / skill / MCP / 图文 十维度）。
+- **状态**：🆕 2026-10-19。
+
+### 定时任务 / 预警专题
+- **[scheduled-task-sessions-plan.md](./scheduled-task-sessions-plan.md)**：定时任务运行会话方案（每期独立会话 + 侧栏分组），阶段 0–6 落地记录。**现行**。
+- **[scheduled-spike-detection-plan.md](./scheduled-spike-detection-plan.md)**：数据暴涨检测/预警最佳实践版（先测后跑 + 仅异常通知 + 恢复）。**P1–P2.5 已落地**。
+- **[scheduled-alert-failure-notify-plan.md](./scheduled-alert-failure-notify-plan.md)**：执行失败不每期刷通知（`on_alert` 失败分离 + 模型冷却换链）。**已落地（2026-10-09）**。
+- **[scheduled-alert-best-practices-comparison.md](./scheduled-alert-best-practices-comparison.md)**：定时预警业界最佳实践与竞品对照（调研文档），产品口径以 `scheduled-spike-detection-plan.md` 为准。
+
 ---
 
 ## 二、计划留档（决策背景；文内 ❌ 多为「改前现状」）
@@ -164,6 +200,10 @@
 - **定位**：项目整体复盘（业界做法 → 本项目做法 → 是否最佳实践 → 偏离原因 → 何时改回）。
 - **状态**：🗂 快照；**2026-09-28 已刷新到 master @ `d9db377`**。**2026-10-02** §7 已补全分页计数。**2026-10-08** §9、部署常量表、环境变量清单与 B 章已对齐 MCP 命令白名单、来源指纹，以及「不上 Agent 集群」。**2026-10-10** C 章是当前全链路待办：F1–F7 已修，F8 部分完成，F12 只做了定时拒绝，F9–F11、F13–F15 与 K1–K7 维持，F16 已作废。同日 R1–R5：对话约 5 秒同步，定时提问按本期补上。细目在 `best-practice-alignment-review.md` 第 6 节。其余叙述性段落仍是较早快照，只作背景。
 - **注意**：其中「MCP 配置缓存：按 mtime 失效、4 例全绿」已过时——现为 `mtime + size`、5 例（见 `artifact-delivery-plan.md` §14）。
+
+### [mongo-outage-incident-20261105.md](./mongo-outage-incident-20261105.md)
+- **定位**：MongoDB 存储层事故复盘（2026-11-05，`MONGO_URI` 缺凭据导致 16h 500）+ 随之落地的代码防线。
+- **状态**：🗂 复盘（2026-11-05）。
 
 ---
 

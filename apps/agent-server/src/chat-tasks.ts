@@ -104,6 +104,8 @@ export interface ChatTask {
   startedAt: number;
   settledAt?: number;
   status: TaskStatus;
+  /** 无人值守运行（定时任务 / 系统发起）：抢占与显式 Stop 都不应取消它（见 chat-preempt-plan.md §12.4）。 */
+  unattended?: boolean;
   /** 事件缓冲（回放用；**不含** text_delta——增量只累加进 `text`，故缓冲体积可控）。 */
   buffer: ChatEvent[];
   /** 已分配的事件序号（下一条事件用完即自增；续传游标的上界）。 */
@@ -193,12 +195,13 @@ export function startTaskRetentionSweeper(): NodeJS.Timeout | null {
   return timer;
 }
 
-export function startTask(input: { conversationId: string; userText: string; ownerKey?: string }): ChatTask {
+export function startTask(input: { conversationId: string; userText: string; ownerKey?: string; unattended?: boolean }): ChatTask {
   const task: ChatTask = {
     id: `task_${randomUUID()}`,
     conversationId: input.conversationId,
     userText: input.userText,
     ...(input.ownerKey ? { ownerKey: input.ownerKey } : {}),
+    ...(input.unattended ? { unattended: true } : {}),
     startedAt: Date.now(),
     status: "running",
     buffer: [],
@@ -303,18 +306,24 @@ export function finishTask(task: ChatTask, status: TaskStatus, outcomePersisted:
   if (task.status !== "running") return;
   task.status = status;
   task.settledAt = Date.now();
-  running.delete(task.conversationId);
-  lastTask.set(task.conversationId, {
-    id: task.id,
-    conversationId: task.conversationId,
-    status,
-    startedAt: task.startedAt,
-    settledAt: task.settledAt,
-    durationMs: task.settledAt - task.startedAt,
-    outcomePersisted,
-  });
-  retainTask(task);
+  // 抢占后「当前任务」可能已换成新任务（running 里已不是本 task）：
+  // 旧任务一律不得改动按对话索引的共享结构（running / lastTask / retained），否则会误删/污染新任务（§12.1 R01）。
+  const stillCurrent = running.get(task.conversationId) === task;
+  if (stillCurrent) {
+    running.delete(task.conversationId);
+    lastTask.set(task.conversationId, {
+      id: task.id,
+      conversationId: task.conversationId,
+      status,
+      startedAt: task.startedAt,
+      settledAt: task.settledAt,
+      durationMs: task.settledAt - task.startedAt,
+      outcomePersisted,
+    });
+    retainTask(task);
+  }
   // 收束立即落一次（终态 + 尾部事件），别等定时器——进程要是接着重启，这一笔就是最后一次机会。
+  // flushTask 带 taskId CAS：旧任务迟到写会被拒绝，不覆盖新任务留档（§12.1 R03）。
   if (task.flushTimer) {
     clearTimeout(task.flushTimer);
     task.flushTimer = undefined;
@@ -514,10 +523,16 @@ export async function* followTask(task: ChatTask, from = 0): AsyncGenerator<Chat
   }
 }
 
-/** 协作式取消：abort 信号会贯穿模型调用与 MCP 工具调用（chat.ts 已透传）。 */
+/**
+ * 协作式取消：abort 信号会贯穿模型调用与 MCP 工具调用（chat.ts 已透传）。
+ * 先发 `cancelled` 事件（此时 status 仍为 running，publishTaskEvent 守卫放行），让前端旧气泡干净收尾；
+ * 随后 abort —— 旧 chatStream 会在 round 边界感知并走 wrapup / catch，其迟到增量仍带 running 状态，
+ * 故前端在收到 cancelled 后**不应吞掉后续增量**（否则会丢模型「哪些没查完」的收尾说明，见 §14.9 R33）。
+ */
 export function cancelTask(conversationId: string): boolean {
   const task = running.get(conversationId);
   if (!task) return false;
+  publishTaskEvent(task, { type: "cancelled" });
   task.abort.abort();
   return true;
 }

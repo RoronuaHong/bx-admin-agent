@@ -212,6 +212,8 @@ type ChatEventBody =
       text: string;
     }
   | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
+  /** 任务被抢占 / 用户中止：前端据此把对应气泡标记「已停止」并停止渲染后续增量（见 cancelled 事件说明）。 */
+  | { type: "cancelled" }
   | ({ type: "chart" } & ChartSpec)
   /**
    * 可下载产物（`export_data` 产出）：前端渲染成下载卡片。
