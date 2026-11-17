@@ -28,7 +28,7 @@ import {
 const MAX_BUFFER_EVENTS = 2000;
 /** 收束任务留档时长（毫秒，0 = 不留档）：断线重连晚到一点也能拿到尾部，不必重开对话。 */
 const TASK_RETAIN_MS = Math.max(0, Number(process.env.CHAT_TASK_RETAIN_MS ?? 300_000));
-/** 留档任务数上限（每对话最多一条，超出按最久未更新淘汰）。 */
+/** 留档任务数上限（方案 C 后按 taskId 一轮一条，同一对话可有多轮；超出按最久未更新淘汰）。 */
 const RETAIN_MAX_TASKS = Math.max(1, Number(process.env.CHAT_TASK_RETAIN_MAX ?? 100));
 /** 落库间隔（毫秒）：事件缓冲按批写 Mongo（避免逐事件往返），正文与状态整体覆盖。 */
 const FLUSH_MS = Math.max(100, Number(process.env.CHAT_TASK_FLUSH_MS ?? 800));

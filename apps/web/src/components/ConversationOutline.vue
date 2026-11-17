@@ -23,6 +23,10 @@ const props = defineProps<{
   activeId: number | null;
   /** 面板展开态（v-model:open）。 */
   open: boolean;
+  /** 高亮带位置（视口顶部往下比例）；父级跳转落点用同一口径，避免点 A 亮 B。 */
+  band: number;
+  /** 点击跳转后锁定高亮，滚动跟踪在此期间不改写 activeId。 */
+  pinnedId: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -86,14 +90,25 @@ function onListScroll() {
   syncListMetrics();
 }
 
+/** 列表顶部内边距：绝对定位条目的内容坐标 = padding-top + index * rowH。 */
+function listPadTop(): number {
+  const list = listEl.value;
+  return list ? parseFloat(getComputedStyle(list).paddingTop) || 0 : 0;
+}
+
+/** 窗口尺寸变化：面板高度、行高都可能变，窗口化度量要跟着重算。 */
+function onWindowResize() {
+  measureRowH();
+  syncListMetrics();
+  onScroll();
+}
+
 /** 组件约定挂在 .thread 内（ChatPage 的对话滚动容器），直接就近取宿主；
  *  不像 BackToTop 需要兼容整页滚动布局，无需向上遍历探测。 */
 function findScroller(): HTMLElement | null {
   return root.value?.closest<HTMLElement>(".thread") ?? null;
 }
 
-/** 高亮带：可视区顶部往下 40% ——「用户此刻读到的那条」大致落在该线上方。 */
-const BAND = 0.4;
 /** 贴底判定容差：与页面跟底逻辑（nearBottom）同口径。 */
 const BOTTOM_GAP = 48;
 let ticking = false;
@@ -123,6 +138,8 @@ function buildRenderedCache(scroller: HTMLElement, items: OutlineItem[]) {
 
 function syncActive() {
   ticking = false;
+  // 点击跳转后的锁定窗口：父级已把 activeId 设为被点项，滚动跟踪先别改写。
+  if (props.pinnedId !== null) return;
   const scroller = findScroller();
   if (!scroller || !props.items.length) return;
   // 面板收起时高亮值不可见，不做逐帧扫描（打开瞬间 open watcher 会强制全量同步一次）。
@@ -144,7 +161,7 @@ function syncActive() {
   }
   const rendered = renderedCache;
   if (!rendered.length) return;
-  const band = scroller.getBoundingClientRect().top + scroller.clientHeight * BAND;
+  const band = scroller.getBoundingClientRect().top + scroller.clientHeight * props.band;
   // 二分找「top 已越过带」的最后一条（单调不减）。
   let lo = 0;
   let hi = rendered.length - 1;
@@ -177,7 +194,7 @@ function revealActive() {
   if (!list || props.activeId === null) return;
   const index = props.items.findIndex((i) => i.id === props.activeId);
   if (index < 0) return;
-  const top = index * rowH.value;
+  const top = listPadTop() + index * rowH.value;
   const bottom = top + rowH.value;
   if (top < list.scrollTop) list.scrollTop = top;
   else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
@@ -195,20 +212,24 @@ let scroller: HTMLElement | null = null;
 onMounted(() => {
   scroller = findScroller();
   scroller?.addEventListener("scroll", onScroll, { passive: true });
-  window.addEventListener("resize", onScroll, { passive: true });
+  window.addEventListener("resize", onWindowResize, { passive: true });
   // 刷新后可能已处于某个滚动位置（浏览器滚动恢复）。
   syncActive();
 });
 
 onBeforeUnmount(() => {
   scroller?.removeEventListener("scroll", onScroll);
-  window.removeEventListener("resize", onScroll);
+  window.removeEventListener("resize", onWindowResize);
 });
 
-// 新增/删除气泡后布局变化：若无滚动事件（如内容不满一屏的新消息）也要重算当前项。
+// 大纲内容整体替换（换会话，即便条目数相同）/新增删除气泡：布局变了就重算当前项，
+// 否则同条目数的会话切换会留着空高亮直到下一次滚动。
 watch(
-  () => props.items.length,
-  () => void nextTick(syncActive),
+  () => props.items,
+  () => {
+    cacheSig = "";
+    void nextTick(syncActive);
+  },
 );
 
 // 展开面板（pre-flush：先于 v-if 首渲染）：
@@ -239,6 +260,14 @@ watch(
   () => props.activeId,
   () => revealActive(),
 );
+
+// 用户滚动解锁后立刻重算一次，不依赖同帧 scroll 监听器的先后顺序。
+watch(
+  () => props.pinnedId,
+  (pinned, prev) => {
+    if (prev !== null && pinned === null) void nextTick(syncActive);
+  },
+);
 </script>
 
 <template>
@@ -251,7 +280,7 @@ watch(
       class="conv-outline__fab"
       type="button"
       :aria-expanded="open ? 'true' : 'false'"
-      aria-controls="conv-outline-panel"
+      :aria-controls="open && items.length ? 'conv-outline-panel' : undefined"
       :aria-label="tx('对话大纲', 'Conversation outline', 'Estrutura da conversa', 'बातचीत की रूपरेखा')"
       :title="tx('对话大纲', 'Conversation outline', 'Estrutura da conversa', 'बातचीत की रूपरेखा')"
       @click="emit('update:open', !open)"

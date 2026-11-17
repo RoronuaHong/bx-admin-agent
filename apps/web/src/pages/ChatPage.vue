@@ -2637,9 +2637,11 @@ async function createConvFromDraft(firstText: string): Promise<string> {
   st.settings = { ...draft.settings, locale: uiLocale.value };
   currentId.value = conv.id;
   reportActiveConversation(conv);
-  const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[] } = {
+  const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[]; sendMode?: "preempt" | "queue" } = {
     locale: st.settings.locale,
   };
+  // 草稿态若切过发送模式，随首条消息一起落库（默认抢占则无需写，少一次字段变更）。
+  if (draftSendMode.value === "queue") patch.sendMode = "queue";
   if (st.settings.modelId) patch.model = st.settings.modelId;
   // 专家自带的数据源跟着角色走，不因草稿里没勾选而被覆盖掉。
   const mcpEnabled = [...new Set([...boundMcpIds.value, ...st.settings.mcpEnabled])];
@@ -3263,6 +3265,24 @@ async function toggleFullAccess(id: string) {
  * 纯设置：不中止当前正在生成的轮次，只从下一条消息起生效；多标签页以服务端会话文档为准。
  * 失败以服务端为唯一真相回滚。
  */
+/** 草稿态（尚无会话）的发送模式待选值，创建会话时随设置一起落库。 */
+const draftSendMode = ref<"preempt" | "queue">("preempt");
+/** 当前会话的发送模式（草稿态用上面的待选值，默认抢占）。输入区按钮据此显示。 */
+const currentSendMode = computed<"preempt" | "queue">(() => {
+  if (currentId.value) return conversations.value.find((c) => c.id === currentId.value)?.sendMode ?? "preempt";
+  return draftSendMode.value;
+});
+
+/** 输入区快捷切换：已有对话走持久化；草稿态只改本地，创建会话时随设置一起落库。 */
+async function toggleSendModeForCurrent() {
+  const next = currentSendMode.value === "preempt" ? "queue" : "preempt";
+  if (currentId.value) {
+    await toggleSendMode(currentId.value);
+    return;
+  }
+  draftSendMode.value = next;
+}
+
 async function toggleSendMode(id: string) {
   const conv = conversations.value.find((c) => c.id === id);
   if (!conv) return;
@@ -3579,12 +3599,15 @@ const MAX_QUEUE = 20;
 /** 整队列写串行链：重排 / 编辑 / 删除走整数组 PATCH，同页内串行避免彼此交错；出入队走原子端点不受此限。 */
 const queueSetChains = new Map<string, Promise<unknown>>();
 
-/** 忙时入队（排队语义）：走服务端原子 $push，避免多标签 / 自动出队并发整体覆盖丢项（B6）。 */
-async function enqueueMessage(convId: string, text: string, imageIds: string[], docIds: string[] = []) {
+/**
+ * 忙时入队（排队语义）：走服务端原子 $push，避免多标签 / 自动出队并发整体覆盖丢项（B6）。
+ * 返回是否真的入队成功：调用方据此决定能否显示「已入队」——失败时消息既没发也没排，必须如实告知。
+ */
+async function enqueueMessage(convId: string, text: string, imageIds: string[], docIds: string[] = []): Promise<boolean> {
   const state = stateOf(convId);
   if (state.queue.length >= MAX_QUEUE) {
     showSettingsError(tx("排队消息已达上限，请先处理队列", "The queue is full; handle it first", "A fila está cheia; resolva-a primeiro", "कतार भरी हुई है; पहले उसे संभालें"));
-    return;
+    return false;
   }
   const item: PendingMessage = {
     text,
@@ -3598,11 +3621,13 @@ async function enqueueMessage(convId: string, text: string, imageIds: string[], 
     const res = await enqueueConversationMessage(convId, item);
     state.queue = res.pendingQueue;
     syncConvLocal(convId, { pendingQueue: res.pendingQueue });
+    return true;
   } catch (err) {
     state.queue = prev;
     showSettingsError(
       localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("排队失败", "Failed to queue message", "Falha ao enfileirar", "कतार में जोड़ने में विफल")),
     );
+    return false;
   }
 }
 
@@ -3620,9 +3645,9 @@ async function setQueue(convId: string, next: PendingMessage[]): Promise<void> {
     } catch (err) {
       state.queue = prev;
       showSettingsError(
-      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("队列保存失败", "Failed to save queue", "Falha ao salvar a fila", "कतार सहेजने में विफल")),
-    );
-  }
+        localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("队列保存失败", "Failed to save queue", "Falha ao salvar a fila", "कतार सहेजने में विफल")),
+      );
+    }
   });
   queueSetChains.set(convId, task);
   void task.finally(() => {
@@ -3677,8 +3702,8 @@ async function send() {
       convId = await createConvFromDraft(text);
       if (!convId) return;
     }
-    // 放开后不再排队（§4 Interrupt 档）：直接开新 run 抢占旧生成。runTurn 内部同步部分会把 sending 置位，
-    // 此后并发的发送会被 sending 守卫、正确地再开一个 run（抢占），而非重复开同一轮。
+    // 默认抢占档（§4 Interrupt）：runTurn 直接开新 run 抢占旧生成；仅当服务端回 409（queue 档 / 无人值守占用）
+    // 才转入待发队列。runTurn 同步部分会把 sending 置位，此后并发发送会再开一个 run 而非重复同一轮。
     const images = state.pendingImages.slice();
     const docs = state.pendingDocs.slice();
     state.input = "";
@@ -3801,16 +3826,18 @@ async function runTurn(
   docIds: string[] = [],
 ) {
   const state = stateOf(convId);
-  // 抢占语义（§4 Interrupt 档）：同一对话正在生成时，新发送直接开新 run，不进队列。
-  // 多轮可并发（runCount 驱动 sending），旧轮次收到 cancelled 事件后其气泡显示「已停止生成」。
+  // 默认抢占语义（§4 Interrupt 档）：同一对话正在生成时，新发送直接开新 run 并取消旧轮；
+  // 仅服务端回 409（queue 档 / 无人值守占用，见下方 catch）才转入队列。多轮可并发（runCount 驱动 sending），
+  // 被抢占的旧轮次收到 cancelled 事件后其气泡显示「已停止生成」。
   const sentAt = Date.now();
-  state.bubbles.push({
+  const userBubble: Bubble = {
     id: ++seq,
     role: "user",
     at: sentAt,
     text,
     images: thumbnails || imageIds.map((id) => ({ id, name: id })),
-  });
+  };
+  state.bubbles.push(userBubble);
   // 必须用 reactive 包装：若 push 原始对象、之后又用原引用改属性，Vue 3 不会触发重渲染
   // （表现：流式文字不逐步显示、工具步骤与确认卡在等待期间不出现 → 确认必然超时）。
   const reply = reactive<Bubble>({
@@ -3874,12 +3901,25 @@ async function runTurn(
       stopped = true;
       reply.text = reply.text ? `${reply.text}\n\n${tx("（已停止生成）", " (stopped)", " (geração interrompida)", " (उत्पादन रोक दिया गया)")}` : tx("（已停止生成）", "(stopped)", "(geração interrompida)", "(उत्पादन रोक दिया गया)");
     } else if (getApiErrorCode(err) === "CONVERSATION_BUSY") {
-      // 服务端并发保护（如另一标签页在跑）：消息不丢，进队列等下一轮自动发。
-      queued = true;
-      reply.text = tx("（该对话正在生成中，此消息已加入待发队列）", "(Chat is busy; the message was queued)", "(A conversa está ocupada; a mensagem entrou na fila)", "(चैट व्यस्त है; संदेश कतार में जोड़ दिया गया)");
-      await enqueueMessage(convId, text, imageIds, docIds);
-      // 本标签页收不到「另一标签页那轮」的收束事件，必须自己守望占用释放后出队，否则队列卡死。
-      watchAndDrain(convId);
+      // 服务端并发保护（如另一标签页在跑）：进队列等下一轮自动发。
+      // 对齐主流产品（Claude/ChatGPT）：待发消息只在「待发队列」里显示一次，不在对话流里留占位气泡——
+      // 入队成功后撤回刚 push 的 user/reply 气泡，等出队发送时再由 runTurn 真正建一对气泡，
+      // 避免同一条消息出现两组气泡 + 两次落库（用户会误以为上一轮被打断 / 消息发了两次）。
+      // 只有入队真的成功才认作 queued：否则消息既没发出也没排上，不能谎报「已入队」，更不能启动守望。
+      queued = await enqueueMessage(convId, text, imageIds, docIds);
+      if (queued) {
+        state.bubbles = state.bubbles.filter((b) => b.id !== userBubble.id && b.id !== reply.id);
+        openReasoning.delete(reply.id);
+        // 轻量提示替代占位气泡；待发内容在队列面板里可见。
+        showSettingsError(
+          tx("消息已排队，将在当前回复完成后发送", "Message queued; it will be sent when the current reply finishes", "Mensagem na fila; será enviada quando a resposta atual terminar", "संदेश कतार में है; वर्तमान उत्तर पूरे होने पर भेजा जाएगा"),
+        );
+        // 本标签页收不到「另一标签页那轮」的收束事件，必须自己守望占用释放后出队，否则队列卡死。
+        watchAndDrain(convId);
+      } else {
+        reply.error = state.error = tx("消息未能入队，请重试", "Message could not be queued; please retry", "A mensagem não entrou na fila; tente novamente", "संदेश कतार में नहीं गया; कृपया पुनः प्रयास करें");
+        if (!state.input) state.input = text;
+      }
     } else {
       // 连接类错误（断网/刷新/代理断开）：执行与推送已解耦，后台任务可能仍在跑。
       // 先按游标续传（与「流无终态结束」同一条路径）；真接不上再查任务状态如实告知，
@@ -3920,9 +3960,9 @@ async function runTurn(
     if (reply.error && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode || "")) failedModelIds.value.add(chosenModel);
     else failedModelIds.value.delete(chosenModel);
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
-    // 曾并发过（hadConcurrent）则本周期收束一律全量落库：本地 bubbles 是 UI 真相源，
-    // 全量替换把增量竞态写出的「半截中间项 / 重复提问」一并修正；并发归零后恢复正常增量。
-    await persist(convId, state.bubbles, state.hadConcurrent);
+    // 曾并发过（hadConcurrent）或本轮入队撤回过气泡（queued）则全量落库：本地 bubbles 是 UI 真相源，
+    // 全量替换把「半截中间项 / 重复提问 / 已撤回的入队占位」一并修正，确保服务端不残留重复气泡。
+    await persist(convId, state.bubbles, state.hadConcurrent || queued);
     if (state.runCount === 0) state.hadConcurrent = false;
     queueScrollIfCurrent(convId);
     // 出队决策：停止 / 中断 / 出错 / 已再入队 / 仍有待确认 / 被抢占取消 → 停下等用户，不自动发下一条。
@@ -3946,11 +3986,14 @@ let doneToastTimer: ReturnType<typeof setTimeout> | null = null;
 const bgWatch = new Map<string, ReturnType<typeof setInterval>>();
 /** 409 入队后守望「占用释放」的定时器（与完成提醒分开：前者要出队，后者只弹 toast）。 */
 const queueWatch = new Map<string, ReturnType<typeof setInterval>>();
+/** 组件已卸载：守望回调里 await 状态查询期间页面可能已销毁，返回后据此放弃出队/弹提醒。 */
+let pageUnmounted = false;
 
 /**
  * 当前消息因 CONVERSATION_BUSY 入队后（常见：另一标签页正在生成），本标签页感知不到那轮结束，
  * 也没有后续 runTurn 收束来触发 drainQueue——队列会一直卡住。这里轮询到占用释放就出队。
- * 任何终态（success/cancelled/interrupted）都算释放；队列仍为空或已在发送则停止守望。
+ * 守望只持续到「本对话队列被清空」或超时（15 分钟）；占用是否释放由服务端任务状态判定，
+ * 且只有上一轮成功收束才出队下一条（见下方）。
  */
 function watchAndDrain(convId: string): void {
   if (queueWatch.has(convId)) return;
@@ -3967,6 +4010,8 @@ function watchAndDrain(convId: string): void {
       return;
     }
     const status = await fetchChatTaskStatus(convId).catch(() => null);
+    // await 期间页面可能已卸载：此时绝不能出队发消息（clearInterval 挡不住已在途的回调）。
+    if (pageUnmounted) return;
     // 查询失败 / 上一轮仍在跑：继续等（最多守望 15 分钟）。只有查到明确「没在跑」才判定终态。
     if (!status || status.running) {
       if (ticks >= 180) {
@@ -4008,15 +4053,24 @@ function watchBackgroundDone(convId: string) {
   const timer = setInterval(async () => {
     ticks += 1;
     const status = await fetchChatTaskStatus(convId).catch(() => null);
-    const running = status?.running ?? false;
-    if (running && ticks < 180) return;
+    // await 期间页面可能已卸载：此时不弹完成提醒（clearInterval 挡不住已在途的回调）。
+    if (pageUnmounted) return;
+    // 查询失败（瞬时网络抖动）不能当成「任务已结束」放弃守望：继续轮询到 15 分钟上限。
+    if (!status) {
+      if (ticks >= 180) {
+        clearInterval(timer);
+        bgWatch.delete(convId);
+      }
+      return;
+    }
+    if (status.running && ticks < 180) return;
     clearInterval(timer);
     bgWatch.delete(convId);
-    if (running) return; // 超时：不再打扰
+    if (status.running) return; // 超时：不再打扰
     // 只报「真正成功完成」：被抢占 / 用户停止 / 中断都不该说「已完成」（否则用户以为有结果可看）。
     // last 已过 retain 期为空时保守不报，避免误报。
-    if (status?.last?.status && status.last.status !== "success") return;
-    if (!status?.last) return;
+    if (status.last?.status && status.last.status !== "success") return;
+    if (!status.last) return;
     const conv = conversations.value.find((c) => c.id === convId);
     // 免打扰 / 用户正看着这个对话 / 对话已删除 → 不提醒。
     if (!conv || conv.muted || convId === currentId.value) return;
@@ -4214,30 +4268,38 @@ function editQueueItem(index: number) {
   void setQueue(convId, state.queue.filter((_, i) => i !== index));
 }
 
+/** 立即发送的同步派发标志：本函数在 runTurn 前有多段 await，快速双击会各自起一个 run（R08 同类问题）。 */
+let queueNowDispatching = false;
 /** 立即发送 = 中断当前生成 + 立刻发出这条（决议 C：主动权交给用户）。 */
 async function sendQueueItemNow(index: number) {
-  const convId = currentId.value;
-  const state = current.value;
-  const item = state.queue[index];
-  if (!convId || !item) return;
-  const rest = state.queue.filter((_, i) => i !== index);
-  state.queue = rest;
-  if (state.sending) {
-    for (const c of state.controllers) c.abort();
-    void cancelChatTask(convId).catch(() => undefined);
-    // 等流真正收束（sending 翻转）再发，否则会被自己的并发保护再次入队。
-    for (let i = 0; i < 20 && state.sending; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+  if (queueNowDispatching) return;
+  queueNowDispatching = true;
+  try {
+    const convId = currentId.value;
+    const state = current.value;
+    const item = state.queue[index];
+    if (!convId || !item) return;
+    const rest = state.queue.filter((_, i) => i !== index);
+    state.queue = rest;
+    if (state.sending) {
+      for (const c of state.controllers) c.abort();
+      void cancelChatTask(convId).catch(() => undefined);
+      // 等流真正收束（sending 翻转）再发，否则会被自己的并发保护再次入队。
+      for (let i = 0; i < 20 && state.sending; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      // 服务端任务收束有一瞬延迟：等注册表清空，避免「立即发送」被 409 再度入队。
+      for (let i = 0; i < 15; i += 1) {
+        if (!(await isChatTaskRunning(convId))) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
     }
-    // 服务端任务收束有一瞬延迟：等注册表清空，避免「立即发送」被 409 再度入队。
-    for (let i = 0; i < 15; i += 1) {
-      if (!(await isChatTaskRunning(convId))) break;
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
+    await setQueue(convId, rest);
+    // 队列项里的图片/文档附件要原样带回本轮（漏传 docs 会让附件静默丢失）。
+    await runTurn(convId, item.text, item.images || [], undefined, item.docs || []);
+  } finally {
+    queueNowDispatching = false;
   }
-  await setQueue(convId, rest);
-  // 队列项里的图片/文档附件要原样带回本轮（漏传 docs 会让附件静默丢失）。
-  await runTurn(convId, item.text, item.images || [], undefined, item.docs || []);
 }
 
 async function answerToolConfirm(bubble: Bubble, confirmed: boolean) {
@@ -5386,9 +5448,16 @@ onBeforeUnmount(() => {
     clearTimeout(skeletonTimer);
     skeletonTimer = null;
   }
+  // 先置卸载标志：守望回调里已在途的 fetchChatTaskStatus 返回后据此放弃出队/弹提醒
+  //（clearInterval 只能挡未发起的 tick，挡不住 await 中的回调）。
+  pageUnmounted = true;
   // 后台守望计时器：组件卸载后仍跑会持有响应式对象、滞留实例（最长 15 分钟），必须清掉。
   for (const t of bgWatch.values()) clearInterval(t);
   bgWatch.clear();
+  for (const t of queueWatch.values()) clearInterval(t);
+  queueWatch.clear();
+  // 在途的整队列 PATCH 无法取消，但其 finally 会自清；这里显式清空 Map 引用，加速回收。
+  queueSetChains.clear();
   if (doneToastTimer) {
     clearTimeout(doneToastTimer);
     doneToastTimer = null;
@@ -7191,6 +7260,29 @@ provide(bubbleContextKey, {
                     aria-hidden="true"
                   >
                     <path d="M12 5v14M5 12h14" />
+                  </svg>
+                </button>
+
+                <!-- 发送模式快捷切换（与 + 并列）：抢占 / 排队。右键菜单里也有同一开关。 -->
+                <button
+                  type="button"
+                  class="sendmode-btn"
+                  :class="{ 'is-queue': currentSendMode === 'queue' }"
+                  :title="currentSendMode === 'preempt'
+                    ? tx('当前：抢占式 · 点击查看排队模式（新消息等本轮完成）', 'Preempt: new message takes over · click to queue', 'Atual: preemptiva · clique para enfileirar', 'वर्तमान: preempt · कतार चुनने के लिए क्लिक करें')
+                    : tx('当前：排队等待 · 点击切回抢占式（新消息接管本轮）', 'Queue: new messages wait · click to preempt', 'Atual: fila · clique para preemptar', 'वर्तमान: कतार · preempt पर लौटने के लिए क्लिक करें')"
+                  :aria-label="currentSendMode === 'preempt'
+                    ? tx('发送模式：抢占式，点击切换到排队等待', 'Send mode: preempt, click to switch to queue', 'Modo: preemptiva, clique para fila', 'मोड: preempt, कतार पर बदलें')
+                    : tx('发送模式：排队等待，点击切换到抢占式', 'Send mode: queue, click to switch to preempt', 'Modo: fila, clique para preemptiva', 'मोड: कतार, preempt पर बदलें')"
+                  @click="toggleSendModeForCurrent"
+                >
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <template v-if="currentSendMode === 'preempt'">
+                      <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" />
+                    </template>
+                    <template v-else>
+                      <path d="M4 6h16M4 12h16M4 18h16" />
+                    </template>
                   </svg>
                 </button>
 

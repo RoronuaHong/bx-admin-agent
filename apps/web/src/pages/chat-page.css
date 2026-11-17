@@ -2339,6 +2339,8 @@
 .tools-menu-box {
   position: relative;
   display: inline-flex;
+  /* 工具按钮(34px)与发送模式按钮(26px)等高不同，居中对齐才不会一个高一个低 */
+  align-items: center;
   /* 菜单宽度：飞出面板按同一变量右移，保证二级面板落在菜单右侧而不是压在菜单上 */
   --tools-menu-w: 208px;
 }
@@ -2556,6 +2558,47 @@
   color: #fff;
   font-size: 13px;
   font-weight: 600;
+}
+
+/* 发送模式快捷切换（+ 旁的纯图标按钮，与 .icon-btn 同规格）：只显示图标，当前档与点击效果走 title 悬停提示。
+   抢占=中性色，排队=强调色高亮。无文字，两态占位恒为 34×34，切换不跳动。 */
+.sendmode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  margin-left: 2px;
+  padding: 0;
+  flex: none;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.sendmode-btn:hover {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink);
+}
+
+/* 排队档：淡色底 + 强调色图标，一眼可辨；抢占档保持中性（与 + 一致）。 */
+.sendmode-btn.is-queue {
+  background: color-mix(in srgb, var(--accent, #4f7cff) 14%, transparent);
+  color: var(--accent, #4f7cff);
+}
+
+.sendmode-btn.is-queue:hover {
+  background: color-mix(in srgb, var(--accent, #4f7cff) 22%, transparent);
+}
+
+/* 键盘焦点用贴合圆角的柔和光环；不用 outline+offset，避免点击后出现突兀的方框。 */
+.sendmode-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #4f7cff) 55%, transparent);
 }
 
 /* 已选专家 chip（对齐 CodeBuddy）：+ 旁的小胶囊，× 可取消选中回通用。 */

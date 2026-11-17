@@ -1806,16 +1806,16 @@ export function createApp() {
       // 并发计数扣除只针对「本 owner 自己的」任务：无主对话 !ownerKey 对所有 owner 可写，
       // 若被别的设备发起的任务占用，本 owner 的 countRunningForOwner 本就不含它，再减 1 会绕过上限。
       const preemptIsMine = !!preemptTarget && !!owner && preemptTarget.ownerKey === owner;
+      // 不可抢占（定时任务 / 会话 queue 档）：保留原 409 排队语义。
+      // 必须在任何 429 限流之前判定：这些请求本轮不 startTask，若被限流拦成 429，
+      // 前端不认该码、消息既不抢占也不入队会静默丢失；同时不该白白消耗 owner 的每分钟配额。
+      if (preemptTarget && !canPreempt) {
+        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
+      }
       const rate = hitRateLimit(`stream:${owner}`, RATE_STREAM_PER_MIN);
       if (!rate.allowed) {
         c.header("Retry-After", String(rate.retryAfterSec));
         return errorJson(c, 429, "CHAT_RATE_LIMITED", `发起太频繁，请 ${rate.retryAfterSec} 秒后再试`);
-      }
-      // 不可抢占（定时任务 / 会话 queue 档）：保留原 409 排队语义。
-      // 必须在并发上限之前判定：queue 档本轮不会 startTask，若被全局并发上限提前拦成 429，
-      // 前端不认该码、消息既不抢占也不入队会静默丢失（队列档 + owner 并发满时触发）。
-      if (preemptTarget && !canPreempt) {
-        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
       }
       // 并发上限：抢占同对话只是「替换」而非「新增」并发，故计数时排除 preemptTarget。
       if (RATE_CONCURRENT_PER_OWNER > 0) {

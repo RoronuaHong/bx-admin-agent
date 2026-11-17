@@ -645,8 +645,6 @@ button.step-head:disabled {
 .row {
   display: flex;
   width: 100%;
-  /* 对话大纲跳转 scrollIntoView 的落点留白：目标行不贴视口顶。 */
-  scroll-margin-top: 12px;
 }
 
 .row.user {
