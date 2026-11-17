@@ -282,18 +282,31 @@ export function dedupeRepeats(text: string): string {
   for (let guard = 0; guard < 6; guard++) {
     const n = s.length;
     let replaced = false;
+    // 前缀滚动哈希：把旧版每次 `slice` 比较（每次都分配两个新字符串）换成 O(1) 的哈希比较。
+    // 循环顺序与语义完全不变（L 从大到小、i 从小到大），哈希相等时再逐字校验，杜绝碰撞误判。
+    const BASE = 911382323;
+    const hash = new Uint32Array(n + 1);
+    const pow = new Uint32Array(n + 1);
+    pow[0] = 1;
+    for (let k = 0; k < n; k++) {
+      hash[k + 1] = (Math.imul(hash[k], BASE) + s.charCodeAt(k)) >>> 0;
+      pow[k + 1] = Math.imul(pow[k], BASE) >>> 0;
+    }
+    const eq = (a: number, b: number, len: number): boolean => {
+      if (a + len > n || b + len > n) return false;
+      if ((hash[a + len] - Math.imul(hash[a], pow[len])) >>> 0 !== (hash[b + len] - Math.imul(hash[b], pow[len])) >>> 0) return false;
+      // 哈希相等才做的兜底校验。用原生 slice 比较（V8 走 memcmp），比逐字 charCodeAt 循环快一个量级。
+      return s.slice(a, a + len) === s.slice(b, b + len);
+    };
     for (let L = Math.min(n >> 1, 600); L >= MIN && !replaced; L--) {
       let i = 0;
       while (i + 2 * L <= n) {
-        const block = s.slice(i, i + L);
-        if (s.slice(i + L, i + 2 * L) === block) {
+        if (eq(i + L, i, L)) {
           let count = 2;
-          while (i + count * L <= n && s.slice(i + (count - 1) * L, i + count * L) === block) count++;
-          if (count >= 2) {
-            s = s.slice(0, i) + block + s.slice(i + count * L);
-            replaced = true;
-            break;
-          }
+          while (i + count * L <= n && eq(i + (count - 1) * L, i, L)) count++;
+          s = s.slice(0, i) + s.slice(i, i + L) + s.slice(i + count * L);
+          replaced = true;
+          break;
         }
         i++;
       }

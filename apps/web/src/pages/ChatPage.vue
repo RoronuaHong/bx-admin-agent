@@ -1734,15 +1734,30 @@ watch(() => current.value.input, () => autoGrow());
 /** 仅最近一条带协议标记的助手结论显示「设为数据预警」，避免历史气泡刷屏。 */
 const latestAlertMarkerId = ref<number | undefined>(undefined);
 /**
- * 只在「气泡数量变化」「尾部气泡结束流式」或「尾部结论原地长出/变更告警标记」时重算，不跟每次 text_delta。
- * 之前是在模板里逐气泡调用扫描函数：父渲染因此依赖所有气泡的 text，长对话每帧 O(N²)，是卡顿主因。
- * 注意 sig 必须包含告警标记位：否则一条助手结论在原地补上 [SPIKE]/[NORMAL] 标记（内容更新、但未增删气泡、
- * 流式标志也未变）时 watch 不触发，「设为数据预警」对话框入口停在原地不刷新。
+ * 只在「切换会话」「气泡数量变化」「尾部气泡结束流式」或「尾部结论原地长出/变更告警标记」时重算，
+ * 不跟每次 text_delta。之前是在模板里逐气泡调用扫描函数：父渲染因此依赖所有气泡的 text，长对话每帧 O(N²)。
+ * sig 必须含告警标记位（原地补 [SPIKE]/[NORMAL] 时要刷新），也必须含会话 id（否则两个气泡数/尾部标记相同的
+ * 会话切换时不触发，入口停在上一会话的残影），还必须含「气泡数组实例」——首次打开会先用列表快照建气泡、
+ * 随后用完整快照 force 重载整段（bubblesFromStored 每次 ++seq 生成全新 id），若只看长度/尾部标记会误判为
+ * 未变化，CTA 残留在已被替换掉的旧 id 上。
+ * 回调的倒序全扫在长对话上很贵，按「会话 id + sig」缓存结果，来回切同一会话直接命中。
  */
+const alertMarkerCache = new Map<string, { sig: string; id: number | undefined }>();
+const EMPTY_BUBBLES: Bubble[] = [];
+const bubbleArrIds = new WeakMap<object, number>();
+let bubbleArrSeq = 0;
+function bubbleArrId(arr: object): number {
+  let id = bubbleArrIds.get(arr);
+  if (id === undefined) {
+    id = ++bubbleArrSeq;
+    bubbleArrIds.set(arr, id);
+  }
+  return id;
+}
 watch(
   () => {
-    const bubbles = current.value?.bubbles || [];
-    let sig = `${bubbles.length}`;
+    const bubbles = current.value?.bubbles || EMPTY_BUBBLES;
+    let sig = `${currentId.value}|${bubbleArrId(bubbles)}|${bubbles.length}`;
     const tail = Math.max(0, bubbles.length - 24);
     for (let i = bubbles.length - 1; i >= tail; i--) {
       const b = bubbles[i]!;
@@ -1750,7 +1765,13 @@ watch(
     }
     return sig;
   },
-  () => {
+  (sig) => {
+    const convId = currentId.value;
+    const cached = alertMarkerCache.get(convId);
+    if (cached && cached.sig === sig) {
+      latestAlertMarkerId.value = cached.id;
+      return;
+    }
     const bubbles = current.value?.bubbles || [];
     let id: number | undefined;
     for (let i = bubbles.length - 1; i >= 0; i--) {
@@ -1760,6 +1781,7 @@ watch(
         break;
       }
     }
+    alertMarkerCache.set(convId, { sig, id });
     latestAlertMarkerId.value = id;
   },
   { immediate: true },
@@ -1808,12 +1830,30 @@ function outlineLabel(b: Bubble): string {
  * computed 依赖是细粒度的——助手气泡流式追加 text 不会触碰这里的依赖，面板在生成全程零重算零抖动；
  * 新增/删除气泡（含用户新消息）才会使它更新。
  */
+// 大纲派生扫全量气泡做正则并生成上千条目：长对话（上万条消息）来回切时每次重算是切换延迟的大头。
+// 用户气泡文本创建后不会被原地改（编辑是回填输入框再重发），气泡数组只会整体替换或 push/splice，
+// 故按「状态对象 + 数组引用 + 长度 + 语言」缓存即可安全失效；助手流式改 text 不影响大纲，也不该触发重算。
+// 语言必须入键：纯图片/空文本用户气泡的标签走 tx()，切界面语言后要重算本地化文案。
+let outlineCache: { state: ConvState; arr: Bubble[]; len: number; locale: string; items: OutlineItem[] } | null = null;
 const conversationOutline = computed<OutlineItem[]>(() => {
+  const state = current.value;
+  const arr = state?.bubbles ?? [];
+  const locale = uiLocale.value;
+  if (
+    outlineCache &&
+    outlineCache.state === state &&
+    outlineCache.arr === arr &&
+    outlineCache.len === arr.length &&
+    outlineCache.locale === locale
+  ) {
+    return outlineCache.items;
+  }
   const out: OutlineItem[] = [];
-  for (const b of current.value?.bubbles ?? []) {
+  for (const b of arr) {
     if (b.role !== "user") continue;
     out.push({ id: b.id, label: outlineLabel(b) });
   }
+  outlineCache = { state, arr, len: arr.length, locale, items: out };
   return out;
 });
 
@@ -2548,16 +2588,19 @@ function selectConversation(conv: ConversationDto) {
   // 打开的是某一期的结果 → 该任务的未读清零（放在选中之后：即便清零请求失败也不影响阅读）。
   clearTaskUnread(conv.id);
   // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
-  const times = messageTimes(conv.messages || [], conv.createdAt, conv.updatedAt);
-  if (!state.bubbles.length) {
-    state.bubbles = bubblesFromStored(conv.messages || [], times);
-    if (!persistedCount.has(conv.id)) persistedCount.set(conv.id, toStored(state.bubbles).length);
-    // 列表不含思考过程。打开后再取最近一段细节，不把整段推理塞进侧栏轮询。
-    void upgradeConversationDetail(conv.id);
-  } else if (state.bubbles.length === times.length) {
-    state.bubbles.forEach((bubble, index) => {
-      if (!bubble.at) bubble.at = times[index];
-    });
+  // messageTimes 要扫全量消息（长对话上万条），只在真要建气泡/补时间时算：切换已初始化的对话直接跳过。
+  if (!state.bubbles.length || state.bubbles.some((bubble) => !bubble.at)) {
+    const times = messageTimes(conv.messages || [], conv.createdAt, conv.updatedAt);
+    if (!state.bubbles.length) {
+      state.bubbles = bubblesFromStored(conv.messages || [], times);
+      if (!persistedCount.has(conv.id)) persistedCount.set(conv.id, toStored(state.bubbles).length);
+      // 列表不含思考过程。打开后再取最近一段细节，不把整段推理塞进侧栏轮询。
+      void upgradeConversationDetail(conv.id);
+    } else if (state.bubbles.length === times.length) {
+      state.bubbles.forEach((bubble, index) => {
+        if (!bubble.at) bubble.at = times[index];
+      });
+    }
   }
   // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
   state.settings.modelId = conv.model || "";
@@ -5273,8 +5316,12 @@ function messageTimes(
   return messages.map((message, index) => message.at || atOfTurn(turnOf[index] ?? 0));
 }
 
-function bubbleTimeText(at: number): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
+// 每条气泡时间都新建 Intl.DateTimeFormat + formatToParts：切换会话时 60 条气泡同时重挂载，
+// 这笔固定开销能占掉几十毫秒。格式化器与按时间戳缓存的文案都要跟随系统时区：Intl 实例一旦
+// 创建就固化了当时的时区，故 zone 变化时重建实例并清空文案缓存（refreshNowClock 每秒探测）。
+function buildBubbleTimeFormatter(zone: string): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: zone || undefined,
     hourCycle: "h23",
     year: "numeric",
     month: "2-digit",
@@ -5282,15 +5329,31 @@ function bubbleTimeText(at: number): string {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-  }).formatToParts(new Date(at));
+  });
+}
+let bubbleTimeZone = "";
+let bubbleTimeFormatter = buildBubbleTimeFormatter(bubbleTimeZone);
+const bubbleTimeCache = new Map<number, string>();
+function bubbleTimeText(at: number): string {
+  const hit = bubbleTimeCache.get(at);
+  if (hit !== undefined) return hit;
+  const parts = bubbleTimeFormatter.formatToParts(new Date(at));
   const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
   const hour = pick("hour") === "24" ? "00" : pick("hour");
-  return `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}:${pick("second")}`;
+  const text = `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}:${pick("second")}`;
+  if (bubbleTimeCache.size > 2000) bubbleTimeCache.clear();
+  bubbleTimeCache.set(at, text);
+  return text;
 }
 
 function refreshNowClock() {
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
   nowZone.value = zone;
+  if (zone !== bubbleTimeZone) {
+    bubbleTimeZone = zone;
+    bubbleTimeFormatter = buildBubbleTimeFormatter(zone);
+    bubbleTimeCache.clear();
+  }
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: zone || undefined,
     hourCycle: "h23",

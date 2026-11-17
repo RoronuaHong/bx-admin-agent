@@ -196,7 +196,14 @@ function foldAgentBlocks(html: string, locale: UiLocale): string {
   return body.innerHTML;
 }
 
+// 缓存上限：切换会话时旧气泡会被卸载、新气泡重挂载，缓存里同时存在多个会话的气泡正文。
+// 原来 80 项一到就 clear()，两个大会话来回切会反复清空重渲染整批气泡；改成超出后淘汰最早一项。
+// 另设累计字符预算：key 是全文原文、value 是 sanitize 后的 HTML，极端长正文（消息体上限 8MB）下
+// 单条就可能占几 MB，光靠条数上限挡不住内存膨胀，超预算时同样从头淘汰。
+const MD_CACHE_MAX = 400;
+const MD_CACHE_CHARS = 2_000_000;
 const mdCache = new Map<string, string>();
+let mdCacheChars = 0;
 
 export function renderChatMarkdown(text: string, locale: UiLocale = "zh"): string {
   // 以全文为键：截断首尾会忽略中间内容，导致「长度相等 + 首尾相同但中间不同」两段文本命中同一键、返回陈旧渲染。
@@ -223,7 +230,17 @@ export function renderChatMarkdown(text: string, locale: UiLocale = "zh"): strin
     FORCE_BODY: true,
     ALLOWED_URI_REGEXP: /^(?:(?:https?|ftp|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
   });
-  if (mdCache.size > 80) mdCache.clear();
+  const cost = key.length + html.length;
+  while (
+    mdCache.size >= MD_CACHE_MAX ||
+    (mdCacheChars + cost > MD_CACHE_CHARS && mdCache.size > 0)
+  ) {
+    const oldest = mdCache.keys().next().value;
+    if (oldest === undefined) break;
+    mdCacheChars -= (oldest as string).length + (mdCache.get(oldest as string)?.length ?? 0);
+    mdCache.delete(oldest as string);
+  }
   mdCache.set(key, html);
+  mdCacheChars += cost;
   return html;
 }

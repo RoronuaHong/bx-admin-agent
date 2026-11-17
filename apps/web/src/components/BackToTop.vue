@@ -39,18 +39,25 @@ let ticking = false;
  * `window.scrollTo()` 也没有效果（实测门户首页正是如此）。
  * 这里从按钮自身往上找最近的可滚动祖先，找不到再退化为「文档级滚动」——内层容器滚动与整页滚动两种布局都成立。
  */
+// 滚动容器是稳定的结构祖先，切换会话只换它内部的消息节点。每次 scroll 都重新 getComputedStyle +
+// 读 scrollHeight/clientHeight 逐层上溯会在样式刚被 DOM 改动弄脏时强制同步重排（实测切换会话 INP 的
+// 大头）。找到一次后缓存元素引用；仅在缓存失效（节点被卸载）时才重找。
+let cachedScroller: HTMLElement | null | undefined;
 function findScroller(): HTMLElement | null {
+  if (cachedScroller !== undefined && cachedScroller?.isConnected) return cachedScroller;
   let el: HTMLElement | null = root.value?.parentElement ?? null;
   while (el) {
     const overflowY = getComputedStyle(el).overflowY;
-    if ((overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") && el.scrollHeight > el.clientHeight + 1) {
+    // 只认 overflow 样式，不看当前是否溢出：短对话时 .thread 也标着 auto，把它缓存下来，
+    // 切到长对话撑出滚动后仍然指向正确容器（若改用 scrollHeight>clientHeight 判定，短对话时
+    // 会退化并缓存 document.scrollingElement，长对话就再也找不到真正的滚动容器了）。
+    if (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") {
+      cachedScroller = el;
       return el;
     }
     el = el.parentElement;
   }
-  for (const candidate of [document.scrollingElement, document.body, document.documentElement]) {
-    if (candidate instanceof HTMLElement && candidate.scrollHeight > candidate.clientHeight + 1) return candidate;
-  }
+  // 没有内层滚动容器 → 文档级滚动。这个兜底不缓存：内联容器日后变可滚时仍要能重新找到。
   return (document.scrollingElement as HTMLElement | null) ?? null;
 }
 
