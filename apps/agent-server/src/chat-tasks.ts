@@ -18,6 +18,7 @@ import {
   TASK_DB_RETAIN_MS,
   flushTask,
   listStaleRunningTasks,
+  loadLatestTaskRecord,
   loadTaskRecord,
   markTaskInterrupted,
   type TaskRecord,
@@ -295,10 +296,11 @@ export function publishTaskEvent(task: ChatTask, event: ChatEvent): void {
   for (const wake of task.waiters) wake(stamped);
 }
 
-/** HTTP 订阅者离开：标记 live=false 并清掉自己的唤醒器。 */
+/** HTTP 订阅者离开：清掉自己的唤醒器（若有），live 按「是否还有别的订阅者」重算。 */
 export function detachTask(task: ChatTask, wake?: (event: ChatEvent | null) => void): void {
-  task.live = false;
   if (wake) task.waiters.delete(wake);
+  // 不能无条件置 false：多标签 / 断线重连时可能还有别的 followTask 订阅者挂着。
+  task.live = task.waiters.size > 0;
 }
 
 /** 收束任务：出注册表、留摘要、留档（供晚到的续传）、唤醒所有等待者（null = 结束）。 */
@@ -323,7 +325,7 @@ export function finishTask(task: ChatTask, status: TaskStatus, outcomePersisted:
     retainTask(task);
   }
   // 收束立即落一次（终态 + 尾部事件），别等定时器——进程要是接着重启，这一笔就是最后一次机会。
-  // flushTask 带 taskId CAS：旧任务迟到写会被拒绝，不覆盖新任务留档（§12.1 R03）。
+  // 留档按 taskId 为主键（R34）：旧任务迟到写只更新自己那份，不覆盖同对话的新任务留档。
   if (task.flushTimer) {
     clearTimeout(task.flushTimer);
     task.flushTimer = undefined;
@@ -422,7 +424,7 @@ export async function recoverStaleTasks(): Promise<number> {
   const stale = await listStaleRunningTasks(BOOTED_AT, INSTANCE_ID);
   let recovered = 0;
   for (const item of stale) {
-    if (await markTaskInterrupted(item.conversationId)) recovered += 1;
+    if (await markTaskInterrupted(item.taskId, item.conversationId)) recovered += 1;
   }
   if (recovered) {
     console.log(`[chat:tasks] 启动恢复：${recovered} 个僵尸任务已标记 interrupted（上次进程留下的）`);
@@ -442,15 +444,18 @@ export async function recoverStaleTasks(): Promise<number> {
  */
 export async function loadTaskForResume(
   conversationId: string,
+  taskId?: string,
 ): Promise<{ record: TaskRecord; canContinue: boolean } | null> {
-  const record = await loadTaskRecord(conversationId);
-  if (!record) return null;
+  // 带 taskId（续传游标所属轮次）：按 taskId 精确读，避免多轮留档里取错轮次造成跨轮串流。
+  // 不带（/chat/task/status 只按对话查）：取该对话最新一轮。
+  const record = taskId ? await loadTaskRecord(taskId) : await loadLatestTaskRecord(conversationId);
+  if (!record || record.conversationId !== conversationId) return null;
   if (record.status !== "running") return { record, canContinue: false };
   // 心跳落在我们启动之后、且属于**别的**实例 = 那边真的还在跑（真多实例部署）。
   // 否则就是「主人进程已不在」的残档：就地改成 interrupted，让状态与事实一致。
   const alive = record.updatedAt >= BOOTED_AT && record.instanceId !== INSTANCE_ID;
   if (alive) return { record, canContinue: true };
-  await markTaskInterrupted(conversationId);
+  await markTaskInterrupted(record.taskId, conversationId);
   return { record: { ...record, status: "interrupted" }, canContinue: false };
 }
 
@@ -492,12 +497,9 @@ function retainTask(task: ChatTask): void {
  * `from = 0` 表示从头开始（首连订阅 / 刷新后重新挂上正在跑的任务）。
  */
 export async function* followTask(task: ChatTask, from = 0): AsyncGenerator<ChatEvent> {
-  task.live = true;
-  if (task.text && task.textSeq > from) yield { type: "text", text: task.text, seq: task.textSeq };
-  for (const event of task.buffer) {
-    if ((event.seq ?? 0) > from) yield event;
-  }
-  if (task.status !== "running") return;
+  // 先注册唤醒器再回放：回放（尤其逐条 send 的 HTTP 写出）可能耗时数秒，这段窗口里产出的
+  // text_delta 只累加进 task.text、不进 buffer——若等回放完再注册，这部分增量会永久丢失。
+  // 水印 startSeq 把「回放的存量」与「订阅期的新增量」切开，二者不重不漏。
   const queue: Array<ChatEvent | null> = [];
   let resolveWait: () => void = () => undefined;
   const wake = (event: ChatEvent | null) => {
@@ -505,7 +507,16 @@ export async function* followTask(task: ChatTask, from = 0): AsyncGenerator<Chat
     resolveWait();
   };
   task.waiters.add(wake);
+  task.live = task.waiters.size > 0;
+  const startSeq = task.seq; // 注册瞬间已分配的最大序号；回放只覆盖 <= 它的存量
   try {
+    if (task.text && task.textSeq > from) yield { type: "text", text: task.text, seq: task.textSeq };
+    for (const event of task.buffer) {
+      const seq = event.seq ?? 0;
+      // 只回放订阅前就已存在的事件；期间新增的（seq > startSeq）已进队列，跳过避免重复。
+      if (seq > from && seq <= startSeq) yield event;
+    }
+    if (task.status !== "running") return;
     while (true) {
       if (queue.length) {
         const event = queue.shift()!;
@@ -518,8 +529,8 @@ export async function* followTask(task: ChatTask, from = 0): AsyncGenerator<Chat
       });
     }
   } finally {
-    task.waiters.delete(wake);
-    task.live = false;
+    // 复用 detachTask：删除自己的 wake 并按剩余订阅者数重算 live（不误伤别的订阅者）。
+    detachTask(task, wake);
   }
 }
 
@@ -529,9 +540,15 @@ export async function* followTask(task: ChatTask, from = 0): AsyncGenerator<Chat
  * 随后 abort —— 旧 chatStream 会在 round 边界感知并走 wrapup / catch，其迟到增量仍带 running 状态，
  * 故前端在收到 cancelled 后**不应吞掉后续增量**（否则会丢模型「哪些没查完」的收尾说明，见 §14.9 R33）。
  */
-export function cancelTask(conversationId: string): boolean {
+export function cancelTask(conversationId: string, includeUnattended = true): boolean {
   const task = running.get(conversationId);
   if (!task) return false;
+  // 重复取消防护：abort 后到 finishTask 前 status 仍是 running，但 signal.aborted 已置位——
+  // 用它挡住第二次 cancel，避免重复发 cancelled 事件进留档 / 多订阅者队列。
+  if (task.status !== "running" || task.abort.signal.aborted) return false;
+  // 无人值守任务（定时任务）不被显式 Stop 取消——与 ChatTask.unattended 的契约一致（§12.4 R07）。
+  // 抢占路径已在 /chat/stream 判 unattended 返回 409；这里只拦「显式取消」入口。
+  if (task.unattended && !includeUnattended) return false;
   publishTaskEvent(task, { type: "cancelled" });
   task.abort.abort();
   return true;

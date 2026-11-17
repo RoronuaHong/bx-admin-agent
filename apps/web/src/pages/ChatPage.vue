@@ -96,6 +96,8 @@ import {
   isChatTaskRunning,
   patchChatSchedule,
   patchConversation,
+  enqueueConversationMessage,
+  dequeueConversationMessage,
   reloadMcpServer,
   reorderConversations,
   resumeChatTaskEvents,
@@ -1818,15 +1820,59 @@ const conversationOutline = computed<OutlineItem[]>(() => {
 /** 大纲面板开关与当前高亮项。切换会话先清高亮，防止上一会话的残影。 */
 const outlineOpen = ref(false);
 const activeOutlineId = ref<number | null>(null);
+/** 点击跳转后锁定高亮：滚动跟踪此时别把「点的那条」改成「带内的下一条」。 */
+const pinnedOutlineId = ref<number | null>(null);
+/** 本轮跳转的程序滚动是否在飞：期间的 scroll 不算用户滚动，不解锁。 */
+let outlineJumpActive = false;
+let outlineJumpFallback = 0;
+let outlineScrollEndHandler: (() => void) | null = null;
+/** scrollend 之后极短的尾随 scroll 忽略窗口，避免程序滚动补发事件误解锁。 */
+let outlineIgnoreScrollUntil = 0;
+
+/** 结束「程序滚动中」标记；不负责清 pin（用户没滚就继续锁定）。 */
+function finishOutlineScroll() {
+  outlineJumpActive = false;
+  outlineIgnoreScrollUntil = Date.now() + 120;
+  window.clearTimeout(outlineJumpFallback);
+  outlineJumpFallback = 0;
+  if (outlineScrollEndHandler && threadEl.value) threadEl.value.removeEventListener("scrollend", outlineScrollEndHandler);
+  outlineScrollEndHandler = null;
+}
+
+/** 用户主动滚动 → 解锁高亮跟踪，并终止本轮程序滚动标记。 */
+function releaseOutlinePin() {
+  if (pinnedOutlineId.value === null) return;
+  pinnedOutlineId.value = null;
+  finishOutlineScroll();
+}
+
+/** 滚轮 / 触摸 / 翻页键都算用户滚动意图，立即解锁（不必等 scrollend）。 */
+const OUTLINE_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+function onOutlineUserScrollIntent(e?: Event) {
+  if (e instanceof KeyboardEvent && !OUTLINE_NAV_KEYS.has(e.key)) return;
+  releaseOutlinePin();
+}
+
 watch(currentId, () => {
   activeOutlineId.value = null;
+  releaseOutlinePin();
 });
+// 新用户消息进来后大纲追加，旧锁不再有意义。
+watch(
+  () => conversationOutline.value.length,
+  () => releaseOutlinePin(),
+);
 
 /** 跳转目标的窗口余量：让目标行进窗后再多留几条上下文，避免它贴在窗口边缘。 */
 const OUTLINE_WINDOW_MARGIN = 20;
+/** 当前项高亮带：视口顶部往下该比例。与 ConversationOutline 的滚动跟踪共用同一口径。 */
+const OUTLINE_ACTIVE_BAND = 0.4;
+/** 目标行落在高亮带略上方，避开像素取整导致高亮判给前一条。 */
+const OUTLINE_LANDING_INSET = 12;
 
 /**
- * 大纲跳转：目标在渲染窗口（最近 60 条）之外时先扩窗，再 scrollIntoView + 落焦。
+ * 大纲跳转：目标在渲染窗口（最近 60 条）之外时先扩窗，再滚动 + 落焦。
+ * 落点对齐高亮带（而非贴视口顶），否则目标下方的下一条会落进带内，高亮跑偏到下一条。
  * 不强制回底——向上跳后 nearBottom() 自然置 followBottom=false，流式增量不会把用户拽回底部，
  * 滚回底部附近即自动恢复跟随（onThreadScroll 既有逻辑）。
  */
@@ -1837,11 +1883,30 @@ function jumpToOutline(id: number) {
   const need = all.length - index;
   if (need > threadWindow.value) threadWindow.value = need + OUTLINE_WINDOW_MARGIN;
   if (isMobile.value) outlineOpen.value = false; // 移动端跳转后收起面板，不遮刚滚到的内容
+  activeOutlineId.value = id; // 点击即高亮，不等平滑滚动过程中的滚动跟踪
+  finishOutlineScroll(); // 清掉上一轮的程序滚动收尾监听
+  pinnedOutlineId.value = id;
+  outlineJumpActive = true; // 点击到 nextTick 之间也可能有 scroll，先屏蔽
   void nextTick(() => {
-    const el = threadEl.value?.querySelector<HTMLElement>(`[data-bubble-id="${id}"]`);
-    if (!el) return;
+    const thread = threadEl.value;
+    const el = thread?.querySelector<HTMLElement>(`[data-bubble-id="${id}"]`);
+    if (!thread || !el) {
+      finishOutlineScroll();
+      return;
+    }
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-    el.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+    const offset = el.getBoundingClientRect().top - thread.getBoundingClientRect().top;
+    const top = Math.max(0, thread.scrollTop + offset - thread.clientHeight * OUTLINE_ACTIVE_BAND + OUTLINE_LANDING_INSET);
+    thread.scrollTo({ top, behavior: reduceMotion ? "auto" : "smooth" });
+    if (reduceMotion) {
+      finishOutlineScroll(); // 瞬时滚动没有 scrollend，立即收尾
+    } else {
+      const done = () => finishOutlineScroll();
+      outlineScrollEndHandler = done;
+      thread.addEventListener("scrollend", done, { once: true });
+      // scrollend 尚未普及的浏览器兜底：避免程序滚动标记永不清。
+      outlineJumpFallback = window.setTimeout(done, 1200);
+    }
     el.focus({ preventScroll: true }); // 行有 tabindex="-1"，落焦避免面板收起后焦点悬空
   });
 }
@@ -2051,6 +2116,8 @@ function atBottomNow(): boolean {
 function onThreadScroll() {
   const el = threadEl.value;
   if (el) followBottom = nearBottom(el);
+  // 非本轮程序滚动的 scroll 一律视为用户滚动（拖滚动条也走这条路），立即解锁高亮跟踪。
+  if (pinnedOutlineId.value !== null && !outlineJumpActive && Date.now() > outlineIgnoreScrollUntil) releaseOutlinePin();
 }
 
 function queueScroll(force = false) {
@@ -2399,8 +2466,35 @@ async function syncOpenConversation(convId: string) {
  * 必须显式传对话 id 与气泡：本轮结束时可能已经切到别的对话（后台流），
  * 用 currentId 会把 A 的内容写进 B。
  */
-async function persist(convId: string, list: Bubble[], forceFull = false) {
-  if (!convId) return;
+/**
+ * 在途落库登记（清空对话竞态）：runTurn finally 先把 sending 归零、再 await persist，
+ * 这段窗口里「清空」守卫看到 sending=false 就放行，但落库请求还在飞，后到会把已清的消息写回。
+ * 清空动作先 await 这里的 Promise，确保落库全部结束后再发 /clear。
+ */
+const pendingPersists = new Map<string, Promise<unknown>>();
+/** 每对话的落库串行链：多 run 收束时写请求 + persistedCount 水位必须按序，否则慢请求晚到覆盖新快照。 */
+const persistChains = new Map<string, Promise<unknown>>();
+async function waitPendingPersists(convId: string): Promise<void> {
+  await pendingPersists.get(convId)?.catch(() => undefined);
+}
+
+function persist(convId: string, list: Bubble[], forceFull = false): Promise<void> {
+  if (!convId) return Promise.resolve();
+  // 串行化：本轮写排在上一个之后。快照 list 在调用时已取好，排队期间其它 run 的增量写不会互相覆盖。
+  const prevChain = persistChains.get(convId) || Promise.resolve();
+  const task = prevChain.catch(() => undefined).then(() => persistNow(convId, list, forceFull));
+  persistChains.set(convId, task);
+  void task.finally(() => {
+    if (persistChains.get(convId) === task) persistChains.delete(convId);
+  });
+  pendingPersists.set(convId, task);
+  void task.finally(() => {
+    if (pendingPersists.get(convId) === task) pendingPersists.delete(convId);
+  });
+  return task;
+}
+
+async function persistNow(convId: string, list: Bubble[], forceFull = false) {
   const stored = toStored(list);
   const title = list.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
   // 本会话首次落库该对话时，用服务端快照长度当基线（避免把整段历史重新全量上传）。
@@ -3164,6 +3258,24 @@ async function toggleFullAccess(id: string) {
   }
 }
 
+/**
+ * 发送模式：抢占式（默认，新消息接管旧轮）/ 排队等待（新消息入队，等上一轮成功收束后自动发）。
+ * 纯设置：不中止当前正在生成的轮次，只从下一条消息起生效；多标签页以服务端会话文档为准。
+ * 失败以服务端为唯一真相回滚。
+ */
+async function toggleSendMode(id: string) {
+  const conv = conversations.value.find((c) => c.id === id);
+  if (!conv) return;
+  const current = conv.sendMode ?? "preempt";
+  const sendMode = current === "preempt" ? "queue" : "preempt";
+  closeCtxMenu();
+  conversations.value = conversations.value.map((c) => (c.id === id ? { ...c, sendMode } : c));
+  const updated = await patchConversation(id, { sendMode }).catch(() => null);
+  if (!updated) {
+    conversations.value = conversations.value.map((c) => (c.id === id ? { ...c, sendMode: current } : c));
+  }
+}
+
 async function duplicateCurrent(id: string) {
   closeCtxMenu();
   const created = await duplicateConversation(id).catch(() => null);
@@ -3323,6 +3435,8 @@ async function clearConversationById(id: string) {
     showSettingsError(tx("生成中，请先停止", "Still generating — stop it first", "Gerando resposta — pare antes", "उत्पन्न हो रहा है — पहले रोकें"));
     return;
   }
+  // 等在途落库结束：否则 sending 已归零但 saveConversationMessages 仍在飞，后到的快照会把刚清的消息写回。
+  await waitPendingPersists(id);
   if (state) {
     state.bubbles = [];
     state.error = "";
@@ -3393,6 +3507,8 @@ function onClearCurrentClick() {
 async function clearCurrent() {
   const state = current.value;
   if (state.sending) return;
+  // 等在途落库结束（详见 waitPendingPersists 注释）：清空守卫只看 sending，盖不住 persist 的请求窗口。
+  if (currentId.value) await waitPendingPersists(currentId.value);
   state.bubbles = [];
   state.error = "";
   // 同时清掉服务端上下文，否则旧历史仍会被带进下一轮模型请求。
@@ -3460,8 +3576,10 @@ function removePendingDoc(id: string) {
 
 /** 队列容量上限：超过拒绝入队，避免无限堆积。 */
 const MAX_QUEUE = 20;
+/** 整队列写串行链：重排 / 编辑 / 删除走整数组 PATCH，同页内串行避免彼此交错；出入队走原子端点不受此限。 */
+const queueSetChains = new Map<string, Promise<unknown>>();
 
-/** 忙时入队（排队语义）：先本地、后落库，失败回滚并提示。 */
+/** 忙时入队（排队语义）：走服务端原子 $push，避免多标签 / 自动出队并发整体覆盖丢项（B6）。 */
 async function enqueueMessage(convId: string, text: string, imageIds: string[], docIds: string[] = []) {
   const state = stateOf(convId);
   if (state.queue.length >= MAX_QUEUE) {
@@ -3475,10 +3593,11 @@ async function enqueueMessage(convId: string, text: string, imageIds: string[], 
     at: Date.now(),
   };
   const prev = state.queue;
-  state.queue = [...prev, item];
   try {
-    await patchConversation(convId, { pendingQueue: state.queue });
-    syncConvLocal(convId, { pendingQueue: state.queue });
+    // 服务端原子追加并返回完整队列：本地直接用它同步，顺带看到其它标签页并发入的项。
+    const res = await enqueueConversationMessage(convId, item);
+    state.queue = res.pendingQueue;
+    syncConvLocal(convId, { pendingQueue: res.pendingQueue });
   } catch (err) {
     state.queue = prev;
     showSettingsError(
@@ -3488,20 +3607,28 @@ async function enqueueMessage(convId: string, text: string, imageIds: string[], 
 }
 
 /** 队列变更（上移/下移/删除/编辑）统一走这里：乐观 + 失败回滚。 */
-async function setQueue(convId: string, next: PendingMessage[]) {
+async function setQueue(convId: string, next: PendingMessage[]): Promise<void> {
   const state = states.get(convId);
   if (!state) return;
-  const prev = state.queue;
-  state.queue = next;
-  try {
-    await patchConversation(convId, { pendingQueue: next });
-    syncConvLocal(convId, { pendingQueue: next });
-  } catch (err) {
-    state.queue = prev;
-    showSettingsError(
+  const prevChain = queueSetChains.get(convId) || Promise.resolve();
+  const task = prevChain.catch(() => undefined).then(async () => {
+    const prev = state.queue;
+    state.queue = next;
+    try {
+      await patchConversation(convId, { pendingQueue: next });
+      syncConvLocal(convId, { pendingQueue: next });
+    } catch (err) {
+      state.queue = prev;
+      showSettingsError(
       localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("队列保存失败", "Failed to save queue", "Falha ao salvar a fila", "कतार सहेजने में विफल")),
     );
   }
+  });
+  queueSetChains.set(convId, task);
+  void task.finally(() => {
+    if (queueSetChains.get(convId) === task) queueSetChains.delete(convId);
+  });
+  return task;
 }
 
 /**
@@ -3511,14 +3638,25 @@ async function setQueue(convId: string, next: PendingMessage[]) {
 async function drainQueue(convId: string, ok: boolean) {
   const state = states.get(convId);
   if (!state || !ok || state.sending || !state.queue.length) return;
-  const [next, ...rest] = state.queue;
-  state.queue = rest;
+  // 原子出队：服务端一次操作移除并返回队首（多标签 / watchAndDrain 并发不会各拿同一条）。
+  let next: PendingMessage;
+  let rest: PendingMessage[];
   try {
-    await patchConversation(convId, { pendingQueue: rest });
-    syncConvLocal(convId, { pendingQueue: rest });
+    const res = await dequeueConversationMessage(convId);
+    if (!res.item) {
+      // 并发下别的出队已取空：以服务端为准同步本地，不发送。
+      state.queue = res.pendingQueue;
+      syncConvLocal(convId, { pendingQueue: res.pendingQueue });
+      return;
+    }
+    next = res.item;
+    rest = res.pendingQueue;
   } catch {
-    /* 落库失败不阻塞发送，下次同步会纠正 */
+    // 出队端点失败（网络）：退回本地队首，仍不落库——下次同步会以服务端为准纠正。
+    [next, ...rest] = state.queue;
   }
+  state.queue = rest;
+  syncConvLocal(convId, { pendingQueue: rest });
   await runTurn(convId, next.text, next.images || [], undefined, next.docs || []);
 }
 
@@ -3586,6 +3724,8 @@ interface TurnRun {
   servedModel?: string;
   /** 是否收到过终态事件（done / 服务端 error）：没收到就结束的流 = 中断，必须收口。 */
   sawTerminal: boolean;
+  /** 本轮被抢占 / 取消（cancelled 事件）：收尾不算成功，不触发队列出队（applyStreamEvent 置位）。 */
+  cancelled?: boolean;
   /** 已消费到的最后一个事件序号 = 续传游标（服务端据它只回放更新的部分）。 */
   lastSeq: number;
   /** 本轮的任务 id（`POST /chat/stream` 的响应头给出）：续传时带回去，确认接的还是**同一轮**。 */
@@ -3738,6 +3878,8 @@ async function runTurn(
       queued = true;
       reply.text = tx("（该对话正在生成中，此消息已加入待发队列）", "(Chat is busy; the message was queued)", "(A conversa está ocupada; a mensagem entrou na fila)", "(चैट व्यस्त है; संदेश कतार में जोड़ दिया गया)");
       await enqueueMessage(convId, text, imageIds, docIds);
+      // 本标签页收不到「另一标签页那轮」的收束事件，必须自己守望占用释放后出队，否则队列卡死。
+      watchAndDrain(convId);
     } else {
       // 连接类错误（断网/刷新/代理断开）：执行与推送已解耦，后台任务可能仍在跑。
       // 先按游标续传（与「流无终态结束」同一条路径）；真接不上再查任务状态如实告知，
@@ -3783,9 +3925,9 @@ async function runTurn(
     await persist(convId, state.bubbles, state.hadConcurrent);
     if (state.runCount === 0) state.hadConcurrent = false;
     queueScrollIfCurrent(convId);
-    // 出队决策：停止 / 中断 / 出错 / 已再入队 / 仍有待确认 → 停下等用户，不自动发下一条
-    // （中断的轮次连接已经不可靠，接着发下一条大概率也失败，交给用户决定）。
-    void drainQueue(convId, !stopped && !interrupted && !queued && !reply.error && !reply.pending);
+    // 出队决策：停止 / 中断 / 出错 / 已再入队 / 仍有待确认 / 被抢占取消 → 停下等用户，不自动发下一条。
+    // 被抢占的旧 run（run.cancelled）虽然可能以 wrapup 正常收尾，但它不是「本轮成功」，不能替最新一轮触发出队。
+    void drainQueue(convId, !stopped && !interrupted && !queued && !reply.error && !reply.pending && !run.cancelled);
   }
 }
 
@@ -3802,6 +3944,45 @@ function stop() {
 const doneToast = ref<{ id: string; title: string } | null>(null);
 let doneToastTimer: ReturnType<typeof setTimeout> | null = null;
 const bgWatch = new Map<string, ReturnType<typeof setInterval>>();
+/** 409 入队后守望「占用释放」的定时器（与完成提醒分开：前者要出队，后者只弹 toast）。 */
+const queueWatch = new Map<string, ReturnType<typeof setInterval>>();
+
+/**
+ * 当前消息因 CONVERSATION_BUSY 入队后（常见：另一标签页正在生成），本标签页感知不到那轮结束，
+ * 也没有后续 runTurn 收束来触发 drainQueue——队列会一直卡住。这里轮询到占用释放就出队。
+ * 任何终态（success/cancelled/interrupted）都算释放；队列仍为空或已在发送则停止守望。
+ */
+function watchAndDrain(convId: string): void {
+  if (queueWatch.has(convId)) return;
+  let ticks = 0;
+  const timer = setInterval(async () => {
+    ticks += 1;
+    const state = states.get(convId);
+    // 只在队列真被清空（别处已出队）时注销；不能因 state.sending 为真就注销——
+    // sending 是本标签页状态，与「服务端那轮占用是否释放」独立；queue 档下入队的那条正是靠这个守望出队，
+    // 若在另一条 409 的 sending 窗口里被误注销，队列就再也无出队入口（卡死）。
+    if (!state || !state.queue.length) {
+      clearInterval(timer);
+      queueWatch.delete(convId);
+      return;
+    }
+    const status = await fetchChatTaskStatus(convId).catch(() => null);
+    // 查询失败 / 上一轮仍在跑：继续等（最多守望 15 分钟）。只有查到明确「没在跑」才判定终态。
+    if (!status || status.running) {
+      if (ticks >= 180) {
+        clearInterval(timer);
+        queueWatch.delete(convId);
+      }
+      return;
+    }
+    clearInterval(timer);
+    queueWatch.delete(convId);
+    // 只有上一轮「成功收束」才自动发下一条；失败 / 被取消 / 中断都停下等用户决定（对齐 §4.6）。
+    // last 为空（任务已过 retain 期，无法判定终态）时保守不发，避免误把失败轮当成功。
+    if (status.last?.status === "success") void drainQueue(convId, true);
+  }, 5000);
+  queueWatch.set(convId, timer);
+}
 
 function showDoneToast(id: string, title: string) {
   doneToast.value = { id, title: title || tx("新对话", "New chat", "Nova conversa", "नई चैट") };
@@ -3826,11 +4007,16 @@ function watchBackgroundDone(convId: string) {
   let ticks = 0;
   const timer = setInterval(async () => {
     ticks += 1;
-    const running = await isChatTaskRunning(convId).catch(() => false);
+    const status = await fetchChatTaskStatus(convId).catch(() => null);
+    const running = status?.running ?? false;
     if (running && ticks < 180) return;
     clearInterval(timer);
     bgWatch.delete(convId);
     if (running) return; // 超时：不再打扰
+    // 只报「真正成功完成」：被抢占 / 用户停止 / 中断都不该说「已完成」（否则用户以为有结果可看）。
+    // last 已过 retain 期为空时保守不报，避免误报。
+    if (status?.last?.status && status.last.status !== "success") return;
+    if (!status?.last) return;
     const conv = conversations.value.find((c) => c.id === convId);
     // 免打扰 / 用户正看着这个对话 / 对话已删除 → 不提醒。
     if (!conv || conv.muted || convId === currentId.value) return;
@@ -5696,6 +5882,21 @@ provide(bubbleContextKey, {
               : tx("关闭完全访问", "Disable full access", "Desativar acesso total", "पूर्ण एक्सेस बंद करें")
           }}
         </button>
+        <button
+          type="button"
+          class="ctx-item"
+          role="menuitem"
+          :title="(ctxTarget?.sendMode ?? 'preempt') === 'preempt'
+            ? tx('当前：抢占式（新消息接管正在生成的回复）', 'Current: preempt (new message takes over)', 'Atual: preemptiva (nova mensagem assume)', 'वर्तमान: preempt (नया संदेश अधिग्रहण करेगा)')
+            : tx('当前：排队等待（新消息等本轮完成后按顺序发出）', 'Current: queue (new messages wait for the current turn)', 'Atual: fila (novas mensagens esperam a vez)', 'वर्तमान: कतार (नया संदेश अपनी बारी का इंतजार करेगा)')"
+          @click="toggleSendMode(ctxMenu.targetId)"
+        >
+          {{
+            (ctxTarget?.sendMode ?? "preempt") === "preempt"
+              ? tx("发送模式：切到排队等待", "Send mode: switch to queue", "Modo de envio: mudar para fila", "भेजने का मोड: कतार पर बदलें")
+              : tx("发送模式：切到抢占式", "Send mode: switch to preempt", "Modo de envio: mudar para preemptiva", "भेजने का मोड: preempt पर बदलें")
+          }}
+        </button>
         <button type="button" class="ctx-item" role="menuitem" @click="duplicateCurrent(ctxMenu.targetId)">
           {{ tx("复制对话", "Duplicate", "Duplicar", "डुप्लिकेट करें") }}
         </button>
@@ -6787,7 +6988,16 @@ provide(bubbleContextKey, {
       </section>
 
       <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
-      <div v-show="!showTaskForm && !showTaskList" ref="threadEl" class="thread" tabindex="-1" @scroll="onThreadScroll">
+      <div
+        v-show="!showTaskForm && !showTaskList"
+        ref="threadEl"
+        class="thread"
+        tabindex="-1"
+        @scroll="onThreadScroll"
+        @wheel.passive="onOutlineUserScrollIntent"
+        @touchstart.passive="onOutlineUserScrollIntent"
+        @keydown="onOutlineUserScrollIntent"
+      >
         <!-- 首屏慢加载才亮骨架；快加载时 booting 期间留空、不闪空态，直接等真实内容出现。 -->
         <div v-if="showSkeleton" class="boot-skeleton" aria-hidden="true">
           <div class="boot-skeleton__row boot-skeleton__row--agent"></div>
@@ -6841,6 +7051,8 @@ provide(bubbleContextKey, {
           v-model:open="outlineOpen"
           :items="conversationOutline"
           :active-id="activeOutlineId"
+          :band="OUTLINE_ACTIVE_BAND"
+          :pinned-id="pinnedOutlineId"
           @jump="jumpToOutline"
           @active="activeOutlineId = $event"
         />

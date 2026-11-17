@@ -142,6 +142,11 @@ interface ConversationDoc {
   timeZone?: string;
   /** 忙碌期间排队的待发消息。 */
   pendingQueue?: PendingMessage[];
+  /**
+   * 生成中再次发送时的行为：preempt（默认）= 新消息抢占旧轮；queue = 新消息排队等上一轮成功收束后自动发。
+   * 缺省按 preempt 处理（老对话 / 新对话无字段时保持既有手感）。
+   */
+  sendMode?: "preempt" | "queue";
   /** 任务规划（write_todos 全量替换），跨轮持久化、前端可见。 */
   todos?: TodoItem[];
   /** 置顶时间戳；null / 缺省 = 未置顶。置顶区固定在列表最上（新的置顶在上）。 */
@@ -669,6 +674,8 @@ export interface ConversationPatch {
   /** 浏览器上报的 IANA 时区。改它不代表对话有新活动。 */
   timeZone?: string;
   pendingQueue?: PendingMessage[];
+  /** 生成中再次发送的模式：preempt（默认，抢占）/ queue（排队等待）。 */
+  sendMode?: "preempt" | "queue";
   /** 置顶时间戳；null = 取消置顶。 */
   pinnedAt?: number | null;
   /** 归档开关。 */
@@ -685,7 +692,7 @@ export interface ConversationPatch {
  * 只改变「列表怎么组织」、不代表对话有新活动的字段：
  * 改它们不应刷新 `updatedAt`，否则在「按最近活动排序」下会把该对话弹到列表最前（与用户预期不符）。
  */
-const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled", "fullAccess", "timeZone"]);
+const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted", "readGrants", "skillsEnabled", "fullAccess", "timeZone", "sendMode"]);
 
 /**
  * 更新对话设置（未提供的字段保持不变）；对话不存在返回 null。
@@ -694,7 +701,7 @@ const ACTIVITY_NEUTRAL_KEYS = new Set(["title", "pinnedAt", "archived", "muted",
  */
 export async function patchConversation(id: string, patch: ConversationPatch): Promise<ConversationDoc | null> {
   const set: Record<string, unknown> = {};
-  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "timeZone", "pendingQueue", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
+  for (const key of ["title", "model", "mcpServers", "skillsEnabled", "locale", "timeZone", "pendingQueue", "sendMode", "pinnedAt", "archived", "muted", "readGrants", "fullAccess"] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
   // 失效模型 id 一律改写成「自动」（见 sanitizeModelId）：不让悬空 id 落库。
@@ -710,6 +717,57 @@ export async function patchConversation(id: string, patch: ConversationPatch): P
   }
   await coll.updateOne({ id }, { $set: set });
   return getConversation(id);
+}
+
+/**
+ * 原子入队：单文档 $push，避免多标签 / 自动出队并发时「各读整队列再整体覆盖」丢项（B6）。
+ * 上限用 $expr + $size 内置判定，超限不写入（返回 false），调用方据此提示「队列已满」。
+ */
+export async function enqueuePending(id: string, item: PendingMessage, cap: number): Promise<boolean> {
+  const now = Date.now();
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (!doc) return false;
+    const queue = doc.pendingQueue || [];
+    if (queue.length >= cap) return false;
+    doc.pendingQueue = [...queue, item];
+    doc.updatedAt = now;
+    return true;
+  }
+  const res = await coll.updateOne(
+    {
+      id,
+      $expr: { $lt: [{ $size: { $ifNull: ["$pendingQueue", []] } }, cap] },
+    } as never,
+    { $push: { pendingQueue: item }, $set: { updatedAt: now } } as never,
+  );
+  return res.modifiedCount > 0;
+}
+
+/**
+ * 原子出队：findOneAndUpdate + $pop 移除队首，一次操作拿到「被移除的项」和「剩余队列」。
+ * 返回 null 表示队列为空（或对话不存在）；并发出队时每个调用各自拿到不同队首，不会重复发同一条。
+ */
+export async function dequeuePending(id: string): Promise<{ item: PendingMessage; rest: PendingMessage[] } | null> {
+  const now = Date.now();
+  const coll = await getColl();
+  if (!coll) {
+    const doc = memory.get(id);
+    if (!doc?.pendingQueue?.length) return null;
+    const [item, ...rest] = doc.pendingQueue;
+    doc.pendingQueue = rest;
+    doc.updatedAt = now;
+    return { item: item!, rest };
+  }
+  const before = await coll.findOneAndUpdate(
+    { id, "pendingQueue.0": { $exists: true } } as never,
+    { $pop: { pendingQueue: -1 }, $set: { updatedAt: now } } as never,
+    { returnDocument: "before" } as never,
+  );
+  const doc = before as unknown as ConversationDoc | null;
+  if (!doc?.pendingQueue?.length) return null;
+  return { item: doc.pendingQueue[0]!, rest: doc.pendingQueue.slice(1) };
 }
 
 /**

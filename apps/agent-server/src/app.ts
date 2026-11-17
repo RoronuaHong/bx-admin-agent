@@ -43,6 +43,8 @@ import {
   listConversations,
   listEnabledMcpServers,
   patchConversation,
+  enqueuePending,
+  dequeuePending,
   pullMcpServerFromAllConversations,
   pullSkillFromAllConversations,
   duplicateConversation,
@@ -414,8 +416,10 @@ async function consumeTask(
       console.log(`[chat/task] ${task.id} 结果已回投（${task.live ? "定时运行" : "客户端断开"}）`);
     }
   }
+  // 抢占后「该对话最后一条摘要」可能已属于新任务：只在本任务仍是 last 时才写回执标记，
+  // 否则会把新任务的 outcomePersisted 改成旧任务的（R01 stillCurrent 守卫的同类问题）。
   const summary = getLastTaskSummary(task.conversationId);
-  if (summary) summary.outcomePersisted = outcomePersisted;
+  if (summary?.id === task.id) summary.outcomePersisted = outcomePersisted;
 }
 
 // knownMcpIds / pickNotifyOn / scheduleConversationTitle / createTaskConversation 已抽到
@@ -1792,27 +1796,33 @@ export function createApp() {
 
       // 抢占判定（先判定、不立即取消）：同一对话已有任务在跑时，是否可由新消息接管。
       // - 无人值守（定时任务）运行：不抢占，退回 409 排队语义（§12.4 R07）。
-      // - 其余（含另一标签页占用）：抢占——取消旧任务并由新任务接管（Interrupt 档，见 §4）。
-      const preemptTarget = getRunningTask(conversationId);
-      const canPreempt = !!preemptTarget && !preemptTarget.unattended;
+      // - 会话 sendMode="queue"：不抢占，新消息走 409 → 前端入队，等上一轮成功收束后按序发。
+      // - 其余（含另一标签页占用，或默认抢占档）：取消旧任务并由新任务接管（Interrupt 档，见 §4）。
       // 入口限流（§5/§13）：每 owner 每分钟次数；429 带 Retry-After。
       // 重要：限流在「任何取消之前」（§12.3 R06）——被 429 拒绝时旧任务不应被取消。
       const owner = c.get("owner");
+      const preemptTarget = getRunningTask(conversationId);
+      const canPreempt = !!preemptTarget && !preemptTarget.unattended && convDoc?.sendMode !== "queue";
+      // 并发计数扣除只针对「本 owner 自己的」任务：无主对话 !ownerKey 对所有 owner 可写，
+      // 若被别的设备发起的任务占用，本 owner 的 countRunningForOwner 本就不含它，再减 1 会绕过上限。
+      const preemptIsMine = !!preemptTarget && !!owner && preemptTarget.ownerKey === owner;
       const rate = hitRateLimit(`stream:${owner}`, RATE_STREAM_PER_MIN);
       if (!rate.allowed) {
         c.header("Retry-After", String(rate.retryAfterSec));
         return errorJson(c, 429, "CHAT_RATE_LIMITED", `发起太频繁，请 ${rate.retryAfterSec} 秒后再试`);
       }
+      // 不可抢占（定时任务 / 会话 queue 档）：保留原 409 排队语义。
+      // 必须在并发上限之前判定：queue 档本轮不会 startTask，若被全局并发上限提前拦成 429，
+      // 前端不认该码、消息既不抢占也不入队会静默丢失（队列档 + owner 并发满时触发）。
+      if (preemptTarget && !canPreempt) {
+        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
+      }
       // 并发上限：抢占同对话只是「替换」而非「新增」并发，故计数时排除 preemptTarget。
       if (RATE_CONCURRENT_PER_OWNER > 0) {
-        const concurrentExcludingPreempt = countRunningForOwner(owner) - (canPreempt ? 1 : 0);
+        const concurrentExcludingPreempt = countRunningForOwner(owner) - (canPreempt && preemptIsMine ? 1 : 0);
         if (concurrentExcludingPreempt >= RATE_CONCURRENT_PER_OWNER) {
           return errorJson(c, 429, "CHAT_CONCURRENT_LIMITED", `同时运行的对话数已达上限（${RATE_CONCURRENT_PER_OWNER}），请稍候`);
         }
-      }
-      // 不可抢占（定时任务 / 并发达上限外的占用）：保留原 409 排队语义。
-      if (preemptTarget && !canPreempt) {
-        return errorJson(c, 409, "CONVERSATION_BUSY", "该对话正在生成中：消息可排队，或先停止当前生成");
       }
       // 所有校验通过 → 执行抢占（取消旧任务并发 cancelled 事件）+ 开新任务。
       if (canPreempt) {
@@ -1873,10 +1883,10 @@ export function createApp() {
     const from = Number.isFinite(parsedFrom) ? Math.max(0, Math.floor(parsedFrom)) : 0;
     const wantTaskId = (c.req.query("taskId") || "").trim();
     const task = getRunningTask(conversationId) || getRetainedTask(conversationId);
-    if (task && wantTaskId && task.id !== wantTaskId) {
-      return errorJson(c, 404, "CHAT_TASK_NOT_FOUND", "游标属于更早的一轮，该任务已结束：请重新发起");
-    }
-    if (task) {
+    // 内存任务与本轮游标不匹配（被抢占的旧轮）：不要立刻 404——旧轮的终态与 wrapup 正文
+    // 仍按 taskId 存在留档里（R34），下面会精确取回。直接 404 会让 R33 的收尾文本永远拿不到。
+    const taskMatches = task && (!wantTaskId || task.id === wantTaskId);
+    if (task && taskMatches) {
       return streamNdjson(async (send) => {
         let sawDone = false;
         for await (const event of followTask(task, from)) {
@@ -1888,7 +1898,8 @@ export function createApp() {
       });
     }
     // 内存里没有这一轮：读留档（跨进程续传）。断线期间产出的事件照旧按游标补齐。
-    const persisted = await loadTaskForResume(conversationId);
+    // 带上 wantTaskId 按 taskId 精确取该轮留档（同一对话可有多轮留档，防跨轮串流）。
+    const persisted = await loadTaskForResume(conversationId, wantTaskId || undefined);
     if (persisted && (!wantTaskId || persisted.record.taskId === wantTaskId)) {
       const { record, canContinue } = persisted;
       return streamNdjson(async (send) => {
@@ -1934,8 +1945,10 @@ export function createApp() {
     if (await conversationNotFoundFor(c, conversationId)) {
       return c.json({ ok: false, running: false });
     }
-    const ok = cancelTask(conversationId);
-    cancelSubagentsOfConversation(conversationId);
+    // 显式 Stop 不取消无人值守任务（定时任务）：它的生命周期由调度器管，本地一次误点不该掐断
+    // 并触发 IM 失败通知。抢占路径已在 /chat/stream 单独判 unattended 返回 409。
+    const ok = cancelTask(conversationId, false);
+    if (ok) cancelSubagentsOfConversation(conversationId);
     return c.json({ ok, running: isTaskRunning(conversationId) });
   });
 
@@ -2138,6 +2151,8 @@ export function createApp() {
       muted?: boolean;
       /** 完全访问：false = 恢复写/破坏性操作的逐项确认卡（前端「完全访问」开关走这里）。 */
       fullAccess?: boolean;
+      /** 生成中再次发送的模式：preempt（默认抢占）/ queue（排队等待）。非法值忽略。 */
+      sendMode?: string;
     }>(c);
     const patch: ConversationPatch = {};
     if (typeof body.title === "string") patch.title = body.title;
@@ -2153,9 +2168,41 @@ export function createApp() {
     if (typeof body.archived === "boolean") patch.archived = body.archived;
     if (typeof body.fullAccess === "boolean") patch.fullAccess = body.fullAccess;
     if (typeof body.muted === "boolean") patch.muted = body.muted;
+    if (body.sendMode === "preempt" || body.sendMode === "queue") patch.sendMode = body.sendMode;
     const updated = await patchConversation(id, patch);
     if (!updated) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
     return c.json({ conversation: updated });
+  });
+
+  // 待发队列原子入队（B6）：多标签 / 自动出队并发下，整体 PATCH 会互相覆盖丢项，这里走 $push。
+  const QUEUE_CAP = 20;
+  app.post("/chat/conversations/:id/queue/enqueue", async (c) => {
+    const id = c.req.param("id");
+    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    const body = await readJson<PendingMessage>(c);
+    if (!body || typeof body.text !== "string" || typeof body.at !== "number") {
+      return errorJson(c, 400, "BAD_REQUEST", "队列消息格式无效");
+    }
+    const item: PendingMessage = {
+      text: body.text,
+      at: body.at,
+      ...(Array.isArray(body.images) ? { images: body.images.filter((x) => typeof x === "string") } : {}),
+      ...(Array.isArray(body.docs) ? { docs: body.docs.filter((x) => typeof x === "string") } : {}),
+    };
+    const ok = await enqueuePending(id, item, QUEUE_CAP);
+    if (!ok) return errorJson(c, 409, "CHAT_QUEUE_FULL", "排队消息已达上限");
+    const conversation = await getConversation(id);
+    return c.json({ conversation, item, pendingQueue: conversation?.pendingQueue || [] });
+  });
+
+  // 待发队列原子出队（B6）：一次操作移除并返回队首，避免多订阅者各读到同一队首而重复发。
+  app.post("/chat/conversations/:id/queue/dequeue", async (c) => {
+    const id = c.req.param("id");
+    if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");
+    const result = await dequeuePending(id);
+    if (!result) return c.json({ item: null, pendingQueue: [] });
+    const conversation = await getConversation(id);
+    return c.json({ item: result.item, pendingQueue: result.rest, conversation });
   });
 
   // 复制对话（Duplicate）：深拷贝消息/上下文/设置，生成带「 副本」后缀的新对话。
@@ -2407,6 +2454,9 @@ export function createApp() {
     // 重启触发的那一期：消费一次性标记，让通知文案写成「已重启」而非普通启动确认。
     const restart = consumeRestart(schedule.id);
     const runStartedAt = Date.now();
+    // 紧邻 startTask 前再查一次：上面 getSchedule 是 await，期间用户可能在专属对话发了交互消息
+    // （unattended 只能防「被抢占」，防不了定时任务反过来顶掉交互任务）。被占则跳过本期，下 tick 补跑。
+    if (isTaskRunning(conversationId)) return "skipped";
     const task = startTask({
       conversationId,
       userText: wake ? `【事件唤醒】${wake}\n\n${live.prompt}` : live.prompt,

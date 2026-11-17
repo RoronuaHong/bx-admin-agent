@@ -62,6 +62,8 @@ export interface StreamRun<T extends StreamReply = StreamReply> {
   chosenModel: string;
   servedModel?: string;
   sawTerminal: boolean;
+  /** 本轮收到过 cancelled（抢占 / 用户停止）：气泡末尾必须保留「已停止」标记，且不算成功轮次。 */
+  cancelled?: boolean;
   lastSeq: number;
   serverErrorCode?: string;
 }
@@ -87,6 +89,16 @@ function interruptRunning(reply: StreamReply): void {
 }
 
 /**
+ * 给被取消轮次的气泡末尾补「已停止生成」。服务端在 abort 后仍会 yield 一条 `text` 全文快照
+ * （chat.ts 的 abortedRun / 正常收尾都会发），它是**替换**语义，会把 cancelled 时加的 marker 抹掉；
+ * 故 text / done 分支都要重加。已存在则不重复（marker 可能夹在 wrapup 文本中间）。
+ */
+function appendStopMarker(reply: StreamReply, marker: string): void {
+  if (!marker || reply.text.includes(marker)) return;
+  reply.text = reply.text ? `${reply.text}\n\n${marker}` : marker;
+}
+
+/**
  * 把一条服务端事件应用到气泡上：首连与续传共用同一条路径。
  * `seq` 只用于记账（游标），渲染分支完全不关心它；`ping` 是保活事件，忽略即可。
  */
@@ -103,7 +115,9 @@ export function applyStreamEvent<T extends StreamReply>(
     host.thinkPhaseEnd(reply);
     host.queueScrollIfCurrent(convId);
   } else if (event.type === "text") {
+    // 全文快照是替换语义：被取消的轮次要在末尾补回 marker，否则 wrapup 的 text 会把「已停止」抹掉（R33 与 R09 的交汇）。
     reply.text = event.text;
+    if (run.cancelled) appendStopMarker(reply, host.localizeStopMarker());
     host.thinkPhaseEnd(reply);
   } else if (event.type === "thinking_delta") {
     reply.thinking = (reply.thinking || "") + event.text;
@@ -236,24 +250,24 @@ export function applyStreamEvent<T extends StreamReply>(
     // 增量分支（text_delta / subagent_delta 等）不检查 sawTerminal，故旧 run 在 abort 后由模型生成的
     // wrapup 文本（abortedRun 说明「哪些没查完」）仍会正常渲染，不会被判终态而吞掉（§14.9 R33）。
     run.sawTerminal = true;
+    run.cancelled = true;
     reply.streaming = false;
     interruptRunning(reply);
     // 清掉仍挂着的确认/澄清卡，否则会残留（§14.3 R35）。
     reply.pending = null;
     reply.clarification = null;
-    const marker = host.localizeStopMarker();
-    if (!reply.text.endsWith(marker)) {
-      reply.text = reply.text ? `${reply.text}\n\n${marker}` : marker;
-    }
+    appendStopMarker(reply, host.localizeStopMarker());
     host.thinkPhaseEnd(reply);
     host.closeReasoning(reply.id);
   } else if (event.type === "done") {
     run.sawTerminal = true;
     reply.text = dedupeRepeats(reply.text);
+    // 被取消的轮次即使收到 done（wrapup 收尾），也要保住 marker 且不算成功模型。
+    if (run.cancelled) appendStopMarker(reply, host.localizeStopMarker());
     host.thinkPhaseEnd(reply);
     reply.streaming = false;
     host.closeReasoning(reply.id);
-    if (!reply.error) host.rememberModel(run.servedModel || run.chosenModel);
+    if (!reply.error && !run.cancelled) host.rememberModel(run.servedModel || run.chosenModel);
     interruptRunning(reply);
   }
 }

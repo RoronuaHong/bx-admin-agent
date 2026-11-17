@@ -13,6 +13,8 @@ import {
   compactSnapshot,
   listSnapshot,
   patchConversation,
+  enqueuePending,
+  dequeuePending,
   duplicateConversation,
   sanitizeModelId,
   SNAPSHOT_DETAIL_TAIL,
@@ -206,4 +208,29 @@ test("⑪模型 id 落库清洗：失效 id 改写「自动」，有效 id 原�
     if (saved === undefined) delete process.env.MODEL_PROVIDERS;
     else process.env.MODEL_PROVIDERS = saved;
   }
+});
+
+test("③原子队列：并发入队不丢项，出队各拿不同队首（B6）", async () => {
+  const id = uniq("queue");
+  await createConversation({ id, title: "queue" });
+  const mk = (text: string) => ({ text, at: Date.now() });
+  // 并发入队（模拟多标签同时入队）：原子 $push 应全部落下
+  await Promise.all([
+    enqueuePending(id, mk("a"), 20),
+    enqueuePending(id, mk("b"), 20),
+    enqueuePending(id, mk("c"), 20),
+  ]);
+  // 并发下 $push 顺序由到达顺序决定，不保证 a/b/c 严格有序；B6 要保证的是「一条都不丢」+ 按实际顺序 FIFO。
+  const queued = (await getConversation(id))!.pendingQueue!.map((x) => x.text);
+  expect([...queued].sort()).toEqual(["a", "b", "c"]);
+
+  // 并发出队：各拿不同项，且正好是队列的前两项（按入队后的实际顺序），不重复发同一条
+  const [d1, d2] = await Promise.all([dequeuePending(id), dequeuePending(id)]);
+  expect([d1?.item.text, d2?.item.text].sort()).toEqual([queued[0], queued[1]].sort());
+  expect((await getConversation(id))!.pendingQueue?.map((x) => x.text)).toEqual([queued[2]]);
+
+  // 上限：cap 已满时拒绝入队，不丢也不静默截断
+  expect(await enqueuePending(id, mk("overflow"), 1)).toBe(false);
+  expect((await getConversation(id))!.pendingQueue).toHaveLength(1);
+  await deleteConversation(id);
 });

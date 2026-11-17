@@ -7,6 +7,7 @@ import {
   TASK_DB_RETAIN_MS,
   flushTask,
   listStaleRunningTasks,
+  loadLatestTaskRecord,
   loadTaskRecord,
   markTaskInterrupted,
   taskStoreBackend,
@@ -47,14 +48,14 @@ test("[A] 留档写入与读取（Mongo 不可用时走内存降级，行为一�
   expect(["memory", "mongo"]).toContain(taskStoreBackend());
   const first = record();
   await flushTask(first, first.events); // 首次落档：把已有事件作为「本次新增」交出去
-  const loaded = await loadTaskRecord("conv_persisted");
+  const loaded = await loadTaskRecord("task_persisted");
   expect(loaded?.taskId).toBe("task_persisted");
   expect(loaded?.text).toBe("已产出的半截正文");
   expect(loaded?.events.map((e) => e.type)).toEqual(["tool_call"]);
 
   // 增量追加：只补新事件，不整表重写（模拟第二次 flush）
   await flushTask(record({ seq: 3, text: "更长的正文", textSeq: 3 }), [{ type: "done", seq: 3 }]);
-  const again = await loadTaskRecord("conv_persisted");
+  const again = await loadTaskRecord("task_persisted");
   expect(again?.events.map((e) => e.type)).toEqual(["tool_call", "done"]);
   expect(again?.text).toBe("更长的正文");
   expect(again?.seq).toBe(3);
@@ -63,20 +64,20 @@ test("[A] 留档写入与读取（Mongo 不可用时走内存降级，行为一�
 test("[B] 僵尸任务判定：心跳停了 → interrupted（就地改正，不假装还在跑）", async () => {
   // 心跳新鲜 + 属于别的实例 = 别处真的还在跑，不能动它
   await flushTask(record({ instanceId: "other-instance", updatedAt: Date.now() }), []);
-  const live = await loadTaskForResume("conv_persisted");
+  const live = await loadTaskForResume("conv_persisted", "task_persisted");
   expect(live?.canContinue).toBe(true);
 
   // 心跳停了（超过恢复阈值）= 上次进程留下的残档 → 判定为僵尸并落成 interrupted
   await flushTask(record({ instanceId: "other-instance", updatedAt: Date.now() - 20 * 60_000 }), []);
-  const zombie = await loadTaskForResume("conv_persisted");
+  const zombie = await loadTaskForResume("conv_persisted", "task_persisted");
   expect(zombie?.canContinue).toBe(false);
   expect(zombie?.record.status).toBe("interrupted");
-  expect((await loadTaskRecord("conv_persisted"))?.status).toBe("interrupted");
+  expect((await loadTaskRecord("task_persisted"))?.status).toBe("interrupted");
 
   // 已跑完的留档：不能继续，但状态如实保留为 success——收口语由它决定，
   // 不能一律说「被中断」（那会让用户以为结果不完整，而它其实已经跑完）
   await flushTask(record({ instanceId: "other-instance", status: "success", settledAt: Date.now() }), []);
-  const done = await loadTaskForResume("conv_persisted");
+  const done = await loadTaskForResume("conv_persisted", "task_persisted");
   expect(done?.canContinue).toBe(false);
   expect(done?.record.status).toBe("success");
 });
@@ -102,8 +103,8 @@ test("[C] 恢复扫描只挑「别人的 + 心跳过期的 running」", async ()
   expect(ids).not.toContain("conv_mine"); // 自己的任务由自己的看门狗负责
 
   // 显式改状态（恢复流程调的就是它）
-  expect(await markTaskInterrupted("conv_stale")).toBe(true);
-  expect((await loadTaskRecord("conv_stale"))?.status).toBe("interrupted");
+  expect(await markTaskInterrupted("t_stale")).toBe(true);
+  expect((await loadTaskRecord("t_stale"))?.status).toBe("interrupted");
 });
 
 test("[D] 留档回放：正文快照 + 只回放游标之后的事件", () => {
@@ -147,11 +148,41 @@ test("[F] 进程退出：把自己在跑的任务就地标成 interrupted 并落
   expect(getRunningTask("conv_quit_b")).toBeUndefined();
 
   // 状态与已产出的正文一起落档：晚到的重连据此补齐内容并如实收口
-  const rec = await loadTaskRecord("conv_quit_a");
+  const rec = await loadTaskRecord(a.id);
   expect(rec?.status).toBe("interrupted");
   expect(rec?.text).toBe("半截正文");
   expect(await getRetainedTask("conv_quit_a")).toBeDefined();
   expect((await loadTaskForResume("conv_quit_a"))?.canContinue).toBe(false);
+});
+
+test("[G] 方案 C：同对话多轮留档按 taskId 隔离，旧轮迟到写不覆盖新轮（多实例脑裂）", async () => {
+  const now = Date.now();
+  const oldStart = now - 60_000;
+  const newStart = now - 30_000;
+  // 同一对话两轮任务（抢占 / 两实例各跑一轮）：各自独立留档
+  await flushTask(
+    record({ conversationId: "conv_split", taskId: "task_old", instanceId: "inst-a", text: "旧轮", startedAt: oldStart }),
+    [],
+  );
+  await flushTask(
+    record({ conversationId: "conv_split", taskId: "task_new", instanceId: "inst-b", text: "新轮", startedAt: newStart }),
+    [],
+  );
+  // 旧轮迟到写一笔（如退出钩子）：心跳刷新了，但 startedAt 仍是旧轮的——只改自己那份，不动新轮
+  await flushTask(
+    record({ conversationId: "conv_split", taskId: "task_old", instanceId: "inst-a", status: "cancelled", text: "旧轮终态", startedAt: oldStart, updatedAt: now }),
+    [],
+  );
+  const old = await loadTaskRecord("task_old");
+  const fresh = await loadTaskRecord("task_new");
+  expect(old?.status).toBe("cancelled");
+  expect(fresh?.text).toBe("新轮"); // 没被旧轮的迟到写反向覆盖
+
+  // 不带 taskId：按 startedAt 取最新一轮；带 taskId：精确取指定轮次（防跨轮串流）
+  const latest = await loadLatestTaskRecord("conv_split");
+  expect(latest?.taskId).toBe("task_new");
+  const byId = await loadTaskForResume("conv_split", "task_old");
+  expect(byId?.record.taskId).toBe("task_old");
 });
 
 test("[E] 无进展看门狗判据：只认实质事件，阈值内不判死", () => {

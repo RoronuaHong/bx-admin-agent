@@ -25,6 +25,8 @@
 
 不做：全局 / 账号级默认、MoviePage 支持、D 档实时注入。
 
+> 已知约束：MoviePage 保持极简、固定抢占，且 ChatPage 按 `agentId=generic` 过滤看不到 movie 对话，故 UI 上无法给 movie 对话切档。但 `sendMode` 是会话级字段，若通过 API 直接把某 movie 对话设成 `queue`，MoviePage 撞忙时会收到 409 而没有入队链路（它只在 UI 路径下不可达）。这是刻意接受的边界，不在本功能范围。
+
 ## 3. 方案选择
 
 - **方案 A（采用）**：会话级字段 `sendMode` + 后端权威判定 `canPreempt` + 复用现有 409 入队链路。改动最小，多标签页语义一致。
@@ -87,7 +89,7 @@ PATCH 端点（`app.ts` 约 2135-2169）：body 类型加 `sendMode` 并做枚�
 
 ### 4.6 错误处理
 
-- PATCH `sendMode` 非法值：后端拒绝，前端乐观回滚。
+- PATCH `sendMode` 非法值：后端静默忽略（与既有字段风格一致，返回 200、保持原值），前端只发合法值；网络失败才乐观回滚。
 - 队列满：`CHAT_QUEUE_FULL`（409）沿用现有提示，不改。
 - 排队模式下若上一轮出错 / 被停止 / 待确认：`drainQueue` 的现有条件（`ok && !sending && !pending`）保证不自动发下一条，等用户决定——语义不变。
 - unattended 定时任务期间：新消息仍走 409 入队，无论开关取值。

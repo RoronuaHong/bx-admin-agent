@@ -120,10 +120,60 @@
 
 | ID | 说明 | 落点 | 状态 |
 |---|---|---|---|
-| R11 | `MoviePage` 未收敛到 `chat-stream.ts` 的抢占/多 run 架构，仍走旧串行 + `CONVERSATION_BUSY` 回滚路径 | `apps/web/src/pages/MoviePage.vue` 的 `send`/流式/`停止` | 待做（P1） |
-| R34 | 多实例脑裂下留档单主键晚到覆盖；`flushTask` 的 `taskId` CAS 仅缓解**同实例**，跨实例需方案 C | `chat-tasks.ts` `flushTask` / `task-store.ts` | 待做（P1，方案 C：留档主键改 `taskId` 或加 `instanceId` 条件） |
+| R11 | `MoviePage` 未收敛到 `chat-stream.ts` 的抢占/多 run 架构，仍走旧串行 + `CONVERSATION_BUSY` 回滚路径 | `apps/web/src/pages/MoviePage.vue` 的 `send`/流式/`停止` | ✅ 已完成（2026-11-16）：`send` 拆同步原子的 `dispatching` + `runTurn`，多轮并发 `runCount/controllers`、抢占由服务端 `cancelled` 事件标记旧气泡；事件分支收敛到 `applyStreamEvent`（`ChatStreamHost` 空实现工具/确认能力）；`stop`/卸载 abort 全部轮次。本页 persist 全量写，无 /chat 的增量水位竞态。type-check 通过。 |
+| R34 | 多实例脑裂下留档单主键晚到覆盖；`flushTask` 的 `taskId` CAS 仅缓解**同实例**，跨实例需方案 C | `chat-tasks.ts` `flushTask` / `task-store.ts` | ✅ 已完成（2026-11-16，方案 C）：留档主键 `_id` 由 `conversationId` 改为全局唯一 `taskId`，MongoDB / 内存降级两侧 flush、read、markInterrupted 同步换键；新增 `loadLatestTaskRecord`（按 `startedAt` 取最新轮，非易被迟到写刷新的 `updatedAt`）+ `{conversationId,startedAt:-1}` 索引；`loadTaskForResume` 接可选 `taskId` 精确取轮，`recoverStaleTasks` 用 `item.taskId`，`/chat/task/events` 透传 `wantTaskId`。新增回归测试 [G]。type-check + 959 测试全通过。 |
 
 > 其余 P1–P3 体验项（R10 评测口径、R14–R26 等）仍按原严重度待处理，详见原风险登记表（需从 git 历史恢复）。
+
+---
+
+## 4.1 全链路复查（2026-11-16）
+
+原始风险登记表（R10/R14–R26 明细）在本仓库 git 历史 / stash / 所有分支均不存在（只有本重建版），无法按编号恢复。改从源码逐链路审查，发现并修复以下遗留问题（均有源码证据）：
+
+**已修**
+- **B1（高）**：抢占后 `cancelled` 追加的「已停止生成」会被随后服务端 `text` 全文快照（替换语义，`chat.ts` abortedRun / 正常收尾都会发）抹掉，旧气泡显示成正常完成。`chat-stream.ts` 加 `StreamRun.cancelled` 标志 + `appendStopMarker`，`text`/`done` 分支保住 marker，`done` 且 cancelled 时不再 `rememberModel`。
+- **B2（高）**：被抢占的旧 run 以「成功」身份触发 `drainQueue`，可能替最新一轮发出队列消息。ChatPage 出队条件加 `!run.cancelled`。
+- **F1（高）**：抢占后旧 taskId 续传被 `app.ts` 内存路径的 404 截断，R34 存的旧轮留档（含 wrapup）拿不到。改为 taskId 不匹配时 fall through 到留档按 taskId 精确取。
+- **F2（高）**：显式 `/chat/cancel` 会取消 unattended 定时任务（违反 `ChatTask.unattended` 契约、会误发 IM 失败通知）。`cancelTask` 加 `includeUnattended` 参数，`/chat/cancel` 传 `false`；调度器主动终止仍走默认 `true`。
+- **B4（高）**：清空对话守卫只看 `sending`，盖不住 finally 里 `sending` 归零后仍在飞行的 `persist`，后到快照把已清消息写回。两页加在途 persist Promise 登记（`pendingPersists` / `pendingPersist`），清空动作先 await。
+- **B5（中）**：MoviePage 多 run 同时 409 时回滚 `input.value = text` 互相覆盖丢消息；改为非空时前插。
+- **F10（中）**：重复 `cancelTask` 产生重复 `cancelled` 事件；`cancelTask` 加 `status`/`abort.signal.aborted` 守卫。
+- **F5（中）**：R34 换主键后内存留档从「每对话一条」变「每任务一条」，无界增长。`task-store` 加 `CHAT_TASK_MEM_CAP`（默认 500）+ 写入时按 `updatedAt` 淘汰最旧。
+- **R11 回归**：MoviePage `rememberModel` 空实现导致 auto 模式「上次成功优先」失效（把 `"auto"` 记成模型 id，被 `resolveModel` 忽略）；改为记录真实 `servedModel`，黑名单跳过 `"auto"`。
+
+**第二轮复查（同日）继续修复**
+- **F3（中）**：`detachTask` / `followTask.finally` 无条件把 `live` 置 false，误伤多标签 / 断线重连的其它订阅者。改为按 `waiters.size` 重算，`followTask` 清理复用 `detachTask`。
+- **F4（中）**：`followTask` 先回放再注册 waiter，回放窗口里的 `text_delta`（只累加 text、不进 buffer）永久丢失。改为先注册 waiter + `startSeq` 水印，回放存量、订阅期增量走队列，不重不漏。新增 `tests/follow-task.test.ts` 4 个实例测试（手动驱动生成器模拟回放窗口）。
+- **F6（中）**：并发计数扣除 `canPreempt` 未校验 owner，无主对话被别的设备占用时会绕过每 owner 上限。加 `preemptIsMine`（ownerKey 严格相等）参与扣减；`owner` 声明前移。
+- **F7（中）**：`outcomePersisted` 写到「该对话最后一条摘要」上，抢占后可能属于新任务。加 `summary.id === task.id` 校验。
+- **F8（低）**：R34 换主键后，部署 TTL 窗口内旧 `_id=conversationId` 留档匹配不到。`markTaskInterrupted` 加可选 conversationId，主键未命中时回退 `{_id: conversationId, taskId}` 精确匹配；两调用点传参。
+- **F9（中）**：定时任务在 `getSchedule` 的 await 之后到 `startTask` 之间有抢占窗口，可能顶掉用户交互消息。`startTask` 前紧邻再查 `isTaskRunning`，被占返回 `"skipped"` 由调度器下 tick 补跑。
+- **B7（中）**：`watchBackgroundDone` 把被抢占 / 停止的后台任务当「完成」弹 toast。改用 `fetchChatTaskStatus`，仅 `last.status === "success"` 才报，`last` 为空（过 retain 期）保守不报。
+- **B3（中）**：409 入队后队列在另一标签页那轮结束时有出队入口缺失，消息卡死。加 `watchAndDrain` 轮询占用释放后 `drainQueue`，入队处调用。
+- **B8（中）**：多 run 收束各自 persist，慢请求晚到覆盖新快照 / `persistedCount` 水位乱序。两页 persist 改为按对话串行链执行。
+- **R11 改进**：movie 角色 `forceToolCall` 走 TMDb 取数，工具执行阶段 MoviePage 只有通用「正在生成…」。Bubble 补 `steps`（复用 `ToolStep`），无 thinking 但有 steps 时显示「正在查询影片数据…」。
+
+**第三轮复查（同日）**
+- **B6（中）**：待发队列多处「读整数组→整体 PATCH 覆盖」，多标签 / 自动出队并发丢项。后端新增原子端点 `POST /chat/conversations/:id/queue/enqueue`（`$push` + `$expr/$size` 上限，满返回 409 `CHAT_QUEUE_FULL`）与 `/queue/dequeue`（`findOneAndUpdate` + `$pop` 返回队首与剩余），`conversations.ts` 加 `enqueuePending`/`dequeuePending`（含内存降级）；前端 `enqueueMessage`/`drainQueue` 改走原子端点并用服务端返回的完整队列同步本地，重排/编辑/删除的 `setQueue` 加按 conv 串行链。新增实例测试：conversations [③] + `preempt-e2e.test.ts`（5 个真实 HTTP 路由测试）。
+
+**实例验证（端到端，非单测）**
+- 新增 `tests/preempt-e2e.test.ts`：在真实 Hono `createApp().request()` 上走完整 HTTP 路由 / 中间件 / 序列化，验证 ①队列原子并发入队不丢、出队各取不同队首且 FIFO ②队列满返回 409 且不丢已有项 ③显式 Stop 不取消 unattended、普通任务可取消且重复取消幂等 ④任务状态端点 running/last 摘要 ⑤对话 CRUD 未被队列改造破坏。5 个全通过。
+
+**结论**：审查发现的 B1–B8 / F1–F10 及 R11 回归全部修复，无遗留项。
+验证：`pnpm type-check` 通过；vitest 137 文件 / 970 用例全通过（含新增 followTask 4 例 + 端到端 5 例；修复测试对并发入队顺序的硬编码依赖，连续两次全量运行一致）；改动文件 lint 0 错误。
+
+---
+
+## 4.2 用户可选「抢占式 / 排队等待」（2026-11-16）
+
+新增会话级开关 `sendMode`：`preempt`（默认，新消息抢占旧轮）/ `queue`（新消息排队，等上一轮成功收束后自动发）。设计见 `docs/superpowers/specs/2026-11-16-send-mode-preempt-vs-queue-design.md`，实现计划见 `docs/superpowers/plans/2026-11-16-send-mode-implementation-plan.md`。
+
+- **决策**：每对话独立、默认抢占；UI 只在 ChatPage 侧栏右键菜单（MoviePage 不动）；切换纯设置、不影响当前轮；队列项「立即发送」逃生口保留；unattended 永不抢占硬约束不变；后端按会话文档判定（多标签页一致）。
+- **实现**：`conversations.ts` 加字段 + `$set` 白名单 + `ACTIVITY_NEUTRAL_KEYS`；`app.ts` 的 `canPreempt` 加 `convDoc.sendMode !== "queue"` + PATCH body 校验；`api.ts` 的 DTO/patch 类型；ChatPage 右键菜单加 `toggleSendMode`（乐观更新 + 回滚）。队列链路（409 入队 / drainQueue / sendQueueItemNow）原样复用。
+- **E2E**：新增 `tests/send-mode.test.ts`（7 例：S1 queue 忙时 409 不抢占且不入队、S2 默认抢占旧轮收 cancelled 且新任务接管、S3 unattended 始终 409、S4 PATCH 合法/非法/updatedAt 不变、S5 queue 完整闭环 409→入队→上一轮成功收束→出队、S6 队列满 409 `CHAT_QUEUE_FULL` 不丢已有项、S7 切回 preempt 恢复可抢占）。
+- **查缺补漏（同日）**：①`app.ts` 把 `CONVERSATION_BUSY` 判定提到 owner 并发上限之前——queue 档本轮不 startTask，若被拦成 429 `CHAT_CONCURRENT_LIMITED`，前端不认该码会静默丢消息；②ChatPage 右键菜单发送模式项补动态 `:title`（此前静态文案在 queue 档显示错误）；③`watchAndDrain` 修正：不因本标签 `state.sending` 为真就注销守望（否则另一标签占用释放后无人出队、队列卡死），状态查询失败/仍在跑继续轮询，且只有 `last.status === "success"` 才自动出队（失败/取消/中断停下等用户）；④测试补 S5–S7，`afterEach` 清理 `/chat/stream` 内部新建的 running 任务避免并发计数泄漏；⑤设计文档 §4.6 更正「非法值被后端拒绝」为「静默忽略」，并记录 MoviePage 被外部 API 设成 queue 时无队列链的已知边界。
+- **验证（最终）**：`pnpm type-check` 通过；vitest **138 文件 / 977 用例全通过**；改动文件 lint 0 错误。
 
 ---
 

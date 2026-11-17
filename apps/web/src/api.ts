@@ -263,6 +263,8 @@ export interface ConversationDto {
   skillsEnabled?: string[];
   locale?: string;
   pendingQueue?: PendingMessage[];
+  /** 生成中再次发送的模式：preempt（默认抢占）/ queue（排队等待）；缺省按抢占处理。 */
+  sendMode?: "preempt" | "queue";
   /** 置顶时间戳；null / 缺省 = 未置顶。置顶项固定排在列表最上（新的置顶在上）。 */
   pinnedAt?: number | null;
   /** 手动顺序（「手动排序」模式下生效）；未排过的项没有该字段。 */
@@ -354,6 +356,7 @@ export async function patchConversation(
     skillsEnabled?: string[];
     locale?: string;
     pendingQueue?: PendingMessage[];
+    sendMode?: "preempt" | "queue";
     pinnedAt?: number | null;
     /** 归档开关：true = 收进归档区（侧栏默认不显示，需打开「显示归档」）。 */
     archived?: boolean;
@@ -368,6 +371,26 @@ export async function patchConversation(
     body: JSON.stringify(patch),
   })) as { conversation: ConversationDto };
   return data.conversation;
+}
+
+/** 原子入队：服务端 $push，返回当前完整队列（含其它标签页并发入的项），避免整数组覆盖丢项。 */
+export async function enqueueConversationMessage(
+  id: string,
+  item: PendingMessage,
+): Promise<{ pendingQueue: PendingMessage[]; conversation: ConversationDto }> {
+  return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/queue/enqueue`, {
+    method: "POST",
+    body: JSON.stringify(item),
+  }) as Promise<{ pendingQueue: PendingMessage[]; conversation: ConversationDto }>;
+}
+
+/** 原子出队：服务端一次操作移除队首，返回被移除项与剩余队列（多订阅者不会重复发同一条）。 */
+export async function dequeueConversationMessage(
+  id: string,
+): Promise<{ item: PendingMessage | null; pendingQueue: PendingMessage[]; conversation?: ConversationDto }> {
+  return jsonFetch(`/agent/chat/conversations/${encodeURIComponent(id)}/queue/dequeue`, {
+    method: "POST",
+  }) as Promise<{ item: PendingMessage | null; pendingQueue: PendingMessage[]; conversation?: ConversationDto }>;
 }
 
 /** 批量写入手动顺序：`ids` 的下标即新顺序（一次提交，服务端按下标写 `sortOrder`）。 */

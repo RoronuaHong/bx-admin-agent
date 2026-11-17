@@ -64,14 +64,25 @@ async function getColl(): Promise<Collection<TaskRecord> | null> {
 }
 
 // ---- 内存降级 ----
+// 主键 = taskId（方案 C，§14 R34）：同一对话可有多轮任务留档（抢占 / 多实例脑裂），
+// 各轮互不覆盖。旧版按 conversationId 做主键时，跨实例后到的旧任务会把新任务留档反向覆盖。
 const memory = new Map<string, TaskRecord>();
+/** 内存留档条数上限（方案 C 后文档数随轮次增长，必须设上限防无界膨胀）。 */
+const MEM_RECORDS_CAP = Math.max(50, Number(process.env.CHAT_TASK_MEM_CAP ?? 500));
 
 function memPut(record: TaskRecord, newEvents: ChatEvent[]): void {
-  // 被抢占后「当前任务」已换：不同 taskId 的留档不复用对方 events，否则 seq 跨任务冲突、replayRecord 按 seq 去重会吞事件（§12.1 R02）。
-  const existing = memory.get(record.conversationId);
-  const base = existing && existing.taskId === record.taskId ? (existing.events || []) : [];
+  // 按 taskId 隔离：同一任务的多批 flush 追加事件，不同任务（哪怕同对话）各自一份。
+  const existing = memory.get(record.taskId);
+  const base = existing ? existing.events || [] : [];
   const events = [...base, ...newEvents].slice(-TASK_EVENTS_CAP);
-  memory.set(record.conversationId, { ...record, events });
+  memory.set(record.taskId, { ...record, events });
+  // 过期 + 超量回收：key 从 conversationId 换成 taskId 后条目数不再受对话数约束，
+  // 没有读请求触发 memSweep 时也会因这里的上限淘汰最旧的（按 updatedAt）。
+  memSweep();
+  if (memory.size > MEM_RECORDS_CAP) {
+    const oldest = [...memory.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    for (let i = 0; i < oldest.length - MEM_RECORDS_CAP; i += 1) memory.delete(oldest[i]![0]);
+  }
 }
 
 function memSweep(): void {
@@ -94,6 +105,11 @@ export async function initTaskStore(): Promise<boolean> {
     // 恢复扫描要按「状态 + 心跳」找僵尸任务。
     await coll.createIndex({ status: 1, updatedAt: 1 }).catch((e) => {
       console.warn(`[task-store] 僵尸任务扫描索引创建失败，重启恢复可能漏扫：${String((e as Error)?.message || e)}`);
+    });
+    // 无 taskId 的读侧（/chat/task/status）按对话取「最新一轮」留档（方案 C 后同一对话可有多轮）。
+    // 排序键用 startedAt（轮次开始时刻，固定）而非 updatedAt（心跳，旧轮迟到写会刷新它）。
+    await coll.createIndex({ conversationId: 1, startedAt: -1 }).catch((e) => {
+      console.warn(`[task-store] 会话留档索引创建失败，按对话取最新留档会变慢：${String((e as Error)?.message || e)}`);
     });
     mongoReady = true;
     console.log(`[task-store] MongoDB 已连接，任务留档启用（${MONGO_DB_NAME}.${COLL}，TTL ${Math.round(TASK_DB_RETAIN_MS / 1000)}s）`);
@@ -128,9 +144,9 @@ export async function flushTask(record: TaskRecord, pendingEvents: ChatEvent[]):
   if (!coll) return true;
   try {
     await coll.updateOne(
-      // taskId CAS：抢占后新任务已占用该对话留档时，旧任务的迟到写因 taskId 不匹配被拒绝（返回未命中），
-      // 不会用「已取消」反向覆盖正在跑的新任务（§12.1 R03）。调用时序保证新任务首 flush 早于旧任务 late flush。
-      { _id: record.conversationId, taskId: record.taskId } as never,
+      // 主键 = taskId（方案 C，§14 R34）：每轮任务独立一份留档，跨实例 / 抢占的旧任务迟到写只更新自己那份，
+      // 不再用「已取消」反向覆盖同对话的新任务。taskId 全局唯一，无需再靠 conversationId + taskId CAS。
+      { _id: record.taskId } as never,
       {
         $set: {
           taskId: record.taskId,
@@ -162,36 +178,69 @@ export async function flushTask(record: TaskRecord, pendingEvents: ChatEvent[]):
   }
 }
 
-/** 读取某对话的任务留档（没有 / 已过 TTL → null）。 */
-export async function loadTaskRecord(conversationId: string): Promise<TaskRecord | null> {
+/** 读取某一轮任务（taskId）的留档（没有 / 已过 TTL → null）。 */
+export async function loadTaskRecord(taskId: string): Promise<TaskRecord | null> {
   memSweep();
   const coll = await getColl();
   if (coll) {
     try {
-      const doc = await coll.findOne({ _id: conversationId } as never);
-      if (doc) return { ...(doc as unknown as TaskRecord), conversationId };
+      const doc = await coll.findOne({ _id: taskId } as never);
+      if (doc) return doc as unknown as TaskRecord;
     } catch (err) {
       console.warn(`[task-store] 读取留档失败：${String((err as Error)?.message || err)}`);
     }
   }
-  return memory.get(conversationId) || null;
+  return memory.get(taskId) || null;
+}
+
+/**
+ * 按对话取「最近一轮」任务的留档（无 taskId 的读侧用，如 /chat/task/status）。
+ * 方案 C 后同一对话可有多份留档（抢占 / 多实例脑裂各一轮），按 startedAt 取最新那轮。
+ * 刻意不按 updatedAt（心跳）：旧轮退出钩子的一次迟到写会刷新它的心跳，反而盖过正在跑的新轮。
+ */
+export async function loadLatestTaskRecord(conversationId: string): Promise<TaskRecord | null> {
+  memSweep();
+  let latest: TaskRecord | null = null;
+  for (const record of memory.values()) {
+    if (record.conversationId !== conversationId) continue;
+    if (!latest || record.startedAt > latest.startedAt) latest = record;
+  }
+  const coll = await getColl();
+  if (coll) {
+    try {
+      const doc = await coll.findOne({ conversationId } as never, { sort: { startedAt: -1 } } as never);
+      if (doc) {
+        const record = doc as unknown as TaskRecord;
+        // 内存降级路径可能更实时（Mongo 写失败时内存已更新）：取两边 startedAt 更新的那份。
+        if (!latest || record.startedAt > latest.startedAt) latest = record;
+      }
+    } catch (err) {
+      console.warn(`[task-store] 读取会话最新留档失败：${String((err as Error)?.message || err)}`);
+    }
+  }
+  return latest;
 }
 
 /** 把「僵尸任务」（进程已死但状态还写着 running）改成 interrupted——恢复扫描与续读路径共用。 */
-export async function markTaskInterrupted(conversationId: string): Promise<boolean> {
+export async function markTaskInterrupted(taskId: string, conversationId?: string): Promise<boolean> {
   const now = Date.now();
-  const local = memory.get(conversationId);
+  const patch = { $set: { status: "interrupted", settledAt: now, updatedAt: now } } as never;
+  const local = memory.get(taskId);
   if (local && local.status === "running") {
-    memory.set(conversationId, { ...local, status: "interrupted", settledAt: now, updatedAt: now });
+    memory.set(taskId, { ...local, status: "interrupted", settledAt: now, updatedAt: now });
   }
   const coll = await getColl();
   if (!coll) return Boolean(local);
   try {
-    const res = await coll.updateOne(
-      { _id: conversationId, status: "running" } as never,
-      { $set: { status: "interrupted", settledAt: now, updatedAt: now } } as never,
-    );
-    return res.modifiedCount > 0;
+    const res = await coll.updateOne({ _id: taskId, status: "running" } as never, patch);
+    if (res.modifiedCount > 0) return true;
+    // 旧数据兼容：R34 之前留档主键是 conversationId，部署后 TTL 到期前仍可能命中旧文档。
+    // 用 {_id: conversationId, taskId} 精确匹配，避免误伤同对话其它轮次。
+    if (conversationId) {
+      const legacy = await coll.updateOne({ _id: conversationId, taskId, status: "running" } as never, patch);
+      return legacy.modifiedCount > 0;
+    }
+    return false;
   } catch {
     return false;
   }

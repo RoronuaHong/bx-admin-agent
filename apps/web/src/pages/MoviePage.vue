@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import type { ChatEvent } from "@bx/shared";
 import BackToTop from "../components/BackToTop.vue";
 import UiLocaleSelect from "../components/UiLocaleSelect.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
+import { applyStreamEvent, type StreamRun } from "../chat-stream";
+import type { ToolStep } from "../chat-types";
 import { renderChatMarkdown } from "../chat-richtext";
 import { detectDefaultLocale, getUiLocale, isUiLocale, setUiLocale, type UiLocale } from "../ui-locale";
 import { agentText, findAgent } from "../agents";
@@ -63,16 +66,24 @@ interface Bubble {
   error?: string;
   /** 扩展思考（thinking 增量拼接）：仅作展示，不回灌模型上下文。 */
   thinking?: string;
+  /** 工具步骤：观影助手强制走 TMDb 工具取数，工具执行阶段用它给出贴切的等待文案（不渲染步骤卡）。 */
+  steps?: ToolStep[];
 }
 
 const bubbles = ref<Bubble[]>([]);
 const input = ref("");
+/** 是否有任意轮次在跑：由 runCount 派生（抢占下同一对话可多轮并行）。模板 / 无障碍只读它。 */
 const sending = ref(false);
 const notice = ref("");
 const scroller = ref<HTMLElement | null>(null);
 let seq = 0;
 let convId = "";
-let controller: AbortController | null = null;
+/** 并发运行中的轮次计数；抢占时新消息直接开新 run（不排队、不 abort 旧 run）。 */
+let runCount = 0;
+/** 所有活跃轮次的中断句柄（抢占下旧轮次也在列表里）；「停止」中止全部。 */
+const controllers: AbortController[] = [];
+/** 同步派发标志：防止并发双击开两个 run（R08）。 */
+let dispatching = false;
 /** 会话建立中的防重入标记（send 内使用，见 send 的 ensureConversation 分支）。 */
 let starting = false;
 
@@ -175,6 +186,10 @@ function hasThinking(b: Bubble): boolean {
  */
 function thinkingLabel(b: Bubble): string {
   if (!hasThinking(b)) {
+    // 观影助手的正文必须来自 TMDb 工具：工具执行阶段给贴切文案，避免用户以为卡在空转。
+    if (b.steps?.length) {
+      return tx("正在查询影片数据…", "Looking up movie data…", "Buscando dados de filmes…", "फ़िल्म डेटा ढूंढ रहा है…");
+    }
     return tx("正在生成…", "Generating…", "Gerando…", "उत्तर बन रहा है…");
   }
   return b.streaming
@@ -227,14 +242,32 @@ async function ensureConversation() {
   scrollToBottom(true); // 进入/新建对话是用户动作：无条件回底并重置跟底状态
 }
 
-async function persist() {
-  if (!convId) return;
+/** 在途落库：runTurn finally 先把 sending 归零再 await persist，清空守卫只看 sending 盖不住这段窗口；
+ *  清空动作先 await 它，避免后到的快照把刚清的消息写回。 */
+let pendingPersist: Promise<void> | null = null;
+
+let persistChain: Promise<unknown> = Promise.resolve();
+
+function persist(): Promise<void> {
+  if (!convId) return Promise.resolve();
+  const id = convId;
+  // 串行化：多 run 收束各自全量落库时，慢请求晚到会覆盖新快照——按调用顺序排队。
+  const task = persistChain.catch(() => undefined).then(() => persistNow(id));
+  persistChain = task;
+  pendingPersist = task;
+  void task.finally(() => {
+    if (pendingPersist === task) pendingPersist = null;
+  });
+  return task;
+}
+
+async function persistNow(id: string) {
   // 与 /chat 一致：过滤空气泡（失败轮可能只留一个空 assistant），并用首条用户消息派生标题。
   const stored = bubbles.value
     .filter((b) => b.text || b.images?.length)
     .map((b) => ({ role: b.role, text: b.text, images: b.images }));
   const title = bubbles.value.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
-  await saveConversationMessages(convId, stored, { title }).catch(() => {});
+  await saveConversationMessages(id, stored, { title }).catch(() => {});
 }
 
 /** 语言切换：组件已先改内存（立即生效），这里负责把偏好落到当前会话，刷新后仍生效。 */
@@ -271,82 +304,137 @@ function onKeydown(event: KeyboardEvent) {
   void send();
 }
 
+/** 抢占后旧轮次气泡末尾的「已停止」标记：/chat 与 /movie 共用同一口径。 */
+function stopMarker(): string {
+  return tx("（已停止生成）", "(stopped)", "(geração interrompida)", "(उत्पादन रोक दिया गया)");
+}
+
+/** 把一条服务端事件应用到气泡上：分支收敛到 chat-stream.ts，这里只接本页的滚动文案。 */
+function applyChatEvent(run: StreamRun<Bubble>, event: ChatEvent): void {
+  applyStreamEvent(run, event, {
+    thinkPhaseEnd: () => undefined,
+    thinkPhaseStart: () => undefined,
+    // 单会话页面：任何轮次的增量都作用在当前视图，跟底判定全交给 scrollToBottom。
+    queueScrollIfCurrent: () => scrollToBottom(),
+    stickThinkingToBottom,
+    // 观影助手是纯对话页（无工具确认 / 推理面板 / 图表），这些宿主能力留空即可。
+    scheduleConfirmExpiry: () => undefined,
+    localizeError: (token, fallback) => localizeToken(uiLocale.value, token, fallback),
+    localizeStopMarker: stopMarker,
+    openReasoning: () => undefined,
+    closeReasoning: () => undefined,
+    // 与 /chat 同源：auto 模式下服务端 model 事件给出真实模型，它是「上次成功优先」的依据；
+    // 空实现会把 chosenModel="auto" 记成成功模型，被 resolveModel 的 usable() 忽略而永远选第一个。
+    rememberModel: (id) => {
+      lastGoodModelId.value = id;
+    },
+  });
+}
+
+/** 流结束却没有终态（服务重启 / 代理切断）：不猜结果，问一次任务状态后如实收口。 */
+async function settleInterruptedRun(run: StreamRun<Bubble>): Promise<void> {
+  const running = await isChatTaskRunning(convId).catch(() => false);
+  const note = running
+    ? tx(
+        "（连接已中断，生成仍在后台继续；稍后重开本对话即可看到结果）",
+        "(Connection lost; generation continues in the background — reopen this chat to see the result)",
+        "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
+        "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
+      )
+    : tx(
+        "（本轮已中断：服务端任务已结束，未完成的部分请重新发起）",
+        "(This turn was interrupted — no task is running on the server; please retry)",
+        "(Este turno foi interrompido — não há tarefa em execução no servidor; tente novamente)",
+        "(यह चरण बाधित हुआ — सर्वर पर कोई कार्य नहीं चल रहा; कृपया फिर से प्रयास करें)",
+      );
+  run.reply.text = run.reply.text ? `${run.reply.text}\n\n${note}` : note;
+}
+
 async function send() {
-  const text = input.value.trim();
-  if (!text || sending.value) return;
-  // 首屏会话可能仍在建立：确保有 conversationId 再发，避免落到服务端兜底会话。
-  // starting 防重入：ensureConversation 是两次网络请求，连按两次回车会各自建一个空会话。
-  if (!convId) {
-    if (starting) return;
-    starting = true;
-    try {
-      await ensureConversation();
-    } catch {
-      // 建会话失败不阻断发送（服务端仍有兜底会话），与原 .catch(() => {}) 语义一致。
-    } finally {
-      starting = false;
+  // R08：同步原子标志——并发双击 / 同步双触发时第二次在 runTurn 同步置位 runCount 前就返回，
+  // 避免同一条消息开两个 run。runTurn 的同步部分跑完后立刻释放，后续发送才能开新 run 抢占。
+  if (dispatching) return;
+  dispatching = true;
+  let released = false;
+  try {
+    const text = input.value.trim();
+    if (!text) return;
+    // 首屏会话可能仍在建立：确保有 conversationId 再发，避免落到服务端兜底会话。
+    // starting 防重入：ensureConversation 是两次网络请求，连按两次回车会各自建一个空会话。
+    if (!convId) {
+      if (starting) return;
+      starting = true;
+      try {
+        await ensureConversation();
+      } catch {
+        // 建会话失败不阻断发送（服务端仍有兜底会话），与原 .catch(() => {}) 语义一致。
+      } finally {
+        starting = false;
+      }
     }
+    notice.value = "";
+    input.value = "";
+    autoGrow();
+    // 抢占语义（§4 Interrupt 档）：同一对话正在生成时，新发送直接开新 run，不进队列、不 abort 旧 run。
+    // 同步启动 runTurn 到它的第一个 await（此刻 runCount/sending 已置位），随后释放 dispatching。
+    const turn = runTurn(text);
+    dispatching = false;
+    released = true;
+    await turn;
+  } finally {
+    if (!released) dispatching = false;
   }
-  notice.value = "";
-  input.value = "";
-  autoGrow();
+}
+
+/** 一轮对话：模型流式 + 终态收口。多轮可并发；旧轮次由服务端 cancelled 事件标记「已停止生成」。 */
+async function runTurn(text: string): Promise<void> {
   const userBubble: Bubble = { id: ++seq, role: "user", text };
   // 必须用 reactive 包装：若 push 原始对象、之后又用原引用改属性，Vue 3 不会触发重渲染
   // （表现：思考流与正文都不逐步显示，一直停在三点加载，直到收尾才整段蹦出来——用户感知就是「很慢」）。
   const reply = reactive<Bubble>({ id: ++seq, role: "assistant", text: "", streaming: true });
   bubbles.value.push(userBubble, reply);
-  sending.value = true;
   scrollToBottom(true); // 用户发送：无条件回底（新回复从底部开始展示）
-  controller = new AbortController();
+
+  runCount += 1;
+  sending.value = true;
+  const controller = new AbortController();
+  controllers.push(controller);
+
   // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
   // 本页刻意不展示模型信息（终端用户界面），服务端 model 事件仅用于服务端标签跟踪，前端无需消费。
   const chosenModel = modelId.value === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(modelId.value);
-  /** 本轮是否收到过终态事件（done / 服务端 error）：没收到的流结束 = 连接断了，必须如实收口。 */
-  let sawTerminal = false;
+  const run: StreamRun<Bubble> = {
+    convId,
+    reply,
+    state: { error: "" },
+    chosenModel,
+    sawTerminal: false,
+    lastSeq: 0,
+  };
   /** 用户是否按了停止（停止不是「中断」，不该报错）。 */
   let stopped = false;
-  /** 服务端终态码：用于把「非模型故障」（中断/流异常等）排除出 auto 失败黑名单（口径见 api.ts）。 */
-  let serverErrorCode = "";
   try {
     await streamChat(
       text,
       // conversationId 显式带上 + agentId 供服务端按角色分流；model 走自动解析（auto = 不传则服务端按候选链兜底）。
       { conversationId: convId, model: chosenModel || undefined, agentId: AGENT_ID, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || undefined },
-      (event) => {
-        if (event.type === "text_delta") {
-          reply.text += event.text;
-          scrollToBottom();
-        } else if (event.type === "thinking_delta") {
-          // 扩展思考增量：模型在正文之前先产出推理流（实测首个思考增量 +8.8s、首个正文 +27.2s），
-          // 此前这类事件被整段丢弃，用户只能看「三点加载」黑盒空转几十秒。仅作展示，不回灌上下文。
-          reply.thinking = (reply.thinking || "") + event.text;
-          scrollToBottom();
-          stickThinkingToBottom();
-        } else if (event.type === "text") {
-          reply.text = event.text;
-        } else if (event.type === "error") {
-          // 服务端明确宣告的终态：这条之后流再断也算「有结论」。
-          sawTerminal = true;
-          serverErrorCode = String(event.code ?? "");
-          // 第三参数是兜底 code 而非文案：token 自带 defaultMessage，直接本地化即可。
-          reply.error = localizeToken(uiLocale.value, event.error);
-        } else if (event.type === "done") {
-          sawTerminal = true;
-          reply.streaming = false;
-        }
-      },
+      (event) => applyChatEvent(run, event),
       controller.signal,
     );
+    // 流结束却没收到终态（cancelled 也算终态，由 applyStreamEvent 置位）：如实收口，别永远停在「正在输入」。
+    if (!run.sawTerminal && !stopped) await settleInterruptedRun(run);
   } catch (err) {
     if ((err as Error)?.name === "AbortError") {
-      // 用户主动停止：不是错误，标注「已停止生成」（与 /chat 行为一致）。
+      // 用户主动停止：不是错误，标注「已停止生成」（cancelled 事件可能已加过，去重避免重复标记）。
       stopped = true;
-      const stoppedText = tx("（已停止生成）", "(stopped)", "(geração interrompida)", "(उत्पादन रोक दिया गया)");
-      reply.text = reply.text ? `${reply.text}\n\n${stoppedText}` : stoppedText;
+      const marker = stopMarker();
+      if (!reply.text.endsWith(marker)) reply.text = reply.text ? `${reply.text}\n\n${marker}` : marker;
     } else if (isBusyError(err)) {
-      // 该会话仍在生成：回滚这一轮（否则会落下没有回答的孤儿用户消息），把输入还给用户。
+      // 不可抢占兜底（定时任务 / 限流）：回滚这一轮，否则会落下没有回答的孤儿用户消息。
       bubbles.value = bubbles.value.filter((b) => b.id !== userBubble.id && b.id !== reply.id);
-      input.value = text;
+      // 多 run 并发下可能有两条消息同时 409：只写回输入框会互相覆盖丢消息。
+      // 草稿为空直接放回，非空则把本条前插，保证两条都还在。
+      input.value = input.value.trim() ? `${text}\n${input.value}` : text;
       autoGrow();
       notice.value = tx(
         "上一条还在生成中，请等它完成后再发送",
@@ -355,9 +443,8 @@ async function send() {
         "पिछला उत्तर अभी बन रहा है — कृपया प्रतीक्षा करें",
       );
     } else if (!reply.error) {
-      // 不要把失败原因吞成一句「出错了」：有服务端 token 就本地化还原（限流/额度/不支持等），
-      // 否则退回原始错误信息，最后才是通用兜底。
-      serverErrorCode = getApiErrorCode(err) || "";
+      // 不要把失败原因吞成一句「出错了」：有服务端 token 就本地化还原（限流/额度/不支持等）。
+      run.serverErrorCode = getApiErrorCode(err) || "";
       const token = getApiErrorToken(err);
       const raw = ((err as Error)?.message || "").trim();
       reply.error = token
@@ -366,44 +453,28 @@ async function send() {
     }
   } finally {
     reply.streaming = false;
-    // 流结束却没收到终态 = 连接在收尾前断了（服务重启 / 代理切断 / 连接回收）：
-    // 与服务端同一原则——**不猜结果**，问一次任务状态后如实说清，别让气泡永远停在「正在输入」。
-    // （/chat 那边更进一步：会先按游标自动续传，见 ChatPage 的 resumeRun；本页轮次短，只做如实收口。）
-    if (!stopped && !sawTerminal) {
-      const running = await isChatTaskRunning(convId).catch(() => false);
-      const note = running
-        ? tx(
-            "（连接已中断，生成仍在后台继续；稍后重开本对话即可看到结果）",
-            "(Connection lost; generation continues in the background — reopen this chat to see the result)",
-            "(Conexão perdida; a geração continua em segundo plano — reabra esta conversa para ver o resultado)",
-            "(कनेक्शन टूट गया; निर्माण पृष्ठभूमि में जारी है — परिणाम देखने के लिए यह चैट दोबारा खोलें)",
-          )
-        : tx(
-            "（本轮已中断：服务端任务已结束，未完成的部分请重新发起）",
-            "(This turn was interrupted — no task is running on the server; please retry)",
-            "(Este turno foi interrompido — não há tarefa em execução no servidor; tente novamente)",
-            "(यह चरण बाधित हुआ — सर्वर पर कोई कार्य नहीं चल रहा; कृपया फिर से प्रयास करें)",
-          );
-      reply.text = reply.text ? `${reply.text}\n\n${note}` : note;
+    runCount = Math.max(0, runCount - 1);
+    sending.value = runCount > 0;
+    const idx = controllers.indexOf(controller);
+    if (idx >= 0) controllers.splice(idx, 1);
+    // 自动模式：失败则把该模型记入黑名单（下次跳过）；成功模型由 applyStreamEvent 的 done 分支
+    // 经 rememberModel 记录真实 id（chosenModel="auto" 不是模型 id，记它会被 resolveModel 忽略）。
+    // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 中断 / 流异常（非模型故障终态码）都不算。
+    if (reply.error && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode || "")) {
+      if (chosenModel !== MODEL_AUTO_ID) failedModelIds.value.add(chosenModel);
+    } else {
+      if (chosenModel !== MODEL_AUTO_ID) failedModelIds.value.delete(chosenModel);
     }
-    sending.value = false;
-    controller = null;
-    // 自动模式：本轮成功则记下来实际用到的具体模型（下次优先复用），失败则记入黑名单（下次跳过）。
-    // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 中断 / 流异常（非模型故障终态码）都不算，
-    // 否则一次服务重启就会让「自动」跳过本来好用的模型（口径与 /chat 的 NOT_MODEL_FAULT_CODES 一致）。
-    if (reply.error && !NOT_MODEL_FAULT_CODES.has(serverErrorCode)) failedModelIds.value.add(chosenModel);
-    else {
-      failedModelIds.value.delete(chosenModel);
-      // 只有真正走完一轮（收到终态、没有错误、没被停止）才算「上次成功」；繁忙回滚不冒充成功。
-      if (sawTerminal && !reply.error) lastGoodModelId.value = chosenModel;
-    }
+    // 本页 persist 始终全量回写（saveConversationMessages 不带 base → 服务端按全量替换处理），
+    // 不依赖「单条流式」的增量水位，故并发多 run 收束不会像 /chat 那样漏中间项的终态。
     await persist();
     scrollToBottom();
   }
 }
 
 function stop() {
-  controller?.abort();
+  // 抢占语义下同一对话可有多轮在跑（旧轮次尚未收束）：全部中止，不能只 abort 最后一个。
+  for (const c of controllers) c.abort();
   // 执行与推送解耦后，断开连接不再中止生成：必须显式调取消端点，否则服务端任务会继续跑完
   // （白烧 token），其结果还会落进「后台任务结果」隔离会话、不回本对话，且在它跑完前
   // 本对话会被并发保护挡住（用户看到的却是「已停止生成」，以为可以继续发）。
@@ -459,6 +530,8 @@ async function confirmClear() {
 }
 
 async function clearChat() {
+  // 等在途落库结束（详见 pendingPersist 注释），否则后到的快照会把刚清的消息写回。
+  await pendingPersist?.catch(() => undefined);
   bubbles.value = [];
   notice.value = "";
   if (!convId) return;
@@ -519,7 +592,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  controller?.abort();
+  for (const c of controllers) c.abort();
   window.removeEventListener("keydown", onClearModalKeydown);
   // 弹窗还开着就卸载组件时，滚动锁会留在 body 上，整页再也滚不动。
   document.body.style.overflow = "";

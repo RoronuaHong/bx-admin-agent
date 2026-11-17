@@ -6,6 +6,7 @@
 import { test, expect, vi } from "vitest";
 import type { ChatEvent } from "@bx/shared";
 import {
+  cancelTask,
   finishTask,
   followTask,
   finalTextOf,
@@ -135,6 +136,26 @@ test("[G] 无进展看门狗：长时间没有实质事件就主动收口，并�
   publishTaskEvent(task, { type: "done" });
   expect(task.buffer.length).toBe(before);
   expect(task.text).toBe("");
+});
+
+test("[H] 取消语义：显式 Stop 不取消无人值守任务；重复取消只发一次 cancelled", async () => {
+  // 无人值守任务（定时任务）：显式取消（includeUnattended=false）必须被拒，任务照跑。
+  const unattended = startTask({ conversationId: "conv_unattended", userText: "scheduled", unattended: true });
+  expect(unattended.unattended).toBe(true);
+  expect(cancelTask("conv_unattended", false)).toBe(false);
+  expect(getRunningTask("conv_unattended")).toBe(unattended);
+  expect(unattended.buffer.filter((e) => e.type === "cancelled")).toHaveLength(0);
+  // 调度器主动终止仍可取消（includeUnattended=true 默认）
+  expect(cancelTask("conv_unattended")).toBe(true);
+  expect(unattended.buffer.filter((e) => e.type === "cancelled")).toHaveLength(1);
+
+  // 重复取消幂等：abort 后到 finishTask 前 status 仍 running，第二次不能再来一条 cancelled。
+  const interactive = startTask({ conversationId: "conv_cancel_twice", userText: "hi" });
+  expect(cancelTask("conv_cancel_twice")).toBe(true);
+  expect(cancelTask("conv_cancel_twice")).toBe(false);
+  expect(interactive.buffer.filter((e) => e.type === "cancelled")).toHaveLength(1);
+  finishTask(unattended, "cancelled", false);
+  finishTask(interactive, "cancelled", false);
 });
 
 test("[F] 留档可关闭（CHAT_TASK_RETAIN_MS=0）：不留档、不启清扫器", async () => {
