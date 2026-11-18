@@ -17,8 +17,8 @@ module.exports = {
       // 不用 tsx --watch 也不用 PM2 watch：Windows 下 kill_timeout 对 SIGTERM 不可靠，
       // watch 重启时旧进程常残留占用 8787 → 新进程 EADDRINUSE 崩溃（pm2 显示 errored/online 但服务是旧代码）。
       // 改为纯手动重启：改代码后先 pm2 delete + 确认端口释放，再 pm2 start。
-      node_args:
-        "--import file:///D:/Code/bx-admin-agent/node_modules/.pnpm/tsx@4.23.12/node_modules/tsx/dist/loader.mjs",
+      // --import tsx 让 Node 从当前工作目录（apps/agent-server）解析本地 tsx，避免写死 pnpm store 路径。
+      node_args: "--import tsx",
       exec_mode: "fork",
       instances: 1,
       autorestart: true,

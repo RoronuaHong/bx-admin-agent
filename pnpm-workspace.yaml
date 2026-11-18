@@ -5,17 +5,31 @@ packages:
 allowBuilds:
   esbuild: true
 
+minimumReleaseAgeExclude:
+  - '@hono/node-server@2.1.9'
+
 onlyBuiltDependencies:
   - esbuild
 
 # 依赖漏洞修复覆盖（pnpm 11 起不再读 package.json 的 pnpm.overrides）。
-# 只写传递依赖：lodash 走 mammoth > argparse，uuid / bl / fast-csv 走 exceljs。
-# 直接依赖（hono / dompurify / markdown-it）在各自 package.json 里升版本，不走覆盖。
+# 覆盖传递依赖；直接依赖同时在各自 package.json 升版本，覆盖用于统一 GitLab MCP 等嵌套副本。
 overrides:
-  # hono：MCP SDK 与 @hono/node-server 各自带一份旧副本（4.13.5 前有多条中危），统一抬到已修复版本。
-  hono: ^4.13.7
+  # hono / MCP SDK / node-server：GitLab MCP 内嵌旧副本，统一抬到已修复版本。
+  hono: ^4.13.16
+  "@hono/node-server": ^2.1.9
+  "@modelcontextprotocol/sdk": ^1.32.2
   lodash: ^4.17.24
   uuid: ^11.1.1
   bl: ^4.0.3
   fast-csv: ^4.3.6
   "@fast-csv/parse": ^4.3.6
+  # 本轮审计新增的传递依赖补丁。
+  body-parser: ^2.4.0
+  fast-uri: ^3.1.9
+  ip-address: ^10.7.4
+  qs: ^6.16.1
+  source-map-js: ^1.2.2
+  tinypool: ^2.1.2
+  undici: ^6.29.1
+  vite: ^7.3.8
+  zod: ^4.6.6

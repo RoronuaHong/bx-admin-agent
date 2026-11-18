@@ -26,8 +26,8 @@ watch(
   <!-- tabindex="-1"：跳转链接的目标必须是可聚焦元素，否则点了只会改 hash、焦点还留在链接上，
        浏览器的某些版本随后一按 Tab 就回到页首 Watson 而不是进入主内容。 -->
   <div id="app-main" tabindex="-1">
-    <!-- 按 path 强制重挂载：/chat 与 /movie 复用同一 ChatPage 组件，直接改 URL 时靠 key 让 setup 重跑、
-         使 agentId prop 重新求值；普通同路由导航（无 path 变化）不受影响。 -->
+    <!-- 按 path 强制重挂载：/chat 与 /support 共用异步 ChatPage，/movie 用独立 MoviePage；
+         直接改 URL 时靠 key 让 setup 重跑、使 agentId prop 重新求值；普通同路由导航（无 path 变化）不受影响。 -->
     <RouterView :key="$route.path" />
   </div>
 </template>

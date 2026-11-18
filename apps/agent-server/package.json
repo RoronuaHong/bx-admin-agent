@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22" },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "node build.mjs",
@@ -11,24 +12,24 @@
   },
   "dependencies": {
     "@bx/shared": "workspace:*",
-    "@hono/node-server": "^1.19.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "@zereight/mcp-gitlab": "^2.1.64",
+    "@hono/node-server": "^2.1.9",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@zereight/mcp-gitlab": "^2.3.28",
     "croner": "^10.0.1",
     "docx": "^9.7.1",
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
-    "hono": "^4.13.7",
+    "hono": "^4.13.16",
     "mammoth": "^1.12.3",
     "mongodb": "^7.5.0",
     "pdfmake": "^0.3.11",
     "unpdf": "^1.8.1"
   },
   "devDependencies": {
-    "@types/node": "^24.3.0",
+    "@types/node": "^22.15.0",
     "esbuild": "^0.25.4",
-    "tsx": "^4.20.5",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.12"
   }
 }

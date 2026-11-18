@@ -35,20 +35,18 @@ export default defineConfig({
     },
   ],
   build: {
-    // @antv/g2、/g6 在组件里是按需 `import()` 懒加载（图表/关系图才拉取），
-    // 单独成块就不会进首屏，也别让兜底 vendor 把它们并成一个巨型块。
-    chunkSizeWarningLimit: 3000,
+    // 图表按包拆块：G2 / G6 各自独立，避免并成一个 1.71 MB 巨型块；
+    // 不抬高 chunkSizeWarningLimit，保留 Vite 默认 500 kB 告警，超大块会立刻暴露。
     rollupOptions: {
       output: {
         manualChunks(id) {
           if (!id.includes("/node_modules/")) return;
+          if (id.includes("/@antv/g2/")) return "vendor-antv-g2";
+          if (id.includes("/@antv/g6/")) return "vendor-antv-g6";
           if (id.includes("/@antv/")) return "vendor-antv";
           if (id.includes("/markdown-it/") || id.includes("/dompurify/")) return "vendor-richtext";
-          if (id.includes("/echarts/") || id.includes("/zrender/")) return "vendor-echarts";
-          if (id.includes("/mermaid/")) return "vendor-mermaid";
-          if (id.includes("/highlight.js/") || id.includes("/lowlight/")) return "vendor-highlight";
-          if (id.includes("/monaco-editor/") || id.includes("/vscode/")) return "vendor-monaco";
-          if (id.includes("/vue/") || id.includes("/vue-router/") || id.includes("/pinia/")) return "vendor-vue";
+          if (id.includes("/highlight.js/")) return "vendor-highlight";
+          if (id.includes("/vue/") || id.includes("/vue-router/")) return "vendor-vue";
           return "vendor";
         },
       },

@@ -16,7 +16,7 @@
 2. **文档口径与代码脱节**，多处现行文档仍引用已删除的脚本、已不存在的模块和过期数字；
 3. **横切能力半成品化**（鉴权、错误上报、接口契约、i18n），需按部署形态决定补到什么程度。
 
-以下所有优化项**均未在本次实施**，本文只做登记与排序。
+2026-11-18 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计剩 1 条 dev-only `picomatch` 无修复版例外；P1-1 阶段 1 已提交，阶段 2 待设计；其余优化项仍未实施。本文保留原登记与排序。
 
 ---
 
@@ -87,7 +87,7 @@
 
 ## 4. 优化空间清单
 
-> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作，**尚未实施**。
+> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作；截至 2026-11-18，P0-1～P0-5 已实施；P3-4 生产依赖 0 漏洞、全量审计 1 条 dev-only 例外；P1-1 阶段 1 已提交，其余条目尚未实施。
 
 ### P0 低投入、高收益（建议 1～2 天）
 
@@ -130,7 +130,7 @@
 | P3-1 | 鉴权模型为匿名设备态 | `src/session.ts:71,113`（cookie `bx_agent_sid`）；`src/admin-gate.ts:33-34` 未配置 `AGENT_ADMIN_TOKEN` 即放行；`src/owner.ts:1-4` 自述「不做登录、cookie 可被复制」；无用户 / RBAC / 行级权限 | 是否补登录体系取决于部署形态；单机内网可维持现状并写明边界 |
 | P3-2 | 生产攻击面 | `src/app.ts:1013-1016` 无条件把 `localhost:5173` 等开发来源加入 CORS 白名单；`:1136,1171,1182,1214,2219` 的 `limit` 无上界 | 按环境区分白名单、给 `limit` 加上界 |
 | P3-3 | 外网资源可达性 | `apps/web/index.html:15-20` 3 条 Google Fonts 外链 | 与「产物零外链」不冲突（§1），但内网 / 离线部署需本地字体兜底 |
-| P3-4 | 依赖风险 | `pnpm-lock.yaml` 内有 deprecated 的 `glob@7` / `fstream` / `rimraf@2` / `graceful-fs@1`；`pnpm audit --prod` 非阻断 | 用 `pnpm why` 定位归属后再决定升级或加 override；本次未下结论 |
+| P3-4 | 依赖风险 | 2026-11-18 实测：`pnpm audit --prod` 0 漏洞；全量审计 1 条 dev-only `picomatch` GHSA-fc5q-39xc-vjpf（公告无修复版本） | 生产依赖已清零；dev-only 例外记录并持续跟踪，deprecated 子依赖仍按 `pnpm why` 结果择机处理 |
 | P3-5 | 1.71 MB 图表块 | `apps/web/dist/assets/vendor-antv-*.js` | 用构建分析工具确认 G2/G6 各自占比，再决定能否按图表类型二次拆分 |
 
 ---
@@ -177,4 +177,4 @@
 - 覆盖：仓库根配置、`.github/workflows/ci.yml`、四个 `package.json`、`pnpm-workspace.yaml`、`pnpm-lock.yaml`（只读抽样）、`apps/web/src/`、`apps/agent-server/src/`、`apps/agent-server/tests/`、`apps/agent-server/scripts/`、`packages/shared/`、`docs/` 索引与冲突点。
 - 未覆盖：逐行业务逻辑正确性、运行时性能 profiling、真实构建与产物分析、依赖漏洞库在线查询、git 索引验证。
 - **BI / Metabase text2sql 能力不在本文范围**：Schema 呈现、外键、口径一致性、口径图 / GraphRAG、黄金集评测的现行状态与待决事项，以 [`docs/bi-metabase-optimization-plan.md`](./bi-metabase-optimization-plan.md) §11.9（当前状态）与 §11.10（口径一致性复核）为准；相关代码在 `scripts/metabase-mcp.mjs`、`scripts/bi-*.mjs` 与 `apps/agent-server/bi-semantic/`，不要按本文的「巨型单文件 / 前端工程化」主线去拆改。
-- 本文所有「建议」均未实施；实施后请回写本文状态行与 §3 冲突清单。
+- 本文「建议」的实施状态见文首 2026-11-17 复核与 `docs/README.md` 索引；继续实施后请回写状态行与 §3 冲突清单。

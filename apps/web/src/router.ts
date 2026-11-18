@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from "vue-router";
-import ChatPage from "./pages/ChatPage.vue";
-import MoviePage from "./pages/MoviePage.vue";
+
+// 大页面按路由懒加载；/chat 与 /support 复用同一个异步组件，避免生成两份 ChatPage chunk。
+const ChatPage = () => import("./pages/ChatPage.vue");
+const MoviePage = () => import("./pages/MoviePage.vue");
 
 // 多 Agent 路由（领域适配指南 §8.2）：门户 `/` + 各 Agent 路由。
 // 观影助手是面向消费者的独立形态（无侧栏 / 工具菜单，但保留轻量模型选择器，默认 AUTO 自动选可用模型），

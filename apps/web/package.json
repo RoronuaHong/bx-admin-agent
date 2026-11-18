@@ -3,30 +3,31 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22" },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "type-check": "vue-tsc --noEmit"
+    "type-check": "vue-tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@antv/g2": "^5.4.8",
     "@antv/g6": "^5.1.1",
     "@bx/shared": "workspace:*",
-    "dompurify": "^3.4.16",
-    "markdown-it": "^14.1.0",
+    "dompurify": "^3.4.17",
+    "markdown-it": "^14.3.3",
     "highlight.js": "^11.10.0",
     "pinyin-pro": "^3.29.2",
-    "vue": "^3.5.18",
+    "vue": "^3.5.45",
     "vue-router": "^4.5.1"
   },
   "devDependencies": {
-    "@types/dompurify": "^3.2.0",
     "@types/markdown-it": "^14.2.0",
     "@vitejs/plugin-vue": "^6.0.1",
-    "tsx": "^4.23.12",
     "typescript": "^5.9.2",
-    "vite": "^7.1.3",
-    "vue-tsc": "^3.3.11"
+    "vite": "^7.3.8",
+    "vue-tsc": "^3.3.11",
+    "vitest": "^4.1.12"
   }
 }

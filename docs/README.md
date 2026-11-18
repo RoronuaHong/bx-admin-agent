@@ -122,8 +122,19 @@
 ### [engineering-optimization-review.md](./engineering-optimization-review.md)
 - **定位**：2026-11-12 全仓**工程现状对齐 + 全局优化清单**（P0–P3 分级、证据、落地路线与验收）。属工程治理评审，**不是设计方案**，不改变各主题文档的权威口径。
 - **覆盖**：口径基准表（内置工具数量 / 测试外部依赖 / 测试规模 / `any` 分布 / 路由注册数等）· 文档冲突与处置 · 优化空间 · 现状基线 · 待确认项。
-- **状态**：✅ 现行（2026-11-12 建立，事实以该时点代码为准；文中优化项**均未实施**）。
+- **状态**：✅ 现行（2026-11-12 建立；2026-11-18 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计 1 条 dev-only picomatch 无修复版例外；P1-1 阶段 1 已提交，其余项仍未实施）。
 - **注意**：与主题文档冲突时以各主题现行文档为准；实施优化后回写该文状态行与 §3 冲突清单。
+
+### [superpowers/specs/2026-11-17-chat-page-refactor-design.md](./superpowers/specs/2026-11-17-chat-page-refactor-design.md)
+- **定位**：P1-1「拆 `ChatPage.vue` 巨型文件」的设计 + 实施计划合一文档；阶段 1 为整脚本原子搬迁，阶段 2 按 SCC 拆 composables 与 UI 子组件。
+- **覆盖**：现状审计（7723 行 / 4142 行 CSS）、根边界不变量、整脚本搬迁规则、SCC 拆分清单、风险/回滚/验收、P1-2 门禁。
+- **状态**：设计已确认（2026-11-17 策略纠正）；阶段 1 已按本设计实施完成并提交，阶段 2 待后续确认。
+- **注意**：行号是 2026-11-17 快照，实施前用符号名定位；阶段 1 不碰模板/CSS/API，不做逐组 composable 抽取。
+
+### [superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md](./superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md)
+- **定位**：P1-1 阶段 1「整脚本原子搬迁」的可执行实施计划（T0–T5）。
+- **覆盖**：AST 生成器准备、`useChatPageCore.ts` 生成、`ChatPage.vue` script 替换、vitest 底座、全量验证、单次提交与回滚。
+- **状态**：T0–T5 已完成并提交；不与阶段 2 / P1-2 门禁混合同一提交。
 
 ### BI Metabase 专题（2026-11-12）
 - **[bi-metabase-optimization-plan.md](./bi-metabase-optimization-plan.md)**：§11.9 是「接下来做什么」的唯一入口，§0–§11.8 保留评估过程与证据；文内历史「工作区状态」行已按 2026-11-12 复核更新。
