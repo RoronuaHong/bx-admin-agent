@@ -14,6 +14,7 @@
   - T5 C7（ArtifactPreviewModal）已提交 `aa556d0`：新增 `components/chat/ArtifactPreviewModal.vue`，props `previewHtml/previewLoading/downloadUrl` + emits `close`；下载 URL 由根层基于 `workspaceDownloadUrl(currentId, previewHtml.path)` 计算后传入，iframe `sandbox="allow-scripts"` 不变。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - T5 C8（ConfirmDialog）已提交 `dbb4569`：新增 `components/chat/ConfirmDialog.vue`，Teleport/DOM 与 Esc、Tab handler 原样搬入；props `confirmDialog`，emits `confirm/cancel/trap`。子组件 `defineExpose` 暴露 `confirmDialogEl`/`confirmPrimaryBtn`，根层用函数 ref 桥接回协调层，`trapConfirmFocus` 与 body overflow watch 仍留根。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - T5 C9（ChatThread）已提交 `e87c4b0`：新增 `components/chat/ChatThread.vue`，整段 `.thread` 容器搬入；根层通过 props 传 visible/bubbleCount/outline 等状态，通过 emits 接回 scroll/showEarlier/askStarter/jump/active/v-model:open；`threadEl` 由子组件 `defineExpose`，根层函数 ref 桥接。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
+  - T6 C10（`ContextMenuHost`）**方案已补齐、尚未实施**：见 §9.1；已修正旧计划中 `locations`、Esc capture、Shift+F10 三处与当前代码不符的描述，并锁定 19 个动作 emit + 1 个 keydown 转发、5 个 props、`ctxMenuEl` expose/ref 桥接、红测先行和 11 步交互推演。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -347,7 +348,7 @@ refactor(web): split chat settings scroll and reasoning composables
 - 会话切换后台流不中断；`selectConversation` 不写错对话；草稿创建带入 MCP/技能/发送模式。
 - 删除撤销 5s 计时与 `onBeforeUnmount → flushPendingDelete()` 清理（已补主动 flush 测试，确认立即落库且 timer 不重复删）；清空竞态；切对话后后台流继续写原状态。
 - 列表排序、置顶分组、归档/免打扰/发送模式切换（这些留根但依赖解构回的会话壳函数）。
-- 右键键盘 `Shift+F10` / 菜单键、点击外部关闭、Esc 优先级。
+- 右键菜单键盘路径（当前为 F2 直接重命名、菜单内 ↑/↓/Home/End/Tab）、chat 根区域点击关闭、Esc 优先级。
 - 每页实例状态不跨路由复用。
 - 通用验证命令 + Chrome 清单。
 
@@ -574,11 +575,148 @@ refactor(web): extract <ComponentName> from ChatPage
 
 ### 9.1 C10 `ContextMenuHost.vue`
 
-- 源块：约 1009–1135 的 `Teleport to="body"`。
-- props：`ctxMenu`、`ctxTarget`、`ctxTargetTask`、`ctxConfirm`、`sortMode`、`locations`；emits：所有 `ctx*` 动作事件 + `close`。
-- 保留 `@click.stop`、`@contextmenu.prevent`、`@keydown="onCtxMenuKeydown"`、`role="menu"` / `role="menuitem"`。
-- `ctxMenuEl` 用 `defineExpose` 暴露；全局 Esc capture、scroll/resize capture 与焦点归还继续留根。
-- 验证：对话/任务两套菜单、二次确认清空、Shift+F10、键盘导航、点击外部关闭、发送模式切换。
+#### 9.1.1 目标与边界
+
+- 目标：只把 `ChatPage.vue:1010–1136` 的右键菜单 DOM 搬进新组件，**状态、动作函数、全局监听、焦点归还全部留根/留 `useChatConversationShell.ts`**，实现「组件只渲染 + 转发事件」。
+- 源块以符号定位，不按行号死守：`<Teleport to="body">` 内的 `.ctx-menu` 节点，包含 `ctxTargetTask` 任务菜单和 `else` 对话菜单两套模板。
+- 与 T5 一致，本步**不动 CSS**；`.ctx-*` 规则继续留在 `chat-page.css`，T7 再下沉。
+- 修正旧计划三处偏差（按当前代码为准）：
+  1. 不存在 `locations` 状态/prop，C10 不传。
+  2. `onCtxEscape` 是 `window.addEventListener("keydown", onCtxEscape)` 的**冒泡阶段**，不是 capture；`scroll` 才是 capture。
+  3. 当前没有 Shift+F10 入口；键盘验证用 `F2`（菜单打开时全局 F2 → `startRename`）和菜单内 ↑/↓/Home/End/Tab。
+
+#### 9.1.2 当前依赖基线（实施前已核对）
+
+| 位置 | 现状 | C10 处理 |
+|---|---|---|
+| `ChatPage.vue` 根解构 | 654 个同名解构；含 `ctxMenu`/`ctxMenuEl`/`ctxConfirm`/`ctxTarget`/`ctxTargetTask`/`armCtxConfirm`/`onCtxMenuKeydown`/`onCtxEscape`/`onCtxDismiss` | 新增 `ContextMenuHost` 解构，654 → 655；其余解构保留 |
+| `ChatPage.vue` 模板 | `.chat @click="closeCtxMenu()"` + 四处 `@contextmenu.prevent` 打开菜单（任务头两处、运行记录一处、会话项一处），另有菜单根节点 `@contextmenu.prevent` 阻止原生菜单 | 全部保留，只替换 Teleport 菜单块 |
+| `useChatConversationShell.ts` | `ctxTriggerEl`（内部 let）、`ctxTarget`、`openCtxMenu`、`openTaskCtxMenu`、`closeCtxMenu(restoreFocus)`、`armCtxConfirm(kind)` | 不搬；继续由根层同名解构调用 |
+| `useChatPageCore.ts` | `onCtxMenuKeydown` 依赖 `ctxMenuEl.value.querySelectorAll('[role="menuitem"]')`；`onCtxEscape` 处理 Esc/F2；`onCtxDismiss` 处理 scroll/resize | 不搬；全局监听注册/移除时机不变 |
+| DOM ref | 根 `ctxMenuEl: Ref<HTMLElement \| null>` 被 `placeCtxMenu()` 与 `armCtxConfirm()` 读取 | 子组件 `defineExpose({ ctxMenuEl })`，根层函数 ref 桥接回同一 ref |
+
+#### 9.1.3 组件契约
+
+**新增 `apps/web/src/components/chat/ContextMenuHost.vue`**
+
+Props（全部按引用/响应式传入，禁止解包成普通值）：
+
+| prop | 类型 | 用途 |
+|---|---|---|
+| `ctxMenu` | `{ open: boolean; x: number; y: number; targetId: string; taskId: string }` | 控制 `v-if`、定位、清空目标 id |
+| `ctxTarget` | `ConversationDto \| null` | 对话菜单标题/状态文案、重命名与置顶载荷 |
+| `ctxTargetTask` | `ScheduleDto \| null` | 任务菜单 `v-if` 与禁用/已读/启用文案 |
+| `ctxConfirm` | `"" \| "clear"` | 清空对话二段确认分支 |
+| `sortMode` | `ConvSortMode` | `manual` 时显示「恢复自动排序」 |
+
+Emits（19 个动作 + 1 个键盘转发；**不新增 `close`**，关闭仍由根层动作函数和全局监听完成）：
+
+| emit | 载荷 | 根层绑定 |
+|---|---|---|
+| `keydown` | `KeyboardEvent` | `onCtxMenuKeydown` |
+| `run-task-now` | — | `ctxRunTaskNow` |
+| `open-task-conv` | — | `ctxOpenTaskConv` |
+| `edit-task` | — | `ctxEditTask` |
+| `toggle-task-enabled` | — | `ctxToggleTaskEnabled` |
+| `mark-task-read` | — | `ctxMarkTaskRead` |
+| `remove-task` | — | `ctxRemoveTask` |
+| `rename` | `ConversationDto \| null` | `conv => conv && startRename(conv)` |
+| `toggle-pin` | `ConversationDto \| null` | `conv => conv && togglePin(conv)` |
+| `restore-recent-sort` | — | `restoreRecentSort` |
+| `arm-clear` | — | `armCtxConfirm('clear')` |
+| `confirm-clear` | `id: string` | `clearConversationById` |
+| `ask-close-others` | — | `askCloseOthers()` |
+| `toggle-archive` | `id: string` | `toggleArchive` |
+| `toggle-mute` | `id: string` | `toggleMute` |
+| `toggle-full-access` | `id: string` | `toggleFullAccess` |
+| `toggle-send-mode` | `id: string` | `toggleSendMode` |
+| `duplicate` | `id: string` | `duplicateCurrent` |
+| `export` | `id: string, format: "md" \| "json"` | `(id, format) => exportConversation(id, format)` |
+| `ask-delete` | — | `askDeleteFromCtx()` |
+
+模板不变量：
+
+- `<Teleport to="body">` 保留；`v-if="ctxMenu.open"` 继续挂在**内部 `.ctx-menu` div** 上，不移到 Teleport，避免宿主挂载顺序变化。
+- 菜单根节点保留 `ref="ctxMenuEl"`、`role="menu"`、`:style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"`、`@click.stop`、`@contextmenu.prevent`。
+- `@keydown="emit('keydown', $event)"` 只转发自定义事件；**不加 `.stop` / `.prevent`**，原生 keydown 仍要冒泡到 window，才能触发 `onCtxEscape` 的 Esc/F2。
+- `role="menuitem"`、`class="ctx-item"`、`class="ctx-sep"`、`kbd.ctx-kbd`、`data-ctx-confirm`、`:disabled="!!ctxTargetTask.runRequestedAt"` 全部原样保留。
+- `tx()` 用 `getUiLocale()` 在子组件内本地生成，模式与 T5 四个组件一致。
+- `defineExpose({ ctxMenuEl })`；根层使用与 C8/C9 相同的函数 ref 桥接：
+  ```vue
+  :ref="(el: any) => { ctxMenuEl = el?.ctxMenuEl ?? null; }"
+  ```
+
+#### 9.1.4 执行顺序
+
+1. 开工前核对 `HEAD`、`git status`，实测 `ChatPage.vue` 根解构仍为 654；确认 `ContextMenuHost.vue` 不存在。
+2. **先加红测** `apps/web/tests/context-menu-host-contract.test.ts`（4 个源码级契约用例，45 → 49）：
+   - 结构锁：Teleport / `v-if="ctxMenu.open"` / `ref="ctxMenuEl"` / `role="menu"` / `@click.stop` / `@contextmenu.prevent` / `@keydown="emit('keydown', $event)"` / `data-ctx-confirm` / `defineExpose({ ctxMenuEl })`。
+   - 事件锁：显式 emits 恰好包含 9.1.3 的 20 个名字；不含 `close`、不含 `locations`。
+   - 副作用锁：组件内无 `window.addEventListener` / `removeEventListener`；core 内仍同时存在 `onCtxEscape` 的 keydown 注册、`onCtxDismiss` 的 scroll(capture)/resize 注册与对称移除。
+   - 接线锁：core 返回并 ChatPage 解构 `ContextMenuHost`；根解构计数为 655；ChatPage 不再出现裸 `.ctx-menu` Teleport 块，且保留函数 ref 桥接。
+3. 新增组件，只搬 DOM 与文案；按 9.1.3 把 19 个动作换成 `emit(...)`，不复制任何函数体。
+4. `useChatPageCore.ts` 在 UI 组件 import/return 区加入 `ContextMenuHost`；`ChatPage.vue` 解构加入同名项，替换 1010–1136 原始块。
+5. 跑 9.1.6 门禁；红测转绿后再看 diff，确认 CSS、全局监听、composable 函数体零改动。
+6. 代码单独提交；再用独立文档提交把 commit hash 回写到本计划和设计/索引文档。
+
+#### 9.1.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| `ctxMenuEl` 桥接拿到 `null` 或旧节点 | `placeCtxMenu` 不能定位/聚焦首项；`armCtxConfirm` 不能聚焦确认按钮；键盘导航失效 | 中 | 组件 `defineExpose` + 根函数 ref；契约测试锁 expose；实测「打开菜单→二次确认→Esc→再打开」连续两次 |
+| emit 名称/载荷漏配 | 菜单项点击无反应或 id 错位（尤其导出/发送模式/清空） | 中 | 20 个 emit 显式列出并逐一绑定；契约测试锁名字集合；人工对照两套菜单 19 个动作 |
+| 自定义 `keydown` 误加 `.stop` 或被当作原生监听重复触发 | Esc 焦点归还、F2 重命名、Tab 关闭回归 | 中 | 不写修饰符；声明 `keydown` emit 避免 fallthrough 双绑；契约测试锁字符串；模拟 F2/Esc |
+| 丢失 `@click.stop` / `@contextmenu.prevent` | 浏览器原生右键菜单弹出，或外部 mousedown 处理器误触发 | 中 | 契约测试锁两个修饰符；右键任务头/会话项实测 |
+| 把 `v-if` 移到 Teleport | 挂载顺序变化，可能重演 `#task-panel-host` 的宿主未就位问题 | 低 | 明确禁止；契约测试锁 `v-if="ctxMenu.open"` 在 Teleport 内部 div |
+| 子组件里重复注册全局监听 | 双次关闭、焦点被抢、卸载残留 | 低 | 契约测试锁子组件零 `addEventListener`，core 注册/移除数量不变 |
+| 根解构漏加/重复加 | 模板未定义变量或返回表漂移 | 中 | 与 core return 同提交；契约测试锁 655 |
+| 任务菜单禁用项仍被 `querySelector` 选中 | 首项 focus 无效（当前既有行为） | 低 | 保持原选择器，不改 `[role="menuitem"]`；不借机修行为 |
+| 视觉/CSS 意外变化 | 菜单位移、层级变化 | 低 | 本步不碰 CSS/Teleport 目标；T7 再按 `.ctx-*` 块下沉 |
+
+#### 9.1.6 验证与模拟推演
+
+门禁命令：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm --filter @bx/web test
+pnpm --filter @bx/web type-check
+pnpm type-check
+pnpm build
+pnpm test
+git diff --check
+Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
+```
+
+判定：web 49/49、全仓 type-check、build、server 978/978 全绿；`ChatPage-*.js` / `ChatPage-*.css` 仍各一份；Chrome 全清单因已知实例冲突为非阻塞项，可做时按下面路径冒烟。
+
+模拟推演（按顺序验证，任一步状态/焦点不符即停止）：
+
+| # | 操作 | 期望状态链路 |
+|---|---|---|
+| 1 | 右键会话项 | `openCtxMenu` 设 `ctxMenu={open:true,targetId:conv.id,taskId:""}` 并记 `ctxTriggerEl` → 组件渲染 `.ctx-menu` → 函数 ref 把 DOM 写回根 `ctxMenuEl` → `placeCtxMenu` 在 nextTick 后量尺寸、夹边、focus 首个 `[role="menuitem"]`；无浏览器原生菜单 |
+| 2 | 右键任务分组头 | 同样链路，但 `taskId` 非空、`ctxTargetTask` 命中 → 只出现 6 个任务项；`runRequestedAt` 存在时「立即执行」disabled |
+| 3 | 菜单内按 ↓ / ↑ / Home / End | 子组件 `keydown` emit → 根 `onCtxMenuKeydown` 用桥接后的 `ctxMenuEl` 查询 menuitem，循环移动焦点；无 console error |
+| 4 | 按 Tab | `closeCtxMenu()` 关闭，`ctxConfirm` 清空，`ctxTriggerEl` 不归还焦点（与现行行为一致） |
+| 5 | 按 Esc | 原生事件继续冒泡到 window → `onCtxEscape` → `closeCtxMenu(true)` → 原触发项重获焦点；菜单 DOM 移除 |
+| 6 | 菜单打开时按 F2 | 原生事件冒泡到 window → `startRename(ctxTarget)`；内部先 `closeCtxMenu()`，随后重命名输入框聚焦/全选；不能同时保留菜单 |
+| 7 | 点「清空对话」 | `arm-clear` → 根 `armCtxConfirm('clear')` → nextTick 后 `[data-ctx-confirm]` 出现并被 focus；菜单不关闭 |
+| 8 | 再点「确认清空」 | `confirm-clear(id)` → `clearConversationById` 收菜单并执行；无二次确认残留 |
+| 9 | 点任务项/导出/发送模式 | 对应 emit 载荷为当前 `ctxTargetTask` 或 `ctxMenu.targetId`；根函数执行后 `ctxMenu.open=false`；无 id 串台 |
+| 10 | 菜单打开后滚动会话列表 / 缩放窗口 | window scroll(capture) / resize → `onCtxDismiss` → `closeCtxMenu()`；子组件不参与监听，卸载后无残留 |
+| 11 | 连续开关菜单两次 | 第二次 `placeCtxMenu` 仍能拿到新 DOM ref，聚焦正常；桥接不持有第一次的旧节点 |
+
+#### 9.1.7 回滚
+
+- 未提交：`git restore` 新增组件/测试与三个修改文件（或删除新增文件后恢复 `ChatPage.vue`、`useChatPageCore.ts`）。
+- 已提交：先 `git revert <C10 code sha>`，再单独 revert 回写 hash 的文档提交；禁止把 C10 与 C11 合并提交。
+- 若仅桥接失败，优先改成子组件在 `ctxMenuEl` ref 变化时 emit 一个 `element` 事件由根层直接赋值，再补契约测试；不把全局监听搬进子组件。
+
+#### 9.1.8 提交信息
+
+```text
+refactor(web): extract ContextMenuHost from ChatPage
+```
 
 ### 9.2 C11 `ChatSidebarList.vue`
 

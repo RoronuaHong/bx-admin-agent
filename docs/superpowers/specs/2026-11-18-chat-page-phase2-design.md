@@ -122,8 +122,8 @@ useChatPageCore.ts（协调层）
 | 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable，共享状态留根后拆（裁剪边界见实施计划 §5.3） | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | ✅ `23c9d28`：33 web 测试与全门禁绿；回滚：单提交 revert |
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已提交 `dab6470`：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
-| 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6/C7/C8/C9 已落地；T5 低风险 UI 完成 | 每组件单提交 revert |
-| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | `@click.stop`、Esc capture、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
+| 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；T5 低风险 UI 完成 | 每组件单提交 revert |
+| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链；C10 详细方案见实施计划 §9.1 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
 
 ### 6.1 每步验收命令
@@ -154,8 +154,8 @@ Chrome 手工清单：
 | `DoneToast` | 1138–1155 | `doneToast` / `view,close` | 低：Teleport to body，定时器留协调层 |
 | `ArtifactPreviewModal` | 1205–1225 | `previewHtml,previewLoading` / `close` | 低：纯展示 |
 | `ConfirmDialog` | 1158–1203 | `confirmDialog` / `confirm,cancel` | 中：focus trap、`confirmDialogEl`/`confirmPrimaryBtn` expose、body overflow 留根 |
-| `ChatThread` | 2210–2280 | `visibleBubbles,booting,showSkeleton,outline...` / `jump,earlier,active` | 中：`threadEl` expose、`onThreadScroll`、`v-model:outlineOpen` |
-| `ContextMenuHost` | 1009–1135 | `ctxMenu,ctxTarget,ctxConfirm` / `action,close` | 高：`@click.stop`、焦点归还、全局 Esc/scroll capture |
+| `ChatThread` | 2210–2280 | `visibleBubbles,booting,showSkeleton,outline...` / `jump,earlier,active,update:open` | 中：`threadEl` expose、`onThreadScroll`、`v-model:open` |
+| `ContextMenuHost` | 1009–1135 | `ctxMenu,ctxTarget,ctxTargetTask,ctxConfirm,sortMode` / 19 个动作 emit + `keydown` 转发 | 高：`@click.stop`、`@contextmenu.prevent`、`ctxMenuEl` expose/ref 桥接；焦点归还与全局监听留根（Esc 冒泡、scroll capture），详见实施计划 §9.1 |
 | `ChatSidebarList` | 667–1001 | 列表/任务分组/侧栏状态 / `select,new,ctx,drag,drop,reorder` | 高：ctx 状态、`convListEl`、大量列表交互 |
 | `MessageComposer` | 2282–2770 | `current.input`、面板状态 / `send,stop,pickFiles,toggleTools...` | 高：`v-model="current.input"`、refs、Esc、Teleport 飞出 |
 | `ChatTaskPanel` | 1230–1965 | `taskDraft,editingTaskId,notifyChannels...` / `submit,cancel,run,toggle...` | 高：Teleport 宿主顺序、多层 Teleport、Esc capture |
@@ -193,7 +193,7 @@ Chrome 手工清单：
 | 卸载清理双重/遗漏 | `effectScope.stop()` 不停原始 `setTimeout` | `pageUnmounted` + 显式定时器清理，同一资源只一套机制 |
 | 模板 ref 丢失 | `threadEl/inputEl/confirmPrimaryBtn` 等 | 根层同名暴露；子组件 `defineExpose`；Chrome 手测 |
 | v-model 契约断裂 | `current.input`、`outlineOpen`、`taskDraft.*` | 每个子组件显式定义 emits；不复制 ref，不转普通值 |
-| 事件冒泡 / Esc 优先级 | `@click.stop`、Esc capture、Teleport | 保持原生 DOM 层级；UI 抽取逐组件手测 |
+| 事件冒泡 / Esc 优先级 | `@click.stop`、右键菜单 Esc 冒泡 / 任务表单 Esc capture、Teleport | 保持原生 DOM 层级；UI 抽取逐组件手测 |
 | CSS 作用域回归 | `.group-head` 曾因 scoped 下沉导致裸奔 | 共享基类留根；每块 CSS 下沉后截图对比 |
 | chunk 边界变化 | composables 若动态 import 会多 chunk | 所有 composables 同步 import；构建确认 `ChatPage-*` 唯一 |
 | 范围蔓延 | 顺手修 P1-3～P1-7 | 明确不做；每 SCC / 每组件单提交 |
