@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645`、C15 `d65b575` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645`、C15 `d65b575` 已提交，C16 前置方案见 §10.8**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -1387,6 +1387,80 @@ style(web): move task group card styles into ChatSidebarList
 ```
 
 - 实际代码提交：`d65b575`；前置方案文档提交：`f01ae3a`。红测先行（组件 CSS 缺规则报红），实施后 web 仍 64/64 + 全门禁全绿；Chrome 6 路径均已实测通过。
+
+### 10.8 C16 通知通道管理 CSS 下沉（前置方案）
+
+#### 10.8.1 目标与边界
+
+- 目标：新建 `apps/web/src/components/chat/ChatTaskPanel.css`，把**只属于任务表单结果通知区**的 CSS 从 `chat-page.css` 搬入并由 `ChatTaskPanel.vue` 以 `<style scoped src="./ChatTaskPanel.css"></style>` 引用。
+- 继续只搬样式：DOM/props/emits/ref/全局监听不动；`ChatPage.vue` 的 `<style src="./chat-page.css">` 保持非 scoped。
+- **修正 §10.2 的旧映射**：没有 `NotifyChannelPanel.vue` 组件，通知通道管理 DOM 在 `ChatTaskPanel.vue`，因此下沉目标是 `ChatTaskPanel.css`，不是新组件。
+
+#### 10.8.2 当前锚点与归属（实施前已核对）
+
+| 位置 | 规则 | C16 处理 |
+|---|---|---|
+| `chat-page.css:66–238` | `.notify-switch*` / `.notify-item__switch*` / `.notify-manage` / `.notify-collapse*` / `.notify-form*` / `.notify-list` / `.notify-item*` | 搬入 `ChatTaskPanel.css` |
+| `chat-page.css:284–291` | `.notify-note` | 搬入组件 CSS |
+| `chat-page.css:293–301` | `.cron-raw`（仅 `ChatTaskPanel` 用） | 顺带搬入组件 CSS，减少后续碎片 |
+| `chat-page.css:239–282` | `.notify-btn*` 全部规则 | **留根**：`ChatPage.vue:1105–1135` 的主区任务列表行动按钮也用这些类，是共享基类 |
+| `chat-page.css:31–64` | `.primary-btn*` | 留根；`.notify-form .primary-btn` 的尺寸覆盖随表单块搬入 |
+| `chat-page.css:173–178` 区域 | `.notify-form .field__input` | 随表单块搬入；基础 `.field__input` 留根 |
+| `chat-page.css:181–183` | `.notify-form .notify-kind .uisel__trigger` | 搬入组件 CSS 时改写为 `.notify-form .notify-kind :deep(.uisel__trigger)`：`.uisel__trigger` 位于 `UiSelect` 子组件内部，不带 `ChatTaskPanel` 的 scope 属性 |
+| `chat-page.css:303+` | `.modal-mask` / `.modal` 等弹窗骨架 | 留根，跨多个弹窗共用 |
+
+#### 10.8.3 组件契约
+
+- 新建 `ChatTaskPanel.css`，内容按上表搬入；保持声明顺序与注释。
+- `ChatTaskPanel.vue` 末尾新增 `<style scoped src="./ChatTaskPanel.css"></style>`。
+- `chat-page.css` 只删除 66–238、284–291、293–301 三段及 `:deep()` 改写对应的原规则；`.notify-btn*` / `.primary-btn` / `.field__input` / `.modal-mask` 一个字节不动。
+- 组件 CSS 内唯一 `:deep()` 允许点是 `.notify-kind` 下的 `.uisel__trigger`；其它选择器保持普通 scoped。
+
+#### 10.8.4 红测前置
+
+- 扩展 `apps/web/tests/chat-task-panel-contract.test.ts` 已有的「四个 DOM ref 暴露，全局监听与 body overflow 留根」用例，不新增 case，web 保持 64/64：
+  - `panel` 含 `<style scoped src="./ChatTaskPanel.css"></style>`。
+  - `ChatTaskPanel.css` 含 `.notify-switch {`、`.notify-manage {`、`.notify-form {`、`.notify-list {`、`.notify-item {`、`.notify-note {`、`.cron-raw {`、`:deep(.uisel__trigger)`。
+  - `chat-page.css` 不再含 `.notify-switch {`、`.notify-manage {`、`.notify-form {`、`.notify-list {`、`.notify-item {`、`.notify-note {`、`.cron-raw {`；仍含 `.notify-btn {`、`.notify-btn--danger {`、`.primary-btn {`、`.field__input {`、`.modal-mask {`。
+- 先让断言在旧样式下报红，再实施。
+
+#### 10.8.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| `.notify-btn` 被误搬 | 主区任务列表「测试/暂停/编辑/删除」按钮裸奔 | 高 | 契约断言根仍含 `.notify-btn {` / `.notify-btn--danger {`；Chrome 实测任务卡片按钮 |
+| `:deep()` 漏写 | 通道类型下拉字号仍为默认（12px 覆盖失效） | 高 | 组件 CSS 用 `:deep(.uisel__trigger)`；打开添加通道表单实测字号 |
+| 弹窗内 scoped 不命中 | 通知管理弹窗裸奔（它是 Teleport 内容） | 中 | 元素在 `ChatTaskPanel` 模板内，scoped 属性随模板生成；Chrome 实测 |
+| `.field__input` / `.primary-btn` 基础样式丢失 | 表单输入框与按钮回归 | 中 | 基础类留根，只搬表单内尺寸覆盖；契约断言 |
+| `.cron-raw` 被遗漏 | cron 表达式失去等宽底纹 | 低 | 随块搬入；任务表单实测 |
+| CSS 拆出多 chunk | 破坏单 chunk | 低 | 构建后 `ChatPage-*` 各一份 |
+
+#### 10.8.6 验证与模拟推演
+
+门禁命令同 §10.6.6，判定 web 仍 **64/64**、全仓 type-check/build/server 978/978 全绿、单 chunk。
+
+Chrome 模拟路径：
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 打开任务表单 → 点「管理」 | 通知管理弹窗卡片边框/圆角、折叠标题箭头、列表行样式与下沉前一致 |
+| 2 | 展开「管理通知通道」 | 表单两列布局、紧凑输入框、按钮右下角；通道类型下拉触发框字号 12px |
+| 3 | 切换通道启用开关 | 灰轨/绿轨与滑块位移 16px 正常；`:focus-visible` 焦点环正常 |
+| 4 | 点测试 / 删除通道 | 行内按钮边框底色、danger 色、disabled 透明度正常（全局 `.notify-btn` 仍在） |
+| 5 | 查看外部 cron 任务 | `.cron-raw` 等宽字体与底纹仍在 |
+| 6 | 关闭弹窗查看主区任务列表 | 「编辑/暂停/删除」按钮样式未回归；Console warn/error 为零 |
+
+#### 10.8.7 回滚与提交
+
+- 未提交：删除 `ChatTaskPanel.css`，撤掉组件 style 标签，恢复 `chat-page.css` 三段规则与测试断言。
+- 已提交：先 `git revert <C16 code sha>`，再单独 revert 回写 hash 的文档提交；不与 C15/C17 合并。
+- 提交信息：
+
+```text
+style(web): move notify channel styles into ChatTaskPanel
+```
+
+- 状态：前置方案已写完，待用户确认后进入红测与实施。
 
 ## 11. 全阶段收口门禁
 
