@@ -30,6 +30,7 @@ import ChatThread from "../../components/chat/ChatThread.vue";
 import ContextMenuHost from "../../components/chat/ContextMenuHost.vue";
 import ChatSidebarList from "../../components/chat/ChatSidebarList.vue";
 import MessageComposer from "../../components/chat/MessageComposer.vue";
+import ChatTaskPanel from "../../components/chat/ChatTaskPanel.vue";
 import { bubbleContextKey, type BubbleContext } from "../../components/bubble-context";
 import { renderChatMarkdown } from "../../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../../chat-stream";
@@ -4303,6 +4304,7 @@ return {
   ContextMenuHost,
   ChatSidebarList,
   MessageComposer,
+  ChatTaskPanel,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,
