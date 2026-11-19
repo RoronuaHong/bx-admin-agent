@@ -150,7 +150,7 @@ describe("ChatSidebarList 契约", () => {
     expect(page).not.toContain('<aside class="sidebar"');
   });
 
-  it("侧栏品牌 CSS 归属组件，共享骨架与顶栏样式留根", () => {
+  it("侧栏 CSS 归属组件，共享骨架与状态变体留根", () => {
     const css = read("../src/pages/chat-page.css");
     const componentCss = read("../src/components/chat/ChatSidebarList.css");
 
@@ -162,6 +162,12 @@ describe("ChatSidebarList 契约", () => {
       ".agent-menu__item {",
       ".coming-soon {",
       ".brand__agent-caret.open {",
+      ".task-group__head {",
+      ".task-group__caret {",
+      ".task-group__unread {",
+      ".conv-item--run {",
+      ".conv-run-at {",
+      ".task-group__caret.open {",
     ]) {
       expect(componentCss).toContain(selector);
     }
@@ -171,10 +177,25 @@ describe("ChatSidebarList 契约", () => {
       ".agent-menu__item {",
       ".coming-soon {",
       ".brand__agent-caret.open {",
+      ".task-group__head {",
+      ".task-group__caret {",
+      ".conv-item--run {",
+      ".conv-run-at {",
+      ".task-group__caret.open {",
     ]) {
       expect(css).not.toContain(selector);
     }
-    for (const selector of [".sidebar {", ".sidebar-backdrop {", ".top .brand {", ".primary-btn {"]) {
+    for (const selector of [
+      ".sidebar {",
+      ".sidebar-backdrop {",
+      ".top .brand {",
+      ".primary-btn {",
+      ".group-head {",
+      ".task-groups {",
+      ".conv-dot {",
+      ".task-page {",
+      ".group-head__caret.open {",
+    ]) {
       expect(css).toContain(selector);
     }
     expect(page).toContain('<style src="./chat-page.css"></style>');
