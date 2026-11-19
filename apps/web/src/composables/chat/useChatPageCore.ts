@@ -136,6 +136,7 @@ import { useChatModelSettings } from "./useChatModelSettings";
 import { useChatThreadScroll } from "./useChatThreadScroll";
 import { useChatReasoningUI } from "./useChatReasoningUI";
 import { useChatConversationShell } from "./useChatConversationShell";
+import { useChatToolPanels } from "./useChatToolPanels";
 import type { Bubble, ConvSettings, ConvState } from "./chat-page-types";
 import type { Router as ChatRouter } from "vue-router";
 
@@ -215,12 +216,6 @@ function stopTasksPoll() {
 async function refreshMcpAvailable() {
   const data = await fetchChatMcpServers(currentId.value || undefined).catch(() => null);
   if (data) mcpAvailable.value = data.available;
-}
-
-function patchMcpRow(id: string, patch: Partial<McpServerStatus>) {
-  const idx = mcpAvailable.value.findIndex((s) => s.id === id);
-  if (idx < 0) return;
-  mcpAvailable.value[idx] = { ...mcpAvailable.value[idx], ...patch };
 }
 
 /**
@@ -1913,17 +1908,7 @@ const {
   stickThinkingToBottom,
   reasoningTitle,
 } = useChatReasoningUI({ threadEl, uiLocale, tx });
-
-// ---- MCP 连接面板（选择即可：服务器由部署侧提供，面板只做启用/停用）----
-const mcpOpen = ref(false);
 const mcpAvailable = ref<McpServerStatus[]>([]);
-const mcpBusy = ref(false);
-/**
- * 正在重连的服务器 id 集（按行置忙）。reload 一台 stdio 服务器可能要几十秒到几分钟
- * （子进程重启慢），用全局 busy 会冻结整个面板——别的行无法勾选。这里只冻当前行。
- */
-const mcpReconnecting = reactive(new Set<string>());
-const mcpError = ref("");
 
 const canSend = computed(
   () => Boolean(current.value.input.trim() || current.value.pendingImages.length || current.value.pendingDocs.length),
@@ -3566,175 +3551,8 @@ function confirmExpiryText(expiresInMs?: number): string {
   );
 }
 
-// ---- MCP 连接面板 ----
-/**
- * 拉取某对话的可用服务器与启用集（必须显式传 conversationId：
- * 不带会回退到服务端 activeConversationId，读到的是别的对话）。
- * 响应可能晚于对话切换，所以写回「发起时那个对话」的状态，避免串味。
- */
-async function loadMcp(convId = currentId.value) {
-  // 草稿态没有对话 id。不带 conversationId 的 GET 会回退到服务端 activeConversationId，
-  // 只能取全局 available，不能把别的对话的启用集写进草稿。
-  if (!convId) {
-    const data = await fetchChatMcpServers().catch(() => null);
-    if (data) mcpAvailable.value = data.available;
-    void ensureBoundMcp("");
-    return;
-  }
-  const data = await fetchChatMcpServers(convId).catch(() => null);
-  if (!data) return;
-  mcpAvailable.value = data.available;
-  const state = states.get(convId);
-  if (state) state.settings.mcpEnabled = data.enabled;
-  void ensureBoundMcp(convId);
-}
-
-/**
- * 打开连接器飞出面板（互斥：同时只开一个飞出）。
- * @param focusSearch 是否把焦点放进搜索框：点击打开要（可直接打字），悬停打开不要
- *   （否则鼠标扫过菜单就把焦点从消息输入框抢走）。
- */
-function openMcpPanel(focusSearch = true) {
-  // 已展开则保持：仅确保互斥，不重置搜索框/焦点/重新拉取（hover 重复进入不应清空用户输入）。
-  if (mcpOpen.value) {
-    skillOpen.value = false;
-    expertOpen.value = false;
-    return;
-  }
-  mcpOpen.value = true;
-  skillOpen.value = false;
-  expertOpen.value = false;
-  mcpAddOpen.value = false;
-  mcpQuery.value = "";
-  searchAutofocus.value = focusSearch;
-  loadPinyin();
-  void loadMcp();
-}
-
 /** 专家自带的数据源（客服 = 已接好的 SalesIQ）。不在连接器里当普通可选项关掉。 */
 const boundMcpIds = computed(() => (AGENT_ID === "support" ? ["zoho-salesiq"] : []));
-
-function isBoundMcp(id: string): boolean {
-  return boundMcpIds.value.includes(id);
-}
-
-/** 已有对话缺了专家自带源时补上；草稿态只改内存，首条消息创建会话时一并落库。 */
-let bindingBoundMcp = false;
-async function ensureBoundMcp(convId: string) {
-  const bound = boundMcpIds.value.filter((id) => mcpAvailable.value.some((server) => server.id === id));
-  if (!bound.length || bindingBoundMcp) return;
-  const state = convId ? states.get(convId) : current.value;
-  if (!state) return;
-  const missing = bound.filter((id) => !state.settings.mcpEnabled.includes(id));
-  if (!missing.length) return;
-  const next = [...new Set([...state.settings.mcpEnabled, ...missing])];
-  if (!convId) {
-    state.settings.mcpEnabled = next;
-    for (const id of missing) void connectTaskMcp(id);
-    return;
-  }
-  bindingBoundMcp = true;
-  try {
-    const data = await setChatMcpServers(next, convId);
-    const live = states.get(convId);
-    if (live) live.settings.mcpEnabled = data.enabled;
-    mcpAvailable.value = data.available;
-    syncConvLocal(convId, { mcpServers: data.enabled });
-  } catch {
-    /* 补启用失败时不打断对话；连接器面板仍会把这一项标成客服自带 */
-  } finally {
-    bindingBoundMcp = false;
-  }
-}
-
-/** 勾选/取消某个 MCP 服务器（乐观更新 + 失败回滚）。 */
-async function toggleMcp(id: string, on: boolean) {
-  if (!on && isBoundMcp(id)) return;
-  const convId = currentId.value;
-  const state = current.value;
-  const prev = state.settings.mcpEnabled;
-  const next = on ? [...new Set([...prev, id])] : prev.filter((item) => item !== id);
-  state.settings.mcpEnabled = next;
-  // 草稿态只改内存，对齐模型选择：首条消息创建对话时再落库（createConvFromDraft）。
-  // 勾选时预热连接，行状态才能从「未启用」变成连接中/已连接。
-  if (!convId) {
-    if (on) void connectTaskMcp(id);
-    return;
-  }
-  mcpBusy.value = true;
-  mcpError.value = "";
-  try {
-    const data = await setChatMcpServers(next, convId);
-    mcpAvailable.value = data.available;
-    state.settings.mcpEnabled = data.enabled;
-    syncConvLocal(convId, { mcpServers: data.enabled });
-    // 连接是异步的，稍后刷新一次拿到真实连接状态。
-    deferOnPage(() => void loadMcp(convId), 1500);
-  } catch (err) {
-    state.settings.mcpEnabled = prev;
-    mcpError.value = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("操作失败", "Request failed", "Falha na solicitação", "अनुरोध विफल"),
-    );
-  } finally {
-    mcpBusy.value = false;
-  }
-}
-
-/** 取消全部启用（面板是纯选择语义，不再提供断开/删除服务端）。 */
-async function clearMcpSelection() {
-  const convId = currentId.value;
-  const state = current.value;
-  const prev = state.settings.mcpEnabled;
-  const keep = boundMcpIds.value.filter((id) => mcpAvailable.value.some((server) => server.id === id));
-  state.settings.mcpEnabled = keep;
-  if (!convId) return;
-  mcpBusy.value = true;
-  mcpError.value = "";
-  try {
-    const data = await setChatMcpServers(keep, convId);
-    mcpAvailable.value = data.available;
-    state.settings.mcpEnabled = data.enabled;
-    syncConvLocal(convId, { mcpServers: data.enabled });
-  } catch (err) {
-    state.settings.mcpEnabled = prev;
-    mcpError.value = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("操作失败", "Request failed", "Falha na solicitação", "अनुरोध विफल"),
-    );
-  } finally {
-    mcpBusy.value = false;
-  }
-}
-
-async function reconnectMcp(id: string) {
-  const convId = currentId.value;
-  mcpReconnecting.add(id);
-  mcpError.value = "";
-  // 立即给这一行「连接中」的反馈：reload 可能要几十秒，不能让人以为点了没反应。
-  patchMcpRow(id, { connecting: true, connected: false, error: undefined, toolsError: undefined });
-  try {
-    await reloadMcpServer(id);
-    // 任务表单可能没有对话 id：仍要刷新 available 才能看到「已连接」。
-    if (convId) await loadMcp(convId);
-    else await refreshMcpAvailable();
-  } catch (err) {
-    patchMcpRow(id, {
-      connecting: false,
-      connected: false,
-      error: (err as Error)?.message || tx("连接失败", "connect failed", "falha na conexão", "कनेक्शन विफल"),
-    });
-    mcpError.value = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("连接失败", "connect failed", "falha na conexão", "कनेक्ट विफल"),
-    );
-  } finally {
-    mcpReconnecting.delete(id);
-  }
-}
 
 async function removeCustomMcp(id: string) {
   const ok = window.confirm(
@@ -3791,332 +3609,11 @@ function mcpRowState(
 function taskRowState(s: McpServerStatus): { cls: string; text: string } {
   return mcpRowState(s, taskDraft.mcpServers);
 }
-
-// ---- 技能面板（与 MCP 面板同构：列表全局、启用集按对话持久化）----
-const skillOpen = ref(false);
-const skillAddOpen = ref(false);
-const mcpAddOpen = ref(false);
 const skillAvailable = ref<SkillMeta[]>([]);
-const skillBusy = ref(false);
-const skillError = ref("");
-
-async function loadSkills(convId = currentId.value) {
-  const data = await fetchChatSkills(convId || undefined).catch(() => null);
-  if (!data) return;
-  skillAvailable.value = data.available;
-  // 草稿态：不带 id 的响应会带回服务端当前活动对话的勾选，不能写进草稿。
-  if (!convId) return;
-  const state = stateOf(convId);
-  state.settings.skillsEnabled = data.enabled;
-}
-
-async function onChatSkillCreated(dir: string) {
-  skillAddOpen.value = false;
-  await loadSkills();
-  if (!current.value.settings.skillsEnabled.includes(dir)) await toggleSkill(dir, true);
-}
-
-async function onTaskSkillCreated(dir: string) {
-  taskSkillAddOpen.value = false;
-  await loadSkills();
-  if (!taskDraft.skills.includes(dir)) taskDraft.skills.push(dir);
-}
-
-async function onChatMcpCreated(id: string) {
-  mcpAddOpen.value = false;
-  await loadMcp();
-  if (!current.value.settings.mcpEnabled.includes(id)) await toggleMcp(id, true);
-}
-
-async function onTaskMcpCreated(id: string) {
-  taskMcpAddOpen.value = false;
-  await loadMcp();
-  if (!taskDraft.mcpServers.includes(id)) {
-    taskDraft.mcpServers.push(id);
-    // 与对话区一致：新建即预热连接，否则行状态会停在「未连接」。
-    void connectTaskMcp(id);
-  }
-}
-
-/** 打开技能飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
-function openSkillPanel(focusSearch = true) {
-  // 已展开则保持：仅确保互斥，不重置搜索框/焦点/重新拉取（hover 重复进入不应清空用户输入）。
-  if (skillOpen.value) {
-    mcpOpen.value = false;
-    expertOpen.value = false;
-    return;
-  }
-  skillOpen.value = true;
-  mcpOpen.value = false;
-  expertOpen.value = false;
-  skillAddOpen.value = false;
-  // 每次从关闭→打开都从空关键词开始，避免残留上次搜索词导致列表看着「少了几项」。
-  skillQuery.value = "";
-  searchAutofocus.value = focusSearch;
-  loadPinyin();
-  void loadSkills();
-}
-
-/** 勾选/取消某个技能（乐观更新 + 失败回滚；语义：勾选 = 全文注入系统提示，不勾 = 按需加载）。 */
-async function toggleSkill(dir: string, on: boolean) {
-  const convId = currentId.value;
-  if (skillBusy.value) return;
-  const state = convId ? stateOf(convId) : current.value;
-  const prev = state.settings.skillsEnabled;
-  const next = on ? [...prev, dir] : prev.filter((x) => x !== dir);
-  state.settings.skillsEnabled = next;
-  // 草稿态只改内存；创建对话时再落库（对齐 toggleMcp / saveModelChoice）。
-  if (!convId) return;
-  skillBusy.value = true;
-  skillError.value = "";
-  try {
-    const data = await setChatSkills(next, convId);
-    stateOf(convId).settings.skillsEnabled = data.enabled;
-    syncConvLocal(convId, { skillsEnabled: data.enabled });
-  } catch (err) {
-    state.settings.skillsEnabled = prev;
-    skillError.value = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("技能勾选失败", "Failed to update skills", "Falha ao atualizar habilidades", "स्किल अपडेट विफल"),
-    );
-  } finally {
-    skillBusy.value = false;
-  }
-}
-
-async function clearSkillSelection() {
-  const convId = currentId.value;
-  const state = convId ? stateOf(convId) : current.value;
-  const prev = state.settings.skillsEnabled;
-  state.settings.skillsEnabled = [];
-  if (!convId) return;
-  skillBusy.value = true;
-  skillError.value = "";
-  try {
-    const data = await setChatSkills([], convId);
-    stateOf(convId).settings.skillsEnabled = data.enabled;
-    syncConvLocal(convId, { skillsEnabled: data.enabled });
-  } catch (err) {
-    state.settings.skillsEnabled = prev;
-    skillError.value = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("技能勾选失败", "Failed to update skills", "Falha ao atualizar habilidades", "स्किल अपडेट विफल"),
-    );
-  } finally {
-    skillBusy.value = false;
-  }
-}
-
-// ---- 输入框左下角「工具」入口（对齐 ima：菜单 + 右侧飞出面板）----
-const toolsMenuOpen = ref(false);
 const toolsRoot = ref<HTMLElement | null>(null);
-const skillQuery = ref("");
-const mcpQuery = ref("");
-/** 本次打开飞出面板是否把焦点放进搜索框（点击 = true，悬停 = false）。 */
-const searchAutofocus = ref(true);
-
-const skillFiltered = computed(() => {
-  const q = skillQuery.value.trim().toLowerCase();
-  // 读 pinyinReady 建立依赖：字典异步就绪后触发重算，启用拼音匹配。
-  void pinyinReady.value;
-  if (!q) return skillAvailable.value;
-  // 单字母关键词只匹配可见名称；目录名与描述归「长字段」，避免任意字母命中一堆英文标识。
-  return skillAvailable.value.filter((s) => matchesFuzzyScoped([s.name], [s.dir, s.description], q));
-});
-
-const mcpFiltered = computed(() => {
-  const q = mcpQuery.value.trim().toLowerCase();
-  void pinyinReady.value;
-  if (!q) return mcpAvailable.value;
-  return mcpAvailable.value.filter((s) => matchesFuzzyScoped([s.label], [s.id], q));
-});
-
-const mcpBoundRows = computed(() => mcpFiltered.value.filter((server) => isBoundMcp(server.id)));
-const mcpOptionalRows = computed(() => mcpFiltered.value.filter((server) => !isBoundMcp(server.id)));
-
-const mcpPanelRows = computed(() => {
-  void uiLocale.value;
-  const rows: Array<
-    | { kind: "label"; key: string; text: string }
-    | {
-        kind: "server";
-        key: string;
-        server: (typeof mcpAvailable.value)[number];
-        bound: boolean;
-        state: { cls: string; text: string };
-      }
-  > = [];
-  if (mcpBoundRows.value.length) {
-    rows.push({
-      kind: "label",
-      key: "bound",
-      text: tx("客服已启用", "Included with support", "Incluído no suporte", "सहायता के साथ शामिल"),
-    });
-    // 行内连接状态每行只算一次（mcpRowState 是纯函数），模板只读取，避免一处渲染重复算三遍。
-    for (const server of mcpBoundRows.value)
-      rows.push({ kind: "server", key: server.id, server, bound: true, state: mcpRowState(server, current.value.settings.mcpEnabled, true) });
-  }
-  if (mcpOptionalRows.value.length) {
-    if (mcpBoundRows.value.length) {
-      rows.push({
-        kind: "label",
-        key: "optional",
-        text: tx("其他连接器", "Other connectors", "Outros conectores", "अन्य कनेक्टर"),
-      });
-    }
-    for (const server of mcpOptionalRows.value)
-      rows.push({ kind: "server", key: server.id, server, bound: false, state: mcpRowState(server, current.value.settings.mcpEnabled, false) });
-  }
-  return rows;
-});
-
-/** 取消全部只清可选连接器；专家自带源不在这层。 */
-const canClearOptionalMcp = computed(() => {
-  if (!mcpAvailable.value.length) return enabledMcpCount.value > 0 && !boundMcpIds.value.length;
-  return current.value.settings.mcpEnabled.some(
-    (id) => !isBoundMcp(id) && mcpAvailable.value.some((server) => server.id === id),
-  );
-});
-
-/**
- * 连接器角标只数「当前列表里确实存在」的 id：服务器若被从服务端配置里移除，
- * 对话的启用集里可能残留悬空 id，直接按数组长度算就会出现「面板里一个勾都没有、角标却显示 1」。
- * 列表还没拉到（首次打开菜单的预取窗口）时不判定，避免角标先亮后灭。
- */
-const enabledMcpCount = computed(() => {
-  const ids = current.value.settings.mcpEnabled;
-  if (!mcpAvailable.value.length) return ids.length;
-  return ids.filter((id) => mcpAvailable.value.some((s) => s.id === id)).length;
-});
-
-function toggleToolsMenu() {
-  toolsMenuOpen.value = !toolsMenuOpen.value;
-  if (toolsMenuOpen.value) {
-    // 打开菜单就预取两份列表：飞出面板秒开无等待。
-    void loadSkills();
-    void loadMcp();
-    // 后台拉起拼音字典，之后打开任一搜索面板都能用拼音（首屏不背这体积）。
-    loadPinyin();
-  } else {
-    skillOpen.value = false;
-    mcpOpen.value = false;
-    expertOpen.value = false;
-  }
-}
-
-/** 连接器一行描述：transport · 工具数 (+ 首个错误)，同时用于悬浮全文。 */
-function mcpDescText(s: McpServerStatus): string {
-  const parts = [`${s.transport} · ${s.tools} ${tx("工具", "tools", "ferramentas", "टूल")}`];
-  if (s.error) parts.push(s.error);
-  else if (s.toolsError) parts.push(s.toolsError);
-  return parts.join(" · ");
-}
-
-const expertOpen = ref(false);
 // 专家菜单只列「有专门角色」的 Agent：观影助手属独立项目（/movie）不在此列，
 // 通用助手是默认形态也不算专家；其余专家（如客服）在此列出。
 const expertAgents: AgentEntry[] = AGENTS.filter((a) => a.id !== "movie" && a.id !== "generic");
-// 当前选中的专家（无 = 通用，对齐 CodeBuddy：chip 存在即已选专家，无 chip 即通用）。
-const currentExpert = computed(() => expertAgents.find((a) => a.id === AGENT_ID));
-
-/** 专家空对话的示例问法。点一下就作为第一条消息发出。 */
-const expertStarters = computed(() => {
-  if (AGENT_ID !== "support") return [] as string[];
-  void uiLocale.value;
-  return [
-    tx(
-      "最近 60 分钟，印度的 SalesIQ 会话有多少？",
-      "How many SalesIQ chats from India in the last 60 minutes?",
-      "Quantas conversas do SalesIQ da Índia nos últimos 60 minutos?",
-      "पिछले 60 मिनट में भारत की कितनी SalesIQ बातचीत हुईं?",
-    ),
-    tx(
-      "列出最近打开的会话",
-      "List the most recently opened chats",
-      "Listar as conversas abertas mais recentes",
-      "हाल ही में खुली बातचीत दिखाएँ",
-    ),
-    tx(
-      "考勤制度里，迟到怎么规定？",
-      "What do the attendance rules say about being late?",
-      "O que as regras de ponto dizem sobre atraso?",
-      "उपस्थिति नियमों में देरी के बारे में क्या है?",
-    ),
-  ];
-});
-
-const composerPlaceholder = computed(() =>
-  AGENT_ID === "support"
-    ? tx(
-        "问会话量、某个地区的会话，或公司制度…",
-        "Ask about chat volume, a region's chats, or company policy…",
-        "Pergunte sobre volume de chats, conversas de uma região ou políticas…",
-        "बातचीत की संख्या, किसी क्षेत्र की चैट या कंपनी नीति पूछें…",
-      )
-    : tx("输入消息…", "Type a message…", "Digite uma mensagem…", "संदेश लिखें…"),
-);
-
-function askStarter(text: string) {
-  const state = current.value;
-  if (!state || state.sending) return;
-  state.input = text;
-  void send();
-}
-
-const expertQuery = ref("");
-/**
- * 专家搜索：单字符关键词只匹配「当前界面语言的名称」（否则英文名/长描述里的字母会让任意
- * 字母都命中，如输入 a 命中「Support assistant」）；≥2 个字符才扩展到 id、四语名称与描述。
- */
-const expertFiltered = computed(() => {
-  const q = expertQuery.value.trim().toLowerCase();
-  void pinyinReady.value;
-  if (!q) return expertAgents;
-  return expertAgents.filter((a) =>
-    matchesFuzzyScoped(
-      [agentText(a.label, uiLocale.value)],
-      [a.id, ...Object.values(a.label), ...Object.values(a.description)],
-      q,
-    ),
-  );
-});
-
-/** 打开专家飞出面板（互斥：同时只开一个飞出；focusSearch 语义同 toggleMcpPanel）。 */
-function openExpertPanel(focusSearch = true) {
-  // 已展开则保持：仅确保互斥，不重置搜索框/焦点（hover 重复进入不应清空用户输入）。
-  if (expertOpen.value) {
-    skillOpen.value = false;
-    mcpOpen.value = false;
-    return;
-  }
-  expertOpen.value = true;
-  skillOpen.value = false;
-  mcpOpen.value = false;
-  expertQuery.value = "";
-  searchAutofocus.value = focusSearch;
-  loadPinyin();
-}
-
-// 收起所有工具面板（专家/技能/连接器/主菜单），切换专家或取消选中前调用。
-function closeToolsPanels() {
-  toolsMenuOpen.value = false;
-  expertOpen.value = false;
-  skillOpen.value = false;
-  mcpOpen.value = false;
-}
-
-function onPickExpert(agent: AgentEntry) {
-  closeToolsPanels();
-  router.push(agent.path);
-}
-
-// chip 上的 ×：取消选中专家，回到 /chat（generic）。
-function onClearExpert() {
-  closeToolsPanels();
-  router.push("/chat");
-}
 
 /** 悬停菜单项即展开右侧飞出面板（与点击等价，但不抢焦点）。 */
 function hoverFlyout(which: "skills" | "mcp" | "expert") {
@@ -4144,6 +3641,82 @@ function onOutsideTools(event: MouseEvent) {
     expertOpen.value = false;
   }
 }
+
+// ---- SCC B 工具面板：MCP / 技能 / 搜索 / 专家（共享状态留根，引用注入）----
+const {
+  mcpOpen,
+  mcpBusy,
+  mcpReconnecting,
+  mcpError,
+  patchMcpRow,
+  loadMcp,
+  openMcpPanel,
+  isBoundMcp,
+  bindingBoundMcp,
+  ensureBoundMcp,
+  toggleMcp,
+  clearMcpSelection,
+  reconnectMcp,
+  skillOpen,
+  skillAddOpen,
+  mcpAddOpen,
+  skillBusy,
+  skillError,
+  loadSkills,
+  onChatSkillCreated,
+  onTaskSkillCreated,
+  onChatMcpCreated,
+  onTaskMcpCreated,
+  openSkillPanel,
+  toggleSkill,
+  clearSkillSelection,
+  toolsMenuOpen,
+  skillQuery,
+  mcpQuery,
+  searchAutofocus,
+  skillFiltered,
+  mcpFiltered,
+  mcpBoundRows,
+  mcpOptionalRows,
+  mcpPanelRows,
+  canClearOptionalMcp,
+  enabledMcpCount,
+  toggleToolsMenu,
+  mcpDescText,
+  expertOpen,
+  expertStarters,
+  currentExpert,
+  composerPlaceholder,
+  askStarter,
+  expertQuery,
+  expertFiltered,
+  openExpertPanel,
+  closeToolsPanels,
+  onPickExpert,
+  onClearExpert,
+} = useChatToolPanels({
+  agentId: AGENT_ID,
+  currentId,
+  current,
+  states,
+  stateOf,
+  mcpAvailable,
+  skillAvailable,
+  expertAgents,
+  boundMcpIds: () => boundMcpIds.value,
+  taskDraft,
+  taskSkillAddOpen,
+  taskMcpAddOpen,
+  mcpRowState,
+  deferOnPage,
+  syncConvLocal,
+  send: () => send(),
+  routerPush: (path) => router.push(path),
+  refreshMcpAvailable: () => refreshMcpAvailable(),
+  connectTaskMcp: (id) => connectTaskMcp(id),
+  uiLocale,
+  tx,
+});
 
 /** 列表项头像：按 key 稳定散列出一个色相 → 渐变底 + 首字符，对齐 ima 的彩色图标列表。 */
 function iconStyle(key: string): Record<string, string> {

@@ -1,13 +1,14 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1 已提交，T2（SCC A 会话壳）已提交 `23c9d28`**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2 已提交，T3（SCC B 工具面板）已实现待提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
   - T0 `useChatPersistence` + `chat-page-types.ts` 提交 `37d8663`（`useChatPageCore.ts` 6269→5959 行）。门禁全绿：build / type-check / web test / server test / diff / 单 chunk。
   - T1 SCC C 拆三件（`useChatModelSettings` / `useChatThreadScroll` / `useChatReasoningUI`）提交 `3f6d81c`（协调层再降约 340 行）。门禁全绿。
   - T2（SCC A）**已提交 `23c9d28`**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
+  - T3（SCC B）已实现待提交：先补 `apps/web/tests/chat-tool-panels.test.ts`（9 个特征测试）锁定三飞出互斥/query 重置、MCP 逐行 busy 与回滚、fuzzy 搜索、专家 chip/starter、任务飞出层共享引用、bound MCP 合并落库；再按 37 个跨组依赖注入拆出 `useChatToolPanels.ts`（603 行），协调层降到 4918 行。AST 对比 50 个声明全部行为等价（无 DIFF），42 web 测试、全仓 type-check、build、978 server 测试全绿，仍为单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -151,7 +152,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` | ✅ `37d8663` |
 | C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
 | C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已提交 `23c9d28`：33 web 测试 + 全门禁绿 |
-| C4 | T3 SCC B | 新增 1 个 composable + `useChatPageCore.ts` | ⏳ 依赖 C3 的 `taskDraft` 边界落地 |
+| C4 | T3 SCC B | 新增 `useChatToolPanels.ts` + `useChatPageCore.ts` + `chat-tool-panels.test.ts` | ✅ 已实现待提交：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
 | C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
 | C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
@@ -378,7 +379,7 @@ refactor(web): split chat settings scroll and reasoning composables
 | provide 41 键 `satisfies` + 长度断言 | 🟡 未落地：41 键完整无丢键，但无门禁；属 C5（T4）范围，拆 SCC 时不夹带 |
 | 注释与实例级约定一致 | 🟡→✅ 已修：`useChatReasoningUI.ts` 的 `thinkStarts` 注释原误写「模块级 Map」，实为实例级，已更正 |
 
-**结论**：T0/T1 实现与阶段1 前端工程最佳实践对齐；审查发现的 2 处可修偏离（注释、测试引用契约）已修复并提交，web 测试 32 例全绿。provide 断断言留 T4 专项处理。T2 方案沿用同一套约定（显式 interface + `satisfies`、引用注入、实例级状态、单 chunk）。
+**结论**：T0/T1/T2 实现与阶段1 前端工程最佳实践对齐；审查发现的 2 处可修偏离（注释、测试引用契约）已修复并提交，T2 拆分后 web 测试 33 例全绿。provide 断断言留 T4 专项处理。T3 沿用同一套约定（显式 interface + `satisfies`、引用注入、实例级状态、单 chunk），开工前已补 9 个特征测试（web 42/42）。
 
 ### 5.9 提交信息
 
@@ -405,19 +406,22 @@ refactor(web): split chat conversation shell composable
 
 `mcpAvailable`、`skillAvailable`、`expertAgents`、`boundMcpIds` 按设计留协调层：
 
-- `boundMcpIds`：T2 已作为根 `Ref` 注入 A；本步由 B 读写，不移动声明位置。
+- `boundMcpIds`：T2 已作为根 computed 的 getter（`() => boundMcpIds.value`）注入 A；本步由 B 读写，不移动声明位置。
 - `mcpAvailable` / `skillAvailable` / `expertAgents`：保留为根同名 ref，B 通过 options 读写；T2 的任务表单 getter 指向同一批 ref。
 
 ### 6.4 必须保留的行为
 
 - 三个 `open*Panel` 互斥切换 `mcpOpen` / `skillOpen` / `expertOpen`，重置对应 query 与 `searchAutofocus`，并触发 `loadPinyin()`。
 - `toggleToolsMenu` 预取 `loadSkills` / `loadMcp`。
-- `toggleMcp` 使用逐行重连集合 `mcpReconnecting`，重连延迟走 `deferOnPage()`。
+- `reconnectMcp` 使用逐行重连集合 `mcpReconnecting`；`connectTaskMcp` / `toggleMcp` 的成功路径用 `deferOnPage()` 延迟刷新，失败回滚在各自 catch 内完成（2026-11-19 实测校正）。
 - 任务表单复用可用集：`taskRowState` 读 `taskDraft.mcpServers`，新增 MCP/技能后同时刷新聊天与任务可用集。
 - 全局 Esc / outside 监听仍在协调层，不随本步移动。
 
+**AST 依赖盘点（2026-11-19 实测）**：T3 目标共 50 个顶层声明；把注入点放在最后一个 T3 声明之后（当前行 4120），跨组依赖 37 个，全部声明在注入点之前，**无 TDZ 敏感项**。注入点前没有 setup 同步值引用这些符号（声明名/属性名除外），watch/onMounted 回调均在 setup 后执行。关键共享引用：`mcpAvailable`、`skillAvailable`、`expertAgents`、`boundMcpIds`、`taskDraft`、`taskSkillAddOpen`、`taskMcpAddOpen`、`mcpRowState`、`deferOnPage`、`send`、`router`、`uiLocale`/`tx`；其中前 7 项保持同一实例，禁止解包或复制。`mcpReconnecting` 是 composable 内部 reactive Set，返回同一实例即可。
+
 ### 6.5 验证重点
 
+- **前置已完成**：`chat-tool-panels.test.ts`（9 个特征测试）已锁定本节六类行为；拆分后必须重跑，连同既有测试共 42 用例全绿才算行为守恒。
 - MCP 勾选/取消、重连、逐行 busy；技能面板、拼音搜索、专家 chip 与 starter。
 - 任务表单复用 MCP/技能可用集；新建会话带入 bound MCP。
 - `loadPinyin()` / `pinyinReady` 不被动态 import 拆出额外 chunk。
