@@ -135,6 +135,7 @@ import { useChatPersistence } from "./useChatPersistence";
 import { useChatModelSettings } from "./useChatModelSettings";
 import { useChatThreadScroll } from "./useChatThreadScroll";
 import { useChatReasoningUI } from "./useChatReasoningUI";
+import { useChatConversationShell } from "./useChatConversationShell";
 import type { Bubble, ConvSettings, ConvState } from "./chat-page-types";
 import type { Router as ChatRouter } from "vue-router";
 
@@ -210,28 +211,6 @@ function stopTasksPoll() {
   clearInterval(tasksPollTimer);
   tasksPollTimer = null;
 }
-/** 不改归档开关、不打断当前对话的侧栏刷新（只同步 running / 标题等）。 */
-async function refreshConversationsQuiet() {
-  const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
-  if (!list) return;
-  const pendingDeleted = undoDelete.value?.conv.id;
-  const next = pendingDeleted ? list.filter((c) => c.id !== pendingDeleted) : list;
-  const alive = new Set(next.map((c) => c.id));
-  const beforeIds = conversations.value.map((c) => c.id).join("\0");
-  // 别处删掉的对话从侧栏去掉。当前这条若刚创建、列表还没带回，先留着。
-  conversations.value = conversations.value.filter((c) => alive.has(c.id) || c.id === currentId.value);
-  const byId = new Map(next.map((c) => [c.id, c]));
-  conversations.value = conversations.value.map((c) => {
-    const fresh = byId.get(c.id);
-    return fresh ? { ...c, ...fresh } : c;
-  });
-  for (const c of next) {
-    if (!conversations.value.some((x) => x.id === c.id)) conversations.value.push(c);
-  }
-  const afterIds = conversations.value.map((c) => c.id).join("\0");
-  if (afterIds !== beforeIds) resortConversations();
-}
-
 /** 只刷新可用服务器连接状态（不依赖当前对话；任务表单勾选预热后用来同步「已连接」）。 */
 async function refreshMcpAvailable() {
   const data = await fetchChatMcpServers(currentId.value || undefined).catch(() => null);
@@ -1330,22 +1309,18 @@ const ctxMenu = ref<{ open: boolean; x: number; y: number; targetId: string; tas
   taskId: "",
 });
 const ctxMenuEl = ref<HTMLElement | null>(null);
-/** 触发菜单的元素（会话项 / ⋯ 按钮）：Esc 关闭后把焦点还回去（WAI-ARIA menu pattern）。 */
-let ctxTriggerEl: HTMLElement | null = null;
 /**
  * 菜单里「清空对话」的二次确认态（空 = 无）：首次点击只进入待确认，再点一次才执行；
  * 「关闭其它对话」改为走 confirmDialog 确认弹窗。菜单关闭即复位。
  */
 const ctxConfirm = ref<"" | "clear">("");
+/** 删除撤销窗口：窗口内可撤销，超时才真正落库删除。 */
+const undoDelete = ref<{ conv: ConversationDto; index: number; wasCurrent: boolean } | null>(null);
 /** 正在内联重命名的会话（id 为空 = 无）。 */
 const renaming = ref<{ id: string; value: string }>({ id: "", value: "" });
 const renameInputEl = ref<HTMLInputElement | null>(null);
 /** 标题长度上限：只做体验层收敛，防误粘贴超长文本。 */
 const RENAME_MAX = 100;
-/** 删除撤销窗口：窗口内可撤销，超时才真正落库删除。 */
-const UNDO_DELETE_MS = 5000;
-const undoDelete = ref<{ conv: ConversationDto; index: number; wasCurrent: boolean } | null>(null);
-let undoDeleteTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ---- 删除确认弹窗（选项 A）----
 // 点删除先弹确认框，确定才真正走 removeConversation；撤销条仍保留作为兜底，避免「确认后反悔」无路可退。
@@ -1988,223 +1963,72 @@ const {
   messageTimes: (messages, createdAt, updatedAt) => messageTimes(messages, createdAt, updatedAt),
 });
 
-/** 切换对话：只改指针，不 abort、不覆盖任何已存在的运行时状态（后台流继续跑）。 */
-function selectConversation(conv: ConversationDto) {
-  // 定时任务表单/任务页开着时点其它对话 = 放下它们切过去（不能挡住侧栏导航）。
-  if (showTaskForm.value) closeTaskForm();
-  showTaskList.value = false;
-  const state = stateOf(conv.id);
-  // 切走时若上一个对话仍在生成：交给后台守望，跑完提醒一次（免打扰的对话不提醒）。
-  const leaving = currentId.value;
-  if (leaving && leaving !== conv.id) {
-    modelSwitchHint.value = "";
-    const leavingState = states.get(leaving);
-    if (leavingState?.sending || (leavingState?.controllers?.length ?? 0) > 0) watchBackgroundDone(leaving);
-  }
-  currentId.value = conv.id;
-  sidebarOpen.value = false; // 移动端选中对话后收起抽屉
-  reportActiveConversation(conv);
-  // 打开的是某一期的结果 → 该任务的未读清零（放在选中之后：即便清零请求失败也不影响阅读）。
-  clearTaskUnread(conv.id);
-  // 仅首次载入时用服务端快照建气泡；已有气泡说明本地状态更新（可能正在流式），不能覆盖。
-  // messageTimes 要扫全量消息（长对话上万条），只在真要建气泡/补时间时算：切换已初始化的对话直接跳过。
-  if (!state.bubbles.length || state.bubbles.some((bubble) => !bubble.at)) {
-    const times = messageTimes(conv.messages || [], conv.createdAt, conv.updatedAt);
-    if (!state.bubbles.length) {
-      state.bubbles = bubblesFromStored(conv.messages || [], times);
-      if (!persistedCount.has(conv.id)) persistedCount.set(conv.id, toStored(state.bubbles).length);
-      // 列表不含思考过程。打开后再取最近一段细节，不把整段推理塞进侧栏轮询。
-      void upgradeConversationDetail(conv.id);
-    } else if (state.bubbles.length === times.length) {
-      state.bubbles.forEach((bubble, index) => {
-        if (!bubble.at) bubble.at = times[index];
-      });
-    }
-  }
-  // 设置按对话灌入（列表条目在每次写成功后都会同步，故不会用过期值覆盖）。
-  state.settings.modelId = conv.model || "";
-  state.settings.mcpEnabled = conv.mcpServers || [];
-  state.settings.skillsEnabled = conv.skillsEnabled || [];
-  state.settings.locale = isUiLocale(conv.locale) ? conv.locale : "";
-  state.queue = conv.pendingQueue || [];
-  applyConversationLocale(state.settings.locale);
-  // 面板的可用服务器列表是全局的；启用集来自该对话。
-  void loadMcp(conv.id);
-  // 技能面板：可用列表全局，启用集按对话。
-  void loadSkills(conv.id);
-  queueScroll(true); // 切对话是用户动作：无条件回底，并重置跟底状态
-  // 已看过的对话也再跟一次服务端：定时任务写入、或切走时跑完的那一轮，不用整页刷新。
-  void syncOpenConversation(conv.id);
-}
-
-/**
- * 新建对话 = 进入「草稿态」（对齐 CodeBuddy）：不立即调接口建会话，
- * 编辑器切到空白（共享 blank 态），列表也不加「新对话」空壳；
- * 首条消息真正发出时才创建会话入列表（见 send 的草稿分支 → createConvFromDraft）。
- * 点开没说话就切走 / 刷新，什么残留都没有；草稿里输入的文字再次进入草稿时保留。
- */
-function newConversation() {
-  // 任务表单/任务页开着时点「新建对话」= 关掉进草稿态（与 selectConversation 同口径）。
-  if (showTaskForm.value) closeTaskForm();
-  showTaskList.value = false;
-  // 草稿本身没有流；离开正在生成的对话时交给后台守望（与 selectConversation 同口径）。
-  const leaving = currentId.value;
-  if (leaving) {
-    const leavingState = states.get(leaving);
-    if (leavingState?.sending || (leavingState?.controllers?.length ?? 0) > 0) watchBackgroundDone(leaving);
-  }
-  currentId.value = "";
-  // 进入草稿态：清空上一轮残留的用户态（技能 / 连接器 / 助手模型 / 待发文件），
-  // 仅保留草稿文字（对齐「草稿再次进入保留输入」的约定），避免新建会话带上旧会话的勾选与附件。
-  blank.settings.mcpEnabled = [];
-  blank.settings.skillsEnabled = [];
-  blank.settings.modelId = "";
-  blank.pendingImages = [];
-  blank.pendingDocs = [];
-  sidebarOpen.value = false; // 移动端点「新建对话」后收起抽屉
-  queueScroll(true);
-}
-
-/**
- * 草稿态首条消息 → 此刻才真正创建会话：标题取首条消息截断（对齐 CodeBuddy），
- * 草稿里已选的设置（模型 / MCP / 技能）一并继承落库，语言始终继承当前界面语言。
- * 创建失败时把错误写回草稿态并返回空串（调用方收口，输入内容不丢，可重试）。
- */
-async function createConvFromDraft(firstText: string): Promise<string> {
-  const draft = current.value; // 草稿态即共享 blank
-  const collapsed = firstText.replace(/\s+/g, " ").trim();
-  const fallback = tx("新对话", "New chat", "Nova conversa", "नई चैट");
-  const title = collapsed ? (collapsed.length > 30 ? `${collapsed.slice(0, 30)}…` : collapsed) : fallback;
-  let conv: ConversationDto;
-  try {
-    conv = await createConversation({ title, agentId: AGENT_ID });
-  } catch (err) {
-    draft.error = localizeToken(
-      uiLocale.value,
-      getApiErrorToken(err),
-      (err as Error)?.message || tx("对话创建失败", "Failed to create conversation", "Falha ao criar conversa", "बातचीत बनाने में विफल"),
-    );
-    return "";
-  }
-  conversations.value = [conv, ...conversations.value.filter((c) => c.id !== conv.id)];
-  // 直接前插会让新对话跑到置顶区之上：按统一排序规则归位（新对话在普通区最上）。
-  resortConversations();
-  // 手动排序模式下，新对话没有 sortOrder 会沉到普通区底部：显式把它排到普通区最前。
-  if (sortMode.value === "manual") {
-    const firstRegular = conversations.value.find((c) => !c.pinnedAt && c.id !== conv.id);
-    if (firstRegular) void applyConversationOrder(conv.id, firstRegular.id, false);
-  }
-  // 草稿里挑过的设置带进新对话（runTurn 读的是新对话自己的 state，必须先搬再发）。
-  const st = stateOf(conv.id);
-  st.settings = { ...draft.settings, locale: uiLocale.value };
-  currentId.value = conv.id;
-  reportActiveConversation(conv);
-  const patch: { locale?: string; model?: string; mcpServers?: string[]; skillsEnabled?: string[]; sendMode?: "preempt" | "queue" } = {
-    locale: st.settings.locale,
-  };
-  // 草稿态若切过发送模式，随首条消息一起落库（默认抢占则无需写，少一次字段变更）。
-  if (draftSendMode.value === "queue") patch.sendMode = "queue";
-  if (st.settings.modelId) patch.model = st.settings.modelId;
-  // 专家自带的数据源跟着角色走，不因草稿里没勾选而被覆盖掉。
-  const mcpEnabled = [...new Set([...boundMcpIds.value, ...st.settings.mcpEnabled])];
-  st.settings.mcpEnabled = mcpEnabled;
-  if (mcpEnabled.length) patch.mcpServers = mcpEnabled;
-  if (st.settings.skillsEnabled.length) patch.skillsEnabled = [...st.settings.skillsEnabled];
-  // 首条消息紧接着就开跑，服务端按对话文档里的启用集取工具。必须等落库完成再拉列表，
-  // 否则 loadMcp 会用新建对话的空启用集把草稿勾选盖掉，这一轮也用不上连接器。
-  try {
-    await patchConversation(conv.id, patch);
-    syncConvLocal(conv.id, patch);
-  } catch {
-    /* 落库失败不阻断发送；前端 state 已带上设置，下次保存会再写 */
-  }
-  void loadMcp(conv.id);
-  void loadSkills(conv.id);
-  return conv.id;
-}
-
-/** 手动顺序步长（须与服务端 `ORDER_STEP` 一致）：相邻项间隔，便于中间插入。 */
-const CONV_ORDER_STEP = 1000;
-
-/**
- * 排序规则：
- * ① 归档组永远在最末（归档 = 收起来，不与在用对话混排；也不参与置顶组）；
- * ② 置顶组在普通组之上；
- * ③ 组内：`manual` 模式先按手动顺序（没排过的沉到最后），否则按默认序；
- * ④ 默认序：置顶组按置顶时间（新的在上），普通组按最近活动。
- */
-function convRank(a: ConversationDto, b: ConversationDto): number {
-  const aa = a.archived ? 1 : 0;
-  const ba = b.archived ? 1 : 0;
-  if (aa !== ba) return aa - ba;
-  const ap = a.pinnedAt ? 1 : 0;
-  const bp = b.pinnedAt ? 1 : 0;
-  if (ap !== bp) return bp - ap;
-  if (sortMode.value === "manual") {
-    const ao = a.sortOrder ?? Number.POSITIVE_INFINITY;
-    const bo = b.sortOrder ?? Number.POSITIVE_INFINITY;
-    if (ao !== bo) return ao - bo;
-  }
-  if (ap && bp) return (b.pinnedAt || 0) - (a.pinnedAt || 0);
-  return b.updatedAt - a.updatedAt;
-}
-
-/** 本地按同一套规则重排：乐观更新后立刻反映到侧栏，不等服务端回包。 */
-function resortConversations() {
-  conversations.value = [...conversations.value].sort(convRank);
-}
-
-/**
- * 把 `fromId` 移动到 `targetId` 前 / 后，并按新顺序整体固化（拖拽与 `Alt+↑/↓` 共用）。
- *
- * 「拖拽即固化」（方案 A）：首次移动即切到 `manual` 模式并写入全部顺序——所见即所得，
- * 不会出现「拖完再发条消息就弹回去」。
- * `pinOverride`：跨区拖拽时顺带改置顶（`null` = 取消置顶，`undefined` = 不动）。
- */
-async function applyConversationOrder(
-  fromId: string,
-  targetId: string,
-  after: boolean,
-  pinOverride?: number | null,
-) {
-  if (fromId === targetId) return;
-  const prevOrder = conversations.value;
-  const prevMode = sortMode.value;
-  const moved = prevOrder.find((c) => c.id === fromId);
-  if (!moved) return;
-  const nextList = prevOrder.filter((c) => c.id !== fromId);
-  const anchor = nextList.findIndex((c) => c.id === targetId);
-  if (anchor < 0) return;
-  const movedNext: ConversationDto = pinOverride === undefined ? moved : { ...moved, pinnedAt: pinOverride };
-  nextList.splice(after ? anchor + 1 : anchor, 0, movedNext);
-
-  // 乐观更新：切手动模式 + 按下标写本地 sortOrder（下标即新顺序，与服务端分配规则一致）。
-  sortMode.value = "manual";
-  conversations.value = nextList.map((c, i) => ({ ...c, sortOrder: i * CONV_ORDER_STEP }));
-  resortConversations();
-
-  try {
-    if (pinOverride !== undefined) await patchConversation(fromId, { pinnedAt: pinOverride });
-    await reorderConversations(conversations.value.map((c) => c.id));
-    if (prevMode !== "manual") void saveChatPreferences({ convSortMode: "manual" }).catch(() => undefined);
-  } catch (err) {
-    // 失败时可能是「置顶已生效、顺序没落库」：以服务端为准重新拉一次，避免本地与后端分叉。
-    sortMode.value = prevMode;
-    conversations.value = await fetchConversations(false, AGENT_ID).catch(() => prevOrder);
-    resortConversations();
-    showSettingsError(
-      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("排序失败", "Reorder failed", "Falha ao reordenar", "क्रम बदलने में विफल")),
-    );
-  }
-}
-
-/** 退出手动排序：普通区恢复「最近活动」自动上浮（手动顺序留在库里，下次拖拽会重新固化）。 */
-function restoreRecentSort() {
-  closeCtxMenu();
-  sortMode.value = "recent";
-  resortConversations();
-  void saveChatPreferences({ convSortMode: "recent" }).catch(() => undefined);
-}
+// ---- SCC A 会话壳：列表排序 / 会话动作 / 右键 / 删除撤销（机械拆分，行为零变化）----
+// 每页实例状态传引用；定义在注入点之后的回调统一用箭头/getter 包裹消解 TDZ。
+const {
+  CONV_ORDER_STEP,
+  convRank,
+  resortConversations,
+  refreshConversationsQuiet,
+  reloadConversations,
+  applyConversationOrder,
+  restoreRecentSort,
+  selectConversation,
+  newConversation,
+  createConvFromDraft,
+  ctxTarget,
+  ctxAnchorPos,
+  placeCtxMenu,
+  openCtxMenu,
+  openTaskCtxMenu,
+  closeCtxMenu,
+  armCtxConfirm,
+  deleteConversationOnServer,
+  flushPendingDelete,
+  scheduleUndoDelete,
+  removeConversation,
+  undoRemoveConversation,
+} = useChatConversationShell({
+  agentId: AGENT_ID,
+  conversations,
+  currentId,
+  states,
+  stateOf,
+  persistedCount,
+  blank,
+  showArchived,
+  sortMode,
+  current,
+  modelSwitchHint,
+  ctxMenu,
+  ctxMenuEl,
+  ctxConfirm,
+  undoDelete,
+  uiLocale,
+  tx,
+  messageTimes: (messages, createdAt, updatedAt) => messageTimes(messages, createdAt, updatedAt),
+  bubblesFromStored: (messages, times) => bubblesFromStored(messages, times),
+  toStored: (list) => toStored(list),
+  upgradeConversationDetail: (id) => upgradeConversationDetail(id),
+  syncOpenConversation: (id) => syncOpenConversation(id),
+  syncConvLocal: (id, patch) => syncConvLocal(id, patch),
+  applyConversationLocale: (locale) => applyConversationLocale(locale),
+  queueScroll: (force) => queueScroll(force),
+  showSettingsError: (message) => showSettingsError(message),
+  isLocale: (locale) => isUiLocale(locale),
+  closeTaskForm: () => closeTaskForm(),
+  showTaskForm,
+  showTaskList,
+  sidebarOpen,
+  loadTasks: () => loadTasks(),
+  watchBackgroundDone: (id) => watchBackgroundDone(id),
+  reportActiveConversation: (conv) => reportActiveConversation(conv),
+  clearTaskUnread: (id) => clearTaskUnread(id),
+  loadMcp: (id) => loadMcp(id),
+  loadSkills: (id) => loadSkills(id),
+  boundMcpIds: () => boundMcpIds.value,
+  draftSendMode: () => draftSendMode.value,
+});
 
 // ---- 拖拽排序 ----
 
@@ -2470,9 +2294,6 @@ function clearTaskUnread(convId: string) {
   void patchChatSchedule(t.id, { unreadRuns: 0 }).catch(() => undefined);
 }
 
-/** 菜单当前指向的会话（模板渲染菜单项状态用）。 */
-const ctxTarget = computed(() => conversations.value.find((c) => c.id === ctxMenu.value.targetId) || null);
-
 /** 菜单当前指向的定时任务（右键任务分组头时非空；此时菜单只渲染任务项）。 */
 const ctxTargetTask = computed(() => tasks.value.find((t) => t.id === ctxMenu.value.taskId) || null);
 
@@ -2513,160 +2334,6 @@ function ctxRemoveTask() {
   const t = ctxTargetTask.value;
   closeCtxMenu();
   if (t) void removeTask(t.id);
-}
-
-// ---- 删除（带撤销窗口）----
-
-/**
- * 删除会话：**先本地消失、服务端延迟落库**，窗口内可撤销（对齐 Gmail / Notion 的 undo 模式）。
- * 流的中断与运行时状态清理不可恢复，撤销只还原列表项本身。
- */
-async function removeConversation(id: string) {
-  closeCtxMenu();
-  const index = conversations.value.findIndex((c) => c.id === id);
-  const conv = conversations.value[index];
-  if (!conv) return;
-  const wasCurrent = currentId.value === id;
-  // 只中断这个对话自己的流，其它对话不受影响。
-  states.get(id)?.controllers?.forEach((c) => c.abort());
-  states.delete(id);
-  conversations.value = conversations.value.filter((c) => c.id !== id);
-  scheduleUndoDelete(conv, index, wasCurrent);
-  if (wasCurrent) {
-    const next = conversations.value[0];
-    if (next) selectConversation(next);
-    else await newConversation();
-  }
-}
-
-/** 服务端落库删除并立即刷新任务列表：任务 runs[] 里指向该会话的运行记录由服务端同步清理，
- *  刷一次任务，幽灵运行记录当场消失（不刷则等 20s 轮询兜底）。 */
-async function deleteConversationOnServer(id: string) {
-  try {
-    await apiDeleteConversation(id);
-    persistedCount.delete(id);
-    await loadTasks();
-  } catch {
-    /* 删除失败不打断交互；任务列表交给轮询兜底 */
-  }
-}
-
-/** 把上一笔待删会话真正落库（新删除到来 / 撤销窗口结束 / 离开页面时调用），避免删除被无限推迟。 */
-function flushPendingDelete() {
-  if (undoDeleteTimer) {
-    clearTimeout(undoDeleteTimer);
-    undoDeleteTimer = null;
-  }
-  const pending = undoDelete.value;
-  undoDelete.value = null;
-  if (pending) void deleteConversationOnServer(pending.conv.id);
-}
-
-/** 登记一笔待删会话并启动撤销倒计时。 */
-function scheduleUndoDelete(conv: ConversationDto, index: number, wasCurrent: boolean) {
-  flushPendingDelete();
-  undoDelete.value = { conv, index, wasCurrent };
-  undoDeleteTimer = setTimeout(() => {
-    undoDeleteTimer = null;
-    const pending = undoDelete.value;
-    undoDelete.value = null;
-    if (pending) void deleteConversationOnServer(pending.conv.id);
-  }, UNDO_DELETE_MS);
-}
-
-/** 撤销最近一次删除：放回原位置（服务端尚未删除，无需重建）。 */
-function undoRemoveConversation() {
-  if (undoDeleteTimer) {
-    clearTimeout(undoDeleteTimer);
-    undoDeleteTimer = null;
-  }
-  const pending = undoDelete.value;
-  undoDelete.value = null;
-  if (!pending) return;
-  const next = [...conversations.value];
-  next.splice(Math.max(0, Math.min(pending.index, next.length)), 0, pending.conv);
-  conversations.value = next;
-  resortConversations();
-  if (pending.wasCurrent) selectConversation(pending.conv);
-}
-
-// ---- 上下文菜单 ----
-
-/** 菜单锚点：键盘触发（Shift+F10 / 菜单键）时 clientX/Y 为 0，退回到触发项自身定位。 */
-function ctxAnchorPos(e: MouseEvent): { x: number; y: number } {
-  const itemRect = ctxTriggerEl?.getBoundingClientRect();
-  const keyboardTriggered = !e.clientX && !e.clientY && !!itemRect;
-  return {
-    x: keyboardTriggered && itemRect ? itemRect.left + 12 : e.clientX,
-    y: keyboardTriggered && itemRect ? itemRect.bottom : e.clientY,
-  };
-}
-
-/** 渲染后按菜单实际尺寸做视口边界翻转，并把焦点移入首个菜单项（WAI-ARIA menu pattern）。 */
-async function placeCtxMenu(anchor: { x: number; y: number }) {
-  await nextTick();
-  const el = ctxMenuEl.value;
-  if (!el) return;
-  const rect = el.getBoundingClientRect();
-  const pad = 8;
-  let { x, y } = ctxMenu.value;
-  if (x + rect.width + pad > window.innerWidth) x = Math.max(pad, anchor.x - rect.width);
-  if (y + rect.height + pad > window.innerHeight) y = Math.max(pad, anchor.y - rect.height);
-  ctxMenu.value = { ...ctxMenu.value, x, y };
-  el.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
-}
-
-/** 打开会话上下文菜单（右键触发）。 */
-async function openCtxMenu(e: MouseEvent, conv: ConversationDto) {
-  e.preventDefault();
-  e.stopPropagation();
-  ctxTriggerEl = (e.currentTarget as HTMLElement | null) || null;
-  const anchor = ctxAnchorPos(e);
-  ctxMenu.value = { open: true, x: anchor.x, y: anchor.y, targetId: conv.id, taskId: "" };
-  await placeCtxMenu(anchor);
-}
-
-/** 打开定时任务上下文菜单（右键触发）：编辑 / 暂停恢复 / 打开结果对话 / 标记已读 / 删除。 */
-async function openTaskCtxMenu(e: MouseEvent, task: ScheduleDto) {
-  e.preventDefault();
-  e.stopPropagation();
-  ctxTriggerEl = (e.currentTarget as HTMLElement | null) || null;
-  const anchor = ctxAnchorPos(e);
-  ctxMenu.value = { open: true, x: anchor.x, y: anchor.y, targetId: "", taskId: task.id };
-  await placeCtxMenu(anchor);
-}
-
-/** 关闭上下文菜单；restoreFocus 用于键盘路径（Esc）把焦点还给触发元素。 */
-function closeCtxMenu(restoreFocus = false) {
-  if (!ctxMenu.value.open) return;
-  ctxMenu.value = { ...ctxMenu.value, open: false };
-  ctxConfirm.value = "";
-  if (restoreFocus) ctxTriggerEl?.focus();
-  ctxTriggerEl = null;
-}
-
-/** 首次点击「不可撤销」菜单项：进入待确认态并把焦点带到确认项（菜单保持打开，菜单项被替换后焦点会掉到 body）。 */
-async function armCtxConfirm(kind: "clear") {
-  ctxConfirm.value = kind;
-  await nextTick();
-  ctxMenuEl.value?.querySelector<HTMLElement>("[data-ctx-confirm]")?.focus();
-}
-
-// ---- 对话 P2 留档项：归档 / 复制 / 导出 ----
-
-/**
- * 重新拉取侧栏列表（切换「显示归档」时调用）。
- * 开关写进设备偏好（刷新 / 换设备后保持），并保住撤销窗口里那笔待删对话的「已删除」状态
- * —— 服务端要等窗口结束才真删，直接覆盖会让它闪回来。
- */
-async function reloadConversations() {
-  void saveChatPreferences({ showArchived: showArchived.value }).catch(() => undefined);
-  const list = await fetchConversations(showArchived.value, AGENT_ID).catch(() => null);
-  // 拉取失败保持原列表：静默清空会让人以为对话都丢了。
-  if (!list) return;
-  const pendingDeleted = undoDelete.value?.conv.id;
-  conversations.value = pendingDeleted ? list.filter((c) => c.id !== pendingDeleted) : list;
-  resortConversations();
 }
 
 async function toggleArchive(id: string) {
@@ -5300,14 +4967,11 @@ return {
   SKELETON_DELAY_MS,
   ctxMenu,
   ctxMenuEl,
-  ctxTriggerEl,
   ctxConfirm,
   renaming,
   renameInputEl,
   RENAME_MAX,
-  UNDO_DELETE_MS,
   undoDelete,
-  undoDeleteTimer,
   confirmDialog,
   confirmDialogEl,
   confirmPrimaryBtn,

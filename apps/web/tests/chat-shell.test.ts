@@ -22,6 +22,7 @@ vi.mock("vue", async (importOriginal) => {
     ...actual,
     onMounted: () => undefined,
     onBeforeUnmount: () => undefined,
+    provide: () => undefined,
     watch: () => () => undefined,
   };
 });
@@ -222,6 +223,27 @@ describe("T2 会话壳特征测试（拆分前锁定当前真实行为）", () =
       await vi.advanceTimersByTimeAsync(5000);
       expect(core.undoDelete.value).toBeNull();
       expect(apiSpies.deleteConversation).toHaveBeenCalledWith("c1"); // 窗口结束真删
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flushPendingDelete：主动 flush 立即落库，且后续定时器不重复删除", async () => {
+    vi.useFakeTimers();
+    try {
+      const core = makeCore();
+      const c1 = conv("c1");
+      const c2 = conv("c2");
+      core.conversations.value = [c1, c2];
+      core.selectConversation(c1);
+      const before = apiSpies.deleteConversation.mock.calls.length;
+      core.removeConversation("c1");
+      core.flushPendingDelete();
+      expect(core.undoDelete.value).toBeNull();
+      expect(apiSpies.deleteConversation).toHaveBeenCalledWith("c1");
+      expect(apiSpies.deleteConversation.mock.calls.length).toBe(before + 1);
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(apiSpies.deleteConversation.mock.calls.length).toBe(before + 1);
     } finally {
       vi.useRealTimers();
     }

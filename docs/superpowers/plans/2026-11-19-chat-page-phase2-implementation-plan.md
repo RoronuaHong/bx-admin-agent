@@ -1,13 +1,13 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1 已提交，T2 因文档与代码偏差暂停待决策**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1 已提交，T2（SCC A 会话壳）已实现待提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
   - T0 `useChatPersistence` + `chat-page-types.ts` 提交 `37d8663`（`useChatPageCore.ts` 6269→5959 行）。门禁全绿：build / type-check / web test / server test / diff / 单 chunk。
   - T1 SCC C 拆三件（`useChatModelSettings` / `useChatThreadScroll` / `useChatReasoningUI`）提交 `3f6d81c`（协调层再降约 340 行）。门禁全绿。
-  - T2（SCC A）**暂停**：代码核对发现本文 §5 与设计的 SCC A 描述存在 4 处事实偏差（见 §0.3），且 SCC A 实际符号规模 100+、与 SCC B 共享 `taskDraft`/飞出层，当前 web 端仅 3 个测试、无行为安全网。已删除不达标草稿，工作区干净。继续前需先按 §0.3 修正方案并补齐测试或接受风险（待用户决策）。
+  - T2（SCC A）**已实现待提交**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -80,11 +80,11 @@ docs(web): record ChatPage phase2 design and implementation plan
 | `selectConversation → showSettingsError` | 不存在。`showSettingsError`（现由 `useChatModelSettings` 解构）在 `openConversationById`、`commitRename`、`togglePin`、`applyConversationOrder` 等处调用，`selectConversation` 函数体内 0 次 | T2 搬迁清单不列此调用边；`selectConversation` 只保留真实的跨组边（见 §5.3） |
 | `newConversation → boundMcpIds（读写）` | 不成立。`newConversation` 只清 `blank.settings.mcpEnabled = []`；读 `boundMcpIds.value` 的是 `createConvFromDraft`（合并进草稿 MCP 集） | `boundMcpIds` 作为 option 注入，边界落在 `createConvFromDraft` |
 | `submitTask` 用到 `mcpAvailable`/`skillAvailable`/`expertAgents` | 不直接用。`submitTask` 只 slice `taskDraft.mcpServers` / `taskDraft.skills`；三个可用集被**任务飞出层 computed**（`taskSkillFiltered`/`taskMcpFiltered`/`taskExpertFiltered`/`taskMcpCount`/`taskAgentLabel`）使用，函数定义在任务表单区（现约 566–611） | 飞出层 computed 与 `taskDraft` 一起留协调层，不随会话壳搬走；SCC B 仍通过 `taskDraft` 引用 |
-| `flushPendingDelete`/`scheduleUndoDelete` 用 `pageUnmounted`/`deferOnPage` | 不直接用。二者只碰 `undoDeleteTimer`/`undoDelete`/`UNDO_DELETE_MS`/`deleteConversationOnServer`；与生命周期的唯一连接是 `onBeforeUnmount` 调 `flushPendingDelete()` | 删除组搬入 composable 并暴露 `dispose()`（`flushPendingDelete` + `clearArmTimer`），协调层 `onBeforeUnmount` 转调 |
+| `flushPendingDelete`/`scheduleUndoDelete` 用 `pageUnmounted`/`deferOnPage` | 不直接用。二者只碰 `undoDeleteTimer`/`undoDelete`/`UNDO_DELETE_MS`/`deleteConversationOnServer`；与生命周期的唯一连接是 `onBeforeUnmount` 调 `flushPendingDelete()` | 删除组搬入 composable；内部 `let` 不导出，协调层 `onBeforeUnmount` 仍转调 `flushPendingDelete()`（不额外造 `dispose()`） |
 | `sortMode` 被列为「排序动作」 | `sortMode` 是 `ref<ConvSortMode>`（约 1491），不是动作；动作是 `resortConversations`/`applyConversationOrder`/`restoreRecentSort`/`reloadConversations` | 状态留根按引用注入，动作随会话壳搬 |
-| SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **T2 暂停待决策**：按 §5.4 的裁剪边界（会话壳核心先搬、任务表单与飞出层留根）执行前，须先补 web 行为测试或明确接受风险 |
+| SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **按 §5.4 裁剪边界落地**：只搬会话壳核心（30 个跨组依赖已 AST 盘点），任务表单与飞出层留根；T2 已实现待提交 |
 
-**规模/安全网提示**：`apps/web` 现仅 `tests/bubble-text.test.ts`（3 用例）。T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，若无行为测试与可运行的 Chrome 冒烟，机械搬迁可能产生「编译通过但交互静默回归」。这是 T2 暂停的核心原因，不是技术不可行。
+**规模/安全网提示**：T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，机械搬迁可能产生「编译通过但交互静默回归」。因此 T2 开工前已补 `chat-composables.test.ts` + `chat-shell.test.ts`（共 33 用例），并以 AST 依赖清单/TDZ 注入规则约束拆分；Chrome 冒烟因浏览器实例冲突仍为非阻塞后续项。
 
 ## 1. 全局约束与统一迁移手法
 
@@ -150,7 +150,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C0 | 文档状态回写 + 本计划 | `docs/**` | ✅ `6709f4a`（本次对齐为 C0 增补） |
 | C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` | ✅ `37d8663` |
 | C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
-| C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 1 个 composable + `useChatPageCore.ts` | ⏸ 暂停：待 §5.6 前置条件 |
+| C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已实现待提交：33 web 测试 + 全门禁绿 |
 | C4 | T3 SCC B | 新增 1 个 composable + `useChatPageCore.ts` | ⏳ 依赖 C3 的 `taskDraft` 边界落地 |
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
 | C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
@@ -304,23 +304,24 @@ refactor(web): split chat settings scroll and reasoning composables
 | 内容 | 原因 |
 |---|---|
 | `states`、`currentId`、`current`、`stateOf`、`persistedCount`、`seq`、`blank` | 每页实例状态，快照组/C 组/bootstrap/卸载清理共用；按引用注入，禁止解包 |
+| `AGENT_ID` | 页面实例常量（非 api 导出），以 `agentId: string` 注入 |
 | `conversations`、`showArchived`、`sortMode` | bootstrap 与列表共用；`sortMode` 是 `ref` 不是动作（§0.3），按引用注入 |
-| `ctxMenuEl` 等模板 refs | UI 抽取前由根同名暴露 |
-| `boundMcpIds` | A↔B 桥接，留根；`createConvFromDraft` 作为 `Ref` 注入读取（非 `newConversation`，§0.3） |
+| `ctxMenu`、`ctxMenuEl`、`ctxConfirm`、`undoDelete` | 模板与根层共享的响应式状态，留在协调层并按引用注入；`ctxTriggerEl` 是 composable 内部 let，不导出 |
+| `boundMcpIds` | A↔B 桥接，留根；`createConvFromDraft` 通过 getter 注入读取（非 Ref、非 `newConversation`，§0.3） |
 | `taskDraft` + 飞出层可用集 getter | 留根；T3 的 MCP/Skills 组仍直接读写同一份状态 |
 | `closeTaskForm`、`showTaskList`、`loadTasks`、`watchBackgroundDone`、`reportActiveConversation`、`clearTaskUnread` | `selectConversation`/`newConversation` 反向依赖（按回调注入） |
 | `loadMcp`、`loadSkills`、`queueScroll`、`syncOpenConversation`、`upgradeConversationDetail`、`applyConversationLocale` | 跨组回调/T1 返回值；注入箭头回调延迟求值 |
-| `messageTimes`、`bubblesFromStored`、`toStored`、`waitPendingPersists` | T0 返回值，直接注入 |
+| `messageTimes`、`bubblesFromStored`、`toStored` | T0 返回值，直接注入；未注入 `waitPendingPersists`（原函数体不用） |
 | `showSettingsError`、`localizeToken`、`getApiErrorToken`、`syncConvLocal`、`uiLocale`、`tx`、`isUiLocale` | T1 返回值 + 根文案工具，直接注入 |
-| `dispose()` 出口 | 删除组 `undoDeleteTimer` + 留根的 `clearArmTimer` 由协调层 `onBeforeUnmount` 转调；不引 `pageUnmounted`/`deferOnPage`（§0.3 已澄清删除组不直接用它们） |
+| 定时器出口 | `undoDeleteTimer`/`UNDO_DELETE_MS`/`ctxTriggerEl` 留在 composable 内部；协调层 `onBeforeUnmount` 转调 `flushPendingDelete()`，留根的 `clearArmTimer` 仍自行清理；不引 `pageUnmounted`/`deferOnPage` |
 
 **AST 精确依赖清单（2026-11-19 实测，权威）**：对 §5.3 搬入的 23 个符号做 TypeScript AST 分析，剔除局部变量后得到跨组依赖共 **30 个**（去重）：
 `AGENT_ID`、`blank`、`boundMcpIds`、`clearTaskUnread`、`closeTaskForm`、`conversations`、`ctxConfirm`、`ctxMenu`、`ctxMenuEl`、`ctxTriggerEl`、`current`、`currentId`、`draftSendMode`、`loadMcp`、`loadSkills`、`loadTasks`、`messageTimes`、`persistedCount`、`reportActiveConversation`、`showArchived`、`showTaskForm`、`showTaskList`、`sidebarOpen`、`sortMode`、`stateOf`、`states`、`tx`、`uiLocale`、`undoDelete`、`watchBackgroundDone`。
-其中 `ctxMenu`/`ctxConfirm`/`ctxMenuEl`/`ctxTriggerEl`/`undoDelete` 随会话壳一起进入 composable 内部（不是注入项）；其余为注入/留根项。
+其中 `ctxMenu`/`ctxConfirm`/`ctxMenuEl`/`undoDelete` 留在协调层并按引用注入（模板仍需共享），`ctxTriggerEl` 只存在于 composable 内部；其余为注入/留根项。
 
 **注入方式规则（TDZ 实测）**：以下 8 个依赖定义在注入调用点之后，必须按对应方式传，禁止直接按值传：
 - `function` 声明（提升安全，但统一用箭头回调更稳）：`clearTaskUnread`、`loadMcp`、`loadSkills`、`messageTimes`、`reportActiveConversation`、`watchBackgroundDone` → 注入 `(...args) => fn(...args)`。
-- `const` 响应式引用：`boundMcpIds`（computed）→ 注入 `() => boundMcpIds.value` getter 或传 ref；`draftSendMode`（ref）→ 传 ref 本身或 `() => draftSendMode.value`。
+- `const` 响应式引用：`boundMcpIds`（computed）与 `draftSendMode`（ref）本次均注入 getter：`() => boundMcpIds.value` / `() => draftSendMode.value`，避免直接持有稍后声明的 ref。
 其余 22 个定义在注入点之前，可按引用/值直接注入。
 
 ### 5.5 成环调用的处理（修订）
@@ -332,10 +333,10 @@ refactor(web): split chat settings scroll and reasoning composables
 
 ### 5.6 验证重点（开工前置条件）
 
-- **前置已完成（2026-11-19）**：会话壳行为安全网已建立——`apps/web/tests/chat-shell.test.ts`（12 个特征测试，通过 mock 实例化真实 `useChatPageCore`）锁定：会话切换/流式保护、草稿创建设置继承与落库、删除撤销 5s 窗口与定时器、右键菜单状态机；并用 api spy「调用链探针」断言 `selectConversation` 触发 loadMcp/loadSkills/syncOpenConversation/upgradeConversationDetail/reportActiveConversation 的下游 api 调用，防拆分漏注入。连同 T0/T1 测试共 31 用例全绿。**T2 拆分后必须重跑这 31 个测试做行为守恒校验**（提交 `4958a53`/`f06712e`/`b80e7db`）。
+- **前置已完成并已用于拆分后校验（2026-11-19）**：会话壳行为安全网已建立——`apps/web/tests/chat-shell.test.ts`（13 个特征测试，通过 mock 实例化真实 `useChatPageCore`）锁定：会话切换/流式保护、草稿创建设置继承与落库、删除撤销 5s 窗口与定时器、右键菜单状态机；并用 api spy「调用链探针」断言 `selectConversation` 触发 loadMcp/loadSkills/syncOpenConversation/upgradeConversationDetail/reportActiveConversation 的下游 api 调用，防拆分漏注入。连同 T0/T1 测试与注入引用契约测试共 33 用例，**T2 拆分后已重跑并全部通过**（相关提交 `4958a53`/`f06712e`/`b80e7db`/`f96fc24`）。
 - Chrome 冒烟仍需先解决 MCP 浏览器实例冲突并起 dev server（非阻塞项）。
 - 会话切换后台流不中断；`selectConversation` 不写错对话；草稿创建带入 MCP/技能/发送模式。
-- 删除撤销 5s 计时与 `dispose()` 清理；清空竞态；切对话后后台流继续写原状态。
+- 删除撤销 5s 计时与 `onBeforeUnmount → flushPendingDelete()` 清理（已补主动 flush 测试，确认立即落库且 timer 不重复删）；清空竞态；切对话后后台流继续写原状态。
 - 列表排序、置顶分组、归档/免打扰/发送模式切换（这些留根但依赖解构回的会话壳函数）。
 - 右键键盘 `Shift+F10` / 菜单键、点击外部关闭、Esc 优先级。
 - 每页实例状态不跨路由复用。

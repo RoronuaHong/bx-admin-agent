@@ -128,19 +128,19 @@
 ### [superpowers/specs/2026-11-17-chat-page-refactor-design.md](./superpowers/specs/2026-11-17-chat-page-refactor-design.md)
 - **定位**：P1-1「拆 `ChatPage.vue` 巨型文件」的设计 + 实施计划合一文档；阶段 1 为整脚本原子搬迁，阶段 2 按 SCC 拆 composables 与 UI 子组件。
 - **覆盖**：现状审计（7723 行 / 4142 行 CSS）、根边界不变量、整脚本搬迁规则、SCC 拆分清单、风险/回滚/验收、P1-2 门禁。
-- **状态**：设计已确认（2026-11-17 策略纠正）；阶段 1 已完成提交（`5e962ca`），阶段 2 执行中——T0/T1 已提交、T2（SCC A）暂停待决策，见下方 phase2 条目。
+- **状态**：设计已确认（2026-11-17 策略纠正）；阶段 1 已完成提交（`5e962ca`），阶段 2 执行中——T0/T1 已提交，T2（SCC A 会话壳）已实现待提交，见下方 phase2 条目。
 - **注意**：行号是 2026-11-17 快照，实施前用符号名定位；阶段 1 不碰模板/CSS/API，不做逐组 composable 抽取。
 
 ### [superpowers/specs/2026-11-18-chat-page-phase2-design.md](./superpowers/specs/2026-11-18-chat-page-phase2-design.md)
 - **定位**：P1-1 阶段 2 设计：按 SCC 拆 `useChatPageCore.ts`，再抽 UI 子组件并下沉 CSS。
 - **覆盖**：阶段 2 基线、SCC A/B/C、共享符号硬约束、UI/CSS 边界、分步实施顺序、风险/回滚/验收。
-- **状态**：设计已审阅；阶段 2 执行中——T0/T1 已提交，T2（SCC A）因本文 §4/§5.2 与代码偏差暂停待决策（2026-11-19 复核，详见实施计划 §0.3）。
+- **状态**：设计已审阅；阶段 2 执行中——T0/T1 已提交，T2（SCC A 会话壳）已实现待提交；原文 §4/§5.2 与代码偏差已在实施计划 §0.3 修订。
 - **注意**：行号是阶段 1 提交后的快照，部分跨组描述已按 2026-11-19 代码核对修订；实施前用符号名定位；本阶段不与 P1-2 门禁混合同一提交。
 
 ### [superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md](./superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md)
 - **定位**：P1-1 阶段 2 的可执行细化实施计划（T0–T7 + P1-2 后续独立变更）。
 - **覆盖**：开工基线检查、SCC 边界与 Options 契约、逐提交验收命令、UI 子组件 props/emits 与 ref 暴露、CSS 下沉清单、回滚策略。
-- **状态**：执行中（2026-11-19）——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（门禁全绿）；**T2 暂停**：代码核对发现 §5 有 4 处事实偏差（已在本计划 §0.3 修正），且 SCC A 100+ 符号、与 SCC B 共享 `taskDraft`/飞出层、web 端仅 3 个测试无行为安全网。继续前需先补测试或书面接受风险。
+- **状态**：执行中（2026-11-19）——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（门禁全绿）；**T2 已实现待提交**：先修正 §5 的 4 处事实偏差，再补 33 个 web 行为测试与 AST/TDZ 审计，按裁剪边界把会话壳迁入 `useChatConversationShell.ts`；拆分后 33 web 测试、全仓 type-check、build、978 server 测试全绿。
 - **注意**：设计文档中的行号/伪符号已被代码快照校正，实施时以符号名为准；本次文档对齐（C0 增补）已把 §5.3 搬迁边界改为「会话壳核心先搬、任务表单与飞出层留根」。
 
 ### [superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md](./superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md)
