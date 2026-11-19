@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3 已提交，T4（provide 契约加固）已提交 `dab6470`**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4 已提交，T5 C6（DoneToast）已实现待提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -10,6 +10,7 @@
   - T2（SCC A）**已提交 `23c9d28`**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
   - T3（SCC B）已提交 `1bbf757`：先补 `apps/web/tests/chat-tool-panels.test.ts`（9 个特征测试）锁定三飞出互斥/query 重置、MCP 逐行 busy 与回滚、fuzzy 搜索、专家 chip/starter、任务飞出层共享引用、bound MCP 合并落库；再按 37 个跨组依赖注入拆出 `useChatToolPanels.ts`（603 行），协调层降到 4918 行。AST 对比 50 个声明全部行为等价（无 DIFF），42 web 测试、全仓 type-check、build、978 server 测试全绿，仍为单个 ChatPage chunk。
   - T4（provide 契约加固）已提交 `dab6470`：新增 `apps/web/tests/bubble-context-contract.test.ts`（3 个契约测试）锁 provide/interface/ChatBubble 三者 41 键顺序与 guard 存在；`useChatPageCore.ts` 原位抽 `bubbleContext`，加 `satisfies BubbleContext` 与 DEV 数量断言，`bubble-context.ts` 无需改动。web 测试 42→45，全仓 type-check、连续 3 次 web type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
+  - T5 C6（DoneToast）已实现待提交：新增 `components/chat/DoneToast.vue`，Teleport 与 done-toast DOM 原样搬入，props `doneToast` + emits `view/close`；根层保留 `doneToast` ref、`doneToastTimer`、`openDoneToast` 与关闭清理。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -155,7 +156,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已提交 `23c9d28`：33 web 测试 + 全门禁绿 |
 | C4 | T3 SCC B | 新增 `useChatToolPanels.ts` + `useChatPageCore.ts` + `chat-tool-panels.test.ts` | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | ✅ 已提交 `dab6470`：web 45/45 + 全门禁绿，bubble-context.ts 无需改动 |
-| C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
+| C6 | T5 `DoneToast.vue` | 新增 `components/chat/DoneToast.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已实现待提交：Teleport/DOM 原样搬入，web 45/45 + 单 chunk |
+| C7–C9 | T5 其余低风险 UI | `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | ⏳ 按组件单提交 |
 | C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 

@@ -23,6 +23,7 @@ import UiLocaleSelect from "../../components/UiLocaleSelect.vue";
 import UiSelect from "../../components/UiSelect.vue";
 import ChartCard from "../../components/ChartCard.vue";
 import ChatBubble from "../../components/ChatBubble.vue";
+import DoneToast from "../../components/chat/DoneToast.vue";
 import { bubbleContextKey, type BubbleContext } from "../../components/bubble-context";
 import { renderChatMarkdown } from "../../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../../chat-stream";
@@ -4289,6 +4290,7 @@ return {
   UiLocaleSelect,
   UiSelect,
   ChatBubble,
+  DoneToast,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,

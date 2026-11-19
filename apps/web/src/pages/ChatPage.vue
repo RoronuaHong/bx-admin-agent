@@ -25,6 +25,7 @@ const {
   UiLocaleSelect,
   UiSelect,
   ChatBubble,
+  DoneToast,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,
@@ -1132,24 +1133,7 @@ const {
     </Teleport>
 
     <!-- 后台任务完成提醒：切走的对话跑完后提示一次；免打扰的对话静默。 -->
-    <Teleport to="body">
-      <div v-if="doneToast" class="done-toast" role="status" aria-live="polite">
-        <span class="done-toast__text">
-          {{ tx("「", '"', '"', '"') }}{{ doneToast.title }}{{ tx("」已完成", '" finished', '" concluído', '" पूर्ण') }}
-        </span>
-        <button type="button" class="done-toast__view" @click="openDoneToast">
-          {{ tx("查看", "View", "Ver", "देखें") }}
-        </button>
-        <button
-          type="button"
-          class="done-toast__close"
-          :aria-label="tx('关闭', 'Close', 'Fechar', 'बंद करें')"
-          @click="doneToast = null"
-        >
-          ×
-        </button>
-      </div>
-    </Teleport>
+    <DoneToast :done-toast="doneToast" @view="openDoneToast" @close="doneToast = null" />
 
     <!-- 删除确认弹窗：点删除先弹这里，确定才真正删除（撤销条仍兜底）。 -->
     <Teleport to="body">
