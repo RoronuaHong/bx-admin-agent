@@ -123,7 +123,7 @@ useChatPageCore.ts（协调层）
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已提交 `dab6470`：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；T5 低风险 UI 完成 | 每组件单提交 revert |
-| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836`（19 动作 + keydown emit、web 49/49）、C11 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根、web 53/53）、C12 `5de59a9`（39 props / 38 emits、四 ref 桥接、web 58/58）、C13 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根、web 63/63）已提交；详细方案见实施计划 §9.4；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
+| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836`（19 动作 + keydown emit、web 49/49）、C11 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根、web 53/53）、C12 `5de59a9`（39 props / 38 emits、四 ref 桥接、web 58/58）、C13 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根、web 63/63）已提交；T7 C14 `8d0a645`（侧栏品牌 CSS 下沉，web 64/64）已提交；详细方案见实施计划 §9.4 / §10.6；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
 
 ### 6.1 每步验收命令
@@ -164,7 +164,7 @@ Chrome 手工清单：
 
 可下沉块按 `chat-page.css` 注释锚点处理：
 
-> 现状（2026-11-19）：C6–C13 组件与 Teleport 内容已移出 ChatPage 模板，`chat-page.css` 由 `f702e85` 改为非 scoped；T7 下沉时给对应组件自身加 `scoped`，不要恢复父级 `scoped`。首块 C14（侧栏品牌 CSS）详细方案见实施计划 §10.6。
+> 现状（2026-11-19）：C6–C13 组件与 Teleport 内容已移出 ChatPage 模板，`chat-page.css` 由 `f702e85` 改为非 scoped；T7 下沉时给对应组件自身加 `scoped`，不要恢复父级 `scoped`。首块 C14（侧栏品牌 CSS）已由 `8d0a645` 下沉到 `ChatSidebarList.css`，详细方案见实施计划 §10.6。
 
 | 块 | 当前行号 | 归属 |
 |---|---:|---|
