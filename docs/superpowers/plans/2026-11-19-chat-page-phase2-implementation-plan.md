@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -23,6 +23,7 @@
   - C13 前置方案校准文档提交 `e9d56f9`：锁定 63 props / 40 emits、外层 Teleport 上的 `v-if`、四个 expose、三类 patch 桥与 14 步推演；实施中修正 props 计数（61→63，补 `isDtToday` / `isDtPicked`）与日期 prop 类型（`dtHours` / `dtMinutes` 为 `string[]`）。
   - T6 C13（`ChatTaskPanel`）**已提交 `f9e8ac8`**：新增 `components/chat/ChatTaskPanel.vue` 与 `tests/chat-task-panel-contract.test.ts`（5 个源码契约用例），任务表单外层 Teleport 与两个内部 `to="body"` 原样搬入；63 props / 40 emits 接回根层，`taskDraft` / `taskRepeat` / `channelDraft` 通过三类 patch emit 回写，根层三个 `Object.assign` 桥接函数与四个 DOM ref 桥接保持；Esc capture、outside/scroll/resize、body overflow、提交/通道 CRUD 全留根。根解构 657→658。实施中修正 props 计数与日期 prop 类型。web 63/63、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
   - **CSS 作用域回归修复 `f702e85`**：C6–C13 抽出的组件与 Teleport 内容不再带 ChatPage 的 scoped 属性，导致 `chat-page.css` 的 `.task-panel[data-v-…]` 等规则全部失配。去掉 `ChatPage.vue` 的 `scoped`，把 5 处 `:deep()` 转为普通后代选择器，并在 C13 契约里锁死该约束；Chrome 实测任务表单、`sidebar`、`composer` 计算样式恢复。web 63/63、全仓 type-check/build/978 server 测试全绿，单 ChatPage chunk。
+  - **UiSelect 注册修复 `1d441cd`**：`ChatTaskPanel.vue` 模板中两处 `<UiSelect>` 只依赖 ChatPage core 的返回值，子组件作用域无法解析；补 `import UiSelect from "../UiSelect.vue"` 并在契约里锁定 import 与两处使用。逐个审计 8 个抽取组件的大写标签，无其它未注册组件；Chrome 打开频率/通知弹窗后两个 `UiSelect` 正常渲染，warn/error 为零。全门禁全绿。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -1171,7 +1172,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 refactor(web): extract ChatTaskPanel from ChatPage
 ```
 
-- 实际代码提交：`f9e8ac8`；前置方案文档提交：`e9d56f9`；CSS 作用域修复提交：`f702e85`。
+- 实际代码提交：`f9e8ac8`；前置方案文档提交：`e9d56f9`；CSS 作用域修复提交：`f702e85`；UiSelect 注册修复提交：`1d441cd`。
 
 ### 9.5 T6 通用提交信息
 
