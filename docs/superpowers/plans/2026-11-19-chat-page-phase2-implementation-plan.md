@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645` 已提交，C15 前置方案见 §10.7**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -1313,6 +1313,79 @@ style(web): move sidebar brand styles into ChatSidebarList
 ```
 
 - 实际代码提交：`8d0a645`；前置方案文档提交：`9e0539e`。红测先行（CSS 文件缺失报红），实施后 web 64/64 + 全门禁全绿；Chrome 6 路径中桌面/移动/菜单/共享类均已实测通过。
+
+### 10.7 C15 `ChatSidebarList` 定时任务卡片 CSS 下沉（前置方案）
+
+#### 10.7.1 目标与边界
+
+- 目标：把**只属于侧栏定时任务分组卡片**的 CSS 追加进 `components/chat/ChatSidebarList.css`（C14 已建，继续复用同一个 scoped 文件），并从 `chat-page.css` 删除对应规则。
+- 继续遵守 C14 的约束：DOM/props/emits/ref/全局监听全不动；`ChatPage.vue` 的 `<style src="./chat-page.css">` 保持非 scoped；只搬样式。
+- **修正 §10.2 的旧映射**：旧锚点 `218–252` 现在是 `.primary-btn` 共享基类（当前 31–64），留根；旧 `653–845` 现在是 `.task-page*` 主区任务列表（当前 466–658），其 DOM 仍在 `ChatPage.vue`，**不属于 `ChatTaskPanel.vue`**，本步不搬。C15 只处理侧栏 `.task-group*` 卡片规则。
+
+#### 10.7.2 当前锚点与归属（实施前已核对）
+
+| 位置 | 规则 | C15 处理 |
+|---|---|---|
+| `chat-page.css:1634–1763` | `.task-group__head` / `__caret` / `__title` / `__main` / `__health` / `__unread` / `__next` / `__open`，以及 `.conv-item--run`、`.conv-item--run .conv-title`、`.conv-run-at` | 整段搬入 `ChatSidebarList.css`，只改归属不改声明 |
+| `chat-page.css:3804–3806` | `.task-group__caret.open { transform:rotate(90deg) }` | 随卡片状态变体一起搬入组件 CSS，放在 `__caret` 基础规则之后 |
+| `chat-page.css:1564–1632` | `.group-head*`、`.task-groups-empty`、`.task-groups` | 留根（§10.3 共享基类） |
+| `chat-page.css:1540–1562` 附近 | `.conv-dot` 及状态色 | 留根（§10.3 通用修饰类）；任务卡片仍靠全局类着色 |
+| `chat-page.css:466–658` | `.task-page*` 主区任务列表 | 留根；DOM 在 `ChatPage.vue`，不在抽取组件内 |
+| `chat-page.css:31–64` | `.primary-btn*` | 留根（共享按钮） |
+| `chat-page.css:3800–3802` | `.group-head__caret.open` | 留根（对话分组头仍用共享基类） |
+
+#### 10.7.3 组件契约
+
+- `ChatSidebarList.css` 在 C14 内容之后追加 10.7.2 中两处规则；顺序保持 `.task-group__caret` 基础规则在前、`.open` 变体在后。
+- `chat-page.css` 删除上述两处规则，不重排其它 CSS；`.group-head*` / `.task-groups*` / `.conv-dot*` / `.task-page*` / `.primary-btn*` 一个字节不动。
+- `.task-group__head` 根节点在组件模板内，scoped 属性可命中；`.conv-item--run` 与 `.conv-run-at` 也在同一模板，scoped 可命中。
+- `.conv-dot` 留根全局，因此任务卡片的健康状态点仍由根 CSS 着色，组件 CSS 不复制状态色。
+
+#### 10.7.4 红测前置
+
+- 扩展 `apps/web/tests/chat-sidebar-list-contract.test.ts` **已有的 CSS 归属用例**（改名为「侧栏 CSS 归属组件，共享骨架与状态变体留根」），不新增 case，web 保持 64/64：
+  - `ChatSidebarList.css` 含 `.task-group__head {`、`.task-group__caret {`、`.task-group__unread {`、`.conv-item--run {`、`.conv-run-at {`、`.task-group__caret.open {`。
+  - `chat-page.css` 不再含 `.task-group__head {`、`.task-group__caret {`、`.conv-item--run {`、`.conv-run-at {`、`.task-group__caret.open {`。
+  - `chat-page.css` 仍含 `.group-head {`、`.task-groups {`、`.conv-dot {`、`.task-page {`、`.primary-btn {`、`.group-head__caret.open {`。
+- 先让断言在旧样式下报红，再实施。
+
+#### 10.7.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| `.conv-dot` 状态色失配 | 任务卡片运行/跳过/暂停状态点失去颜色与脉冲 | 高 | 共享类留根；Chrome 实测各状态点 |
+| `.group-head` 被误搬 | 对话分组头裸奔（历史回归点） | 高 | 契约断言根仍含 `.group-head {` 与 `.group-head__caret.open {` |
+| `.task-page*` 被误搬 | 主区任务列表样式错位（DOM 不在组件内） | 中 | 明确留根；契约断言 `.task-page {` 仍在根 |
+| 展开箭头不旋转 | `.task-group__caret.open` 失配 | 中 | 变体随块搬入且顺序在基础规则后；展开任务分组实测 |
+| scoped 优先级变化 | 与 hover/focus 变体叠加后视觉漂移 | 低 | 同文件内保持声明顺序；截图对比任务卡片行 |
+| CSS 拆出多 chunk | 破坏单 chunk | 低 | 构建后确认 `ChatPage-*` 各一份 |
+
+#### 10.7.6 验证与模拟推演
+
+门禁命令同 §10.6.6，判定 web 仍 **64/64**（case 数不变）、全仓 type-check/build/server 978/978 全绿、单 chunk。
+
+Chrome 模拟路径：
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 打开 `/chat` | 定时任务分组头与对话分组头视觉一致；任务行 padding/gap/字体与下沉前一致 |
+| 2 | 展开一个任务分组 | `.task-group__caret` 旋转 90°；子会话行缩进 26px，时间列等宽 |
+| 3 | 有未读角标的任务 | 角标蓝色圆点、数字居中；点击打开最新一期且清零 |
+| 4 | 不同状态任务 | `.conv-dot` 的 running 脉冲 / paused / skipped / idle 颜色仍由根 CSS 命中 |
+| 5 | 右键任务行 | 右键菜单仍由根 `ContextMenuHost` 接管，位置与操作项不变 |
+| 6 | 390px 视口 | 抽屉内任务卡片不溢出，箭头/角标/时间对齐 |
+
+#### 10.7.7 回滚与提交
+
+- 未提交：从 `ChatSidebarList.css` 删除追加段，恢复 `chat-page.css` 两处规则与测试断言。
+- 已提交：先 `git revert <C15 code sha>`，再单独 revert 回写 hash 的文档提交；不与 C14/C16 合并。
+- 提交信息：
+
+```text
+style(web): move task group card styles into ChatSidebarList
+```
+
+- 状态：前置方案已写完，待用户确认后进入红测与实施。
 
 ## 11. 全阶段收口门禁
 
