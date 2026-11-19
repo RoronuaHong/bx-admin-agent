@@ -149,4 +149,35 @@ describe("ChatSidebarList 契约", () => {
     expect(page).toContain('class="sidebar-backdrop"');
     expect(page).not.toContain('<aside class="sidebar"');
   });
+
+  it("侧栏品牌 CSS 归属组件，共享骨架与顶栏样式留根", () => {
+    const css = read("../src/pages/chat-page.css");
+    const componentCss = read("../src/components/chat/ChatSidebarList.css");
+
+    expect(sidebar).toContain('<style scoped src="./ChatSidebarList.css"></style>');
+    for (const selector of [
+      ".sidebar__inner {",
+      ".brand {",
+      ".brand__agent {",
+      ".agent-menu__item {",
+      ".coming-soon {",
+      ".brand__agent-caret.open {",
+    ]) {
+      expect(componentCss).toContain(selector);
+    }
+    for (const selector of [
+      ".sidebar__inner {",
+      ".brand__agent {",
+      ".agent-menu__item {",
+      ".coming-soon {",
+      ".brand__agent-caret.open {",
+    ]) {
+      expect(css).not.toContain(selector);
+    }
+    for (const selector of [".sidebar {", ".sidebar-backdrop {", ".top .brand {", ".primary-btn {"]) {
+      expect(css).toContain(selector);
+    }
+    expect(page).toContain('<style src="./chat-page.css"></style>');
+    expect(page).not.toContain('<style scoped src="./chat-page.css">');
+  });
 });

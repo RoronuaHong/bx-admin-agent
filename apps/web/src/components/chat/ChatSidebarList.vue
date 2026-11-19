@@ -452,3 +452,5 @@ function onRenameInput(event: Event) {
     </div>
   </aside>
 </template>
+
+<style scoped src="./ChatSidebarList.css"></style>
