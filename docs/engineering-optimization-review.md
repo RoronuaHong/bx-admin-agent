@@ -16,7 +16,7 @@
 2. **文档口径与代码脱节**，多处现行文档仍引用已删除的脚本、已不存在的模块和过期数字；
 3. **横切能力半成品化**（鉴权、错误上报、接口契约、i18n），需按部署形态决定补到什么程度。
 
-2026-11-19 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计剩 1 条 dev-only `picomatch` 无修复版例外；P1-1 阶段 1 已提交（`5e962ca`），阶段 2 执行中——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（协调层 6269→约 5600 行，门禁全绿），T2（SCC A 会话壳）已提交 `23c9d28`（协调层降到 5345 行），T3（SCC B 工具面板）已提交 `1bbf757`（协调层降到 4918 行；50 声明 AST 无 DIFF，web 42/42），T4（provide 契约加固）已实现待提交（`bubbleContext` 加 `satisfies BubbleContext` + DEV 41 键断言，`bubble-context-contract.test.ts` 锁 41 键顺序；web 45/45 + 全仓 type-check/build/978 server 测试全绿，详见实施计划 §7）；其余优化项仍未实施。本文保留原登记与排序。
+2026-11-19 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计剩 1 条 dev-only `picomatch` 无修复版例外；P1-1 阶段 1 已提交（`5e962ca`），阶段 2 执行中——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（协调层 6269→约 5600 行，门禁全绿），T2（SCC A 会话壳）已提交 `23c9d28`（协调层降到 5345 行），T3（SCC B 工具面板）已提交 `1bbf757`（协调层降到 4918 行；50 声明 AST 无 DIFF，web 42/42），T4（provide 契约加固）已提交 `dab6470`（`bubbleContext` 加 `satisfies BubbleContext` + DEV 41 键断言，`bubble-context-contract.test.ts` 锁 41 键顺序；web 45/45 + 全仓 type-check/build/978 server 测试全绿，详见实施计划 §7）；其余优化项仍未实施。本文保留原登记与排序。
 
 ---
 
@@ -87,7 +87,7 @@
 
 ## 4. 优化空间清单
 
-> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作；截至 2026-11-19，P0-1～P0-5 已实施；P3-4 生产依赖 0 漏洞、全量审计 1 条 dev-only 例外；P1-1 阶段 1 已提交、阶段 2 的 T0/T1 已提交、T2（会话壳）已提交 `23c9d28`，T3（工具面板）已提交 `1bbf757`，T4（provide 契约加固）已实现待提交（详见 `docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md` §7），其余条目尚未实施。
+> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作；截至 2026-11-19，P0-1～P0-5 已实施；P3-4 生产依赖 0 漏洞、全量审计 1 条 dev-only 例外；P1-1 阶段 1 已提交、阶段 2 的 T0/T1 已提交、T2（会话壳）已提交 `23c9d28`，T3（工具面板）已提交 `1bbf757`，T4（provide 契约加固）已提交 `dab6470`（详见 `docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md` §7），其余条目尚未实施。
 
 ### P0 低投入、高收益（建议 1～2 天）
 
