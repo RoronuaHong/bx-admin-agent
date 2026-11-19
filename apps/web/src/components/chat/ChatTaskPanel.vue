@@ -4,6 +4,7 @@ import PromptBox from "../PromptBox.vue";
 import ToolsSearch from "../ToolsSearch.vue";
 import SkillAddForm from "../SkillAddForm.vue";
 import McpAddForm from "../McpAddForm.vue";
+import UiSelect from "../UiSelect.vue";
 import type {
   ConversationDto,
   McpServerStatus,

@@ -38,6 +38,8 @@ describe("ChatTaskPanel 契约", () => {
     expect(panel).toContain('ref="dtPanel"');
     expect(panel).toContain('ref="taskToolsRoot"');
     expect(panel).toContain('ref="taskToolsPanel"');
+    expect(panel).toContain('import UiSelect from "../UiSelect.vue";');
+    expect((panel.match(/<UiSelect\b/g) || []).length).toBe(2);
     expect(panel).not.toContain("resRoot");
     expect(panel).not.toContain("showTaskForm");
   });
