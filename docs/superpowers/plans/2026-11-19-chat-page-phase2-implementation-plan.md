@@ -341,7 +341,27 @@ refactor(web): split chat settings scroll and reasoning composables
 - 每页实例状态不跨路由复用。
 - 通用验证命令 + Chrome 清单。
 
-### 5.7 提交信息
+### 5.7 执行细节检查（2026-11-19 AST 审计，避免拆分出错）
+
+对协调层做第二次 AST 审计，查清三类隐藏引用，结论如下：
+
+**① 顶层初始化式 TDZ（无崩溃点）**：搬入符号在协调层顶层代码中只被两处生命周期回调引用——`onMounted`(4803) 用 `resortConversations`/`selectConversation`/`newConversation`，`onBeforeUnmount`(4915) 用 `flushPendingDelete`。二者都是 setup 之后才执行的延迟回调，且注册行在解构点（约 1980）之后，安全。无顶层 `const x = <搬入符号>` 的同步引用。
+
+**② 高频被调枢纽（拆分后必须靠同名解构暴露，不能漏）**：以下搬入符号被大量**留根函数**调用，靠协调层 `const {...} = useChatConversationShell()` 同名解构解析：
+- `closeCtxMenu` ← 21 处（所有 toggle*、ctx* 任务动作、rename、键盘 dismiss/escape/keydown 等）——**最高频枢纽，务必保留同名**。
+- `selectConversation` ← `closeOtherConversations`/`onConvKeydown`/`openConversationById`/`openDoneToast`/`toggleArchive`。
+- `resortConversations` ← `duplicateCurrent`/`openConversationById`/`submitTask`/`toggleArchive`/`togglePin`。
+- `applyConversationOrder` ← `moveConversation`/`onConvDrop`（拖拽/键盘排序，留根）。
+- 其余单点：`createConvFromDraft`←`send`；`flushPendingDelete`←`closeOtherConversations`；`removeConversation`←`askDeleteConversation`；`refreshConversationsQuiet`←`startTasksPoll`。
+这些调用点全部不改（函数体内运行时调用，解构在 setup 阶段已完成）。
+
+**③ 内部 let 的返回表暴露**：`ctxTriggerEl`、`undoDeleteTimer`、`UNDO_DELETE_MS` 被 return 表（5303/5310/5308）暴露给模板。模板 `ChatPage.vue` 只在 script 解构区列出它们、template 段未实际使用；但它们随会话壳搬入后会从协调层消失。处理：要么在 composable 返回同名（推荐，保持 653 表不变），要么确认无模板使用后从返回表移除——本次采用前者，行为零变化。
+
+**④ provide / watch**：`provide(bubbleContextKey, {...})`(4981) 只注入 reasoning 与留根函数，不含会话壳符号；`watch` 顶层调用未引用搬入符号。均无影响。
+
+**执行顺序建议**：搬入组内部按依赖顺序声明（`convRank`/`CONV_ORDER_STEP` → `resortConversations` → `refreshConversationsQuiet`/`reloadConversations` → 会话动作 → 右键 → 删除撤销），与 T1 同构；options 契约用显式 interface + `satisfies` 校验，注入方式按 §5.4 的 TDZ 规则。
+
+### 5.8 提交信息
 
 ```text
 refactor(web): split chat conversation shell composable
