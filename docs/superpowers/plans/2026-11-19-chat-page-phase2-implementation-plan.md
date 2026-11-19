@@ -1,14 +1,14 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2 已提交，T3（SCC B 工具面板）已实现待提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2 已提交，T3（SCC B 工具面板）已提交 `1bbf757`**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
   - T0 `useChatPersistence` + `chat-page-types.ts` 提交 `37d8663`（`useChatPageCore.ts` 6269→5959 行）。门禁全绿：build / type-check / web test / server test / diff / 单 chunk。
   - T1 SCC C 拆三件（`useChatModelSettings` / `useChatThreadScroll` / `useChatReasoningUI`）提交 `3f6d81c`（协调层再降约 340 行）。门禁全绿。
   - T2（SCC A）**已提交 `23c9d28`**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
-  - T3（SCC B）已实现待提交：先补 `apps/web/tests/chat-tool-panels.test.ts`（9 个特征测试）锁定三飞出互斥/query 重置、MCP 逐行 busy 与回滚、fuzzy 搜索、专家 chip/starter、任务飞出层共享引用、bound MCP 合并落库；再按 37 个跨组依赖注入拆出 `useChatToolPanels.ts`（603 行），协调层降到 4918 行。AST 对比 50 个声明全部行为等价（无 DIFF），42 web 测试、全仓 type-check、build、978 server 测试全绿，仍为单个 ChatPage chunk。
+  - T3（SCC B）已提交 `1bbf757`：先补 `apps/web/tests/chat-tool-panels.test.ts`（9 个特征测试）锁定三飞出互斥/query 重置、MCP 逐行 busy 与回滚、fuzzy 搜索、专家 chip/starter、任务飞出层共享引用、bound MCP 合并落库；再按 37 个跨组依赖注入拆出 `useChatToolPanels.ts`（603 行），协调层降到 4918 行。AST 对比 50 个声明全部行为等价（无 DIFF），42 web 测试、全仓 type-check、build、978 server 测试全绿，仍为单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -152,7 +152,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` | ✅ `37d8663` |
 | C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
 | C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已提交 `23c9d28`：33 web 测试 + 全门禁绿 |
-| C4 | T3 SCC B | 新增 `useChatToolPanels.ts` + `useChatPageCore.ts` + `chat-tool-panels.test.ts` | ✅ 已实现待提交：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
+| C4 | T3 SCC B | 新增 `useChatToolPanels.ts` + `useChatPageCore.ts` + `chat-tool-panels.test.ts` | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
 | C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
 | C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
