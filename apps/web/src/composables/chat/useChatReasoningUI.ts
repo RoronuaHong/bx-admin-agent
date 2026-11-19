@@ -109,7 +109,8 @@ export function useChatReasoningUI(options: ChatReasoningUIOptions) {
 
   // ---- 思考耗时（对齐 ChatGPT「Thought for Ns」的口径）----
   // 各思考段分别计时后累加：工具执行 / 结果回灌的间隙不算思考；
-  // 计时起点放模块级 Map（气泡 id → 该段首个思考增量时刻），不进响应式状态。
+  // 计时起点放每页实例级 Map（气泡 id → 该段首个思考增量时刻），不进响应式状态；
+  // 不可提成模块单例——多开对话时不同页面的计时起点会互相覆盖。
   const thinkStarts = new Map<number, number>();
 
   function thinkPhaseStart(id: number) {

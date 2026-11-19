@@ -361,7 +361,25 @@ refactor(web): split chat settings scroll and reasoning composables
 
 **执行顺序建议**：搬入组内部按依赖顺序声明（`convRank`/`CONV_ORDER_STEP` → `resortConversations` → `refreshConversationsQuiet`/`reloadConversations` → 会话动作 → 右键 → 删除撤销），与 T1 同构；options 契约用显式 interface + `satisfies` 校验，注入方式按 §5.4 的 TDZ 规则。
 
-### 5.8 提交信息
+### 5.8 最佳实践对齐审查（2026-11-19）
+
+基准：`docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md` §9–§10 的前端工程约定。对 T0/T1 已落地代码逐条审查：
+
+| 约定 | 结论 |
+|---|---|
+| ref/computed 以对象返回，不 `toValue()` 成快照 | ✅ 对齐（`toValue`/`unref` 命中 0；`let` 原始值快照属计划允许） |
+| 每页实例状态不做模块单例 | ✅ 对齐（composable 状态均在函数体内；模块级仅 `AGENTS`/theme/`uiLocale`） |
+| options 注入传引用/回调，不传 `.value` 快照 | ✅ 对齐（8 个定义在后符号用箭头/getter，符合 §5.4 TDZ 规则） |
+| 无第三方真源分叉 | ✅ 对齐（`followBottom` 走 setter、`settingsErrorTimer` 走 dispose、`nextSeq` 共享根计数器） |
+| composable 无动态 import，保持单 chunk | ✅ 对齐 |
+| 卸载清理 composable 自清原始定时器 | ✅ 对齐（4 具名定时器 + 删除组 flushPendingDelete） |
+| 测试覆盖响应式契约 | 🟡→✅ 已修：新增「注入引用连通」测试——composable 写 `settingsError`/`syncConvLocal` 同步到外部 ref，防传 `.value` 快照回归 |
+| provide 41 键 `satisfies` + 长度断言 | 🟡 未落地：41 键完整无丢键，但无门禁；属 C5（T4）范围，拆 SCC 时不夹带 |
+| 注释与实例级约定一致 | 🟡→✅ 已修：`useChatReasoningUI.ts` 的 `thinkStarts` 注释原误写「模块级 Map」，实为实例级，已更正 |
+
+**结论**：T0/T1 实现与阶段1 前端工程最佳实践对齐；审查发现的 2 处可修偏离（注释、测试引用契约）已修复并提交，web 测试 32 例全绿。provide 断断言留 T4 专项处理。T2 方案沿用同一套约定（显式 interface + `satisfies`、引用注入、实例级状态、单 chunk）。
+
+### 5.9 提交信息
 
 ```text
 refactor(web): split chat conversation shell composable

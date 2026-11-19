@@ -138,7 +138,10 @@ describe("useChatPersistence（T0 安全网）", () => {
   });
 });
 
-function makeModelSettings(state: ConvState = makeState()) {
+function makeModelSettings(
+  state: ConvState = makeState(),
+  injected: Partial<Parameters<typeof useChatModelSettings>[0]> = {},
+) {
   return useChatModelSettings({
     current: ref(state) as never,
     currentId: ref("c1"),
@@ -149,10 +152,25 @@ function makeModelSettings(state: ConvState = makeState()) {
     tx: noopTx,
     nextSeq: (() => { let n = 0; return () => ++n; })(),
     queueScroll: () => undefined,
+    ...injected,
   });
 }
 
 describe("useChatModelSettings（T1 安全网）", () => {
+  it("注入引用连通：composable 写 settingsError 同步到外部 ref（未传 .value 快照）", () => {
+    const externalError = ref("");
+    const externalConversations = ref([] as Array<{ id: string; model?: string }>);
+    const api = makeModelSettings(makeState(), {
+      settingsError: externalError,
+      conversations: externalConversations as never,
+    });
+    api.showSettingsError("boom");
+    expect(externalError.value).toBe("boom");
+    externalConversations.value.push({ id: "c1", model: "old" });
+    api.syncConvLocal("c1", { model: "m9" } as never);
+    expect(externalConversations.value[0]!.model).toBe("m9"); // 外部 ref 看到 composable 的写入
+  });
+
   it("resolveModel：auto 落到首个可用模型，跳过失败过的", () => {
     const api = makeModelSettings();
     api.models.value = [
