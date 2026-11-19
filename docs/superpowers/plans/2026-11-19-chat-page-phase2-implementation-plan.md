@@ -1031,12 +1031,142 @@ refactor(web): extract MessageComposer from ChatPage
 
 ### 9.4 C13 `ChatTaskPanel.vue`
 
-- 源块：约 1230–1965 的 `Teleport v-if="showTaskForm" to="#task-panel-host"` 及其内容。
-- props：`taskDraft`、`editingTaskId`、`notifyChannels`、`freqDialogOpen`、`notifyDialogOpen`、`cronUnparsed` 等；emits：`submit`、`cancel`、`run`、`toggle` 等。
-- `#task-panel-host` 约 2073 行，必须先于条件 Teleport 渲染；`v-if` 继续挂在 `Teleport` 上，不能移到内部 div。
-- `dtRoot` / `dtPanel`（来自 `useOnceAtPicker()`）、`taskToolsRoot` / `taskToolsPanel`、`resRoot` 用 `defineExpose` 暴露。
-- 内部多层 Teleport、Esc capture、`onOutsideTaskTools` 留根；body overflow 由根控制。
-- 验证：新建/编辑任务、Cron 解析、通知通道、日期时间选择器、工具选择面板、Esc 退出、打开结果会话。
+#### 9.4.1 目标与边界
+
+- 目标：只把 `ChatPage.vue:806–1541` 的 `<Teleport v-if="showTaskForm" to="#task-panel-host">` 整段搬进新组件，**宿主、Esc capture、全局 outside/scroll/resize 监听、body overflow、提交/保存/通道 CRUD 函数全部留根**。
+- 源块定位以符号为准：从 `<!-- v-if 挂在 Teleport 上 -->` 注释开始，到任务表单外层 `</Teleport>` 结束；后面的 `<main>`、`#task-panel-host`（`1649`）、任务列表和 MessageComposer 都留根。
+- `v-if` 继续挂在组件内部 `Teleport` 上：根层无条件渲染 `<ChatTaskPanel :visible="showTaskForm" ... />`，子组件模板写 `<Teleport v-if="visible" to="#task-panel-host">`。不能把 `v-if` 挪到内部 `.task-panel` div，也不能在根层用 `v-if` 包组件后让子组件无条件 Teleport——两者都会改变宿主解析/挂载时机。
+- 内部两层 `<Teleport to="body">`（日期时间面板、任务工具飞出）**随 DOM 一起搬进组件**，不抽出、不改成 Teleport 目标复用。
+- 修正旧计划：`resRoot` 属于主区顶栏 `v-if="false"` 的遗留资源面板（`1558`），不在任务表单块，C13 不暴露；`onInlineSubmitKeydown` 留根，C12 已确认它不属于输入区，C13 也不搬。
+
+#### 9.4.2 当前依赖基线（实施前已核对）
+
+| 位置 | 现状 | C13 处理 |
+|---|---|---|
+| Teleport 宿主 | `#task-panel-host` 在 `<main>` 内，由 ChatPage 渲染；源 Teleport 在 `<main>` 之前 | 宿主留根；组件内部 Teleport 继续 `to="#task-panel-host"`，`v-if` 由 `visible` prop 控制 |
+| 根状态机 | `showTaskForm`、`editingTaskId`、`taskDraft`、`editingTask`、`taskError`、`notify*`、`freq*`、`cronUnparsed`、`dt*`、`taskTools*` 全在 core | 全部 props + emits；可写字段通过 3 个 patch 事件回根 |
+| 根 patch 桥 | 为避免在子组件内直接改 props，ChatPage 脚本新增三个本地函数：`patchTaskDraft`、`patchTaskRepeat`、`patchChannelDraft`，内部 `Object.assign` 到 reactive 对象 | 只做浅合并，不改业务逻辑；根解构只加 `ChatTaskPanel`，不加这三个函数 |
+| DOM refs | `dtRoot` / `dtPanel`（`useOnceAtPicker()`）、`taskToolsRoot` / `taskToolsPanel` 被 core 的定位和 outside 判断读取 | 子组件 `defineExpose` 四个 ref，根层函数 ref 桥接 |
+| 全局监听 | `onTaskFormEsc`（capture）、`onOutsideTaskTools`、`syncTaskToolsPos`、`syncDtPos` 在 core 注册/移除 | 不搬；组件内无 `addEventListener` / `removeEventListener` |
+| 内部 Teleport | 日期面板 `v-if="dtOpen"`、任务工具面板 `v-if="taskToolsOpen"`，都 `to="body"` | 原样留在组件模板；`ref` 通过 expose 回根 |
+| 工具/通道 helper | `iconStyle`、`iconChar`、`mcpDescText`、`taskConvText`、`notifyKindLabel`、`agentText` 等 | 后两者作为函数 prop，`agentText` 子组件直接 import |
+| 根解构 | C12 后 657 个同名解构 | 新增 `ChatTaskPanel`，657 → 658 |
+
+#### 9.4.3 组件契约
+
+**新增 `apps/web/src/components/chat/ChatTaskPanel.vue`**
+
+Props（61 个）：
+
+| 分组 | props |
+|---|---|
+| 可见性/编辑态 | `visible`、`editingTaskId`、`editingTask`、`tasksBusy`、`taskDraft`、`taskError` |
+| 通知 | `notifySummary`、`notifyDialogOpen`、`notifyChannels`、`channelDraft`、`notifyBusy`、`notifyNote` |
+| 频率 | `freqDialogOpen`、`taskFreqSummary`、`cronUnparsed`、`editingCron`、`repeatPreview`、`taskRepeat`、`repeatFreqs`、`minutelyIntervals`、`weekdays` |
+| 一次性日期 | `dtOpen`、`dtPos`、`dtDisplay`、`dtShortcuts`、`dtMonthLabel`、`dtWeekdays`、`dtCells`、`dtHour`、`dtMinute`、`dtHours`、`dtMinutes`、`dtHourPart`、`dtMinutePart` |
+| 任务工具 | `taskSearchAutofocus`、`taskToolsOpen`、`taskToolsPos`、`taskSkillOpen`、`taskSkillQuery`、`taskSkillFiltered`、`skillAvailable`、`taskSkillAddOpen`、`taskMcpOpen`、`taskMcpQuery`、`taskMcpFiltered`、`mcpAvailable`、`taskMcpCount`、`mcpReconnecting`、`mcpBusy`、`taskMcpAddOpen`、`taskExpertOpen`、`taskExpertQuery`、`taskExpertFiltered`、`taskAgentLabel` |
+| helper/常量 | `agentId`、`uiLocale`、`iconStyle`、`iconChar`、`mcpDescText`、`taskConvText`、`notifyKindLabel` |
+
+`dtShortcuts` 是 `DT_SHORTCUTS`，元素自带 `fn()` 闭包；`dtHourPart` / `dtMinutePart` 来自 `useOnceAtPicker()`，模板继续调用其 `onInput` / `onChange`。`taskDraft` / `taskRepeat` / `channelDraft` 是 reactive 对象，子组件**只读**，写操作通过 patch emit 回根。
+
+Emits（40 个）：
+
+| 类别 | emits |
+|---|---|
+| 表单 | `close-task-form`、`submit-task`、`apply-task-purpose(purpose)`、`open-task-conversation(schedule)`、`patch-task-draft(patch)` |
+| 通知弹窗 | `update:notifyDialogOpen`、`save-channel`、`toggle-channel(ch)`、`test-channel(id)`、`remove-channel(id)`、`patch-channel-draft(patch)` |
+| 频率弹窗 | `update:freqDialogOpen`、`patch-task-repeat(patch)`、`toggle-weekday(code)` |
+| 日期选择 | `open-dt-picker`、`update:dtOpen`、`shift-month(n)`、`pick-day(day)`、`dt-hour-input`、`dt-hour-change`、`dt-minute-input`、`dt-minute-change` |
+| 任务技能 | `update:taskSkillQuery`、`toggle-task-skill(dir)`、`task-skill-created(dir)`、`toggle-task-skill-add`、`cancel-task-skill-add`、`clear-task-skills` |
+| 任务 MCP | `update:taskMcpQuery`、`toggle-task-server(id)`、`reconnect-mcp(id)`、`remove-custom-mcp(id)`、`task-mcp-created(id)`、`toggle-task-mcp-add`、`cancel-task-mcp-add`、`clear-task-mcp` |
+| 任务助手/工具 | `update:taskExpertQuery`、`toggle-task-tools`、`open-task-flyout(kind)`、`hover-task-flyout(kind)` |
+
+模板不变量：
+
+- 外层 `<Teleport v-if="visible" to="#task-panel-host">`；`<div class="task-panel" role="region">` 是 Teleport 内单根。内部 `Teleport to="body"` 两处保持 `v-if` 在内部 div 上。
+- `PromptBox v-model="taskDraft.prompt"` 改为 `:model-value` + `emit('patch-task-draft', { prompt: value })`；其余 `taskDraft.*` 直写也改为 patch emit。
+- `v-model` 契约：`notifyDialogOpen`、`freqDialogOpen`、`dtOpen` 用对应 `update:*`；三个查询词用 `update:taskSkillQuery` / `update:taskMcpQuery` / `update:taskExpertQuery`。
+- `ref="dtRoot"` / `ref="dtPanel"` / `ref="taskToolsRoot"` / `ref="taskToolsPanel"` 原样保留；`defineExpose({ dtRoot, dtPanel, taskToolsRoot, taskToolsPanel })`。
+- `@click.stop`（任务面板内没有，但 MCP 重连/移除有）与 `@mouseenter` hover 预开保持；不新增 `.stop`。
+- `tx()` 由 `getUiLocale()` 本地生成；`agentText` 直接 import；`iconStyle` / `iconChar` / `mcpDescText` / `taskConvText` / `notifyKindLabel` 只作 prop 调用。
+- 组件内无 `addEventListener` / `removeEventListener` / `AbortController` / `setTimeout` / `document.body.style`。
+
+#### 9.4.4 执行顺序
+
+1. 开工前核对 `HEAD`、工作区干净、根解构 658 的前置 657，确认 `ChatTaskPanel.vue` 不存在。
+2. **先加红测** `apps/web/tests/chat-task-panel-contract.test.ts`（5 个源码契约用例，web 58 → 63）：
+   - 结构锁：外层 `Teleport v-if="visible" to="#task-panel-host"`、两个内部 `Teleport to="body"`、`.task-panel`、`.modal-mask`、`.tools-flyout`、四个 ref。
+   - props 锁：61 个 prop 名字逐项一致；不含 `resRoot` / `showTaskForm`。
+   - emits 锁：40 个 emit 名字逐项一致；含三类 patch 与七处 `update:*`。
+   - expose/副作用锁：`defineExpose({ dtRoot, dtPanel, taskToolsRoot, taskToolsPanel })`；组件内无全局监听/计时器/body overflow 写入；core 仍保留 `onTaskFormEsc` capture 与 `onOutsideTaskTools` / `syncTaskToolsPos` / `syncDtPos` 监听。
+   - 接线锁：core 返回且 ChatPage 解构 `ChatTaskPanel`，根解构计数 658；根层仍有 `#task-panel-host`，footer 原始 Teleport 块不在 ChatPage；三个 patch 函数在 ChatPage 脚本中存在。
+3. 新增组件，只搬 DOM 与文案；40 个动作全部换成 `emit(...)`，helper 只作 prop 调用。
+4. `useChatPageCore.ts` import/return 加 `ChatTaskPanel`；`ChatPage.vue` 解构加同名项，脚本加三个 patch 函数，替换 806–1541 原始 Teleport 块。
+5. 跑 9.4.6 门禁；红测转绿后看 diff，确认 CSS、全局监听、提交/通道函数体、body overflow watch 零改动。
+6. 代码单独提交；再用独立文档提交回写 commit hash。
+
+#### 9.4.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| Teleport 宿主解析时机回归 | 首次打开任务表单时报 target not found，或表单挂到错误节点 | 高 | 根层无条件渲染组件、`v-if` 留在外层 Teleport；契约测试锁字符串；模拟首次打开与反复开关 |
+| 四个 DOM ref 桥接失效 | 日期面板定位错、任务工具飞出定位错、outside 点击判断失效 | 高 | 一个函数 ref 桥接四个 expose；模拟日期面板/工具面板定位与点外部关闭 |
+| patch emit 漏接 | 名称/频率/提示词/通道草稿改不动，保存的是旧值 | 高 | 3 个 patch emit 显式锁定；契约测试锁名字；模拟改名称→保存→重开编辑 |
+| Esc capture 被误搬或重复 | 表单开着时 Esc 关错面板，或关不掉表单 | 中 | `onTaskFormEsc` 留 core；契约测试锁 capture 注册；模拟频率/通知/日期面板开着时按 Esc |
+| 内部 Teleport 被误改成 Teleport 目标复用 | 弹窗层级/裁剪回归 | 中 | 两个内部 `to="body"` 原样保留；模拟工具飞出不被弹窗 overflow 裁剪 |
+| Cron/频率互斥漂移 | `cronUnparsed` 时选项仍可改，保存覆盖高级表达式 | 中 | `cronUnparsed` 由根 computed 回灌；按钮 `:disabled` 原样；模拟外部 cron 任务编辑 |
+| 日期选择器闭包丢失 | `DT_SHORTCUTS` / `dtHourPart` / `dtMinutePart` 的 root 闭包失效 | 中 | 作为 prop 传入，不复制算法；模拟快捷日期、上/下月、时分输入 |
+| 工具飞出 hover/click 顺序回归 | 悬停预开后点击反而关闭；focus 不对 | 中 | `hover-task-flyout` 与 `open-task-flyout` 分开；`taskSearchAutofocus` 由根决定 |
+| 通道 CRUD 载荷错 | 保存/测试/删除打到错误通道 | 中 | id/ch 对象作为 emit 载荷回根；模拟多通道列表 |
+| 根解构漏加 | 模板未定义变量或返回表漂移 | 中 | 与 core return 同提交；契约测试锁 658 |
+
+#### 9.4.6 验证与模拟推演
+
+门禁命令：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm --filter @bx/web test
+pnpm --filter @bx/web type-check
+pnpm type-check
+pnpm build
+pnpm test
+git diff --check
+Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
+```
+
+判定：web 63/63、全仓 type-check、build、server 978/978 全绿；`ChatPage-*.js` / `ChatPage-*.css` 仍各一份；Chrome 全清单因已知实例冲突为非阻塞项，可做时按下列路径冒烟。
+
+模拟推演（按顺序验证，任一步状态/焦点不符即停止）：
+
+| # | 操作 | 期望状态链路 |
+|---|---|---|
+| 1 | 首次打开任务表单 | `showTaskForm=true` → 组件内部 Teleport 在 `#task-panel-host` 已存在后挂载 → `.task-panel` 出现；无 target not found |
+| 2 | 关闭/重开 | 取消、×、Esc 都由 root `closeTaskForm` / `onTaskFormEsc` 收起；再次打开仍定位正确，四个 ref 重新桥接 |
+| 3 | 新建 vs 编辑 | `editingTaskId` 控制标题与按钮文案；编辑时显示结果对话行，`taskConvText` 正确，「打开」回 root `openTaskConversation` |
+| 4 | 名称/用途/落点/通知策略 | 每次输入或点击 emit patch → root `Object.assign(taskDraft, patch)` → 表单回显与 `:aria-checked` 同步 |
+| 5 | 保存/创建 | root `submitTask` 用最新 `taskDraft` / `taskRepeat` / `channelDraft`；`tasksBusy` 时按钮禁用；错误行 `taskError` 回灌 |
+| 6 | 通知通道弹窗 | 管理按钮开弹窗；保存/启停/测试/删除都带正确草稿或 ch/id；摘要 `notifySummary` 与列表随 root 状态更新 |
+| 7 | 频率弹窗 | 周期/一次性切换、分钟/小时/日/周/月、时刻、星期多选全部 patch `taskRepeat`；`repeatPreview` 与 `taskFreqSummary` 回灌 |
+| 8 | 外部 cron | `cronUnparsed` 时两类按钮 disabled、只显示 `editingCron`；保存不回传频率 |
+| 9 | 一次性日期面板 | 点日期字段 → `open-dt-picker` 定位；快捷项/翻月/选日/时分输入/确定全走 root；`dtOpen` 关闭后 Teleport 内 div 卸载 |
+| 10 | 任务内容 PromptBox | `taskDraft.prompt` patch 回写；`:hint` 与用途相关 placeholder 正确；Shift+Enter 换行 |
+| 11 | 任务工具菜单 | 点 + → `toggle-task-tools`；定位用 `taskToolsRoot` + `taskToolsPos`；点外部/滚动/缩放仍由 root 监听关闭或重定位 |
+| 12 | 技能/MCP/助手飞出 | 三类 `open-task-flyout` / `hover-task-flyout` 与查询词 v-model 回根；勾选写 `taskDraft.skills/mcpServers/agentId` 的 patch；badge 同步 |
+| 13 | Esc 优先级 | 通知/频率/日期/工具面板任一开启时按 Esc，只关最内层或按 root `onTaskFormEsc` 口径处理；表单退出只走 root |
+| 14 | 保存后回列表 | 成功提交后表单关闭、任务列表刷新；再打开编辑回显同一任务；无残留 Teleport 节点或全局监听 |
+
+#### 9.4.7 回滚
+
+- 未提交：删除新增组件/测试，恢复 `ChatPage.vue` 与 `useChatPageCore.ts`，移除三个 patch 函数。
+- 已提交：先 `git revert <C13 code sha>`，再单独 revert 回写 hash 的文档提交。
+- 若仅 Teleport/ref 桥接失败，优先恢复 `v-if` 在外层 Teleport 与四个 expose 桥接；不把全局监听、body overflow 或提交逻辑搬进子组件。
+
+#### 9.4.8 提交信息
+
+```text
+refactor(web): extract ChatTaskPanel from ChatPage
+```
 
 ### 9.5 T6 通用提交信息
 
