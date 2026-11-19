@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/C6/C7/C8 已提交，T5 C9（ChatThread）已提交 `e87c4b0`**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10（ContextMenuHost）已提交 `58bd836`**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -14,7 +14,8 @@
   - T5 C7（ArtifactPreviewModal）已提交 `aa556d0`：新增 `components/chat/ArtifactPreviewModal.vue`，props `previewHtml/previewLoading/downloadUrl` + emits `close`；下载 URL 由根层基于 `workspaceDownloadUrl(currentId, previewHtml.path)` 计算后传入，iframe `sandbox="allow-scripts"` 不变。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - T5 C8（ConfirmDialog）已提交 `dbb4569`：新增 `components/chat/ConfirmDialog.vue`，Teleport/DOM 与 Esc、Tab handler 原样搬入；props `confirmDialog`，emits `confirm/cancel/trap`。子组件 `defineExpose` 暴露 `confirmDialogEl`/`confirmPrimaryBtn`，根层用函数 ref 桥接回协调层，`trapConfirmFocus` 与 body overflow watch 仍留根。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - T5 C9（ChatThread）已提交 `e87c4b0`：新增 `components/chat/ChatThread.vue`，整段 `.thread` 容器搬入；根层通过 props 传 visible/bubbleCount/outline 等状态，通过 emits 接回 scroll/showEarlier/askStarter/jump/active/v-model:open；`threadEl` 由子组件 `defineExpose`，根层函数 ref 桥接。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
-  - T6 C10（`ContextMenuHost`）**方案已补齐、尚未实施**：见 §9.1；已修正旧计划中 `locations`、Esc capture、Shift+F10 三处与当前代码不符的描述，并锁定 19 个动作 emit + 1 个 keydown 转发、5 个 props、`ctxMenuEl` expose/ref 桥接、红测先行和 11 步交互推演。
+  - C10 前置方案校准文档提交 `0064d33`：修正旧计划中 `locations`、Esc capture、Shift+F10 三处与当前代码不符的描述，并锁定 19 个动作 emit + 1 个 keydown 转发、5 个 props、`ctxMenuEl` expose/ref 桥接、红测先行和 11 步交互推演（见 §9.1）。
+  - T6 C10（`ContextMenuHost`）**已提交 `58bd836`**：新增 `components/chat/ContextMenuHost.vue` 与 `tests/context-menu-host-contract.test.ts`（4 个源码契约用例），Teleport/DOM/`role`/`data-ctx-confirm` 原样搬入；19 个动作 emit + keydown 转发接回根层，全局监听与焦点归还继续留根，`ctxMenuEl` 用 expose/函数 ref 桥接；根解构 654→655。web 49/49、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -97,7 +98,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 
 ### 1.1 不变量（每步都要守住）
 
-1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`、653 个顶层同名解构。
+1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655。
 2. `useChatPageCore.ts` 继续是同步 setup 协调层；`provide`、`onMounted`、`onBeforeUnmount`、`watch`、全局键鼠监听的同步调用链不得被 `await` 打断。
 3. `RouterView :key="$route.path"` 重挂载语义不变（`App.vue`）。
 4. `provide(bubbleContextKey, {...})` 的 41 键逐项保留、顺序不变；在 T4 做类型与数量加固。
@@ -164,7 +165,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C7 | T5 `ArtifactPreviewModal.vue` | 新增 `components/chat/ArtifactPreviewModal.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `aa556d0`：sandbox 不变，downloadUrl 根层计算，web 45/45 + 单 chunk |
 | C8 | T5 `ConfirmDialog.vue` | 新增 `components/chat/ConfirmDialog.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `dbb4569`：expose ref 桥接，focus trap/overflow 留根，web 45/45 + 单 chunk |
 | C9 | T5 `ChatThread.vue` | 新增 `components/chat/ChatThread.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `e87c4b0`：threadEl bridge + outline v-model，web 45/45 + 单 chunk |
-| C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
+| C10 | T6 `ContextMenuHost.vue` | 新增 `components/chat/ContextMenuHost.vue` + `tests/context-menu-host-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `58bd836`：19 动作 + keydown emit，expose/ref 桥接，web 49/49 + 全门禁绿 |
+| C11–C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
@@ -717,6 +719,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 ```text
 refactor(web): extract ContextMenuHost from ChatPage
 ```
+
+- 实际代码提交：`58bd836`；前置方案文档提交：`0064d33`。
 
 ### 9.2 C11 `ChatSidebarList.vue`
 
