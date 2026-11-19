@@ -1288,5 +1288,6 @@ function patchChannelDraft(patch: Record<string, unknown>) {
   </div>
 </template>
 
-<style scoped src="./chat-page.css"></style>
+<!-- 抽取到独立组件后，模板元素不再带 ChatPage 的 scoped 属性；保持全局样式才能让子组件与 Teleport 内容继续命中这些规则。 -->
+<style src="./chat-page.css"></style>
 

@@ -195,5 +195,7 @@ describe("ChatTaskPanel 契约", () => {
     expect(page).toContain("taskToolsRoot = el?.taskToolsRoot ?? null");
     expect(page).toContain("taskToolsPanel = el?.taskToolsPanel ?? null");
     expect(page).not.toContain('<Teleport v-if="showTaskForm" to="#task-panel-host">');
+    expect(page).toContain('<style src="./chat-page.css"></style>');
+    expect(page).not.toContain('<style scoped src="./chat-page.css">');
   });
 });

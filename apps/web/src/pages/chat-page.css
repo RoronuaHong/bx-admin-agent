@@ -365,7 +365,7 @@
 }
 
 /* 通道类型下拉（UiSelect）：字号与同排输入框一致（高度已是 38px 同档）。 */
-.notify-form .notify-kind :deep(.uisel__trigger) {
+.notify-form .notify-kind .uisel__trigger {
   font-size: 12px;
 }
 
@@ -871,7 +871,7 @@
 }
 
 /* PromptBox 在卡片里撑满。 */
-.task-composer :deep(.prompt-box) {
+.task-composer .prompt-box {
   width: 100%;
 }
 
@@ -3768,7 +3768,7 @@
 
 /* 输入框外壳（描边/圆角/底纹/聚焦态）在 components/PromptBox.vue，这里只留对话区自己的东西。
    注意：组件要占满这一行，得在外层给宽度（组件内是 width:100%，靠父级 .composer-row 撑开）。 */
-.composer-row > :deep(.prompt-box) {
+.composer-row > .prompt-box {
   flex: 1;
   min-width: 0;
 }
@@ -3916,8 +3916,7 @@
     height: 40px;
   }
 /* 输入框字号提到 16px：iOS 聚焦时若 <16px 会触发整页放大（移动端最佳实践）。 */
-  .field__input,
-  :deep(.field__input) {
+  .field__input {
     font-size: 16px;
   }
 }
@@ -4127,7 +4126,7 @@
   .top .brand {
     display: none;
   }
-.top :deep(.msel__trigger) {
+.top .msel__trigger {
     min-width: 92px;
     max-width: 132px;
   }
