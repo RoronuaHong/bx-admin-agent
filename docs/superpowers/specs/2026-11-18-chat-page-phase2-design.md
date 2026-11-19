@@ -28,7 +28,7 @@
 
 阶段 1 已验证的不变量，阶段 2 不得破坏：
 
-- `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656，C12 后 657。
+- `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656，C12 后 657，C13 后 658。
 - `App.vue:31` 的 `<RouterView :key="$route.path" />` 继续负责重挂载。
 - `provide(bubbleContextKey, {…})` 41 键继续在同步 setup 调用链里组装。
 - `pageUnmounted` / `unmountTimers` / `deferOnPage()` 与 4 个具名定时器继续统一清理。
@@ -52,7 +52,7 @@ useChatPageCore.ts（协调层）
   ├─ SCC B: MCP + 技能 + 工具 + 专家
   ├─ 记忆 / 工作区 / 面板状态 / 文案
   ├─ provide(bubbleContextKey, 41 键)
-  └─ return 657 个模板可见绑定（T2 移除 3 个未使用快照，C6–C9 新增四个 UI 组件，C10 新增 ContextMenuHost，C11 新增 ChatSidebarList，C12 新增 MessageComposer，随抽离逐步改为组合返回）
+  └─ return 658 个模板可见绑定（T2 移除 3 个未使用快照，C6–C9 新增四个 UI 组件，C10 新增 ContextMenuHost，C11 新增 ChatSidebarList，C12 新增 MessageComposer，C13 新增 ChatTaskPanel，随抽离逐步改为组合返回）
 ```
 
 原则：**先拆逻辑，后拆模板**。逻辑未稳定前不改模板/CSS；UI 子组件抽取时，每个组件单独提交、单独截图和手测。
@@ -123,7 +123,7 @@ useChatPageCore.ts（协调层）
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已提交 `dab6470`：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；T5 低风险 UI 完成 | 每组件单提交 revert |
-| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836`（19 动作 + keydown emit、web 49/49）、C11 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根、web 53/53）、C12 `5de59a9`（39 props / 38 emits、四 ref 桥接、web 58/58）已提交；C13 详细方案见实施计划 §9.4；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
+| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836`（19 动作 + keydown emit、web 49/49）、C11 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根、web 53/53）、C12 `5de59a9`（39 props / 38 emits、四 ref 桥接、web 58/58）、C13 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根、web 63/63）已提交；详细方案见实施计划 §9.4；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
 
 ### 6.1 每步验收命令

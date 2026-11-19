@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -20,6 +20,8 @@
   - T6 C11（`ChatSidebarList`）**已提交 `383630e`**：新增 `components/chat/ChatSidebarList.vue` 与 `tests/chat-sidebar-list-contract.test.ts`（4 个源码契约用例），aside DOM 原样搬入；39 props / 29 emits 接回根层，三处 `v-model` 契约与 `setRenameInput` 函数 prop 保持，双 DOM ref 桥接；遮罩、全局监听、localStorage 折叠、拖拽/右键/删除/清空状态全留根。根解构 655→656；C10 契约的根解构断言改下界 655。web 53/53、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
   - C12 前置方案校准文档提交 `89b8c17`：修正源块行号、Teleport/工具飞出、`onInlineSubmitKeydown` 与 `inputEl` 四处旧描述，锁定 39 props / 38 emits、四 DOM ref 桥接和 14 步推演。
   - T6 C12（`MessageComposer`）**已提交 `5de59a9`**：新增 `components/chat/MessageComposer.vue` 与 `tests/message-composer-contract.test.ts`（5 个源码契约用例），footer DOM / PromptBox 三 slot / 工具飞出原样搬入；39 props / 38 emits 接回根层，`current.input` 走 `modelValue`，三处查询 v-model 与四个 DOM ref 桥接保持；全局监听、发送/停止、队列/附件/resize 全留根。根解构 656→657；C11 契约的根解构断言改下界 656。实施中修正 `move-queue-item` 方向类型、`skill-created(dir)` / `mcp-created(id)` 载荷与 SFC 顶层 `</template>`。web 58/58、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
+  - C13 前置方案校准文档提交 `e9d56f9`：锁定 63 props / 40 emits、外层 Teleport 上的 `v-if`、四个 expose、三类 patch 桥与 14 步推演；实施中修正 props 计数（61→63，补 `isDtToday` / `isDtPicked`）与日期 prop 类型（`dtHours` / `dtMinutes` 为 `string[]`）。
+  - T6 C13（`ChatTaskPanel`）**已提交 `f9e8ac8`**：新增 `components/chat/ChatTaskPanel.vue` 与 `tests/chat-task-panel-contract.test.ts`（5 个源码契约用例），任务表单外层 Teleport 与两个内部 `to="body"` 原样搬入；63 props / 40 emits 接回根层，`taskDraft` / `taskRepeat` / `channelDraft` 通过三类 patch emit 回写，根层三个 `Object.assign` 桥接函数与四个 DOM ref 桥接保持；Esc capture、outside/scroll/resize、body overflow、提交/通道 CRUD 全留根。根解构 657→658。实施中修正 props 计数与日期 prop 类型。web 63/63、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -102,7 +104,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 
 ### 1.1 不变量（每步都要守住）
 
-1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656，C12 后 657。
+1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656，C12 后 657，C13 后 658。
 2. `useChatPageCore.ts` 继续是同步 setup 协调层；`provide`、`onMounted`、`onBeforeUnmount`、`watch`、全局键鼠监听的同步调用链不得被 `await` 打断。
 3. `RouterView :key="$route.path"` 重挂载语义不变（`App.vue`）。
 4. `provide(bubbleContextKey, {...})` 的 41 键逐项保留、顺序不变；在 T4 做类型与数量加固。
@@ -172,7 +174,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C10 | T6 `ContextMenuHost.vue` | 新增 `components/chat/ContextMenuHost.vue` + `tests/context-menu-host-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `58bd836`：19 动作 + keydown emit，expose/ref 桥接，web 49/49 + 全门禁绿 |
 | C11 | T6 `ChatSidebarList.vue` | 新增 `components/chat/ChatSidebarList.vue` + `tests/chat-sidebar-list-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `383630e`：39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿 |
 | C12 | T6 `MessageComposer.vue` | 新增 `components/chat/MessageComposer.vue` + `tests/message-composer-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `5de59a9`：39 props / 38 emits、四 ref 桥接、全局监听留根，web 58/58 + 全门禁绿 |
-| C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
+| C13 | T6 其余高风险 UI | 同上 | ✅ 已提交 `f9e8ac8`：63 props / 40 emits、四 ref 桥接、三类 patch 留根，web 63/63 + 全门禁绿 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
@@ -1056,14 +1058,14 @@ refactor(web): extract MessageComposer from ChatPage
 
 **新增 `apps/web/src/components/chat/ChatTaskPanel.vue`**
 
-Props（61 个）：
+Props（63 个）：
 
 | 分组 | props |
 |---|---|
 | 可见性/编辑态 | `visible`、`editingTaskId`、`editingTask`、`tasksBusy`、`taskDraft`、`taskError` |
 | 通知 | `notifySummary`、`notifyDialogOpen`、`notifyChannels`、`channelDraft`、`notifyBusy`、`notifyNote` |
 | 频率 | `freqDialogOpen`、`taskFreqSummary`、`cronUnparsed`、`editingCron`、`repeatPreview`、`taskRepeat`、`repeatFreqs`、`minutelyIntervals`、`weekdays` |
-| 一次性日期 | `dtOpen`、`dtPos`、`dtDisplay`、`dtShortcuts`、`dtMonthLabel`、`dtWeekdays`、`dtCells`、`dtHour`、`dtMinute`、`dtHours`、`dtMinutes`、`dtHourPart`、`dtMinutePart` |
+| 一次性日期 | `dtOpen`、`dtPos`、`dtDisplay`、`dtShortcuts`、`dtMonthLabel`、`dtWeekdays`、`dtCells`、`isDtToday`、`isDtPicked`、`dtHour`、`dtMinute`、`dtHours`、`dtMinutes`、`dtHourPart`、`dtMinutePart` |
 | 任务工具 | `taskSearchAutofocus`、`taskToolsOpen`、`taskToolsPos`、`taskSkillOpen`、`taskSkillQuery`、`taskSkillFiltered`、`skillAvailable`、`taskSkillAddOpen`、`taskMcpOpen`、`taskMcpQuery`、`taskMcpFiltered`、`mcpAvailable`、`taskMcpCount`、`mcpReconnecting`、`mcpBusy`、`taskMcpAddOpen`、`taskExpertOpen`、`taskExpertQuery`、`taskExpertFiltered`、`taskAgentLabel` |
 | helper/常量 | `agentId`、`uiLocale`、`iconStyle`、`iconChar`、`mcpDescText`、`taskConvText`、`notifyKindLabel` |
 
@@ -1096,7 +1098,7 @@ Emits（40 个）：
 1. 开工前核对 `HEAD`、工作区干净、根解构 658 的前置 657，确认 `ChatTaskPanel.vue` 不存在。
 2. **先加红测** `apps/web/tests/chat-task-panel-contract.test.ts`（5 个源码契约用例，web 58 → 63）：
    - 结构锁：外层 `Teleport v-if="visible" to="#task-panel-host"`、两个内部 `Teleport to="body"`、`.task-panel`、`.modal-mask`、`.tools-flyout`、四个 ref。
-   - props 锁：61 个 prop 名字逐项一致；不含 `resRoot` / `showTaskForm`。
+   - props 锁：63 个 prop 名字逐项一致；不含 `resRoot` / `showTaskForm`。
    - emits 锁：40 个 emit 名字逐项一致；含三类 patch 与七处 `update:*`。
    - expose/副作用锁：`defineExpose({ dtRoot, dtPanel, taskToolsRoot, taskToolsPanel })`；组件内无全局监听/计时器/body overflow 写入；core 仍保留 `onTaskFormEsc` capture 与 `onOutsideTaskTools` / `syncTaskToolsPos` / `syncDtPos` 监听。
    - 接线锁：core 返回且 ChatPage 解构 `ChatTaskPanel`，根解构计数 658；根层仍有 `#task-panel-host`，footer 原始 Teleport 块不在 ChatPage；三个 patch 函数在 ChatPage 脚本中存在。
@@ -1167,6 +1169,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 ```text
 refactor(web): extract ChatTaskPanel from ChatPage
 ```
+
+- 实际代码提交：`f9e8ac8`；前置方案文档提交：`e9d56f9`。
 
 ### 9.5 T6 通用提交信息
 
