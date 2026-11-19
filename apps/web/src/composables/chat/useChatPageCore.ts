@@ -23,7 +23,7 @@ import UiLocaleSelect from "../../components/UiLocaleSelect.vue";
 import UiSelect from "../../components/UiSelect.vue";
 import ChartCard from "../../components/ChartCard.vue";
 import ChatBubble from "../../components/ChatBubble.vue";
-import { bubbleContextKey } from "../../components/bubble-context";
+import { bubbleContextKey, type BubbleContext } from "../../components/bubble-context";
 import { renderChatMarkdown } from "../../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../../chat-stream";
 // 气泡相关共享类型以 chat-types.ts 为**单一来源**（原先在页面内各有一份重复定义，抽 ChatBubble 后需共享）。
@@ -4218,7 +4218,7 @@ onBeforeUnmount(() => {
 
 // 把气泡模板依赖的全部函数 / 响应式集合 / ref 一次性透传给 ChatBubble 子组件，
 // 避免逐个 prop 钻透。气泡因此成为独立渲染单元：流式只重渲染正在输出的那一条，其余纹丝不动。
-provide(bubbleContextKey, {
+const bubbleContext = {
   openReasoning,
   openSteps,
   clarifyDraft,
@@ -4260,7 +4260,13 @@ provide(bubbleContextKey, {
   bubbleBody,
   isStoppedBubble,
   workspaceDownloadUrl,
-});
+} satisfies BubbleContext;
+
+if (import.meta.env.DEV && Object.keys(bubbleContext).length !== 41) {
+  throw new Error(`bubbleContext key count changed: ${Object.keys(bubbleContext).length}`);
+}
+
+provide(bubbleContextKey, bubbleContext);
 
 
 return {

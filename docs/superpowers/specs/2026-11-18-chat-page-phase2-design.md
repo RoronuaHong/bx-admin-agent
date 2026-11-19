@@ -1,7 +1,7 @@
 # ChatPage.vue 阶段 2 拆分设计（P1-1 第二阶段）
 
 - 日期：2026-11-18
-- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1/T2 已提交，T3（SCC B 工具面板）已提交 `1bbf757`（2026-11-19，详见实施计划 §6）
+- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1/T2/T3 已提交，T4（provide 契约加固）已实现待提交（2026-11-19，详见实施计划 §7）
 - 对应阶段 1：`docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`、`docs/superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md`
 - 细化实施计划：`docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md`
 - 基线提交：`5e962ca refactor(web): extract ChatPage core and harden frontend`
@@ -121,7 +121,7 @@ useChatPageCore.ts（协调层）
 | 1 | 拆 SCC C：`modelSettings → threadScroll → reasoningUI` | 新增 3 个 composables；Run 保留协调层 | 发送/停止焦点、跟底、思考计时、模型 auto 黑名单 | ✅ `3f6d81c`，回滚：单提交 revert |
 | 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable，共享状态留根后拆（裁剪边界见实施计划 §5.3） | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | ✅ `23c9d28`：33 web 测试与全门禁绿；回滚：单提交 revert |
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
-| 4 | provide 契约加固 | `useChatPageCore.ts`、`bubble-context.ts`、新增 `tests/bubble-context-contract.test.ts` | 41 键齐全且顺序锁定，气泡复制/编辑/工具确认/澄清可用；流程与风险见实施计划 §7 | 单提交 revert |
+| 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已实现待提交：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | Teleport 顺序、focus trap、`threadEl` expose、`v-model:outlineOpen` | 每组件单提交 revert |
 | 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | `@click.stop`、Esc capture、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
