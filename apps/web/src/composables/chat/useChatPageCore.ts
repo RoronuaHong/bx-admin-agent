@@ -132,6 +132,9 @@ import {
 } from "../../api";
 import { parseAlertMarker, type ArtifactSpec, type ChatEvent, type TodoItem } from "@bx/shared";
 import { useChatPersistence } from "./useChatPersistence";
+import { useChatModelSettings } from "./useChatModelSettings";
+import { useChatThreadScroll } from "./useChatThreadScroll";
+import { useChatReasoningUI } from "./useChatReasoningUI";
 import type { Bubble, ConvSettings, ConvState } from "./chat-page-types";
 import type { Router as ChatRouter } from "vue-router";
 
@@ -1219,10 +1222,6 @@ function blankState(): ConvState {
 }
 
 const threadEl = ref<HTMLElement | null>(null);
-const models = ref<ModelInfo[]>([]);
-/** 模型列表是否已取回（含失败）：只有取回后才能判定对话存的 modelId 是否还有效，
- *  避免列表还在 loading 时把有效 id 误判成失效。 */
-const modelsLoaded = ref(false);
 const conversations = ref<ConversationDto[]>([]);
 
 /**
@@ -1860,147 +1859,85 @@ watch(
   },
 );
 
-/** 当前对话的模型选择；空 = 自动模式（运行时挑可用模型），UI 兜底展示「自动」。
- *  对话里存的 id 已被挪出模型配置（失效 id）时同样回落「自动」：
- *  失效 id 在任何列表里都查不到，UI 会退化成没有标签的「选择模型」空壳——
- *  而它本身不承载任何信息，回落自动既有标签、发送时也会解析到可用模型。 */
-const modelId = computed({
-  get: () => {
-    const stored = current.value.settings.modelId;
-    if (!stored) return MODEL_AUTO_ID;
-    if (modelsLoaded.value && !models.value.some((model) => model.id === stored)) return MODEL_AUTO_ID;
-    return stored;
-  },
-  set: (value: string) => {
-    void saveModelChoice(value);
-  },
+let seq = 0;
+
+// ---- SCC C：模型设置 / 滚动跟底 / 推理 UI（从本文件机械拆分，行为零变化）----
+// 初始化顺序固定：modelSettings → threadScroll → reasoningUI。
+// 跨组/跨层依赖只通过 options 注入引用或回调；薄代理仅在事件/异步回调里被触发，
+// setup 同步阶段不得调用——搬迁后用搜索确认没有提前调用。
+const {
+  models,
+  modelsLoaded,
+  modelId,
+  lastGoodModelId,
+  failedModelIds,
+  resolveModel,
+  settingsErrorTimer,
+  showSettingsError,
+  disposeSettingsErrorTimer,
+  syncConvLocal,
+  applyConversationLocale,
+  modelChoiceLabel,
+  modelSwitchHint,
+  saveModelChoice,
+  onLocaleChange,
+  resolvedModelId,
+  modelSupportsImages,
+  imagesUnsupported,
+} = useChatModelSettings({
+  current,
+  currentId,
+  settingsError,
+  conversations,
+  deviceLocale,
+  uiLocale,
+  tx,
+  nextSeq: () => ++seq,
+  queueScroll: (force) => queueScroll(force),
 });
 
-/**
- * 「自动」模式解析：把 auto（或空/失效值）落到具体模型。
- * 优先用「上次成功用过的模型」，否则按列表顺序挑第一个「近期未失败」的——
- * 实现「哪个能用用哪个」：失败过的模型会被跳过，直到全部失败才重置黑名单重新探测。
- */
-const lastGoodModelId = ref<string>("");
-const failedModelIds = ref<Set<string>>(new Set());
-function resolveModel(value: string): string {
-  const ids = models.value.map((m) => m.id);
-  const usable = (id: string | undefined) => !!id && ids.includes(id) && !failedModelIds.value.has(id);
-  if (value && value !== MODEL_AUTO_ID && usable(value)) return value;
-  if (usable(lastGoodModelId.value)) return lastGoodModelId.value;
-  const next = ids.find((id) => !failedModelIds.value.has(id));
-  if (next) return next;
-  // 全部失败过：清空黑名单，给一次重新探测的机会。
-  failedModelIds.value.clear();
-  return ids[0] ?? "";
-}
+const {
+  scrollQueued,
+  scrollForce,
+  queueScrollIfCurrent,
+  followBottom,
+  nearBottom,
+  atBottomNow,
+  onThreadScroll,
+  queueScroll,
+  setFollowBottom,
+} = useChatThreadScroll({
+  currentId,
+  threadEl,
+  pinnedOutlineId,
+  isOutlineJumpActive: () => outlineJumpActive,
+  getOutlineIgnoreScrollUntil: () => outlineIgnoreScrollUntil,
+  releaseOutlinePin,
+});
 
-let settingsErrorTimer: ReturnType<typeof setTimeout> | null = null;
-/** 乐观更新失败后的提示；4s 自动消失，不打扰。 */
-function showSettingsError(message: string) {
-  settingsError.value = message;
-  if (settingsErrorTimer) clearTimeout(settingsErrorTimer);
-  settingsErrorTimer = setTimeout(() => {
-    settingsError.value = "";
-  }, 4000);
-}
-
-/** 把改动同步回本地列表条目，避免下次切回时被过期 DTO 覆盖（服务端仍是唯一真相）。 */
-function syncConvLocal(convId: string, patch: Partial<ConversationDto>) {
-  conversations.value = conversations.value.map((c) => (c.id === convId ? { ...c, ...patch } : c));
-}
-
-/** 应用某对话的语言（未显式设置时用设备默认）。tx() / localizeToken 都读这个内存态。 */
-function applyConversationLocale(locale: string | undefined) {
-  setUiLocale(isUiLocale(locale) ? locale : deviceLocale.value);
-}
-
-/**
- * 模型切换：乐观更新 → PATCH 落库 → 失败回滚（对齐 TanStack 的 onMutate/onError/onSettled 三段式）。
- * 尚未创建对话时（首屏）只改内存，创建对话后随设置一起落库。
- */
-function modelChoiceLabel(id: string): string {
-  if (!id || id === MODEL_AUTO_ID) return tx("自动", "Auto", "Automático", "स्वतः");
-  return models.value.find((model) => model.id === id)?.label || id;
-}
-
-const modelSwitchHint = ref("");
-
-async function saveModelChoice(value: string) {
-  const convId = currentId.value;
-  const state = current.value;
-  const prev = state.settings.modelId;
-  const prevShown = prev || MODEL_AUTO_ID;
-  if (prevShown === value) return;
-  state.settings.modelId = value;
-  const fromLabel = modelChoiceLabel(prevShown);
-  const toLabel = modelChoiceLabel(value);
-  const hadThread = state.bubbles.some((bubble) => bubble.role !== "notice");
-  const noticeId = hadThread && fromLabel !== toLabel ? ++seq : 0;
-  if (noticeId) {
-    state.bubbles.push({
-      id: noticeId,
-      role: "notice",
-      at: Date.now(),
-      text: tx(
-        `模型已从 ${fromLabel} 更改为 ${toLabel}`,
-        `Model changed from ${fromLabel} to ${toLabel}`,
-        `Modelo alterado de ${fromLabel} para ${toLabel}`,
-        `मॉडल ${fromLabel} से ${toLabel} में बदला गया`,
-      ),
-    });
-    modelSwitchHint.value = tx(
-      "在对话中途更换模型可能降低效果，上下文的分词方式也会变化。",
-      "Switching models mid-chat can hurt quality, and the context is tokenized differently.",
-      "Trocar o modelo no meio da conversa pode piorar a resposta, e o contexto é tokenizado de outro jeito.",
-      "बीच बातचीत में मॉडल बदलने से गुणवत्ता घट सकती है, और संदर्भ अलग तरह से टोकनाइज़ होता है।",
-    );
-    void nextTick(() => queueScroll(true));
-  }
-  if (!convId) return;
-  try {
-    await patchConversation(convId, { model: value });
-    syncConvLocal(convId, { model: value });
-  } catch (err) {
-    state.settings.modelId = prev;
-    if (noticeId) state.bubbles = state.bubbles.filter((bubble) => bubble.id !== noticeId);
-    modelSwitchHint.value = "";
-    showSettingsError(
-      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("模型保存失败", "Failed to save model", "Falha ao salvar o modelo", "मॉडल सहेजने में विफल")),
-    );
-  }
-}
-
-/** 语言切换：组件已先改内存（立即生效），这里负责落当前对话 + 失败回滚。 */
-async function onLocaleChange(locale: UiLocale) {
-  const convId = currentId.value;
-  const state = current.value;
-  const prev = state.settings.locale;
-  state.settings.locale = locale;
-  if (!convId) return;
-  try {
-    await patchConversation(convId, { locale });
-    syncConvLocal(convId, { locale });
-  } catch (err) {
-    state.settings.locale = prev;
-    applyConversationLocale(prev);
-    showSettingsError(
-      localizeToken(uiLocale.value, getApiErrorToken(err), (err as Error)?.message || tx("语言保存失败", "Failed to save language", "Falha ao salvar o idioma", "भाषा सहेजने में विफल")),
-    );
-  }
-}
-
-/** 实际生效的模型（auto 已解析为具体模型），用于图片能力等预判。 */
-const resolvedModelId = computed(() => resolveModel(modelId.value));
-
-/** 当前模型是否支持直读图片（由服务端 /models 的 vision 字段给出）。 */
-const modelSupportsImages = computed(
-  () => models.value.find((m) => m.id === resolvedModelId.value)?.vision === "direct",
-);
-/** 已选图片但当前模型不支持：明确提示，避免"传了但模型看不到"的静默失效。 */
-const imagesUnsupported = computed(
-  () => current.value.pendingImages.length > 0 && !modelSupportsImages.value,
-);
+const {
+  openReasoning,
+  reasoningCollapsedByUser,
+  toggleReasoning,
+  openReasoningPanel,
+  closeReasoningPanel,
+  openSteps,
+  stepKey,
+  toggleStep,
+  stepSummary,
+  hasRunningStep,
+  hasThinking,
+  INTENT_RE,
+  intentOf,
+  thinkingDisplay,
+  thinkStarts,
+  thinkPhaseStart,
+  thinkPhaseEnd,
+  thinkLabel,
+  thinkStickQueued,
+  stickThinkingToBottom,
+  reasoningTitle,
+} = useChatReasoningUI({ threadEl, uiLocale, tx });
 
 // ---- MCP 连接面板（选择即可：服务器由部署侧提供，面板只做启用/停用）----
 const mcpOpen = ref(false);
@@ -2013,222 +1950,9 @@ const mcpBusy = ref(false);
 const mcpReconnecting = reactive(new Set<string>());
 const mcpError = ref("");
 
-let seq = 0;
-let scrollQueued = false;
-/** 同一帧里后到的「强制回底」不能被已经排上的普通跟随丢掉。 */
-let scrollForce = false;
-
 const canSend = computed(
   () => Boolean(current.value.input.trim() || current.value.pendingImages.length || current.value.pendingDocs.length),
 );
-
-/** 气泡更新时是否要跟随滚动：只有"正在看的这个对话"才滚，后台流不抢滚动条。 */
-function queueScrollIfCurrent(convId: string) {
-  if (currentId.value === convId) queueScroll();
-}
-
-/**
- * 跟底开关（stick-to-bottom）：流式增量只在「当前已贴近底部」（48px 容差）时才自动跟随。
- * 没有它，用户在生成中上滚阅读历史会被下一片增量拉回底部——「回到顶部」也就形同虚设。
- * 判定挂在滚动容器的 scroll 事件上（程序滚动同样触发），滚回底部附近即自动恢复跟随。
- */
-let followBottom = true;
-function nearBottom(el: HTMLElement, gap = 48): boolean {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < gap;
-}
-/**
- * 「此刻用户是否贴着底部」——**必须在内容变高之前量**。
- * 新回复/新增量会把容器撑高，之后再量到的已经不是用户原来的位置：自己长出来的那截高度
- * 会被当成「用户已上滚」，新回复于是不滚动（页面停在原地，压根看不见刚来的回复）。
- */
-function atBottomNow(): boolean {
-  const el = threadEl.value;
-  return followBottom && (!el || nearBottom(el));
-}
-function onThreadScroll() {
-  const el = threadEl.value;
-  if (el) followBottom = nearBottom(el);
-  // 非本轮程序滚动的 scroll 一律视为用户滚动（拖滚动条也走这条路），立即解锁高亮跟踪。
-  if (pinnedOutlineId.value !== null && !outlineJumpActive && Date.now() > outlineIgnoreScrollUntil) releaseOutlinePin();
-}
-
-function queueScroll(force = false) {
-  if (force) {
-    scrollForce = true;
-    followBottom = true;
-  } else if (!followBottom) {
-    return;
-  }
-  if (scrollQueued) return;
-  scrollQueued = true;
-  requestAnimationFrame(() => {
-    const forced = scrollForce;
-    scrollQueued = false;
-    scrollForce = false;
-    void nextTick(() => {
-      const el = threadEl.value;
-      if (!el) return;
-      // 执行时再按实时几何复核（阈值放宽到 240px：单片增量一般长不了这么多，超出只可能是用户上滚）。
-      // 只靠标记有个窗口：rAF+nextTick 双重延迟下，密集增量可能先于 scroll 事件把用户刚上滚的位置盖掉。
-      // 用户主动发送走 forced：人已经滚到很上面时也要回到最底，不能被这道阈值拦下。
-      if (!forced && !nearBottom(el, 240)) return;
-      if (forced) followBottom = true;
-      el.scrollTop = el.scrollHeight;
-    });
-  });
-}
-
-// ---- 推理过程（任务计划 + 工具步骤）折叠：生成中默认展开，收束后自动折叠，避免长过程刷屏 ----
-const openReasoning = reactive(new Set<number>());
-/**
- * 用户在生成中手动收起的气泡。思考增量很密，每一片都会请求「展开」；
- * 不记住这次收起的话，点一下立刻又被下一片思考撑开，看起来就是无法折叠。
- */
-const reasoningCollapsedByUser = new Set<number>();
-
-function toggleReasoning(id: number) {
-  if (openReasoning.has(id)) {
-    openReasoning.delete(id);
-    reasoningCollapsedByUser.add(id);
-  } else {
-    reasoningCollapsedByUser.delete(id);
-    openReasoning.add(id);
-    stickThinkingToBottom();
-  }
-}
-
-/** 流式事件请求展开：尊重用户刚刚的收起，直到他们再点开或本轮收束。 */
-function openReasoningPanel(id: number) {
-  if (reasoningCollapsedByUser.has(id)) return;
-  openReasoning.add(id);
-}
-
-function closeReasoningPanel(id: number) {
-  openReasoning.delete(id);
-  reasoningCollapsedByUser.delete(id);
-}
-
-/**
- * 单步结果的展开态（键 = 气泡 id + 步骤 id）。
- * 结果默认收起：一次工具循环常有 3-8 步，全部铺开会把气泡撑得很长；收起时用一行摘要交代
- * 「这步拿到了什么」，要看全文再点开（对齐 antd Collapse 的「默认收起 + 摘要」）。
- */
-const openSteps = reactive(new Set<string>());
-
-function stepKey(b: Bubble, step: ToolStep): string {
-  return `${b.id}::${step.id}`;
-}
-
-function toggleStep(b: Bubble, step: ToolStep) {
-  if (!step.result) return;
-  const key = stepKey(b, step);
-  if (openSteps.has(key)) openSteps.delete(key);
-  else openSteps.add(key);
-}
-
-/** 收起时的摘要：取结果首个非空行并截断（只作提示，全文点开看）。 */
-function stepSummary(step: ToolStep): string {
-  const line = (step.result || "")
-    .split("\n")
-    .map((item) => item.trim())
-    .find((item) => item.length > 0);
-  if (!line) return "";
-  // 抓正文的步骤结果首行是 markdown 标题（`# 标题`）：摘要里去掉标记，省得像乱码。
-  return line.replace(/^#{1,6}\s*/, "").slice(0, 90);
-}
-
-function hasRunningStep(b: Bubble): boolean {
-  return !!b.steps?.some((s) => s.status === "running");
-}
-
-/**
- * 是否真的有思考内容。流式片段常常只推来空白（换行/空格），
- * 直接判 `b.thinking` 会把「空白的推理面板」渲染出来，所以统一按去空白后判断。
- */
-function hasThinking(b: Bubble): boolean {
-  return !!b.thinking && b.thinking.trim().length > 0;
-}
-
-// 意图识别：只认模型显式写的「意图：/Intent:」前缀。
-// 不做「取首句」兜底——推理流首行经常是半截话（如「用户只输入了"123"，没有明确的请求或问题。这可能是：」），
-// 截断后放进高亮卡里像坏数据，也是推理面板观感差的主要来源之一（ChatGPT/Claude 都不做这种二次高亮）。
-const INTENT_RE = /^(意图|Intent)\s*[:：]\s*(.+)$/i;
-
-function intentOf(b: Bubble): string | undefined {
-  const firstLine = (b.thinking || "").split("\n", 1)[0].trim();
-  const m = firstLine.match(INTENT_RE);
-  return m ? m[2].trim() : undefined;
-}
-
-// 去掉首行意图（作为意图行展示）后的思考流，避免重复；无意图时不剥离。
-function thinkingDisplay(b: Bubble): string {
-  const t = b.thinking || "";
-  const nl = t.indexOf("\n");
-  const body = intentOf(b) ? (nl >= 0 ? t.slice(nl + 1).replace(/^\s*\n/, "") : "") : t;
-  return visibleThinking(body, uiLocale.value);
-}
-
-// ---- 思考耗时（对齐 ChatGPT「Thought for Ns」的口径）----
-// 各思考段分别计时后累加：工具执行 / 结果回灌的间隙不算思考；
-// 计时起点放模块级 Map（气泡 id → 该段首个思考增量时刻），不进响应式状态。
-const thinkStarts = new Map<number, number>();
-
-function thinkPhaseStart(id: number) {
-  if (!thinkStarts.has(id)) thinkStarts.set(id, Date.now());
-}
-
-/** 结束当前思考段并累加进气泡：正文到达 / 收束 / 出错时都要调，否则该段时长丢失。 */
-function thinkPhaseEnd(reply: Bubble) {
-  const start = thinkStarts.get(reply.id);
-  if (!start) return;
-  thinkStarts.delete(reply.id);
-  reply.thinkMs = (reply.thinkMs || 0) + (Date.now() - start);
-}
-
-/** 展示用耗时（如「8 秒」）；累计不足 0.8s 不显示，避免短轮次凑热闹。 */
-function thinkLabel(b: Bubble): string {
-  if (!b.thinkMs || b.thinkMs < 800) return "";
-  const s = Math.round(b.thinkMs / 1000);
-  return tx(`${s} 秒`, `${s}s`, `${s}s`, `${s} सेकंड`);
-}
-
-// 思考流跟底：面板限高内滚，不跟底就只能盯着开头（推理增量很密，rAF 合并避免每片都触发布局）。
-let thinkStickQueued = false;
-function stickThinkingToBottom() {
-  if (thinkStickQueued) return;
-  thinkStickQueued = true;
-  requestAnimationFrame(() => {
-    thinkStickQueued = false;
-    // 取最后一个思考区：正在流式的通常就是最新一条助手气泡。
-    const bodies = threadEl.value?.querySelectorAll<HTMLElement>(".reasoning__thinking");
-    const last = bodies?.length ? bodies[bodies.length - 1] : null;
-    if (last) last.scrollTop = last.scrollHeight;
-  });
-}
-
-function reasoningTitle(b: Bubble): string {
-  const n = b.steps?.length || 0;
-  const sn = b.subagents?.length || 0;
-  // 思考期（流式、已收到 thinking 但还没具体步骤）：有意图识别则标「理解意图」，否则「思考中」。
-  if (b.streaming && hasThinking(b) && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
-    return intentOf(b)
-      ? tx("理解意图…", "Understanding intent…", "Entendendo a intenção…", "इरादा समझ रहा है…")
-      : tx("思考中…", "Thinking…", "Pensando…", "सोच रहा है…");
-  // 已在出正文但尚无步骤/子代理（模型未显式规划，直接作答）：标「回答中」，避免还挂着「正在规划」像卡死。
-  if (b.streaming && b.text && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
-    return tx("回答中…", "Answering…", "Respondendo…", "उत्तर दे रहा है…");
-  // 静默规划期（流式但还没有任何步骤/子代理，也没有思考流、也没出正文）：显式标「正在规划」。
-  if (b.streaming && !b.steps?.length && !b.todos?.length && !b.subagents?.length)
-    return tx("正在规划…", "Planning…", "Planejando…", "योजना बना रहा है…");
-  if (b.streaming && hasRunningStep(b)) return tx("推理中…", "Reasoning…", "Pensando…", "तर्क कर रहा है…");
-  if (b.streaming && sn) {
-    return tx(`子代理运行中 · ${sn} 个`, `Subagents running · ${sn}`, `Subagentes rodando · ${sn}`, `उप-एजेंट चल रहे · ${sn}`);
-  }
-  if (n) return tx(`推理过程 · ${n} 步`, `Reasoning · ${n} step${n > 1 ? "s" : ""}`, `Raciocínio · ${n} passos`, `तर्क · ${n} चरण`);
-  if (b.todos?.length) return tx("任务计划", "Plan", "Plano", "कार्य योजना");
-  if (sn) return tx(`子代理 · ${sn} 个`, `Subagents · ${sn}`, `Subagentes · ${sn}`, `उप-एजेंट · ${sn}`);
-  return tx("推理过程", "Reasoning", "Raciocínio", "तर्क प्रक्रिया");
-}
 
 const {
   conversationSyncing,
@@ -3434,7 +3158,7 @@ async function send() {
     let convId = currentId.value;
     const text = state.input.trim();
     if (!text && !state.pendingImages.length && !state.pendingDocs.length) return;
-    followBottom = true; // 用户发送：无条件回底（新一轮回复从底部开始展示）
+    setFollowBottom(true); // 用户发送：无条件回底（新一轮回复从底部开始展示）
     if (!convId) {
       // 草稿态首条消息：此刻才创建会话入列表（对齐 CodeBuddy）；失败则保留输入不丢内容。
       convId = await createConvFromDraft(text);
@@ -5225,10 +4949,8 @@ onBeforeUnmount(() => {
   for (const t of unmountTimers) clearTimeout(t);
   unmountTimers.clear();
   // 四个短时具名定时器：卸载后回写 ref 或上报偏好，必须取消。
-  if (settingsErrorTimer) {
-    clearTimeout(settingsErrorTimer);
-    settingsErrorTimer = null;
-  }
+  // settingsErrorTimer 归 modelSettings composable 所有，经 dispose 入口清理。
+  disposeSettingsErrorTimer();
   if (clearArmTimer) {
     clearTimeout(clearArmTimer);
     clearArmTimer = null;
