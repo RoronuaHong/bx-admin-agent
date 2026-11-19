@@ -131,6 +131,8 @@ import {
   type WorkspaceFile,
 } from "../../api";
 import { parseAlertMarker, type ArtifactSpec, type ChatEvent, type TodoItem } from "@bx/shared";
+import { useChatPersistence } from "./useChatPersistence";
+import type { Bubble, ConvSettings, ConvState } from "./chat-page-types";
 import type { Router as ChatRouter } from "vue-router";
 
 export function useChatPageCore(options: {
@@ -190,8 +192,6 @@ async function loadTasks() {
 
 /** 定时任务和各对话的新消息：页面可见时定期跟上，不必整页刷新。 */
 let tasksPollTimer: ReturnType<typeof setInterval> | null = null;
-let conversationSyncing = false;
-let pendingSyncId = "";
 function startTasksPoll() {
   if (tasksPollTimer) return;
   tasksPollTimer = setInterval(() => {
@@ -1184,77 +1184,6 @@ function openRunConversation(run: TaskGroupRun): void {
 // 步骤状态 / 子代理状态 / 工具步骤：以上方 import 的 chat-types.ts 为单一来源，此处不再重复定义。
 // （历史原因：这三个类型曾在页面内各有一份，抽 ChatBubble 组件后已抽取到 chat-types.ts 共享。）
 
-interface Bubble {
-  id: number;
-  role: "user" | "assistant" | "notice";
-  text: string;
-  /** 这条气泡出现的时刻（毫秒）。旧快照没有这个字段时不显示。 */
-  at?: number;
-  images?: Array<{ id: string; name: string }>;
-  streaming?: boolean;
-  error?: string;
-  steps?: ToolStep[];
-  /** 等待用户确认的工具调用（write/destructive 级别或服务器级 requireConfirm；批准必须用一次性票据）。 */
-  pending?: {
-    id: string;
-    ticket: string;
-    name: string;
-    server?: string;
-    args?: string;
-    level?: "read" | "write" | "destructive";
-    reason?: string;
-    argSummary?: Array<{ key: string; value: string }>;
-    canGrantRead?: boolean;
-    grantRead?: boolean;
-    /** 票据有效期（服务端下发）：超时按拒绝处理，前端据此提示并自动作废卡片。 */
-    expiresInMs?: number;
-  } | null;
-  /**
-   * 结构化澄清（工具 request_clarification）：把模型的「散文追问」变成可点选的选项卡，
-   * 复用确认通道回传用户选中的选项值。
-   */
-  clarification?: {
-    id: string;
-    ticket: string;
-    question: string;
-    options: Array<{ label: string; description?: string }>;
-    /** 模型声明的「缺的是哪个决策点」与「为什么它会影响答案」（可选；未声明时不显示）。 */
-    missingField?: string;
-    whyItMatters?: string;
-    expiresInMs?: number;
-  } | null;
-  /** 客服助手封闭分类（事项、是否要求代发、路由建议、越权、承诺门控）。 */
-  supportLabels?: import("@bx/shared").SupportLabels;
-  /** 本轮上下文用量（服务端回传，用于透明度展示）。 */
-  usage?: {
-    tokens: number;
-    budget: number;
-    window: number;
-    turns: number;
-    dropped: number;
-    summarized?: boolean;
-    toolResultsCleared: number;
-    toolResultsOffloaded?: number;
-  };
-  /** 任务规划（write_todos 产出，随执行推进状态）。 */
-  todos?: TodoItem[];
-  /** 前端本地渲染图表（render_chart 产出；零外链，浏览器用 AntV 绘制）。一轮可出多张，按顺序展示。 */
-  charts?: ChartSpec[];
-  /** 可下载产物（export_data 产出；随对话快照恢复，前端渲染下载卡片，点一下即可拿走文件）。 */
-  artifacts?: ArtifactSpec[];
-  /** 子代理（task）实时状态：独立事件维度，随流式进度更新，仅作展示（不落库）。 */
-  subagents?: Array<{
-    id: string;
-    parentId: string;
-    description: string;
-    status: SubagentStatus;
-    text: string;
-  }>;
-  /** 扩展思考（thinking 增量拼接，支持思考的模型才有；仅作展示，不回灌模型上下文）。 */
-  thinking?: string;
-  /** 累计思考耗时（毫秒）：各思考段相加，工具执行/回灌的间隙不计；展示用（对齐 ChatGPT「Thought for Ns」）。 */
-  thinkMs?: number;
-}
 
 /**
  * 旧的**前端**持久化键：只用于一次性迁移读取（迁移成功后删除，此后前端零持久化）。
@@ -1271,48 +1200,6 @@ const uiLocale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   uiLocale.value === "zh" ? zh : uiLocale.value === "pt-BR" ? pt : uiLocale.value === "hi" ? hi : en;
 
-/** 对话级设置（真相在 conversation 文档；前端只做镜像 + 乐观更新）。 */
-interface ConvSettings {
-  /** 空 = 用服务端默认模型。 */
-  modelId: string;
-  /** 空 = 用设备默认语言（`session.preferences.locale`）。 */
-  locale: "" | UiLocale;
-  mcpEnabled: string[];
-  /** 用户为本对话勾选的技能（skills 目录名）；空 = 全部走索引 + read_skill 按需加载。 */
-  skillsEnabled: string[];
-}
-
-/**
- * 每个对话独立的运行时状态。
- * 对齐 AI SDK 的「每个会话一个显式实例」：状态与中断句柄都归实例所有，
- * 因此切换对话只改指针、不打断任何流，N 个对话可同时流式。
- */
-interface ConvState {
-  bubbles: Bubble[];
-  input: string;
-  sending: boolean;
-  /** 并发运行中的轮次计数：放开「流式期间发送」（抢占）后同一对话可同时有多轮，sending 由它推导。 */
-  runCount: number;
-  /**
-   * 本轮发送周期内发生过并发（runCount 曾 >1）。增量落库水位假设「同一时刻只有一条 reply 在流式更新」，
-   * 并发时被打破：先收束者把水位推到「含对方半截」，后收束者若只回写末条，中间项 reply 的终态就落不库。
-   * 并发过的对话在并发收束期间一律全量落库（见 runTurn finally），runCount 归零后复位。
-   */
-  hadConcurrent: boolean;
-  /** 该对话所有活跃轮次的中断句柄；「停止」中止全部（抢占语义下旧轮次也在列表里）。 */
-  controllers: AbortController[];
-  /** 同步派发标志：防止并发双击导致同一条消息开两个 run（R08）。 */
-  dispatching: boolean;
-  pendingImages: UploadResult[];
-  /** 待发的文档附件（PDF / Word / Excel / md / txt / csv）：随消息发 attachments，由服务端解析后注入上下文。 */
-  pendingDocs: UploadResult[];
-  /** 该对话最近一次错误（侧栏状态点用）。 */
-  error: string;
-  /** 对话级设置（模型 / 语言 / MCP 启用集 / 技能启用集）。 */
-  settings: ConvSettings;
-  /** 待发队列（后端持久化：忙时入队，turn 收束后按序自动发）。 */
-  queue: PendingMessage[];
-}
 
 function blankState(): ConvState {
   return {
@@ -2343,236 +2230,39 @@ function reasoningTitle(b: Bubble): string {
   return tx("推理过程", "Reasoning", "Raciocínio", "तर्क प्रक्रिया");
 }
 
-/** 读取快照里的图表 spec（兼容旧的单张 chart 字段：并入 charts）。 */
-function chartsOf(m: StoredMessage): ChartSpec[] {
-  const list = Array.isArray(m.charts) ? m.charts : [];
-  return m.chart ? [...list, m.chart] : list;
-}
-
-/**
- * 快照的状态归一：**快照里不存在「正在跑」**。
- * 落库与恢复都过这一遍——终态没收到的步骤（连接被切断 / 服务进程重启）若以 running 存进库，
- * 刷新后会被当成实时状态永久转圈（用户看到的「卡住」就是这个）。宁可如实记中断，也不冒充仍在执行。
- */
-function settleStep(step: ToolStep): ToolStep {
-  return step.status === "running" ? { ...step, status: "interrupted" } : step;
-}
-
-/** 与服务端快照窗口一致：只有最近一段带回思考和工具原文。 */
-const SNAPSHOT_DETAIL_TAIL = 40;
-const SNAPSHOT_THINKING_CAP = 8_000;
-const SNAPSHOT_STEP_RESULT_CAP = 4_000;
-
-function capTail(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return `…\n${text.slice(text.length - max)}`;
-}
-
-function toStored(list: Bubble[]): StoredMessage[] {
-  const kept = list.filter(
-    (b): b is Bubble & { role: "user" | "assistant" } =>
-      b.role !== "notice" && !!(b.text || b.images?.length || b.charts?.length || b.artifacts?.length),
-  );
-  const detailFrom = Math.max(0, kept.length - SNAPSHOT_DETAIL_TAIL);
-  return kept.map((b, index) => {
-    const keepDetail = index >= detailFrom;
-    const steps = b.steps?.map(settleStep);
-    return {
-      role: b.role,
-      text: b.text,
-      ...(b.at ? { at: b.at } : {}),
-      images: b.images,
-      ...(keepDetail && b.thinking ? { thinking: capTail(b.thinking, SNAPSHOT_THINKING_CAP) } : {}),
-      ...(b.thinkMs ? { thinkMs: b.thinkMs } : {}),
-      ...(steps?.length
-        ? {
-            steps: keepDetail
-              ? steps.map((step) => ({
-                  ...step,
-                  ...(step.result ? { result: capTail(step.result, SNAPSHOT_STEP_RESULT_CAP) } : {}),
-                  ...(step.args ? { args: capTail(step.args, 400) } : {}),
-                }))
-              : steps.map((step) => ({ id: step.id, name: step.name, server: step.server, status: step.status })),
-          }
-        : {}),
-      ...(b.todos?.length ? { todos: b.todos } : {}),
-      ...(b.charts?.length ? { charts: b.charts } : {}),
-      ...(b.artifacts?.length ? { artifacts: b.artifacts } : {}),
-      ...(b.supportLabels ? { supportLabels: b.supportLabels } : {}),
-    };
-  });
-}
-
-function bubblesFromStored(messages: StoredMessage[], times: number[]): Bubble[] {
-  return messages.map((m, i) => ({
-    id: ++seq,
-    role: m.role,
-    at: times[i],
-    text: m.role === "assistant" ? dedupeRepeats(m.text || "") : (m.text || ""),
-    images: m.images,
-    ...(m.thinking ? { thinking: m.thinking } : {}),
-    ...(m.thinkMs ? { thinkMs: m.thinkMs } : {}),
-    ...(Array.isArray(m.steps) && m.steps.length ? { steps: (m.steps as ToolStep[]).map(settleStep) } : {}),
-    ...(Array.isArray(m.todos) && m.todos.length ? { todos: m.todos as TodoItem[] } : {}),
-    ...(chartsOf(m).length ? { charts: chartsOf(m) } : {}),
-    ...(Array.isArray(m.artifacts) && m.artifacts.length ? { artifacts: m.artifacts as ArtifactSpec[] } : {}),
-    ...(m.supportLabels ? { supportLabels: m.supportLabels } : {}),
-  }));
-}
-
-/** 列表快照没有推理细节。打开对话后补最近一段，生成中的气泡不被覆盖。 */
-async function upgradeConversationDetail(convId: string) {
-  const full = await fetchConversation(convId).catch(() => null);
-  if (!full) return;
-  applyServerThread(convId, full, true);
-}
-
-/**
- * 把服务端快照铺进这个对话。正在发送或流式输出时不覆盖。
- * 本地更新、或条数更多时也不覆盖，避免刚生成的这一轮被旧快照抹掉。
- * force 只用于第一次打开：补上列表快照里没有的推理细节。
- */
-function applyServerThread(convId: string, full: ConversationDto, force: boolean) {
-  const state = states.get(convId);
-  if (!state || state.sending || state.bubbles.some((b) => b.streaming)) return;
-  const serverMessages = full.messages || [];
-  if (!force && !serverThreadAhead(state.bubbles, serverMessages)) return;
-  // 先量「用户本来贴不贴底部」：内容一多 scrollHeight 就变高，此刻再量已被自己长出来的高度推翻。
-  const wasAtBottom = convId === currentId.value && atBottomNow();
-  const times = messageTimes(serverMessages, full.createdAt, full.updatedAt);
-  const notices = state.bubbles.filter((bubble) => bubble.role === "notice");
-  state.bubbles = [...bubblesFromStored(serverMessages, times), ...notices];
-  persistedCount.set(convId, toStored(state.bubbles).length);
-  // 强制回底：forced 跳过 queueScroll 里两道「还在底部吗」的复核。
-  // 用户本来就在底部时，新回复必须自己滚进视野——否则「停在页面上看着」就永远看不到它。
-  if (wasAtBottom) queueScroll(true);
-}
-
-function tailSig(
-  item:
-    | {
-        text?: string;
-        charts?: unknown[];
-        artifacts?: unknown[];
-        steps?: unknown[];
-        todos?: unknown[];
-      }
-    | undefined,
-): string {
-  if (!item) return "";
-  const steps = ((item.steps as Array<{ status?: string }>) || []).map((step) => step.status || "").join(",");
-  const todos = ((item.todos as Array<{ status?: string }>) || []).map((todo) => todo.status || "").join(",");
-  return `${item.text?.length || 0}|${item.charts?.length || 0}|${item.artifacts?.length || 0}|${steps}|${todos}`;
-}
-
-function serverThreadAhead(local: Bubble[], server: StoredMessage[]): boolean {
-  const messages = local.filter((bubble) => bubble.role !== "notice");
-  if (server.length > messages.length) return true;
-  if (server.length < messages.length) return false;
-  const lb = messages[messages.length - 1];
-  const sb = server[server.length - 1];
-  if ((lb?.text?.length || 0) > (sb?.text?.length || 0)) return false;
-  return tailSig(lb) !== tailSig(sb);
-}
-
-/** 当前打开的对话：还在跑就接上事件流，已经写完就补上新消息。 */
-async function syncOpenConversation(convId: string) {
-  if (!convId) return;
-  if (conversationSyncing) {
-    pendingSyncId = convId;
-    return;
-  }
-  const state = states.get(convId);
-  if (!state) return;
-  conversationSyncing = true;
-  try {
-    const status = await fetchChatTaskStatus(convId).catch(() => null);
-    // 正在跟流时不能整段覆盖，但本期提问必须在场：定时任务每期正文相同，不能拿上一期那条充数。
-    if (state.sending || state.bubbles.some((b) => b.streaming)) {
-      if (status?.running) ensureRunPrompt(state, status.task?.userText || "", status.task?.startedAt || 0);
-      return;
-    }
-    if (status?.running) {
-      await attachRunningTask(convId);
-      return;
-    }
-    const full = await fetchConversation(convId).catch(() => null);
-    if (full) applyServerThread(convId, full, false);
-  } finally {
-    conversationSyncing = false;
-    const next = pendingSyncId;
-    pendingSyncId = "";
-    if (next && next !== convId) void syncOpenConversation(next);
-  }
-}
-
-/**
- * 落库某个对话的气泡快照。
- * 必须显式传对话 id 与气泡：本轮结束时可能已经切到别的对话（后台流），
- * 用 currentId 会把 A 的内容写进 B。
- */
-/**
- * 在途落库登记（清空对话竞态）：runTurn finally 先把 sending 归零、再 await persist，
- * 这段窗口里「清空」守卫看到 sending=false 就放行，但落库请求还在飞，后到会把已清的消息写回。
- * 清空动作先 await 这里的 Promise，确保落库全部结束后再发 /clear。
- */
-const pendingPersists = new Map<string, Promise<unknown>>();
-/** 每对话的落库串行链：多 run 收束时写请求 + persistedCount 水位必须按序，否则慢请求晚到覆盖新快照。 */
-const persistChains = new Map<string, Promise<unknown>>();
-async function waitPendingPersists(convId: string): Promise<void> {
-  await pendingPersists.get(convId)?.catch(() => undefined);
-}
-
-function persist(convId: string, list: Bubble[], forceFull = false): Promise<void> {
-  if (!convId) return Promise.resolve();
-  // 串行化：本轮写排在上一个之后。快照 list 在调用时已取好，排队期间其它 run 的增量写不会互相覆盖。
-  const prevChain = persistChains.get(convId) || Promise.resolve();
-  const task = prevChain.catch(() => undefined).then(() => persistNow(convId, list, forceFull));
-  persistChains.set(convId, task);
-  void task.finally(() => {
-    if (persistChains.get(convId) === task) persistChains.delete(convId);
-  });
-  pendingPersists.set(convId, task);
-  void task.finally(() => {
-    if (pendingPersists.get(convId) === task) pendingPersists.delete(convId);
-  });
-  return task;
-}
-
-async function persistNow(convId: string, list: Bubble[], forceFull = false) {
-  const stored = toStored(list);
-  const title = list.find((b) => b.role === "user" && b.text)?.text.slice(0, 24) || undefined;
-  // 本会话首次落库该对话时，用服务端快照长度当基线（避免把整段历史重新全量上传）。
-  const serverLen = conversations.value.find((c) => c.id === convId)?.messages?.length ?? 0;
-  const prev = persistedCount.get(convId) ?? serverLen;
-  try {
-    if (forceFull) {
-      // 并发多 run 抢占：增量水位假设「同一时刻只有一条 reply 在流式更新」，并发下被打破——
-      // 先收束者把水位推到「含对方半截」，后收束者若只回写末条，中间项 reply 的终态就永远落不库。
-      // 全量写以本地 bubbles（UI 真相源）覆盖服务端，顺带清掉增量竞态写出的半截/重复；并发归零后恢复增量。
-      await saveConversationMessages(convId, stored, { title, full: true });
-    } else if (stored.length < prev) {
-      // 长度回退（如清空对话）：全量替换。
-      await saveConversationMessages(convId, stored, { title, full: true });
-    } else if (stored.length === prev) {
-      if (prev > 0) {
-        // 没有新增消息，只可能是「最后一条正在流式更新」→ 只回写最后一条（base=prev-1 触发服务端原地替换）。
-        await saveConversationMessages(convId, [stored[prev - 1]!], { title, base: prev - 1 });
-      } else if (title) {
-        await saveConversationMessages(convId, [], { title, base: 0 });
-      }
-    } else {
-      // 有新增消息：只回写尾部增量（base=prev）。
-      await saveConversationMessages(convId, stored.slice(prev), { title, base: prev });
-    }
-    persistedCount.set(convId, stored.length);
-    if (title) {
-      conversations.value = conversations.value.map((c) => (c.id === convId ? { ...c, title } : c));
-    }
-  } catch {
-    /* 保存失败不打断对话（下次变更会重试增量回写） */
-  }
-}
+const {
+  conversationSyncing,
+  pendingSyncId,
+  chartsOf,
+  settleStep,
+  SNAPSHOT_DETAIL_TAIL,
+  SNAPSHOT_THINKING_CAP,
+  SNAPSHOT_STEP_RESULT_CAP,
+  capTail,
+  toStored,
+  bubblesFromStored,
+  upgradeConversationDetail,
+  applyServerThread,
+  tailSig,
+  serverThreadAhead,
+  syncOpenConversation,
+  pendingPersists,
+  persistChains,
+  waitPendingPersists,
+  persist,
+  persistNow,
+} = useChatPersistence({
+  states,
+  currentId,
+  conversations,
+  persistedCount,
+  nextSeq: () => ++seq,
+  atBottomNow: () => atBottomNow(),
+  queueScroll: (force) => queueScroll(force),
+  ensureRunPrompt,
+  attachRunningTask,
+  messageTimes: (messages, createdAt, updatedAt) => messageTimes(messages, createdAt, updatedAt),
+});
 
 /** 切换对话：只改指针，不 abort、不覆盖任何已存在的运行时状态（后台流继续跑）。 */
 function selectConversation(conv: ConversationDto) {
