@@ -1,8 +1,9 @@
 # ChatPage.vue 阶段 2 拆分设计（P1-1 第二阶段）
 
 - 日期：2026-11-18
-- 状态：设计已写入，待用户审阅；**未按本设计改代码，也未写细化实施计划**
+- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1 已提交，T2（SCC A）因本文 §4/§5.2 的描述与实际代码偏差暂停待决策（2026-11-19 复核，详见实施计划 §0.3）
 - 对应阶段 1：`docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`、`docs/superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md`
+- 细化实施计划：`docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md`
 - 基线提交：`5e962ca refactor(web): extract ChatPage core and harden frontend`
 - 范围：`apps/web/src/composables/chat/useChatPageCore.ts`、`apps/web/src/pages/ChatPage.vue`、`apps/web/src/pages/chat-page.css`、新增 composables / UI 子组件
 
@@ -62,8 +63,15 @@ useChatPageCore.ts（协调层）
 |---|---|---|---|
 | 前置：快照归一化 | `settleStep`、`toStored`、`bubblesFromStored`、`applyServerThread`、`syncOpenConversation`、`waitPendingPersists`、`upgradeConversationDetail` | `useChatPageCore.ts:2346–2507`；被 A 的 `selectConversation`、C 的 `runTurn`、右键清空竞态调用 | 先抽成 `useChatPersistence`，暴露完整 ComposableApi |
 | SCC C | 模型设置、滚动、推理 UI、Run | `applyChatEvent` 读 `atBottomNow/queueScrollIfCurrent/thinkPhaseStart/thinkPhaseEnd/openReasoningPanel/closeReasoningPanel/lastGoodModelId`；`runTurn` 写 `failedModelIds`；`onThreadScroll` 读 `pinnedOutlineId` | 内部固定顺序 `modelSettings → threadScroll → reasoningUI`；Run 留在协调层，通过返回值注入状态 |
-| SCC A | 会话壳、列表、右键、任务、删除撤销 | `removeConversation` 与 `closeCtxMenu/selectConversation/newConversation/scheduleUndoDelete` 互调；`selectConversation` 又调任务表单关闭与 MCP/技能加载 | 整体抽为一个 composable，或先把共享状态留根再拆；不在本阶段强行细拆 |
-| SCC B | MCP、技能、工具选择、专家 | `boundMcpIds` 被会话新建读；`taskRowState` 读 `taskDraft.mcpServers`；`skillQuery/mcpQuery/searchAutofocus` 与 `skillAvailable/mcpAvailable/expertAgents` 互相读写 | 整体抽为一个 composable；不在本阶段强行细拆 |
+| SCC A | 会话壳、列表、右键、任务、删除撤销 | `removeConversation` 与 `closeCtxMenu/selectConversation/newConversation/scheduleUndoDelete` 互调；`selectConversation` 又调任务表单关闭与 MCP/技能加载 | **采用「共享状态留根后再拆」**：会话壳核心先抽，任务表单 + 飞出层留根（与 SCC B 共享 `taskDraft`）。见下方 2026-11-19 修订 |
+| SCC B | MCP、技能、工具选择、专家 | `boundMcpIds` 被 `createConvFromDraft` 读（非 `newConversation`）；`taskDraft.mcpServers` 被任务飞出层与任务表单共享；`skillQuery/mcpQuery/searchAutofocus` 与 `skillAvailable/mcpAvailable/expertAgents` 互相读写 | 整体抽为一个 composable；`taskDraft`/飞出层留根供 A、B 共用。见下方 2026-11-19 修订 |
+
+> **2026-11-19 代码核对修订**（细节见实施计划 §0.3）：上表 SCC A/B 的原始描述有几处与现行代码不符——
+> ① `selectConversation` 并不调 `showSettingsError`（后者在 `openConversationById`/`commitRename`/`togglePin`/`applyConversationOrder` 处调用）；
+> ② `boundMcpIds` 由 `createConvFromDraft` 读取，`newConversation` 只清 `blank.settings.mcpEnabled`；
+> ③ `mcpAvailable`/`skillAvailable`/`expertAgents` 不出现在 `submitTask`，而在任务飞出层 computed（`taskSkillFiltered` 等）使用；
+> ④ 删除组的 `flushPendingDelete`/`scheduleUndoDelete` 不直接用 `pageUnmounted`/`deferOnPage`，仅在 `onBeforeUnmount` 经 `flushPendingDelete()` 连接。
+> 另：SCC A 实际 100+ 符号、与 SCC B 共享 `taskDraft`/飞出层，且 web 端仅 3 个测试。故 SCC A 拆分（T2）暂停待决策，优先采用裁剪边界或先补行为测试。
 
 结论：**禁止按“每个职责一个文件”逐组提交**。阶段 2 的提交单元是 SCC，不是原来的小职责组。
 
@@ -92,9 +100,9 @@ useChatPageCore.ts（协调层）
 | `sortMode` | 1605 | 列表、bootstrap | SCC A |
 | `showArchived` | 1423 | A、bootstrap | SCC A |
 | `ctxMenu` / `undoDelete` | 1439 / 1461 | A | SCC A |
-| `taskDraft` | 155 | 任务组、SCC B、新建会话 | A↔B 桥接，留协调层注入 |
-| `boundMcpIds` | 4534 | SCC B、新建会话 | A↔B 桥接，留协调层注入 |
-| `mcpAvailable` / `skillAvailable` / `expertAgents` | 2120 / 4718 / 4939 | SCC B、任务组 | SCC B，任务组通过 getter 读 |
+| `taskDraft` | 154 | 任务组、飞出层、SCC B | A↔B 桥接，留协调层；任务表单 + 飞出层随之留根（2026-11-19 修订） |
+| `boundMcpIds` | 3948 | SCC B、`createConvFromDraft` | A↔B 桥接，留协调层注入；读点是 `createConvFromDraft`（约 2109），非 `newConversation` |
+| `mcpAvailable` / `skillAvailable` / `expertAgents` | 1944 / 4132 / — | SCC B、任务飞出层 computed | SCC B；由飞出层 `taskMcpFiltered`/`taskSkillFiltered`/`taskExpertFiltered` 读（约 566–611），不在 `submitTask` |
 | `skillQuery` / `mcpQuery` / `searchAutofocus` | 4834–4837 | SCC B、工具菜单 | SCC B |
 | `threadWindow` / `pinnedOutlineId` | 1797 / 1869 | 告警、大纲、滚动 | SCC C↔大纲，读 getter 注入 |
 | `followBottom` / `atBottomNow` / `queueScrollIfCurrent` | 2148 / 2157 / 2172 | SCC C、Run | SCC C，Run 通过 ComposableApi 使用 |
@@ -107,12 +115,12 @@ useChatPageCore.ts（协调层）
 
 每一步单独提交、单独验证；任何一步失败只回退该步骤。
 
-| 步骤 | 内容 | 主要文件 | 验证重点 | 回滚 |
+| 步骤 | 内容 | 主要文件 | 验证重点 | 状态（2026-11-19） |
 |---:|---|---|---|---|
-| 0 | 抽 `useChatPersistence` | 新增 `composables/chat/useChatPersistence.ts`；改 `useChatPageCore.ts` | 首屏恢复、刷新/续传、并发落库、清空竞态 | 单提交 revert |
-| 1 | 拆 SCC C：`modelSettings → threadScroll → reasoningUI` | 新增 3 个 composables；Run 保留协调层 | 发送/停止焦点、跟底、思考计时、模型 auto 黑名单 | 单提交 revert |
-| 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable 或共享状态留根后拆 | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | 单提交 revert |
-| 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 1 个 SCC composable | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | 单提交 revert |
+| 0 | 抽 `useChatPersistence` | 新增 `composables/chat/useChatPersistence.ts`；改 `useChatPageCore.ts` | 首屏恢复、刷新/续传、并发落库、清空竞态 | ✅ `37d8663`，回滚：单提交 revert |
+| 1 | 拆 SCC C：`modelSettings → threadScroll → reasoningUI` | 新增 3 个 composables；Run 保留协调层 | 发送/停止焦点、跟底、思考计时、模型 auto 黑名单 | ✅ `3f6d81c`，回滚：单提交 revert |
+| 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable，共享状态留根后拆（裁剪边界见实施计划 §5.3） | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | ⏸ 暂停：偏差修订 + 待补行为测试；回滚：单提交 revert |
+| 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 1 个 SCC composable | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ⏳ 依赖步骤 2 的 `taskDraft` 边界 |
 | 4 | provide 契约加固 | `useChatPageCore.ts`、`bubble-context.ts` | 41 键齐全，气泡复制/编辑/工具确认/澄清可用 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | Teleport 顺序、focus trap、`threadEl` expose、`v-model:outlineOpen` | 每组件单提交 revert |
 | 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | `@click.stop`、Esc capture、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |

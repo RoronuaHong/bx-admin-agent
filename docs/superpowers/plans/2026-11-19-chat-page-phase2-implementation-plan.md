@@ -1,8 +1,13 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：已编制，待执行
-- 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理；本文件只写计划，不改代码。
+- 状态：**执行中｜C0/T0/T1 已提交，T2 因文档与代码偏差暂停待决策**（2026-11-19 复核）
+- 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
+- 执行记录（2026-11-19）：
+  - C0 文档提交 `6709f4a`。
+  - T0 `useChatPersistence` + `chat-page-types.ts` 提交 `37d8663`（`useChatPageCore.ts` 6269→5959 行）。门禁全绿：build / type-check / web test / server test / diff / 单 chunk。
+  - T1 SCC C 拆三件（`useChatModelSettings` / `useChatThreadScroll` / `useChatReasoningUI`）提交 `3f6d81c`（协调层再降约 340 行）。门禁全绿。
+  - T2（SCC A）**暂停**：代码核对发现本文 §5 与设计的 SCC A 描述存在 4 处事实偏差（见 §0.3），且 SCC A 实际符号规模 100+、与 SCC B 共享 `taskDraft`/飞出层，当前 web 端仅 3 个测试、无行为安全网。已删除不达标草稿，工作区干净。继续前需先按 §0.3 修正方案并补齐测试或接受风险（待用户决策）。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -14,11 +19,15 @@
 
 ### 0.1 基线快照
 
-| 文件 | 行数 / 大小 | 说明 |
+> 原基线（阶段 1 提交 `5e962ca`）：`useChatPageCore.ts` 6269 行 / 266,245 字节。
+> 本文记录时（T1 提交 `3f6d81c` 后）实测：协调层已降到约 5600 行；`ChatPage.vue` 2779 行、`chat-page.css` 4142 行未变。
+> 下方表格保留原基线作历史对照；T2+ 若开工，须以当时 `git status` + 行数实测为准，不照抄此表。
+
+| 文件 | 原基线行数 / 大小 | 说明 |
 |---|---:|---|
-| `apps/web/src/composables/chat/useChatPageCore.ts` | 6269 行 / 266,245 字节 | 协调层，return 块 5614–6269，653 个返回值 |
-| `apps/web/src/pages/ChatPage.vue` | 2779 行 / 151,455 字节 | script 1–663、template 665–2776、style 2778 |
-| `apps/web/src/pages/chat-page.css` | 4142 行 / 92,705 字节 | 所有样式仍在页面级 |
+| `apps/web/src/composables/chat/useChatPageCore.ts` | 6269 行 / 266,245 字节 | 协调层，原 return 块 5614–6269，653 个返回值；T0/T1 后已降至约 5600 行 |
+| `apps/web/src/pages/ChatPage.vue` | 2779 行 / 151,455 字节 | script 1–663、template 665–2776、style 2778（未动） |
+| `apps/web/src/pages/chat-page.css` | 4142 行 / 92,705 字节 | 所有样式仍在页面级（未动） |
 
 开工前执行：
 
@@ -37,29 +46,18 @@ git -C d:/Code/bx-admin-agent diff --check
 - 三个代码文件不得出现在 `git status --short` 中；若存在改动，先停止并查清来源。
 - 行数与大小若与设计基线不符，先回写基线再实施，禁止带着未知漂移开工。
 
-### 0.2 当前工作区文档改动
+### 0.2 文档提交（已完成）
 
-当前 `git status --short` 中只有文档改动：
-
-- `M docs/README.md`
-- `M docs/engineering-optimization-review.md`
-- `?? docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
-- 本计划文件落盘后也会成为新增文件。
-
-**C0 文档提交（独立提交，先于任何代码改动）**：
+**C0 文档提交 `6709f4a`** 已入库：
 
 ```text
 docs(web): record ChatPage phase2 design and implementation plan
 ```
 
-包含文件：
+包含：`docs/README.md`、`docs/engineering-optimization-review.md`、
+`docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`、本计划文件。
 
-- `docs/README.md`
-- `docs/engineering-optimization-review.md`
-- `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
-- `docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md`
-
-文档提交与代码提交严格分离，便于回滚。
+本次「文档对齐」的修订（进度回写 + §0.3 偏差表 + §5 边界修正）作为 C0 增补独立提交，仍与代码提交分离。
 
 ### 0.3 设计文档与代码快照的偏差（以代码符号为准）
 
@@ -74,6 +72,19 @@ docs(web): record ChatPage phase2 design and implementation plan
 | `#task-panel-host` 旧行号 | 当前在 `ChatPage.vue:2073` | 只按 id 定位，不按行号 |
 | `ChatThread` 等 UI 子组件 | 当前不存在对应 `.vue` 文件 | 它们是本计划要新建的抽取边界，不是既有组件 |
 | 根 `pnpm test` | 只跑 `@bx/agent-server` | 每步必须额外跑 `pnpm --filter @bx/web test` |
+
+**T2（SCC A）专项偏差（2026-11-19 代码核对，§5 与 §设计 4 节据此修正）**：
+
+| 计划/设计说法 | 代码实际（T1 后现文件、按符号） | 处理 |
+|---|---|---|
+| `selectConversation → showSettingsError` | 不存在。`showSettingsError`（现由 `useChatModelSettings` 解构）在 `openConversationById`、`commitRename`、`togglePin`、`applyConversationOrder` 等处调用，`selectConversation` 函数体内 0 次 | T2 搬迁清单不列此调用边；`selectConversation` 只保留真实的跨组边（见 §5.3） |
+| `newConversation → boundMcpIds（读写）` | 不成立。`newConversation` 只清 `blank.settings.mcpEnabled = []`；读 `boundMcpIds.value` 的是 `createConvFromDraft`（合并进草稿 MCP 集） | `boundMcpIds` 作为 option 注入，边界落在 `createConvFromDraft` |
+| `submitTask` 用到 `mcpAvailable`/`skillAvailable`/`expertAgents` | 不直接用。`submitTask` 只 slice `taskDraft.mcpServers` / `taskDraft.skills`；三个可用集被**任务飞出层 computed**（`taskSkillFiltered`/`taskMcpFiltered`/`taskExpertFiltered`/`taskMcpCount`/`taskAgentLabel`）使用，函数定义在任务表单区（现约 566–611） | 飞出层 computed 与 `taskDraft` 一起留协调层，不随会话壳搬走；SCC B 仍通过 `taskDraft` 引用 |
+| `flushPendingDelete`/`scheduleUndoDelete` 用 `pageUnmounted`/`deferOnPage` | 不直接用。二者只碰 `undoDeleteTimer`/`undoDelete`/`UNDO_DELETE_MS`/`deleteConversationOnServer`；与生命周期的唯一连接是 `onBeforeUnmount` 调 `flushPendingDelete()` | 删除组搬入 composable 并暴露 `dispose()`（`flushPendingDelete` + `clearArmTimer`），协调层 `onBeforeUnmount` 转调 |
+| `sortMode` 被列为「排序动作」 | `sortMode` 是 `ref<ConvSortMode>`（约 1491），不是动作；动作是 `resortConversations`/`applyConversationOrder`/`restoreRecentSort`/`reloadConversations` | 状态留根按引用注入，动作随会话壳搬 |
+| SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **T2 暂停待决策**：按 §5.4 的裁剪边界（会话壳核心先搬、任务表单与飞出层留根）执行前，须先补 web 行为测试或明确接受风险 |
+
+**规模/安全网提示**：`apps/web` 现仅 `tests/bubble-text.test.ts`（3 用例）。T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，若无行为测试与可运行的 Chrome 冒烟，机械搬迁可能产生「编译通过但交互静默回归」。这是 T2 暂停的核心原因，不是技术不可行。
 
 ## 1. 全局约束与统一迁移手法
 
@@ -134,17 +145,17 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 
 ## 2. 提交粒度总表
 
-| 提交 | 内容 | 主要文件 |
-|---|---|---|
-| C0 | 文档状态回写 + 本计划 | `docs/**` |
-| C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` |
-| C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` |
-| C3 | T2 SCC A | 新增 1 个 composable + `useChatPageCore.ts` |
-| C4 | T3 SCC B | 新增 1 个 composable + `useChatPageCore.ts` |
-| C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts`（如需类型导出） |
-| C6–C9 | T5 低风险 UI：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue` + `ChatPage.vue` |
-| C10–C13 | T6 高风险 UI：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 |
-| C14+ | T7 CSS 下沉：按 CSS 注释块逐块提交 | 新增 `components/chat/*.css` + `chat-page.css` |
+| 提交 | 内容 | 主要文件 | 状态（2026-11-19） |
+|---|---|---|---|
+| C0 | 文档状态回写 + 本计划 | `docs/**` | ✅ `6709f4a`（本次对齐为 C0 增补） |
+| C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` | ✅ `37d8663` |
+| C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
+| C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 1 个 composable + `useChatPageCore.ts` | ⏸ 暂停：待 §5.6 前置条件 |
+| C4 | T3 SCC B | 新增 1 个 composable + `useChatPageCore.ts` | ⏳ 依赖 C3 的 `taskDraft` 边界落地 |
+| C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
+| C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
+| C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
+| C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
 
@@ -263,45 +274,60 @@ refactor(web): split chat settings scroll and reasoning composables
 
 ## 5. T2：拆 SCC A（会话壳 / 列表 / 右键 / 任务 / 删除撤销）
 
-### 5.1 目标
+### 5.1 目标（已修订）
 
-把互相成环的会话动作整体抽为一个 composable；共享状态继续留根，避免模块单例化。
+把互相成环的会话动作抽为 composable；共享状态留根避免单例化。
+**但字面量搬迁整个 §5.3 原始清单不可行**：实际符号 100+、与 SCC B 共享 `taskDraft`/飞出层，且 §0.3 列出 4 处事实偏差。
+因此采用设计文档 §4 允许的「共享状态留根后再拆」裁剪边界：**会话壳核心先搬，任务表单与飞出层留根**。
 
 ### 5.2 新增文件
 
 `apps/web/src/composables/chat/useChatConversationShell.ts`
 
-### 5.3 搬迁符号（按职责分组）
+### 5.3 搬迁符号（修订后的裁剪边界）
 
-- 任务：`tasks`、`showTaskForm`、`showTaskList`、`taskError`、`taskDraft`、`editingTaskId`、`cronUnparsed`、`freqDialogOpen`、`notifyDialogOpen`、`loadTasks`、`openTaskForm`、`closeTaskForm`、`submitTask`、`taskCardTipOf`、`taskConvTextOf`、`taskDotClassOf`、`taskHealthShortOf`、`taskKindTextOf`、`taskMarkerTextOf`、`taskNextRunTextOf`、`taskNextShortOf`、`taskRightShortOf`、`taskRunTextOf`、`taskStatusTextOf`
-- 列表/排序：`refreshConversationsQuiet`、`resortConversations`、`applyConversationOrder`、`reloadConversations`、`sortMode` 相关动作
-- 会话动作：`selectConversation`、`newConversation`、`createConvFromDraft`、`togglePin`、`toggleArchive`、`toggleMute`、`toggleFullAccess`、`toggleSendMode`、`duplicateCurrent`、`exportConversation`
-- 右键/删除：`ctxMenu`、`ctxMenuEl`、`ctxTarget`、`ctxTargetTask`、`ctxConfirm`、`openCtxMenu`、`openTaskCtxMenu`、`placeCtxMenu`、`closeCtxMenu`、`armCtxConfirm`、`ctxAnchorPos`、`askDeleteFromCtx`、`askCloseOthers`、`removeConversation`、`deleteConversationOnServer`、`flushPendingDelete`、`scheduleUndoDelete`、`undoRemoveConversation`、`undoDelete`、`undoDeleteTimer`、`clearArmTimer`
+**第一批搬入 composable（会话壳核心，内部成环、跨组依赖可注入）**：
+- 列表/排序动作：`refreshConversationsQuiet`、`resortConversations`、`convRank`、`CONV_ORDER_STEP`、`applyConversationOrder`、`restoreRecentSort`、`reloadConversations`
+- 会话动作：`selectConversation`、`newConversation`、`createConvFromDraft`
+- 右键/删除：`ctxMenu`、`ctxConfirm`、`ctxTarget`、`ctxAnchorPos`、`placeCtxMenu`、`openCtxMenu`、`openTaskCtxMenu`、`closeCtxMenu`、`armCtxConfirm`、`askDeleteFromCtx`、`askCloseOthers`、`removeConversation`、`deleteConversationOnServer`、`flushPendingDelete`、`scheduleUndoDelete`、`undoRemoveConversation`、`undoDelete`、`undoDeleteTimer`、`UNDO_DELETE_MS`
 
-### 5.4 必须留根/注入
+**留根（不随会话壳搬，注释原因）**：
+- 任务表单全组：`tasks`、`showTaskForm`、`showTaskList`、`taskError`、`taskDraft`、`editingTaskId`、`cronUnparsed`、`freqDialogOpen`、`notifyDialogOpen`、`loadTasks`、`openTaskForm`、`closeTaskForm`、`submitTask` 及全部 `task*Of` 别名与飞出层 computed（`taskSkillFiltered`/`taskMcpFiltered`/`taskExpertFiltered`/`taskMcpCount`/`taskAgentLabel`）——`taskDraft` 是 A↔B 桥接状态，飞出层与 MCP/Skills 组深度耦合（§0.3）；留根后 T3 无需跨文件访问。
+- 会话 toggle 与批量操作：`togglePin`、`toggleArchive`、`toggleMute`、`toggleFullAccess`、`toggleSendMode`、`duplicateCurrent`、`exportConversation`、`closeOtherConversations`、`clearConversationById`——仅调用 `closeCtxMenu`/`selectConversation`/`resortConversations`，它们从 composable 解构回协调层后同名自动解析，无需搬函数体。
+- 二次确认与重命名：`confirmDialog` 系列、`trapConfirmFocus`、`clearArmTimer`/`clearArmFor`、`onClearCurrentClick`、重命名 5 函数——与模板 refs 强绑定，UI 阶段（T5/T6）再处理。
+- 拖拽/键盘：`onConvDrag*`、`onConvKeydown`、`onConvDrop`、`moveConversation` 等——依赖 `convListEl`、`draggingId` 等模板/UI 状态。
+
+**模板 refs 留根按引用注入**：`ctxMenuEl`、`convListEl`、`confirmDialogEl`、`confirmPrimaryBtn`、`renameInputEl`、`setRenameInput`。
+
+### 5.4 必须留根/注入（修订）
 
 | 内容 | 原因 |
 |---|---|
-| `states`、`currentId`、`current`、`stateOf`、`persistedCount`、`seq` | 快照组、C 组、bootstrap、卸载清理共同读写 |
-| `showArchived`、`conversations` | bootstrap 与列表共同读写 |
-| `threadEl`、`convListEl`、`confirmDialogEl`、`confirmPrimaryBtn`、`renameInputEl`、`setRenameInput`、`ctxMenuEl` | 模板 refs，UI 抽取前由根同名暴露 |
-| `boundMcpIds` | A↔B 桥接，留协调层；本步作为 `Ref` 注入，T3 由 B 填充 |
-| `mcpAvailable` / `skillAvailable` / `expertAgents` getter | 任务表单读可用集，但 B 尚未拆；先用根同名 getter |
-| `closeTaskForm`、`loadMcp`、`loadSkills`、`watchBackgroundDone` | `selectConversation` 反向依赖 |
-| `bubblesFromStored`、`toStored`、`upgradeConversationDetail`、`syncOpenConversation`、`waitPendingPersists` | T0 返回值，直接注入 |
-| `applyConversationLocale`、`showSettingsError` | T1 返回值，直接注入 |
-| `pageUnmounted`、`deferOnPage` | 定时器/异步登记继续走统一清理 |
+| `states`、`currentId`、`current`、`stateOf`、`persistedCount`、`seq`、`blank` | 每页实例状态，快照组/C 组/bootstrap/卸载清理共用；按引用注入，禁止解包 |
+| `conversations`、`showArchived`、`sortMode` | bootstrap 与列表共用；`sortMode` 是 `ref` 不是动作（§0.3），按引用注入 |
+| `ctxMenuEl` 等模板 refs | UI 抽取前由根同名暴露 |
+| `boundMcpIds` | A↔B 桥接，留根；`createConvFromDraft` 作为 `Ref` 注入读取（非 `newConversation`，§0.3） |
+| `taskDraft` + 飞出层可用集 getter | 留根；T3 的 MCP/Skills 组仍直接读写同一份状态 |
+| `closeTaskForm`、`showTaskList`、`loadTasks`、`watchBackgroundDone`、`reportActiveConversation`、`clearTaskUnread` | `selectConversation`/`newConversation` 反向依赖（按回调注入） |
+| `loadMcp`、`loadSkills`、`queueScroll`、`syncOpenConversation`、`upgradeConversationDetail`、`applyConversationLocale` | 跨组回调/T1 返回值；注入箭头回调延迟求值 |
+| `messageTimes`、`bubblesFromStored`、`toStored`、`waitPendingPersists` | T0 返回值，直接注入 |
+| `showSettingsError`、`localizeToken`、`getApiErrorToken`、`syncConvLocal`、`uiLocale`、`tx`、`isUiLocale` | T1 返回值 + 根文案工具，直接注入 |
+| `dispose()` 出口 | 删除组 `undoDeleteTimer` + 留根的 `clearArmTimer` 由协调层 `onBeforeUnmount` 转调；不引 `pageUnmounted`/`deferOnPage`（§0.3 已澄清删除组不直接用它们） |
 
-### 5.5 成环调用的处理
+### 5.5 成环调用的处理（修订）
 
-`removeConversation -> closeCtxMenu / scheduleUndoDelete / selectConversation / newConversation`、`undoRemoveConversation -> selectConversation`、`selectConversation -> closeTaskForm / loadMcp / loadSkills / syncOpenConversation` 全部保留为 composable 内部互调；跨到根/T0/T1 的调用只通过 options 注入。禁止把其中任何一个函数单独再抽一次。
+搬入组内部互调：`removeConversation -> closeCtxMenu / scheduleUndoDelete / selectConversation / newConversation`、`undoRemoveConversation -> selectConversation`、`applyConversationOrder -> resortConversations / closeCtxMenu(经 restoreRecentSort)` 全部保留为 composable 内互调。
+跨到根/T0/T1 的调用（`closeTaskForm`/`loadMcp`/`loadSkills`/`syncOpenConversation`/`upgradeConversationDetail`/`applyConversationLocale`/`queueScroll`/`watchBackgroundDone`/`reportActiveConversation`）只通过 options 注入回调。
+留根函数（`togglePin` 等）调用搬入函数时，靠协调层同名解构自动解析，不另建薄代理。
+禁止把 `selectConversation`/`newConversation` 等成环成员单独再抽一次。
 
-### 5.6 验证重点
+### 5.6 验证重点（开工前置条件）
 
-- 任务表单新建/编辑/打开结果会话；通知通道与 cron 面板正常。
-- 拖拽排序、置顶分组、归档/免打扰/发送模式切换。
+- **前置（T2 暂停原因）**：`apps/web` 现仅 3 个测试，无会话壳行为安全网。开工前二选一：① 为 `selectConversation` / `removeConversation` / `undoRemoveConversation` / `applyConversationOrder` 补 vitest + Vue Test Utils 用例（推荐）；② 明确书面接受「无行为测试守护」的风险。Chrome 冒烟还需先解决 MCP 浏览器实例冲突并起 dev server。
+- 会话切换后台流不中断；`selectConversation` 不写错对话；草稿创建带入 MCP/技能/发送模式。
+- 删除撤销 5s 计时与 `dispose()` 清理；清空竞态；切对话后后台流继续写原状态。
+- 列表排序、置顶分组、归档/免打扰/发送模式切换（这些留根但依赖解构回的会话壳函数）。
 - 右键键盘 `Shift+F10` / 菜单键、点击外部关闭、Esc 优先级。
-- 删除撤销 5s 计时与 `clearArmTimer` 清理；清空竞态。
 - 每页实例状态不跨路由复用。
 - 通用验证命令 + Chrome 清单。
 
