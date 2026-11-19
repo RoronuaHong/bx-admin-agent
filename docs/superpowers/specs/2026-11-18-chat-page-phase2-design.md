@@ -1,7 +1,7 @@
 # ChatPage.vue 阶段 2 拆分设计（P1-1 第二阶段）
 
 - 日期：2026-11-18
-- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1 已提交，T2（SCC A 会话壳）已实现待提交（2026-11-19，详见实施计划 §0.3/§5.6）
+- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1 已提交，T2（SCC A 会话壳）已提交 `23c9d28`（2026-11-19，详见实施计划 §0.3/§5.6）
 - 对应阶段 1：`docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`、`docs/superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md`
 - 细化实施计划：`docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md`
 - 基线提交：`5e962ca refactor(web): extract ChatPage core and harden frontend`
@@ -71,7 +71,7 @@ useChatPageCore.ts（协调层）
 > ② `boundMcpIds` 由 `createConvFromDraft` 读取，`newConversation` 只清 `blank.settings.mcpEnabled`；
 > ③ `mcpAvailable`/`skillAvailable`/`expertAgents` 不出现在 `submitTask`，而在任务飞出层 computed（`taskSkillFiltered` 等）使用；
 > ④ 删除组的 `flushPendingDelete`/`scheduleUndoDelete` 不直接用 `pageUnmounted`/`deferOnPage`，仅在 `onBeforeUnmount` 经 `flushPendingDelete()` 连接。
-> 另：SCC A 实际 100+ 符号、与 SCC B 共享 `taskDraft`/飞出层，因此 T2 采用裁剪边界（只搬会话壳核心）并先补 33 个 web 行为测试；拆分已实现待提交，任务表单与飞出层继续留根。
+> 另：SCC A 实际 100+ 符号、与 SCC B 共享 `taskDraft`/飞出层，因此 T2 采用裁剪边界（只搬会话壳核心）并先补 33 个 web 行为测试；拆分已提交 `23c9d28`，任务表单与飞出层继续留根。
 
 结论：**禁止按“每个职责一个文件”逐组提交**。阶段 2 的提交单元是 SCC，不是原来的小职责组。
 

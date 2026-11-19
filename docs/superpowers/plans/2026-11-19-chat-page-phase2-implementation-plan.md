@@ -1,13 +1,13 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1 已提交，T2（SCC A 会话壳）已实现待提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1 已提交，T2（SCC A 会话壳）已提交 `23c9d28`**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
   - T0 `useChatPersistence` + `chat-page-types.ts` 提交 `37d8663`（`useChatPageCore.ts` 6269→5959 行）。门禁全绿：build / type-check / web test / server test / diff / 单 chunk。
   - T1 SCC C 拆三件（`useChatModelSettings` / `useChatThreadScroll` / `useChatReasoningUI`）提交 `3f6d81c`（协调层再降约 340 行）。门禁全绿。
-  - T2（SCC A）**已实现待提交**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
+  - T2（SCC A）**已提交 `23c9d28`**：先补齐 33 个 web 行为测试与 AST 依赖/TDZ 审计，再按裁剪边界把会话壳（排序/切换/草稿建会话/右键/删除撤销）迁入 `useChatConversationShell.ts`；`useChatPageCore.ts` 降到 5345 行。拆分后 33 个 web 测试、全仓 type-check、build、978 个 server 测试全绿；provide 41 键契约加固仍留 T4。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -82,7 +82,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 | `submitTask` 用到 `mcpAvailable`/`skillAvailable`/`expertAgents` | 不直接用。`submitTask` 只 slice `taskDraft.mcpServers` / `taskDraft.skills`；三个可用集被**任务飞出层 computed**（`taskSkillFiltered`/`taskMcpFiltered`/`taskExpertFiltered`/`taskMcpCount`/`taskAgentLabel`）使用，函数定义在任务表单区（现约 566–611） | 飞出层 computed 与 `taskDraft` 一起留协调层，不随会话壳搬走；SCC B 仍通过 `taskDraft` 引用 |
 | `flushPendingDelete`/`scheduleUndoDelete` 用 `pageUnmounted`/`deferOnPage` | 不直接用。二者只碰 `undoDeleteTimer`/`undoDelete`/`UNDO_DELETE_MS`/`deleteConversationOnServer`；与生命周期的唯一连接是 `onBeforeUnmount` 调 `flushPendingDelete()` | 删除组搬入 composable；内部 `let` 不导出，协调层 `onBeforeUnmount` 仍转调 `flushPendingDelete()`（不额外造 `dispose()`） |
 | `sortMode` 被列为「排序动作」 | `sortMode` 是 `ref<ConvSortMode>`（约 1491），不是动作；动作是 `resortConversations`/`applyConversationOrder`/`restoreRecentSort`/`reloadConversations` | 状态留根按引用注入，动作随会话壳搬 |
-| SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **按 §5.4 裁剪边界落地**：只搬会话壳核心（30 个跨组依赖已 AST 盘点），任务表单与飞出层留根；T2 已实现待提交 |
+| SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **按 §5.4 裁剪边界落地**：只搬会话壳核心（30 个跨组依赖已 AST 盘点），任务表单与飞出层留根；T2 已提交 `23c9d28` |
 
 **规模/安全网提示**：T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，机械搬迁可能产生「编译通过但交互静默回归」。因此 T2 开工前已补 `chat-composables.test.ts` + `chat-shell.test.ts`（共 33 用例），并以 AST 依赖清单/TDZ 注入规则约束拆分；Chrome 冒烟因浏览器实例冲突仍为非阻塞后续项。
 
@@ -150,7 +150,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C0 | 文档状态回写 + 本计划 | `docs/**` | ✅ `6709f4a`（本次对齐为 C0 增补） |
 | C1 | T0 `useChatPersistence` | 新增 composable + `useChatPageCore.ts` | ✅ `37d8663` |
 | C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
-| C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已实现待提交：33 web 测试 + 全门禁绿 |
+| C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已提交 `23c9d28`：33 web 测试 + 全门禁绿 |
 | C4 | T3 SCC B | 新增 1 个 composable + `useChatPageCore.ts` | ⏳ 依赖 C3 的 `taskDraft` 边界落地 |
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
 | C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
