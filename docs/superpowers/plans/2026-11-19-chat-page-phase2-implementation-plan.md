@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/C6/C7 已提交，T5 C8（ConfirmDialog）已实现待提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/C6/C7 已提交，T5 C8（ConfirmDialog）已提交 `dbb4569`**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -12,7 +12,7 @@
   - T4（provide 契约加固）已提交 `dab6470`：新增 `apps/web/tests/bubble-context-contract.test.ts`（3 个契约测试）锁 provide/interface/ChatBubble 三者 41 键顺序与 guard 存在；`useChatPageCore.ts` 原位抽 `bubbleContext`，加 `satisfies BubbleContext` 与 DEV 数量断言，`bubble-context.ts` 无需改动。web 测试 42→45，全仓 type-check、连续 3 次 web type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
   - T5 C6（DoneToast）已提交 `8631510`：新增 `components/chat/DoneToast.vue`，Teleport 与 done-toast DOM 原样搬入，props `doneToast` + emits `view/close`；根层保留 `doneToast` ref、`doneToastTimer`、`openDoneToast` 与关闭清理。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - T5 C7（ArtifactPreviewModal）已提交 `aa556d0`：新增 `components/chat/ArtifactPreviewModal.vue`，props `previewHtml/previewLoading/downloadUrl` + emits `close`；下载 URL 由根层基于 `workspaceDownloadUrl(currentId, previewHtml.path)` 计算后传入，iframe `sandbox="allow-scripts"` 不变。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
-  - T5 C8（ConfirmDialog）已实现待提交：新增 `components/chat/ConfirmDialog.vue`，Teleport/DOM 与 Esc、Tab handler 原样搬入；props `confirmDialog`，emits `confirm/cancel/trap`。子组件 `defineExpose` 暴露 `confirmDialogEl`/`confirmPrimaryBtn`，根层用函数 ref 桥接回协调层，`trapConfirmFocus` 与 body overflow watch 仍留根。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
+  - T5 C8（ConfirmDialog）已提交 `dbb4569`：新增 `components/chat/ConfirmDialog.vue`，Teleport/DOM 与 Esc、Tab handler 原样搬入；props `confirmDialog`，emits `confirm/cancel/trap`。子组件 `defineExpose` 暴露 `confirmDialogEl`/`confirmPrimaryBtn`，根层用函数 ref 桥接回协调层，`trapConfirmFocus` 与 body overflow watch 仍留根。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -160,7 +160,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C5 | T4 provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | ✅ 已提交 `dab6470`：web 45/45 + 全门禁绿，bubble-context.ts 无需改动 |
 | C6 | T5 `DoneToast.vue` | 新增 `components/chat/DoneToast.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `8631510`：Teleport/DOM 原样搬入，web 45/45 + 单 chunk |
 | C7 | T5 `ArtifactPreviewModal.vue` | 新增 `components/chat/ArtifactPreviewModal.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `aa556d0`：sandbox 不变，downloadUrl 根层计算，web 45/45 + 单 chunk |
-| C8 | T5 `ConfirmDialog.vue` | 新增 `components/chat/ConfirmDialog.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已实现待提交：expose ref 桥接，focus trap/overflow 留根，web 45/45 + 单 chunk |
+| C8 | T5 `ConfirmDialog.vue` | 新增 `components/chat/ConfirmDialog.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `dbb4569`：expose ref 桥接，focus trap/overflow 留根，web 45/45 + 单 chunk |
 | C9 | T5 `ChatThread.vue` | 新增 `components/chat/ChatThread.vue` + `ChatPage.vue` | ⏳ 按组件单提交 |
 | C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
