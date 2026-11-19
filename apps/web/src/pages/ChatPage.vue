@@ -28,6 +28,7 @@ const {
   DoneToast,
   ArtifactPreviewModal,
   ConfirmDialog,
+  ChatThread,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,
@@ -2140,76 +2141,33 @@ const {
       </section>
 
       <!-- tabindex="-1"：给「回到顶部」点击后的焦点落点（不进入 Tab 序列），也方便键盘直接滚动对话区。 -->
-      <div
-        v-show="!showTaskForm && !showTaskList"
-        ref="threadEl"
-        class="thread"
-        tabindex="-1"
+      <ChatThread
+        :ref="(el: any) => { threadEl = el?.threadEl ?? null; }"
+        :visible="!showTaskForm && !showTaskList"
+        :booting="booting"
+        :show-skeleton="showSkeleton"
+        :bubble-count="current.bubbles.length"
+        :visible-bubbles="visibleBubbles"
+        :model-switch-hint="modelSwitchHint"
+        :current-expert="currentExpert"
+        :expert-starters="expertStarters"
+        :latest-alert-marker-id="latestAlertMarkerId"
+        :open="outlineOpen"
+        :outline-items="conversationOutline"
+        :active-outline-id="activeOutlineId"
+        :outline-band="OUTLINE_ACTIVE_BAND"
+        :pinned-outline-id="pinnedOutlineId"
+        :is-mobile="isMobile"
+        :sidebar-open="sidebarOpen"
         @scroll="onThreadScroll"
-        @wheel.passive="onOutlineUserScrollIntent"
-        @touchstart.passive="onOutlineUserScrollIntent"
-        @keydown="onOutlineUserScrollIntent"
-      >
-        <!-- 首屏慢加载才亮骨架；快加载时 booting 期间留空、不闪空态，直接等真实内容出现。 -->
-        <div v-if="showSkeleton" class="boot-skeleton" aria-hidden="true">
-          <div class="boot-skeleton__row boot-skeleton__row--agent"></div>
-          <div class="boot-skeleton__row boot-skeleton__row--user"></div>
-          <div class="boot-skeleton__row boot-skeleton__row--agent boot-skeleton__row--short"></div>
-        </div>
-        <div v-else-if="!booting && !current.bubbles.length && currentExpert" class="expert-home">
-          <div class="expert-home__mark" aria-hidden="true">{{ currentExpert.icon }}</div>
-          <h2 class="expert-home__title">{{ agentText(currentExpert.label, uiLocale) }}</h2>
-          <p class="expert-home__desc">{{ agentText(currentExpert.description, uiLocale) }}</p>
-          <div v-if="expertStarters.length" class="expert-home__prompts">
-            <button
-              v-for="prompt in expertStarters"
-              :key="prompt"
-              type="button"
-              class="expert-home__prompt"
-              @click="askStarter(prompt)"
-            >
-              {{ prompt }}
-            </button>
-          </div>
-        </div>
-        <div v-else-if="!booting && !current.bubbles.length" class="empty">
-          {{ tx("想聊点什么？", "Want to chat about something?", "Quer conversar sobre algo?", "कुछ बात करना चाहते हैं?") }}
-        </div>
-        <div v-if="modelSwitchHint" class="model-switch-hint" role="status">
-          <span class="model-switch-hint__icon" aria-hidden="true">i</span>
-          <span>{{ modelSwitchHint }}</span>
-          <button type="button" class="model-switch-hint__close" :aria-label="tx('关闭', 'Dismiss', 'Fechar', 'बंद करें')" @click="modelSwitchHint = ''">×</button>
-        </div>
-        <button
-          v-if="current.bubbles.length > visibleBubbles.length"
-          type="button"
-          class="thread-earlier"
-          @click="showEarlierMessages"
-        >
-          {{ tx("显示更早的消息", "Show earlier messages", "Mostrar mensagens anteriores", "पुराने संदेश दिखाएं") }}
-        </button>
-        <ChatBubble v-for="b in visibleBubbles" :key="b.id" :bubble="b" :is-latest="b.id === latestAlertMarkerId" />
-          <!-- 回到顶部：挂在对话滚动容器内（滚动容器由组件自动识别），长对话翻久了可一键回顶；
-             avoid-selector 让按钮抬到底部输入区上方，不压住输入框与发送键。
-             threshold 用 120（约一个气泡高）：对话区可滚高度常常只有一两百像素（几轮对话），
-             沿用页面级的 240 会几乎不出现。 -->
-        <BackToTop :threshold="120" avoid-selector=".composer" focus-target=".thread" />
-
-        <!-- 对话大纲浮层（docs/conversation-outline-panel-plan.md）：右缘悬浮，列出本会话用户指令，点击跳转。
-             移动端打开侧栏抽屉时隐藏：抽屉 z-60 与本浮层同档且 DOM 靠后，同 z 会盖住遮罩，直接隐藏最稳。
-             跳转逻辑在页面（要扩 threadWindow + 滚动 .thread），组件只管展示与高亮跟踪。 -->
-        <ConversationOutline
-          v-show="!(isMobile && sidebarOpen)"
-          v-model:open="outlineOpen"
-          :items="conversationOutline"
-          :active-id="activeOutlineId"
-          :band="OUTLINE_ACTIVE_BAND"
-          :pinned-id="pinnedOutlineId"
-          @jump="jumpToOutline"
-          @active="activeOutlineId = $event"
-        />
-
-      </div>
+        @outline-user-scroll-intent="onOutlineUserScrollIntent"
+        @show-earlier="showEarlierMessages"
+        @dismiss-model-hint="modelSwitchHint = ''"
+        @ask-starter="askStarter"
+        @jump="jumpToOutline"
+        @active="activeOutlineId = $event"
+        @update:open="outlineOpen = $event"
+      />
 
       <footer v-show="!showTaskForm && !showTaskList" class="composer">
         <div v-if="current.queue.length" class="queue" role="region" :aria-label="tx('待发队列', 'Message queue', 'Fila de envio', 'प्रेषण कतार')">
