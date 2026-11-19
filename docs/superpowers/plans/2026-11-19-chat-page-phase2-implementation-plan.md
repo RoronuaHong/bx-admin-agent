@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645` 已提交，C15 前置方案见 §10.7**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 `8d0a645`、C15 `d65b575` 已提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -25,6 +25,7 @@
   - **CSS 作用域回归修复 `f702e85`**：C6–C13 抽出的组件与 Teleport 内容不再带 ChatPage 的 scoped 属性，导致 `chat-page.css` 的 `.task-panel[data-v-…]` 等规则全部失配。去掉 `ChatPage.vue` 的 `scoped`，把 5 处 `:deep()` 转为普通后代选择器，并在 C13 契约里锁死该约束；Chrome 实测任务表单、`sidebar`、`composer` 计算样式恢复。web 63/63、全仓 type-check/build/978 server 测试全绿，单 ChatPage chunk。
   - **UiSelect 注册修复 `1d441cd`**：`ChatTaskPanel.vue` 模板中两处 `<UiSelect>` 只依赖 ChatPage core 的返回值，子组件作用域无法解析；补 `import UiSelect from "../UiSelect.vue"` 并在契约里锁定 import 与两处使用。逐个审计 8 个抽取组件的大写标签，无其它未注册组件；Chrome 打开频率/通知弹窗后两个 `UiSelect` 正常渲染，warn/error 为零。全门禁全绿。
   - T7 C14（侧栏品牌 CSS 下沉）**已提交 `8d0a645`**：新增 `components/chat/ChatSidebarList.css`，把 `chat-page.css` 的侧栏品牌/助手菜单连续块、移动端 inner 规则、caret 展开态共 3 处搬到组件 scoped 样式；`.sidebar` 骨架、抽屉/遮罩/折叠、顶栏 `.brand`、`.primary-btn` 等共享类留根。C11 契约新增 CSS 归属用例，web 63→64。Chrome 实测桌面 256px、移动抽屉 320px/inner 100%、助手菜单旋转 180°、共享按钮/输入样式正常，warn/error 为零；全仓 type-check/build/978 server 测试全绿，单 ChatPage chunk。
+  - T7 C15（定时任务卡片 CSS 下沉）**已提交 `d65b575`**：把 `.task-group*` 卡片规则、`.conv-item--run` / `.conv-run-at` 与 `.task-group__caret.open` 追加进 `ChatSidebarList.css`；实施前逐个核对 10 个选择器仅出现在侧栏模板与根 CSS，`.group-head*` / `.task-groups*` / `.conv-dot*` / `.task-page*` / `.primary-btn*` 全部留根（修正 §10.2 旧锚点映射）。复用 C11 CSS 归属 case，web 仍 64/64。Chrome 实测任务分组头 13px/7px padding、展开箭头旋转 90°、子会话缩进 26px、时间 10px、状态点根 CSS 着色与右键入口正常，warn/error 为零；全门禁全绿，单 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -1385,7 +1386,7 @@ Chrome 模拟路径：
 style(web): move task group card styles into ChatSidebarList
 ```
 
-- 状态：前置方案已写完，待用户确认后进入红测与实施。
+- 实际代码提交：`d65b575`；前置方案文档提交：`f01ae3a`。红测先行（组件 CSS 缺规则报红），实施后 web 仍 64/64 + 全门禁全绿；Chrome 6 路径均已实测通过。
 
 ## 11. 全阶段收口门禁
 
