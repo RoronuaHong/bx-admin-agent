@@ -314,6 +314,15 @@ refactor(web): split chat settings scroll and reasoning composables
 | `showSettingsError`、`localizeToken`、`getApiErrorToken`、`syncConvLocal`、`uiLocale`、`tx`、`isUiLocale` | T1 返回值 + 根文案工具，直接注入 |
 | `dispose()` 出口 | 删除组 `undoDeleteTimer` + 留根的 `clearArmTimer` 由协调层 `onBeforeUnmount` 转调；不引 `pageUnmounted`/`deferOnPage`（§0.3 已澄清删除组不直接用它们） |
 
+**AST 精确依赖清单（2026-11-19 实测，权威）**：对 §5.3 搬入的 23 个符号做 TypeScript AST 分析，剔除局部变量后得到跨组依赖共 **30 个**（去重）：
+`AGENT_ID`、`blank`、`boundMcpIds`、`clearTaskUnread`、`closeTaskForm`、`conversations`、`ctxConfirm`、`ctxMenu`、`ctxMenuEl`、`ctxTriggerEl`、`current`、`currentId`、`draftSendMode`、`loadMcp`、`loadSkills`、`loadTasks`、`messageTimes`、`persistedCount`、`reportActiveConversation`、`showArchived`、`showTaskForm`、`showTaskList`、`sidebarOpen`、`sortMode`、`stateOf`、`states`、`tx`、`uiLocale`、`undoDelete`、`watchBackgroundDone`。
+其中 `ctxMenu`/`ctxConfirm`/`ctxMenuEl`/`ctxTriggerEl`/`undoDelete` 随会话壳一起进入 composable 内部（不是注入项）；其余为注入/留根项。
+
+**注入方式规则（TDZ 实测）**：以下 8 个依赖定义在注入调用点之后，必须按对应方式传，禁止直接按值传：
+- `function` 声明（提升安全，但统一用箭头回调更稳）：`clearTaskUnread`、`loadMcp`、`loadSkills`、`messageTimes`、`reportActiveConversation`、`watchBackgroundDone` → 注入 `(...args) => fn(...args)`。
+- `const` 响应式引用：`boundMcpIds`（computed）→ 注入 `() => boundMcpIds.value` getter 或传 ref；`draftSendMode`（ref）→ 传 ref 本身或 `() => draftSendMode.value`。
+其余 22 个定义在注入点之前，可按引用/值直接注入。
+
 ### 5.5 成环调用的处理（修订）
 
 搬入组内部互调：`removeConversation -> closeCtxMenu / scheduleUndoDelete / selectConversation / newConversation`、`undoRemoveConversation -> selectConversation`、`applyConversationOrder -> resortConversations / closeCtxMenu(经 restoreRecentSort)` 全部保留为 composable 内互调。
@@ -323,7 +332,8 @@ refactor(web): split chat settings scroll and reasoning composables
 
 ### 5.6 验证重点（开工前置条件）
 
-- **前置（T2 暂停原因）**：`apps/web` 现仅 3 个测试，无会话壳行为安全网。开工前二选一：① 为 `selectConversation` / `removeConversation` / `undoRemoveConversation` / `applyConversationOrder` 补 vitest + Vue Test Utils 用例（推荐）；② 明确书面接受「无行为测试守护」的风险。Chrome 冒烟还需先解决 MCP 浏览器实例冲突并起 dev server。
+- **前置已完成（2026-11-19）**：会话壳行为安全网已建立——`apps/web/tests/chat-shell.test.ts`（12 个特征测试，通过 mock 实例化真实 `useChatPageCore`）锁定：会话切换/流式保护、草稿创建设置继承与落库、删除撤销 5s 窗口与定时器、右键菜单状态机；并用 api spy「调用链探针」断言 `selectConversation` 触发 loadMcp/loadSkills/syncOpenConversation/upgradeConversationDetail/reportActiveConversation 的下游 api 调用，防拆分漏注入。连同 T0/T1 测试共 31 用例全绿。**T2 拆分后必须重跑这 31 个测试做行为守恒校验**（提交 `4958a53`/`f06712e`/`b80e7db`）。
+- Chrome 冒烟仍需先解决 MCP 浏览器实例冲突并起 dev server（非阻塞项）。
 - 会话切换后台流不中断；`selectConversation` 不写错对话；草稿创建带入 MCP/技能/发送模式。
 - 删除撤销 5s 计时与 `dispose()` 清理；清空竞态；切对话后后台流继续写原状态。
 - 列表排序、置顶分组、归档/免打扰/发送模式切换（这些留根但依赖解构回的会话壳函数）。
