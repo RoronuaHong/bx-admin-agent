@@ -882,11 +882,147 @@ refactor(web): extract ChatSidebarList from ChatPage
 
 ### 9.3 C12 `MessageComposer.vue`
 
-- 源块：约 2282–2770 的 `<footer class="composer">`。
-- props：`modelValue`（对应 `current.input`）、`queue`、`pendingImages`、`pendingDocs`、`canSend`、`busy`、`panels`、`models` 等；emits：`update:modelValue`、`send`、`stop`、`pick-files`、`toggle-tools` 等。
-- 必须使用 `v-model` 契约，不复制 ref 为普通值；`fileInput`、`promptBoxEl`、`inputEl`、`stopBtnRef`、`toolsRoot` 通过 `defineExpose` 暴露。
-- Teleport 飞出层、Esc、工具面板互斥、发送模式快捷入口行为不变。
-- 验证：普通发送、停止、续传、附件、工具菜单、MCP/技能/专家面板、输入框 autogrow 与焦点。
+#### 9.3.1 目标与边界
+
+- 目标：只把 `ChatPage.vue:1814–2302` 的 `<footer v-show="!showTaskForm && !showTaskList" class="composer">` 整段搬进新组件，**输入状态机、工具面板状态机、发送/停止、队列、附件、resize、全局 Esc/外部点击全部留根**。
+- 源块定位以符号为准，不依赖行号；旧计划的 `1505–2153` / `2282–2770` 均已过时，当前 footer 到 `</footer>` 结束，后面的 `.copy-toast` 和 `</main>` 留根。
+- 本步**不动 CSS**；`.composer*` / `.queue*` / `.pending` / `.tools-*` / `.mcp-*` 规则继续留在 `chat-page.css`，T7 再下沉。
+- 修正旧计划两处偏差：
+  1. `onInlineSubmitKeydown` 属于任务表单（C13），不在 footer；C12 只涉及 `onKeydown`、`autoGrow`、`onEscTools`、`onOutsideTools`。
+  2. `inputEl` 是 core 里由 `promptBoxEl.value?.inputEl` 推导的 computed，不单独 expose；子组件 expose `promptBoxEl` 即可。
+  3. 工具飞出层不是 Teleport，而是 `.tools-menu-box` 内的普通 `v-if` 面板；不新增 Teleport。
+
+#### 9.3.2 当前依赖基线（实施前已核对）
+
+| 位置 | 现状 | C12 处理 |
+|---|---|---|
+| DOM 源块 | `<footer>` 单根节点，内部依次是 queue、pending 图片、pending 文档、图片警告、`composer-row`、`PromptBox` 三个 slot | 整段原样搬入，根节点仍是 `<footer class="composer">`，`v-show` 改由 `visible` prop 控制 |
+| 输入状态 | `current.input`、`canSend`、`current.sending`、队列/附件、settings | 传 `current: ConvState` + `modelValue` + `canSend`；`current.input` 用 `update:modelValue` emit 回写 |
+| DOM refs | `fileInput`、`promptBoxEl`、`stopBtnRef`、`toolsRoot` 均被根层/全局监听读取 | 子组件 `defineExpose` 四个 ref，根层一个函数 ref 桥接；`inputEl` 继续由 core computed 从 `promptBoxEl` 推导 |
+| 工具面板 | `toolsMenuOpen` / `skillOpen` / `mcpOpen` / `expertOpen`；搜索词、列表、busy、错误、add form 状态全在 core | 全部 props + emits；面板开合、hover 预开、焦点策略仍由根函数决定 |
+| 全局监听 | `onEscTools` / `onOutsideTools` 在 core 注册；`onOutsideTools` 依赖 `toolsRoot.contains()` | 不搬；`toolsRoot` 桥接失效会导致面板点外面/Esc 不收起 |
+| 键盘/resize | `onKeydown` 处理 Enter/Shift+Enter/斜杠等；`autoGrow` 跟输入高度；grip `mousedown.prevent` / `dblclick` | 事件 emit 回根；组件不改键盘逻辑、不复制高度算法 |
+| 文件选择 | `<input id="chat-file-input" ref="fileInput" hidden multiple accept=...>`；工具菜单内 `fileInput?.click(); closeToolsPanels()` | input 留在组件内，子组件本地 `fileInput.value?.click()`，另 emit `close-tools-panels` |
+| 根解构 | C11 后 656 个同名解构 | 新增 `MessageComposer`，656 → 657 |
+
+#### 9.3.3 组件契约
+
+**新增 `apps/web/src/components/chat/MessageComposer.vue`**
+
+Props（39 个）：
+
+| 分组 | props |
+|---|---|
+| 可见性/会话 | `visible`、`current`、`modelValue`、`canSend` |
+| 输入展示 | `imagesUnsupported`、`composerPlaceholder`、`minHeight`、`maxHeight` |
+| 文件/工具开关 | `toolsMenuOpen`、`skillOpen`、`mcpOpen`、`expertOpen`、`currentSendMode`、`currentExpert`、`uiLocale`、`agentId`、`enabledMcpCount` |
+| 技能面板 | `skillQuery`、`skillAvailable`、`skillFiltered`、`skillBusy`、`skillAddOpen`、`skillError`、`searchAutofocus`、`iconStyle`、`iconChar` |
+| MCP 面板 | `mcpQuery`、`mcpAvailable`、`mcpFiltered`、`mcpPanelRows`、`mcpBusy`、`boundMcpIds`、`mcpReconnecting`、`canClearOptionalMcp`、`mcpAddOpen`、`mcpError`、`mcpDescText` |
+| 助手面板 | `expertQuery`、`expertFiltered` |
+
+`current` 用 `ConvState`（`chat-page-types.ts`），一次传入 `queue` / `pendingImages` / `pendingDocs` / `settings` / `sending` / `input`，避免复制一堆窄类型。`minHeight` / `maxHeight` 分别对应 `COMPOSER_BASE` / `COMPOSER_AUTO_MAX`。`iconStyle` / `iconChar` / `mcpDescText` 作为函数 prop；`agentText` 子组件直接 import。
+
+Emits（38 个）：
+
+| 类别 | emits |
+|---|---|
+| 输入 | `update:modelValue`、`composer-input`、`keydown` |
+| 队列/附件 | `move-queue-item(index, dir)`、`edit-queue-item(index)`、`remove-queue-item(index)`、`send-queue-item-now(index)`、`remove-pending-image(id)`、`remove-pending-doc(id)`、`pick-files(event)` |
+| 输入区 UI | `start-composer-resize(event)`、`reset-composer-size`、`toggle-tools-menu`、`close-tools-panels`、`toggle-send-mode`、`clear-expert` |
+| 工具面板开合 | `open-skill-panel`、`open-mcp-panel`、`open-expert-panel`、`hover-flyout(kind)` |
+| 技能 | `update:skillQuery`、`toggle-skill(dir, enabled)`、`skill-created`、`toggle-skill-add`、`cancel-skill-add`、`clear-skill-selection` |
+| MCP | `update:mcpQuery`、`toggle-mcp(id, enabled)`、`reconnect-mcp(id)`、`remove-custom-mcp(id)`、`mcp-created`、`toggle-mcp-add`、`cancel-mcp-add`、`clear-mcp-selection` |
+| 助手 | `update:expertQuery`、`pick-expert(agent)` |
+| 发送/停止 | `stop`、`send` |
+
+模板不变量：
+
+- `<footer v-show="visible" class="composer">` 为单根；`PromptBox` 的 `#top` / `#toolbar-left` / `#toolbar-right` 三个 slot 名称、顺序与内容层级不变。
+- `PromptBox` 绑定：`v-model="modelValue"` 改为 `:model-value` + `@update:model-value` 转发；`id` / `name` / `rows` / `:min-height` / `:max-height` / `:pad-top` / `:placeholder` / `:hint` 原样；`@input` 改为 `emit('composer-input', $event)`，`@keydown` 改为 `emit('keydown', $event)`。
+- `ref="fileInput"` / `ref="promptBoxEl"` / `ref="stopBtnRef"` / `ref="toolsRoot"` 原样保留；`defineExpose({ fileInput, promptBoxEl, stopBtnRef, toolsRoot })`。
+- 工具菜单内 `fileInput?.click(); closeToolsPanels()` 改为子组件本地 `fileInput.value?.click(); emit('close-tools-panels')`；`input accept/multiple/hidden/name` 不变。
+- 三处 `ToolsSearch` 用 `v-model` 契约：`skillQuery` / `mcpQuery` / `expertQuery` 分别配 `update:skillQuery` / `update:mcpQuery` / `update:expertQuery`；`autofocus` 继续由 `searchAutofocus` prop 决定。
+- `SkillAddForm` / `McpAddForm` 的 `@created` / `@cancel` 改为 emit；`skillAddOpen` / `mcpAddOpen` 不搬进子组件状态。
+- 所有 `@click.stop`（专家 chip 取消、MCP 重连/移除）保留；不新增 `.stop`、不改键盘冒泡。
+- `tx()` 由 `getUiLocale()` 在子组件本地生成；`agentText` 直接 import。
+
+#### 9.3.4 执行顺序
+
+1. 开工前核对 `HEAD`、工作区干净、根解构 657 的前置 656，确认 `MessageComposer.vue` 不存在。
+2. **先加红测** `apps/web/tests/message-composer-contract.test.ts`（5 个源码契约用例，web 53 → 58）：
+   - 结构锁：`<footer v-show="visible" class="composer">`、PromptBox 三个 slot、`#chat-file-input` 的 `accept`/`multiple`/`hidden`、`.queue` / `.pending` / `.tools-flyout`、四个 ref。
+   - props 锁：39 个 prop 名字逐项一致；不含 `showTaskForm` / `showTaskList` / `inputEl`。
+   - emits 锁：38 个 emit 名字逐项一致；含 `update:modelValue` 与三处 `update:*Query`。
+   - expose/副作用锁：`defineExpose({ fileInput, promptBoxEl, stopBtnRef, toolsRoot })`；组件内无 `addEventListener` / `removeEventListener` / `AbortController` / `setTimeout`。
+   - 接线锁：core 返回且 ChatPage 解构 `MessageComposer`，根解构计数 657；根层仍注册 `onEscTools`/`onOutsideTools`，footer 原始块不再出现在 ChatPage；根层保留 `copy-toast`。
+3. 新增组件，只搬 DOM 与文案；38 个动作全部换成 `emit(...)`。
+4. `useChatPageCore.ts` import/return 加 `MessageComposer`；`ChatPage.vue` 解构加同名项，替换 1814–2302 原始 footer。
+5. 跑 9.3.6 门禁；红测转绿后看 diff，确认 CSS、全局监听、发送/工具函数体零改动。
+6. 代码单独提交；再用独立文档提交回写 commit hash。
+
+#### 9.3.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| `modelValue` / `composer-input` / `keydown` 漏接 | 输入不更新、高度不增长、Enter 不发送 | 高 | 三事件显式 emit；契约测试锁名字；模拟输入→Enter→发送→停止 |
+| 四个 DOM ref 桥接失效 | `fileInput.click()`、`inputEl` 聚焦、`stopBtnRef` 焦点归还、`toolsRoot.contains()` 全失效 | 高 | 一个函数 ref 同时桥接四个 expose；模拟文件选择、停止后聚焦、工具面板外部点击/Esc |
+| `toolsRoot` 桥接错导致全局监听误判 | 工具面板点外面不关、Esc 不关，或误关其它面板 | 中 | 契约测试锁 expose 与 root 监听；模拟 click outside 与 Esc |
+| PromptBox slot / props 漂移 | 工具栏左右顺序错、高度被锁死、hint/placeholder 丢失 | 中 | 结构锁逐项核对；首屏截图对比（可用时）与手测 |
+| 工具飞出 hover + click 顺序回归 | 悬停打开后点击反而关闭；搜索框焦点不对 | 中 | `hover-flyout` 与 `open-*panel` 分开发；根层函数仍用「已展开则保持」口径；模拟 hover→click |
+| 队列/附件索引错位 | 上移/下移/编辑/删除/立即发送打错条目 | 中 | 所有 index/id 作为 emit 载荷回根；模拟 3 条队列与混合附件 |
+| 发送/停止按钮状态漂移 | `current.sending` 时不显示停止、发送按钮可点、焦点不回输入框 | 中 | `current` + `canSend` 由根回灌；`stopBtnRef` 桥接；模拟流式发送中切换 |
+| resize grip 事件丢失 | 拖拽高度、双击复位失效 | 低 | `@mousedown.prevent` / `@dblclick` 直接 emit；模拟拖拽与双击 |
+| 文件 input 被误移出/属性变化 | 支持的文件类型、多选、隐藏行为变化 | 低 | 契约测试锁 id/accept/multiple/hidden；模拟工具菜单「添加文件」 |
+| 全局监听或 AbortController 被误搬 | 重复注册/中断句柄漂移 | 低 | 契约测试锁组件内无 `addEventListener` / `AbortController`；core 注册/移除不变 |
+| 根解构漏加 | 模板未定义变量或返回表漂移 | 中 | 与 core return 同提交；契约测试锁 657 |
+
+#### 9.3.6 验证与模拟推演
+
+门禁命令：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm --filter @bx/web test
+pnpm --filter @bx/web type-check
+pnpm type-check
+pnpm build
+pnpm test
+git diff --check
+Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
+```
+
+判定：web 58/58、全仓 type-check、build、server 978/978 全绿；`ChatPage-*.js` / `ChatPage-*.css` 仍各一份；Chrome 全清单因已知实例冲突为非阻塞项，可做时按下列路径冒烟。
+
+模拟推演（按顺序验证，任一步状态/焦点不符即停止）：
+
+| # | 操作 | 期望状态链路 |
+|---|---|---|
+| 1 | 首屏 / 打开任务表单或任务列表 | `visible = !showTaskForm && !showTaskList`；表单/列表打开时 footer `display:none` 但仍挂载，DOM ref 不丢 |
+| 2 | 输入文字 | `update:modelValue` 回写 `current.input` → `composer-input` 调根 `autoGrow` → PromptBox 高度在 min/max 间变化；placeholder/hint 正常 |
+| 3 | Enter / Shift+Enter | `keydown` emit → 根 `onKeydown`：Enter 发送、Shift+Enter 换行；阻断开关与斜杠命令按既有行为 |
+| 4 | 流式发送中切换停止/发送 | `current.sending` 时显示 `stopBtnRef` 按钮；点停止 → 根 `stop` 中断 root `controllers` 并归还焦点；停止后恢复发送按钮 |
+| 5 | 队列三条时上移/下移/编辑/删除/立即发送 | 每条 emit 带正确 index → 根函数改 `current.queue`；首项上移与末项下移 disabled；落库后顺序回灌 |
+| 6 | 添加/移除图片与文档，模型不支持图片 | `pick-files` 打开本地 hidden input；`remove-pending-*` 按 id 移除；`imagesUnsupported` 时警告行出现且图片不发送 |
+| 7 | 拖拽 grip / 双击 | `start-composer-resize(event)` 与 `reset-composer-size` 回根；高度状态由 root 控制，刷新后行为一致 |
+| 8 | 工具菜单开合 | 点 + → `toggle-tools-menu`；点外面 → 根 `onOutsideTools` 用桥接后的 `toolsRoot` 判断并关闭；Esc → 根 `onEscTools` 关闭全部面板 |
+| 9 | 悬停/点击技能、MCP、助手入口 | `hover-flyout(kind)` 预开 + `open-*panel` 保持已展开；`searchAutofocus` 决定 ToolsSearch 是否聚焦；搜索词通过 `update:*Query` 回根 |
+| 10 | 技能操作 | 勾选/取消 `toggle-skill(dir, enabled)`；添加技能打开/取消 SkillAddForm；created 回根刷新；取消全部按 root 状态禁用 |
+| 11 | MCP 操作 | 开关 `toggle-mcp`、重连 `reconnect-mcp`、移除自定义 `remove-custom-mcp`、添加/取消/清空全部；`boundMcpIds` 的「已启用」项不可关；错误行回灌 |
+| 12 | 助手 chip / 专家列表 / 发送模式 | 选专家 → `pick-expert` 路由跳转；× → `clear-expert` 回通用；`toggle-send-mode` 切换抢占/排队，图标与 title 同步 |
+| 13 | 文件选择 | 工具菜单「添加文件」→ 本地 `fileInput.value?.click()` + `close-tools-panels`；选择后 `pick-files(event)` 回根，附件 chip 出现 |
+| 14 | 切换对话后再回到原对话 | 四个 DOM ref 桥接仍指向当前 footer 节点；输入草稿/队列/附件随 `current` 切换正确显示 |
+
+#### 9.3.7 回滚
+
+- 未提交：删除新增组件/测试，恢复 `ChatPage.vue` 与 `useChatPageCore.ts`。
+- 已提交：先 `git revert <C12 code sha>`，再单独 revert 回写 hash 的文档提交；禁止与 C13 合并。
+- 若仅 DOM ref 桥接失败，优先保留四个 expose 并补 `element` emit 同步 root ref；不把全局监听、发送逻辑或 AbortController 搬进子组件。
+
+#### 9.3.8 提交信息
+
+```text
+refactor(web): extract MessageComposer from ChatPage
+```
 
 ### 9.4 C13 `ChatTaskPanel.vue`
 
