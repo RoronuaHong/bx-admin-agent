@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9`、C13 `f9e8ac8` 已提交，CSS 作用域修复 `f702e85`、UiSelect 注册修复 `1d441cd` 已提交；T7 C14 前置方案见 §10.6**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -1226,6 +1226,92 @@ refactor(web): extract <ComponentName> from ChatPage
 ```text
 style(web): move <block> styles into <ComponentName>
 ```
+
+### 10.6 C14 `ChatSidebarList` CSS 下沉（前置方案）
+
+#### 10.6.1 目标与边界
+
+- 目标：把**只属于侧栏品牌/助手切换/助手菜单**的 CSS 从 `chat-page.css` 搬进新文件 `apps/web/src/components/chat/ChatSidebarList.css`，由 `ChatSidebarList.vue` 以 `<style scoped src="./ChatSidebarList.css"></style>` 引用；`chat-page.css` 删除对应规则。
+- 这是 T7 的第一块，完成后仍保持单个 `ChatPage-*.js` / `ChatPage-*.css` chunk。
+- **不动 DOM、props、emits、ref、全局监听、路由与状态机**；只搬样式。
+- 当前 `chat-page.css` 已由 `f702e85` 改为非 scoped；C14 开始按组件自身 `scoped` 收敛，**不要把 `scoped` 加回 `ChatPage.vue`**。
+
+#### 10.6.2 当前锚点与归属（实施前已核对）
+
+| 位置 | 规则 | C14 处理 |
+|---|---|---|
+| `chat-page.css:31–217` | `.sidebar__inner`、`.brand*`、`.agent-menu*`、`.coming-soon` 连续块 | 整块搬入 `ChatSidebarList.css` |
+| `chat-page.css:3903–3907` | `@media (max-width:860px)` 内的 `.sidebar__inner { width:100%; padding:16px 14px }` | 搬入组件 CSS 的同名 media query；同 media 内 `.sidebar` 抽屉规则留根 |
+| `chat-page.css:3988–3990` | `.brand__agent-caret.open { transform:rotate(180deg) }` | 搬入组件 CSS；它是页面级状态变体还原注释块里的侧栏专属规则 |
+| `chat-page.css:15–29` | `.sidebar` 布局骨架 | 留根（共享骨架） |
+| `chat-page.css:3892–3902`、`3963–3969`、`3973–3978` | `.sidebar` 移动端抽屉、`.sidebar.collapsed`、`.sidebar-backdrop` | 留根；组件模板仍用 `.sidebar` / `.open` / `.collapsed` 类，由根全局 CSS 命中 |
+| `chat-page.css:2287–2290`、`4126–4128` | 主区顶栏 `.brand`、`.top .brand` | 留根；与侧栏 `.brand` 同名但不同 DOM 作用域，组件 scoped 不会误伤 |
+| `chat-page.css:219+` | `.primary-btn` 等通用按钮/表单类 | 留根（共享基类不得下沉） |
+
+#### 10.6.3 组件契约
+
+- 新增 `apps/web/src/components/chat/ChatSidebarList.css`，内容为上表三处规则原样复制。
+- `ChatSidebarList.vue` 末尾新增 `<style scoped src="./ChatSidebarList.css"></style>`；不写内联 `<style scoped>`，便于契约锁定文件名。
+- `chat-page.css` 删除上述三处规则，保留周围注释与留根规则；不重排其它 CSS。
+- 模板里 `.sidebar` 根节点继续只由根全局 CSS 提供布局；`.sidebar__inner` 及内部元素由组件 scoped CSS 命中。
+- 因 scoped 会增加 `[data-v-…]`，需确认 `.brand__agent-caret.open` 的优先级仍高于 `.brand__agent-caret` 基础规则；必要时在组件 CSS 内保持相同顺序，不改声明值。
+
+#### 10.6.4 红测前置
+
+- 扩展 `apps/web/tests/chat-sidebar-list-contract.test.ts`，新增 1 个 CSS 归属用例（web 63 → 64）：
+  - `ChatSidebarList.vue` 含 `<style scoped src="./ChatSidebarList.css"></style>`。
+  - `ChatSidebarList.css` 含 `.sidebar__inner`、`.brand__agent`、`.agent-menu__item`、`.coming-soon`、`.brand__agent-caret.open`。
+  - `chat-page.css` 不再含 `.brand__agent {`、`.agent-menu__item {`、`.coming-soon {`、`.brand__agent-caret.open {`；仍含 `.sidebar {`、`.sidebar-backdrop {`、`.top .brand {`。
+  - `ChatPage.vue` 仍为非 scoped `<style src="./chat-page.css"></style>`。
+- 先让该用例在缺文件时报红，再落 CSS 与组件改动。
+
+#### 10.6.5 风险表
+
+| 风险 | 影响 | 概率 | 缓解/判定 |
+|---|---|---|---|
+| scoped 后侧栏内部样式失配 | 品牌区/助手菜单/折叠按钮回到裸样式 | 中 | 契约锁文件名与选择器；Chrome 实测桌面/移动两种视口 |
+| 同名 `.brand` 误伤主区顶栏 | 顶栏字体/字号回归 | 中 | 主区 `.brand` 留根；组件 CSS 的 `.brand` 带 scope，契约断言根仍保留 `.top .brand` |
+| 移动端 `.sidebar__inner` 丢规则 | 抽屉内内容仍固定 256px、出现横向裁切 | 高 | 同步搬 media query 内规则；390px 视口截图对比 |
+| `.brand__agent-caret.open` 失配 | 助手菜单展开箭头不旋转 | 中 | 随块搬入组件 CSS；打开菜单实测 `transform` |
+| CSS 拆出多 chunk | 破坏单 chunk 不变量 | 低 | 构建后 `Get-ChildItem apps/web/dist/assets/ChatPage-*` 必须仍各一份 |
+| 共享基类被误搬 | `.primary-btn` 等按钮在任务表单/输入区丢样式 | 中 | 只搬 31–217 与两处明确专属规则；契约断言 `.primary-btn` 仍在根 |
+
+#### 10.6.6 验证与模拟推演
+
+门禁命令：
+
+```powershell
+pnpm --filter @bx/web test
+pnpm --filter @bx/web type-check
+pnpm type-check
+pnpm build
+pnpm test
+git diff --check
+Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
+```
+
+Chrome 模拟路径（任一步视觉/状态不符即停止）：
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 桌面端打开 `/chat` | 侧栏宽 256px、`.sidebar__inner` padding 16px 14px、品牌区/助手切换器布局与下沉前一致 |
+| 2 | 点当前助手名展开菜单 | `.agent-menu` 出现，项高亮/图标/勾选正常；`.brand__agent-caret` 旋转 180° |
+| 3 | 收起/展开侧栏 | 折叠动画不变，文字不 reflow 闪现；`.sidebar` 布局规则仍由根提供 |
+| 4 | 缩小到 390px 视口 | 侧栏变离屏抽屉；点汉堡滑入；`.sidebar__inner` 宽度 100%，无横向裁切 |
+| 5 | 打开设置/弹窗/任务表单 | `.primary-btn`、`.modal-mask`、`.field__input` 等共享类样式仍在 |
+| 6 | 切到 `/skills` 再回 `/chat` | 全局 CSS 无跨页污染；侧栏样式重新命中 |
+
+#### 10.6.7 回滚与提交
+
+- 未提交：删除 `ChatSidebarList.css`，撤掉组件 style 标签，恢复 `chat-page.css` 三处规则与测试断言。
+- 已提交：先 `git revert <C14 code sha>`，再单独 revert 回写 hash 的文档提交；禁止与其它 CSS 块合并。
+- 提交信息：
+
+```text
+style(web): move sidebar brand styles into ChatSidebarList
+```
+
+- 状态：前置方案已写完，待用户确认后进入红测与实施。
 
 ## 11. 全阶段收口门禁
 

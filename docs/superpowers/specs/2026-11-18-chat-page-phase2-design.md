@@ -164,7 +164,7 @@ Chrome 手工清单：
 
 可下沉块按 `chat-page.css` 注释锚点处理：
 
-> 现状（2026-11-19）：C6–C13 组件与 Teleport 内容已移出 ChatPage 模板，`chat-page.css` 由 `f702e85` 改为非 scoped；T7 下沉时给对应组件自身加 `scoped`，不要恢复父级 `scoped`。
+> 现状（2026-11-19）：C6–C13 组件与 Teleport 内容已移出 ChatPage 模板，`chat-page.css` 由 `f702e85` 改为非 scoped；T7 下沉时给对应组件自身加 `scoped`，不要恢复父级 `scoped`。首块 C14（侧栏品牌 CSS）详细方案见实施计划 §10.6。
 
 | 块 | 当前行号 | 归属 |
 |---|---:|---|
