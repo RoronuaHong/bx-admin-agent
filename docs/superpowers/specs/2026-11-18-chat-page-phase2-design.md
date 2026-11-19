@@ -123,7 +123,7 @@ useChatPageCore.ts（协调层）
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
 | 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已提交 `dab6470`：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；T5 低风险 UI 完成 | 每组件单提交 revert |
-| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836` 已提交：19 动作 + keydown emit、expose/ref 桥接、web 49/49；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
+| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836` 已提交：19 动作 + keydown emit、expose/ref 桥接、web 49/49；C11 详细方案见实施计划 §9.2；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
 
 ### 6.1 每步验收命令
