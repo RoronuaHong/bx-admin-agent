@@ -27,6 +27,7 @@ import DoneToast from "../../components/chat/DoneToast.vue";
 import ArtifactPreviewModal from "../../components/chat/ArtifactPreviewModal.vue";
 import ConfirmDialog from "../../components/chat/ConfirmDialog.vue";
 import ChatThread from "../../components/chat/ChatThread.vue";
+import ContextMenuHost from "../../components/chat/ContextMenuHost.vue";
 import { bubbleContextKey, type BubbleContext } from "../../components/bubble-context";
 import { renderChatMarkdown } from "../../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../../chat-stream";
@@ -4297,6 +4298,7 @@ return {
   ArtifactPreviewModal,
   ConfirmDialog,
   ChatThread,
+  ContextMenuHost,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,
