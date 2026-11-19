@@ -24,6 +24,7 @@ import UiSelect from "../../components/UiSelect.vue";
 import ChartCard from "../../components/ChartCard.vue";
 import ChatBubble from "../../components/ChatBubble.vue";
 import DoneToast from "../../components/chat/DoneToast.vue";
+import ArtifactPreviewModal from "../../components/chat/ArtifactPreviewModal.vue";
 import { bubbleContextKey, type BubbleContext } from "../../components/bubble-context";
 import { renderChatMarkdown } from "../../chat-richtext";
 import { applyStreamEvent, dedupeRepeats } from "../../chat-stream";
@@ -4291,6 +4292,7 @@ return {
   UiSelect,
   ChatBubble,
   DoneToast,
+  ArtifactPreviewModal,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,

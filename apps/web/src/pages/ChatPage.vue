@@ -26,6 +26,7 @@ const {
   UiSelect,
   ChatBubble,
   DoneToast,
+  ArtifactPreviewModal,
   bubbleContextKey,
   renderChatMarkdown,
   applyStreamEvent,
@@ -1183,27 +1184,12 @@ const {
       </div>
     </Teleport>
 
-    <Teleport to="body">
-      <div v-if="previewHtml" class="modal-mask" @click.self="closeArtifactPreview">
-        <div class="modal modal--preview" role="dialog" aria-modal="true" :aria-label="previewHtml.name">
-          <div class="modal__head">
-            <span class="modal__title">{{ previewHtml.name }}</span>
-            <div class="modal__head-actions">
-              <a
-                class="ghost-btn"
-                :href="workspaceDownloadUrl(currentId, previewHtml.path)"
-                :download="previewHtml.name"
-              >{{ tx("下载", "Download", "Descargar", "डाउनलोड") }}</a>
-              <button class="modal__close" type="button" aria-label="Close" @click="closeArtifactPreview">×</button>
-            </div>
-          </div>
-          <div class="modal__body preview-body">
-            <div v-if="previewLoading" class="preview-loading">{{ tx("加载中…", "Loading…", "Cargando…", "लोड हो रहा है…") }}</div>
-            <iframe v-else class="preview-frame" :srcdoc="previewHtml.content" sandbox="allow-scripts"></iframe>
-          </div>
-        </div>
-      </div>
-    </Teleport>
+    <ArtifactPreviewModal
+      :preview-html="previewHtml"
+      :preview-loading="previewLoading"
+      :download-url="previewHtml ? workspaceDownloadUrl(currentId, previewHtml.path) : ''"
+      @close="closeArtifactPreview"
+    />
 
     <!-- v-if 挂在 Teleport 上：宿主 #task-panel-host 在 <main> 里、由本组件渲染，
          若 Teleport 随组件一起挂载会在宿主存在前解析目标而报错；
