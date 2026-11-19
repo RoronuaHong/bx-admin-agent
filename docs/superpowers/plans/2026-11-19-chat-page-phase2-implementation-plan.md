@@ -153,7 +153,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C2 | T1 SCC C | 新增 3 个 composable + `useChatPageCore.ts` | ✅ `3f6d81c` |
 | C3 | T2 SCC A（裁剪边界，见 §5.3） | 新增 `useChatConversationShell.ts` + `useChatPageCore.ts` + `ChatPage.vue` | ✅ 已提交 `23c9d28`：33 web 测试 + 全门禁绿 |
 | C4 | T3 SCC B | 新增 `useChatToolPanels.ts` + `useChatPageCore.ts` + `chat-tool-panels.test.ts` | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
-| C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts` | ⏳ 可独立完成 |
+| C5 | T4 provide 契约加固 | `useChatPageCore.ts`、`components/bubble-context.ts`、新增 `tests/bubble-context-contract.test.ts` | ⏳ 已细化风险评估与执行流程（§7），可独立完成 |
 | C6–C9 | T5 低风险 UI | 新增 `components/chat/*.vue` + `ChatPage.vue` | ⏳ 可独立完成 |
 | C10–C13 | T6 高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
@@ -435,14 +435,30 @@ refactor(web): split chat tool panels composable
 
 ## 7. T4：provide 契约加固
 
-### 7.1 目标
+### 7.1 目标与边界
 
 在不改 41 键内容与顺序的前提下，给 `provide(bubbleContextKey, ...)` 加类型和数量门禁，防止后续 UI 抽取把 inject 链弄断。
 
-### 7.2 改动
+**2026-11-19 AST 基线已实测**：`provide` 对象 41 键、`BubbleContext` 接口 41 字段、`ChatBubble.vue` 解构 41 项，三者顺序完全一致；`ChatBubble.vue` 没有 `ctx.xxx` 动态访问，只有 `inject(...)` + 一次性解构。
 
-1. 在 `useChatPageCore.ts` 把现有对象字面量抽成 `const bubbleContext = { ... } satisfies BubbleContext`，再 `provide(bubbleContextKey, bubbleContext)`。
-2. 增加开发环境数量断言：
+不做：不改键名/顺序、不改运行时行为、不改模板/CSS、不把 `BubbleContext` 改 optional / `any`、不新增动态 import。
+
+### 7.2 文件与改动
+
+1. 新增 `apps/web/tests/bubble-context-contract.test.ts`
+   - 源码级 AST 锁：provide 键数量/顺序、接口字段数量/顺序、ChatBubble 解构数量/顺序三者一致。
+   - 源码级文本锁：`satisfies BubbleContext` 和 `Object.keys(bubbleContext).length !== 41` 断言存在。
+   - 这是必要补口：现有 web 测试 mock 掉 `provide`，运行时 DEV 断言不会在单测里实际执行。
+2. 改 `apps/web/src/composables/chat/useChatPageCore.ts`
+   - import `type BubbleContext`。
+   - 原位把内联对象字面量抽成 `const bubbleContext = { ... } satisfies BubbleContext`。
+   - 紧随其后加 DEV 数量断言，再 `provide(bubbleContextKey, bubbleContext)`。
+   - `provide` 仍在同步 setup 链上，不进 async / `onMounted`。
+3. 改 `apps/web/src/components/bubble-context.ts`
+   - 预期无需改动；仅当 `satisfies` 暴露既有类型偏差时，做与现有 41 键一一对应的最小类型修正，不改 key、不改顺序。
+4. 不改 `apps/web/src/components/ChatBubble.vue` 的解构顺序。
+
+DEV 断言形态：
 
 ```ts
 if (import.meta.env.DEV && Object.keys(bubbleContext).length !== 41) {
@@ -450,20 +466,60 @@ if (import.meta.env.DEV && Object.keys(bubbleContext).length !== 41) {
 }
 ```
 
-3. 如 `BubbleContext` 类型需要补充导出/字段调整，只允许在 `apps/web/src/components/bubble-context.ts` 做与现有 41 键一一对应的最小改动，不改运行时行为。
-4. `provide` 调用位置保持在同步 setup 链上，不放入 async、不延后到 `onMounted`。
+### 7.3 执行顺序
 
-### 7.3 验证重点
+1. 固化 41 键基线（已完成，见 §7.1）。
+2. 先新增契约测试并跑绿，确保当前源码满足顺序锁。
+3. 再改 `useChatPageCore.ts`：抽 `bubbleContext`、`satisfies`、DEV 断言、原位 `provide`。
+4. 若 type-check 报类型差异，逐项核对，只允许在 `bubble-context.ts` 做最小类型修正；禁止用 `any` / optional 掩盖。
+5. 跑 web 测试、type-check 连续 3 次、build、server 测试、`diff --check`。
+6. 确认 build 仍是单个 `ChatPage-*.js` / `.css`。
+7. 单提交代码与契约测试；再单提交回写提交号到文档。
 
-- `Object.keys(...).length === 41`，键顺序与 T4 前逐项一致。
-- 气泡复制/编辑、工具确认、澄清输入、推理面板、产物预览、告警标记全部可用。
-- 通用验证命令 + Chrome 清单。
+### 7.4 风险评估
 
-### 7.4 提交信息
+| 风险 | 等级 | 控制措施 | 残余风险 |
+|---|---|---|---|
+| 抽取对象改变 `provide` 时机 | 低 | const 与 `provide` 留在原位置；不进 async / `onMounted` | 很低 |
+| 41 键顺序漂移 | 中 | AST 契约测试锁 provide / interface / ChatBubble 三者顺序 | 很低 |
+| `satisfies` 暴露既有类型偏差 | 中 | 逐项核对；只做最小类型修正，不改运行时、不放宽契约 | 中低 |
+| 数量断言只锁数量不锁 key | 中 | AST 测试锁完整名单与顺序；`satisfies` 锁字段类型 | 很低 |
+| web 测试 mock 掉 `provide` | 中 | 新增源码级契约测试，运行时断言不依赖单测触发 | 很低 |
+| 为过 type-check 放宽 `BubbleContext` | 中 | 禁止 `any` / optional；差异必须逐项解释 | 低 |
+| 单 chunk 被破坏 | 低 | 只加 type import 与常量；build 后检查 chunk | 很低 |
+| 交互回归未被自动化覆盖 | 中 | 全门禁 + Chrome 清单；浏览器实例冲突仍是已知非阻塞项 | 中，需人工冒烟兜底 |
 
-```text
-refactor(web): harden bubble context contract
+### 7.5 验证命令
+
+```bash
+pnpm --filter @bx/web exec vitest run tests/bubble-context-contract.test.ts
+pnpm --filter @bx/web test
+pnpm --filter @bx/web type-check
+pnpm --filter @bx/web type-check
+pnpm --filter @bx/web type-check
+pnpm type-check
+pnpm build
+pnpm test
+git --no-pager diff --check
 ```
+
+验收点：
+
+- web / server 测试全绿；
+- type-check 连续 3 次稳定；
+- build 成功且仍是单个 `ChatPage-*.js` / `.css`；
+- 41 键断言未被触发；
+- 气泡复制/编辑、工具确认、澄清输入、推理面板、产物预览、告警标记在 Chrome 清单中无 error。
+
+### 7.6 回滚与提交
+
+- 失败且未提交：`git restore` 该步文件。
+- 已提交：`git revert <sha>`，单提交回滚。
+- 提交信息：
+  ```text
+  refactor(web): harden bubble context contract
+  ```
+- 文档 hash 回写提交：`docs(web): record T4 commit hash`。
 
 ## 8. T5：抽低风险 UI 子组件
 

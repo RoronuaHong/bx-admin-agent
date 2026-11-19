@@ -52,7 +52,7 @@ useChatPageCore.ts（协调层）
   ├─ SCC B: MCP + 技能 + 工具 + 专家
   ├─ 记忆 / 工作区 / 面板状态 / 文案
   ├─ provide(bubbleContextKey, 41 键)
-  └─ return 653 个模板可见绑定（随抽离逐步改为组合返回）
+  └─ return 650 个模板可见绑定（T2 移除 3 个未使用快照，随抽离逐步改为组合返回）
 ```
 
 原则：**先拆逻辑，后拆模板**。逻辑未稳定前不改模板/CSS；UI 子组件抽取时，每个组件单独提交、单独截图和手测。
@@ -121,7 +121,7 @@ useChatPageCore.ts（协调层）
 | 1 | 拆 SCC C：`modelSettings → threadScroll → reasoningUI` | 新增 3 个 composables；Run 保留协调层 | 发送/停止焦点、跟底、思考计时、模型 auto 黑名单 | ✅ `3f6d81c`，回滚：单提交 revert |
 | 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable，共享状态留根后拆（裁剪边界见实施计划 §5.3） | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | ✅ `23c9d28`：33 web 测试与全门禁绿；回滚：单提交 revert |
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
-| 4 | provide 契约加固 | `useChatPageCore.ts`、`bubble-context.ts` | 41 键齐全，气泡复制/编辑/工具确认/澄清可用 | 单提交 revert |
+| 4 | provide 契约加固 | `useChatPageCore.ts`、`bubble-context.ts`、新增 `tests/bubble-context-contract.test.ts` | 41 键齐全且顺序锁定，气泡复制/编辑/工具确认/澄清可用；流程与风险见实施计划 §7 | 单提交 revert |
 | 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | Teleport 顺序、focus trap、`threadEl` expose、`v-model:outlineOpen` | 每组件单提交 revert |
 | 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | `@click.stop`、Esc capture、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
 | 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
