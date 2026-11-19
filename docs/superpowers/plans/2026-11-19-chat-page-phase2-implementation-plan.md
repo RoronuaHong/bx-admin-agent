@@ -357,7 +357,7 @@ refactor(web): split chat settings scroll and reasoning composables
 - 其余单点：`createConvFromDraft`←`send`；`flushPendingDelete`←`closeOtherConversations`；`removeConversation`←`askDeleteConversation`；`refreshConversationsQuiet`←`startTasksPoll`。
 这些调用点全部不改（函数体内运行时调用，解构在 setup 阶段已完成）。
 
-**③ 内部 let 的返回表暴露**：`ctxTriggerEl`、`undoDeleteTimer`、`UNDO_DELETE_MS` 被 return 表（5303/5310/5308）暴露给模板。模板 `ChatPage.vue` 只在 script 解构区列出它们、template 段未实际使用；但它们随会话壳搬入后会从协调层消失。处理：要么在 composable 返回同名（推荐，保持 653 表不变），要么确认无模板使用后从返回表移除——本次采用前者，行为零变化。
+**③ 内部 let 的返回表暴露**：`ctxTriggerEl`、`undoDeleteTimer`、`UNDO_DELETE_MS` 原被 return 表暴露，但模板 `ChatPage.vue` 只在 script 解构区列出、template 段未实际使用。T2 实测确认后从 composable 返回表、`useChatPageCore` 返回表与 `ChatPage.vue` 解构区一并移除（653→650），避免导出陈旧快照；无模板行为变化。
 
 **④ provide / watch**：`provide(bubbleContextKey, {...})`(4981) 只注入 reasoning 与留根函数，不含会话壳符号；`watch` 顶层调用未引用搬入符号。均无影响。
 
