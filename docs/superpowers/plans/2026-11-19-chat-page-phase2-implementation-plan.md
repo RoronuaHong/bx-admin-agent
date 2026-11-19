@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e` 已提交**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e`、C12 `5de59a9` 已提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -18,6 +18,8 @@
   - T6 C10（`ContextMenuHost`）**已提交 `58bd836`**：新增 `components/chat/ContextMenuHost.vue` 与 `tests/context-menu-host-contract.test.ts`（4 个源码契约用例），Teleport/DOM/`role`/`data-ctx-confirm` 原样搬入；19 个动作 emit + keydown 转发接回根层，全局监听与焦点归还继续留根，`ctxMenuEl` 用 expose/函数 ref 桥接；根解构 654→655。web 49/49、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
   - C11 前置方案校准文档提交 `e2a1818`：锁定 39 props / 29 emits、3 处 aside 右键入口、`agentMenuEl`/`convListEl` 双 ref 桥接、遮罩留根与 13 步推演；实施时修正 `TaskGroupRun.conv` 类型与右键入口计数。
   - T6 C11（`ChatSidebarList`）**已提交 `383630e`**：新增 `components/chat/ChatSidebarList.vue` 与 `tests/chat-sidebar-list-contract.test.ts`（4 个源码契约用例），aside DOM 原样搬入；39 props / 29 emits 接回根层，三处 `v-model` 契约与 `setRenameInput` 函数 prop 保持，双 DOM ref 桥接；遮罩、全局监听、localStorage 折叠、拖拽/右键/删除/清空状态全留根。根解构 655→656；C10 契约的根解构断言改下界 655。web 53/53、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
+  - C12 前置方案校准文档提交 `89b8c17`：修正源块行号、Teleport/工具飞出、`onInlineSubmitKeydown` 与 `inputEl` 四处旧描述，锁定 39 props / 38 emits、四 DOM ref 桥接和 14 步推演。
+  - T6 C12（`MessageComposer`）**已提交 `5de59a9`**：新增 `components/chat/MessageComposer.vue` 与 `tests/message-composer-contract.test.ts`（5 个源码契约用例），footer DOM / PromptBox 三 slot / 工具飞出原样搬入；39 props / 38 emits 接回根层，`current.input` 走 `modelValue`，三处查询 v-model 与四个 DOM ref 桥接保持；全局监听、发送/停止、队列/附件/resize 全留根。根解构 656→657；C11 契约的根解构断言改下界 656。实施中修正 `move-queue-item` 方向类型、`skill-created(dir)` / `mcp-created(id)` 载荷与 SFC 顶层 `</template>`。web 58/58、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -100,7 +102,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 
 ### 1.1 不变量（每步都要守住）
 
-1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656。
+1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656，C12 后 657。
 2. `useChatPageCore.ts` 继续是同步 setup 协调层；`provide`、`onMounted`、`onBeforeUnmount`、`watch`、全局键鼠监听的同步调用链不得被 `await` 打断。
 3. `RouterView :key="$route.path"` 重挂载语义不变（`App.vue`）。
 4. `provide(bubbleContextKey, {...})` 的 41 键逐项保留、顺序不变；在 T4 做类型与数量加固。
@@ -169,7 +171,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C9 | T5 `ChatThread.vue` | 新增 `components/chat/ChatThread.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `e87c4b0`：threadEl bridge + outline v-model，web 45/45 + 单 chunk |
 | C10 | T6 `ContextMenuHost.vue` | 新增 `components/chat/ContextMenuHost.vue` + `tests/context-menu-host-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `58bd836`：19 动作 + keydown emit，expose/ref 桥接，web 49/49 + 全门禁绿 |
 | C11 | T6 `ChatSidebarList.vue` | 新增 `components/chat/ChatSidebarList.vue` + `tests/chat-sidebar-list-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `383630e`：39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿 |
-| C12–C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
+| C12 | T6 `MessageComposer.vue` | 新增 `components/chat/MessageComposer.vue` + `tests/message-composer-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `5de59a9`：39 props / 38 emits、四 ref 桥接、全局监听留根，web 58/58 + 全门禁绿 |
+| C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
@@ -927,11 +930,11 @@ Emits（38 个）：
 | 类别 | emits |
 |---|---|
 | 输入 | `update:modelValue`、`composer-input`、`keydown` |
-| 队列/附件 | `move-queue-item(index, dir)`、`edit-queue-item(index)`、`remove-queue-item(index)`、`send-queue-item-now(index)`、`remove-pending-image(id)`、`remove-pending-doc(id)`、`pick-files(event)` |
+| 队列/附件 | `move-queue-item(index, dir: 1 \| -1)`、`edit-queue-item(index)`、`remove-queue-item(index)`、`send-queue-item-now(index)`、`remove-pending-image(id)`、`remove-pending-doc(id)`、`pick-files(event)` |
 | 输入区 UI | `start-composer-resize(event)`、`reset-composer-size`、`toggle-tools-menu`、`close-tools-panels`、`toggle-send-mode`、`clear-expert` |
 | 工具面板开合 | `open-skill-panel`、`open-mcp-panel`、`open-expert-panel`、`hover-flyout(kind)` |
-| 技能 | `update:skillQuery`、`toggle-skill(dir, enabled)`、`skill-created`、`toggle-skill-add`、`cancel-skill-add`、`clear-skill-selection` |
-| MCP | `update:mcpQuery`、`toggle-mcp(id, enabled)`、`reconnect-mcp(id)`、`remove-custom-mcp(id)`、`mcp-created`、`toggle-mcp-add`、`cancel-mcp-add`、`clear-mcp-selection` |
+| 技能 | `update:skillQuery`、`toggle-skill(dir, enabled)`、`skill-created(dir)`、`toggle-skill-add`、`cancel-skill-add`、`clear-skill-selection` |
+| MCP | `update:mcpQuery`、`toggle-mcp(id, enabled)`、`reconnect-mcp(id)`、`remove-custom-mcp(id)`、`mcp-created(id)`、`toggle-mcp-add`、`cancel-mcp-add`、`clear-mcp-selection` |
 | 助手 | `update:expertQuery`、`pick-expert(agent)` |
 | 发送/停止 | `stop`、`send` |
 
@@ -1023,6 +1026,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 ```text
 refactor(web): extract MessageComposer from ChatPage
 ```
+
+- 实际代码提交：`5de59a9`；前置方案文档提交：`89b8c17`。
 
 ### 9.4 C13 `ChatTaskPanel.vue`
 
