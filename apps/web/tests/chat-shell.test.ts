@@ -1,5 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// 可断言的 api spy（vi.hoisted 提升到 vi.mock 之前，供 mock 工厂与测试共用）
+const apiSpies = vi.hoisted(() => ({
+  fetchChatMcpServers: vi.fn(async () => null),
+  fetchChatSkills: vi.fn(async () => null),
+  fetchChatTaskStatus: vi.fn(async () => null),
+  fetchConversation: vi.fn(async () => null),
+  saveChatPreferences: vi.fn(async () => undefined),
+  createConversation: vi.fn(async () => ({ id: "new", title: "新对话", messages: [] })),
+  deleteConversation: vi.fn(async () => undefined),
+  patchConversation: vi.fn(async () => undefined),
+}));
+
 // useChatPageCore 在 node 环境实例化的依赖打桩：
 // - 生命周期（onMounted/onBeforeUnmount/watch）置空，避免 bootstrap 网络与定时器副作用；
 // - 浏览器 DOM 相关模块（DOMPurify/theme/pinyin）置空；
@@ -35,15 +47,17 @@ vi.mock("../src/api", () => {
     MODEL_AUTO_ID: "auto",
     NOT_MODEL_FAULT_CODES: [],
     fetchConversations: async () => [],
-    fetchChatTaskStatus: async () => null,
-    fetchConversation: async () => null,
+    fetchChatTaskStatus: apiSpies.fetchChatTaskStatus,
+    fetchConversation: apiSpies.fetchConversation,
     fetchModels: async () => [],
     saveConversationMessages: async () => undefined,
     reorderConversations: async () => undefined,
-    saveChatPreferences: async () => undefined,
-    patchConversation: async () => undefined,
-    createConversation: async () => ({ id: "new", title: "新对话", messages: [] }),
-    deleteConversation: async () => undefined,
+    fetchChatMcpServers: apiSpies.fetchChatMcpServers,
+    fetchChatSkills: apiSpies.fetchChatSkills,
+    saveChatPreferences: apiSpies.saveChatPreferences,
+    patchConversation: apiSpies.patchConversation,
+    createConversation: apiSpies.createConversation,
+    deleteConversation: apiSpies.deleteConversation,
     getApiErrorToken: () => "",
   });
   return mock;
@@ -80,6 +94,7 @@ function makeCore(): Core {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: () => undefined }));
   vi.stubGlobal("localStorage", {
     getItem: () => null,
@@ -171,5 +186,106 @@ describe("T2 会话壳特征测试（拆分前锁定当前真实行为）", () =
     await core.applyConversationOrder("c3", "c1", false);
     expect(core.conversations.value.map((c) => c.id)).toEqual(["c3", "c1", "c2"]);
     expect(core.sortMode.value).toBe("manual");
+  });
+
+  // 依赖注入探针：selectConversation 的 14 个跨组依赖中，凡最终落到 api 的回调，
+  // 拆分后若漏注入就会断链 → 这里断言调用链完整，是防"漏注入"的核心安全网。
+  it("selectConversation 触发完整下游调用链（防 T2 拆分漏注入）", async () => {
+    const core = makeCore();
+    const target = conv("c1", { messages: [{ role: "user", text: "hi" }] });
+    core.conversations.value = [target];
+    core.selectConversation(target);
+    await vi.waitFor(() => {
+      expect(apiSpies.fetchChatMcpServers).toHaveBeenCalled(); // loadMcp
+      expect(apiSpies.fetchChatSkills).toHaveBeenCalled(); // loadSkills
+      expect(apiSpies.fetchChatTaskStatus).toHaveBeenCalledWith("c1"); // syncOpenConversation
+      expect(apiSpies.fetchConversation).toHaveBeenCalled(); // upgradeConversationDetail
+      expect(apiSpies.saveChatPreferences).toHaveBeenCalledWith(
+        expect.objectContaining({ activeConversationId: "c1" }),
+      ); // reportActiveConversation
+    });
+  });
+
+  // R2：删除撤销的 5s 窗口 + flush —— 用 fake timers 锁定定时器行为
+  it("removeConversation：撤销窗口内 undoDelete 保留，5s 后清空并服务端落库", async () => {
+    vi.useFakeTimers();
+    try {
+      const core = makeCore();
+      const c1 = conv("c1");
+      const c2 = conv("c2");
+      core.conversations.value = [c1, c2];
+      core.selectConversation(c1);
+      const beforeDeleteCalls = apiSpies.deleteConversation.mock.calls.length;
+      core.removeConversation("c1");
+      expect(core.undoDelete.value?.conv.id).toBe("c1");
+      expect(apiSpies.deleteConversation.mock.calls.length).toBe(beforeDeleteCalls); // 窗口内还没真删
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(core.undoDelete.value).toBeNull();
+      expect(apiSpies.deleteConversation).toHaveBeenCalledWith("c1"); // 窗口结束真删
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("undoRemoveConversation：撤销后取消定时器，服务端不会落库删除", async () => {
+    vi.useFakeTimers();
+    try {
+      const core = makeCore();
+      const c1 = conv("c1");
+      const c2 = conv("c2");
+      core.conversations.value = [c1, c2];
+      core.selectConversation(c1);
+      const before = apiSpies.deleteConversation.mock.calls.length;
+      core.removeConversation("c1");
+      core.undoRemoveConversation();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(apiSpies.deleteConversation.mock.calls.length).toBe(before); // 撤销后不应真删
+      expect(core.conversations.value.map((c) => c.id)).toEqual(["c1", "c2"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // R3：右键菜单状态机
+  it("openCtxMenu/closeCtxMenu：菜单开合与 targetId", () => {
+    const core = makeCore();
+    const c1 = conv("c1");
+    const e = { preventDefault: () => undefined, stopPropagation: () => undefined, clientX: 10, clientY: 20, currentTarget: null } as unknown as MouseEvent;
+    core.openCtxMenu(e, c1);
+    expect(core.ctxMenu.value.open).toBe(true);
+    expect(core.ctxMenu.value.targetId).toBe("c1");
+    core.closeCtxMenu();
+    expect(core.ctxMenu.value.open).toBe(false);
+  });
+
+  it("armCtxConfirm：进入待确认态", async () => {
+    const core = makeCore();
+    const c1 = conv("c1");
+    const e = { preventDefault: () => undefined, stopPropagation: () => undefined, clientX: 10, clientY: 20, currentTarget: null } as unknown as MouseEvent;
+    core.openCtxMenu(e, c1);
+    await core.armCtxConfirm("clear");
+    expect(core.ctxConfirm.value).toBe("clear");
+    core.closeCtxMenu();
+    expect(core.ctxConfirm.value).toBe("");
+  });
+
+  // createConvFromDraft：草稿创建继承草稿的 MCP/技能集并落库（A↔B 桥接的 createConvFromDraft 边界）
+  it("createConvFromDraft：草稿的 MCP / 技能 / 模型设置带入新对话", async () => {
+    const core = makeCore();
+    core.blank.settings.mcpEnabled = ["draft-srv"];
+    core.blank.settings.skillsEnabled = ["skill-a"];
+    core.blank.settings.modelId = "m-x";
+    const id = await core.createConvFromDraft("帮我查数据");
+    expect(id).toBe("new");
+    expect(core.currentId.value).toBe("new");
+    const st = core.states.get("new");
+    expect(st!.settings.mcpEnabled).toEqual(["draft-srv"]);
+    expect(st!.settings.skillsEnabled).toEqual(["skill-a"]);
+    expect(st!.settings.modelId).toBe("m-x");
+    // 设置随首条消息落库（patchConversation 被调用）
+    expect(apiSpies.patchConversation).toHaveBeenCalledWith(
+      "new",
+      expect.objectContaining({ mcpServers: ["draft-srv"], skillsEnabled: ["skill-a"], model: "m-x" }),
+    );
   });
 });
