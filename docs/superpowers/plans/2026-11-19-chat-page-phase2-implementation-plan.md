@@ -1,7 +1,7 @@
 # 实现计划：ChatPage 阶段 2 细化实施（SCC 拆分 + UI 子组件 + CSS 下沉）
 
 - 日期：2026-11-19
-- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10（ContextMenuHost）已提交 `58bd836`**（2026-11-19 复核）
+- 状态：**执行中｜C0/T0/T1/T2/T3/T4/T5（C6–C9）已提交，T6 C10 `58bd836`、C11 `383630e` 已提交**（2026-11-19 复核）
 - 用户指令依据：2026-11-19「写细化计划吧」——按 `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md` 已被审阅确认处理。
 - 执行记录（2026-11-19）：
   - C0 文档提交 `6709f4a`。
@@ -16,6 +16,8 @@
   - T5 C9（ChatThread）已提交 `e87c4b0`：新增 `components/chat/ChatThread.vue`，整段 `.thread` 容器搬入；根层通过 props 传 visible/bubbleCount/outline 等状态，通过 emits 接回 scroll/showEarlier/askStarter/jump/active/v-model:open；`threadEl` 由子组件 `defineExpose`，根层函数 ref 桥接。web 45/45、web type-check、build 全绿，仍是单个 ChatPage chunk。
   - C10 前置方案校准文档提交 `0064d33`：修正旧计划中 `locations`、Esc capture、Shift+F10 三处与当前代码不符的描述，并锁定 19 个动作 emit + 1 个 keydown 转发、5 个 props、`ctxMenuEl` expose/ref 桥接、红测先行和 11 步交互推演（见 §9.1）。
   - T6 C10（`ContextMenuHost`）**已提交 `58bd836`**：新增 `components/chat/ContextMenuHost.vue` 与 `tests/context-menu-host-contract.test.ts`（4 个源码契约用例），Teleport/DOM/`role`/`data-ctx-confirm` 原样搬入；19 个动作 emit + keydown 转发接回根层，全局监听与焦点归还继续留根，`ctxMenuEl` 用 expose/函数 ref 桥接；根解构 654→655。web 49/49、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
+  - C11 前置方案校准文档提交 `e2a1818`：锁定 39 props / 29 emits、3 处 aside 右键入口、`agentMenuEl`/`convListEl` 双 ref 桥接、遮罩留根与 13 步推演；实施时修正 `TaskGroupRun.conv` 类型与右键入口计数。
+  - T6 C11（`ChatSidebarList`）**已提交 `383630e`**：新增 `components/chat/ChatSidebarList.vue` 与 `tests/chat-sidebar-list-contract.test.ts`（4 个源码契约用例），aside DOM 原样搬入；39 props / 29 emits 接回根层，三处 `v-model` 契约与 `setRenameInput` 函数 prop 保持，双 DOM ref 桥接；遮罩、全局监听、localStorage 折叠、拖拽/右键/删除/清空状态全留根。根解构 655→656；C10 契约的根解构断言改下界 655。web 53/53、web type-check、全仓 type-check、build、978 server 测试全绿，仍是单个 ChatPage chunk。
 - 对应设计：
   - `docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`
   - `docs/superpowers/specs/2026-11-18-chat-page-phase2-design.md`
@@ -98,7 +100,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 
 ### 1.1 不变量（每步都要守住）
 
-1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655。
+1. `ChatPage.vue` 根层保留 `defineProps`、`useRouter`、`import type { ScheduleDto }`；顶层同名解构原为 653，T5 后 654，C10 后 655，C11 后 656。
 2. `useChatPageCore.ts` 继续是同步 setup 协调层；`provide`、`onMounted`、`onBeforeUnmount`、`watch`、全局键鼠监听的同步调用链不得被 `await` 打断。
 3. `RouterView :key="$route.path"` 重挂载语义不变（`App.vue`）。
 4. `provide(bubbleContextKey, {...})` 的 41 键逐项保留、顺序不变；在 T4 做类型与数量加固。
@@ -166,7 +168,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C8 | T5 `ConfirmDialog.vue` | 新增 `components/chat/ConfirmDialog.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `dbb4569`：expose ref 桥接，focus trap/overflow 留根，web 45/45 + 单 chunk |
 | C9 | T5 `ChatThread.vue` | 新增 `components/chat/ChatThread.vue` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `e87c4b0`：threadEl bridge + outline v-model，web 45/45 + 单 chunk |
 | C10 | T6 `ContextMenuHost.vue` | 新增 `components/chat/ContextMenuHost.vue` + `tests/context-menu-host-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `58bd836`：19 动作 + keydown emit，expose/ref 桥接，web 49/49 + 全门禁绿 |
-| C11–C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
+| C11 | T6 `ChatSidebarList.vue` | 新增 `components/chat/ChatSidebarList.vue` + `tests/chat-sidebar-list-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `383630e`：39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿 |
+| C12–C13 | T6 其余高风险 UI | 同上 | ⏳ 可独立完成 |
 | C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
@@ -740,7 +743,7 @@ refactor(web): extract ContextMenuHost from ChatPage
 | 根状态机 | `agentMenuOpen`、`convQuery`、`showArchived`、`taskSectionOpen`、`expandedTasks`、`convSectionOpen`、`draggingId`、`dropTarget`、`renaming`、`clearArmed` | 全部留根，通过 props + emits 双向交互；折叠偏好 localStorage 写入函数也留根 |
 | 纯展示 helper | `agentText`、`taskDotClass`、`taskCardTip`、`taskHealthShort`、`taskRightShort`、`taskMarkerText`、`taskStatusText`、`filteredRuns`、`runTimeText`、`runMetaText`、`convStatus`、`convStatusText`、`queueCount` | `agentText` 子组件直接 import；其余作为函数 props 传入，不在子组件复制函数体或本地状态 |
 | 全局监听 | `onAgentMenuOutside`、`onAgentMenuEsc`、`onSidebarEsc` 在 core 的 `onMounted/onBeforeUnmount` 对称注册 | 不搬；子组件不得注册任何全局监听 |
-| 右键菜单 | aside 内 4 个 `@contextmenu.prevent` 入口（任务头、运行记录、会话项，另有主区任务头一处留根） | 只 emit 事件；`ContextMenuHost` 与 `ctxMenu` 状态继续由根层/C10 管 |
+| 右键菜单 | aside 内 3 个 `@contextmenu.prevent` 入口（任务头、运行记录、会话项；主区任务头一处和菜单根节点一处留根） | 只 emit 事件；`ContextMenuHost` 与 `ctxMenu` 状态继续由根层/C10 管 |
 | 根解构 | C10 后 655 个同名解构 | 新增 `ChatSidebarList`，655 → 656 |
 
 #### 9.2.3 组件契约
@@ -757,7 +760,7 @@ type TaskGroupRun = {
   marker?: string;
   trigger?: "schedule" | "manual" | "wake";
   durationMs?: number;
-  conv?: ConversationDto | null;
+  conv?: ConversationDto;
 };
 ```
 
@@ -786,7 +789,7 @@ Emits（29 个，动作全部转发，不在子组件执行状态变更）：
 模板不变量：
 
 - 根节点保持 `<aside class="sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }" ...>`；`.sidebar-backdrop` 不进组件。
-- 保留 4 个 aside 内 `@contextmenu.prevent` 入口和所有 `@click.stop`（未读角标、打开最近一期、重命名输入框、删除按钮）；不补 `@click.stop`、不改冒泡。
+- 保留 3 个 aside 内 `@contextmenu.prevent` 入口和所有 `@click.stop`（未读角标、打开最近一期、重命名输入框、删除按钮）；不补 `@click.stop`、不改冒泡。
 - 三处 `v-model` 契约：`convQuery` / `showArchived` 用 `update:convQuery` / `update:showArchived`；`renaming.value` 用 `renameValue` + `update:renameValue`。根层分别用 `v-model:conv-query`、`v-model:show-archived`、显式 `@update:rename-value` 接回。
 - `@keydown="onTaskGroupKeydown(...)"` / `onRunKeydown` / `onConvKeydown` / `onRenameKeydown` 全部改为 emit 转发，不复制键盘逻辑。
 - `aria-expanded` / `aria-current` / `role` / `tabindex` / `:draggable` / `:data-conv-id` / `:title` / `:aria-label` 原样保留。
@@ -802,8 +805,8 @@ Emits（29 个，动作全部转发，不在子组件执行状态变更）：
 #### 9.2.4 执行顺序
 
 1. 开工前核对 `HEAD`、工作区干净、根解构 655，确认 `ChatSidebarList.vue` 不存在。
-2. **先加红测** `apps/web/tests/chat-sidebar-list-contract.test.ts`（5 个源码契约用例，web 49 → 54）：
-   - 结构锁：`<aside class="sidebar">`、`.sidebar-backdrop` 不在组件、4 个 `@contextmenu.prevent`、`:ref="setRenameInput"`、`:data-conv-id`、三处 v-model emit 字符串。
+2. **先加红测** `apps/web/tests/chat-sidebar-list-contract.test.ts`（4 个源码契约用例，web 49 → 53）：
+   - 结构锁：`<aside class="sidebar">`、`.sidebar-backdrop` 不在组件、3 个 `@contextmenu.prevent`、`:ref="setRenameInput"`、`:data-conv-id`、三处 v-model emit 字符串。
    - props 锁：39 个 prop 名字逐项一致；不含 `sortMode` / `ctxMenu` / `pinnedAt`。
    - emits 锁：29 个 emit 名字逐项一致；含 `update:convQuery` / `update:showArchived` / `update:renameValue`。
    - expose/副作用锁：`defineExpose({ agentMenuEl, convListEl })`；组件无 `addEventListener` / `removeEventListener` / `localStorage` / `router.push` / `confirmDialog`。
@@ -821,7 +824,7 @@ Emits（29 个，动作全部转发，不在子组件执行状态变更）：
 | 三处 v-model / 函数 ref 漏接 | 搜索不过滤、归档勾选不刷新、重命名输入框不聚焦/不提交 | 中 | 契约测试锁 emit 名与模板字符串；模拟搜索/归档/F2 重命名全链路 |
 | 拖拽事件载荷丢失 | 排序落点错位或直接不排序 | 中 | `drag-start/over/drop/end` 显式 emit；保留 `dropTarget` class 计算由根 prop 回灌；模拟上下半区插入 |
 | 键盘路径被吞 | F2 重命名、Alt+↑/↓ 调序、Enter/Space 打开任务期/会话失效 | 中 | 4 类 keydown 均转发且不写 `.stop`；模拟焦点在任务头/运行记录/会话项/重命名框 |
-| 右键入口或载荷错 | 任务菜单/对话菜单打不开或打到错误目标 | 中 | 4 个 aside 入口逐一 emit；C10 `ContextMenuHost` 不动；模拟任务头与会话项 |
+| 右键入口或载荷错 | 任务菜单/对话菜单打不开或打到错误目标 | 中 | 3 个 aside 入口逐一 emit；C10 `ContextMenuHost` 不动；模拟任务头、运行记录与会话项 |
 | 展示 helper prop 漏传 | 状态点、快捷文案、运行时间空白或抛错 | 中 | 12 个 helper 列入 props 锁；首屏渲染逐项检查 |
 | 折叠偏好被误搬进子组件 | localStorage 写入时机/键名漂移，刷新后展开态丢失 | 低 | `toggleTaskSection` / `toggleTaskGroup` / `toggleConvSection` 留根；契约测试锁组件内无 `localStorage` |
 | 遮罩被误搬/包装 | 移动端抽屉层级或点击关闭回归 | 中 | 明确只搬 `<aside>`；契约测试锁子组件无 `.sidebar-backdrop`、根层仍保留 |
@@ -843,7 +846,7 @@ git diff --check
 Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 ```
 
-判定：web 54/54、全仓 type-check、build、server 978/978 全绿；`ChatPage-*.js` / `ChatPage-*.css` 仍各一份；Chrome 全清单因已知实例冲突为非阻塞项，可做时按下列路径冒烟。
+判定：web 53/53、全仓 type-check、build、server 978/978 全绿；`ChatPage-*.js` / `ChatPage-*.css` 仍各一份；Chrome 全清单因已知实例冲突为非阻塞项，可做时按下列路径冒烟。
 
 模拟推演（按顺序验证，任一步状态/焦点不符即停止）：
 
@@ -857,7 +860,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | 6 | 搜索对话 | `convQuery` v-model + `conv-search-input` → 根 `onConvSearchInput` 懒加载拼音；`conversationsFiltered` 由根重算回灌；任务分组隐藏、空态显示 |
 | 7 | 勾选显示归档 | `showArchived` v-model + `archived-change` → 根 `reloadConversations`；归档分隔线与计数由根 computed 回灌 |
 | 8 | 折叠任务区 / 任务组 / 对话区 | 三个 toggle emit → 根函数改状态并写 localStorage（键名不变）；刷新后展开态恢复 |
-| 9 | 右键任务头 / 运行记录 / 会话项 | 4 个入口按原参数 emit → 根 `openTaskCtxMenu` / `openCtxMenu` → C10 `ContextMenuHost` 渲染正确菜单；原生右键菜单不弹出 |
+| 9 | 右键任务头 / 运行记录 / 会话项 | 3 个入口按原参数 emit → 根 `openTaskCtxMenu` / `openCtxMenu` → C10 `ContextMenuHost` 渲染正确菜单；原生右键菜单不弹出 |
 | 10 | 键盘操作 | 任务头 Enter/Space、运行记录 Enter/Space、会话项 F2/Alt+↑/↓/↑/↓/Enter/Space、重命名框 Enter/Esc/↑/↓ 全部由根 handler 处理，焦点/排序/重命名符合既有行为 |
 | 11 | 拖拽排序 | `drag-start/over/drop/end` 带 conv 与 event 回根；`convListEl` 桥接生效，拖到边缘自动滚动；drop 后 `dropTarget` 清空、顺序落库 |
 | 12 | F2 重命名 | 根 `startRename` 先关菜单再设 `renaming`；`setRenameInput` 函数 prop 拿到 input，聚焦全选；输入 → `update:renameValue` 回根；Enter/失焦 → `commit-rename` |
@@ -874,6 +877,8 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 ```text
 refactor(web): extract ChatSidebarList from ChatPage
 ```
+
+- 实际代码提交：`383630e`；前置方案文档提交：`e2a1818`。
 
 ### 9.3 C12 `MessageComposer.vue`
 
