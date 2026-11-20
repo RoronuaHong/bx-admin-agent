@@ -241,7 +241,7 @@ function renderToolingStatus(status: ToolingStatus): string {
   if (status.web) {
     lines.push(
       status.web.available
-        ? `- 联网检索可用（${status.web.provider}）。`
+        ? `- 联网检索可用（${status.web.provider}）。调用失败或零命中只说明这次没拿到数据，不等于该主体在公开互联网上不存在；换说法/换来源再试，仍拿不到就如实说明未查到，不要凭记忆作答。`
         : `- 联网检索不可用（${status.web.reason || "未配置"}）：需要外部来源才能回答时，如实说明当前无法联网，不要用记忆代替。`,
     );
   }

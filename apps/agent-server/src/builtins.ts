@@ -454,8 +454,10 @@ const TOOL_SEARCH_SPEC: ToolSpec = {
 };
 
 export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[] {
-  // 联网检索工具只在真的配好了检索服务时注入：不可用的工具不注册（否则模型会去调一个必然失败的
-  // 工具，并把「调用了但没结果」误当成「网上没有这个信息」）。可用性由系统提示的通道现状如实告知。
+  // 联网检索工具只在真的配好了检索服务时注入；不可用的工具不注册（否则模型会去调一个必然失败的
+  // 工具，并把「调用了但没结果」误当成「网上没有这个信息」）。
+  // 只按配置判定、不做运行时探测：服务瞬时抖动属于调用期故障，由工具返回值如实上报即可。
+  // 探测失败就摘工具会让清单在会话中途缩水，模型会误以为自己没有联网能力而放弃检索。
   const webEnabled = readWebSearchConfig() !== null;
   return [
     spec(
@@ -952,6 +954,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
             "在公开互联网上检索，返回若干条结果的标题、链接与摘要。" +
               "句子在问外部主体的公开事实时调用本工具。自有业务数字、内部文档、角色专用数据源不要改走本工具。" +
               "某个连接器已经启用，不等于这件事的来源已经指定，也不要先用那个连接器检索专名来决定该不该联网。不要凭记忆编造。" +
+              "调用失败或零命中只说明这次没拿到数据，不等于该主体在公开互联网上不存在：换说法或换语言再试，仍然没有就如实说明未查到。" +
               "需要某条结果的正文时，再用 fetch_url 打开它的链接。",
             {
               type: "object",
@@ -1972,7 +1975,13 @@ export async function execBuiltin(
       if (!query) return { ok: false, text: "search_knowledge 需要 query" };
       const topK = Math.min(Math.max(Number(args.topK) || 5, 1), 20);
       const hits = await ragSearch(query, topK, namespace, { ownerKey, role: namespace });
-      if (!hits.length) return { ok: true, text: "（这次检索没有命中。换个说法再查；不要据此断定资料里没有这件事，也不要拿它证明经营数字不存在）" };
+      // 同 web_search：零命中不算接地证据，否则「库里查不到」会被拿来支撑事实性结论。
+      if (!hits.length) {
+        return {
+          ok: false,
+          text: "（这次知识库检索没有命中，本轮没有拿到可用的数据。换个说法再查；不要据此断定资料里没有这件事，也不要拿它证明经营数字不存在）",
+        };
+      }
       return {
         ok: true,
         text: hits
@@ -1993,7 +2002,15 @@ export async function execBuiltin(
       if (!query) return { ok: false, text: "web_search 需要 query" };
       const outcome = await webSearch(query, Number(args.count) || undefined);
       if (!outcome.ok) return { ok: false, text: outcome.error };
-      if (!outcome.hits.length) return { ok: true, text: "（这次公开检索没有命中。换个说法或换语言再查；仍然没有，就说明这个来源没有该结果，不要改用别的数据源换一个主体）" };
+      // 零命中 = 本轮没有拿到可用数据，与「调用失败」同属「没有证据」：必须走 ok:false，
+      // 否则会被 chat.ts 记成接地证据，护栏放行「这个主体网上不存在」这类无支撑结论。
+      // 文案仍保留可操作指引，但不引导模型据此下「该来源没有该结果」的事实结论。
+      if (!outcome.hits.length) {
+        return {
+          ok: false,
+          text: "（这次公开检索没有命中，本轮没有拿到可用的外部数据。换个说法或换语言再查；仍然没有，就如实说明未查到，不要据此断定该主体不存在，也不要改用别的数据源换一个主体）",
+        };
+      }
       const body = outcome.hits
         .map((hit, i) => {
           const meta = [hit.source, hit.publishedAt].filter(Boolean).join(" · ");

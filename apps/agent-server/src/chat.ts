@@ -67,6 +67,7 @@ import {
   buildDataNeedPrompt,
   buildGroundedFallbackSystem,
   buildGroundedFallbackUser,
+  buildGroundingHint,
   buildClaimExtractPrompt,
   buildSupportPrompt,
   buildVerifyHint,
@@ -78,7 +79,6 @@ import {
   crossCheckSources,
   DATA_NEED_SYSTEM,
   decideGrounding,
-  GROUNDING_HINT,
   hasBusinessDataSource,
   hasExternalDataSource,
   isGroundingEvidenceTool,
@@ -729,6 +729,7 @@ async function honestFallbackWith(
   prior: readonly { role: "user" | "assistant"; content: string }[],
   webOnly: boolean,
   signal?: AbortSignal,
+  hadFetchFailure = false,
 ): Promise<string | null> {
   try {
     const result = await callAgent(
@@ -739,7 +740,11 @@ async function honestFallbackWith(
       undefined,
       {
         systemParts: {
-          stable: buildGroundedFallbackSystem(roleLabel, { hasPriorTopic: prior.length > 0, webOnly }),
+          stable: buildGroundedFallbackSystem(roleLabel, {
+            hasPriorTopic: prior.length > 0,
+            webOnly,
+            hadFetchFailure,
+          }),
           dynamic: "",
         },
         disableThinking: true,
@@ -887,14 +892,18 @@ const BLANK_SYNTHESIS_HINT =
  */
 export function defersPublicLookup(text: string): boolean {
   const body = String(text || "");
+  // 「需要公开检索才能回答」也是把检索停在原地，不一定要带疑问词。
   const asksFirst =
-    /外部/.test(body) && /联网|公开检索|公网/.test(body) && /确认|要不要|是否|告诉我/.test(body);
+    /外部|公网/.test(body) &&
+    /联网|公开检索|公网/.test(body) &&
+    /确认|要不要|是否|告诉我|才能回答|才能判断|才能确定/.test(body);
   // 已经写出具体笔数/条数的，是自有业务结论，不是「库里没有这个主体」。
   const deliveredCount = /\d[\d,]{2,}\s*(笔|条|元|个)/.test(body);
   const closesOnInternalMiss =
     !deliveredCount &&
     /自有|数据源|主库/.test(body) &&
-    (/未找到|无结果|没命中|未发现/.test(body) || /没有[^。\n]{0,24}(数据|主体|相关)/.test(body));
+    (/未找到|无结果|没命中|未发现|没有找到|查不到|找不到/.test(body) ||
+      /没有[^。\n]{0,24}(数据|主体|相关|信息|记录)/.test(body));
   return asksFirst || closesOnInternalMiss;
 }
 
@@ -907,8 +916,8 @@ export function answeredFromWarehouseMiss(text: string): boolean {
   const body = String(text || "");
   if (/\d[\d,]{2,}\s*(笔|条|元|个|单)/.test(body)) return false;
   if (/公开检索|来源链接|web_search/.test(body)) return false;
-  const miss = /无法|不足以|没有确认|未找到|查不到|没命中|零命中|0\s*条|给不出|算不出|没有任何/.test(body);
-  const warehouse = /表|资产|指标|字段|记录|库|口径/.test(body);
+  const miss = /无法|不足以|没有确认|未找到|没有找到|查不到|找不到|没命中|零命中|0\s*条|给不出|算不出|没有任何/.test(body);
+  const warehouse = /表|资产|指标|字段|记录|库|口径|数据源/.test(body);
   return miss && warehouse;
 }
 
@@ -2669,7 +2678,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         groundingRetries += 1;
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         conversation.push({ role: "assistant", content: outcome.text });
-        conversation.push({ role: "user", content: GROUNDING_HINT });
+        conversation.push({ role: "user", content: buildGroundingHint(toolFailures > 0) });
         console.log("[chat:grounding] 未取得任何工具数据即作答，已作废并回灌纠正提示");
         continue;
       }
@@ -2698,6 +2707,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           priorTopicMessages(turns, userQuestion),
           ctx.groundingWebOnly === true,
           ctx.signal,
+          toolFailures > 0,
         );
         const finalHonest = honest || UNGROUNDED_REPLY;
         console.log(
@@ -2884,7 +2894,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
 
     // 逐个处理；**连续的** task 委派合并成一批并行执行（对齐 Deep Agents：单轮多个 task 并行）。
     const calls = outcome.toolCalls;
-    if (calls.some((call) => call.name === "web_search")) usedWebSearch = true;
+    // usedWebSearch 表示「本轮真的拿到了公开检索结果」，不是「发起过调用」：
+    // 失败 / 零命中（ok:false）/ 被熔断跳过都不能算「已经检索过」，否则下面几处纠偏闸门会被错误跳过。
+    // 置位在两条执行路径的成功分支里（见本函数下方的串行 / 并发记账处）。
     if (calls.some((call) => call.name.startsWith("mcp__bi__"))) usedOwnBusiness = true;
     skillsVisible = new Set(skillsRead);
     let index = 0;
@@ -3290,6 +3302,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               groundingEvidence += 1;
               pushEvidence(out.rawText, item.call.name);
               noteWrapUpEvidence(wrapEvidence, item.call.name, out.rawText);
+              if (item.call.name === "web_search") usedWebSearch = true;
             }
             if (out.todos) {
               latestTodos = out.todos;
@@ -3688,6 +3701,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         groundingEvidence += 1;
         pushEvidence(rawText, call.name);
         noteWrapUpEvidence(wrapEvidence, call.name, rawText);
+        if (call.name === "web_search") usedWebSearch = true;
       }
       content = prepareToolResultText(call.name, rawText);
       yield {

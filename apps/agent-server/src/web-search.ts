@@ -75,6 +75,38 @@ function positiveInt(raw: string, fallback: number, cap: number): number {
 }
 
 /**
+ * 把 fetch/undici 的网络错误还原成可排查的文案。
+ * undici 的 TypeError.message 恒为 "fetch failed"，真正原因藏在 cause 链（code / message）里；
+ * 只上报 .message 会得到一句没有信息量的 "fetch failed"，既误导模型也误导运维。
+ */
+export function describeNetworkError(error: unknown): string {
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+  let cur: unknown = error;
+  while (cur && typeof cur === "object" && !seen.has(cur)) {
+    seen.add(cur);
+    const node = cur as { code?: unknown; message?: unknown; cause?: unknown };
+    if (typeof node.code === "string" && node.code && !parts.includes(node.code)) parts.push(node.code);
+    if (
+      typeof node.message === "string" &&
+      node.message &&
+      node.message !== "fetch failed" &&
+      !parts.includes(node.message)
+    ) {
+      parts.push(node.message);
+    }
+    cur = node.cause;
+  }
+  const raw = parts.join(" / ") || (error instanceof Error ? error.message : String(error));
+  if (/ECONNREFUSED/i.test(raw)) return `${raw}：检索服务未启动或地址/端口配置错误`;
+  if (/ENOTFOUND|EAI_AGAIN|ENODATA/i.test(raw)) return `${raw}：检索服务域名解析失败，检查 WEB_SEARCH_BASE_URL`;
+  // undici 的实际文案是 "The operation timed out."，不是 timeout；两种都要认。
+  if (/ETIMEDOUT|ABORT_ERR|timeout|timed\s*out/i.test(raw)) return `${raw}：检索服务无响应`;
+  if (/CERT_|SSL|SELF_SIGNED/i.test(raw)) return `${raw}：检索服务证书校验失败`;
+  return raw;
+}
+
+/**
  * 读取联网检索配置；返回 null = 本次不可用（原因由 `webSearchStatus` 给出）。
  * 每次现读 env：改配置后重启即生效，无需额外状态。
  */
@@ -97,7 +129,11 @@ export function readWebSearchConfig(): WebSearchConfig | null {
 
 /**
  * 能力可用性 + 不可用原因（进系统提示的「工具通道现状」，让模型如实说明而不是编造）。
- * 原因文案只描述配置缺口，不含任何业务语义。
+ *
+ * 只按 env 配置判定，绝不做运行时探测：
+ * - 工具是否注入由「配置齐备」决定，一次抖动不能让工具清单在对话中途变化；
+ * - 服务瞬时不可达属于**调用期故障**，由 `webSearch()` 的返回值如实上报（错误文案带真实原因），
+ *   而不是在入口把工具藏起来、让模型误以为「我没有联网能力」从而放弃检索。
  */
 export function webSearchStatus(): { available: boolean; provider?: string; reason?: string } {
   const provider = env("WEB_SEARCH_PROVIDER").toLowerCase();
@@ -135,7 +171,7 @@ async function requestJson(
       return { ok: false, error: `检索服务返回非 JSON 响应：${body.slice(0, 200)}` };
     }
   } catch (error) {
-    return { ok: false, error: `检索请求失败：${(error as Error).message}` };
+    return { ok: false, error: `检索请求失败：${describeNetworkError(error)}` };
   }
 }
 
@@ -261,7 +297,7 @@ export async function webSearch(query: string, count?: number): Promise<WebSearc
       })),
     };
   } catch (error) {
-    return { ok: false, error: `检索失败：${(error as Error).message}` };
+    return { ok: false, error: `检索失败：${describeNetworkError(error)}` };
   }
 }
 
@@ -461,6 +497,6 @@ export async function fetchPage(
       truncated: truncated || clipped,
     };
   } catch (error) {
-    return { ok: false, error: `抓取失败：${(error as Error).message}` };
+    return { ok: false, error: `抓取失败：${describeNetworkError(error)}` };
   }
 }
