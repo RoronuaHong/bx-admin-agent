@@ -27,6 +27,7 @@ describe("ChatTaskPanel 契约", () => {
   const panel = read("../src/components/chat/ChatTaskPanel.vue");
   const core = read("../src/composables/chat/useChatPageCore.ts");
   const page = read("../src/pages/ChatPage.vue");
+  const css = read("../src/pages/chat-page.css");
 
   it("外层 Teleport、内部 Teleport 与四个 ref 原样保留", () => {
     expect(panel).toContain('<Teleport v-if="visible" to="#task-panel-host">');
@@ -174,6 +175,26 @@ describe("ChatTaskPanel 契约", () => {
     expect(core).toContain('window.addEventListener("resize", syncTaskToolsPos)');
     expect(core).toContain('window.addEventListener("scroll", syncDtPos, true)');
     expect(core).toContain('window.removeEventListener("keydown", onTaskFormEsc, true)');
+
+    // C16 selector 归属：本轮不下沉 CSS，只锁定当前归属与共享留根（§2.4 / §3.1）。
+    for (const selector of [
+      ".notify-switch {",
+      ".notify-manage {",
+      ".notify-form {",
+      ".notify-list {",
+      ".notify-item {",
+      ".notify-note {",
+      ".cron-raw {",
+    ]) {
+      expect(css, selector).toContain(selector);
+    }
+    for (const selector of [".notify-btn {", ".notify-btn--danger {", ".primary-btn {", ".field__input {", ".modal-mask {"]) {
+      expect(css, selector).toContain(selector);
+    }
+    for (const cls of ["notify-switch", "notify-manage", "notify-form", "notify-list", "notify-item", "notify-note", "cron-raw"]) {
+      expect(panel, cls).toContain(cls);
+    }
+    expect(panel).not.toContain("ChatTaskPanel.css");
   });
 
   it("根层接线、patch 桥与关键事件全部接通", () => {

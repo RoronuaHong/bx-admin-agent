@@ -1,6 +1,6 @@
 # 风险可控的剩余待办实施设计（2026-11-23 v2）
 
-- 状态：设计复核完成，待用户确认后写实施计划
+- 状态：A/B/C/D 低风险项已实施并推送；高风险项保持降级，收口记录见 §8（2026-11-24）
 - 决策来源：用户要求「第 1 类不做，其余能做的都做」，并追加硬约束「先评估风险，不要改动原有功能和交互；没问题的先做，有问题的先列出来」
 - 实施顺序：A 前端测试补强 → B 定时任务测试补强 → C 安全与审计测试/接线 → D 产品功能 additive 项
 - 原则：每个子项目单独验证、独立回滚；任何无法用自动化测试证明「原行为不变」的项降级为方案文档，不落生产代码
@@ -117,3 +117,58 @@
 3. 每子项目结束运行：服务端 `pnpm test` / `type-check` / `build`；前端 `pnpm --filter @bx/web test` / `type-check` / `build`；`git diff --check`；ChatPage 单 chunk 检查。前端测试数不低于 64。
 4. 功能代码默认不提交；用户明确要求时逐子项目独立提交、独立回滚。
 5. 最终结论只报告：已完成、已降级为方案、验证结果、残留风险。
+
+## 8. 实施收口与后续计划（2026-11-24）
+
+### 8.1 本轮实施记录
+
+| 子项目 | 落地内容 | 提交 |
+|---|---|---|
+| A | `visible-thinking.test.ts`（15 例）、`ime-composing-contract.test.ts`（7 例）、`task-groups-contract.test.ts`（4 例）；C16 在 `chat-task-panel-contract.test.ts` 既有 case 内加 selector 归属断言，case 数不变 | `b843b18` |
+| B | `schedule-runs.test.ts` +2 例（purpose 默认、`same` 两期复用）；`schedule-retry.test.ts` +1 例（`same` 与 skipped 组合） | `f92714e` |
+| C | `app.ts` 透传 `/chat/stream` 的 `toolAllowlist`（不传等价现状）；新增 allowlist/T-7·A-3/DATA_DIR/令牌端点四组测试 | `f92714e` |
+| D | 新增 RAG 分块默认值测试、命令输出三分支测试；修复 Node 22 缓冲超限错误码（`ERR_CHILD_PROCESS_STDIO_MAXBUFFER`）使 `ok: true` 回到注释既有意图 | `f92714e` |
+
+门禁：`pnpm test` 147 files / 1017 tests、`pnpm --filter @bx/web test` 12 files / 90 tests、`pnpm type-check`、`pnpm build`、`git diff --check`、单 ChatPage chunk 全绿。前端测试数高于 64 基线。
+
+### 8.2 C16 冲突裁决
+
+§3.1 要求 C16 锁定 selector 归属，§10.8 的红测样本写的是「CSS 已搬进 `ChatTaskPanel.css`」，与 §2.4「生产 CSS 下沉不做」冲突。按硬约束取前者：**本轮只锁定当前归属**——`.notify-switch*` / `.notify-manage` / `.notify-form*` / `.notify-list` / `.notify-item*` / `.notify-note` / `.cron-raw` 仍在 `chat-page.css`，`.notify-btn*` / `.primary-btn` / `.field__input` / `.modal-*` 留根，`ChatTaskPanel.vue` 无 `ChatTaskPanel.css` 引用。§10.8 的搬迁断言待视觉可自动化证明后再启用。
+
+### 8.3 C17–C26 前置方案与 selector 归属表
+
+> 当前锚点以代码为准（旧计划 §10.2 行号已漂移）：`chat-page.css` 中通知 `:69–303`、任务表单 `:374–1194`、日期 `:1195–1407`、快捷导航 `:1408–1458`、骨架/状态点 `:1460–1562`、确认弹窗 `:783–826`、Toast `:1678–1713`、右键 `:1804–1864`、输入区 `:3393–3520`、产物预览 `:2928–2975`、对话区 `:3043–3070`。
+
+| 块 | 主 DOM | 必须留根 | `:deep` / 特殊处理 | Teleport | 风险 |
+|---|---|---|---|---|---|
+| C17 任务表单主体 | `ChatTaskPanel.vue` | `.modal-*`、`.field__input`、`.primary-btn`、`.tools-*`、`.mcp-*`、`.prompt-box` | `UiSelect`/`ToolsSearch`/`SkillAddForm`/`McpAddForm`/`PromptBox` 逐项 `:deep` | `#task-panel-host` + 2× `to="body"` | 高→高 |
+| C18 一次性日期选择器 | `ChatTaskPanel.vue` | `.field__input`；`dtPos`/ref 桥留根 | 状态变体随块搬；定位由根层算 | `to="body"` | 高→中高 |
+| C19 快捷导航 | `ChatSidebarList.vue` | 无（`.side-nav*` 独占） | 无需 `:deep`；目标 `ChatSidebarList.css` | 无 | 低→低 |
+| C20 骨架/拖拽/状态点 | `ChatSidebarList.vue` / `ChatThread.vue` | `.conv-dot*`、`.dragging*`、`.boot-skeleton*` | 只搬侧栏专属骨架 | 无 | 中高→中 |
+| C21 删除确认弹窗 | `ConfirmDialog.vue` | `.modal-*`、`.ghost-btn`；`.confirm-text` 在 bubble 侧有副本 | 只搬 confirm 专属 | `to="body"` | 中→中 |
+| C22 Toast | `DoneToast.vue` | `@keyframes done-toast-in` 在 `styles.css`（全局唯一来源） | 只搬 `done-toast*` 前缀 | `to="body"` | 中→中低 |
+| C23 产物预览 | `ArtifactPreviewModal.vue` | `.modal-*`、`.ghost-btn` | 只搬 `preview-*`（类独占） | `to="body"` | 中低→低 |
+| C24 对话区/气泡/大纲 | `ChatThread.vue` / `ChatBubble.vue` / `ConversationOutline.vue` | `bubble.css` 已有共享副本；`.group-head*` 等留根 | 逐 selector 建映射，建议拆 2–3 子提交 | 无 | 高→高 |
+| C25 右键菜单 | `ContextMenuHost.vue` | 定位计算留根层 | 原规则写为 `:global(.ctx-*)`；下沉后需实测 scope 命中 | `to="body"` | 中→中 |
+| C26 输入区 | `MessageComposer.vue` | `.tools-flyout*`、`.prompt-box` 基础、`.primary-btn` | `PromptBox`/`ToolsSearch`/`UiSelect` 需 `:deep` 清单 | 工具飞出 `to="body"` | 高→中高 |
+
+独占性已核实：`.side-nav*`、类级 `preview-*`、类级 `.ctx-*`、类级 `done-toast*` 均只出现在对应组件与 `chat-page.css`，可作为后续下沉的第一梯队。
+
+### 8.4 风险项 go / no-go 与触发条件
+
+| 项 | 结论 | 触发条件或替代方案 |
+|---|---|---|
+| C16–C26 生产 CSS 下沉 | 不做（本轮） | 需先有视觉回归自动化或人工签字；本轮只交付归属表与 C16 当前归属契约 |
+| pptx 导出 | 不做（本轮） | 需引入 `pptxgenjs` 并更新锁文件；先过依赖风险评审，再按 §6.1 落地 |
+| `http_request` 内置工具 | 不做（本轮） | 白名单/私网/重定向/DNS/上限/确认门/审计/`wrapUntrusted` 任一缺失即不注册；当前未实现完整闸门 |
+| R3/R4 引用清单与脚本归档 | 不做（本轮） | 先产出 tsc/LSP 引用证据与保留理由表，无证据不删 |
+| sendBeacon | 不做 | 投递监听/幂等端点/卸载竞态无法本轮验证 |
+| 未读清零失败回滚、老任务补 `runs[0]` | 不做 | 会改变失败路径角标与持久化数据；现有行为已由测试固化 |
+| `onKeydown` / `onRenameKeydown` 的 `keyCode=229` 回退 | 未改 | 契约测试已锁现状；修复需改实现，留待明确授权 |
+| T-8、IO-6~9、T-9、C-1/2/3/5、S-3~6、A-4、png | 不做 | 按 §2.4 改变输出语义/配额/调度/视觉，风险高于收益 |
+
+### 8.5 残留风险
+
+- 视觉一致性无自动化证明，C16–C26 下沉仍需浏览器实测或人工签字。
+- IME 两个 handler 在旧浏览器缺少 `keyCode=229` 回退；中文真实输入法实例验证按 §2.2 非本轮前置条件。
+- Node 22 缓冲错误码兼容已修，但仍只在集成测试环境验证，未做真机长日志场景。
