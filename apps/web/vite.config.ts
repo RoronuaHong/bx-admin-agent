@@ -9,6 +9,19 @@ export default defineConfig({
   plugins: [
     vue(),
     {
+      // @vitejs/plugin-vue 6.0.8 的 <style scoped src="..."> 回归：
+      // 外部样式请求只带 &scoped=<id>，但插件从 &id= 读取，导致编译后
+      // 选择器变成 [data-v-]（空 id），所有规则都不生效。
+      // 这里在插件输出后把空 id 补回真实 scope id，保留 scoped 隔离。
+      name: "fix-vue-external-scoped-style-id",
+      transform(code, id) {
+        if (!id.includes("?vue&type=style") || !id.includes("&src=")) return null;
+        const m = id.match(/[?&]scoped=([0-9a-f]+)/);
+        if (!m || !code.includes("[data-v-]")) return null;
+        return { code: code.replaceAll("[data-v-]", `[data-v-${m[1]}]`), map: null };
+      },
+    },
+    {
       name: "spa-history-fallback",
       configureServer(server) {
         server.middlewares.use(async (req, res, next) => {

@@ -2839,6 +2839,8 @@ async function send() {
       images.map((i) => i.id),
       images.map((i) => ({ id: i.id, name: i.name })),
       docs.map((i) => i.id),
+      images,
+      docs,
     );
     state.dispatching = false;
     released = true;
@@ -2946,6 +2948,9 @@ async function runTurn(
   imageIds: string[],
   thumbnails?: Array<{ id: string; name: string }>,
   docIds: string[] = [],
+  /** 原附件对象：409 入队失败时按原样回填，避免只恢复文字、丢失图片/文档。 */
+  originalImages?: UploadResult[],
+  originalDocs?: UploadResult[],
 ) {
   const state = stateOf(convId);
   // 默认抢占语义（§4 Interrupt 档）：同一对话正在生成时，新发送直接开新 run 并取消旧轮；
@@ -3041,6 +3046,9 @@ async function runTurn(
       } else {
         reply.error = state.error = tx("消息未能入队，请重试", "Message could not be queued; please retry", "A mensagem não entrou na fila; tente novamente", "संदेश कतार में नहीं गया; कृपया पुनः प्रयास करें");
         if (!state.input) state.input = text;
+        // 附件也在 send() 里被清空了：入队失败必须原样回填，否则用户只能重输文字、图片/文档永久丢失。
+        if (!state.pendingImages.length && originalImages?.length) state.pendingImages = originalImages;
+        if (!state.pendingDocs.length && originalDocs?.length) state.pendingDocs = originalDocs;
       }
     } else {
       // 连接类错误（断网/刷新/代理断开）：执行与推送已解耦，后台任务可能仍在跑。
@@ -3077,10 +3085,15 @@ async function runTurn(
     state.runCount = Math.max(0, state.runCount - 1);
     state.sending = state.runCount > 0;
     state.controllers = state.controllers.filter((c) => c !== controller);
-    // auto 模式：本轮失败则把该模型记入黑名单（下次解析跳过），成功则清除其失败标记。
-    // 仅「模型真的不可用」计入——用户主动停止 / 对话繁忙 / 后台继续 / 中断 / 无进展收口 都不算。
-    if (reply.error && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode || "")) failedModelIds.value.add(chosenModel);
-    else failedModelIds.value.delete(chosenModel);
+    // auto 模式：本轮失败则把「实际服务模型」记入黑名单，成功则清除其失败标记。
+    // 仅「服务端明确报了模型故障码」计入——断网 / 繁忙 / 停止 / 中断都没有 serverErrorCode。
+    // auto 本身不是模型 id，记进黑名单既不生效还会污染状态，必须用 servedModel。
+    const faultModel = run.servedModel || (chosenModel === MODEL_AUTO_ID ? "" : chosenModel);
+    if (reply.error && run.serverErrorCode && !NOT_MODEL_FAULT_CODES.has(run.serverErrorCode)) {
+      if (faultModel) failedModelIds.value.add(faultModel);
+    } else if (faultModel) {
+      failedModelIds.value.delete(faultModel);
+    }
     // 显式带上 convId：此刻用户可能已经切到别的对话，不能写错对话。
     // 曾并发过（hadConcurrent）或本轮入队撤回过气泡（queued）则全量落库：本地 bubbles 是 UI 真相源，
     // 全量替换把「半截中间项 / 重复提问 / 已撤回的入队占位」一并修正，确保服务端不残留重复气泡。

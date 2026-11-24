@@ -31,6 +31,7 @@ const tx = (zh: string, en: string, pt = en, hi = en) =>
 const root = ref<HTMLElement | null>(null);
 const visible = ref(false);
 let ticking = false;
+let rafId = 0;
 
 /**
  * 找页面真正的滚动容器：**不能直接读 window**。
@@ -98,7 +99,10 @@ function sync() {
 function onScroll() {
   if (ticking) return;
   ticking = true;
-  requestAnimationFrame(sync);
+  rafId = requestAnimationFrame(() => {
+    rafId = 0;
+    sync();
+  });
 }
 
 function toTop() {
@@ -156,6 +160,8 @@ onMounted(() => {
   window.addEventListener("resize", onScroll, { passive: true });
 });
 onBeforeUnmount(() => {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
   avoidObserver?.disconnect();
   document.removeEventListener("scroll", onScroll, { capture: true });
   window.removeEventListener("resize", onScroll);

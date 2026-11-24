@@ -112,6 +112,7 @@ function findScroller(): HTMLElement | null {
 /** 贴底判定容差：与页面跟底逻辑（nearBottom）同口径。 */
 const BOTTOM_GAP = 48;
 let ticking = false;
+let rafId = 0;
 
 /**
  * 已渲染条目缓存：行在 DOM 里自上而下有序（rect.top 单调不减），滚动跟踪对 top 做二分，
@@ -185,7 +186,10 @@ function syncActive() {
 function onScroll() {
   if (ticking) return;
   ticking = true;
-  requestAnimationFrame(syncActive);
+  rafId = requestAnimationFrame(() => {
+    rafId = 0;
+    syncActive();
+  });
 }
 
 /** 面板内层滚到当前条目：窗口化 + 均匀行高 → 纯算术定位（O(1)，不量 DOM、不依赖补丁时序）。 */
@@ -207,6 +211,37 @@ function closeFromPanel() {
   fabEl.value?.focus({ preventScroll: true });
 }
 
+/** Esc 监听放根节点：FAB 与面板是兄弟，挂在 nav 上时从 FAB 展开后按 Esc 关不掉。 */
+function onRootEsc() {
+  if (props.open) closeFromPanel();
+}
+
+/** 窗口化列表的键盘导航：方向键 / Home / End 先把目标滚进窗口，再在下一帧转移焦点。 */
+async function onListKeydown(event: KeyboardEvent) {
+  if (!props.items.length) return;
+  const key = event.key;
+  if (key !== "ArrowDown" && key !== "ArrowUp" && key !== "Home" && key !== "End") return;
+  event.preventDefault();
+  const current = props.items.findIndex((item) => item.id === props.activeId);
+  const last = props.items.length - 1;
+  let target: number;
+  if (key === "Home") target = 0;
+  else if (key === "End") target = last;
+  else if (current < 0) target = key === "ArrowDown" ? 0 : last;
+  else target = Math.max(0, Math.min(last, current + (key === "ArrowDown" ? 1 : -1)));
+
+  const list = listEl.value;
+  if (!list) return;
+  const top = listPadTop() + target * rowH.value;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (top + rowH.value > list.scrollTop + list.clientHeight) {
+    list.scrollTop = top + rowH.value - list.clientHeight;
+  }
+  syncListMetrics();
+  await nextTick();
+  list.querySelector<HTMLElement>(`[data-outline-index="${target}"]`)?.focus({ preventScroll: true });
+}
+
 let scroller: HTMLElement | null = null;
 
 onMounted(() => {
@@ -218,6 +253,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
   scroller?.removeEventListener("scroll", onScroll);
   window.removeEventListener("resize", onWindowResize);
 });
@@ -271,7 +308,7 @@ watch(
 </script>
 
 <template>
-  <div ref="root" class="conv-outline">
+  <div ref="root" class="conv-outline" @keydown.esc.prevent="onRootEsc">
     <!-- 折叠 FAB：胶囊按钮 + 条目数徽标；面板展开时徽标隐藏（面板头部已有计数）。
          无条目（新会话 / 无用户消息）时整组不渲染。 -->
     <button
@@ -298,7 +335,6 @@ watch(
         id="conv-outline-panel"
         class="conv-outline__panel"
         :aria-label="tx('对话大纲', 'Conversation outline', 'Estrutura da conversa', 'बातचीत की रूपरेखा')"
-        @keydown.esc.prevent="closeFromPanel"
       >
         <div class="conv-outline__head">
           <span class="conv-outline__title">{{ tx("对话大纲", "Conversation outline", "Estrutura da conversa", "बातचीत की रूपरेखा") }}</span>
@@ -313,13 +349,21 @@ watch(
             ×
           </button>
         </div>
-        <div ref="listEl" class="conv-outline__list" @scroll="onListScroll">
+        <div
+          ref="listEl"
+          class="conv-outline__list"
+          tabindex="0"
+          :aria-label="tx('对话大纲条目', 'Outline items', 'Itens da estrutura', 'रूपरेखा आइटम')"
+          @scroll="onListScroll"
+          @keydown="onListKeydown"
+        >
           <!-- 窗口化画布：总高 = 条目数 × 行高（均匀单行），只挂可视窗口内的条目（绝对定位）。
                屏外条目不在 DOM——给条目带上 setsize/posinset，让读屏器知道完整规模与位置。 -->
           <div class="conv-outline__canvas" :style="{ height: `${items.length * rowH}px` }">
             <button
               v-for="{ item, index } in windowedItems"
               :key="item.id"
+              :data-outline-index="index"
               type="button"
               class="conv-outline__item"
               :class="{ active: item.id === activeId }"

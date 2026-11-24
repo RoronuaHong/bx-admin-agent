@@ -19,11 +19,11 @@ const locale = getUiLocale();
 const tx = (zh: string, en: string, pt = en, hi = en) =>
   locale.value === "zh" ? zh : locale.value === "pt-BR" ? pt : locale.value === "hi" ? hi : en;
 
-const ROLE_OPTIONS = [
-  { id: "generic", label: "通用助手" },
-  { id: "movie", label: "观影助手" },
-  { id: "support", label: "客服助手" },
-];
+const ROLE_OPTIONS = computed(() => [
+  { id: "generic", label: tx("通用助手", "General assistant", "Assistente geral", "सामान्य सहायक") },
+  { id: "movie", label: tx("观影助手", "Movie assistant", "Assistente de filmes", "फ़िल्म सहायक") },
+  { id: "support", label: tx("客服助手", "Support assistant", "Assistente de suporte", "सहायता सहायक") },
+]);
 
 const loading = ref(false);
 const busy = ref(false);
@@ -38,6 +38,8 @@ const preview = ref("");
 const form = ref({ dir: "", name: "", description: "", roles: [] as string[], body: "" });
 const uploadDir = ref("");
 const uploadFile = ref<File | null>(null);
+/** openSkill 异步读取的序号：后点开的技能先返回时，旧响应不得覆盖当前面板。 */
+let skillFetchSeq = 0;
 
 const filtered = computed(() => {
   void pinyinReady.value;
@@ -72,18 +74,24 @@ function resetForm() {
   warning.value = "";
 }
 
+/** 每个入口/写操作开头统一清掉上一条反馈，避免旧成功提示误导当前失败操作。 */
+function resetFeedback() {
+  errorText.value = "";
+  notice.value = "";
+  warning.value = "";
+}
+
 function openCreate() {
   mode.value = "create";
   activeDir.value = "";
-  notice.value = "";
+  resetFeedback();
   resetForm();
 }
 
 function openUpload() {
   mode.value = "upload";
   activeDir.value = "";
-  notice.value = "";
-  warning.value = "";
+  resetFeedback();
   uploadDir.value = "";
   uploadFile.value = null;
 }
@@ -91,14 +99,16 @@ function openUpload() {
 function closePanel() {
   mode.value = "";
   activeDir.value = "";
-  errorText.value = "";
+  resetFeedback();
 }
 
 async function openSkill(skill: SkillCatalogItem, edit: boolean) {
-  errorText.value = "";
+  const seq = ++skillFetchSeq;
+  resetFeedback();
   activeDir.value = skill.dir;
   try {
     const doc = await fetchSkillDocument(skill.dir);
+    if (seq !== skillFetchSeq || activeDir.value !== skill.dir) return;
     preview.value = doc.content;
     form.value = {
       dir: doc.skill.dir,
@@ -109,6 +119,7 @@ async function openSkill(skill: SkillCatalogItem, edit: boolean) {
     };
     mode.value = edit && skill.source === "local" ? "edit" : "view";
   } catch (err) {
+    if (seq !== skillFetchSeq) return;
     errorText.value = String((err as Error)?.message || err);
   }
 }
@@ -120,9 +131,7 @@ function toggleRole(id: string) {
 
 async function save() {
   busy.value = true;
-  errorText.value = "";
-  warning.value = "";
-  notice.value = "";
+  resetFeedback();
   try {
     const payload = {
       dir: form.value.dir.trim(),
@@ -135,8 +144,8 @@ async function save() {
     const result = creating ? await createSkill(payload) : await updateSkill(payload.dir, payload);
     warning.value = result.warning || "";
     notice.value = creating
-      ? "已新建。对话里可以勾选它，不勾选时模型仍会按需加载。"
-      : "已保存。";
+      ? tx("已新建。对话里可以勾选它，不勾选时模型仍会按需加载。", "Created. You can select it in a chat; the model can still load it on demand if not selected.", "Criado. Você pode selecioná-lo em um chat; o modelo ainda pode carregá-lo sob demanda.", "बन गया। आप इसे चैट में चुन सकते हैं; न चुनने पर भी मॉडल इसे ज़रूरत पड़ने पर लोड कर सकता है।")
+      : tx("已保存。", "Saved.", "Salvo.", "सहेजा गया।");
     if (result.warning) notice.value = `${notice.value} ${result.warning}`;
     mode.value = "view";
     activeDir.value = result.skill.dir;
@@ -151,7 +160,7 @@ async function save() {
 
 async function onToggle(skill: SkillCatalogItem) {
   busy.value = true;
-  errorText.value = "";
+  resetFeedback();
   try {
     await setSkillEnabled(skill.dir, !skill.enabled);
     await load();
@@ -163,12 +172,17 @@ async function onToggle(skill: SkillCatalogItem) {
 }
 
 async function onDelete(skill: SkillCatalogItem) {
-  if (!window.confirm(`删除本地技能「${skill.name}」？文件会从这台机器去掉。`)) return;
+  if (!window.confirm(tx(
+    `删除本地技能「${skill.name}」？文件会从这台机器去掉。`,
+    `Delete local skill "${skill.name}"? The files will be removed from this machine.`,
+    `Excluir a habilidade local "${skill.name}"? Os arquivos serão removidos desta máquina.`,
+    `स्थानीय कौशल "${skill.name}" हटाएँ? फ़ाइलें इस मशीन से हट दी जाएँगी।`,
+  ))) return;
   busy.value = true;
-  errorText.value = "";
+  resetFeedback();
   try {
     const result = await deleteSkill(skill.dir);
-    notice.value = result.notice || "已从各对话勾选中消失";
+    notice.value = result.notice || tx("已从各对话勾选中消失", "Removed from chat selections", "Removido das seleções dos chats", "चैट चयन से हटाया गया");
     if (activeDir.value === skill.dir) {
       mode.value = "";
       activeDir.value = "";
@@ -188,15 +202,14 @@ function onFile(event: Event) {
 
 async function submitUpload() {
   if (!uploadFile.value) {
-    errorText.value = "请选择 SKILL.md 或 zip";
+    errorText.value = tx("请选择 SKILL.md 或 zip", "Choose a SKILL.md or zip file", "Escolha um arquivo SKILL.md ou zip", "SKILL.md या zip फ़ाइल चुनें");
     return;
   }
   busy.value = true;
-  errorText.value = "";
-  warning.value = "";
+  resetFeedback();
   try {
     const result = await importSkillFile(uploadDir.value.trim(), uploadFile.value);
-    notice.value = "已上传。对话里可以勾选它。";
+    notice.value = tx("已上传。对话里可以勾选它。", "Uploaded. You can select it in a chat.", "Enviado. Você pode selecioná-lo em um chat.", "अपलोड हो गया। आप इसे चैट में चुन सकते हैं।");
     if (result.warning) notice.value = `${notice.value} ${result.warning}`;
     mode.value = "";
     await load();
@@ -208,9 +221,9 @@ async function submitUpload() {
 }
 
 function badge(skill: SkillCatalogItem): string {
-  if (!skill.enabled) return "已全局关闭";
-  if (skill.default) return "按需加载，不用勾选";
-  return "可在对话里勾选";
+  if (!skill.enabled) return tx("已全局关闭", "Disabled globally", "Desativado globalmente", "वैश्विक रूप से बंद");
+  if (skill.default) return tx("按需加载，不用勾选", "Loaded on demand, no selection needed", "Carregado sob demanda, sem necessidade de seleção", "ज़रूरत पर लोड, चयन की आवश्यकता नहीं");
+  return tx("可在对话里勾选", "Selectable in chats", "Selecionável em chats", "चैट में चुना जा सकता है");
 }
 
 onMounted(load);
@@ -222,14 +235,14 @@ onMounted(load);
       <div>
         <h1 class="skills__title">{{ tx("技能", "Skills", "Habilidades", "स्किल") }}</h1>
         <p class="skills__sub">
-          系统自带的技能随版本更新。本地技能只存在这台机器上。关掉后文件还在，但索引、按需读取和对话勾选都不再提供它。
+          {{ tx("系统自带的技能随版本更新。本地技能只存在这台机器上。关掉后文件还在，但索引、按需读取和对话勾选都不再提供它。", "Built-in skills update with the release. Local skills live only on this machine. Turning one off keeps its files but removes it from indexing, on-demand loading and chat selection.", "As habilidades integradas são atualizadas com a versão. As locais existem apenas nesta máquina. Desativar mantém os arquivos, mas remove a habilidade da indexação, do carregamento sob demanda e da seleção em chats.", "अंतर्निहित कौशल रिलीज़ के साथ अपडेट होते हैं। स्थानीय कौशल केवल इस मशीन पर रहते हैं। बंद करने पर फ़ाइलें रहती हैं, लेकिन अनुक्रमणिका, ऑन-डिमांड लोडिंग और चैट चयन से हट जाते हैं।") }}
         </p>
       </div>
       <div class="skills__actions">
-        <button class="skills__btn skills__btn--primary" type="button" :disabled="busy" @click="openCreate">新建</button>
-        <button class="skills__btn" type="button" :disabled="busy" @click="openUpload">上传</button>
-        <button class="skills__btn" type="button" :disabled="loading" @click="load">{{ loading ? "加载中…" : "刷新" }}</button>
-        <RouterLink class="skills__btn" to="/">返回门户</RouterLink>
+        <button class="skills__btn skills__btn--primary" type="button" :disabled="busy" @click="openCreate">{{ tx("新建", "New", "Novo", "नया") }}</button>
+        <button class="skills__btn" type="button" :disabled="busy" @click="openUpload">{{ tx("上传", "Upload", "Enviar", "अपलोड") }}</button>
+        <button class="skills__btn" type="button" :disabled="loading" @click="load">{{ loading ? tx("加载中…", "Loading…", "Carregando…", "लोड हो रहा है…") : tx("刷新", "Refresh", "Atualizar", "रीफ़्रेश") }}</button>
+        <RouterLink class="skills__btn" to="/">{{ tx("返回门户", "Back to portal", "Voltar ao portal", "पोर्टल पर वापस") }}</RouterLink>
       </div>
     </header>
 
@@ -237,7 +250,7 @@ onMounted(load);
       v-model="query"
       class="skills__search"
       type="search"
-      placeholder="搜索技能"
+      :placeholder="tx('搜索技能', 'Search skills', 'Buscar habilidades', 'कौशल खोजें')"
       @input="onSearchInput"
     />
 
@@ -247,14 +260,14 @@ onMounted(load);
     <div class="skills__layout" :class="{ 'skills__layout--split': mode }">
       <div>
         <section>
-          <h2 class="skills__section">系统自带 <span class="skills__count">{{ builtin.length }}</span></h2>
-          <p v-if="!loading && !builtin.length" class="skills__empty">没有匹配的系统技能。</p>
+          <h2 class="skills__section">{{ tx("系统自带", "Built-in", "Integradas", "अंतर्निहित") }} <span class="skills__count">{{ builtin.length }}</span></h2>
+          <p v-if="!loading && !builtin.length" class="skills__empty">{{ tx("没有匹配的系统技能。", "No matching built-in skills.", "Nenhuma habilidade integrada encontrada.", "कोई मेल खाता अंतर्निहित कौशल नहीं।") }}</p>
           <ul class="skills__list">
             <li v-for="skill in builtin" :key="skill.dir" class="skills__item" :class="{ off: !skill.enabled }">
               <button type="button" class="skills__main" @click="openSkill(skill, false)">
                 <span class="skills__name">{{ skill.name }}</span>
                 <span class="skills__dir">{{ skill.dir }}</span>
-                <span class="skills__desc">{{ skill.description || "（无描述）" }}</span>
+                <span class="skills__desc">{{ skill.description || tx("（无描述）", "(no description)", "(sem descrição)", "(विवरण नहीं)") }}</span>
                 <span
                   class="skills__badge"
                   :class="{ 'skills__badge--off': !skill.enabled, 'skills__badge--auto': skill.default }"
@@ -262,7 +275,7 @@ onMounted(load);
               </button>
               <div class="skills__row-actions">
                 <button class="skills__mini" type="button" :disabled="busy" @click="onToggle(skill)">
-                  {{ skill.enabled ? "关闭" : "打开" }}
+                  {{ skill.enabled ? tx("关闭", "Disable", "Desativar", "बंद करें") : tx("打开", "Enable", "Ativar", "चालू करें") }}
                 </button>
               </div>
             </li>
@@ -270,25 +283,25 @@ onMounted(load);
         </section>
 
         <section>
-          <h2 class="skills__section">本地技能 <span class="skills__count">{{ local.length }}</span></h2>
-          <p v-if="!loading && !local.length" class="skills__empty">还没有本地技能。新建或上传一份 SKILL.md。</p>
+          <h2 class="skills__section">{{ tx("本地技能", "Local skills", "Habilidades locais", "स्थानीय कौशल") }} <span class="skills__count">{{ local.length }}</span></h2>
+          <p v-if="!loading && !local.length" class="skills__empty">{{ tx("还没有本地技能。新建或上传一份 SKILL.md。", "No local skills yet. Create or upload a SKILL.md.", "Ainda não há habilidades locais. Crie ou envie um SKILL.md.", "अभी कोई स्थानीय कौशल नहीं। SKILL.md बनाएँ या अपलोड करें।") }}</p>
           <ul class="skills__list">
             <li v-for="skill in local" :key="skill.dir" class="skills__item" :class="{ off: !skill.enabled }">
               <button type="button" class="skills__main" @click="openSkill(skill, false)">
                 <span class="skills__name">{{ skill.name }}</span>
                 <span class="skills__dir">{{ skill.dir }}</span>
-                <span class="skills__desc">{{ skill.description || "（无描述）" }}</span>
+                <span class="skills__desc">{{ skill.description || tx("（无描述）", "(no description)", "(sem descrição)", "(विवरण नहीं)") }}</span>
                 <span
                   class="skills__badge"
                   :class="{ 'skills__badge--off': !skill.enabled, 'skills__badge--auto': skill.default }"
                 >{{ badge(skill) }}</span>
               </button>
               <div class="skills__row-actions">
-                <button class="skills__mini" type="button" :disabled="busy" @click="openSkill(skill, true)">编辑</button>
+                <button class="skills__mini" type="button" :disabled="busy" @click="openSkill(skill, true)">{{ tx("编辑", "Edit", "Editar", "संपादित करें") }}</button>
                 <button class="skills__mini" type="button" :disabled="busy" @click="onToggle(skill)">
-                  {{ skill.enabled ? "关闭" : "打开" }}
+                  {{ skill.enabled ? tx("关闭", "Disable", "Desativar", "बंद करें") : tx("打开", "Enable", "Ativar", "चालू करें") }}
                 </button>
-                <button class="skills__mini skills__mini--danger" type="button" :disabled="busy" @click="onDelete(skill)">删除</button>
+                <button class="skills__mini skills__mini--danger" type="button" :disabled="busy" @click="onDelete(skill)">{{ tx("删除", "Delete", "Excluir", "हटाएँ") }}</button>
               </div>
             </li>
           </ul>
@@ -298,31 +311,31 @@ onMounted(load);
       <aside v-if="mode" class="skills__panel">
         <div class="skills__panel-head">
           <h2 class="skills__section">
-            {{ mode === "create" ? "新建本地技能" : mode === "upload" ? "上传" : mode === "edit" ? "编辑" : "查看" }}
+            {{ mode === "create" ? tx("新建本地技能", "New local skill", "Nova habilidade local", "नया स्थानीय कौशल") : mode === "upload" ? tx("上传", "Upload", "Enviar", "अपलोड") : mode === "edit" ? tx("编辑", "Edit", "Editar", "संपादित करें") : tx("查看", "View", "Visualizar", "देखें") }}
           </h2>
-          <button class="skills__close" type="button" :aria-label="tx('关闭面板', 'Close panel')" @click="closePanel">×</button>
+          <button class="skills__close" type="button" :aria-label="tx('关闭面板', 'Close panel', 'Fechar painel', 'पैनल बंद करें')" @click="closePanel">×</button>
         </div>
 
         <form v-if="mode === 'upload'" class="skills__form" @submit.prevent="submitUpload">
-          <label>目录名<input v-model="uploadDir" required placeholder="weekly-report" /></label>
-          <label>文件<input type="file" accept=".md,.zip,text/markdown,application/zip" @change="onFile" /></label>
-          <p class="skills__hint">只接受单个 SKILL.md，或根目录只有这一个文件的 zip。不能附带脚本。</p>
-          <button class="skills__btn skills__btn--primary" type="submit" :disabled="busy">上传</button>
+          <label>{{ tx("目录名", "Directory", "Diretório", "निर्देशिका") }}<input v-model="uploadDir" required placeholder="weekly-report" /></label>
+          <label>{{ tx("文件", "File", "Arquivo", "फ़ाइल") }}<input type="file" accept=".md,.zip,text/markdown,application/zip" @change="onFile" /></label>
+          <p class="skills__hint">{{ tx("只接受单个 SKILL.md，或根目录只有这一个文件的 zip。不能附带脚本。", "Only a single SKILL.md, or a zip whose root contains just that file. No scripts.", "Apenas um SKILL.md, ou um zip cuja raiz contenha somente esse arquivo. Sem scripts.", "केवल एक SKILL.md, या ऐसा zip जिसकी रूट में केवल यही फ़ाइल हो। स्क्रिप्ट नहीं।") }}</p>
+          <button class="skills__btn skills__btn--primary" type="submit" :disabled="busy">{{ tx("上传", "Upload", "Enviar", "अपलोड") }}</button>
         </form>
 
         <form v-else-if="mode === 'create' || mode === 'edit'" class="skills__form" @submit.prevent="save">
-          <label>目录名<input v-model="form.dir" :readonly="mode === 'edit'" required placeholder="weekly-report" /></label>
-          <label>显示名<input v-model="form.name" required maxlength="80" /></label>
-          <label>描述<textarea v-model="form.description" required maxlength="1024" rows="3" placeholder="做什么，以及什么时候该用它" /></label>
+          <label>{{ tx("目录名", "Directory", "Diretório", "निर्देशिका") }}<input v-model="form.dir" :readonly="mode === 'edit'" required placeholder="weekly-report" /></label>
+          <label>{{ tx("显示名", "Display name", "Nome de exibição", "प्रदर्शन नाम") }}<input v-model="form.name" required maxlength="80" /></label>
+          <label>{{ tx("描述", "Description", "Descrição", "विवरण") }}<textarea v-model="form.description" required maxlength="1024" rows="3" :placeholder="tx('做什么，以及什么时候该用它', 'What it does and when to use it', 'O que faz e quando usá-la', 'क्या करता है और कब इस्तेमाल करें')" /></label>
           <fieldset>
-            <legend>适用助手（不选 = 全部可见）</legend>
+            <legend>{{ tx("适用助手（不选 = 全部可见）", "Applicable assistants (none selected = all)", "Assistentes aplicáveis (nenhum = todos)", "लागू सहायक (कोई चयन नहीं = सभी)") }}</legend>
             <label v-for="role in ROLE_OPTIONS" :key="role.id" class="skills__check">
               <input type="checkbox" :checked="form.roles.includes(role.id)" @change="toggleRole(role.id)" />
               {{ role.label }}
             </label>
           </fieldset>
-          <label>正文<textarea v-model="form.body" required rows="12" /></label>
-          <button class="skills__btn skills__btn--primary" type="submit" :disabled="busy">保存</button>
+          <label>{{ tx("正文", "Content", "Conteúdo", "सामग्री") }}<textarea v-model="form.body" required rows="12" /></label>
+          <button class="skills__btn skills__btn--primary" type="submit" :disabled="busy">{{ tx("保存", "Save", "Salvar", "सहेजें") }}</button>
         </form>
 
         <pre v-else class="skills__preview">{{ preview }}</pre>

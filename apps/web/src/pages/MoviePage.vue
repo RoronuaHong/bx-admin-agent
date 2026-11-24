@@ -593,6 +593,9 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   for (const c of controllers) c.abort();
+  // 与 stop() 同口径：断开连接不会中止服务端任务，卸载时也必须显式取消，
+  // 否则切页/刷新后模型继续烧 token，结果落进隔离会话且本对话被并发保护挡住。
+  if (convId) void cancelChatTask(convId).catch(() => undefined);
   window.removeEventListener("keydown", onClearModalKeydown);
   // 弹窗还开着就卸载组件时，滚动锁会留在 body 上，整页再也滚不动。
   document.body.style.overflow = "";
