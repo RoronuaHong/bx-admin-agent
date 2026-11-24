@@ -75,7 +75,7 @@
 - [x] 引用出处渲染（回答中带 `来源：docs/knowledge/xxx`）
 - [x] 模型自主检索：`search_knowledge_base` 工具 description 明确触发场景，模型自主判断调用（2026-08-24 删除服务端 KB 预检短路——词表低召回/业务句误短路/forcedReply 无模型整合；chit-chat 分支补 KB 意图提示）
 - [x] 语义检索升级（embedding 向量化）——✅ 已落地：`rag/embedding.ts`（`KB_EMBEDDING=on` 开关 + 余弦/RRF 融合，失败自动降级纯词法）
-- [ ] 权限过滤（按项目/角色过滤文档可见性）——当前全量可见
+- [x] 文档级权限过滤（owners/roles frontmatter + namespace，`src/rag/store.ts` visibleTo / `search(viewer)`）已落地；按登录用户 RBAC 未做（等登录体系）
 - [ ] 钉钉文档拉取入库——凭证到位后接入
 - [x] 增量索引——✅ 已落地：`build-rag-index.mjs` 按 `sourceHashes` 指纹增量（只重建变更文档，且按 namespace 隔离）
 
@@ -128,9 +128,9 @@
 
 ### 可立即开工
 - [x] P1 本地知识库 RAG（方案 B）✅ 骨架已落地（2026-08-22）
-- [ ] P1 语义检索升级（embedding 向量化，当前词法）
+- [x] P1 语义检索升级（embedding 向量化）✅ 已完成（2026-08-24，`rag/embedding.ts`）
 
 ### 待排期
 - [ ] P2 多项目权限隔离（ACL）
-- [ ] P1 知识库权限过滤 / 钉钉拉取 / 增量索引
+- [ ] P1 钉钉文档拉取入库（文档级权限过滤与增量索引已完成，见 P1 RAG 链路）
 - [ ] P3 闲聊兜底 / 写参数动态语言 / 操作说明补全

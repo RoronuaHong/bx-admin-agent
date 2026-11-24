@@ -224,7 +224,7 @@
 
 **验证**：`tsc --noEmit` 0 错误；全量 **84 文件 / 558 用例全绿**（较实施前 +3 文件 / +18 例，无回归）。
 
-**诚实边界**：P0-3 只解决「长期不稳的模型排在开场」。它**不解决**配额突然耗尽——评测记录里的 `model` 是该轮实际服务模型，「某模型作为第一个候选被打死」不留痕，且配额是当天突然发生的（见 `src/model-health.ts` 顶部边界说明）。那部分由 P0-1 的探测 + 冷却兜底，跨进程重启后的重打由 P0-2（未做）解决。
+**诚实边界**：P0-3 只解决「长期不稳的模型排在开场」。它**不解决**配额突然耗尽——评测记录里的 `model` 是该轮实际服务模型，「某模型作为第一个候选被打死」不留痕，且配额是当天突然发生的（见 `src/model-health.ts` 顶部边界说明）。那部分由 P0-1 的探测 + 冷却兜底，跨进程重启后的重打已由 P0-2 冷却持久化解决（见第 2 批实施记录）。
 
 ### 第 2 批实施记录（2026-10-14）
 
@@ -256,7 +256,7 @@
 | 项 | 对标依据 | 落地位置 | 回归 |
 |---|---|---|---|
 | **P1-3** 子代理结构化契约 | Anthropic 子代理隔离的结构化返回（status/coverage/errors） | `chat.ts`：`SubagentResult` 增 `status: success｜partial｜no_findings｜failed` + `coverage` + `errors`（纯函数 `subagentHandoffText` 生成交接文本，fail-closed：状态缺失/越界按「未完成」呈现）；失败但已产出内容 → `partial`（旧实现把已产出的内容整个丢掉）；父轮**只有 `success` 计入接地证据**（`no_findings`/`failed` 不得当结论），句柄摘要按状态分流 | `tests/subagent-status-contract.test.ts`（4 例：四种状态交接文本 / fail-closed / servers 不可用 → 结构化 failed 且不计证据 / 零发现 → `no_findings` 且不计证据——以 `[chat:integrate]` 不打点证明） |
-| **P0-2** 冷却状态持久化 | 本仓 `task-store.ts` 成熟范式直接复用 | 新增 `src/model-cooldown.ts`（Mongo `model_cooldowns` 集合 + `expiresAt` TTL 索引 + 内存降级 + best-effort，同任务留档口径）；`chat.ts` 冷却写入时 fire-and-forget 落盘、新增 `restoreModelCooldowns()` 启动恢复（读路径 `orderModelCandidates` 零改动）；`index.ts` 启动接线；回滚 `MODEL_COOLDOWN_PERSIST=off` | `tests/model-cooldown.test.ts`（5 例：读写回 / 过期失效 / 同模型取更晚 until / 开关静默 / 状态码随条目保留） |
+| **P0-2** 冷却状态持久化 | 本仓 `task-store.ts` 成熟范式直接复用 | 新增 `src/model-cooldown.ts`（Mongo `model_cooldowns` 集合 + `expiresAt` TTL 索引 + 内存降级 + best-effort；TTL 仅做过期清理，连接失败时 best-effort 不自愈、须重启，见 `mongo-outage-incident-20261105.md` §5）；`chat.ts` 冷却写入时 fire-and-forget 落盘、新增 `restoreModelCooldowns()` 启动恢复（读路径 `orderModelCandidates` 零改动）；`index.ts` 启动接线；回滚 `MODEL_COOLDOWN_PERSIST=off` | `tests/model-cooldown.test.ts`（5 例：读写回 / 过期失效 / 同模型取更晚 until / 开关静默 / 状态码随条目保留） |
 | **P2-2** 在线评测扩四维 | OTel 低基数 + 「判不了的就不判」 | `trace.ts` `RunTrace` 增 `toolFailures`/`synthesisRounds`/`toolRepeatMax`/`stalled`；`shared` usage 事件增前三项（`stalled` 由 `app.ts` 从看门狗 error 码识别）；`chat.ts` 埋点（真实执行失败 / 综合轮四处收束路径 + 补位收尾 / 同工具重复峰值，跨候选累加）；`eval-online.ts` 增 `tool_health`/`synthesis`/`stall`/`efficiency` 四维，阈值 `EVAL_MAX_TOOL_FAIL_RATE`(0.2)/`EVAL_MAX_TOOL_REPEAT`(8) 等全走 env，**缺字段不计入分母** | `tests/eval-online.test.ts` 扩 8 例：**事故轨迹回放固定判 `poor` 且 `failed` 含 `tool_health`/`synthesis`/`stall`/`efficiency`**；健康运行不误伤；零工具运行不判；边界与 env 阈值 |
 | **P2-3** 看门狗阈值按实测派生 | AWS「超时值按实测分位数反推」 | `chat-tasks.ts`：`deriveStallMs()` 纯函数 = `max(2 × 实测模型超时, 240s)`（实测值取注册表最大 `timeoutMs`——旧口径在本文件读了一个与 `config.ts` 不同的 300s 默认，真实部署每模型 180s，推出 600s 与实测不匹配）；env `CHAT_TASK_STALL_MS` 覆盖优先；`stallThresholdInfo()` + 启动日志打印推导依据 | `tests/stall-threshold.test.ts`（6 例：180s→360s / 下限兜底 / env 覆盖与 60s 绝对下限 / 读不到实测值不产出 NaN / 启动信息自洽 / 判据不变） |
 
@@ -366,7 +366,7 @@
 | **失败分类与冷却** | AWS「按可重试性分类」 | 新增 `src/model-availability.ts`（抽出对话模型与 Jev **共用**的失败判据、`noteDownFailure` 与冷却表，避免 `jev.ts → chat.ts` 循环依赖）；Jev 用独立冷却键 `jev`，冷却落盘 + TTL 自愈（第 3 批 `model-cooldown.ts`） | [D]：冷却键 `jev` 与对话模型共用同一张表，但不互相污染 |
 | **额度预检** | 第 5 批 C4 的同一套开关 | 仅当 `quotaPreflightEnabled()` 且 host 命中（默认 `openrouter.ai`）时查当日免费额度，耗尽则**不发请求**并冷却到 UTC 日切；fail-open | [E][F]：未配置 / 冷却中都不发请求，且**不计数**（没调过≠坏了） |
 | **失败可观测** | ASI09 | 每次调用落一条 llm span：`gen_ai.operation.name=classify` + provider/model + `bx.jev.questions` + 失败带低基数 `error.type`，runId 贯穿 | [H][I]：span 字段；三个代发检查点都带 `runId`（漏传 = 查不出来的失败） |
-| **在线评测新维度** | §6.2 L3 | `ClassifierStats` → usage 事件 → `RunTrace.classifierCalls/classifierFailures`（`app.ts` 映射）→ `classifier_health`（`EVAL_MAX_CLASSIFIER_FAIL_RATE` 默认 0.2），**单列**，不混进收敛类维度（Jev 不生成回复） | [J][K]：解析与拒发阈值未变（≥0.9 拒发、0.5–0.9 只标记）；代发工具名单不变（治理改造不扩权） |
+| **在线评测新维度** | §6.2 L3 | `ClassifierStats` → usage 事件 → `RunTrace.classifierCalls/classifierFailures`（`app.ts` 映射）→ `classifier_health`（`EVAL_MAX_CLASSIFIER_FAIL_RATE` 默认 0.2），**单列**，不混进收敛类维度（Jev 不生成回复） | [J][K]：解析与拒发阈值已按 Jev 治理更新（≥0.6 标高风险/拒发，0.6–0.9 标记）；代发工具名单不变（治理改造不扩权） |
 
 **新增环境变量（均带默认，不配即上表的默认口径）**：`JEV_TIMEOUT_MS`（显式覆盖）· `JEV_TIMEOUT_FLOOR_MS`（8000）· `JEV_TIMEOUT_MAX_MS`（30000）· `JEV_LATENCY_WINDOW`（20）。额度预检沿用 `MODEL_QUOTA_PREFLIGHT*` 一套。
 
@@ -461,7 +461,7 @@
 - 阶梯只解决「**提醒跟着走**」，不保证模型照做——它仍是提示（回灌一条 user 消息），不是硬拦。真要收住总量得开 `TOOL_REPEAT_STOP_AFTER`，而**打开后长任务可能因此取不到数据**（例如确实需要 N 次分页/分桶取数的场景），所以默认关，需要按部署评估后再开。
 - 首阶 8 次是**与评测阈值对齐**的选择（让「评测判红的量」与「运行时提醒的量」对得上），不是实测出来的最优值；倍率 2 同理。
 - 阶梯统计只算**真实执行**的调用（被闸门拦下、同轮去重跳过的都不计，与既有 `noteToolCall` 同口径），因此「被拒绝 5 次」不会因为拒绝而继续推高阶梯。
-- 本批**未做真实端到端复跑**：阶梯提醒有没有让模型少走几轮，要同一问题再跑一次对比 `toolRepeatMax` 与轮数才能证明（第 9 批的 32 次是改动前的基线）。
+- 本批当时未做真实端到端复跑；BI 路已于 2026-11-10 复跑闭环（见 §7.1）。阶梯提醒有没有让模型少走几轮，仍需同一问题二次对比 `toolRepeatMax` 与轮数才能证明。
 
 ### 第 11 批实施记录（2026-10-15，上下文治理对齐 CodeBuddy 的 Micro-compact 方案）
 
@@ -554,9 +554,9 @@ Anthropic 明确建议"保留测试集，避免只对少数任务过拟合"。�
 | 3 次代码聚合通道失败的确切退出码 | 推断为「桥接内调用失败向外 reject，模型代码未捕获 → 子进程非 0 退出」。**历史三次不可复原**（发生在退出码文案与 span 埋点之前）；现状 `run_tool_code` 失败即回「代码退出码 N + stderr 尾部」（tool-code.ts），并经 P2-1 的 `error.description` 落 span，此后可诊断（退出码类归 `other`，保守不计熔断） |
 | 子代理空转 7.5 分钟 | 时间线与"第 23 轮单工具调用阻塞 7 分钟、子代理轮次另起 runId 计数"完全吻合。**第 4 批已补父轮 task 调用的 span**（墙钟时间 + 结构化状态 attr），同类空转此后在 span 层直接可见；历史当次无 span 仍不可复原 |
 | 本次是否本可救回 | 至少两次机会：L2 熔断生效（少 6 次无效调用）、L5 补位覆盖中止（保住 39 条证据的结论） |
-| 真实复跑的覆盖面 | 第 9 批只复跑了 **BI 路**（事故 run 原始提问 + 真实 MCP + 真实模型，四项验收见 §5）；**客服路的 Jev 未复跑**（需可用密钥 + 客服真实请求），第 7 批对它的治理目前只有单测证据 |
-| 探索效率（L4） | 复跑里单工具累计最多被调用 **32 次**、全程 28 轮 / 83 次工具调用，绝大多数是同一批元数据反复探查。第 10 批已把重复提醒改为**跨轮阶梯**（8/16/32 各提醒一次，改动前全程只提醒 1 次），并提供默认关闭的运行级重复上限 `TOOL_REPEAT_STOP_AFTER`。**仍未验证的是「模型会不会因此少走几轮」**——需同一问题再复跑一次对比 `toolRepeatMax` 与轮数（基线：32 次 / 28 轮） |
-| 上下文治理对标（Best Practice §4.4） | 第 11 批对照 CodeBuddy 的 Micro-compact 方案：采纳安全子集（keep 硬下限显式化 + `[chat:compact]` 可观测），**刻意不采用**其「保留窗口逐级收窄」token 闸门（会丢最近证据，与 keep 保证冲突）。**仍未验证的是真实长轨迹里压缩日志是否真把体积压下来**——需一次复跑观察 `[chat:compact]` 输出 |
+| 真实复跑的覆盖面 | 第 9 批只复跑了 **BI 路**（事故 run 原始提问 + 真实 MCP + 真实模型，四项验收见 §5）；**客服路 Jev 已于 2026-11-10 真实复跑闭环**（见 §7.1：4 项分类均正确、`classifier_health` PASS、0 error） |
+| 探索效率（L4） | 复跑里单工具累计最多被调用 **32 次**、全程 28 轮 / 83 次工具调用，绝大多数是同一批元数据反复探查。第 10 批已把重复提醒改为**跨轮阶梯**（8/16/32 各提醒一次，改动前全程只提醒 1 次），并提供默认关闭的运行级重复上限 `TOOL_REPEAT_STOP_AFTER`。§7.1 复跑实测 `toolRepeatMax` 32→30、总调用 83→40；单点最大重复仍需 `TOOL_REPEAT_STOP_AFTER` 硬上限进一步收（默认关） |
+| 上下文治理对标（Best Practice §4.4） | 第 11 批对照 CodeBuddy 的 Micro-compact 方案：采纳安全子集（keep 硬下限显式化 + `[chat:compact]` 可观测），**刻意不采用**其「保留窗口逐级收窄」token 闸门（会丢最近证据，与 keep 保证冲突）。已由 §7.1 复跑验证：13 次压缩、工具结果 32k–53k 压到 12000 tok 内、卸载 1→10、keep 硬下限守住 |
 | 未涉及 | 取数口径正确性、只读安全、图表与导出链路（另见 `docs/text2sql-text2api-plan.md`） |
 
 ### 7.1 真实复跑验证（2026-11-10，补全上表三条「未验证」）

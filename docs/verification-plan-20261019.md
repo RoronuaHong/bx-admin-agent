@@ -1,7 +1,8 @@
 # bx-admin-agent 多场景多实例全链路验证方案
 
-> v1 · 2026-10-19 · 依据 2026 最新最佳实践 + 本系统实际架构（deep agent harness / 三角色 / ~24 内置工具 / skills / MCP / 记忆 / 上下文压缩 / grounding / 在线评测）编制。
+> v1 · 2026-10-19 · 依据 2026 最新最佳实践 + 本系统实际架构（deep agent harness / 三角色 / ~30 内置工具 / skills / MCP / 记忆 / 上下文压缩 / grounding / 在线评测）编制。
 > 目的：把「回答时间、质量、意图分析、记忆、上下文、超长文本、全工具、skill、MCP、图文」十个维度拆成可执行、可判定、可回归的验证矩阵，并给出优先级与执行手段。
+> **状态（2026-11-23 对齐）**：§9 已跑 8 类场景基线（DeepSeek-Flash）；仍未闭环的待补测为：skill 触发、结构化澄清触发、BI/YApi/gitlab/movie 连接器只读闸实测、多 Agent/音视频覆盖。未标记闭环前不作为验收完成依据。
 
 ---
 
@@ -24,7 +25,7 @@
 - **角色实例**：通用 `/chat`、客服 `/support`（enforceGrounding + KB）、观影 `/movie`（forceToolCall + 全量电影工具）；会话互相独立、按 ownerKey 隔离。
 - **循环**：deep agent harness，`MAX_TOOL_ROUNDS=14`，同轮去重 + 跨轮 Doom Loop 熔断；模型候选链 + 瞬时重试。
 - **上下文/记忆**：历史分层压缩（prune→LLM 摘要，保留近 3 轮）、大工具结果卸载工作区（offloadToolResult）、工具结果治理（governToolResults，`MCP_TOOL_RESULT_CHARS=12000`）、跨会话长期记忆（memory.ts，owner 隔离 + 条目/字符双上限）、静态引导前缀化（prompt cache）。
-- **内置工具（~29，deep-agent 全集；`submit`/`call_api`/`search_api_module` 是已移除的旧架构，当前 src 0 命中）**：文件 `fs_write/fs_read/fs_edit/fs_glob/fs_grep/fs_delete/fs_ls`；定时 `list_schedules/manage_schedule`；知识库 `search_knowledge/knowledge_sources`；数据聚合 `count_list_by_time/salesiq_chat_brief`；输出 `export_data/render_chart/normalize_output`；规划 `write_todos`；委派 `task`（子代理，并行 3）；记忆 `save_memory`；澄清 `request_clarification`；技能 `read_skill`；检索 `search_tools`（deferred 加载）；执行 `run_tool_code/run_command/run_script`；联网 `web_search`；图像 `image_gen`；钉钉 `search_dingtalk_doc`。**业务数据一律走 MCP 连接器**（Zoho SalesIQ / BI(Metabase) / gitlab / movie(TMDb) / YApi），按对话启用；无对应连接器时模型应如实说明并给路径（这也是已验证的正确行为）。
+- **内置工具（30 个，清单见根 README §4；`submit`/`call_api`/`search_api_module` 与 `normalize_output` 均已退役，当前 src 0 命中）**：文件 `fs_write/fs_read/fs_edit/fs_glob/fs_grep/fs_delete/fs_ls`；定时 `list_schedules/manage_schedule`；知识库 `search_knowledge/knowledge_sources`；数据聚合 `count_list_by_time/salesiq_chat_brief`；输出 `export_data/render_chart`；规划 `write_todos`；委派 `task`（子代理，并行 3）；记忆 `save_memory/recall_memory`；澄清 `request_clarification`；技能 `read_skill`；检索 `search_tools`（deferred 加载）；执行 `run_tool_code/run_command/run_script`；联网 `web_search/fetch_url`；图像 `image_gen`；钉钉 `search_dingtalk_doc`；观影 `record_watched_movies`。**业务数据一律走 MCP 连接器**（Zoho SalesIQ / BI(Metabase) / gitlab / movie(TMDb) / YApi），按对话启用；无对应连接器时模型应如实说明并给路径（这也是已验证的正确行为）。
 - **skills**：`pc-column-mapping / api-interface-routing / business-data-query / ...`，索引注入 + `read_skill` 按需加载；`default:true` 仅在面板隐藏（不删能力）。
 - **MCP**：gitlab、Zoho SalesIQ、BI(Metabase)、movie 等；命名空间 `mcp__<id>__<tool>`；**BI 只读硬闸（双层 fail-closed）**；写操作走确认通道；按对话启用集做作用域闸。
 - **图文**：视觉模型 `hyvision`(direct) / `ds4vexp`；聊天图片输入（OptionImage）；`image_gen`；图表 `render_chart` + 导出内联 SVG。

@@ -19,12 +19,12 @@
 | S2 | SQL | 静默给错数防护（截断/超行） | 触及上限必须明示 | ✅ | `result_overflow_mode` 默认 `'throw'`（fail-loud） |
 | S3 | SQL | 只读校验 | 写操作 fail-closed | ⚠️ | `runSql` 强拦；`execute_query` 后门绕过 |
 | S4 | SQL | 方言/版本兼容 | 非 ClickHouse 不注入 CK 语法 | ❌ | `runSql` 未判引擎 |
-| S5 | SQL | 重聚合护栏 | 高基数/长窗拦截 | ❌ | `HEAVY` 漏 `uniqExactIf` 家族 |
-| O1 | 正确率 | 结论先行 + 总分总 | 运行时强制结构 | ⚠️ | 仅 few-shot `ANSWER_SHAPE_EXAMPLE` |
+| S5 | SQL | 重聚合护栏 | 高基数/长窗拦截 | ✅ | `HEAVY` 已覆盖 `uniqExactIf/Array/State/OrNull` 家族 |
+| O1 | 正确率 | 结论先行 + 总分总 | 运行时强制结构 | ⚠️ | `WRAP_UP_HINT` 结构硬指令 + `wrapUpWith`/`hasCaliberSection` 校验闭环已落地；主循环流式合成轮仍靠契约 |
 | O2 | 正确率 | 数字可溯源 / 不编造 | 零证据不收束 | ⚠️ | `grounding` 两阶段强；但 generic 未开 |
 | O3 | 正确率 | 合计 / 汇总自检 | 服务端确定性重算 | ❌ | 普通查询合计无复核 |
 | O4 | 正确率 | 中文表头 / 枚举翻译 | 服务端翻译层 | ❌ | 表头=模型键名，枚举直出 |
-| O5 | 正确率 | 口径 / 来源声明 | 运行时强制 | ⚠️ | 仅 few-shot |
+| O5 | 正确率 | 口径 / 来源声明 | 运行时强制 | ⚠️ | 已有结构硬指令 + `hasCaliberSection` 校验闭环；主循环流式合成轮仍靠契约 |
 | P1 | 排版 | 图表深色主题 | 随主题切换 | ❌ | `isDark()` 读 `.dark` 类（全仓无） |
 | P2 | 排版 | 代码块语法高亮 | SQL/JSON 着色 | ❌ | markdown-it 无 `highlight` |
 | P3 | 排版 | 不可信内容净化 | 链接 target/rel 加固 | ⚠️ | markdown 链接已加固；原始 `<a>` 绕过 |
@@ -59,16 +59,16 @@
 - **现状**：`runSql`（`metabase-mcp.mjs:251`）无条件 `appendClickHouseSettings`（CK 专有语法），未先取 engine；非 CK 引擎（误填/未来 PG/MySQL/H2）会语法错误 400。
 - **目标**：取 engine，仅 ClickHouse 系才 append；wid 归一化上提共用。
 
-### S5 ❌ 重聚合护栏漏网
-- **现状**：`HEAVY_EXACT_AGG_NOWINDOW` 正则 `/\buniq\s*exact\s*\(/i` 要求 `exact` 后紧跟 `(`，漏掉 `uniqExactIf(`/`uniqExactArray`/`uniqExactState`——恰是线上事故形态。
+### S5 ✅ 重聚合护栏已覆盖变体
+- **现状**：`HEAVY_EXACT_AGG_NOWINDOW` 正则已改为 `/\buniq\s*exact\s*\w*\s*\(/i`，覆盖 `uniqExactIf(`/`uniqExactArray`/`uniqExactState` 等线上事故形态（见 `GUARDRAIL_REMEDIATION_ROADMAP.md` P0-5）。
 
 ---
 
 ## 二、输出正确率与总结质量
 
-### O1 ⚠️ 结论先行 / 总分总（只有 few-shot，无强制）
+### O1 ⚠️ 结论先行 / 总分总（结构硬指令已落地，运行时判定以主循环契约为准）
 - **最佳实践**：先给结论（数字+口径），再展开明细；长文有总分总骨架。
-- **现状**：`system-prompt.ts:111` `ANSWER_SHAPE_EXAMPLE` 仅示范骨架（注释"只演示骨架，不重复规定"），无运行时结构判定。弱模型可能直接堆表格不总结。
+- **现状**：`ANSWER_SHAPE_EXAMPLE` 仍只示范骨架；本轮已补 `WRAP_UP_HINT` 结构硬指令与 `wrapUpWith`/`hasCaliberSection` 校验闭环（见总表），主循环流式合成轮的结构判定仍以契约回归为准。
 - **当前问题示例**（弱模型可能产出）：
   > | 区域 | 新增用户 |
   > |---|---|
@@ -102,7 +102,7 @@
   > | 待处理 | 2026-10-15 08:12 | Android |
 
 ### O5 ⚠️ 口径 / 来源声明
-- **现状**：仅 `ANSWER_SHAPE_EXAMPLE` few-shot 示范；`grounding.ts:482/502` 的 verify 只查"来源是否存在"，不查"是否声明"。无口径无来源的吻合结论会直接通过。
+- **现状**：总表所列结构硬指令 + `hasCaliberSection` 校验闭环已落地；`grounding.ts` 的 verify 仍只查"来源是否存在"，不查"是否声明"，主循环流式合成轮的无口径吻合结论仍靠契约兜底。
 
 ---
 

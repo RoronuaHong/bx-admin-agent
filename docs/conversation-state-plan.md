@@ -296,9 +296,9 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 
 | 期 | 内容 | 验收标准 |
 |---|---|---|
-| **P0（本文档）** | 设计评审 + 契约冻结 | 决策点已确认（§11.1）；§11.2 待讨论 |
+| **P0（本文档）** | 设计评审 + 契约冻结 | 决策点已确认（§11.1/§11.2 已于 2026-09-17 冻结） |
 | **P1+P2 统一实施** | 服务端：`conversation.context` 读写 + 设置字段 + 对话级锁/409 + MCP 引用计数改造 + session 瘦身 + 迁移；前端：`states: Map<convId, ConvState>` + 去全局锁 + 设置后端化 + 三处 localStorage 移除与迁移 + 侧栏状态点 | ① 直连脚本：两个 `conversationId` 并行请求，上下文互不污染；同 `conversationId` 并发返回 409；② 浏览器：3 个对话同时流式且互不中断；切卡不掉线；改 A 的模型/MCP/语言，B 不受影响；③ 刷新后设置与上下文保持；④ `tsc` / `vite build` 全绿（原 `_bi-tools-check.mjs` 已随 2026-09 调试脚本清理移除，现行回归入口见本文档头部口径） |
-| **P3 待讨论项落地** | 若采纳 §11.2 的 B/C：`pendingQueue` 持久化 + 队列 UI（Pending(N)/上移/下移/编辑/删除/立即发送）+ 出队策略 | 忙碌时发消息进队列不丢；turn 收束后按序自动发；「立即发送」= abort + 出队 |
+| **P3 已落地** | §11.2 的 B/C：`pendingQueue` 持久化 + 队列 UI（Pending(N)/上移/下移/编辑/删除/立即发送）+ 出队策略 | 忙碌时发消息进队列不丢；turn 收束后按序自动发；「立即发送」= abort + 出队 |
 | **P4 收尾** | 文档同步（`mcp-guide.md` / `agent-infrastructure.md` 对照表）、回归清单、旧字段标注 deprecated | 文档与代码一致 |
 | **P5（可选）** | 断线续跑（后台任务化 + run 状态持久化）——✅ 已于 2026-09-17 随异步任务底座落地（`src/chat-tasks.ts` + `/chat/cancel`、`/chat/task/status`、`/chat/task/events`；断开后任务照跑、结果回投进对话消息快照） | 发起后立刻断网/关页面，重连可见完整结果 |
 
@@ -315,11 +315,11 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 | 1 | 上下文存 **Mongo conversation doc** | `conversation.context` + `contextSeq` + `summary*`（对齐 LangGraph/OpenAI"生产用共享存储"） |
 | 2 | **所有配置都按对话独立** | `model` / `mcpServers` / `locale` 全部挂对话文档；`locale` 同时决定**界面文案**与**回复语言**（§5.1 注释） |
 | 3 | 主题放 `session.preferences` | 设备态，非对话态；前端不再写 localStorage |
-| 4 | — | **待讨论**，见 §11.2 |
+| 4 | 同对话并发策略：做 A/B/C，不做 D | 见 §11.2（已决议并落地，2026-09-17 冻结） |
 | 5 | 旧 `session.messages` **迁移** | 一次性归入该 cookie 的"默认对话"的 `context`；`session.mcpServers` 同法迁入该对话的 `mcpServers` |
 | 6 | **统一实施** | 契约一次冻结，服务端与前端在**同一次改动**里统一落地，不留"半可用"的中间态（单次改动较大，靠回归清单兜底） |
 
-### 11.2 待讨论：同一对话在生成中再次发送
+### 11.2 同对话并发策略（已决议并落地，2026-09-17 冻结）
 
 **共识**：锁的作用域必须是**对话级**（不同对话并行；同一对话同时只能有一条流在写 `context`）。
 **最佳实践依据**（Claude Code / Codex 官方指南，2026-04-03）：把两个诉求**刻意分开**——
@@ -362,7 +362,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 |---|---|
 | 对话级上下文 `context` + 原子追加 | `conversations.ts`（`$push` + `$inc: contextSeq`） |
 | 对话级设置 `model`/`mcpServers`/`locale`/`pendingQueue` | `conversation` 文档 + `PATCH /chat/conversations/:id`（`app.ts:735`） |
-| 同对话并发 409 | 异步任务注册表 `chat-tasks.ts`（`isTaskRunning` / `startTask`）→ `CONVERSATION_BUSY`（`app.ts:532`） |
+| 同对话并发 | 交互消息默认抢占；仅 `unattended` 定时任务或 `sendMode=queue` 才回 `CONVERSATION_BUSY`(409) 并入队（见 `chat-preempt-plan.md` §1/§4.1） |
 | 列表回传 `running` | `app.ts:664`（列表）/ `app.ts:731`（单条）；**前端已消费**：`ConversationDto.running?`（`api.ts:165`）→ `ChatPage.convStatus()` 侧栏状态点 + 排队徽标 |
 | 设备态后端化 | `GET/PUT /chat/preferences`（`app.ts:854/859`）；`session.preferences`（接口 `session.ts:27-47`，字段 `session.ts:65`） |
 | `session` 瘦身 | `messages`/`mcpServers` 标 `@deprecated`，仅迁移路径读取（`session.ts:56-59`） |
@@ -382,7 +382,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 
 | # | 项 | 落点 | 实测 |
 |---|---|---|---|
-| F1 | 每对话状态容器 `ConvState` | `states: Map<convId, ConvState>`（bubbles / input / sending / controller / pendingImages / settings / queue / error）；模板统一 `current.xxx` | ✓ |
+| F1 | 每对话状态容器 `ConvState` | `states: Map<convId, ConvState>`（bubbles / input / sending / controllers[] / runCount / dispatching / hadConcurrent / pendingImages / settings / queue / error）；模板统一 `current.xxx` | ✓ |
 | F2 | 去全局锁 | `selectConversation` 只改指针；`persist(convId, bubbles)` 显式带对话 id，后台流不会串写 | 两对话同时流式（侧栏双点闪烁）；切走后 A 照常跑完并落库；草稿按对话保留 |
 | F3 | 设置按对话 | model / locale / MCP 全部镜像进 `ConvState.settings`，写 = 乐观更新 + `PATCH` + 失败回滚（TanStack 三段式） | A 选模型 hyvision、B 仍默认；A 改英文、B 仍中文；刷新后保持 |
 | F4 | 去 localStorage | `ui-locale.ts` / `theme.ts` / `LAST_CONV_KEY` 只剩迁移读取；迁移标记 `preferences.migratedAt`（服务端首次 PUT 自动落） | 塞入旧值 → 迁移后本地键清空、后端收到 theme / locale / activeConversationId |
@@ -395,7 +395,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 
 **回归**：`tsc --noEmit` ✓、`vite build` ✓、`pnpm test` 全绿 ✓、NDJSON 流式 / usage 行 / 新对话默认无 MCP ✓。
 
-**遗留观察（待查）**：2026-09-17 发现 Mongo `bx_agent.chat_conversations` 只剩 1–2 条（此前 15+）。已排除：前端 DELETE（网络面板无该请求）、TTL 索引（集合只有 `_id_` 索引）、`resolveConversation` / `clearConversation`（无删除路径）；`_thread-check.mjs` 的 DELETE 均限定在自建 id。待排查是否有外部清理脚本或人工操作。
+**遗留观察（待查，2026-09-17 快照）**：当时发现 Mongo `bx_agent.chat_conversations` 只剩 1–2 条（此前 15+）；2026-10-19 审计样本已回升到 379 会话（`docs/audit/dialog-reply-audit-20261019.md:9`），中间发生了什么尚无定论。已排除：前端 DELETE、TTL 索引、`resolveConversation` / `clearConversation`、`_thread-check.mjs`。需外部清理脚本或人工操作记录才能定因。
 
 ---
 
@@ -405,7 +405,7 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 
 | 来源 | 关键结论 | 对本期的约束 |
 |---|---|---|
-| **Vercel AI SDK `useChat`** | 状态绑定到**显式 Chat 实例**（`CHAT?`）而非隐式单例；`stop()` 是**实例级方法**（非全局中断）；持久化标准落点是 `onFinish` | 每对话一个 `ConvState`（自带 `controller`）；`stop()` 只作用于 `current.controller`；落库在 turn 收束时 |
+| **Vercel AI SDK `useChat`** | 状态绑定到**显式 Chat 实例**（`CHAT?`）而非隐式单例；`stop()` 是**实例级方法**（非全局中断）；持久化标准落点是 `onFinish` | 每对话一个 `ConvState`（自带 `controllers[]`）；`stop()` 中止 `controllers` 全部轮次；落库在 turn 收束时（多轮抢占后字段已扩，见 §14.2 注） |
 | **TanStack Query · Optimistic Updates** | 三段式：`onMutate` **先快照再写入** → `onError` 回滚（必须带 context）→ `onSettled` 与服务器重新对齐；能重取就**优先重取**，纯回滚只在不可达时用 | 设置写失败必须回滚；成功后以服务端返回值为准 |
 | **Claude Code / Codex 队列语义**（guides.happier.dev，2026-04-03） | 「会不会丢」→ 排队；「要不要改变正在发生的事」→ steer/interrupt；默认保守 = 排队 | 本期做排队 + 立即发送，不做 steer |
 | 本方案 §11.2 决议 | A/B/C 做，D 不做；出错/待确认**停下等用户** | 队列出队条件 = 上一 turn **成功**收束 |
@@ -416,7 +416,10 @@ const current = computed(() => states.get(currentId.value) ?? blankState(current
 interface ConvState {
   bubbles: Bubble[];
   sending: boolean;
-  controller: AbortController | null;   // 每对话唯一，禁止跨对话复用
+  controllers: AbortController[];       // 多轮并发/抢占，不再单值
+  runCount: number;
+  dispatching: boolean;
+  hadConcurrent: boolean;
   input: string;
   pendingImages: UploadResult[];
   settings: { modelId: string; locale: string; mcpEnabled: string[] };  // 按对话
@@ -431,7 +434,7 @@ const current = computed(() => stateOf(currentId.value));   // 模板统一改 c
 **不变式**：
 1. 全局只剩"视图骨架"：`currentId` / `models` / `conversations` / UI 开关（`mcpOpen` 等）；
 2. 切换对话**只改 `currentId`** —— 不 abort、不覆盖任何 `ConvState`（后台流继续写自己的 `bubbles`）；
-3. 删除对话：先 `states.get(id)?.controller?.abort()` → 删后端 → 清理本地 state；
+3. 删除对话：先 `states.get(id)?.controllers.forEach(c => c.abort())` → 删后端 → 清理本地 state；
 4. 侧栏状态点数据源 = 服务端 `running` ∪ 本地 `sending` ∪ `pending.length`（切卡不掉线时才准）。
 
 ### 14.3 设置同步协议（F3）
@@ -461,7 +464,7 @@ const current = computed(() => stateOf(currentId.value));   // 模板统一改 c
   └─ 409 CONVERSATION_BUSY → PATCH pendingQueue 追加 → 徽标 Pending(N)
 turn 成功收束 → 出队首条 → 自动发起
 turn 失败 / 待确认超时 → 停止出队 + 保留队列 + 提示（"停下等用户"）
-「立即发送」→ abort current.controller → 出队首条 → 立即发起（C）
+「立即发送」→ 主动抢占直接开新 run（中止 `controllers` 全部轮次）；仅 409 时按队列出队（C）
 ```
 - 队列为**后端真相**（`conversation.pendingQueue`），刷新/换设备不丢；
 - 容量上限 20，超出拒绝并提示；
@@ -473,7 +476,7 @@ turn 失败 / 待确认超时 → 停止出队 + 保留队列 + 提示（"停下
 |---|---|
 | 1 | 3 个对话同时流式，互不中断；生成中切卡不掉线、切回可见进度 |
 | 2 | 改 A 的模型/MCP/语言，B 不受影响；刷新后三者的设置与上下文都保持 |
-| 3 | 同 `conversationId` 并发 → 409 → 消息入队（不丢）；正常收束后自动出队依次发送 |
-| 4 | turn 失败/待确认 → 队列**停住**并提示；「立即发送」= 中断 + 出队 |
+| 3 | 同 `conversationId` 并发：交互消息默认抢占（开新 run、旧轮标 `cancelled`）；仅 `unattended`/`sendMode=queue` 才 409 → 入队，正常收束后自动出队（历史快照：原验收写的是一律 409，见 `chat-preempt-plan.md`） |
+| 4 | turn 失败/待确认 → 队列**停住**并提示；「立即发送」= 抢占开新 run（仅 409 回退时出队）（历史快照，现行见 `chat-preempt-plan.md`） |
 | 5 | 清空 localStorage 后首启，主题/语言/上次对话仍从后端恢复 |
 | 6 | `tsc --noEmit` + `vite build` + BI 工具回归全绿 |

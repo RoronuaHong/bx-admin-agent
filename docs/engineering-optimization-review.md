@@ -16,7 +16,7 @@
 2. **文档口径与代码脱节**，多处现行文档仍引用已删除的脚本、已不存在的模块和过期数字；
 3. **横切能力半成品化**（鉴权、错误上报、接口契约、i18n），需按部署形态决定补到什么程度。
 
-2026-11-19 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计剩 1 条 dev-only `picomatch` 无修复版例外；P1-1 阶段 1 已提交（`5e962ca`），阶段 2 执行中——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（协调层 6269→约 5600 行，门禁全绿），T2（SCC A 会话壳）已提交 `23c9d28`（协调层降到 5345 行），T3（SCC B 工具面板）已提交 `1bbf757`（协调层降到 4918 行；50 声明 AST 无 DIFF，web 42/42），T4（provide 契约加固）已提交 `dab6470`（`bubbleContext` 加 `satisfies BubbleContext` + DEV 41 键断言，`bubble-context-contract.test.ts` 锁 41 键顺序；web 45/45 + 全仓 type-check/build/978 server 测试全绿，详见实施计划 §7），T5 低风险 UI 已完成（C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0`，均 web 45/45 + web type-check + build 全绿、单 chunk），T6 C10（`ContextMenuHost`）已提交 `58bd836`（契约测试 4 个，web 49/49 + 全仓 type-check/build/978 server 测试全绿，计划 §9.1），T6 C11（`ChatSidebarList`）已提交 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿，计划 §9.2），T6 C12（`MessageComposer`）已提交 `5de59a9`（39 props / 38 emits、四 ref 桥接、全局监听留根，web 58/58 + 全门禁绿，计划 §9.3），T6 C13（`ChatTaskPanel`）已提交 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根，web 63/63 + 全门禁绿，计划 §9.4）；其余优化项仍未实施。本文保留原登记与排序。
+2026-11-19 复核：P0-1～P0-5 已实施；P3-4 生产依赖审计 0 漏洞、全量审计剩 1 条 dev-only `picomatch` 无修复版例外；P1-1 阶段 1 已提交（`5e962ca`），阶段 2 执行中——C0 `6709f4a`、T0 `37d8663`、T1 `3f6d81c` 已提交（协调层 6269→约 5600 行，门禁全绿），T2（SCC A 会话壳）已提交 `23c9d28`（协调层降到 5345 行），T3（SCC B 工具面板）已提交 `1bbf757`（协调层降到 4918 行；50 声明 AST 无 DIFF，web 42/42），T4（provide 契约加固）已提交 `dab6470`（`bubbleContext` 加 `satisfies BubbleContext` + DEV 41 键断言，`bubble-context-contract.test.ts` 锁 41 键顺序；web 45/45 + 全仓 type-check/build/978 server 测试全绿，详见实施计划 §7），T5 低风险 UI 已完成（C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0`，均 web 45/45 + web type-check + build 全绿、单 chunk），T6 C10（`ContextMenuHost`）已提交 `58bd836`（契约测试 4 个，web 49/49 + 全仓 type-check/build/978 server 测试全绿，计划 §9.1），T6 C11（`ChatSidebarList`）已提交 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿，计划 §9.2），T6 C12（`MessageComposer`）已提交 `5de59a9`（39 props / 38 emits、四 ref 桥接、全局监听留根，web 58/58 + 全门禁绿，计划 §9.3），T6 C13（`ChatTaskPanel`）已提交 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根，web 63/63 + 全门禁绿，计划 §9.4）；其余优化项仍未实施。本文保留原登记与排序。2026-11-23 另做两轮代码质量复核，修复 9 类缺陷（含旧问题），明细见 §9；工作区改动尚未提交。
 
 ---
 
@@ -87,14 +87,14 @@
 
 ## 4. 优化空间清单
 
-> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作；截至 2026-11-19，P0-1～P0-5 已实施；P3-4 生产依赖 0 漏洞、全量审计 1 条 dev-only 例外；P1-1 阶段 1 已提交、阶段 2 的 T0/T1 已提交、T2（会话壳）已提交 `23c9d28`，T3（工具面板）已提交 `1bbf757`，T4（provide 契约加固）已提交 `dab6470`，T5 低风险 UI 已提交至 `e87c4b0`，T6 C10 已提交 `58bd836`、C11 已提交 `383630e`、C12 已提交 `5de59a9`、C13 已提交 `f9e8ac8`（详见 `docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md` §7/§9），其余条目尚未实施。
+> 排序依据：收益 / 改动面 / 风险。所有条目均标注证据与动作；截至 2026-11-19，P0-1～P0-5 已实施；P3-4 生产依赖 0 漏洞、全量审计 1 条 dev-only 例外；P1-1 阶段 1 已提交、阶段 2 的 T0/T1 已提交、T2（会话壳）已提交 `23c9d28`，T3（工具面板）已提交 `1bbf757`，T4（provide 契约加固）已提交 `dab6470`，T5 低风险 UI 已提交至 `e87c4b0`，T6 C10 已提交 `58bd836`、C11 已提交 `383630e`、C12 已提交 `5de59a9`、C13 已提交 `f9e8ac8`（详见 `docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md` §7/§9），其余条目尚未实施；2026-11-23 两轮代码质量复核另修 9 类缺陷，见 §9。
 
 ### P0 低投入、高收益（建议 1～2 天）
 
 | # | 问题 | 证据 | 建议动作 | 收益 / 风险 |
 |---|---|---|---|---|
 | P0-1 | 两个大页面静态导入，进首屏包 | `apps/web/src/router.ts:2-3,12-13`，而 `:11,18,19` 已懒加载；`ChatPage.vue` 354.84 KB / 7218 行、`MoviePage.vue` 59.11 KB | 改动态 `import()`；`/chat` 与 `/support` 共用 `ChatPage`（`:12,16`），抽一个 `const ChatPage = () => import(...)` 复用，避免生成两份 | 首屏主包显著变小；风险低，注意 `/support` 的 `props` 保持不变 |
-| P0-2 | `manualChunks` 死分支 + 1.71 MB 单块 + 告警被关 | `apps/web/vite.config.ts:40`（`chunkSizeWarningLimit: 3000`）、`:45`（G2+G6 并一块）、`:47-51`（6 个零引用库名） | 精确删死分支（**保留** `/vue/`、`/vue-router/`、`/highlight.js/`）、G2/G6 分块、阈值回落到合理值 | 块粒度可控、回归告警恢复；只改构建配置 |
+| P0-2 | `manualChunks` 死分支 + 图表大块（已实施） | `apps/web/vite.config.ts:37-51` 已移除 `chunkSizeWarningLimit`（默认 500 kB 告警生效）；`vendor-antv-g2`/`g6` 已分块，兜底 `vendor-antv` ≈1.01 MB（历史问题证据见 git，勿作现状引用） | 已精确删死分支（保留 `/vue/`、`/vue-router/`、`/highlight.js/`）、G2/G6 分块、恢复默认告警；剩余兜底块治理见 P3-5 | 块粒度可控、告警已恢复；只改构建配置 |
 | P0-3 | 无用依赖与不可移植配置 | `apps/web/package.json:24`（`@types/dompurify` 为 deprecated stub，且拖入第二份 dompurify 3.4.13）、`:27`（web 的 `tsx` 零引用）；`apps/agent-server/package.json:16`（`@zereight/mcp-gitlab` 零代码引用）；`ecosystem.dev.config.cjs:21`（硬编码 `D:/.../tsx@4.23.12`）；四个 `package.json` 均无 `engines`，`@types/node` 24.x 对 Node 22 | 删 stub 类型包；补 `engines`；统一 `@types/node` 与 Node 22；pm2 配置改用 `pnpm exec` 而非绝对路径 | 依赖树变干净、跨机器可跑；**删 `@zereight/mcp-gitlab` 与 web 的 `tsx` 前先确认部署侧 `MCP_BUILTIN_SERVERS` 与 pm2 loader，见 §7** |
 | P0-4 | 组件卸载时 5 个具名定时器未清理 | `ChatPage.vue:5082-5117` 的 `onBeforeUnmount` 只清 `nowClockTimer` / `stopTasksPoll()` / `skeletonTimer` / `bgWatch` / `doneToastTimer` 与监听器；未清 `undoDeleteTimer`(`:1441,2930`)、`settingsErrorTimer`(`:1825,1830`)、`clearArmTimer`(`:3288,3302`)、`copyToastTimer`(`:4818,4827`)、`activeReportTimer`(`:4857,4872`，回调内还会发请求)；另 `:257,4053,4192` 三处无句柄 `setTimeout` | 在清理块补 `clearTimeout`，无句柄处保存句柄 | 消除卸载后回写状态 / 发请求；风险极低 |
 | P0-5 | 定时器与资源在路由切换时的存活语义 | `apps/web/src/App.vue:31` 用 `:key="$route.path"` 强制重挂载 | 结合 P0-1 验证懒加载后重挂载行为不变 | 防止 P0-1 引入回归 |
@@ -131,7 +131,7 @@
 | P3-2 | 生产攻击面 | `src/app.ts:1013-1016` 无条件把 `localhost:5173` 等开发来源加入 CORS 白名单；`:1136,1171,1182,1214,2219` 的 `limit` 无上界 | 按环境区分白名单、给 `limit` 加上界 |
 | P3-3 | 外网资源可达性 | `apps/web/index.html:15-20` 3 条 Google Fonts 外链 | 与「产物零外链」不冲突（§1），但内网 / 离线部署需本地字体兜底 |
 | P3-4 | 依赖风险 | 2026-11-18 实测：`pnpm audit --prod` 0 漏洞；全量审计 1 条 dev-only `picomatch` GHSA-fc5q-39xc-vjpf（公告无修复版本） | 生产依赖已清零；dev-only 例外记录并持续跟踪，deprecated 子依赖仍按 `pnpm why` 结果择机处理 |
-| P3-5 | 1.71 MB 图表块 | `apps/web/dist/assets/vendor-antv-*.js` | 用构建分析工具确认 G2/G6 各自占比，再决定能否按图表类型二次拆分 |
+| P3-5 | 兜底图表块 ≈1.01 MB | `apps/web/dist/assets/vendor-antv*.js`（兜底 ≈1.01 MB、g2 ≈410 KB、g6 ≈309 KB） | 已拆出 g2/g6；是否继续拆兜底块待构建分析结论 |
 
 ---
 
@@ -178,3 +178,25 @@
 - 未覆盖：逐行业务逻辑正确性、运行时性能 profiling、真实构建与产物分析、依赖漏洞库在线查询、git 索引验证。
 - **BI / Metabase text2sql 能力不在本文范围**：Schema 呈现、外键、口径一致性、口径图 / GraphRAG、黄金集评测的现行状态与待决事项，以 [`docs/bi-metabase-optimization-plan.md`](./bi-metabase-optimization-plan.md) §11.9（当前状态）与 §11.10（口径一致性复核）为准；相关代码在 `scripts/metabase-mcp.mjs`、`scripts/bi-*.mjs` 与 `apps/agent-server/bi-semantic/`，不要按本文的「巨型单文件 / 前端工程化」主线去拆改。
 - 本文「建议」的实施状态见文首 2026-11-17 复核与 `docs/README.md` 索引；继续实施后请回写状态行与 §3 冲突清单。
+
+---
+
+## 9. 2026-11-23 代码质量复核（两轮，未提交）
+
+> 范围：上周（2026-11-16～11-22）改动 + 顺带查到的旧缺陷。代码是唯一真相；以下为**工作区已改但未提交**的状态。
+
+| # | 问题 | 修复落点 |
+|---|---|---|
+| 1 | 接地纠正/兜底误用整轮累计 `toolFailures`，非取数工具失败也可能让模型声称“数据源故障” | `apps/agent-server/src/chat.ts` 新增按轮重置、仅外部数据源工具失败置位的 `dataSourceFetchFailed` |
+| 2 | 409 入队失败只恢复文字、图片/文档永久丢失 | `useChatPageCore.ts` 把原附件对象传入 `runTurn`，失败分支原样回填 |
+| 3 | 对话大纲 Esc 只在 `<nav>` 内生效、窗口化列表键盘不可达、rAF 卸载未取消 | `ConversationOutline.vue` Esc 移到根节点、列表支持方向键/Home/End、卸载取消 rAF；`BackToTop.vue` 同步取消 rAF |
+| 4 | MoviePage 卸载只 abort 本地 controller，服务端任务继续烧 token | `MoviePage.vue` 的 `onBeforeUnmount` 复用 `stop()` 的 `cancelChatTask` |
+| 5 | BI `dimension_source.forbidden` 列匹配大小写敏感，大写禁列可绕过 `reject` | `bi-semantic.mjs` 表名/列名统一转义 + `i`，并补大写绕过回归用例 |
+| 6 | RAG 命名空间解析在 `filter` 内重复读索引，大索引 O(N²) | `rag/store.ts` 把 `effectiveNamespace` 提到 `filter` 外只算一次 |
+| 7 | 连接类错误被误记为模型故障、auto 黑名单记 `"auto"`、短冷却覆盖长冷却 | `useChatPageCore.ts` 只认服务端故障码且记 `servedModel`；`model-availability.ts` 冷却只延长不缩短，并补回归用例 |
+| 8 | 技能页 `openSkill` 异步竞态、旧反馈条误导、绝大多数文案硬编码中文 | `SkillsPage.vue` 加请求序号、统一 `resetFeedback()`、全量接入 zh/en/pt-BR/hi |
+| 9 | 队列整体 PATCH 可绕过 20 条上限、可写畸形项 | `app.ts` 的 PATCH 补 `QUEUE_CAP` 与消息形状校验 |
+
+**验证**：`pnpm type-check` 0；web 9 文件 / 64 用例全绿；server 141 文件全绿；`pnpm build` 0；`git diff --check` 0（若干 LF→CRLF 提示，非错误）。
+
+**仍未做 / 非本次范围**：BI A/B 全量重跑、FK/owner/隐藏表人工签批、C16/C17 等阶段 2 剩余 CSS 下沉、队列删除/重排原子端点（入队/出队已原子化，见 `chat-preempt-plan.md` B6）、图表兜底大块治理（P3-5；默认告警已恢复）。

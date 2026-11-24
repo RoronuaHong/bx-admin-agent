@@ -1,6 +1,6 @@
 # 子进程 OS 级沙箱方案对比（审计第 1 项）
 
-> 背景：安全审计遗留 4 项局限，其中第 2（Node ESM 命名导入绕过 permission model）、3（凭据文件读取守卫）、4（SQL 只读绑定）已在 `936c691` 收口并推送。本文档只处理**第 1 项：子进程 OS 级沙箱**——这是唯一剩下的代码级缺口，且需要架构决策。
+> 背景：安全审计遗留 4 项局限，其中第 2（Node ESM 命名导入绕过 permission model）、3（凭据文件读取守卫）、4（SQL 只读绑定）已在 `936c691` 收口并推送。本文档只处理**第 1 项：子进程 OS 级沙箱**——这是唯一剩下的**架构级隔离**缺口，且需要架构决策；另有若干 P1 代码项见 `DEEP_AGENT_FULLCHAIN_AUDIT_2026-10-18.md` §8 P1 清单。
 
 ## 0. 现状
 
@@ -8,7 +8,7 @@
 
 | 维度 | 现状 |
 |---|---|
-| 凭据文件读取 | ✅ `tool-code-fs-guard.ts` 模块级补丁拦截（`.env`/私钥/云凭据目录） |
+| 凭据文件读取 | ✅ 形态化凭据（`.env`/私钥/云凭据目录）已拦；⚠️ `.data/mcp-servers.json` 内明文凭据不在拒读清单（审计 T-8，P1 未修） |
 | 命令执行（Node） | ✅ `node:child_process` 的 exec/spawn 家族已在模块层打补丁抛错（ESM 命名导入 / require / createRequire / 动态 import() 均拿不到可用函数） |
 | 命令执行（Python） | ⚠️ `subprocess` / `os.system` / `os.popen` 已包装抛错，但 `from subprocess import Popen` 这类把名字绑到局部变量的写法**仍绕过** |
 | 原生插件 / `process.binding` | ❌ 不拦 |

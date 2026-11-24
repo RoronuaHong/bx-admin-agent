@@ -32,7 +32,7 @@
 | LLM05 供应链漏洞 | 依赖审计、模型/插件完整性校验、SBOM | `pnpm audit` 进非阻断 CI；overrides 修传递依赖；子进程不继承凭据；MCP stdio 命令白名单（`NODE_ENV=production` 未配则拒绝连接）；来源指纹含命令、HTTP `url`、请求头哈希、本地脚本内容 | 🟡 | 开发环境白名单仍放行；未开 `MCP_REQUIRE_PROVENANCE` 时建连不拦；不哈希 `node`/`npx` 本体；子进程仍无 OS 沙箱 |
 | LLM06 敏感信息泄露 | 输出 PII 扫描脱敏；RAG 按权限过滤 | RAG 文档级 ACL（召回前过滤）；审计/trace 不落凭据；出站凭据打码；**本轮新增**可开启的 PII 打码（`REDACT_PII=on`，email/手机号/身份证/银行卡，可按类型选） | 🟡 | PII **默认关闭**（业务数据误报高）；无姓名/地址类识别（无形态可依，靠词典必然误报，不做） |
 | LLM07 不安全的插件设计 | 工具参数校验、最小权限、不执行任意 SQL | `BUILTIN_RISK` 风险登记 + 启动断言；`risk.ts`/`sql-readonly.ts` MCP 原生 SQL 只读闸（fail-closed）；`run_tool_code` 只读工具桥 | ✅ | — |
-| LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集；**本轮新增** per-run 工具 allowlist（`toolAllowlist` 正向清单，注入即收窄、点名也被拒并回灌模型） | ✅ | allowlist 为 opt-in（未传入=行为不变），契合「模型自选 + 最小权限」 |
+| LLM08 过度自主 | 最小权限，只给任务需要的工具 | 工具分级（read/write/destructive）；写操作二次确认；子代理最小工具集；会话级 MCP 启用集；per-run 工具 allowlist（`toolAllowlist` 正向清单，注入即收窄、点名也被拒并回灌模型） | 🟡 | 定时任务侧 ✅；交互式会话侧 ❌（全部内置工具常驻注入，无 per-run 收窄，见 §11.4）；allowlist 未传 = 行为不变 |
 | LLM09 过度依赖 | 高风险输出加验证层、标注来源与置信度 | 事后核验两阶段（抽断言 → 不回传草稿逐条判支持性）；grounding 诚实兜底；RAG 答案带来源；未取证如实说 | ✅ | — |
 | LLM10 模型窃取 | 限流、token 总量限制、批量相似请求检测 | 有 HTTP 限流（chat/login/admin）；进程级 metrics 可观测请求量；**token 总量配额**（`COST_HARD_QUOTA=on` + `DAILY_TOKEN_BUDGET` 全局池 + **本轮新增** `DAILY_TOKEN_BUDGET_PER_OWNER` 每 owner 池，防单用户烧光共享预算把其他人全挡住） | 🟡 | 配额**默认关闭**（免费链波动大，默认硬拦会误伤）且为**每实例**计数（多实例需入口层兜底）；仍**无批量相似请求检测** |
 
@@ -86,8 +86,8 @@
 | # | 不一致点 | 最佳实践 | 本项目做法 | 是否有意为之 |
 | --- | --- | --- | --- | --- |
 | 1 | 提示词注入检测 | 用分类器/规则检测注入 | 只做结构化定界，**不做检测** | ✅ 有意：检测必然退化为业务词写死，违反最高红线；以定界+只读桥+确认替代 |
-| 2 | Trace 格式 | OTel 语义约定 + OTLP | 自研 JSONL（**本轮已挂 `gen_ai.*` 标准属性**） | 🟡 部分有意：零依赖优先；属性名已对齐，导出器待补 |
-| 3 | 评测形态 | 在线/持续评测闭环 | 测试闸门（G1–G7） | 🟡 有意：评测层已随 analytics 拆分清理，现以测试承担回归 |
+| 2 | Trace 格式 | OTel 语义约定 + OTLP | 自研 JSONL（**已挂 `gen_ai.*` 标准属性 + OTLP/HTTP JSON 导出器**） | 🟡 部分有意：零依赖优先；导出器默认关闭，指标看板/按会话回放仍缺 |
+| 3 | 评测形态 | 在线/持续评测闭环 | 测试闸门（G1–G7）+ 在线评测（`eval-online.ts`，七维确定性打分） | 🟡 有意：在线评测已补齐，不再依赖旧 analytics 层 |
 | 4 | 成本治理 | 硬配额（超限拒绝） | 默认只告警；`COST_HARD_QUOTA=on` 时**可开启硬配额**（本轮补齐） | 🟡 部分：默认仍是告警（免费链波动大，默认硬拦会误伤），开启后 fail-closed |
 | 5 | MCP 白名单 | 默认启用工具 allowlist | 开发未配 = 放行；`NODE_ENV=production` 未配 = 拒绝 stdio | ✅ 有意：单机开发放行；生产进程强制白名单 |
 | 6 | 子进程沙箱 | OS 级容器隔离 | 无沙箱，靠「环境白名单+超时+并发上限+只读桥」 | 🟡 无意（成本/平台限制），已在 `SECURITY.md` §8.4 诚实标注 |
@@ -547,7 +547,7 @@ tsc --noEmit 0 errors
 
 ### 11.3 可选加固（非缺口，纵深一致）：技能面纳入全局限流
 
-把 `app.ts:1042` 白名单里的 `path === "/skills" || path.startsWith("/skills/")` 去掉，使技能端点也走全局 `adminDenied` + `RATE_ADMIN_PER_MIN` 限流（handler 内已各自 `adminDenied`，去掉白名单不改动鉴权语义，仅追加限流）。**纯服务端一行改动，无需前端配合**；但因不解决安全问题，列为可选、未实施。
+把 `app.ts` 白名单（原 `:1042`，按符号 `app.use("*")` 定位）里的 `path === "/skills" || path.startsWith("/skills/")` 去掉，使技能端点也走全局 `adminDenied` + `RATE_ADMIN_PER_MIN` 限流（handler 内已各自 `adminDenied`，去掉白名单不改动鉴权语义，仅追加限流）。**纯服务端一行改动，无需前端配合**；但因不解决安全问题，列为可选、未实施。
 
 ### 11.4 缺口复核：交互式会话工具收窄（LLM08 / ASI02）
 

@@ -1,5 +1,6 @@
 > ⚠️ **历史快照 · 与当前代码已脱节**：本文件描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本文件仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
 > **2026-10-08**：文内 Worker 清单与 Supervisor 路由**不要开工**。领域继续用角色 + 技能 + MCP。当前范围以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 文首为准。
+> **2026-11-23 状态对齐**：M0–M3 Worker/Supervisor 方案**整体废止**，未进入当前 deep-agent 代码。文内所有 ✅ M1/M2、`preferredModel`、`route_to_agent`、WorkerDef 与权限投影均为历史设计，不代表现状；「门户级 Trace 权限投影」也未落地（当前 trace 仅按 ownerKey 过滤）。
 
 # Multi-Agent 架构规划
 
@@ -218,12 +219,12 @@ interface WorkerDef {
 
 | 阶段 | 内容 | 风险 | 依赖 |
 |---|---|---|---|
-| **M0** | 工具按领域分组标记 + 系统提示按领域裁剪候选（不拆 Agent） | 零 | 无 |
-| **M1** ✅ | 加 Supervisor 路由层：主管模型判（领域×环境）→ 交给对应上下文；含可选 worker 级模型切换（`preferredModel`）；2026-09-05 收尾（systemPrompt / prod Worker / 双域名） | 小 | 环境配置（test/prod URL） |
-| **M2** 🟡 | Worker 独立成子图，各自完整 understand⇄tool→final 循环；analytics-bi 已先行落地（§3.2.1） | 中 | M1 路由稳定 |
-| **M3** | 并行 worker / 按 worker 隔离权限 / 独立审计；出现独立部署 worker 时经 A2A Client 编排（见 [A2A_INTEGRATION.md](./A2A_INTEGRATION.md) §3.3）| 大 | 权限体系 |
+| ~~**M0**~~ 已废止 | 历史方案：工具按领域分组标注；当前代码 0 命中，领域用角色 + 技能 + MCP | — | — |
+| ~~**M1** ✅~~ 已废止 | 历史方案：Supervisor 路由 + `preferredModel`；当前代码无 `route_to_agent`/`preferredModel` | — | — |
+| ~~**M2** 🟡~~ 已废止 | 历史方案：Worker 独立子图；当前领域用角色 + 技能 + MCP | — | — |
+| ~~**M3**~~ 已废止 | 历史方案：并行 worker / A2A Client 编排；A2A 按 `A2A_INTEGRATION.md` 文首决定**不启动** | — | — |
 
-**为什么先 M0/M1**：multi-agent 最大坑是路由错误；先把路由调稳再拆子图，回退成本最低。
+~~**为什么先 M0/M1**~~（历史思路，整体方案已废止）：当时认为 multi-agent 最大坑是路由错误，先把路由调稳再拆子图；现领域用角色 + 技能 + MCP。
 
 ---
 
@@ -234,12 +235,12 @@ interface WorkerDef {
 - [ ] 确认生产环境 token 来源（与测试环境是否同一登录体系）
 - [ ] 数据库 Agent 语义确认：直查 SQL 还是归后台 API Agent
 - [ ] 各领域 Agent 的权限边界（谁能用哪个 Agent / 哪个环境）
-- [x] 门户级 Trace 权限投影（2026-09-07）：`/trace` 改为门户级入口；前后端统一使用 `canViewTrace` 控制“是否显示 / 是否可进 / 是否可读”；当前支持 `TRACE_ALLOWED_OWNERS`、`TRACE_DENIED_OWNERS`、`TRACE_ALLOWED_COUNTRIES` 做组合收紧，未接入完整 RBAC
-- [x] 是否现在启动 M0（工具分组）：**已启动（2026-09-03）**——tools.ts 全量工具加 `domain` 标注（backend-api/knowledge/common 三类当前有工具落入，finance/customer-service/database 为 M1+ 预留）、提供 `listAgentToolsForDomains` 过滤函数、`toolCatalogByDomain` 注入系统提示按领域呈现候选；实际「按请求裁剪」属 M1 路由层（需环境配置）。
-- [x] M1 实现 worker 级模型切换（`preferredModel`）：命中后 understand 优先用该模型；未配则沿用默认（代码已挂钩；默认注册表暂未配具体模型 id）
-- [x] **M1 收尾（2026-09-05）**：`systemPrompt` 注入 + `backend-api-…-prod` + `session.activeEnvironment` / `call_api.environment` + `resolveBaseUrl(country×env)` + META 始终可见
-- [x] **M1 路由完善（2026-09-05）**：未路由仅 META；自然问法评测 `eval-m1-routing-natural.mjs`（知识库/后台/模糊）实跑通过
-- [x] **观影助手 Worker 方案（高优）**：2026-09-05 定稿 [VIEWING_ASSISTANT_AGENT.md](./VIEWING_ASSISTANT_AGENT.md)——Web 先行、不做 App；Worker id=`consumer-viewing`；MVP 必补 + 多语言跟聊；**代码未开工**
+- [ ] ~~门户级 Trace 权限投影（2026-09-07）~~ **未落地**：`canViewTrace` / `TRACE_*` 只存在于本文档，当前代码无对应权限模块；trace 仅按 ownerKey 过滤
+- [ ] ~~是否现在启动 M0（工具分组）~~ **未落地**（历史方案：`tools.ts` domain 标注 / `listAgentToolsForDomains` / `toolCatalogByDomain` 当前代码 0 命中）
+- [ ] ~~M1 实现 worker 级模型切换（`preferredModel`）~~ **未落地**（历史方案，当前代码 0 命中）
+- [ ] ~~**M1 收尾（2026-09-05）**~~ **未落地**（历史方案：`session.activeEnvironment` / `resolveBaseUrl` / META 可见等）
+- [ ] ~~**M1 路由完善（2026-09-05）**~~ **未落地**（历史评测脚本 `eval-m1-routing-natural.mjs` 已清理）
+- [ ] ~~**观影助手 Worker 方案（高优）**~~ **历史方案，未开工**；当前观影为角色 + 技能 + MCP，非独立 Worker。
 
 ---
 

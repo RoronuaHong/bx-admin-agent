@@ -26,11 +26,8 @@
 
 > 说明：第 4 项 **2026-09-24 全部落地**（`fs_delete` §15、上传附件进工作区 §16、定时任务工具化 §17）。
 > 复核口径（以 `builtins.ts` 的 `BUILTIN_RISK` 登记表为准）：
-> 内置工具共 **24** 个 —— `fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `fs_delete` `read_skill`
-> `render_chart` `request_clarification` `recall_memory` `save_memory` `search_tools` `search_knowledge`
-> `knowledge_sources` `web_search` `fetch_url` `export_data` `write_todos` `task` `run_command`
-> `record_watched_movies` `list_schedules` `manage_schedule`；其中 22 个在 `execBuiltin` 里分发，
-> `task` 与 `search_tools` 由 `chat.ts` 循环内直接处理。第 5 项 `run_script` / `image_gen` 已落地，对齐 `docs/DELIVERABLE_GUARDRAILS.md`（§11.8）。
+> 内置工具现行 **30** 条登记 / 30 个定义 —— 文件 `fs_read` `fs_ls` `fs_glob` `fs_grep` `fs_write` `fs_edit` `fs_delete` `read_skill`；出图 `render_chart` `image_gen`；澄清/记忆 `request_clarification` `recall_memory` `save_memory`；检索 `search_tools` `search_knowledge` `knowledge_sources` `web_search` `fetch_url`；输出/规划 `export_data` `write_todos`；委派/定时 `task` `list_schedules` `manage_schedule`；执行 `run_command` `run_tool_code` `run_script`；业务数据 `count_list_by_time` `salesiq_chat_brief` `search_dingtalk_doc`。
+> 其中 **28 个**在 `execBuiltin` 里分发，`task` 与 `search_tools` 由 `chat.ts` 主循环直接处理（旧 24/22、27/25 口径已作废，见根 `README.md` §4）。
 
 ---
 
@@ -255,8 +252,8 @@ user: 123
 | **pdf** | P0 本批 | `pdfmake`（声明式表格布局，字体经 vfs 注入） | `pdfmake` + NotoSansSC TTF 字体资产 | **唯一硬点：PDF 必须内嵌 CJK 字体**，否则中文全变空白；详见 10.3 |
 | **html** | P0 本批 | 自包含单文件（内联 CSS 的样式表格），走 `fsWrite` 文本路径 | **零依赖** | 双重价值：①本身可预览/二次加工；②浏览器打开 Ctrl+P 即存 PDF——是 PDF 的**零成本兜底通道**（v1 §7 的兜底方案正式落地） |
 | **txt** | P0 本批 | 等宽对齐纯文本（CJK 记 2 计算列宽），走 `fsWrite` | 零依赖 | 补齐 Code Interpreter 基线格式 |
-| **pptx（PowerPoint）** | P0 本批 | `pptxgenjs`（标题页 + 每表一页幻灯表格） | `pptxgenjs`（纯 JS，零原生依赖） | 用户拍板全量补齐；表格数据 → 每表一页幻灯，中文走系统字体无需内嵌；密集表格建议仍用 xlsx |
-| **png（图表图片）** | P0 本批 | 前端 ChartCard 增加「存 PNG」按钮：G2 canvas `toDataURL` 白底合成后下载 | **零依赖、零服务端改动** | 对齐 Cursor/CodeBuddy 图表卡标配；图表本就前端本地渲染（v1 §7 判定维持），服务端重复渲染无意义 |
+| **pptx（PowerPoint）** | 未做，列入后续批次（见 §10.7） | `pptxgenjs`（标题页 + 每表一页幻灯表格） | `pptxgenjs`（纯 JS，零原生依赖） | 未纳入本批 `EXPORT_FORMATS`；表格数据 → 每表一页幻灯，中文走系统字体无需内嵌；密集表格建议仍用 xlsx |
+| **png（图表图片）** | 未做，列入后续批次（见 §10.7） | 前端 ChartCard 增加「存 PNG」按钮：G2 canvas `toDataURL` 白底合成后下载 | **零依赖、零服务端改动** | 图表本就前端本地渲染（v1 §7 判定维持），服务端重复渲染无意义 |
 
 **不新增第二个工具**：全部并入 `export_data`（v1 §4 准则「不为每种格式各建一个工具」不变）。工具名/描述/schema 全协议级英文，不含业务词（红线）。
 
@@ -524,7 +521,7 @@ user: 123
 > 关键区分：#1 是模型写错参数（换个参数就好）；#2 是稳定复现的产品缺陷——
 > **即使命令写对，用户看到的仍是乱码**（`dir`、`netstat`、git 中文路径、任何中文报错都一样）。
 
-### 13.2 最佳实践对照
+### 13.2 最佳实践对照（实施前现状快照，2026-09-24 已修复，见 §13.4/§13.5）
 
 | 来源 | 官方做法 | 我们现状 | 判定 |
 |---|---|---|---|

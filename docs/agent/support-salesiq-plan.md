@@ -1,8 +1,8 @@
 # 客服助手接入 Zoho SalesIQ（现行方案）
 
-> 2026-10-08。状态：**客服角色已改用现有 `zoho-salesiq`，未新增连接器**。单条消息与代发仍未做（现有白名单只有会话列表）。
+> 2026-10-08。状态：**客服角色已改用现有 `zoho-salesiq`，未新增连接器**。文首 2026-10-12 记录：逐句消息读取与代发均已实施（阶段一～四，见 §7），不再按「只有会话列表」理解。
 > 2026-10-12：定了分阶段扩容方案（§7）——先读扩容、再子集按需加载、再组合读工具、最后代发。对通用预警任务的影响已核查（§7.1）。**四段全部已实施并通过实机验收**：阶段一白名单 1→10；阶段二子集扩到 26 个只读 + `toolNotes` 中文注记；阶段三内置组合读工具 `salesiq_chat_brief`（验收：一轮取全详情+逐句消息，3 轮 1 次工具调用）；阶段四放行 `sendMessageInConversation`（单独标 `write`），Jev 门控 + 确认卡 + 6018 友好提示接上。`pathDefaults` 实测分两族（screenname / portalid，后者实际收门户名），逐工具精确配置，不用 `"*"` 通配。
-> 客服助手上的事项、代发和承诺门控见 `support-jev-plan.md`。判的是坐席这条指令，不是访客情绪。访客逐句要等本文件的消息工具接上。代发工具接上之后，仍由 Jev 在概率 ≥ 0.9、检查没有结果或正文为空时拒绝发出。
+> 客服助手上的事项、代发和承诺门控见 `support-jev-plan.md`。判的是坐席这条指令，不是访客情绪。访客逐句要等本文件的消息工具接上。代发工具接上之后，仍由 Jev 在概率 ≥ 0.6（CJK 地板）、检查没有结果或正文为空时拒绝发出。
 > 目标：让已有客服助手（`/support`，角色 `support`）能查阅 `castleapp` 门户里的 SalesIQ 会话，并在人工确认后起草回复。
 > 不做：不新建进程、不走 A2A、不把助手嵌进访客聊天框、不用 SalesIQ 替代订单/工单源。
 >
@@ -163,7 +163,7 @@ MCP 只规定怎么调用，不决定这一轮该调用哪一个。Zoho 控制�
 1. **阶段一（读扩容）**：白名单 1 → 约 10，全部 `read` + 固定 `screenname=castleapp`。工具与取舍见 `support-salesiq-tools.md` 的「阶段一」表。同步改 `roles.ts` 人设（第 2 条「当前只接了会话列表」按新能力改写）和 `skills/support-salesiq/SKILL.md`（何时按 id、何时用列表、空消息数组、备注≠访客原话）。
 2. **阶段二（按需加载，已实施 2026-10-12）**：白名单扩成 26 个只读工具做「客服子集」（实际挑选见 `support-salesiq-tools.md`，宁少勿滥）。新增服务器配置 `toolNotes`（`src/mcp/config.ts`）：每个白名单工具一行中文用途注记，`installTools`（`src/mcp/hub.ts` 的 `withToolNote`）把它并进 description——不改上游 schema、工具缓存仍存原文，但让 `searchMcpTools`/`prefetchDeferredTools` 的字面关键词匹配能被中文问句命中（此前只匹配英文工具名/描述，中文检索会落空——§3.1 预警过的问题）。deferred 仍由 `TOOL_SEARCH_MODE=auto` 的 10% 阈值自动触发：大窗口模型保持 26 个 eager（在 30–50 拐点内），小窗口模型自动切按需（名字目录 ≪ `TOOL_CATALOG_MAX_NAMES=200`），两条路都满足「每轮暴露个位数到几十」。
 3. **阶段三（Workflow 化，已实施 2026-10-12）**：引擎内置组合读工具 `salesiq_chat_brief(conversationId)`（`src/salesiq-brief.ts` + `src/builtins.ts` 的 case），一次取 会话详情 + 逐句消息 + 最后一条，服务端按 Zoho 公开文档的字段结构裁剪（状态/部门/接待人/访客/最后一条 → 一行元信息，消息 → 逐行转录，上限 100 条、单条 400 字符）。两个源接口的会话 id path 字段名不一致（`conversation_id` vs `id`），从 inputSchema 运行时发现（`conversationIdField`），不硬编码；门户名沿用 `pathDefaults`。解析失败回退原文截断，不整体失败。风险登记 `read/external`（与 `count_list_by_time` 同口径）。
-4. **阶段四（代发，已实施 2026-10-12）**：`ZohoSalesIQ_sendMessageInConversation` 进白名单，`toolRisks` 里在 `"*": "read"` 之外**单独声明**为 `write`（`src/risk.ts` 的取值顺序是具体键优先于 `*`）；support 角色 `defaultFullAccess: false` → 每次都弹确认卡。Jev 门控零改动即生效：`SEND_TOOLS`（`src/jev.ts`）本就包含两个发送工具，`chat.ts` 三个 MCP 调用点都会先过 `visitorSendRefusal`（空正文 / 未配置 / 检查失败 / 承诺 ≥ 0.9 → 拒绝）。补了两处：`outboundText` 支持嵌套 `body` 对象（Zoho 发送接口 body 是 `{text}` 或 `{file, comment}`，文件类按无正文拒绝）；新增 `friendlySendFailure`（`chat.ts`）把 6018 非参与者错误翻成「先接起会话再发」的坐席指引。`replyToMessage` 仍未放（坐席明确要「回复那一条」时再单独加）。
+4. **阶段四（代发，已实施 2026-10-12）**：`ZohoSalesIQ_sendMessageInConversation` 进白名单，`toolRisks` 里在 `"*": "read"` 之外**单独声明**为 `write`（`src/risk.ts` 的取值顺序是具体键优先于 `*`）；support 角色 `defaultFullAccess: false` → 每次都弹确认卡。Jev 门控零改动即生效：`SEND_TOOLS`（`src/jev.ts`）本就包含两个发送工具，`chat.ts` 三个 MCP 调用点都会先过 `visitorSendRefusal`（空正文 / 未配置 / 检查失败 / 承诺 ≥ 0.6 → 拒绝）。补了两处：`outboundText` 支持嵌套 `body` 对象（Zoho 发送接口 body 是 `{text}` 或 `{file, comment}`，文件类按无正文拒绝）；新增 `friendlySendFailure`（`chat.ts`）把 6018 非参与者错误翻成「先接起会话再发」的坐席指引。`replyToMessage` 仍未放（坐席明确要「回复那一条」时再单独加）。
 
 明确不做（维持 §3.1 红线）：281 全量入向量库；清空白名单改靠引擎兜底（`MCP_MAX_TOOLS=80` 是按数量截断，不是按相关度）；入站自动接待（§6，需单独立项）。
 

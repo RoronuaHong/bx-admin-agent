@@ -102,7 +102,7 @@ docs(web): record ChatPage phase2 design and implementation plan
 | `sortMode` 被列为「排序动作」 | `sortMode` 是 `ref<ConvSortMode>`（约 1491），不是动作；动作是 `resortConversations`/`applyConversationOrder`/`restoreRecentSort`/`reloadConversations` | 状态留根按引用注入，动作随会话壳搬 |
 | SCC A 规模被低估（计划列约 40 符号） | 实际 100+ 符号，散落约 154–2987 行，横跨任务表单/飞出层/日期选择器、会话动作、拖拽键盘、右键删除、确认弹窗、重命名，且与 SCC B 共享 `taskDraft`/飞出层 | **按 §5.4 裁剪边界落地**：只搬会话壳核心（30 个跨组依赖已 AST 盘点），任务表单与飞出层留根；T2 已提交 `23c9d28` |
 
-**规模/安全网提示**：T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，机械搬迁可能产生「编译通过但交互静默回归」。因此 T2 开工前已补 `chat-composables.test.ts` + `chat-shell.test.ts`（共 33 用例），并以 AST 依赖清单/TDZ 注入规则约束拆分；Chrome 冒烟因浏览器实例冲突仍为非阻塞后续项。
+**规模/安全网提示**：T0/T1 的门禁主要覆盖类型/构建/后端；SCC A 是 UI 交互密集区，机械搬迁可能产生「编译通过但交互静默回归」。因此 T2 开工前已补 `chat-composables.test.ts` + `chat-shell.test.ts`（共 33 用例），并以 AST 依赖清单/TDZ 注入规则约束拆分；Chrome **全清单**冒烟因浏览器实例冲突仍为非阻塞后续项；C14/C15 的单步定向实测已完成。
 
 ## 1. 全局约束与统一迁移手法
 
@@ -153,7 +153,7 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 - `apps/web/dist/assets/ChatPage-*` 仍只有一份 JS / CSS。
 - `pnpm test` 与 `pnpm --filter @bx/web test` 都必须跑，原因见 0.3。
 
-### 1.4 通用 Chrome 手工清单（每步至少跑一次）
+### 1.4 通用 Chrome 手工清单（每步可做时至少跑一次；与全阶段收口门禁解耦，未完成不阻断提交）
 
 - `/chat -> /support -> /movie -> /chat`：标题、Agent 身份、输入框占位符正确，每次 path 变化重挂载。
 - 发送普通消息并收到流式回复；停止、续传、刷新恢复正常。
@@ -179,7 +179,9 @@ Get-ChildItem -Name apps/web/dist/assets/ChatPage-*
 | C11 | T6 `ChatSidebarList.vue` | 新增 `components/chat/ChatSidebarList.vue` + `tests/chat-sidebar-list-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `383630e`：39 props / 29 emits、双 ref 桥接、遮罩留根，web 53/53 + 全门禁绿 |
 | C12 | T6 `MessageComposer.vue` | 新增 `components/chat/MessageComposer.vue` + `tests/message-composer-contract.test.ts` + `ChatPage.vue` + `useChatPageCore.ts` | ✅ 已提交 `5de59a9`：39 props / 38 emits、四 ref 桥接、全局监听留根，web 58/58 + 全门禁绿 |
 | C13 | T6 其余高风险 UI | 同上 | ✅ 已提交 `f9e8ac8`：63 props / 40 emits、四 ref 桥接、三类 patch 留根，web 63/63 + 全门禁绿 |
-| C14+ | T7 CSS 下沉（按注释块逐块提交） | 新增 `components/chat/*.css` + `chat-page.css` | ⏳ 依赖 UI 子组件就位 |
+| C14 | T7 侧栏品牌 CSS 下沉 | 新增 `components/chat/*.css` + `chat-page.css` | ✅ 已提交 `8d0a645`（web 64/64） |
+| C15 | T7 定时任务卡片 CSS 下沉 | 同上 | ✅ 已提交 `d65b575`（web 64/64） |
+| C16+ | T7 剩余 CSS 下沉 | 同上 | ⏳ C16 前置方案已写（§10.8）待确认；C17–C26 未写前置方案（§10.9） |
 
 任何一步失败：未提交则 `git restore` 该步文件；已提交则 `git revert <sha>`。禁止把多步合并成一次提交。
 
@@ -1199,17 +1201,17 @@ refactor(web): extract <ComponentName> from ChatPage
 |---|---:|---|---|
 | 侧栏品牌/助手切换 | 31–217 | `ChatSidebarList.css` | C14 `8d0a645` 已提交 |
 | 定时任务分组/任务卡片 | 218–252、653–845 | 旧锚点已漂移；实际侧栏 `.task-group*` → `ChatSidebarList.css`；`.task-page*` DOM 仍在根，留根 | C15 `d65b575` 已提交 |
-| 通知通道管理 | 253–489 | 无 `NotifyChannelPanel.vue`；DOM 在 `ChatTaskPanel.vue` → `ChatTaskPanel.css`；`.notify-btn*` 共享留根 | C16 前置方案 §10.8 |
-| 任务表单 | 490–1064、1073–1381 | 追加到 `ChatTaskPanel.css`；`.modal-*` / `.field__input` / `.primary-btn` / `.tools-*` 留根或按需 `:deep` | 待 C17 |
-| 任务时间选择器 | 1382–1594 | 无独立组件，`dt__` 仅出现在 `ChatTaskPanel.vue` 与根 CSS；预计并入 `ChatTaskPanel.css`，预计划再核 | 待 C18 |
-| 快捷操作导航 | 1595–1645 | 实际类名是 `.side-nav*`，仅出现在 `ChatSidebarList.vue` 与根 CSS → `ChatSidebarList.css` | 待 C19 |
-| 骨架/拖拽/状态点 | 1646–1750 | `.skeleton*` 同时用于 `ChatThread`；`.dragging*` 根层也用；`.conv-dot*` 留根；只搬侧栏专属 | 待 C20 |
-| 删除确认弹窗 | 970–1014 | `ConfirmDialog.vue` → `ConfirmDialog.css`；`.modal-*` 留根 | 待 C21 |
-| Toast | `done-toast` 相关规则 | `DoneToast.vue` → `DoneToast.css`；全局 toast 类留根 | 待 C22 |
-| 产物预览 | `preview-*` 相关规则 | `ArtifactPreviewModal.vue` → `ArtifactPreviewModal.css`；`.modal-*` 留根 | 待 C23 |
-| 对话区/气泡/大纲 | `.thread` / `.reasoning` / `.outline` 相关规则 | `ChatThread.css`；`bubble.css` 有共享规则副本，需逐 selector 建映射 | 待 C24 |
-| 右键菜单 | `.ctx-*` 相关规则 | `ContextMenuHost.css`；Teleport 到 body，定位逻辑留根 | 待 C25 |
-| 输入区 | `.composer` 相关规则 | `MessageComposer.css`；`PromptBox` / `ToolsSearch` / `UiSelect` 子组件需 `:deep` 清单 | 待 C26 |
+| 通知通道管理 | 253–489 | 无 `NotifyChannelPanel.vue`；DOM 在 `ChatTaskPanel.vue` → `ChatTaskPanel.css`；`.notify-btn*` 共享留根 | C16 前置方案已写（§10.8），待实施 |
+| 任务表单 | 490–1064、1073–1381 | 追加到 `ChatTaskPanel.css`；`.modal-*` / `.field__input` / `.primary-btn` / `.tools-*` 留根或按需 `:deep` | 待前置方案（§10.9 高风险，必要时拆子块） |
+| 任务时间选择器 | 1382–1594 | 无独立组件，`dt__` 仅出现在 `ChatTaskPanel.vue` 与根 CSS；预计并入 `ChatTaskPanel.css`，预计划再核 | 待前置方案（§10.9） |
+| 快捷操作导航 | 1595–1645 | 实际类名是 `.side-nav*`，仅出现在 `ChatSidebarList.vue` 与根 CSS → `ChatSidebarList.css` | 待前置方案（§10.9） |
+| 骨架/拖拽/状态点 | 1646–1750 | `.skeleton*` 同时用于 `ChatThread`；`.dragging*` 根层也用；`.conv-dot*` 留根；只搬侧栏专属 | 待前置方案（§10.9） |
+| 删除确认弹窗 | 970–1014 | `ConfirmDialog.vue` → `ConfirmDialog.css`；`.modal-*` 留根 | 待前置方案（§10.9） |
+| Toast | `done-toast` 相关规则 | `DoneToast.vue` → `DoneToast.css`；全局 toast 类留根 | 待前置方案（§10.9） |
+| 产物预览 | `preview-*` 相关规则 | `ArtifactPreviewModal.vue` → `ArtifactPreviewModal.css`；`.modal-*` 留根 | 待前置方案（§10.9） |
+| 对话区/气泡/大纲 | `.thread` / `.reasoning` / `.outline` 相关规则 | `ChatThread.css`；`bubble.css` 有共享规则副本，需逐 selector 建映射 | 待前置方案（§10.9 高风险，建议拆 2–3 个子提交） |
+| 右键菜单 | `.ctx-*` 相关规则 | `ContextMenuHost.css`；Teleport 到 body，定位逻辑留根 | 待前置方案（§10.9） |
+| 输入区 | `.composer` 相关规则 | `MessageComposer.css`；`PromptBox` / `ToolsSearch` / `UiSelect` 子组件需 `:deep` 清单 | 待前置方案（§10.9） |
 
 ### 10.3 必须留在 `chat-page.css`
 

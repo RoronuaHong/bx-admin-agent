@@ -81,8 +81,8 @@
 | **P0-1** | SETTINGS 未判数据库引擎就全局追加；3 个 SQL 入口 `database_id` 归一化不一致 | 与事故①同源（一处全局注入打挂全部查询） |
 | **P0-2** | `classifyUpstreamError` 不识别 `Code 115 / UNKNOWN_SETTING` | 事故①只是被"改名+默认关闭"遮住，**无自愈**；换库/开开关即全失败且归因方向相反 |
 | **P0-3** | `result_overflow_mode='break'` 静默截断 | 高基数查询**系统性偏小且零提示**（静默给错数） |
-| **P0-4** | `hasDateWindow` 只认 `'YYYY-MM-DD'`，DateTime 不识别 | DateTime 写法有界短窗误判无窗 → 误报 HEAVY |
-| **P0-5** | `HEAVY_EXACT_AGG_NOWINDOW` 漏 `uniqExactIf/Array/State/OrNull` | **恰好是线上事故形态**，护栏对其失效 |
+| **P0-4** | `hasDateWindow` 已支持 DateTime / 函数包裹 | 原问题：DateTime 写法误报 HEAVY（已修，见批次 2） |
+| **P0-5** | `HEAVY_EXACT_AGG_NOWINDOW` 已覆盖 `uniqExactIf/Array/State/OrNull` 家族 | 原问题：护栏对线上事故形态失效（已修，见批次 1） |
 | **严重-1** | 前端**零测试** | 状态映射改动无回归保护 |
 | **严重-2** | `tool_result.executed` 13 个 yield 分支**零测试** | 核心语义（未执行 vs 真失败）无自动化保护 |
 | **严重-3** | COMPARISON 文档 DAU 数字**自相矛盾**（3 处过时） | 削弱结论可信度 |
@@ -91,8 +91,8 @@
 ### P1 / 高
 | # | 问题 |
 |---|---|
-| P1-1 | `!=` 被当单日等值窗（修复③引入的假阴性，漏报 HEAVY） |
-| P1-2 | `GROUP BY 1` 误报 `GROUP_BY_SELECT_MISMATCH` |
+| P1-1 | `!=` 误判已修（只认 `=` 为等值） |
+| P1-2 | `GROUP BY` 序号判定已修（纯序号返回 null） |
 | P1-3 | 形态过滤把真外部专名也删了（判据选错实证，P0-3 节已述） |
 | P1-4 | `GENERIC_LATIN_TOKENS` 覆盖不足（SQL 关键字/技能名成分未豁免） |
 | P1-5 | 自有业务护栏硬编码 `mcp__bi__` server id |
@@ -120,22 +120,23 @@
 
 ### 批次 1：资源安全（会打挂/静默给错数，最高优先）
 - [ ] **P0-1**：`runSql` 内先取 engine，仅 ClickHouse 系才 append SETTINGS；wid 归一化上提到 `runSql` 共用
-- [ ] **P0-2**：`classifyUpstreamError` 增 `115/UNKNOWN_SETTING` 分支 → 自动不带 SETTINGS 重试一次 + 记日志回显被跳过 setting + 再失败才回落通用
+- [x] **P0-2**：`115/UNKNOWN_SETTING` 识别已落地；自动不带 SETTINGS 重试一次仍未做（再失败回落通用）。
 - [x] **P0-3**：`result_overflow_mode` 默认改 `'throw'`（已在 `bi-query-settings.mjs` 落地；`BI_CH_RESULT_OVERFLOW_MODE=break` 可还原静默截断）
-- [ ] **P0-5**：`HEAVY` 正则扩到 `uniq\w*(?:If|Array|State|OrNull)?` 家族
+- [x] **P0-5**：`HEAVY` 正则已覆盖 `uniq\w*(?:If|Array|State|OrNull)?` 家族（含 `uniqExactIf`）。
 - [ ] **P1-11**：`execute_query` 纳入同一 lint/SETTINGS/只读校验链
 
 ### 批次 2：判据正确性
-- [ ] **P0-4**：`hasDateWindow` 放宽日期正则支持 `toDateTime('… 08:00:00')` 写法
-- [ ] **P1-1**：排除 `!=`/`<>`（只认 `=` 为等值）
-- [ ] **P1-2**：`GROUP BY` 只含序号时返回 null（放弃判定）
+- [x] **P0-4**：`hasDateWindow` 已支持 `toDateTime('… 08:00:00')` 与 DateTime 写法。
+- [x] **P1-1**：已排除 `!=`/`<>`，只认 `=` 为等值。
+- [x] **P1-2**：`GROUP BY` 只含序号时返回 null（放弃判定）。
 - [ ] **P1-10**：`app.ts` 重建 steps 保留 `executed`，无结果记 `interrupted`
 
 ### 批次 3：专名护栏收口（消除边角死锁）
 - [ ] 按 3.3：纯小写单词类触发降为 **warn 档**（不阻断），保留"未读技能+真外部专名"硬拦
 - [ ] **P1-5**：`mcp__bi__` 改为常量/配置
-- [ ] **P1-6/7**：`usedOwnBusiness` 改用 `ownBusinessExecuted`；专名闸命中也置 `ownBusinessRefused`
-- [ ] **P1-8/9**：串行补 `repeatBudgetStop`；主循环补 try/catch
+- [x] **P1-6/7**：`ownBusinessExecuted`/`ownBusinessRefused` 已引入并用于重试兜底；`afterInternalMiss` 仍有一处用 `usedOwnBusiness`（残留观察）。
+- [x] **P1-8**：串行已接 `repeatBudgetStop`（默认关，`TOOL_REPEAT_STOP_AFTER`）。
+- [ ] **P1-9**：主循环工具调用 try/catch 防异常逃逸 `runLoop`（待补回归锚点确认）。
 
 ### 批次 4：测试与前端收尾
 - [ ] **严重-1**：`apps/web` 装 vitest + 至少 3 条状态映射用例（executed===false&&ok===false→refused 等）

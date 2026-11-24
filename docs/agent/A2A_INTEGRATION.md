@@ -1,5 +1,6 @@
 > ⚠️ **历史快照 · 与当前代码已脱节**：本文件描述的是已移除的「PC 后台管理 Agent」（`bx-film-admin-in2` 集成：`search_api_module` / `call_api` / `render_table` / `get_list_columns` 等工具）。当前 `apps/agent-server/src` 已重构为通用 **deep-agent 框架**（roles 角色 / 子 Agent 委派 / 虚拟文件系统 / todo 规划 / web 检索 / 钉钉文档 / sql-readonly BI 只读闸 / grounding 接地门禁 / 审计 / 限流 / 异步定时任务）。本文件仅作历史参考，当前架构以 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 为准。
 > **2026-10-08**：A2A **不启动实现**。没有外部 Agent 要按协议调用本服务。触发条件见 [./CURRENT_ARCHITECTURE.md](./CURRENT_ARCHITECTURE.md) 文首；真要做时先做 A2A Server。
+> **2026-11-23 状态对齐**：文内所有「A0 已实现 / B0 骨架已建 / 6/6 自测 / 28 个 MCP 工具」均为历史实现记录，相关 `a2a.ts` / `a2a-client.ts` 已不在当前代码；旧 28 工具清单作废，现行连接器以运行时 `/mcp` 列举为准。
 
 # A2A 接入方案（Agent2Agent：对外暴露 + 对外编排）
 
@@ -184,12 +185,12 @@ A2A Task(message) ──► 映射 ──► chatStream(session, text, {model, f
 | 写操作安全 | A2A 通道默认只读 + 拒绝写；可写 token 显式配置且复用 writeConfirmPolicy |
 | 协议结构护栏 vs 语义判断 | 方法名/状态机/Task 结构是协议契约（跨系统通用），允许；业务词不进协议层 |
 
-### 3.4.1 双通道现实状态（代码层，2026-09-03 核实）
+### 3.4.1 双通道历史状态（代码层，2026-09-03 核实；2026-10-08 决定不启动，A2A 代码已移除）
 
 | 通道 | 协议层级 | 代码状态 | 证据 |
 |---|---|---|---|
-| **MCP** | 工具级（agent↔工具，函数调用）| **✅ 已实现**（`apps/agent-server/src/mcp.ts`，`attachMcp(app)` 挂 `/mcp`，Streamable HTTP）| 已注册 **28 个 MCP 工具**（submit_understood_intent / parse_intent / set_project / call_api / search_api_module / export_dataset / grep_codebase / search_knowledge_base / search_dingtalk_doc / get_list_columns / render_table 等），任何 MCP 客户端（Claude Desktop / Claude Code / opencode）连上即可当一个工具箱调用 |
-| **A2A** | 任务级（agent↔agent，发目标自主完成）| **✅ A0 已实现**（2026-09-03，`apps/agent-server/src/a2a.ts` + `app.ts` 挂载；零新依赖最小自实现）| 已实现：Agent Card `/.well-known/agent-card.json` + JSON-RPC `/a2a`（`SendMessage` 同步 / `GetTask` / `CancelTask`）+ Bearer 鉴权 + Task→chatStream 映射 + 默认只读拒绝写；自测 `scripts/a2a-selfcheck.mjs` 6/6 通过 |
+| **MCP** | 工具级（agent↔工具，函数调用）| ✅ 已重构为连接器注册表（`mcp/config.ts` / `hub.ts` / `path-defaults.ts`）| 旧 28 工具清单（submit_understood_intent / call_api / search_api_module 等）已作废；当前内置 bi/yapi/movie/order + 自定义/远程连接器，具体工具以运行时 `/mcp` 列举为准 |
+| **A2A** | 任务级（agent↔agent，发目标自主完成）| ❌ **已移除 / 不启动**（原 A0 实现为 2026-09-03 历史记录）| 当前 `src/` 无 `a2a.ts` / `a2a-client.ts`，`attachA2a` / `agent-card` 0 命中；A2A 通道按文首 2026-10-08 决议不启动 |
 
 > **重要澄清**：MCP 出口当前暴露的是**工具函数**（单个能力），MCP 客户端拿到的是「可调用的 28 个函数」，而非「一个会自主跑任务的 agent」。它实现的是**工具级协作**（A 让 B 的一段代码/某函数替它干活），不是**任务级协作**（A 对 B 说「去把 XX 模块前 2 页查出来并总结」，B 自主决策调哪些工具）。任务级协作是 A2A 的事，尚未实现。
 

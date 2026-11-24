@@ -3,7 +3,7 @@
 > 生成时间：2026-11-10（v4，已确认范围边界：仅 BI MCP 层能力增强，不改 Agent 部分；对齐 2025–2026 线上最佳实践）
 > 数据来源：Metabase REST API（`https://bi.vmovs.com`，等价于 `bi-metabase` MCP 元数据接口，使用项目 `.env` 中 `BI_API_KEY` 实测）＋ `apps/agent-server/scripts/metabase-mcp.mjs` 源码核查
 > 关联文档：`docs/agent/bi-mcp.md`、`docs/agent/RAG_INGESTION_PLAN.md`、`apps/agent-server/src/eval-online.ts`
-> 补充进展（2026-11-12）：黄金集 97 题已改写为自然语言提问、白名单外 7 张表已只读查证、P1.1 惰性取值充实已实施（`with_values` 默认关闭）、线上卡片→表索引已剔除外键显示映射表、P3 A/B 评测开关 `BI_EVAL_DISABLE_CALIBER` 已就绪；**留一法评测模式下的全量重跑仍未执行**，所有端到端数字仍来自 11-11 旧报告。
+> 补充进展（2026-11-12）：黄金集 97 题已改写为自然语言提问、白名单外 7 张表已只读查证、P1.1 惰性取值充实已实施（`with_values` 默认开启，2026-11-12 起；可显式传 false 关闭）、线上卡片→表索引已剔除外键显示映射表、P3 A/B 评测开关 `BI_EVAL_DISABLE_CALIBER` 已就绪；**留一法评测模式下的全量重跑仍未执行**，所有端到端数字仍来自 11-11 旧报告。
 > 状态：评估文档（**P1 + P2 已实施并全量验证**：P1 = `get_database_schema` 新增 `mode:"mschema"` 紧凑 M-Schema 输出 + 取值域内联 + 两阶段 linking 提示；P2 = 「问题-表」窄图工具 + 黄金集（97 题）+ `bi-eval-runner.mjs` 三维评分，均真实 BI 验证，全量 96 题旧基线 v3 口径 + 归一化后金样重评：ValidSQL 96.9%、JoinCorrect 63.0%（最终 SQL）～84.8%（所有尝试并集）、EX 不可评；旧轮无留一法防泄题，仅作参考，见 §11.7；评测模式与 P3 离线检索评测已就绪，见 §11.8；**P3 已实施**（口径层语义图 `bi-caliber-graph.mjs` + `get_caliber_context` 工具，见 §11.8）；**P4 已实施**（few-shot join 样例库 + 查询校验闭环）；P0 已整理为可签字清单 `apps/agent-server/bi-semantic/fk-signoff.json` 待人工核查，核对结论已回灌到外键输出；口径一致性复核与口径词典草稿见 §11.10，待业务拍板；对齐最佳实践的差距清单见 §11.11）
 
 ---
@@ -598,10 +598,10 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 ### 11.5 残留风险与 P1.1 实施（取值域真实性）
 
-- **残留风险**：当字段 description 里写的枚举是**过期**的（§4.3 T4 的原场景：`clientType` 描述为 `{1,2,4,6}` 但真实是 `{0,1,4,5}`），而本 BI 又不提供 `fingerprint.type.values` 纠偏，则 M-Schema 内联的 description 会**把过期枚举喂给模型**——这正是 §4.3-2 想解决的痛点。默认路径（`with_values=false`）下在本 ClickHouse 后端**仍未根除**；显式开启 P1.1 的 `with_values=true` 后可由实测取值覆盖描述而根除（见下）。
-- **P1.1（2026-11-12 已实施；默认关闭，线上零额外延迟）**：`get_database_schema(mode="mschema", table=…, with_values=true)` 触发惰性取值充实，`max_value_fields` 控制预算（默认 8、上限 20）。实现拆成 `scripts/bi-mschema-values.mjs`（候选筛选 + 取样 DISTINCT + TTL 缓存 + 并发/预算护栏）与 `metabase-mschema.mjs`（实测值标 `(live)`，优先级高于指纹与可能过期的描述枚举）；单字段失败只回落、不影响整表输出。护栏：默认关闭、仅表级生效、标识符白名单、每字段取样 ≤20 万行 / ≤30 个去重值、并发 ≤3、跨调用缓存 5 分钟。
+- **残留风险**：当字段 description 里写的枚举是**过期**的（§4.3 T4 的原场景：`clientType` 描述为 `{1,2,4,6}` 但真实是 `{0,1,4,5}`），而本 BI 又不提供 `fingerprint.type.values` 纠偏，则 M-Schema 内联的 description 会**把过期枚举喂给模型**——这正是 §4.3-2 想解决的痛点。默认路径（`with_values=true`，2026-11-12 起）下由实测取值覆盖描述；显式传 `with_values=false` 才会退回可能过期的描述枚举（见下）。
+- **P1.1（2026-11-12 已实施；默认开启，可显式关闭）**：`get_database_schema(mode="mschema", table=…, with_values=true)` 触发惰性取值充实，`max_value_fields` 控制预算（默认 8、上限 20）。实现拆成 `scripts/bi-mschema-values.mjs`（候选筛选 + 取样 DISTINCT + TTL 缓存 + 并发/预算护栏）与 `metabase-mschema.mjs`（实测值标 `(live)`，优先级高于指纹与可能过期的描述枚举）；单字段失败只回落、不影响整表输出。护栏：默认开启（首拉约 +1s、5 分钟缓存后 ≈1ms）、仅表级生效、标识符白名单、每字段取样 ≤20 万行 / ≤30 个去重值、并发 ≤3、跨调用缓存 5 分钟。
   - **真实 BI 验证（只读，stdio 直连 `film_report.film_app_verify`）**：关闭时输出无 `(live)`、零额外查询；开启时 3 个 Category 字段全部拿到实测值，且**再次证明描述枚举过期**——`result_type` 描述只列 4 种 `SUCCESS/OFFICIAL_VERIFICATION_FAILED/SERVICE_VERIFICATION_FAILED/PROCESSING_FAILED`，实测多出 `VERIFICATION_SKIPPED`；`reason` 实测 10 个原因码、`verification_path` 实测 3 种。首拉 1030ms（含 2 字段查询），同参数二次调用 1ms（缓存命中 2/2），库级输出不触发查询。
-  - **残留决策**：默认仍走 description 兜底；是否把 `with_values` 在线上默认打开（代价约 +1s/表首拉、缓存后 ≈1ms）待拍板。未打开前 §4.3-2 的「ClickHouse 后端枚举以描述为据，可能过期」风险仍在，调用方可按需显式开启。
+  - **决策已落地（2026-11-12）**：`with_values` 已默认开启；显式传 false 才回退 description 兜底，此时 §4.3-2 的「ClickHouse 后端枚举以描述为据，可能过期」风险仍在。
 
 ---
 
@@ -618,7 +618,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 |---|---|---|
 | P0 FK 技术核对 | `apps/agent-server/bi-semantic/fk-signoff.json` + §10.1/§10.2 | 11 可信 / 6 根因定位 / 1 越权；**人工签字待办** |
 | P1 M-Schema | `metabase-mschema.mjs` + `get_database_schema(mode=mschema)` | 新增可选模式，默认仍是旧 JSON，消费方无感 |
-| P1.1 惰性取值 | `bi-mschema-values.mjs` + `with_values` / `max_value_fields` | **默认关闭**，真实 BI 只读验证通过（§11.5） |
+| P1.1 惰性取值 | `bi-mschema-values.mjs` + `with_values` / `max_value_fields` | **默认开启（2026-11-12 起）**，真实 BI 只读验证通过（§11.5） |
 | P2 窄图 + 黄金集 + 跑分器 | `metabase-card-graph.mjs` / `tests/bi-golden-set.json` / `bi-eval-runner.mjs` | 评分口径 v3；防泄题留一法 + `--arm` 已就绪 |
 | P3 口径图 | `bi-caliber-graph.mjs` + `get_caliber_context`；A/B 开关 `BI_EVAL_DISABLE_CALIBER` | 离线检索有效；**端到端提升未验证** |
 | P4 收尾 | `bi-join-examples.mjs` / `bi-query-guard.mjs` | 已带单测 |
@@ -626,17 +626,17 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 | 白名单外 7 张表查证 | `bi-known-tables.json` 的 `tableAudit` + `unverifiedTableStatus` | 5 张库里存在但 Metabase 隐藏 / 2 张库里不存在（§11.7） |
 | 抽表口径统一 | `cardTablesFromSql`（`getCardTables` + `buildGoldenSet`） | 剔除未使用的 FK 显示映射表，线上工具与离线金样一致 |
 | 外键问题边标注 | `bi-semantic.mjs` + `bi-semantic/fk-signoff.json` | `get_table_relationships` / M-Schema 对 7 条核对未通过的外键标 `verified=false` + 说明（§11.10） |
-| 口径词典草稿 + 审计 + 评测口径检查 | `bi-semantic/caliber-glossary.json` / `bi-caliber-audit.mjs` / 评分口径 v4 | 8 条草稿口径**全部待业务拍板**；`get_metric_definitions` 只提供已批准条目，当前不宣告（§11.10） |
+| 口径词典 + 审计 + 评测口径检查 | `bi-semantic/caliber-glossary.json` / `bi-caliber-audit.mjs` / 评分口径 v4 | 10/10 已 `approved`（owner 仍为 `verify-demo` 占位）；`get_metric_definitions` 已宣告（§11.10 / `bi-metabase-todo.md`） |
 | 最佳实践差距项（第一批） | 评分口径 v5（`valueMatch` / `goldBlocked`）、`bi-metadata-gaps.mjs`、`runCard` 反馈行、口径图表检索文本、`get_caliber_context` 内联 SQL、闸门读词典 | 见 §11.11-6；闸门在词典批准前行为不变 |
 
 离线验证基线：`npx vitest run tests/bi- tests/metabase tests/mcp-adapter-syntax.test.ts` → **18 文件 / 149 测试通过**（含 `sql-readonly-consistency`；全量 131 文件 / 914 测试），lint 0；`bi-golden-normalize.mjs --check` 0 例变化；`bi-eval-runner.mjs --dry` 自检通过；真实 BI 只读 stdio 冒烟（工具列表三态、A/B 拒绝、`with_values` 开关与缓存）全部通过。
 
 #### B. 待拍板（4 项，建议按此顺序定）
 
-1. **`with_values` 是否线上默认开启**：开 → 换真·实测取值域，代价约 +1s/表首拉（缓存后 ≈1ms）；不开 → §4.3-2 的过期枚举风险仍在，调用方可显式开启。
+1. ~~**`with_values` 是否线上默认开启**~~ → ✅ 已定：默认开启（2026-11-12 起），可显式传 false 关闭；关闭时 §4.3-2 的过期枚举风险仍在。
 2. **5 张隐藏表是否请 Metabase 管理员暴露**：暴露后可补进 `tables` 白名单、7 例金样正常评 JoinCorrect；不暴露则维持现状，由 `joinCorrectComplete` 剔除。
 3. **引用失效表的 3 例（#338/#179/#74）是否退出黄金集**：退出会把基线从 96 例改为 93 例，历史数字不可直接比较。
-4. **口径词典 8 条草稿逐条拍板**（§11.10 的问题清单）：至少先定已支付订单、收入金额、时区、国家维度四条，评测的口径检查才有统一标准。
+4. ~~**口径词典 8 条草稿逐条拍板**~~ → ✅ 已完成（2026-11-13，10/10 `approved`；剩 owner 占位与 17 条 `openQuestions` 的正式签批，见 `bi-metabase-todo.md`）。
 5. **是否启动 A/B 全量重跑**：见 C；建议 1–4 定稿后再启动，否则题目 / 样本 / 工具输出 / 口径标准还会变，新基线很快作废。
 
 #### C. 待重跑（唯一能给出端到端结论的动作）
@@ -665,7 +665,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 
 #### 1. 数据多：大体解决
 
-已落地：`get_database_schema` 默认只给表清单、传 `table` 才给字段；M-Schema 紧凑格式；两阶段定位提示；口径图只推 12 张表且前 5 张标 `primary`；ClickHouse 单查询 90 秒中断、结果上限 100 万行、超长结果截断。剩两个「默认关闭」：M-Schema 不是默认格式（模型要主动传 `mode=mschema`，用没用旧报告查不到，新 runner 记录工具参数，重跑后可见）；`with_values` 默认关，ClickHouse 上枚举只能信描述，而描述已证实会过期。
+已落地：`get_database_schema` 默认只给表清单、传 `table` 才给字段；M-Schema 紧凑格式；两阶段定位提示；口径图只推 12 张表且前 5 张标 `primary`；ClickHouse 单查询 90 秒中断、结果上限 100 万行、超长结果截断。其中 `with_values` 已默认开启（2026-11-12 起）；M-Schema 仍非默认格式（模型需主动传 `mode=mschema`，用没用旧报告查不到，新 runner 记录工具参数，重跑后可见）。
 
 #### 2. 口径不一致：此前没有解决，本轮补了诊断与机制，口径取值待业务拍板
 
@@ -789,7 +789,7 @@ $meta = Invoke-RestMethod -Uri "$base/api/database/$dbId/metadata" -Headers $h
 |---|---|---|
 | 2.3 描述匹配 | `metabase-mcp.mjs` 的 `search_columns` | 匹配 Metabase 字段描述；白名单外表标「Metabase 未暴露」 |
 | 2.5 按值搜索 | `bi-value-search.mjs`（纯函数）+ `search_values` 工具 | 新增 7 例回归；续查修复 `schema.table` 被整批拒绝、`type/Category` 死分支；**真实 BI 冒烟未做（本环境无凭据）** |
-| 2.6 歧义信号 | 词典 5 条 `ambiguous` + `bi-semantic.mjs` 的 `ambiguityFor` / `metricDefinitions` + 工具接线 | 只给信号、草稿不泄漏；真实词典批准态 dry-run 固化为 2 例回归；**当前全 `draft`，线上零变化** |
+| 2.6 歧义信号 | 词典 5 条 `ambiguous` + `bi-semantic.mjs` 的 `ambiguityFor` / `metricDefinitions` + 工具接线 | 只给信号、草稿不泄漏；10/10 已 `approved`、`get_metric_definitions` 已宣告，详见 `bi-metabase-todo.md` |
 | 2.7 评测夹具收口 | `goldenSetEnabled()` | `ListTools` 隐藏 + `CallTool` 纵深拒绝 |
 | 2.2 检索文本复验 | `bi-caliber-eval.mjs` | 留一法 recall@3/5/12 = 0.801 / 0.871 / 0.968，与本节记录一致 |
 | 1.1 默认值同步 | `metabase-mcp.mjs` | `with_values` 默认开启；`docs/agent/bi-mcp.md` §3 已同步 |

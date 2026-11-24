@@ -3,7 +3,8 @@
 > **范围**：`apps/agent-server`（含 `scripts/*-mcp.mjs`）+ `apps/web` 渲染层。按五条链路逐项对照 2026 年业界最佳实践：**上下文管理 / 输入输出 / 工具调用 / 定时任务 / 预警任务**。
 > **方法**：联网收集最佳实践（来源见 §9）→ 分链路只读审计源码 → 对高危结论逐条回到源码复核，SQL 绕过做了实际复现。
 > **行号**：基于 2026-10-18 工作区（含未提交改动），后续改动会漂移，以函数名为准。
-> **关系**：[`DEEP_AGENT_PLAYBOOK.md`](./DEEP_AGENT_PLAYBOOK.md) 讲方法论与测试；本文是对照方法论的**落地体检**。架构权威仍是 [`CURRENT_ARCHITECTURE.md`](./CURRENT_ARCHITECTURE.md)。
+> **关系**：方法论见本文 §1–§6 基线表；架构权威仍是 [`CURRENT_ARCHITECTURE.md`](./CURRENT_ARCHITECTURE.md)。（原引用的 `DEEP_AGENT_PLAYBOOK.md` 当前工作区无此文件，链接已移除。）
+> **状态口径（2026-11-23 对齐）**：§7 各「现状」表是**审计当时（2026-10-18 上午）**快照；P0 修复状态以 §8 为准（已修 9、部分 1），P1/P2 仍开；§9 中 P0 回归锚点已补，SQL 转义绕过锚点已补。
 
 ---
 
@@ -19,7 +20,7 @@ Harness 骨架已经很完整：虚拟文件系统卸载、按重取代价清理
 
 | 严重度 | 数量 | 代表 |
 | --- | --- | --- |
-| P0（可直接利用 / 数据泄露） | 15 | 越权读对话、上传存储型 XSS、SQL 只读绕过、工具作用域旁路、无人值守写操作免审、检查失效静默 |
+| P0（可直接利用 / 数据泄露） | 15（§8 已修 9、部分 1） | 越权读对话、上传存储型 XSS、SQL 只读绕过、工具作用域旁路、无人值守写操作免审、检查失效静默 |
 | P1（正确性 / 静默失败） | 17 | 历史静默丢失、配额少记、失败通知死代码、多实例双跑、cron 忽略时区 |
 | P2（体验 / 成本 / 可观测） | 若干 | 缓存命中、指标无工具名、OTLP 扁平、摘要硬截断 |
 
@@ -311,23 +312,23 @@ flowchart LR
 
 ### P1（两周内）
 
-C-1 卸载先于截断、C-2/C-3 历史与摘要、C-5 配额计数、IO-6 链接参数、IO-7 公式注入、IO-8 出站脱敏统一、IO-9 远程图片、T-7 风险名匹配、T-8 凭据文件、T-9 参数 schema 校验、S-3 CAS + runId、S-4 时区、S-5 失败治理、S-6 心跳、A-3 失败通知、A-4 重复通知间隔。
+C-1 卸载先于截断、C-2/C-3 历史与摘要、C-5 配额计数、IO-6 链接参数、IO-7 公式注入、IO-8 出站脱敏统一、IO-9 远程图片、T-7 风险名匹配、T-8 凭据文件、T-9 参数 schema 校验、S-3 CAS + runId、S-4 时区、S-5 失败治理、S-6 心跳、A-4 重复通知间隔。（A-3 失败通知已在 §8 P0 表标已修，不再列 P1。）
 
 ### P2
 
-Prompt 缓存（时钟取整、固定工具集、消息段断点）、真实 token 用量回读、`is_error` 回传、取消信号透传到 `fetch_url`/`runShell`/确认等待、熔断 half-open、指标加工具名标签、OTLP 嵌套 span 与 `gen_ai.operation.name=execute_tool`、写操作幂等键与执行结果审计、补跑上限、tick 并发派发、阈值结构化、流缓冲 `gap` 事件、子代理时钟与独立工作区。
+Prompt 缓存**精细化**（基础 `cache_control` 已生效；时钟取整/固定工具集/消息段断点仍 P2）、token 用量**全链路**回读（Jev 已回读）、`is_error` 回传（**Anthropic tool_result 侧**；MCP 已有）、取消信号透传到 `fetch_url`/`runShell`/确认等待、熔断 half-open、指标加工具名标签、OTLP 嵌套 span 与 `gen_ai.operation.name=execute_tool`、写操作幂等键与执行结果审计、补跑上限、tick 并发派发、阈值结构化、流缓冲 `gap` 事件、子代理时钟与独立工作区。
 
 ---
 
 ## 9. 测试补齐清单
 
-现有相关测试（`schedule-*`、`notify-deliver`、`risk-hard-deny`、`system-prompt-contract`、`tool-error-observability` 等）覆盖了主路径。建议为每个 P0/P1 补一条回归锚点：
+现有相关测试（`schedule-*`、`notify-deliver`、`risk-hard-deny`、`system-prompt-contract`、`tool-error-observability` 等）覆盖了主路径。P0 回归锚点已补（见 §8 每行「回归测试」列）；下表为 P1 待补项（SQL 转义绕过锚点 `[x]` 已补）：
 
 | 场景 | 断言 |
 | --- | --- |
 | 越权创建对话 | 带他人 id 的 `POST /chat/conversations` 返回 404 且对方文档不变 |
 | 上传伪造类型 | `x.txt` + `text/html` 上传后 GET 的 `Content-Type` 为 `text/plain` 且带 `nosniff` |
-| SQL 转义绕过 | 上文两条样例 `isReadOnlySql === false`；表函数白名单真值表 |
+| SQL 转义绕过 | [x] 已补：`sql-readonly-escape-bypass`（上文两条样例 `isReadOnlySql === false`；表函数白名单真值表） |
 | 工具作用域 | 点名未授权服务器的工具 → 拒绝；`count_list_by_time` 传 write 级工具 → 拒绝 |
 | SSRF | 302 跳到 `127.0.0.1`、`127.0.0.1.nip.io`、`[::ffff:7f00:1]` 均被拒 |
 | 无人值守 | 定时运行调用 MCP write 工具 → 硬拒且审计记 `denied` |

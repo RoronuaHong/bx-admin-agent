@@ -3,12 +3,13 @@
 # 门户 Trace（多 Agent 共用观测）
 
 > 定稿对齐：`MULTI_AGENT_ARCHITECTURE.md` §可观测 + `PORTAL_SUPERVISOR_AGENT.md`（Trace ≠ 对话子 Agent）。
+> **2026-11-23 状态对齐**：文内 `meta.agentId` 多 Agent 写入、`/trace/login` 与 `canViewTrace` 白/黑名单均为历史设计；当前 trace 仅按 ownerKey 过滤，无对应权限投影。
 
 ## 结论
 
 - **Trace 是门户级观测面**，不是后台管理 Agent 的附属页。
-- **各对话 Agent 独立鉴权、各自写入** run/span（`meta.agentId`）。
-- **查看权限独立**：`/trace/login` 为观察者入口（当前复用运营账密 + `canViewTrace` 白/黑名单），**不**等于「进入后台工作台」。
+- ~~**各对话 Agent 独立鉴权、各自写入**~~（历史设计，未落地）：当前 trace 无 `meta.agentId` 多 Agent 写入。
+- **查看权限独立（历史设计）**：曾规划 `/trace/login` 为观察者入口（复用运营账密 + `canViewTrace` 白/黑名单，均未落地），**不**等于「进入后台工作台」。
 
 ## 写入
 
@@ -23,7 +24,7 @@
 ## 查看
 
 1. 路由：`/trace`（`requiredPortalEntry: trace`），未登录 → **`/trace/login`**（非 `/agents/admin/login`）。
-2. 权限：仍用 `resolvePortalPermissions` → `canViewTrace`（`TRACE_ALLOWED_*` / `TRACE_DENIED_*`）。
+2. 权限（历史设计，未落地）：当时规划 `resolvePortalPermissions` → `canViewTrace`（`TRACE_ALLOWED_*` / `TRACE_DENIED_*`）；当前仅按 ownerKey 过滤。
 3. 列表：`GET /trace/runs?agentId=admin|analytics` 可过滤；前端 Tab「全部 / 后台管理 / 问数」。
 
 ## 明确不做

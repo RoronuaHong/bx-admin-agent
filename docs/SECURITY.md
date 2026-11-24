@@ -178,7 +178,7 @@ Agent 会读文件、读环境、调外部系统——回答里若带了读到�
 默认所有内置工具都注入本轮（§8.8 提供收窄方式）。两种收窄方式：
 
 - **反向剔除** `omitBuiltinTools`：划掉几个（如预警跑摘掉 `render_chart`/`export_data`）。
-- **正向 allowlist** `toolAllowlist`（本轮新增）：只给明确清单。**未传 = 不收窄**（与改动前一致）。
+- **正向 allowlist** `toolAllowlist`（2026-10-05 加入）：只给明确清单。**未传 = 不收窄**（与改动前一致）。当前仅定时任务路径通过 opts 接入；交互式会话仍全量注入（见 `BEST_PRACTICE_ALIGNMENT.md` §11.4）。
   清单外工具既不注入，模型点名调用也**拒绝并把拒绝回灌模型**——静默丢弃会让模型以为工具坏了反复重试（Doom Loop）。
 - 定时任务已有 `mcpServers`/`mcpAllowlist`/`denyBuiltinTools`：任务级工具集以任务自身配置为准，不与对话勾选取并集（避免越权放大）。
 
@@ -322,6 +322,8 @@ stdio 传输会 `spawn` 任意命令。命令白名单（`MCP_ALLOWED_COMMANDS`�
 | 成本硬配额 | 🟡 默认只告警 | 默认 `DAILY_TOKEN_BUDGET` 只产生 `budgetAlerts`；置 `COST_HARD_QUOTA=on` 后当日累计达预算即拒绝**新的**运行（不掐在途运行），落审计 `quota_exceeded`。**双层**：全局池（守钱包）+ `DAILY_TOKEN_BUDGET_PER_OWNER` 每 owner 池（守公平，避免单用户烧光共享预算把其他人全挡住），两层都未配即不拦截。多实例时为**每实例**计数，需入口层兜底；owner 跟踪表按 `QUOTA_MAX_TRACKED_OWNERS`（默认 1000）有界淘汰 |
 | 行为异常检测 | ✅ 已做 | `src/anomaly.ts` 按 owner 建滚动基线比对（轮数/token/耗时突增、工具新颖性、未取证成串）；**样本 <5 不判**、只报不管。局限：基线在进程内，重启重建，多实例不共享 |
 | trace 保留期 / 遗留回收 | ✅ 已做 | `TRACE_RETENTION_DAYS`（默认 30 天，启动 + 每 24h）回收过期 run/rounds/spans 明细、孤儿子文件、以及旧格式遗留（`<uuid>.jsonl`，当前无读取方）。损坏行**保留不删**（宁可留痕不误删证据）；不匹配任何已知形态的文件（如 analytics 的 `analytics-standalone.jsonl`）**一律不动** |
+
+> 本表只登记安全控制项。仍敞开的非纯安全缺口（目标约束层 / 批量相似请求检测 / trace 采样 / 交互式会话 per-run 收窄）以 `BEST_PRACTICE_ALIGNMENT.md` §10 #6–#7、§4、§7 P2、§11.4 为准。
 
 ---
 

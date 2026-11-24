@@ -27,7 +27,7 @@
 ## 2. 架构与数据流
 
 ```
-用户勾选 MCP ──PUT /chat/mcp/servers──▶ 会话启用集(per-session) + 按需 connect
+用户勾选 MCP ──PUT /chat/mcp/servers──▶ 对话级启用集(per-conversation, conversation.mcpServers) + 按需 connect
                                                   │
 提问 ──POST /chat/stream──▶ chatStream                       │
                               │                               │
@@ -137,14 +137,14 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 | { type: "model"; id: string; label: string }
 | { type: "tool_call"; id: string; name: string; server?: string; args?: string }
 | { type: "tool_result"; id: string; name: string; ok: boolean; text: string }
-| { type: "confirmation_required"; id: string; name: string; args?: string; reason?: string }
-| { type: "confirmation_response"; id: string; confirmed: boolean }
+| { type: "confirmation_required"; ticket: string; level: string; name: string; reason: string; argSummary: string; canGrantRead: boolean }
+| { type: "confirmation_response"; ticket: string; confirmed: boolean }
 // 子代理（task 委派）独立事件维度：异步产出，旧前端忽略未知 type 即向后兼容。
 | { type: "subagent_start"; id: string; parentId: string; description: string }
 | { type: "subagent_delta"; id: string; text: string }
 | { type: "subagent_end"; id: string; ok: boolean; status: "done"|"cancelled"|"error"; text: string }
 | { type: "error"; error: LocalizedToken; message?: string; code?: string | number }
-| { type: "usage"; tokens: number; budget: number; window: number; turns: number; dropped: number; toolResultsCleared: number }  // 上下文用量（透明度）
+| { type: "usage"; tokens: number; budget: number; window: number; turns: number; dropped: number; toolResultsCleared: number; summarized?: boolean; toolResultsOffloaded?: number; rounds?: number; toolCalls?: number; modelRetries?: number; modelFallbacks?: number; toolFusions?: number; pseudoCallRetries?: number; costTokens?: number }  // 上下文用量（透明度；字段以 `conversation-state-plan.md` §契约为准）
 | { type: "done" }
 ```
 
@@ -173,7 +173,7 @@ vite 代理注意：`apps/web/vite.config.ts` 只对 `/agent` 设 `Accept-Encodi
 | `MCP_IDLE_TIMEOUT_MS` | 1800000 | `MCP_IDLE_TIMEOUT_MS` | 空闲连接回收阈值（0 = 关闭回收）。 |
 | `MCP_IDLE_SWEEP_MS` | 300000 | `MCP_IDLE_SWEEP_MS` | 空闲回收扫描间隔（定时器 unref，不阻止进程退出）。 |
 | ~~`MCP_CONFIRM_STRICT`~~ | — | ~~`MCP_CONFIRM_STRICT`~~ | **已废弃**（见 `src/mcp/hub.ts:79` 注释）：保守语义「未声明风险 = 需确认」现在是内置默认行为，不再由该环境变量开关控制。 |
-| `MAX_TOOL_ROUNDS` | 28 | `MCP_MAX_TOOL_ROUNDS` | 工具循环轮次上限，达上限即收束而非编造。**2026-09-28 复核更正：原写 14，现默认 28**（`chat.ts:85-90`，与无人值守 `SCHEDULE_MAX_TOOL_ROUNDS` 拉齐）；定时任务另有 `MCP_SCHEDULE_MAX_TOOL_ROUNDS`（默认同为 28）。 |
+| `MAX_TOOL_ROUNDS` | 28 | `MCP_MAX_TOOL_ROUNDS` | 工具循环轮次上限，达上限即收束而非编造。**2026-09-28 复核更正：原写 14，现默认 28**（`chat.ts:85-90`，与无人值守 `SCHEDULE_MAX_TOOL_ROUNDS` 拉齐；注意 `/chat/autonomy` 展示口径在 `app.ts` 仍写 14，待统一）；定时任务另有 `MCP_SCHEDULE_MAX_TOOL_ROUNDS`（默认同为 28）。 |
 | `MAX_TOOL_RESULT_CHARS` | 12000 | `MAX_TOOL_RESULT_CHARS` | 单条工具结果回灌截断长度。 |
 | `TOOL_DEDUP_SAME_ROUND` | on | `TOOL_DEDUP_SAME_ROUND` | 同轮同参数去重：一轮内模型重复发出的相同工具调用（`name` + 规范化参数）只执行一次，其余回灌「已跳过（同轮重复）」。 |
 | `DOOM_LOOP_MAX_ROUNDS` | 3 | `MCP_DOOM_LOOP_MAX` | 跨轮 Doom Loop 熔断：同一组工具调用**连续**重复达到该轮数即主动收束（追加提示并 `break`），避免无限循环空耗 token；设置 ≥2。 |

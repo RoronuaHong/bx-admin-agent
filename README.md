@@ -20,7 +20,7 @@ pnpm workspace（`pnpm-workspace.yaml`：`apps/*` + `packages/*`）。
 | `apps/agent-server/scripts` | 功能性脚本：`metabase-mcp.mjs`（BI / text2sql）、`yapi-mcp.mjs`（text2api）、`build-rag-index.mjs`（知识库入库） |
 | `apps/agent-server/skills` | 技能库（`.codebuddy/skills/` 同源），模型经 `read_skill` 按需取用 |
 | `docs` | 设计 / 方案文档；`docs/knowledge/` 同时是 RAG 语料 |
-| `apps/agent-server/.data` | 运行时数据（会话文件、trace、审计、上传）；可用 `AGENT_DATA_DIR` 覆盖 |
+| `apps/agent-server/.data` | 运行时数据（会话、trace、审计、评测、上传、工作区、知识库、本地技能）；可用 `AGENT_DATA_DIR` 整体覆盖 |
 
 ## 2. 快速开始
 
@@ -59,7 +59,7 @@ pnpm dev:web
 | `MONGO_DB_NAME` | `bx_agent` | 库名（`chat_conversations` / `chat_tasks` / `chat_schedules` / `movie_profiles`） |
 | `MODEL_PROVIDERS` | —— | 逗号分隔的模型 id 列表，模型参数见各 `MODEL_<ID>_*` 变量 |
 | `MCP_BUILTIN_SERVERS` | —— | 内置 MCP 服务器 JSON 数组（不落盘、前端不可删） |
-| `AGENT_DATA_DIR` | 仓库内 `.data` | 仅测试 / 特殊部署覆盖 |
+| `AGENT_DATA_DIR` | 仓库内 `.data` | 覆盖全部运行时数据（会话/trace/审计/评测/上传/工作区/知识库/本地技能）；测试隔离与容器/特殊部署使用 |
 
 完整清单与注释见 `apps/agent-server/.env.example`。
 

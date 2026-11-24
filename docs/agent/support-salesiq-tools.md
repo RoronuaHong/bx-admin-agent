@@ -42,7 +42,7 @@
 | 阶段二（子集） | `ZohoSalesIQ_getOperatorDetails` / `ZohoSalesIQ_getOperatorStatus` / `ZohoSalesIQ_listOperators` | 坐席详情（id 或邮箱）/当前状态/名册 | `read` |
 | 阶段二（子集） | `ZohoSalesIQ_getDepartmentPresence` | 部门在线状态（按坐席可用性计算；需管理员角色） | `read` |
 | 阶段二（子集） | `ZohoSalesIQ_listPortals` / `ZohoSalesIQ_getPortalDetails` | 门户列表与详情 | `read` |
-| 阶段四（代发，已放行） | `ZohoSalesIQ_sendMessageInConversation` | 往会话里发一条。调用者必须已是该会话参与者，否则接口回 6018。正文空、Jev 没有结果或承诺概率 ≥ 0.9 时，本服务拒绝发出；其余仍走确认卡 | `write`，已在 `toolRisks` 单独声明（优先于 `"*": "read"`），不要清掉 |
+| 阶段四（代发，已放行） | `ZohoSalesIQ_sendMessageInConversation` | 往会话里发一条。调用者必须已是该会话参与者，否则接口回 6018。正文空、Jev 没有结果或承诺概率 ≥ 0.6（CJK 地板）时，本服务拒绝发出；其余仍走确认卡 | `write`，已在 `toolRisks` 单独声明（优先于 `"*": "read"`），不要清掉 |
 
 `ZohoSalesIQ_replyToMessage` 是回复某一条具体消息，同样要求已是参与者。代发阶段如果坐席明确要「回复那一条」，再单独加，并标 `write`。不要和发送一起预先放进白名单。
 
@@ -104,7 +104,7 @@
 - 真实描述：Send a new message in a conversation with optional file attachments and channel-specific templates. Supports text messages, canned responses, articles, file uploads, and template placeholders. Important: The caller must be an active participant of the conversation. Non-participants will receive error 6018. The 'type' body field should be omitted for standard text messages.
 - 必填：`body` + `path_variables`（含 `screenname` + 会话 id）
 - 常用可选：`query_params`
-- 闸门：正文空、Jev 没有结果、或承诺概率 ≥ 0.9 → 本服务拒绝发出；其余仍走确认卡。不要用 `"*": "read"` 盖住它的 `write`。
+- 闸门：正文空、Jev 没有结果、或承诺概率 ≥ 0.6（CJK 地板）→ 本服务拒绝发出；其余仍走确认卡。不要用 `"*": "read"` 盖住它的 `write`。
 
 **`ZohoSalesIQ_replyToMessage`**（`write`，坐席明确要「回复那一条」时才加）
 - 真实描述：Reply to a specific message in a conversation. The reply is linked to the original message and supports text, file attachments, canned responses, and template placeholders. Important: The caller must be an active participant of the conversation. Non-participants will receive error 6018.

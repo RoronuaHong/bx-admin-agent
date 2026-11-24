@@ -18,7 +18,7 @@
 | xlsx/xlsm 解析 | ✅ `exceljs`（可选依赖） | `parsers.ts:parseXlsx` |
 | 增量索引 | ✅ md5 内容指纹 | `build-rag-index.mjs` / `store.ts` |
 | 语义向量检索 | ✅ `KB_EMBEDDING=on` 复用 TokenHub embedding，off 自动降级词法 | `embedding.ts` |
-| 网页链接抓取 | 🟡 仅当次会话注入、不入库 | 旧 `sources.ts` |
+| 网页链接抓取 | 🟡 仅当次会话通过 `fetch_url` 注入、不入库 | `src/web-search.ts` |
 | 钉钉文档拉取 | ❌ 等管理员凭证 | 挂账 |
 
 ## 2. 解析器注册表（P0 核心，`src/rag/parsers.ts`）
@@ -78,7 +78,7 @@ node --import tsx scripts/build-rag-index.mjs [目录] [--full] [--namespace mov
 
 | 项 | 说明 |
 |---|---|
-| 权限过滤 | 检索不看用户权限，M4 多租户时补 |
+| 权限过滤 | 🟡 文档级 owners/roles frontmatter + namespace 隔离已落地（`rag/store.ts` visibleTo / `search(viewer)`）；按登录用户 RBAC 待登录体系 |
 | Top-K 模型重排 | 当前仅 RRF 融合，无 cross-encoder 重排 |
 | 引用渲染 | 来源目前是文本，非可点击链接 |
 | MCP resources 入库 | 旧版有，当前只做本地目录 |
@@ -94,9 +94,9 @@ node --import tsx scripts/build-rag-index.mjs [目录] [--full] [--namespace mov
 | 2 | 分块策略升级：结构感知递归切分（标题→段落→句子）+ 重叠；表格整块带表头 | P0.5 | 🟡 待做 |
 | 3 | 检索增强：大模型 Rerank（Top-20 → 精排 5）；元数据过滤 | P1 | 🟡 待做 |
 | 4 | 评估体系：50-100 题评测集 + verify 脚本跑分基线 | P1 必做 | 🟡 待做 |
-| 5 | 增量索引：md5 指纹（已实现基础版） | P1 | ✅ 基础版 |
+| 5 | 增量索引：md5 指纹 + namespace 隔离 + 删除源清理 | P1 | ✅ 已落地 |
 | 6 | 网页链接入库 | P2 | ❌ |
-| 挂账 | 钉钉文档拉取（等管理员凭证）；权限过滤 | - | ❌ |
+| 挂账 | 钉钉文档拉取（等管理员凭证）；按登录用户 RBAC（文档级 ACL 已落地） | - | ❌ |
 
 执行顺序：阶段 1 → 2 → 4（建基线）→ 3 → 5 → 6。
 

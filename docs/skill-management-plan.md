@@ -1,15 +1,16 @@
-# 本地技能与技能管理页（方案，尚未改代码）
+# 本地技能与技能管理页（已落地 2026-10-12；2026-11-23 补修见文首）
 
 > 2026-10-12。状态：**已按本文落地**（管理页 `/skills`，本地目录 `.data/skills/`，全局开关 `.data/skills-state.json`）。对话飞出仍只做本对话全文注入。
+> **2026-11-23 补修（工作区未提交）**：管理页改版后补了 `openSkill` 异步竞态守卫、统一反馈清空，页面文案与角色标签全量接入 zh/en/pt-BR/hi；详见 `engineering-optimization-review.md` §9。
 > 对话里的「技能」飞出面板继续负责「本对话要不要把全文塞进提示」；新建独立管理页负责「这台机器上有哪些技能、本地技能怎么增删、全局开不开」。两件事不要合成一个开关。
 
-## 0. 现在实际是什么
+## 0. 改前现状（2026-10-12 之前，仅作背景；以下均已按 §2–§6 落地）
 
 飞出面板（`ChatPage.vue` 的 `tools-flyout`，接口 `GET/PUT /chat/skills`）列的不是全部技能。`listSelectableSkillMetas` 会丢掉 `default: true`。当前 8 个技能里，只有 `pdf` 没有这个标记，所以面板里只剩「PDF 资料问答」。其余 7 个（业务取数、探库、口径核对、图表、观影、客服会话、联网检索）索引仍在系统提示里，命中时走 `read_skill`，只是不出现在勾选列表。空列表时的文案已经写了这件事：「没有可勾选的技能（默认技能无需勾选即已生效）」。
 
 勾选的含义写在页脚：勾上的全文注入本对话系统提示的**动态段**（`renderEnabledSkills`，上限 `SKILLS_INJECT_CHARS`，缺省 12000 字，超出的注明未注入）；没勾的仍可按需加载。启用集存在对话文档的 `skillsEnabled`，和连接器的「本对话启用哪些 MCP」同构，但技能侧没有「添加」入口。
 
-技能文件只来自仓库目录 `apps/agent-server/skills/<目录>/SKILL.md`。`skills.ts` 启动扫 frontmatter（`name` / `description` / `roles` / `default`），30 秒缓存。`read_skill` 只读这一层目录下的 `SKILL.md`，拒绝 `..` 和路径分隔符。没有用户目录、没有上传、没有启用开关落盘、没有管理路由。对照 `best-practice-alignment-review.md` 的 F12：技能少、静态目录，当时结论是维持。本地技能和管理页就是把这条从「维持」改成「要做」的范围。
+技能文件只来自仓库目录 `apps/agent-server/skills/<目录>/SKILL.md`。`skills.ts` 启动扫 frontmatter（`name` / `description` / `roles` / `default`），30 秒缓存。`read_skill` 只读这一层目录下的 `SKILL.md`，拒绝 `..` 和路径分隔符。改前没有用户目录、没有上传、没有启用开关落盘、没有管理路由；以上均已按 §2–§6 落地（`.data/skills/`、`.data/skills-state.json`、`/skills`）。对照 `best-practice-alignment-review.md` 的 F12：技能少、静态目录，当时结论是维持；本地技能和管理页已把这条从「维持」改成「已落地」。
 
 连接器已经有可写层：`.data/mcp-servers.json` 相对 `.env` 的 `MCP_BUILTIN_SERVERS`。技能应对齐同一分层，而不是把用户文件写进仓库 `skills/`。
 

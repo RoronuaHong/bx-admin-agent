@@ -52,7 +52,7 @@ MODEL_ZEN_TIMEOUT_MS=300000
 | 11 | 续聊功能 | 第二轮「上面第一条记录的详情是什么」 | 同上链路（自动补全模块/参数） | ✅ PASS |
 | 12 | 续聊功能 | 第三轮「把它导出来」 | submit_understood_intent → search_api_module → read_api_module → call_api（缺 export_dataset） | ❌ FAIL |
 
-**总计：10/12 PASS（83%）**；2 个 FAIL 均为**模型语义能力差异**，非代码逻辑缺陷（见 §4 分析）。
+**总计：10/12 PASS（83%）**（历史快照）；2 个 FAIL 当时的归因是**模型语义能力差异**，非代码逻辑缺陷（见 §4 分析）。原验证脚本与 `submit`/`call_api` 等工具链已移除，归因不可复验。
 
 ## 4. 失败场景分析
 
@@ -60,7 +60,7 @@ MODEL_ZEN_TIMEOUT_MS=300000
 
 - **现象**：模型将「设置为下线」理解为**查询批次详情**（走 getDetail），而非调用更新接口，因此未触发 `confirmation_required`。
 - **根因**：`hy3-free` 对「状态设置为下线」这类业务口语的**写操作意图识别不足**，未拆出 update 类 ToolCall。服务端确认机制本身工作正常——只有当模型真的请求写调用（`method != GET` 或 `isWriteCall`）才会拦截确认。
-- **结论**：非代码缺陷。这是模型语义理解的边界；换更强模型（如 hy3 付费版 / claude / gpt）后该场景预期 PASS。红线「写操作必须确认」由服务端 `isWriteQuery` + `method!=GET` 双重兜底保证（§4.3 佐证），不依赖模型自觉。
+- **结论（历史归因，不可复验）**：当时判为模型语义理解边界，非代码缺陷；原验证脚本与工具链已移除，无法再用强模型复测。写操作确认以现行 `mcp-guide.md` §7 闸门为准，旧 `isWriteQuery` 口径已随代码移除。
 
 ### 4.2 续聊第三轮「把它导出来」
 
@@ -114,7 +114,7 @@ npx tsx scripts/verify-scenarios.mjs
 
 | 项 | 说明 |
 |---|---|
-| 模型能力 | `hy3-free` 对写操作意图与「导出」工具映射理解不足；建议正式验证用付费强模型（hy3/claude/gpt）跑同一脚本，预期全 PASS |
+| 模型能力 | `hy3-free` 当时对写操作意图与「导出」工具映射理解不足；原脚本与工具链已移除，无法再用付费强模型复跑，「预期全 PASS」为历史推测，不再保留 |
 | rg 缺失 | Windows 下 `rg` 不在 PATH，grep_codebase 靠 Node 原生回退（日志有 `'rg' is not recognized` 噪音，不影响功能） |
 | mock 数据 | 表格值多为「-」（mock 响应不含真实字段值），验证的是**链路正确性**而非数据准确性 |
 | 跨模块对比 | 场景 3 模型最终输出澄清（未找到 search/vipExchangeCode 组合接口）而非对比结论——mock 模式接口约束，属可接受边界 |

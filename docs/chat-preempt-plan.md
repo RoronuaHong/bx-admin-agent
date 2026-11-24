@@ -3,6 +3,7 @@
 > **文档重建于 2026-11-13**。原 `chat-preempt-plan.md`（含完整动机、现状、风险推演、场景验证等约 87KB 历史内容）在会话间隙被删除/移走，本文件聚焦 **P0 实施落地与验收记录**，不再重建完整推演史。如需完整计划文档请从 git 历史恢复。
 >
 > 本文档覆盖：P0 改动清单、修复落地清单（§2）、全链路查缺补漏与实地读码验证（§3）、P1 待办（§4）。
+> **2026-11-23 补修（工作区未提交）**：断网等无 `serverErrorCode` 的连接类错误不再进模型黑名单；auto 模式改记实际 `servedModel`；模型冷却只延长不缩短，避免 90s 弱失败覆盖 UTC 日切级额度冷却（含回归用例）。详见 `engineering-optimization-review.md` §9。
 
 ---
 
@@ -47,7 +48,7 @@
 | R33（顺带） | `chat-stream.ts` 增量分支 | 增量分支不检查 `sawTerminal`，旧 runner 在 abort 后产生的 wrapup `text_delta` 正常渲染（不丢「哪些没查完」说明） |
 | R35（顺带） | `chat-stream.ts` `cancelled` 分支 | `cancelled` 分支统一清 `reply.pending=null`，确认卡不残留 |
 
-> **未做项**：R11（MoviePage）属 P1，本期保持 MoviePage 串行 + 409 显式拒绝，未收敛到 `chat-stream.ts`；R34（多实例脑裂）需方案 C（留档主键改 `taskId`），本期未做。
+> **P0 阶段未做项**：R11（MoviePage）与 R34（多实例脑裂）当时留 P1；两者已于 2026-11-16 完成，见 §4（R11 抢占路径收敛、R34 方案 C 留档主键改 `taskId`）。
 
 ---
 
@@ -106,7 +107,7 @@
 | 前端透明转发 | `readNdjson:96-120` 逐行 `onEvent(JSON.parse)` 不过滤；`applyChatEvent:3525` 直转 `applyStreamEvent` | ✅ cancelled 必达正确 run |
 | R08 并发双发 | `ChatPage` `dispatching` 同步原子（已查无遗留 `.controller` 单值引用） | ✅ |
 | ChatEvent 类型 | `shared:216` `{ type: "cancelled" }` | ✅ |
-| R11 确为 P1 | `MoviePage.vue:127-129` 仍 `isBusyError(CONVERSATION_BUSY)`、`311` 直接 `streamChat` | ✅ 未收敛到抢占路径，留作 P1 |
+| R11 确为 P1（2026-11-13 时点） | `MoviePage.vue:127-129` 当时仍 `isBusyError(CONVERSATION_BUSY)`、`311` 直接 `streamChat` | ✅ 当时未收敛，2026-11-16 已完成（见 §4） |
 
 ### 3.3 验收状态
 
@@ -123,7 +124,7 @@
 | R11 | `MoviePage` 未收敛到 `chat-stream.ts` 的抢占/多 run 架构，仍走旧串行 + `CONVERSATION_BUSY` 回滚路径 | `apps/web/src/pages/MoviePage.vue` 的 `send`/流式/`停止` | ✅ 已完成（2026-11-16）：`send` 拆同步原子的 `dispatching` + `runTurn`，多轮并发 `runCount/controllers`、抢占由服务端 `cancelled` 事件标记旧气泡；事件分支收敛到 `applyStreamEvent`（`ChatStreamHost` 空实现工具/确认能力）；`stop`/卸载 abort 全部轮次。本页 persist 全量写，无 /chat 的增量水位竞态。type-check 通过。 |
 | R34 | 多实例脑裂下留档单主键晚到覆盖；`flushTask` 的 `taskId` CAS 仅缓解**同实例**，跨实例需方案 C | `chat-tasks.ts` `flushTask` / `task-store.ts` | ✅ 已完成（2026-11-16，方案 C）：留档主键 `_id` 由 `conversationId` 改为全局唯一 `taskId`，MongoDB / 内存降级两侧 flush、read、markInterrupted 同步换键；新增 `loadLatestTaskRecord`（按 `startedAt` 取最新轮，非易被迟到写刷新的 `updatedAt`）+ `{conversationId,startedAt:-1}` 索引；`loadTaskForResume` 接可选 `taskId` 精确取轮，`recoverStaleTasks` 用 `item.taskId`，`/chat/task/events` 透传 `wantTaskId`。新增回归测试 [G]。type-check + 959 测试全通过。 |
 
-> 其余 P1–P3 体验项（R10 评测口径、R14–R26 等）仍按原严重度待处理，详见原风险登记表（需从 git 历史恢复）。
+> R10 / R14–R26 的原风险登记表已在 git/stash/各分支均找不到，**逐条状态无法确认**；§4.1 的 B1–B8 / F1–F10 及 R11 复查项已全部修复，二者不是同一批，不能用本表反推 R10/R14–R26 已完成。
 
 ---
 
@@ -140,7 +141,7 @@
 - **B5（中）**：MoviePage 多 run 同时 409 时回滚 `input.value = text` 互相覆盖丢消息；改为非空时前插。
 - **F10（中）**：重复 `cancelTask` 产生重复 `cancelled` 事件；`cancelTask` 加 `status`/`abort.signal.aborted` 守卫。
 - **F5（中）**：R34 换主键后内存留档从「每对话一条」变「每任务一条」，无界增长。`task-store` 加 `CHAT_TASK_MEM_CAP`（默认 500）+ 写入时按 `updatedAt` 淘汰最旧。
-- **R11 回归**：MoviePage `rememberModel` 空实现导致 auto 模式「上次成功优先」失效（把 `"auto"` 记成模型 id，被 `resolveModel` 忽略）；改为记录真实 `servedModel`，黑名单跳过 `"auto"`。
+- **R11 回归**：MoviePage `rememberModel` 空实现导致 auto 模式「上次成功优先」失效（把 `"auto"` 记成模型 id，被 `resolveModel` 忽略）；改为记录真实 `servedModel`，黑名单跳过 `"auto"`（2026-11-23 工作区未提交，见文首补修注）。
 
 **第二轮复查（同日）继续修复**
 - **F3（中）**：`detachTask` / `followTask.finally` 无条件把 `live` 置 false，误伤多标签 / 断线重连的其它订阅者。改为按 `waiters.size` 重算，`followTask` 清理复用 `detachTask`。

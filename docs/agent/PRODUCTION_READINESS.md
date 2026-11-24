@@ -8,6 +8,7 @@
 > 落地进度随时更新；评测闸门（P0）已开工，详见 §4。
 
 > **2026-09-26 刷新记录（不含登录/租户维度）**：按当前 `src/` 重新核对，修正若干过期事实——① 安全维度 `prompt-guard.ts` 已重写为 `src/untrusted.ts`，并新增「外部 MCP 原生 SQL 只读闸」（`src/risk.ts` + `src/sql-readonly.ts` + `audit.ts` gate）；② 异步维度 09-17~09-24 已扩展为完整异步底座 + 定时任务（见 `agent-infrastructure.md` §8）；③ 追踪维度 09-24 已补逐轮 trace；④ 评测门禁由旧 `eval-core.mjs`/`eval-trace-gate.mjs`（已归档）演进为 `scripts/_movie-grounding-gate.mjs` + `tests/grounding-guard.test.ts`（G1-G7），回归入口 `pnpm test`。文中 `scripts/inspect-*.mjs` / `chain-multirun.mjs` / `eval-*.mjs` 等验证脚本已于 2026-09 清理移除，脚本名 → 替代回归查 `docs/mcp-guide.md` §11，读到旧脚本名不要照抄命令。
+> **2026-11-23 对齐补注**：本文八维结论止于 2026-09-26 口径；2026-10-18 全链路审计（`DEEP_AGENT_FULLCHAIN_AUDIT_2026-10-18.md`）另列 P0/P1 边界问题，两类结论不互相覆盖。多项目 ACL 与门户级 Trace 权限投影均未进入当前代码；钉钉告警旧 `alert-notify.ts` 已移除，现行为 `src/notify/*` 通道。
 
 ---
 
@@ -28,10 +29,10 @@
 
 ## 2. 维度详情
 
-### 2.1 身份 Identity ✅ P2 已落地（溯源 + 多项目 ACL）
+### 2.1 身份 Identity 🟡 ownerKey 溯源已落地（多项目 ACL 未实现）
 - 已有：`app.ts` 的 `getSession(getCookie(c, COOKIE))` 会话校验；`/chat/conversations` 等接口走 `requireOwner`。
 - **调用方溯源（本次落地）**：`ownerKey`（countryId:loginName）在 chatStream 入口计算一次，贯穿——①trace run span meta（可回溯每次请求的操作者）；②成本聚合 `byOwner` 维度 + `inspect-cost.mjs --owner` CLI；③审计事件（P1 已有）；④会话（conversations 既有）。
-- **多项目 ACL（本次落地）**：项目配置（clarification-policy.json）可选 `allowOwners`（ownerKey 数组）——未配置/空 = 对所有登录用户开放；配置后仅名单内操作者可 `set_project`（判定先于会话写入，拒绝零副作用，未知项目标识诚实拒绝）。判定逻辑为 `project-registry.ts` 纯函数 `projectAccessibleBy`。
+- ~~**多项目 ACL（本次落地）**~~ **未实现**：`clarification-policy.json` 不含 `allowOwners`，`src/` 无权限模块，多项目隔离目前仅靠 ownerKey + 会话归属，无项目级授权。
 - **最小权限口径**：`GET /cost/summary` 与 `GET /audit/list` 只暴露当前登录操作者自己的数据（ownerKey 强制过滤）；全局视角只走服务端 CLI（inspect-cost.mjs / inspect-audit.mjs），不暴露 HTTP 面。
 - 验证：ACL 纯函数 4/4 + set_project 真实路径（名单外拒绝/名单内放行/未配置开放/未知项目拒绝）+ 真实请求 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200。
 - 仍缺：角色/权限模型（越权防护靠 M1 worker 白名单运行期拦截，非数据期 ACL）；跨租户管理员视角（现 CLI 承担）。
@@ -104,9 +105,9 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 - **单价可配**：`COST_RATE_<MODEL>_PROMPT/_COMPLETION`（每百万 token），未配置只统计 token、不编造费用（诚实降级，未配价 token 计入 `unpricedTokens`）。
 - 设计原则：零业务词（维度仅时间/模型/会话/耗时）、零新依赖（Node 标准库）、采集侧零感知。
 - 遗留：多 key 轮转（NVIDIA_API_KEYS）按 key 成本分摊。
-- **告警推送（2026-09-04）**：`alert-notify.ts` 钉钉自定义机器人 Webhook（`ALERT_DINGTALK_WEBHOOK`）；预算告警（`inspect-cost` + `/cost/summary`）与劣化 `degradeHint`（`/trace/runs`）可推送；`ALERT_DEDUP_MS` 默认 30min 去重；`ALERT_BUDGET_NOTIFY` / `ALERT_DEGRADE_NOTIFY` 可关；未配 webhook 静默。
+- ~~**告警推送（2026-09-04）**~~（历史实现）：旧 `alert-notify.ts` / `ALERT_DINGTALK_WEBHOOK` 已移除；当前通知走 `src/notify/channels.ts` + `notify/deliver.ts` 的群机器人通道（本机 id=`dingtalk`），以通道配置为准。
 - **推送形态与配色（2026-09-15 实机验收）**：`ALERT_MSGTYPE=action_card` 时卡片正文 + 底部 4 实体按钮（查看完整报告/下载 Excel/下载 PDF/去问数追问）；`ALERT_FONT_COLOR=1` 用 `<font color>` 上色。**配色口径（2026-09-15 二次统一）**：**异常与预警一律红 `#f5222d`**（异常细分条目 / `异常：N 条` 摘要 / `← 异常` 标记 / 预警与严重徽标 / 下跌，全站只用一个红，`#cf1322` 与橙 `#fa8c16` 均已废弃移除 —— 预警 vs 严重只由**徽标文字**区分）；绿 `#52c41a` = 正常徽标 / 上涨；蓝 `#2f54eb` = 日报徽标（日报有无异常都不变蓝→异常时摘要转红）；蓝 `#597ef7` = 柱条。**标题约定**：告警 `🚨 [bx-agent] 巡检预警 <日期>：N 个渠道异常`、日报 `📊 [bx-agent] 巡检日报 <日期>：渠道日活 + 异常汇总`——告警与日报经 emoji + 文案 + 配色三重区分。钉钉机器人「关键词安全设置」须配 `ALERT_KEYWORD`（如 `Agent`），sender 发送前注入正文+标题，否则被静默拒收（HTTP 200 + errcode 310000）；sender 已校验 `errcode!=0` 抛错，杜绝「假 sent」。
-- **挂账（后续）**：①生产 Webhook 尚未写入 `.env`（需在钉钉群创建「自定义机器人」后配置 `ALERT_DINGTALK_WEBHOOK` 并实推验收）；②真·单聊推个人（企业应用 OpenAPI + userid）未做，与群机器人 Webhook 不同通道。
+- **挂账（后续）**：①生产钉钉通知通道尚未实推验收（旧 `ALERT_DINGTALK_WEBHOOK` 口径作废，现按 `src/notify/*` 通道配置）；②真·单聊推个人（企业应用 OpenAPI + userid）仍未做，与群机器人通道不同。
 - **审计告警节流（2026-09-30）**：`audit.ts` 的高风险决策（`denied` / `ownership_mismatch` / `subagent_refused` / `timeout`）原来**逐条推送**——用户正常点「不同意」也会推，等于刷屏。改为：同一「归属 + 工具」在 `AUDIT_ALERT_WINDOW_MS`（默认 10min）内累计到 `AUDIT_ALERT_BURST`（默认 3）才推第一条，推完进 `AUDIT_ALERT_COOLDOWN_MS`（默认 30min）冷静期，期内只累计，期后仍有新增再推一条**带累计条数**的汇总；`AUDIT_ALERT_THROTTLE=off` 退回逐条推送。**留痕不受影响**：append-only JSONL 一条不少，节流只作用于打扰人的那一层。
 
 ### 2.6 安全 Security ✅ P1 已落地（审计 + 限流 + Prompt 结构护栏）
@@ -136,8 +137,8 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
   - `GET /trace/runs?limit=&agentId=` ——最近 N 个 run 摘要（含 `agentId`：admin/analytics…；模型/轮次/token/耗时/ownerKey/release/userText）+ 统计；
   - `GET /trace/run/:runId` ——完整 span 树，响应带当前 release。
 - **写入（2026-09-10）**：后台 chat → `agentId=admin`；问数 `/analytics/ask` → `agentId=analytics`；详见 [PORTAL_TRACE.md](./PORTAL_TRACE.md)。
-- **权限口径（2026-09-07 / 09-10 更新）**：`/trace` 是门户级路由，不再挂在 `/agents/admin/trace` 作为产品主入口；页面入口展示、路由进入、HTTP 数据读取统一受 `canViewTrace` 控制。当前 `canViewTrace` 由服务端权限投影输出，支持 `TRACE_ALLOWED_OWNERS`（账号白名单）、`TRACE_DENIED_OWNERS`（账号黑名单）、`TRACE_ALLOWED_COUNTRIES`（国家线白名单）组合收紧；判定顺序为 deny 优先，其次 owner / country 任一 allow 命中即可放行；未配置时保持“已登录可看”。
-- **前端交互闭环（2026-09-10 更新）**：未登录访问 `/trace` 跳到 **`/trace/login`**（观察者入口，复用运营账密 API，不进后台工作台）并保留 `next=/trace`；已登录但无权访问时，会回到门户并携带 `denied=canViewTrace`、`deniedSource`、`deniedFrom`，门户页据此展示拒绝原因与来源页。
+- ~~**权限口径（2026-09-07 / 09-10 更新）**~~ **历史记录，未落地**：当时规划 `/trace` 为门户级路由并受 `canViewTrace` 控制；当前代码无该权限投影，trace 仅按 ownerKey 过滤。
+- ~~**前端交互闭环（2026-09-10 更新）**~~ **历史记录**：`/trace/login`、`denied=canViewTrace` 等随未落地的权限投影一起作废，当前无对应前端闭环。
 - **门户通用化准备（2026-09-07 更新）**：权限返回值已开始扩成门户级 `entries` 结构（`admin/knowledge/viewing/trace`），当前真正受控的是 `trace`，其余入口先保持开放，为后续多 Agent 统一权限模型留接口。
 - **前端工作台收口（2026-09-07 更新）**：`ChatPage.vue` 近期已开始按“低风险边界拆分”收口，先后抽出富文本渲染、会话存储恢复、后台任务状态恢复、标签菜单定位等 helper/module；目标是降低单文件复杂度，同时不改现有对话、刷新恢复、多语言标题、模型缓存与工具链展示行为。
 - **前端包体治理（2026-09-07 更新）**：聊天页图表能力改为异步加载，`vite.config.ts` 已对 `echarts` / `zrender` / `markdown-it` / `dompurify` 做 chunk 拆分；当前 `ChatPage` 主 chunk 已从大体量首屏包收敛到约 60k 级，避免因为观测图表能力拖慢聊天首屏。
@@ -154,13 +155,13 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 
 | 优先级 | 维度 | 动作 | 理由 |
 |---|---|---|---|
-| **P0** | 评测 Eval | ✅ 完整落地：通用 `eval-core` + `eval-trace-gate` + 分层入口（`pnpm eval`/`eval:full`/`eval:trace-gate`）+ CI 闸门 `.github/workflows/eval.yml` | 复用 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
+| **P0** | 评测 Eval | 🟡 历史方案（旧 harness 已归档）：现行入口为 `_movie-grounding-gate` + `pnpm test`，无 `eval.yml` CI | 复用 traces，把 demo 验证变成可重复回归；最便宜的「上线」杠杆 |
 | **P1** | 安全审计 | ✅ 已落地：审计三类 + 限流 + Prompt 结构护栏（零词典）+ `/audit/list` + `inspect-audit.mjs` | 上线必备合规；runId 关联 trace 可反查上下文 |
 | **P1** | 成本 Cost | ✅ 已落地：`cost.ts` 聚合 + `inspect-cost.mjs` CLI + `GET /cost/summary` 端点 + 预算告警（env 阈值） | traces 已采集，只差聚合 |
-| **P2** | 身份 Identity | ✅ 已落地：ownerKey 溯源贯穿 trace/cost/audit + 项目级 `allowOwners` ACL + HTTP 面最小权限（只看自己，全局走 CLI） | 多租户上线前必需 |
+| **P2** | 身份 Identity | 🟡 ownerKey 溯源已落地；项目级 `allowOwners` ACL 未实现（当前仅 ownerKey + 会话归属） | 多租户上线前必需 |
 | **P2** | 异步 Async | ✅ 已落地：执行与推送解耦（断线任务跑完+自动落库）/ 并发回放 / `/chat/cancel` / `/chat/task/status` | 刷新丢结果根因消除；chat.ts 零改动 |
 | **P3** | 版本 Version | ✅ 已落地：release 标识（git sha/RELEASE env）贯穿 trace run meta + eval 基线，回归按版本对比 | 降低线上试错成本 |
-| **P3** | 可观测 | ✅ 已落地：`GET /trace/runs`（摘要+统计）+ `/trace/run/:id`（span 树）+ 门户级 `canViewTrace` 权限投影 | Web 可视化直接接端点即可 |
+| **P3** | 可观测 | 🟡 `GET /trace/runs` + `/trace/run/:id` + llm/tool 分层 span 已落地；门户级 `canViewTrace` 权限投影未实现（仅 ownerKey 过滤） | Web 可视化直接接端点即可 |
 
 ---
 
@@ -168,7 +169,7 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 
 | 日期 | 模块 | 进展 | 关联文件 |
 |---|---|---|---|
-| 2026-09-03 | 追踪 Tracing | ✅ 建 `trace.ts` + `inspect-trace.mjs`：runId 贯穿 + llm/route/tool span + token usage；JSONL 落盘 `.data/traces/` | src/trace.ts / src/chat.ts / src/models.ts / scripts/inspect-trace.mjs |
+| 2026-09-03 | 追踪 Tracing | ✅ 历史记录：`trace.ts` runId 贯穿 + llm/tool 两类 span（无独立 `route` span）+ token usage；`inspect-trace.mjs` 已移除，现行验证走 `pnpm test` | src/trace.ts / src/chat.ts / src/models.ts |
 | 2026-09-03 | 评估 | 建立本文档（八维度现状 + 优先级） | PRODUCTION_READINESS.md |
 | 2026-09-03 | 评测 Eval | ✅ P0 落地：`eval-trace-gate.mjs` 跑真实 chat + 读 trace 断言 5 条生产红线（轮次/越权/伪调用/成本/收束）+ 基线落库 `.data/eval-baseline/`；`trace.ts` 加 `latestRunId()` | scripts/eval-trace-gate.mjs / src/trace.ts |
 | 2026-09-04 | 评测 Eval | ✅ 通用化 + 分层 + CI：抽 `eval-core.mjs`（纯函数零 import，G2 三态）；`eval-core.test.ts` 17 用例全 PASS 作零依赖地基；`package.json` 加 `eval`/`eval:core`/`eval:full`/`eval:trace-gate`/`test`；根 package.json 转发；**CI 闸门 `.github/workflows/eval.yml`**（push main/PR 只跑零依赖 core，其余层 CI 无条件）；发现 `eval-intent-routing.mjs` 0/6 失效+违规（业务词硬编码），排除出闸门 | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs / package.json / .github/workflows/eval.yml |
@@ -178,17 +179,17 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 | 2026-09-04 | 安全+评测 实例验证 | ✅ 真实实例验证：①写确认审计端到端 PASS（真实写意图 → confirmation_required → 自动拒绝零副作用 → 审计落 confirm_request+confirm_result=denied，owner=countryId:loginName、runId 关联 trace、/audit/list 可查）；②读场景回归发现免费链劣化窗口（nemotronultra 2 次 rounds=10 含 3 空响应轮、zenhy3 2 次短路 <1s）——非代码回归（diff 不涉 LLM 循环）；③**gate 盲区修复**：短路/幻觉直答不调工具能骗过 G1-G5，补 **G6 业务期望断言**（`expectTools`，默认关）+ 阈值环境变量（EVAL_MAX_ROUNDS/EVAL_MAX_TOKENS）+ adapter `--expect-tool`；core 单测 23/23，G6 实战拦截 zenhy3 短路（5/6 如实红） | eval-core.mjs / eval-core.test.ts / eval-trace-gate.mjs |
 | 2026-09-04 | 身份 Identity | ✅ P2 落地：①溯源——`ownerKey`（countryId:loginName）chatStream 入口计算，贯穿 trace run span meta / 成本 `byOwner` 维度（+`inspect-cost.mjs --owner`）/ 审计（P1）/ 会话；②多项目 ACL——项目配置可选 `allowOwners`（未配置=开放），`set_project` 判定先于会话写入（拒绝零副作用）+ 未知项目诚实拒绝，`projectAccessibleBy` 纯函数；③最小权限——`/cost/summary` 与 `/audit/list` HTTP 面强制 ownerKey 过滤（只看自己），全局视角只走 CLI；顺手修 bySession/byOwner runs 计数恒 0 缺陷。验证：ACL 11 用例 + 真实 run span 带 ownerKey + byOwner 过滤正确 + 端点 401/200 + 最小权限不泄漏 | src/trace.ts / src/cost.ts / src/chat.ts / src/tools.ts / src/project-registry.ts / src/app.ts / scripts/inspect-cost.mjs |
 | 2026-09-04 | 异步 Async | ✅ P2 落地：`/chat/stream` 执行与推送解耦——后台消费者驱动 chatStream（任务级 AbortController），事件入缓冲，SSE 只做转发订阅者（断开不停执行）；断线闭环=任务收束自动落「后台任务结果」会话（task-<sessionId>，前端不在线数据不丢）；并发保护=进行中重连只回放+task_running；新增 `/chat/cancel`（显式取消）+ `/chat/task/status`（状态查询）+ shared 契约加 task_running 事件；缓冲 5min GC + lastTasks 上限 100。验证实例 8/8：断线后台完成落库配对 / 进行中重连回放 / cancel 收束 running=null | src/app.ts / packages/shared/src/index.ts |
-| 2026-09-04 | 版本+可观测 | ✅ P3 落地（八维度收官）：①版本——`trace.ts getRelease()`（RELEASE env > git 短 sha，进程内缓存），run span meta 落 release（实测 b6b0dd7）+ eval 基线顶层加 release 字段（回归按版本对比）；②可观测——`GET /trace/runs`（最近 N run 摘要+统计 avgRounds/tokens，实测 stats 正确）+ `GET /trace/run/:runId`（span 树，响应带 release）。随后在 2026-09-07 已补门户级 `canViewTrace` 权限投影与组合策略收紧。验证：真实 run release 落盘 + 基线 release 字段 | src/trace.ts / src/app.ts / scripts/eval-trace-gate.mjs |
+| 2026-09-04 | 版本+可观测 | ✅ P3 落地（八维度收官）：①版本——`trace.ts getRelease()`（RELEASE env > git 短 sha，进程内缓存），run span meta 落 release（实测 b6b0dd7）+ eval 基线顶层加 release 字段（回归按版本对比）；②可观测——`GET /trace/runs`（最近 N run 摘要+统计 avgRounds/tokens，实测 stats 正确）+ `GET /trace/run/:runId`（span 树，响应带 release）。随后在 2026-09-07 规划了门户级 `canViewTrace` 权限投影（历史记录，当前未落地）。验证：真实 run release 落盘 + 基线 release 字段 | src/trace.ts / src/app.ts / scripts/eval-trace-gate.mjs |
 | 2026-09-04 | 全链路多点回归 | ✅ 新增可复用回归工具 `chain-multirun.mjs`（battery/chit/kb/read/write/async 六 suite）+ `chain-report.mjs`（聚合分析），证据落 `.data/multirun/`；**2026-09-04 首轮多点实测 24/26（92.3%）**：正确性链路全绿（battery 9/9、chit 3/3、kb 1/1 命中考勤制度、write 4/4 双确认点全拒+审计 denied、async 6/6 断线落库配对、read 数据正确性 3/3 含逐页校验与 G6 全中）；唯二红=读链路效率 G1/G4（2/3 次 rounds 10-12、tokens 114k-146k）——trace 定性为上游免费链**空响应轮**（tok=0、无工具调用、10-35s/轮，每轮后模型自愈继续，数据终局正确）非客户端缺陷；改善建议见 §5 | scripts/chain-multirun.mjs / scripts/chain-report.mjs |
 | 2026-09-04 | 空响应瞬时重试 | ✅ §5.1 落地：`callAgentSafe` 将空结果（无 text 且无 toolCalls）纳入与 429 同预算瞬时重试（退避 3s×attempt，最多 2 次）；耗尽返回空交条件边兜底；span note=`recovered_from_empty`/`empty_after_retry` + meta.emptyRetries | src/chat.ts |
 | 2026-09-04 | G4 预算自适应 | ✅ §5.2 落地：`resolveTokenBudget` 默认 `8000+16000×rounds`；显式 `maxTotalTokens`/`EVAL_MAX_TOKENS` 固定覆盖；core 单测覆盖健康多轮放行/单轮爆量拦截/固定优先 | scripts/eval-core.mjs / eval-core.test.ts |
 | 2026-09-04 | 空轮劣化信号 | ✅ §5.3 落地：`listRunSummaries` stats 增 `emptyRounds/emptyRetries/emptyRoundRate/shortCircuitRuns/degradeHint`；run 摘要带 per-run 空轮计数；阈值/备选模型走 env | src/trace.ts / scripts/trace-empty-stats.test.ts |
 | 2026-09-04 | Trace 前端可视化 | ✅ §5.4 落地：`apps/web` 新增 `/trace` 调用观察页（stats 条 + run 表 + span 树），Chat 顶栏入口，API `fetchTraceRuns`/`fetchTraceRun` | TracePage.vue / api.ts / router.ts |
-| 2026-09-07 | Trace 门户权限收口 | ✅ `Trace` 提升为门户级路由 `/trace`；Header 入口按 `canViewTrace` 展示；前后端统一权限投影；支持 `TRACE_ALLOWED_OWNERS` / `TRACE_DENIED_OWNERS` / `TRACE_ALLOWED_COUNTRIES` 组合收紧（未配则已登录可看） | src/app.ts / src/config.ts / src/permissions.ts / .env.example / apps/web/src/router.ts / apps/web/src/pages/AgentPortalPage.vue / apps/web/src/pages/TracePage.vue |
+| 2026-09-07 | Trace 门户权限收口（历史记录，未落地） | 当时规划 `/trace` 门户级路由 + `canViewTrace` / `TRACE_*` 组合收紧；当前代码无对应权限模块，仅按 ownerKey 过滤 | src/app.ts / src/config.ts / src/permissions.ts / .env.example / apps/web/src/router.ts / apps/web/src/pages/AgentPortalPage.vue / apps/web/src/pages/TracePage.vue |
 | 2026-09-04 | 定位空转熔断 | ✅ 读链路：定位≤1、探索合计（含 read）≤2 超额 skip；错 path（如 `/v0.1/user/getList`）猜 `module.func`；不提前 final→编排（编排 call_api 无 trace span 会红 G6）。实例 read **3/3** | src/chat.ts / api-operation-index.ts / tools.ts |
 | 2026-09-04 | 全链路复扫（6908145 后） | ✅ `battery/chit/kb/write/async/read` 全绿：battery 9/9、chit 3/3、kb 1/1、write+audit 4/4、async 6/6、read 3/3（gates 6/6）；软观察：chit#1 偶发把「你好」当业务澄清（suite 仍 PASS） | scripts/chain-multirun.mjs |
 | 2026-09-04 | HTTP 限流 | ✅ 进程内滑动窗口：`rate-limit.ts` + `/chat/stream`(ownerKey) + `/auth/login`(IP)；env 可关；429+Retry-After+审计 reject；单测 `rate-limit.test.ts` | src/rate-limit.ts / src/app.ts |
-| 2026-09-04 | 钉钉告警推送 | ✅ 代码就绪（Webhook+去重+单测+mock 实推）；**挂账**：生产 `ALERT_DINGTALK_WEBHOOK` 待群机器人 token；真·单聊推个人未做 | src/alert-notify.ts |
+| 2026-09-04 | 钉钉告警推送（历史实现） | 旧 `alert-notify.ts` / `ALERT_DINGTALK_WEBHOOK` 已移除；现行通知通道见 `src/notify/*`；真·单聊推个人仍未做 | src/notify/channels.ts / src/notify/deliver.ts |
 | 2026-09-04 | Prompt 结构护栏 | ✅ 零词典：`prompt-guard.ts`（控制符剥离 + nonce 定界碰撞中和）+ preprocess/chat 接线 + static guide 协议句 + 审计 `prompt_guard`；单测入 `pnpm test` | src/prompt-guard.ts / src/app.ts / src/chat.ts / scripts/prompt-guard.test.ts |
 | 2026-09-05 | 多语言业务读修复 | ✅ 通用结构回落 + explore-cap；**续修**：strip 窗口仅自上次成功 call_api、apiGrep 去写死 getList（模块唯一才采纳）；单测 13/13 | api-operation-index.ts / chat.ts / tools.ts |
 | 2026-09-07 | 前端工作台收口 | ✅ `ChatPage` 按低风险边界开始解耦：抽 `chat-richtext.ts`、`chat-storage.ts`、`chat-background-sync.ts`、`chat-tab-menu.ts`；保持刷新恢复、默认标题多语言、模型缓存、后台任务恢复、工具链展示行为不变 | apps/web/src/pages/ChatPage.vue / apps/web/src/chat-richtext.ts / apps/web/src/chat-storage.ts / apps/web/src/chat-background-sync.ts / apps/web/src/chat-tab-menu.ts |
@@ -202,4 +203,4 @@ G1-G5 全部红线（G5 只验「流程收束」不验「业务目标达成」�
 1. **空响应轮即时重试** ✅ 已落地（2026-09-04）：`callAgentSafe` 把「空结果（无 text 且无 toolCalls）」纳入与 429 同预算的瞬时重试（退避 3s×attempt，最多 2 次）；耗尽后仍返回空结果交条件边兜底；span 记 `recovered_from_empty` / `empty_after_retry` + `emptyRetries`。原靠条件边重跑 understand 自愈，每空轮浪费 1 轮次 + ~30s。
 2. **G4 预算自适应** ✅ 已落地（2026-09-04）：`eval-core` 默认 `budget = 8000 + 16000 × rounds`（prompt 随轮次线性累积）；显式 `maxTotalTokens` / `EVAL_MAX_TOKENS` 仍为固定覆盖。健康多轮（如 6 轮≈98k）不再误红；单轮爆量（1 轮 100k）仍拦。`resolveTokenBudget` 可单测。
 3. **多模型降级信号** ✅ 已落地（2026-09-04）：`/trace/runs` stats 输出 `emptyRounds` / `emptyRetries` / `emptyRoundRate` / `shortCircuitRuns` / `degradeHint`；空轮含 tok=0 span + `meta.emptyRetries`（自愈重试）；`emptyRoundRate≥TRACE_EMPTY_ROUND_RATE_WARN`（默认 0.2）或存在短路 run 时给出切换模型提示（`TRACE_DEGRADE_HINT_MODELS` 可选备选列表）。
-4. **前端可视化** ✅ 已落地（2026-09-04，2026-09-07 权限收口）：Web `/trace`「调用观察」只读页——汇总 stats（含 emptyRoundRate / degradeHint）+ 最近 run 表 + 点选展开 span 树；门户 Header 入口按 `canViewTrace` 展示；支持 `TRACE_ALLOWED_OWNERS` / `TRACE_DENIED_OWNERS` / `TRACE_ALLOWED_COUNTRIES` 组合收紧。
+4. **前端可视化** ✅ 已落地（2026-09-04）：Web `/trace`「调用观察」只读页——汇总 stats（含 emptyRoundRate / degradeHint）+ 最近 run 表 + 点选展开 span 树。2026-09-07 规划的 `canViewTrace` / `TRACE_*` 权限收口未落地，当前仅按 ownerKey 过滤。

@@ -244,7 +244,7 @@
   <h1>bx-admin-agent · 全链路梳理</h1>
   <p>一个<strong>自研 Deep Agent harness</strong>：Hono + TypeScript 服务端（模型编排 / 工具循环 / MCP / 产物交付），Vue3 前端（流式对话 UI），MongoDB 持久化。</p>
   <p>本文按「<strong>流程 → 具体实现 → 知识点</strong>」三段式组织：每个流程都给出落地的文件、函数、关键常量，方便对照源码复盘。</p>
-  <p class="kv">生成日期：2026-09-23（末次刷新 2026-10-10） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7；含 2026-10-08：MCP 生产命令白名单与来源指纹，见 §9；含 2026-10-09：C 章全链路待办，F1–F7 已修；含 2026-10-10：对话约 5 秒同步，定时提问气泡按本期补上）</p>
+  <p class="kv">生成日期：2026-09-23（**历史快照，末次刷新 2026-10-10**；2026-10-18 全链路审计及 P0 修复见 <code>docs/agent/DEEP_AGENT_FULLCHAIN_AUDIT_2026-10-18.md</code> §8） · 面向：项目梳理与技术复盘 · 代码基准：master（含方向 2：交互式轮次预算 28 / orders 示例数据源 / 模型级关思考开关；含 2026-09-29：定时任务每期独立会话 runMode/runs、models.ts 端点参数学习型自愈；含 2026-09-30：数据预警 on_alert / 先测后跑 / 预警摘图与短轮次；含 2026-10-02：分页计数 <code>count_list_by_time</code> / <code>run_tool_code</code> / 翻页闸门，见 §7；含 2026-10-08：MCP 生产命令白名单与来源指纹，见 §9；含 2026-10-09：C 章全链路待办，F1–F7 已修；含 2026-10-10：对话约 5 秒同步，定时提问气泡按本期补上）</p>
   <div class="toolbar">
     <input class="filter" id="fullSearch" style="flex:1 1 220px" placeholder="全文搜索（命中项高亮，回车跳下一个）…" />
     <button id="btnTheme" title="切换深色 / 浅色">◐ 主题</button>
@@ -1879,8 +1879,8 @@ src/
 </tbody>
 </table>
 <h3 id="s31-jev">客服助手 Jev（2026-10-12，已接线）</h3>
-<p>只在 <code>/support</code>。Jev 不写回复，也不进对话模型名单。输入题是坐席这条指令的事项（查会话 / 查制度 / 起草回复 / 其他）、是否要求代发、路由建议（含其他）、是否越权。不把坐席的话当成访客情绪，也不据此建单。未配置密钥时不发请求。草稿再问一次有没有把退款说成已经答应。概率 ≥ 0.9 只标高风险，不改正文；0.5–0.9 只标记；没有结果时回复仍发出，但代发不放行。状态标明说话人是坐席。不跳转。知识库仍是对话模型调用 <code>search_knowledge</code>（词法 + 可选向量），Jev 不参与召回，也不负责从 Zoho 工具里挑一个。全文在 <code>docs/agent/support-jev-plan.md</code>。</p>
-<p>Zoho 控制台同一台服务器有两百多个工具。客服助手不把它们交给模型：<code>tools</code> 白名单现在只有会话列表，下一阶段也只加按 id 取会话和取消息。引擎里的 <code>search_tools</code> 只搜白名单剩下的，不能代替这张名单。不做工具向量库，不另拆 SalesIQ 子代理。全文在 <code>docs/agent/support-salesiq-plan.md</code> 的「不要把控制台上的两百多个工具交给模型」。</p>
+<p>只在 <code>/support</code>。Jev 不写回复，也不进对话模型名单。输入题是坐席这条指令的事项（查会话 / 查制度 / 起草回复 / 其他）、是否要求代发、路由建议（含其他）、是否越权。不把坐席的话当成访客情绪，也不据此建单。未配置密钥时不发请求。草稿再问一次有没有把退款说成已经答应。概率 ≥ 0.9 标高风险，0.6–0.9 标记，均不改正文；没有结果时回复仍发出，但代发不放行（≥0.6 拒发）。状态标明说话人是坐席。不跳转。知识库仍是对话模型调用 <code>search_knowledge</code>（词法 + 可选向量），Jev 不参与召回，也不负责从 Zoho 工具里挑一个。全文在 <code>docs/agent/support-jev-plan.md</code>。</p>
+<p>Zoho 控制台同一台服务器有两百多个工具。客服助手不把它们交给模型：<code>tools</code> 白名单已含会话列表、按 id 取会话/取消息与阶段四代发工具（<code>sendMessageInConversation</code> / <code>replyToMessage</code>）。引擎里的 <code>search_tools</code> 只搜白名单剩下的，不能代替这张名单。不做工具向量库，不另拆 SalesIQ 子代理。全文在 <code>docs/agent/support-salesiq-plan.md</code> 的「不要把控制台上的两百多个工具交给模型」。</p>
 </section>
 
 <hr />

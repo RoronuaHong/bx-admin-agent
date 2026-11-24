@@ -5,7 +5,7 @@
 
 ## 做什么
 
-一次 `POST /v1/systemone`（模型 `jev-latest`）问事先写死的封闭题。选项和阈值在 `src/jev.ts`，不写进人设。
+一次 `POST /v1/systemone`（模型默认已钉 `jev-1.13.0`，原 alias `jev-latest` 已弃用）问事先写死的封闭题。选项和阈值在 `src/jev.ts`，不写进人设。
 
 客服助手跟坐席说话，会话事实从 Zoho SalesIQ 来。Jev 判的是坐席这条指令，不是访客情绪。访客逐句要等消息工具接上，在那之前不编一档访客情绪。
 
@@ -15,15 +15,15 @@
 | 是否要求代发 | 概率 | 只显示。不因此去调用发送工具 |
 | 路由 | 留在客服 / 建议通用助手 / 其他 | 只显示。不跳转、不换角色、不换模型 |
 | 是否越权 | 概率 | 只显示。现有定界、身份护栏、接地、确认卡照旧 |
-| 草稿是否把退款说成已经答应 | 概率 | ≥ 0.9 标成高风险，正文不改；0.5–0.9 只标记；低于 0.5 不标记。是否题的标签带上概率。写在给访客的草稿里也算 |
+| 草稿是否把退款说成已经答应 | 概率 | ≥ 0.6 标成高风险，正文不改；低于 0.6 且非 null 才走确认卡；null 不标记。是否题的标签带上概率。写在给访客的草稿里也算 |
 
-代发工具（`sendMessageInConversation`、`replyToMessage` 等）目前不在白名单里。一旦坐席助手点名调用，概率 ≥ 0.9、安全检查没有结果，或正文是空的，都不会发出。中间一带仍走原来的确认卡。承诺达到 0.9、以及「要代发」「像越权」到达 0.9，用警示色。绿色只表示这一格很集中。
+代发工具（`sendMessageInConversation`、`replyToMessage` 等）已在阶段四放行（见 `support-salesiq-tools.md`）。坐席助手点名调用时，概率 ≥ 0.6（CJK 地板）、安全检查没有结果，或正文是空的，都不会发出；仅 `p<0.6` 且非 null 才走确认卡放行。承诺达到 0.6、以及「要代发」「像越权」到达 0.6，用警示色。绿色只表示这一格很集中。
 
 没有 `JEV_API_KEY`：不发请求。气泡写「未配置 Jev，这次没有调用」。调用失败或超时：气泡写「安全检查没有结果，不能视为已通过」。两种情况下查阅和普通回复都照旧发出。
 
 ## 配置
 
-`JEV_API_KEY`、`JEV_BASE_URL`（缺省 `https://api.typesafe.ai`）、`JEV_MODEL`（缺省 `jev-latest`）。见 `apps/agent-server/.env.example`。走 OpenRouter 时端点改为 `https://openrouter.ai/api`，模型名仍用 `jev-latest`，密钥用 OpenRouter 的。
+`JEV_API_KEY`、`JEV_BASE_URL`（缺省 `https://api.typesafe.ai`）、`JEV_MODEL`（缺省 `jev-1.13.0`）。见 `apps/agent-server/.env.example`。走 OpenRouter 时端点改为 `https://openrouter.ai/api`，模型名仍用 `jev-latest`，密钥用 OpenRouter 的。
 
 超时不再写死 8s（第 7 批，见下）：`JEV_TIMEOUT_MS`（显式覆盖，优先）· `JEV_TIMEOUT_FLOOR_MS`（保底，默认 8000）· `JEV_TIMEOUT_MAX_MS`（封顶，默认 30000）· `JEV_LATENCY_WINDOW`（成功延迟样本数，默认 20）。额度预检沿用对话模型那套开关（`MODEL_QUOTA_PREFLIGHT` / `MODEL_QUOTA_PREFLIGHT_HOSTS`）。
 
@@ -40,7 +40,7 @@
 | 计数 | 调用/失败次数进 usage 事件 → RunTrace → 在线评测 `classifier_health`（阈值 `EVAL_MAX_CLASSIFIER_FAIL_RATE`，默认 0.2） | 单列维度，不混进收敛/效率类维度（Jev 不生成回复） |
 | 可观测 | 启动日志打印一次当前生效阈值与推导依据（`jevTimeoutInfo()`：生效值 / 保底 / 封顶 / 样本数 / 是否被显式覆盖）；阈值变化时 stderr 再打一行 | 与 BI 查询超时同口径，排障时不用猜「这次为什么等了 N 秒」 |
 
-**语义没变**：Jev 仍不在 `MODEL_PROVIDERS` / `listModels()` 里（不在模型下拉、不进自动候选链），结果仍不回灌写回复的模型；承诺 ≥0.9 仍拒发、0.5–0.9 仍只标记。改的只是「它自己那一次调用怎么被对待」。
+**语义没变**：Jev 仍不在 `MODEL_PROVIDERS` / `listModels()` 里（不在模型下拉、不进自动候选链），结果仍不回灌写回复的模型；承诺 ≥0.6 标高风险、0.6–0.9 标记（均不改正文），代发概率 ≥0.6 拒发。改的只是「它自己那一次调用怎么被对待」。
 
 新增环境变量均带默认值，不配即上表所写的默认口径。回归见 `apps/agent-server/tests/jev-governance.test.ts`（11 例：超时派生/覆盖、冷却短路、计数不虚增、span 字段、三个代发检查点都带 runId、解析与拒发阈值未变）。
 
@@ -70,7 +70,7 @@
 
 | 说法 | 接上之后 |
 |---|---|
-| 概率可以拿来设阈值 | 成立的是接口返回概率，代码能分支。承诺 ≥ 0.9 只标高风险，不改正文；代发在 ≥ 0.9 或没有结果时拒绝。0.5–0.9 只标记。没有做成「> 0.9 自动执行、0.7–0.9 改走大模型、< 0.7 转人工」。选择题上的 `confidence` 表示分布有多集中，不是「这条标签有多大概率是对的」；本项目也还没有用中文标注数据校准过 |
+| 概率可以拿来设阈值 | 成立的是接口返回概率，代码能分支。承诺 ≥ 0.6 只标高风险，不改正文；代发在 ≥ 0.6 或没有结果时拒绝。低于 0.6 且非 null 才走确认卡。没有做成「> 0.9 自动执行、0.7–0.9 改走大模型、< 0.7 转人工」。选择题上的 `confidence` 表示分布有多集中，不是「这条标签有多大概率是对的」；本项目也还没有用中文标注数据校准过 |
 | 非自回归，适合每条消息都判 | 客服助手每一轮会问两次（输入一次、草稿一次）。通用助手、观影、定时预警不问。延迟和 $0.042 / 百万输入 token、输出免费，是厂商公开价，本仓库没有自己计量。单次等待**保底 8 秒**（与既有体感一致），并按实测成功延迟 p95 × 2 自适应派生、封顶 30 秒（第 7 批；样本不足 3 条时按保底走）。失败或超时就当没有结果 |
 | 类型化输出，格式有保证 | 调用成功时答案是封闭题，解析只认 `choice` / `probability`。失败、超时、没密钥时没有结构，不编一个标签 |
 | 标签事先写死，不会冒出新类 | 事项和路由都有「其他」，看不出时不必硬归进某一档 |
@@ -118,12 +118,12 @@ Jev 也不负责从 Zoho 的工具里挑一个。事项标签不回灌模型，�
 
 | 最佳实践 | 当前实现（`src/jev.ts`） | 状态 | 待办 |
 |---|---|---|---|
-| 锁定模型版本，不用 `jev-latest` | `JEV_MODEL` 缺省 `jev-latest`（alias） | ⚠️ 部分(已加未钉告警 + 记录真实版本；默认仍 alias 待运维钉死) | 默认改钉版本 + 记录真实版本 |
-| 每次调用记录 `resp.model` + `resp.usage` | span 只记请求侧 `gen_ai.request.model`（别名），无 usage | ✅ 已实施(2026-10-16) | 解析响应顶层 `model`/`usage` 进 span |
-| CJK 地板 0.6–0.7 | `JEV_REVIEW_AT=0.5`（低于 CJK 地板） | ✅ 已实施(`JEV_REVIEW_AT` 默认 0.6) | 抬到 0.6（可经 `JEV_REVIEW_AT` 覆盖） |
-| Noul≈0.5 升级不硬猜（send 闸门 fail-open） | `supportSendAllowed(p)` 在 `p∈[0.5,0.9)` 放行；`p=0.5` 视为可发 | ✅ 已实施(仅 `p<0.6` 且非 null 放行) | 仅当 `p<地板` 且非 null 才放行 |
-| 按风险分级阈值，非全局 | 全局 0.9/0.5 套用 4 类题（现地板抬到 0.6） | ✅ 已实施(高利害题复用抬高地板) | 高利害题（promise/send/override）用更高地板 |
-| 中文校准（分桶精度 + 抽检闭环） | 文档已自陈"未用中文标注数据校准"；只有 `classifier_health` 失败率 | ❌ 缺口 | 加置信度分桶指标 + 人工抽检回流 |
+| 锁定模型版本，不用 `jev-latest` | `JEV_MODEL` 缺省 `jev-1.13.0`（alias 已钉死） | ✅ 已实施(2026-10-16) | — |
+| 每次调用记录 `resp.model` + `resp.usage` | span 已记 `gen_ai.response.model` + `bx.jev.usage` | ✅ 已实施(2026-10-16) | — |
+| CJK 地板 0.6–0.7 | `JEV_REVIEW_AT` 默认 0.6 | ✅ 已实施(2026-10-16) | — |
+| Noul≈0.5 升级不硬猜（send 闸门 fail-open） | `supportSendAllowed(p)` 仅 `p<0.6` 且非 null 放行 | ✅ 已实施(2026-10-16) | — |
+| 按风险分级阈值，非全局 | 高利害题复用抬高地板 | ✅ 已实施(2026-10-16) | — |
+| 中文校准（分桶精度 + 抽检闭环） | 文档自陈"未用中文标注数据校准"；只有 `classifier_health` 失败率 | ❌ 缺口（持续待办） | 加置信度分桶指标 + 人工抽检回流 |
 | state 不可信 / 对抗偏置 | `supportSeatState` 直接塞坐席/草稿原文（8000 字截断，未净化） | ⚠️ 已知 | 文档标注：依赖 fail-open + 人在环，未剥离"指令型"文本 |
 | Choice 必带 `其他` | task/route 均有"其他" | ✅ 已符合 | — |
 | 一题一判 / Fan-Out 一次多发 | `classifySupportInput` 一次发 4 题 | ✅ 已符合 | — |
@@ -167,11 +167,11 @@ promise/send/override 视为高利害，复用已抬到 0.6 的 `JEV_REVIEW_AT`�
 不剥离"指令型"文本（否则会削弱 override 检测）；仅在文档标注：state 含用户/坐席原文，对抗性"把我判成安全"类话术可能偏置，缓解靠 fail-open + 人在环。
 
 ### 7.4 结论
-当前 jev 接线在**治理与 fail-open** 上已超出官网公开文档的要求；主要缺口集中在**三处可量化项**：① 模型版本未钉（用 `jev-latest`）、② 未记录真实版本与用量、③ 中文置信度未校准且 CJK 地板偏低（0.5）。这三项按 7.3 的片段补上即可与网上最佳实践对齐；其中 ①②③ 已于 2026-10-16 落到 `src/jev.ts`（见下方「实施记录」），④ 为持续性校准工作。
+当前 jev 接线在**治理与 fail-open** 上已超出官网公开文档的要求。原列的三处可量化缺口（① 模型版本未钉、② 未记录真实版本与用量、③ CJK 地板 0.5）已于 2026-10-16 落到 `src/jev.ts`（见下方「实施记录」）；**当前唯一持续缺口是中文置信度校准**（分桶精度 + 人工抽检回流），坐席状态文本未剥离“指令型”内容仍依赖 fail-open + 人在环。
 
 ### 7.5 实施记录（2026-10-16）
 - `jev.ts:jevConfig` 默认版本由 `jev-latest` 钉为 `jev-1.13.0`（多源印证 jev-latest 解析到 jev-1.13.0）；仍显式用别名（*-latest）时启动告警一次；base 增加 trim。
 - `postSystemOne` 的 span 新增 `gen_ai.response.model` 与 `bx.jev.usage`（取自响应顶层），请求别名仍记 `gen_ai.request.model` 以便对比漂移。
 - `JEV_REVIEW_AT` 默认值 `0.5 → 0.6`（CJK 地板），可经 `JEV_REVIEW_AT` 覆盖；`supportSendAllowed` 改为「仅 `p<0.6` 且非 null 才放行」（fail-open：模糊/无结果一律拒发，由坐席确认卡兜底）。
-- 行为变更提醒：代发闸门以前在 `p∈[0.6,0.9)` 放行（交确认卡），现在该一带直接拒发；这是更保守的 fail-open，与网上最佳实践一致。回归见 `tests/jev-governance.test.ts`（[J] 已同步更新地板断言）。
+- 行为变更提醒：代发闸门以前在 `p∈[0.5,0.9)` 放行（交确认卡），现在该一带直接拒发；这是更保守的 fail-open，与网上最佳实践一致。回归见 `tests/jev-governance.test.ts`（[J] 已同步更新地板断言）。
 - **连通性实测（2026-10-16）**：本实现打 TypeSafe 私有路由 `POST /v1/systemone`。① 直连 `api.typesafe.ai` 用 OpenRouter key → 401（key 不属 TypeSafe）；② 走 `openrouter.ai/api/v1/systemone`（key 有效）→ 400 schema（OpenRouter 不代理该路由，只走 `/api/v1/chat/completions` + `typesafe/jev-1.13`，另一套集成）。**结论：`.env` 指 OpenRouter 时 jev 每次调用都失败并 fail-open（标签恒「没有结果」、代发永不放行）——安全但无产出。要真正启用须 `JEV_BASE_URL=https://api.typesafe.ai` + 一个 TypeSafe API key；`jev-latest`/OpenRouter slug 分别为 `jev-1.13.0`/`typesafe/jev-1.13`。**

@@ -2,7 +2,7 @@
 
 # 门户总 Agent 分发 + 子 Agent 独立鉴权（定稿建议）
 
-> **状态**：设计定稿（按产品确认的建议写入；**待实现**）  
+> **状态**：**已废止（历史设计稿）**——门户总 Agent / 分发协议 / 按域保险箱均未进入当前实现；当前入口为实体页面路由（含 `/trace`），无 `/agents/home`。
 > **日期**：2026-09-10  
 > **关联**：[`MULTI_AGENT_ARCHITECTURE.md`](./MULTI_AGENT_ARCHITECTURE.md)（进程内 Supervisor + Worker）；[`A2A_INTEGRATION.md`](./A2A_INTEGRATION.md)（跨进程远程子 Agent，挂阶段 C）；问数设计见 [`../superpowers/specs/2026-09-09-metabase-analytics-agent-design.md`](../superpowers/specs/2026-09-09-metabase-analytics-agent-design.md)  
 > **产品目标**：门户点进去先进入**总 Agent**，由总 Agent **分发**到各子 Agent；**每个子 Agent 鉴权相互独立，禁止共用后台运营账密冒充。**
@@ -214,7 +214,7 @@ type DispatchResult =
 
 ---
 
-## 11. 阶段 A 验收清单（实现时勾选）
+## 11. 阶段 A 验收清单（历史设计，未实施）
 
 - [ ] `/agents/home` 可打开，ChatShell 与其它 Agent 同框  
 - [ ] 门户可一键进总台；子 Agent 仍可直达  
@@ -230,4 +230,4 @@ type DispatchResult =
 
 | 日期 | 事项 |
 |---|---|
-| 2026-09-10 | 产品确认建议方案；本文落盘为定稿建议；**代码未开工** |
+| 2026-09-10 | 产品确认建议方案；本文落盘为定稿建议；**代码未开工**（2026-11-23 复核：方案已废止，仍无 `/agents/home` 路由） |

@@ -1,7 +1,7 @@
 # ChatPage.vue 阶段 2 拆分设计（P1-1 第二阶段）
 
 - 日期：2026-11-18
-- 状态：设计已审阅；**阶段 2 执行中**——C0/T0/T1/T2/T3 已提交，T4（provide 契约加固）已提交 `dab6470`（2026-11-19，详见实施计划 §7）
+- 状态：设计已审阅；**阶段 2 执行中**——C0/T0–T5、T6 C10–C13、T7 C14/C15 已提交；C16 前置方案见实施计划 §10.8，C17–C26 见 §10.2/§10.9（进度以实施计划为准）
 - 对应阶段 1：`docs/superpowers/specs/2026-11-17-chat-page-refactor-design.md`、`docs/superpowers/plans/2026-11-17-chat-page-core-extraction-plan.md`
 - 细化实施计划：`docs/superpowers/plans/2026-11-19-chat-page-phase2-implementation-plan.md`
 - 基线提交：`5e962ca refactor(web): extract ChatPage core and harden frontend`
@@ -121,10 +121,10 @@ useChatPageCore.ts（协调层）
 | 1 | 拆 SCC C：`modelSettings → threadScroll → reasoningUI` | 新增 3 个 composables；Run 保留协调层 | 发送/停止焦点、跟底、思考计时、模型 auto 黑名单 | ✅ `3f6d81c`，回滚：单提交 revert |
 | 2 | 拆 SCC A：会话壳 + 列表 + 右键 + 任务 | 新增 1 个 SCC composable，共享状态留根后拆（裁剪边界见实施计划 §5.3） | 任务表单、拖拽排序、右键键盘、删除撤销 5s、归档/免打扰/发送模式 | ✅ `23c9d28`：33 web 测试与全门禁绿；回滚：单提交 revert |
 | 3 | 拆 SCC B：MCP + 技能 + 工具 + 专家 | 新增 `useChatToolPanels.ts` | 勾选/重连、拼音搜索、专家 chip、任务表单复用可用集 | ✅ 已提交 `1bbf757`：50 声明 AST 无 DIFF，web 42/42 + 全门禁绿 |
-| 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 已提交 `dab6470`：41 键顺序锁定，`satisfies` + DEV 断言就位，web 45/45；`bubble-context.ts` 无需改动 | 单提交 revert |
-| 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；T5 低风险 UI 完成 | 每组件单提交 revert |
-| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | C10 `58bd836`（19 动作 + keydown emit、web 49/49）、C11 `383630e`（39 props / 29 emits、双 ref 桥接、遮罩留根、web 53/53）、C12 `5de59a9`（39 props / 38 emits、四 ref 桥接、web 58/58）、C13 `f9e8ac8`（63 props / 40 emits、四 ref 桥接、三类 patch 留根、web 63/63）已提交；T7 C14 `8d0a645`（侧栏品牌 CSS 下沉，web 64/64）、C15 `d65b575`（定时任务卡片 CSS 下沉，web 64/64）已提交；详细方案见实施计划 §9.4 / §10.6 / §10.7；其余仍需守 `@click.stop`、Esc 优先级（右键菜单冒泡 / 任务表单 capture）、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | 每组件单提交 revert |
-| 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | 每块单提交 revert |
+| 4 | provide 契约加固 | `useChatPageCore.ts`、新增 `tests/bubble-context-contract.test.ts` | 41 键顺序锁定、`satisfies` + DEV 断言、web 45/45 | ✅ 已提交 `dab6470`；回滚：单提交 revert |
+| 5 | UI 子组件（低风险）：`DoneToast` → `ArtifactPreviewModal` → `ConfirmDialog` → `ChatThread` | 新增 `components/chat/*.vue`；改 `ChatPage.vue` template | 模板渲染与交互回归、web 45/45 | ✅ C6 `8631510` / C7 `aa556d0` / C8 `dbb4569` / C9 `e87c4b0` 已提交；每组件单提交 revert |
+| 6 | UI 子组件（高风险）：`ContextMenuHost` → `ChatSidebarList` → `MessageComposer` → `ChatTaskPanel` | 同上 | 19/39/39/63 props 与动作/键盘/遮罩回归、web 49→64；守 `@click.stop`、Esc 优先级、`#task-panel-host` 顺序、`v-model="current.input"`、provide 链 | ✅ C10 `58bd836` / C11 `383630e` / C12 `5de59a9` / C13 `f9e8ac8`、C14 `8d0a645` / C15 `d65b575` 已提交；每组件单提交 revert |
+| 7 | CSS 下沉 | 新增对应 `components/chat/*.css`；改 `chat-page.css` | 截图对比侧栏/任务表单/弹窗/气泡/输入区 | C14/C15 已完成；C16 前置方案见实施计划 §10.8，C17–C26 待前置方案（§10.9） |
 
 ### 6.1 每步验收命令
 
@@ -136,7 +136,7 @@ pnpm test && pnpm --filter @bx/web test
 git diff --check
 ```
 
-Chrome 手工清单：
+Chrome 定向实测（C10–C15 已逐项执行）+ 全清单冒烟（非阻塞，实例冲突解除后补跑）：
 
 - `/chat → /support → /movie → /chat`：标题、Agent、输入框占位符正确，每次 path 变化重挂载。
 - 发送普通消息、停止、续传；焦点与跟底正常。
@@ -211,4 +211,4 @@ Chrome 手工清单：
 
 ## 11. 交付物与下一步
 
-本文档只定义阶段 2 的设计边界、SCC、UI/CSS 边界、风险与验收。用户审阅确认后，再写细化实施计划（逐文件、逐命令、逐回滚点）。阶段 2 当前状态：**仅设计，未实施**。
+本文档只定义阶段 2 的设计边界、SCC、UI/CSS 边界、风险与验收。细化实施计划见 §0 链接。阶段 2 当前状态：**执行中**（截至 2026-11-19，C14/C15 已提交，C16 待实施），进度以实施计划为准。
