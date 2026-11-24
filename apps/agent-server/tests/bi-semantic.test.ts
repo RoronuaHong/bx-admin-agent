@@ -331,6 +331,17 @@ test("维度来源：禁用列与合法列同时出现仍判冲突（混合写�
   expect(checkCaliber("SELECT u.countryCode, count() FROM film_report.elt_user_full u GROUP BY u.countryCode", g).violations).toEqual([]);
 });
 
+test("维度来源：禁用列换大小写仍判冲突（不能靠大小写绕过 reject）", () => {
+  const g = {
+    entries: [{
+      id: "country_dimension", status: "approved",
+      check: { type: "dimension_source", allowed: ["elt_user_full.countryCode"], forbidden: ["elt_app_params.ipCountryCode"] },
+    }],
+  };
+  const upper = checkCaliber("SELECT u.countryCode, count() FROM film_report.elt_user_full u JOIN film_report.elt_app_params a ON u.guid = a.guid GROUP BY u.countryCode, a.IPCOUNTRYCODE", g);
+  expect(upper.violations.map((v: { id: string }) => v.id)).toEqual(["country_dimension"]);
+});
+
 test("口径命中：长自然语言问题包含短别名时也能命中（B5 第二路径）", () => {
   const real = loadGlossary()!;
   const r = metricDefinitions(real, "已支付订单的订单金额按天统计");

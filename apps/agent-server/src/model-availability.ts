@@ -163,6 +163,12 @@ export function noteDownFailure(
   if (!isModelDownFailure(failure)) return null;
   const coolingMs = modelDownCooldownMs(failure, now);
   const until = now + coolingMs;
+  const prevUntil = quotaCooldownUntil.get(modelId) || 0;
+  // 后到的弱失败（90s 的 429）不能缩短已生效的强失败冷却（可到 UTC 日切），
+  // 否则额度耗尽的模型很快又被当新模型重试。
+  if (prevUntil > until) {
+    return { coolingMs: prevUntil - now, status: quotaCooldownStatus.get(modelId) || null };
+  }
   quotaCooldownUntil.set(modelId, until);
   const status = modelAvailabilityStatus(failure);
   if (status) quotaCooldownStatus.set(modelId, status);
@@ -178,6 +184,9 @@ export function noteDownFailure(
 export function noteDailyQuotaExhausted(modelId: string, now = Date.now()): number {
   const coolingMs = dailyQuotaCooldownMs(now);
   const until = now + coolingMs;
+  const prevUntil = quotaCooldownUntil.get(modelId) || 0;
+  // 已经是更长的冷却就保持原样（含原状态码），不被本调用缩短或改写成 402。
+  if (prevUntil > until) return prevUntil - now;
   quotaCooldownUntil.set(modelId, until);
   // 每日免费额度耗尽本质属「额度 / 余额没了」，与 modelAvailabilityStatus 的归口一致，记 402 而非 429。
   quotaCooldownStatus.set(modelId, "402");

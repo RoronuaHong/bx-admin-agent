@@ -225,3 +225,20 @@ test("预警破线后下一拍比 cron 更密，cron 本身不改", async () => 
   expect(after?.nextRunAt || 0).toBeLessThan(cronNext || 0);
   expect((after?.nextRunAt || 0) - (after?.lastRunAt || 0)).toBeGreaterThanOrEqual(5 * 60_000 - 50);
 });
+
+test("same 落点任务被占用时同样排队补跑，runMode 不随重试漂移", async () => {
+  const now = Date.now();
+  const due = now - 20_000;
+  await patchSchedule(id, OWNER, {
+    enabled: true,
+    cron: "0 * * * *",
+    runMode: "same",
+    nextRunAt: due,
+  });
+  await schedulerTick(async () => "skipped", now);
+  const after = await getSchedule(id);
+  expect(after?.runMode).toBe("same");
+  expect(after?.nextRunAt).toBe(due); // 钉住到点时刻，下一 tick 还补
+  expect(after?.queuedSince).toBe(now);
+  expect(after?.lastStatus).toBe("skipped");
+});

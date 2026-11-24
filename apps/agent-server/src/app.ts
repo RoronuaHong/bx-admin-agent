@@ -340,6 +340,8 @@ async function consumeTask(
     omitBuiltinTools?: string[];
     /** 点名调用也会拒绝，并把拒绝写进本期工具记录（定时运行用）。 */
     denyBuiltinTools?: string[];
+    /** 本次运行只放行这些内置工具（交互式显式传入才收窄；不传等价现状）。 */
+    toolAllowlist?: string[];
     /** 无人值守结论协议：本轮没取到可核对的数据时，正文按 alert / report 协议结论化（定时运行用）。 */
     unattendedConclusion?: "alert" | "report";
     /** 指令问了启用/频率时附上的已保存配置原句。 */
@@ -1757,7 +1759,7 @@ export function createApp() {
   // 收束后结果回投进对话消息快照，重连可用 GET /chat/task/events 续传。
   app.post("/chat/stream", async (c) => {
     try {
-      const body = await readJson<{ text?: string; model?: string; images?: string[]; attachments?: string[]; conversationId?: string; agentId?: string; timeZone?: string }>(c);
+      const body = await readJson<{ text?: string; model?: string; images?: string[]; attachments?: string[]; conversationId?: string; agentId?: string; timeZone?: string; toolAllowlist?: string[] }>(c);
       const text = String(body.text || "").trim().slice(0, MAX_INPUT_LEN);
       if (!text) return errorJson(c, 400, "CHAT_EMPTY_INPUT", "请输入内容");
       if (body.agentId !== undefined && body.agentId !== "" && !hasRole(body.agentId)) {
@@ -1843,6 +1845,9 @@ export function createApp() {
         sessionId: session.id,
         ownerKey: owner,
         ...(timeZone ? { timeZone } : {}),
+        ...(Array.isArray(body.toolAllowlist)
+          ? { toolAllowlist: body.toolAllowlist.filter((x): x is string => typeof x === "string") }
+          : {}),
       });
 
       const stream = streamNdjson(async (send) => {
@@ -2135,6 +2140,9 @@ export function createApp() {
     return c.json({ conversation: { ...doc, running: isTaskRunning(doc.id) } });
   });
 
+  // 待发队列上限：PATCH 与原子入队共用同一口径。
+  const QUEUE_CAP = 20;
+
   // 更新对话设置：标题 / 模型 / MCP 启用集 / 语言 / 待发队列 / 置顶（未提供的字段保持不变）。
   app.patch("/chat/conversations/:id", async (c) => {
     const id = c.req.param("id");
@@ -2161,7 +2169,23 @@ export function createApp() {
       patch.mcpServers = body.mcpServers.filter((x): x is string => typeof x === "string");
     }
     if (typeof body.locale === "string") patch.locale = body.locale;
-    if (Array.isArray(body.pendingQueue)) patch.pendingQueue = body.pendingQueue;
+    if (Array.isArray(body.pendingQueue)) {
+      // 整体 PATCH 曾经可绕过 QUEUE_CAP 与形状校验：这里补齐服务端边界，
+      // 客户端删/改/排序仍可用 PATCH，但不能塞入畸形项或超限队列。
+      if (body.pendingQueue.length > QUEUE_CAP) {
+        return errorJson(c, 400, "CHAT_QUEUE_FULL", "排队消息已达上限");
+      }
+      const valid = body.pendingQueue.every(
+        (item) =>
+          item &&
+          typeof item.text === "string" &&
+          typeof item.at === "number" &&
+          (!item.images || Array.isArray(item.images)) &&
+          (!item.docs || Array.isArray(item.docs)),
+      );
+      if (!valid) return errorJson(c, 400, "BAD_REQUEST", "队列消息格式无效");
+      patch.pendingQueue = body.pendingQueue;
+    }
     // 置顶：null = 取消置顶，数字 = 置顶时间戳。
     if (body.pinnedAt === null) patch.pinnedAt = null;
     else if (typeof body.pinnedAt === "number") patch.pinnedAt = body.pinnedAt;
@@ -2175,7 +2199,6 @@ export function createApp() {
   });
 
   // 待发队列原子入队（B6）：多标签 / 自动出队并发下，整体 PATCH 会互相覆盖丢项，这里走 $push。
-  const QUEUE_CAP = 20;
   app.post("/chat/conversations/:id/queue/enqueue", async (c) => {
     const id = c.req.param("id");
     if (await conversationNotFoundFor(c, id)) return errorJson(c, 404, "CHAT_CONVERSATION_NOT_FOUND", "对话不存在");

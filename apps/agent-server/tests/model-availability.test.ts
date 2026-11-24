@@ -8,6 +8,7 @@ import { test, expect, beforeEach, afterEach } from "vitest";
 import {
   modelAvailabilityStatus,
   noteDailyQuotaExhausted,
+  noteDownFailure,
   quotaCooldownUntil,
   quotaCooldownStatus,
   uniformFailureStatus,
@@ -100,4 +101,13 @@ test("noteDailyQuotaExhausted 把冷却状态记成 402（与 modelAvailabilityS
   noteDailyQuotaExhausted("kimi-free", 0);
   expect(quotaCooldownStatus.get("kimi-free")).toBe("402");
   expect(quotaCooldownUntil.get("kimi-free")).toBeGreaterThan(0);
+});
+
+test("后到的短冷却不能缩短已有长冷却，也不能改写状态码", () => {
+  noteDailyQuotaExhausted("short-cool", 0);
+  const until = quotaCooldownUntil.get("short-cool")!;
+  const result = noteDownFailure("short-cool", "model http 429 rate limit", 1000);
+  expect(quotaCooldownUntil.get("short-cool")).toBe(until);
+  expect(quotaCooldownStatus.get("short-cool")).toBe("402");
+  expect(result?.coolingMs).toBe(until - 1000);
 });

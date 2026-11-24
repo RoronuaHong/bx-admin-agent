@@ -81,6 +81,7 @@ import {
   decideGrounding,
   hasBusinessDataSource,
   hasExternalDataSource,
+  isExternalDataSourceTool,
   isGroundingEvidenceTool,
   MAX_UNSUPPORTED_CLAIMS,
   parseDataNeed,
@@ -2335,6 +2336,9 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
   let pseudoCallRetried = false;
   // 第 3 批 P2-2 三维统计：真实执行的失败 / 综合轮 / 同工具重复峰值（回填 usage 事件，进在线评测）。
   let toolFailures = 0;
+  // 接地提示专用：只记**本轮外部数据源工具**的失败。toolFailures 是整 run 累计的任意工具失败，
+  // 不能直接喂给 buildGroundingHint / honestFallbackWith（它们的契约是「本轮取数失败」）。
+  let dataSourceFetchFailed = false;
   let synthesisRounds = 0;
   /**
    * 标记「本轮即综合轮」（P2-2 收敛质量）：产出最终答案的那一轮。
@@ -2400,6 +2404,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     // executedSigs 也会把上一轮的去重记录错成本轮的（同参调用被误判「本轮已执行过」而跳过）。
     executedSigs.clear();
     roundExecuted = [];
+    dataSourceFetchFailed = false;
     // 成本护栏：轮次上限之外的第二道闸门。累计每轮实际发送的 prompt（历史 + 工具 schema）
     // 估算，超过预算即停止继续调用（已生成内容仍会正常返回）。
     if (MAX_TOTAL_TOKENS > 0) {
@@ -2678,7 +2683,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         groundingRetries += 1;
         text = text.slice(0, Math.max(0, text.length - outcome.text.length));
         conversation.push({ role: "assistant", content: outcome.text });
-        conversation.push({ role: "user", content: buildGroundingHint(toolFailures > 0) });
+        conversation.push({ role: "user", content: buildGroundingHint(dataSourceFetchFailed) });
         console.log("[chat:grounding] 未取得任何工具数据即作答，已作废并回灌纠正提示");
         continue;
       }
@@ -2707,7 +2712,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           priorTopicMessages(turns, userQuestion),
           ctx.groundingWebOnly === true,
           ctx.signal,
-          toolFailures > 0,
+          dataSourceFetchFailed,
         );
         const finalHonest = honest || UNGROUNDED_REPLY;
         console.log(
@@ -3295,7 +3300,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
               toolHealth.record(item.call.name, batchErrorKind);
               noteToolCall(item.call.name);
               // P2-2 工具健康度：只记真实执行的失败（闸门拒绝/同轮跳过/熔断摘除都不计）。
-              if (!out.ok) toolFailures += 1;
+              if (!out.ok) {
+                toolFailures += 1;
+                if (isExternalDataSourceTool(item.call.name)) dataSourceFetchFailed = true;
+              }
               if (out.ok && !executedSigRounds.has(item.sig)) executedSigRounds.set(item.sig, round);
             }
             if (out.executed && out.ok && isGroundingEvidenceTool(item.call.name)) {
@@ -3687,7 +3695,10 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         toolHealth.record(call.name, classifyToolFailure({ executed, ok, text: rawText, aborted: ctx.signal?.aborted }));
         noteToolCall(call.name);
         // P2-2 工具健康度：只记真实执行的失败（未执行的拒绝/跳过不进分母，见 LoopOutcome 注释）。
-        if (!ok) toolFailures += 1;
+        if (!ok) {
+          toolFailures += 1;
+          if (isExternalDataSourceTool(call.name)) dataSourceFetchFailed = true;
+        }
         if (ok && !executedSigRounds.has(sig)) executedSigRounds.set(sig, round);
       }
       // 接地证据（详见 src/grounding.ts）：真正执行成功、且引入外部数据的工具才算「答案有数据支撑」；

@@ -388,7 +388,12 @@ export async function search(
   viewer?: RagViewer,
 ): Promise<RagHit[]> {
   let docs = loadIndex().docs;
-  if (namespace) docs = docs.filter((d) => matchesNamespace(d, effectiveNamespace(namespace)));
+  if (namespace) {
+    // effectiveNamespace 会读索引判「专属语料是否为空」：必须在 filter 外算一次，
+    // 否则每条文档都重读一遍索引，大库下退化成 O(N²)。
+    const ns = effectiveNamespace(namespace);
+    docs = docs.filter((d) => matchesNamespace(d, ns));
+  }
   // 权限过滤：与命名空间过滤同一层做掉，不可见的文档根本不进召回（不是「召回后隐藏」——
   // 那样排序与 RRF 融合仍会被不可见内容影响，等于按别人的语料排自己的结果）。
   docs = docs.filter((d) => visibleTo(d, viewer));

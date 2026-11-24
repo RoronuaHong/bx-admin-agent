@@ -26,6 +26,7 @@ function readJsonCached(file) {
 }
 
 const bare = (s) => String(s || "").replace(/[`"]/g, "").trim().toLowerCase().split(".").pop();
+const escapeRe = (s) => String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // ---- 外键健康 ----
 
@@ -203,7 +204,7 @@ export function caliberValueAliases(glossary, query, retrievedColumns) {
 }
 
 const stripComments = (sql) => String(sql || "").replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
-const refsTable = (sql, table) => new RegExp(`\\b${bare(table)}\\b`, "i").test(sql);
+const refsTable = (sql, table) => new RegExp(`\\b${escapeRe(bare(table))}\\b`, "i").test(sql);
 
 /** SQL 里对某列的「过滤取值集合」：支持 = v / IN (..) / 多个 = v 用 OR 连接；没有过滤返回 null。 */
 export function filterValues(sql, column) {
@@ -271,7 +272,9 @@ const CHECKS = {
     const s = stripComments(sql).replace(/(?:`?\w+`?\.)*`(\w+)`\s+AS\s+`\1`/g, " ");
     const hit = (ref) => {
       const [t, c] = ref.split(".").slice(-2);
-      return refsTable(s, t) && new RegExp(`\\b${c}\\b`).test(s);
+      // 与 filterValues / 表名匹配同口径：SQL 标识符大小写不敏感，禁列必须忽略大小写，
+      // 否则把 IPCOUNTRYCODE 写成大写即可绕过 enforce:reject。
+      return refsTable(s, t) && new RegExp(`\\b${escapeRe(bare(c))}\\b`, "i").test(s);
     };
     const bad = forbidden.filter(hit);
     const good = allowed.filter(hit);

@@ -255,7 +255,7 @@ function runShell(
           const code = (err as { code?: number | string }).code;
           // 输出超缓冲不再判「整体失败」：命令其实跑过了，给模型头尾并显式标注被截断（§13.4 B），
           // 好过一句「执行失败」却什么内容都拿不到。
-          if (code === "ERR_CHILD_PROCESS_MAXBUFFER") {
+          if (code === "ERR_CHILD_PROCESS_MAXBUFFER" || code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
             const body = truncateShellOutput(formatShellStream(out, errOut, "stdout"), RUN_OUTPUT_MAX_CHARS);
             resolve({
               ok: true,

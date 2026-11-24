@@ -186,3 +186,43 @@ test("[G] 未读清零：打开任一期后 unreadRuns 归 0", async () => {
   expect(after.unreadRuns).toBe(0);
   expect(after.runs?.length).toBe(1); // 清零不能顺手把历史清掉
 });
+
+test("[H] purpose 默认值固化：预警 = on_alert + same，报告 = always + new", async () => {
+  const alert = await createScheduleTask({
+    ownerKey: owner("h-alert"),
+    prompt: "水位预警",
+    name: "水位预警",
+    cron: "0 9 * * *",
+    purpose: "alert",
+  });
+  if (!alert.ok) throw new Error(alert.error);
+  expect(alert.schedule.purpose).toBe("alert");
+  expect(alert.schedule.notifyPolicy).toBe("on_alert");
+  expect(alert.schedule.runMode).toBe("same");
+
+  const report = await createScheduleTask({
+    ownerKey: owner("h-report"),
+    prompt: "每日汇总",
+    name: "每日汇总",
+    cron: "0 9 * * *",
+    purpose: "report",
+  });
+  if (!report.ok) throw new Error(report.error);
+  expect(report.schedule.purpose).toBe("report");
+  expect(report.schedule.notifyPolicy).toBe("always");
+  expect(report.schedule.runMode).toBe("new");
+});
+
+test("[I] same 落点两期复用同一会话：runs 去重、unreadRuns 累加、回投对话不变", async () => {
+  const { schedule } = await makeTask("i", "same");
+  const at1 = Date.now() - 86_400_000;
+  const at2 = Date.now();
+  await recordScheduleRun(schedule, schedule.conversationId, at1, "success");
+  await recordScheduleRun(schedule, schedule.conversationId, at2, "success");
+  const updated = (await listSchedules(owner("i")))[0]!;
+  expect(updated.runMode).toBe("same");
+  expect(updated.conversationId).toBe(schedule.conversationId);
+  expect(updated.runs?.length).toBe(1); // 同一会话只占一条执行记录
+  expect(updated.runs?.[0]?.at).toBe(at2); // 新一期顶掉旧一期的时间
+  expect(updated.unreadRuns).toBe(2); // 两期各计一次未读，去重不等于丢未读
+});
