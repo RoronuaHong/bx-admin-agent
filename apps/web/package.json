@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "type-check": "vue-tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:chunks": "node scripts/check-chunk-graph.mjs"
   },
   "dependencies": {
     "@antv/g2": "^5.4.8",

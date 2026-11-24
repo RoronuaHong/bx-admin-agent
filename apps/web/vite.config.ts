@@ -54,12 +54,23 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (!id.includes("/node_modules/")) return;
+          // pinyin-pro 保持按需：单独成块，避免拖入通用 vendor。
+          if (id.includes("/pinyin-pro/")) return "vendor-pinyin-pro";
+          // Vue 核心归位：runtime/reactivity/shared/vue/vue-router 统一到 vendor-vue。
+          if (
+            id.includes("/@vue/runtime-") ||
+            id.includes("/@vue/reactivity") ||
+            id.includes("/@vue/shared") ||
+            id.includes("/vue/") ||
+            id.includes("/vue-router/")
+          ) return "vendor-vue";
           if (id.includes("/@antv/g2/")) return "vendor-antv-g2";
           if (id.includes("/@antv/g6/")) return "vendor-antv-g6";
           if (id.includes("/@antv/")) return "vendor-antv";
+          // 顶层 d3 归 vendor-antv-d3；放在 @antv 之后，@antv 内部自带 d3 不会被误拆。
+          if (/\/d3-[^/]*\//.test(id) || id.includes("/internmap/")) return "vendor-antv-d3";
           if (id.includes("/markdown-it/") || id.includes("/dompurify/")) return "vendor-richtext";
           if (id.includes("/highlight.js/")) return "vendor-highlight";
-          if (id.includes("/vue/") || id.includes("/vue-router/")) return "vendor-vue";
           return "vendor";
         },
       },

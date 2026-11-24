@@ -200,3 +200,42 @@
 **验证**：`pnpm type-check` 0；web 9 文件 / 64 用例全绿；server 141 文件全绿；`pnpm build` 0；`git diff --check` 0（若干 LF→CRLF 提示，非错误）。
 
 **仍未做 / 非本次范围**：BI A/B 全量重跑、FK/owner/隐藏表人工签批、C16/C17 等阶段 2 剩余 CSS 下沉、队列删除/重排原子端点（入队/出队已原子化，见 `chat-preempt-plan.md` B6）、图表兜底大块治理（P3-5；默认告警已恢复）。
+
+---
+
+## 10. 2026-11-24 首屏分包优化基线
+
+> 记录 Dev-1 完成的 `manualChunks` 优化与 Dev-2 固化的自动校验，作为后续改动的回归基线（工作区未提交）。
+
+**改动文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `apps/web/vite.config.ts` | Dev-1：`manualChunks` 拆出 `vendor-pinyin-pro`（pinyin-pro 单独成块、保持按需动态加载）、`vendor-vue`（Vue 核心归位）、`vendor-antv-d3`（顶层 d3 独立，放在 `@antv` 分支之后） |
+| `apps/web/package.json` | Dev-2：scripts 新增 `"check:chunks": "node scripts/check-chunk-graph.mjs"`，其它脚本与依赖不变 |
+| `apps/web/scripts/check-chunk-graph.mjs` | Dev-2：新增；Node 原生 ESM + `node:fs/path`，无第三方依赖 |
+| `docs/engineering-optimization-review.md` | Dev-2：追加本节 |
+
+**首屏体积（静态首屏链 raw / gzip）**：优化前 `1,037,004 / 387,852` → 优化后 `122,795 / 46,920`，**约 -88%**。优化后首屏静态链仅 `index-D8p8t4Wt.js` + `vendor-vue-DEiqpvT8.js` 两个 chunk；`ChatPage` 与 pinyin-pro 均在首屏链之外。
+
+**三个新 chunk（本次构建产物名与大小）**：
+
+| chunk | raw | gzip |
+|---|---|---|
+| `vendor-pinyin-pro-Budwu9JC.js` | 312,387 B (312.39 kB) | 142.45 kB |
+| `vendor-vue-DEiqpvT8.js` | 107,580 B (107.58 kB) | 41.71 kB |
+| `vendor-antv-d3-Cq76ZsQx.js` | 121,112 B (121.11 kB) | 43.97 kB |
+
+**不变项**：CSS 与 `ChatPage` 产物逐字节基本不变——`ChatPage-CBpzxIm8.css`（100,066 B）、`ChatPage-BB0yPlje.js`（304,068 B）在优化前后文件名 hash 一致；优化仅调整第三方依赖的分块归属，未触碰页面源码与样式。
+
+**校验命令**：`pnpm --filter @bx/web build && pnpm --filter @bx/web check:chunks`。
+
+**校验覆盖的断言**（`check:chunks` 输出首屏链清单与逐项结果，任一失败退出码 1）：
+
+1. 首屏静态链（从 `dist/index.html` 入口递归 `from "./x.js"` / `import "./x.js"`）不含 pinyin-pro 指纹 `NumberDICT`；
+2. 首屏静态链不含 `ChatPage-*.js`；
+3. `dist/assets` 恰有一个 `vendor-pinyin-pro-*.js`，且存在其它 chunk 对它做动态 `import("./...")`；
+4. `vendor-vue-*.js` 存在且静态 import 数必须为 0；
+5. `ChatPage-*.js` 与 `ChatPage-*.css` 各一份。
+
+**本次基线验证结果**：`build` 成功、`check:chunks` **8/8 PASS**，退出码 0。新增了 `ChatPage` 不在首屏链的守护与 `vendor-vue` 零静态依赖的强断言，当前构建产物实测通过。
