@@ -26,7 +26,7 @@ const MAX_BINARY_BYTES = Number(process.env.FS_MAX_BINARY_BYTES || 20 * 1024 * 1
  * 工作区不是任意二进制仓库，放行未知扩展名等于给「下载任意字节」开后门。
  * 文本类扩展名（csv/json/md/txt）不在此列——它们走 `fsWrite` 的文本路径。
  */
-const BINARY_EXTS = new Set([".xlsx", ".xls", ".pdf", ".docx", ".zip"]);
+const BINARY_EXTS = new Set([".xlsx", ".xls", ".pdf", ".docx", ".zip", ".pptx"]);
 
 /** 扩展名 → MIME（下载响应与产物卡片共用一份；未知扩展名回落 application/octet-stream）。 */
 const MIME_BY_EXT: Record<string, string> = {
@@ -40,6 +40,7 @@ const MIME_BY_EXT: Record<string, string> = {
   ".xls": "application/vnd.ms-excel",
   ".pdf": "application/pdf",
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   ".zip": "application/zip",
   ".png": "image/png",
   ".jpg": "image/jpeg",

@@ -1,10 +1,12 @@
 // export_data 格式扩展回归（2026-09-23）：
 // 钉住「8 种格式都能产出真实文件」+ 多表策略 + 扩展名别名 + 分格式行数上限，
 // 避免将来改动把 pdf/docx 又退回「只能如实报错说做不到」。
+// 2026-11-24：pptx additive——多表放行用注入 builder 验计划、不生成真二进制；
+// 另加 [A2] 逐字锁住既有 8 格式的 name/mime/魔数/成功文案，证明 pptx 只做加法。
 // 依赖：docx / pdfmake 两个运行时依赖 + assets/fonts/NotoSansSC-Regular.otf 字体资产。
 import { test, expect, afterAll } from "vitest";
 import fs from "node:fs";
-import { execBuiltin } from "../src/builtins.js";
+import { execBuiltin, setPptxBuilderForTest, type PptxPlan } from "../src/builtins.js";
 import { fsRemoveConversation, fsResolve } from "../src/fs-store.js";
 
 const CONV = "vitest-export-formats";
@@ -26,6 +28,35 @@ test("[A] 八种格式都生成真实文件（非空、可落盘）", async () =
     const out = await run({ filename: `回归.${fmt}`, title: "回归", rows });
     expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
     expect(fs.statSync(absOf(out.artifact!.path)).size, fmt).toBeGreaterThan(0);
+  }
+});
+
+test("[A2] 既有 8 格式 name/mime/魔数/成功文案逐字不变（pptx 只做加法）", async () => {
+  // 逐字锁定 Dev-1 之前的 8 种格式：文件名清洗、MIME、文件头、成功文案模板都不许被 pptx 带偏。
+  // head 用 UTF-16 长度截取（文本格式含中文，字节数≠字符数）；binary=true 的按 latin1 取魔数。
+  const expected: Array<{ fmt: string; mime: string; head: string; binary?: boolean }> = [
+    { fmt: "xlsx", mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", head: "PK", binary: true },
+    { fmt: "csv", mime: "text/csv; charset=utf-8", head: "\uFEFF名称,数量" },
+    { fmt: "json", mime: "application/json; charset=utf-8", head: '[\n  {\n    "名称": "甲"' },
+    { fmt: "md", mime: "text/markdown; charset=utf-8", head: "# 回归\n" },
+    { fmt: "docx", mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", head: "PK", binary: true },
+    { fmt: "pdf", mime: "application/pdf", head: "%PDF-", binary: true },
+    { fmt: "html", mime: "text/html; charset=utf-8", head: "<!doctype html>" },
+    { fmt: "txt", mime: "text/plain; charset=utf-8", head: "回归\n" },
+  ];
+  for (const { fmt, mime, head, binary } of expected) {
+    const out = await run({ filename: `回归.${fmt}`, title: "回归", rows });
+    expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
+    expect(out.artifact!.name, fmt).toBe(`回归.${fmt}`);
+    expect(out.artifact!.mime, fmt).toBe(mime);
+    const buf = fs.readFileSync(absOf(out.artifact!.path));
+    const actualHead = binary ? buf.toString("latin1", 0, head.length) : buf.toString("utf-8").slice(0, head.length);
+    expect(actualHead, `${fmt} 魔数`).toBe(head);
+    // 成功文案逐字：字节数用 artifact 自报，避免把不同生成器的体积写进断言。
+    const verbatim =
+      `已生成可下载文件：${out.artifact!.path}（${out.artifact!.bytes} 字节，2 行 × 2 列）。` +
+      "它已作为下载卡片显示在对话中；不要在回复里粘贴文件内容，也不要再用 fs_write 另存副本。";
+    expect(out.text, fmt).toBe(verbatim);
   }
 });
 
@@ -191,14 +222,25 @@ test("[C8] pdf/docx 同样自包含（零外链）：合法文件签名 + 无 ht
   }
 });
 
-test("[D] 多表：xlsx/docx/pdf 放行；csv/json/md/html/txt 明确拒绝", async () => {
+test("[D] 多表：xlsx/docx/pdf/pptx 放行；csv/json/md/html/txt 明确拒绝", async () => {
   const sheets = [
     { name: "表一", rows: [{ A: 1 }] },
     { name: "表二", rows: [{ A: 2 }] },
   ];
-  for (const fmt of ["xlsx", "docx", "pdf"]) {
-    const out = await run({ filename: `多表.${fmt}`, sheets });
-    expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
+  // pptx 用注入 builder：只验放行与计划形态，不真实生成二进制（保持测试快）。
+  let pptxPlan: PptxPlan | null = null;
+  setPptxBuilderForTest(async (plan) => {
+    pptxPlan = plan;
+    return new Uint8Array([0x50, 0x4b]);
+  });
+  try {
+    for (const fmt of ["xlsx", "docx", "pdf", "pptx"]) {
+      const out = await run({ filename: `多表.${fmt}`, sheets });
+      expect(out.ok, `${fmt}: ${out.text}`).toBe(true);
+    }
+    expect(pptxPlan!.slides.map((s) => s.kind)).toEqual(["title", "table", "table"]);
+  } finally {
+    setPptxBuilderForTest(null); // 无论断言成败都复位，避免污染后续用例
   }
   for (const fmt of ["csv", "json", "md", "html", "txt"]) {
     const out = await run({ filename: `多表.${fmt}`, sheets });

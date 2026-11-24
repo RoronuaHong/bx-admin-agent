@@ -1,8 +1,9 @@
 // 上传附件进工作区回归（2026-09-24，docs/artifact-delivery-plan.md §16）：
 // A 二进制附件可导入 · B 文本附件也能导入（不被 BINARY_EXTS / 256KB 文本上限卡住）·
 // C 白名单外类型被拒且不中断 · D 配额满时优雅降级 · E 注入文本回报工作区路径。
+// 2026-11-24：F 确认 .pptx 入 BINARY_EXTS 后被 fsRead 当二进制拒绝，.txt/.md 仍可读。
 import { test, expect, afterAll } from "vitest";
-import { fsImportFile, fsList, fsRemoveConversation } from "../src/fs-store.js";
+import { fsImportFile, fsList, fsRead, fsRemoveConversation, fsWriteBinary } from "../src/fs-store.js";
 
 const CONV = "vitest-upload-ws";
 
@@ -49,4 +50,21 @@ test("[E] 导入路径与大小如实回报（注入文本据此告诉模型可�
     expect(res.path).toBe("uploads/数据.csv");
     expect(res.bytes).toBe(7);
   }
+});
+
+test("[F] .pptx 落盘后 fsRead 按二进制拒绝；.txt/.md 仍可读（BINARY_EXTS 不污染文本白名单）", () => {
+  // pptx 是导出产物（走 fsWriteBinary），不是上传附件；这里只验读取侧白名单行为。
+  const pptx = fsWriteBinary(CONV, "uploads/幻灯片.pptx", Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+  expect(pptx, JSON.stringify(pptx)).not.toHaveProperty("error");
+  const denied = fsRead(CONV, "uploads/幻灯片.pptx");
+  expect(denied).toHaveProperty("error");
+  if ("error" in denied) expect(denied.error).toContain(".pptx 是二进制文件");
+
+  // 文本类扩展名绝不能被加进 BINARY_EXTS，否则模型读回草稿会全被拒。
+  expect(fsImportFile(CONV, "uploads/可读.txt", Buffer.from("hello", "utf-8"))).not.toHaveProperty("error");
+  expect(fsImportFile(CONV, "uploads/可读.md", Buffer.from("# 标题", "utf-8"))).not.toHaveProperty("error");
+  const txt = fsRead(CONV, "uploads/可读.txt");
+  const md = fsRead(CONV, "uploads/可读.md");
+  expect("content" in txt && txt.content, JSON.stringify(txt)).toBe("hello");
+  expect("content" in md && md.content, JSON.stringify(md)).toBe("# 标题");
 });

@@ -393,9 +393,9 @@ export function externalRefHint(content: string): string {
  * 这里刻意只做「数据 → 文件」的确定性转换，不接通用代码执行：模型给行数据，格式由服务端保证，
  * 弱模型也不会因为写错脚本而产出坏文件（对齐「产物需求可枚举」的取舍，见 docs/artifact-delivery-plan.md §6）。
  */
-const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md", "docx", "pdf", "html", "txt"]);
+const EXPORT_FORMATS = new Set(["xlsx", "csv", "json", "md", "docx", "pdf", "html", "txt", "pptx"]);
 /** 能承载多张表的格式：其余格式散成多个文件语义更差，故只允许单表。 */
-const MULTI_SHEET_FORMATS = new Set(["xlsx", "docx", "pdf"]);
+const MULTI_SHEET_FORMATS = new Set(["xlsx", "docx", "pdf", "pptx"]);
 /** 走文本路径（fsWrite，256KB 上限）的格式；其余走二进制路径（fsWriteBinary，20MB 上限）。 */
 const TEXT_EXPORT_FORMATS = new Set(["csv", "json", "md", "html", "txt"]);
 /** 报告式格式：载体是「叙述 + 图表 + 表格（可选）」，允许零表格（只给 sections/charts 也能成文）；
@@ -847,7 +847,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
     ),
     spec(
       "export_data",
-      "把**真实数据**导出成可下载文件（xlsx / csv / json / md / docx / pdf / html / txt），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
+      "把**真实数据**导出成可下载文件（xlsx / csv / json / md / docx / pdf / html / txt / pptx），生成后对话里会出现下载卡片，用户点一下即可拿走。" +
         "**调用必带内容**：rows / sheets / sections / charts 至少提供一项；光给 filename 或只给 title 都不行（title 只是大标题文字，不是正文）。" +
         "格式选择：表格/数据 → xlsx 或 csv；网页预览（自包含、可离线打开）→ html；文档式排版（打印/存档）→ pdf 或 docx；纯文本 → txt。" +
         "用户说「导出 / 生成 excel / 生成表格 / 生成 csv / 生成 pdf / 导出 word / 生成文档 / 下载数据 / 生成报告 / 全部放进去」时都用它；**不要**用 fs_write 写文本文件去冒充表格或文档文件。" +
@@ -867,7 +867,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         type: "object",
         properties: {
           filename: jsonType("string", "文件名（含扩展名，如 报表.xlsx、分析报告.html）"),
-          format: jsonType("string", "csv | xlsx | json | md | docx | pdf | html | txt（省略时按 filename 扩展名推断，默认 xlsx）"),
+          format: jsonType("string", "csv | xlsx | json | md | docx | pdf | html | txt | pptx（省略时按 filename 扩展名推断，默认 xlsx）"),
           rows: {
             type: "array",
             description: "单张表的行数据：行对象数组（键即表头）或二维数组（第一行为表头）。报告式导出（html/pdf/docx）可省略（只给 sections/charts）",
@@ -879,7 +879,7 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
           },
           sheets: {
             type: "array",
-            description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；只有 xlsx / docx / pdf 支持多表）",
+            description: "可选：多张表 [{ name, rows, columns? }]（给了 sheets 就忽略 rows；只有 xlsx / docx / pdf / pptx 支持多表）",
             items: { type: "object" },
           },
           title: jsonType("string", "可选：报告标题（html / pdf / docx 的大标题）。注意：title 仅作标题文字，不能替代正文——仍需另行提供 rows / sheets / sections / charts 之一"),
@@ -1461,6 +1461,81 @@ async function buildPdf(
 }
 
 /**
+ * pptx 导出（additive）：只把标题 + 表格编排成「页面计划」——纯函数、无依赖、可单测。
+ * sections/charts 不额外产页；无标题也不编造文案（title 原样落 ""，由生成器决定是否写字）。
+ */
+export type PptxSlidePlan =
+  | { kind: "title"; title: string }
+  | { kind: "table"; name: string; matrix: unknown[][] };
+
+export interface PptxPlan {
+  slides: PptxSlidePlan[];
+}
+
+export function buildPptxPlan({
+  title,
+  built,
+}: {
+  title: string;
+  built: Array<{ name: string; matrix: unknown[][] }>;
+}): PptxPlan {
+  return {
+    slides: [
+      { kind: "title" as const, title: title || "" },
+      ...built.map((s) => ({ kind: "table" as const, name: s.name, matrix: s.matrix })),
+    ],
+  };
+}
+
+/** pptx 生成器签名：成功返回字节，失败返回 error（不抛穿）。 */
+export type PptxBuilder = (plan: PptxPlan) => Promise<Uint8Array | { error: string }>;
+
+/** 测试注入 seam：默认 null（走真实默认 builder）；传 null 复位。 */
+let pptxBuilderForTest: PptxBuilder | null = null;
+export function setPptxBuilderForTest(fn: PptxBuilder | null): void {
+  pptxBuilderForTest = fn;
+}
+
+/** 当前生效的 pptx 生成器：测试注入优先，否则默认。 */
+function pptxBuilder(): PptxBuilder {
+  return pptxBuilderForTest ?? buildPptxDefault;
+}
+
+/** 默认 pptx 生成器：变量 specifier 动态导入 pptxgenjs（仿 rag/parsers.ts:46-55），失败返回 error。 */
+async function buildPptxDefault(plan: PptxPlan): Promise<Uint8Array | { error: string }> {
+  try {
+    const specifier = "pptxgenjs";
+    const mod = (await import(specifier)) as unknown as { default?: unknown } & Record<string, unknown>;
+    const PptxGenJS = (mod.default ?? mod) as new () => {
+      addSlide: () => {
+        addText: (text: string, opts?: Record<string, unknown>) => unknown;
+        addTable: (rows: unknown[][], opts?: Record<string, unknown>) => unknown;
+      };
+      write: (opts: { outputType: string }) => Promise<unknown>;
+    };
+    const pptx = new PptxGenJS();
+    for (const slide of plan.slides) {
+      const page = pptx.addSlide();
+      if (slide.kind === "title") {
+        // 无标题不写占位文字：宁可空白标题页，也不编造用户没给过的文案。
+        if (slide.title) {
+          page.addText(slide.title, { x: 0.5, y: 2.5, w: 9, h: 1, fontSize: 32, bold: true, align: "center" });
+        }
+        continue;
+      }
+      // 每表一页：表名 + addTable（复用 cellValue 做长文本截断与对象文本化）。
+      if (slide.name) page.addText(slide.name, { x: 0.5, y: 0.4, w: 9, h: 0.6, fontSize: 20, bold: true });
+      const rows = slide.matrix.map((row) => row.map((cell) => ({ text: String(cellValue(cell)) })));
+      if (rows.length) page.addTable(rows, { x: 0.5, y: 1.2, w: 9 });
+    }
+    const buf = (await pptx.write({ outputType: "nodebuffer" })) as unknown as Uint8Array;
+    return new Uint8Array(buf);
+  } catch (err) {
+    return { error: `生成 pptx 失败：${String((err as Error)?.message || err)}` };
+  }
+}
+
+/**
  * 执行内置工具；不是内置工具返回 null（交回 MCP 通道）。
  * `conversationId` 用于工作区隔离与 todos 落库；
  * `namespace` 用于知识库按角色隔离（默认 "generic"，由调用方按当前角色传入，不暴露给模型）。
@@ -1929,6 +2004,11 @@ export async function execBuiltin(
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else if (target.format === "pdf") {
         const bytes = await buildPdf(built, title, sections, chartSvgs(charts), chartFallbackTables(charts));
+        if ("error" in bytes) return { ok: false, text: bytes.error };
+        written = fsWriteBinary(conversationId, target.name, bytes);
+      } else if (target.format === "pptx") {
+        // additive：标题页 + 每表一页；sections/charts 不额外产页（由 buildPptxPlan 决定）。
+        const bytes = await pptxBuilder()(buildPptxPlan({ title, built }));
         if ("error" in bytes) return { ok: false, text: bytes.error };
         written = fsWriteBinary(conversationId, target.name, bytes);
       } else {

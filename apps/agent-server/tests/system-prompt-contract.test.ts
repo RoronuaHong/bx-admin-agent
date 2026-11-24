@@ -162,3 +162,33 @@ test("[L] 客服答复骨架示范：制度类与会话事实类各一个输入�
   expect(base).toContain("依据：<来源文件>");
   expect(base).toContain("共 N 条会话");
 });
+
+test("[M] export_data 格式枚举：既有 8 项顺序与文案不变，pptx 只追加在尾部", () => {
+  const spec = builtinToolSpecs().find((s) => s.name === "export_data");
+  expect(spec, "export_data 工具定义缺失").toBeTruthy();
+
+  // ① 工具描述里的枚举（" / " 分隔，顺序与 EXPORT_FORMATS 字面量一致）
+  const desc = spec!.description;
+  const descList = desc.match(/导出成可下载文件（([^）]+)）/)?.[1];
+  expect(descList).toBeTruthy();
+  expect(descList).toBe("xlsx / csv / json / md / docx / pdf / html / txt / pptx");
+  expect(descList!.replace(/ \/ pptx$/, "")).toBe("xlsx / csv / json / md / docx / pdf / html / txt");
+
+  // ② 参数 format 的枚举（" | " 分隔，注意与①的顺序刻意不同，是既有文案）
+  const params = spec!.parameters as { properties?: Record<string, { description?: string }> };
+  const fmtDesc = params.properties?.format?.description ?? "";
+  const fmtList = fmtDesc.split("（")[0];
+  expect(fmtList).toBe("csv | xlsx | json | md | docx | pdf | html | txt | pptx");
+  expect(fmtList.replace(/ \| pptx$/, "")).toBe("csv | xlsx | json | md | docx | pdf | html | txt");
+  expect(fmtDesc).toContain("省略时按 filename 扩展名推断，默认 xlsx");
+
+  // ③ 关键说明文案逐字不变（pptx 只是加法，不重写调用约定 / 反编造 / 行数上限提示）
+  for (const verbatim of [
+    "**调用必带内容**：rows / sheets / sections / charts 至少提供一项",
+    "数据必须来自工具真实返回，禁止编造",
+    "pdf 上限 2000 行、docx 2 万行，其余 5 万行",
+    "报告式格式**可以不带表格**：只给 sections 与 charts（不给 rows/sheets）也能成文",
+  ]) {
+    expect(desc, `export_data 描述文案变了：${verbatim}`).toContain(verbatim);
+  }
+});
