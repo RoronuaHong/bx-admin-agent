@@ -58,6 +58,11 @@ test("describeNetworkError 展开 cause，不把网络故障压成 fetch failed"
   const dns = Object.assign(new Error("fetch failed"), { cause: Object.assign(new Error(""), { code: "ENOTFOUND" }) });
   expect(describeNetworkError(dns)).toMatch(/ENOTFOUND.*域名解析失败/);
 
+  // EAI_AGAIN 是临时解析失败：允许稍后原样重试，不能和 ENOTFOUND 一样判成配置错误。
+  const transientDns = Object.assign(new Error("fetch failed"), { cause: Object.assign(new Error(""), { code: "EAI_AGAIN" }) });
+  expect(describeNetworkError(transientDns)).toMatch(/EAI_AGAIN.*暂时失败/);
+  expect(describeNetworkError(transientDns)).not.toMatch(/重试不会成功/);
+
   // undici 的实际超时文案是 "The operation timed out."，不是 timeout
   const undiciTimeout = Object.assign(new Error("fetch failed"), {
     cause: new Error("The operation timed out."),

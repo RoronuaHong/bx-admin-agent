@@ -102,7 +102,9 @@ export function describeNetworkError(error: unknown): string {
   // 零命中或临时超时；这里明确止错，避免模型对 ECONNREFUSED 反复换关键词重试、白烧轮次。
   const noRetry = "（确定性的服务/配置故障，重试不会成功；请如实告知用户当前无法访问该外部来源，不要用记忆补答案）";
   if (/ECONNREFUSED/i.test(raw)) return `${raw}：检索服务未启动或地址/端口配置错误${noRetry}`;
-  if (/ENOTFOUND|EAI_AGAIN|ENODATA/i.test(raw)) return `${raw}：检索服务域名解析失败，检查 WEB_SEARCH_BASE_URL${noRetry}`;
+  if (/ENOTFOUND|ENODATA/i.test(raw)) return `${raw}：检索服务域名解析失败，检查 WEB_SEARCH_BASE_URL${noRetry}`;
+  // EAI_AGAIN 是「临时解析失败」，语义上可重试；不能和 ENOTFOUND 一起判成配置错误。
+  if (/EAI_AGAIN/i.test(raw)) return `${raw}：检索服务域名解析暂时失败，稍后原样重试即可（不必换关键词）`;
   // undici 的实际文案是 "The operation timed out."，不是 timeout；两种都要认。
   if (/ETIMEDOUT|ABORT_ERR|timeout|timed\s*out/i.test(raw)) return `${raw}：检索服务无响应`;
   if (/CERT_|SSL|SELF_SIGNED/i.test(raw)) return `${raw}：检索服务证书校验失败${noRetry}`;

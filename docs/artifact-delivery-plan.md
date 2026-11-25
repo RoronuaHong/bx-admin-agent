@@ -584,9 +584,10 @@ user: 123
 | 3 | `fs_read ../../..` 只回「非法路径」 | 报错没说工作区外该走哪条路 | 越界报错指向 `run_command` 绝对路径；命令失败在原始报错后附 Windows 语法提示 |
 | 4 | 手写 PowerShell 替换因 CRLF 不匹配返回 `OLD_NOT_FOUND` | 模型从 `fs_read` 复制的片段被规范化成 LF | `fs_edit` 精确匹配 0 命中时做一次 CRLF/LF 归一化重试，写回保持源文件换行风格 |
 | 5 | （补漏）`fs_edit` 把超限文件的截断快照写回 | `fs_read` 超 `FS_MAX_FILE_BYTES` 会附省略标记，而 `fs_edit` 拿它整段回写 → 静默丢尾 | 检测到截断标记即拒绝编辑，明确引导改用 `run_command` 或拆分文件 |
+| 6 | （补漏）`EAI_AGAIN` 被提示「重试不会成功」 | 与 `ENOTFOUND` 合并在同一分支，但前者语义是临时解析失败 | 拆出单独分支，提示稍后原样重试、不必换关键词；`ENOTFOUND`/`ENODATA` 仍按配置错误处理 |
 
-验证：`tests/run-command-shell.test.ts` 扩到 21 例（语言推断 / 扩展名 / 端到端执行 / bash 提示 / 越界提示 / CRLF 编辑 / 截断文件拒绝 / 主子代理提示 / 执行前预检），见 §13.7；
-全量 148 文件 / 1043 测试通过，`pnpm type-check` 通过。
+验证：`tests/run-command-shell.test.ts` 扩到 22 例（语言推断 / 扩展名 / 端到端执行 / bash 提示 / 越界提示 / CRLF 编辑 / 截断文件拒绝 / 主子代理提示 / 执行前预检 / 预检误报），`tests/web-search-availability.test.ts` 补 `EAI_AGAIN` 可重试断言，见 §13.7；
+全量 148 文件 / 1044 测试通过，`pnpm type-check` 通过。
 口径：只改 harness，历史会话记录不动（它是审计证据）。
 
 ### 13.7 防错设计：把错误挡在执行前（2026-11-25）
@@ -602,7 +603,7 @@ user: 123
 
 效果：把「等命令失败 → 读原始报错 → 再猜一次」的循环压成一次调用；错误码前缀也便于模型与日志直接识别，
 等价于给工具返回补了轻量的 `error_code / next_step`（不改 `BuiltinOutcome` 协议）。
-验证：新增 [M] / [M2] / [N] / [N2] 四例；`governance-guardrails [G4]` 的源码窗口由固定 1400 字符改为「到下一个 case」，避免预检分支把 `runShell` 挤出窗口造成误报。
+验证：新增 [M] / [M2] / [M3] / [N] / [N2] 五例（[M3] 锁住「命令链后半段命中时不误报第一段合法命令」）；`governance-guardrails [G4]` 的源码窗口由固定 1400 字符改为「到下一个 case」，避免预检分支把 `runShell` 挤出窗口造成误报。
 
 ---
 

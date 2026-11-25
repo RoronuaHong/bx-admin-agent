@@ -289,10 +289,13 @@ export function nodeScriptExtension(code: string): string {
 export function shellSyntaxPreflight(command: string): string | null {
   if (!IS_WINDOWS) return null;
   const cmd = String(command || "");
-  if (!UNIX_ONLY_CMD_RE.test(cmd)) return null;
-  const first = cmd.trim().split(/[;&|]/)[0]?.trim().split(/\s+/)[0] || "(未知)";
+  const match = UNIX_ONLY_CMD_RE.exec(cmd);
+  if (!match) return null;
+  // 命中可能在命令链后半段（如 `dir && grep foo`）：报错要点名真正不匹配的命令，
+  // 否则会误称合法命令为 Unix 写法，模型据此改错地方。
+  const offending = match[2] || "(未知)";
   return (
-    `[SHELL_SYNTAX] 当前 shell 是 Windows cmd.exe，命令里的「${first}」是 Unix/bash 写法，直接执行必然失败。` +
+    `[SHELL_SYNTAX] 当前 shell 是 Windows cmd.exe，命令里的「${offending}」是 Unix/bash 写法，直接执行必然失败。` +
     "请改用：dir（列目录）/ type（看文件）/ findstr（查文本）/ cd /d D:\\path（切盘）；选项用 / 或 -，不要用 --。" +
     "确需 bash 语法且已装 Git Bash 时，请显式写 bash -c \"...\"。"
   );

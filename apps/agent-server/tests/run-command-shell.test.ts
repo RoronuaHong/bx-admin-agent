@@ -146,6 +146,13 @@ test("[M2] 预检不误伤字符串里的 Unix 词", () => {
   expect(shellSyntaxPreflight('echo "cat this" && dir')).toBeNull();
 });
 
+test("[M3] 预检点名命令链后半段真正命中的命令（不误报合法命令）", () => {
+  if (!isWin) return;
+  const hint = shellSyntaxPreflight("dir && grep foo *.txt");
+  expect(hint).toContain("「grep」");
+  expect(hint).not.toContain("「dir」是 Unix");
+});
+
 test("[N] run_script 语言错配在写文件/起解释器前拦下", () => {
   expect(detectRunScriptLanguageMismatch("python", "const a = 1; console.log(a);")).toContain("改成 node");
   expect(detectRunScriptLanguageMismatch("node", "print('hi')")).toContain("改成 python");
