@@ -98,11 +98,14 @@ export function describeNetworkError(error: unknown): string {
     cur = node.cause;
   }
   const raw = parts.join(" / ") || (error instanceof Error ? error.message : String(error));
-  if (/ECONNREFUSED/i.test(raw)) return `${raw}：检索服务未启动或地址/端口配置错误`;
-  if (/ENOTFOUND|EAI_AGAIN|ENODATA/i.test(raw)) return `${raw}：检索服务域名解析失败，检查 WEB_SEARCH_BASE_URL`;
+  // 确定性故障（服务没起 / 域名写错 / 证书错）重试不会成功。系统提示里的「换说法再试」只适用于
+  // 零命中或临时超时；这里明确止错，避免模型对 ECONNREFUSED 反复换关键词重试、白烧轮次。
+  const noRetry = "（确定性的服务/配置故障，重试不会成功；请如实告知用户当前无法访问该外部来源，不要用记忆补答案）";
+  if (/ECONNREFUSED/i.test(raw)) return `${raw}：检索服务未启动或地址/端口配置错误${noRetry}`;
+  if (/ENOTFOUND|EAI_AGAIN|ENODATA/i.test(raw)) return `${raw}：检索服务域名解析失败，检查 WEB_SEARCH_BASE_URL${noRetry}`;
   // undici 的实际文案是 "The operation timed out."，不是 timeout；两种都要认。
   if (/ETIMEDOUT|ABORT_ERR|timeout|timed\s*out/i.test(raw)) return `${raw}：检索服务无响应`;
-  if (/CERT_|SSL|SELF_SIGNED/i.test(raw)) return `${raw}：检索服务证书校验失败`;
+  if (/CERT_|SSL|SELF_SIGNED/i.test(raw)) return `${raw}：检索服务证书校验失败${noRetry}`;
   return raw;
 }
 

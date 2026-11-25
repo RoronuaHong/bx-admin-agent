@@ -19,7 +19,7 @@
 | 9 | 跨轮重复调用观察提示（软提示不硬拦，§12.4） | ✅ 已落地（2026-09-24） |
 | 10 | 逐轮 trace 可观测（`rounds-<runId>.jsonl`，§12.7） | ✅ 已落地（2026-09-24） |
 | 11 | 手写 HTML 零外链软护栏（`externalRefHint`，§11.6） | ✅ 已落地（2026-09-24） |
-| 12 | `run_command` 命令执行治理（编码 / 截断 / 干净环境 / 非交互，§13） | ✅ 已落地（2026-09-24） |
+| 12 | `run_command` 命令执行治理（编码 / 截断 / 干净环境 / 非交互 / 运行环境告知，§13） | ✅ 已落地（2026-09-24，2026-11-25 补运行环境告知，§13.6） |
 | 13 | MCP 配置热重载缓存失效键 `mtime + size`（§14） | ✅ 已落地（2026-09-24） |
 | 14 | 禁止工具侧确定性编造（导出物不注入默认标题 / 缺字段如实报错，§11.5） | ✅ 已落地（2026-09-28，见 §11.5） |
 | 15 | HTML 报告零外链观感增强（REPORT_CSS 设计系统 / Hero / KPI 卡 / 卡片化 / 打印友好，§11.7） | ✅ 已落地（2026-09-28，见 §11.7） |
@@ -570,6 +570,39 @@ user: 123
   [A] GBK 字节按中文还原；[A2] 端到端无替换字符；**[A3] `ipconfig /all` 输出含「配置」，乱码不再复现**；
   [B] 头尾截断含「已省略」；[C] `pause` 不再挂死；[D] `BX_AGENT=1` 对子进程可见。
   全量 27 文件 / 167 测试两轮连续全绿。
+
+### 13.6 补漏：运行环境告知与脚本形态兜底（2026-11-25）
+
+> 触发：审计会话 `conv_1795570069383_n8bvil`（标题「请只回复 ok」，实际在改另一个项目的 CSS）——
+> 两轮 40 余次工具调用里 **10 次失败**，其中 6 次是「不知道服务端是什么 shell / 脚本该用什么扩展名」。
+> 全库聚合 `messages.steps.status=error` 确认：同类失败仅此一例，但根因是 harness 层共性缺口，故按最佳实践补齐。
+
+| # | 失败形态 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `ls -la` / `pwd` / `head` 连报「不是内部或外部命令」（3 次） | 系统提示与工具描述从未说明服务端 OS；`run_command` 示例还写着 `ls -la` | `system-prompt.ts` 新增 `RUNTIME_ENVIRONMENT`，写进主代理**与子代理**稳定前缀；`run_command` / `run_script` 描述按 `process.platform` 动态生成语法提示与示例 |
+| 2 | 整段 JS 被当 shell 执行、`.js` 里 `require` 报 `require is not defined`（3 次） | `run_script` 缺省 `language=shell`，Node 固定落 `.js`，而工作区在 `type=module` 包下 | 省略 `language` 时按代码形态推断；Node 按 `require` / `import` 选 `.cjs` / `.mjs`；Windows 下 `bash/sh` 直接给替代方案而非丢给 cmd.exe |
+| 3 | `fs_read ../../..` 只回「非法路径」 | 报错没说工作区外该走哪条路 | 越界报错指向 `run_command` 绝对路径；命令失败在原始报错后附 Windows 语法提示 |
+| 4 | 手写 PowerShell 替换因 CRLF 不匹配返回 `OLD_NOT_FOUND` | 模型从 `fs_read` 复制的片段被规范化成 LF | `fs_edit` 精确匹配 0 命中时做一次 CRLF/LF 归一化重试，写回保持源文件换行风格 |
+| 5 | （补漏）`fs_edit` 把超限文件的截断快照写回 | `fs_read` 超 `FS_MAX_FILE_BYTES` 会附省略标记，而 `fs_edit` 拿它整段回写 → 静默丢尾 | 检测到截断标记即拒绝编辑，明确引导改用 `run_command` 或拆分文件 |
+
+验证：`tests/run-command-shell.test.ts` 扩到 21 例（语言推断 / 扩展名 / 端到端执行 / bash 提示 / 越界提示 / CRLF 编辑 / 截断文件拒绝 / 主子代理提示 / 执行前预检），见 §13.7；
+全量 148 文件 / 1043 测试通过，`pnpm type-check` 通过。
+口径：只改 harness，历史会话记录不动（它是审计证据）。
+
+### 13.7 防错设计：把错误挡在执行前（2026-11-25）
+
+> 对齐 Anthropic《Writing effective tools for agents》的 Poka-yoke 原则——「最好的错误处理是让错误根本发生不了」，
+> 以及项目内 `run_tool_code` 已落地的 `detectToolCodeLanguageMismatch` 模式（其注释即写明「错一次就白费一轮」）。
+> §13.6 的 `shellFailureHint` 是**事后**提示，模型已经烧掉一次调用；本轮把两类高频错误前移到执行前。
+
+| 预检 | 触发 | 返回 | 绕过方式 |
+|---|---|---|---|
+| `shellSyntaxPreflight` | Windows 下命令位置出现 `ls/pwd/head/grep/cat/…`（不误伤字符串里的 `cat`） | `[SHELL_SYNTAX]` + `dir/type/findstr/cd /d` 正确写法，**不起子进程** | 已装 Git Bash 时显式写 `bash -c "…"` |
+| `detectRunScriptLanguageMismatch` | 显式 `language` 与代码语法不符（python 写 JS / node 写 Python / shell 写源码） | `[LANG_MISMATCH]` + 应改成哪个 language，**不写文件、不起解释器** | 省略 `language` 时由代码形态推断，不受此限 |
+
+效果：把「等命令失败 → 读原始报错 → 再猜一次」的循环压成一次调用；错误码前缀也便于模型与日志直接识别，
+等价于给工具返回补了轻量的 `error_code / next_step`（不改 `BuiltinOutcome` 协议）。
+验证：新增 [M] / [M2] / [N] / [N2] 四例；`governance-guardrails [G4]` 的源码窗口由固定 1400 字符改为「到下一个 case」，避免预检分支把 `runShell` 挤出窗口造成误报。
 
 ---
 

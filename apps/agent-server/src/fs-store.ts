@@ -21,6 +21,10 @@ const MAX_FILES = Number(process.env.FS_MAX_FILES || 100);
  */
 const MAX_BINARY_BYTES = Number(process.env.FS_MAX_BINARY_BYTES || 20 * 1024 * 1024);
 
+/** 越界路径的报错同时给出替代路径，避免模型在 fs_* 上反复换写法（实测曾因此白费一次调用）。 */
+const INVALID_PATH_ERROR =
+  "非法路径（fs_* 只接受当前对话工作区内的相对路径；工作区外的文件请用 run_command 以绝对路径读取）";
+
 /**
  * 允许二进制落盘的扩展名白名单（小写含点）。白名单之外一律拒绝：
  * 工作区不是任意二进制仓库，放行未知扩展名等于给「下载任意字节」开后门。
@@ -84,7 +88,7 @@ function safePath(conversationId: string, rawPath: string): string | null {
 /** 写文件（覆盖）。返回实际写入的相对路径。 */
 export function fsWrite(conversationId: string, path: string, content: string): { path: string; bytes: number } | { error: string } {
   const target = safePath(conversationId, path);
-  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  if (!target) return { error: INVALID_PATH_ERROR };
   const bytes = Buffer.byteLength(content, "utf-8");
   if (bytes > MAX_FILE_BYTES) return { error: `内容过大（${bytes} 字节，上限 ${MAX_FILE_BYTES}）` };
   try {
@@ -109,7 +113,7 @@ export function fsWriteBinary(
   data: Uint8Array,
 ): { path: string; bytes: number } | { error: string } {
   const target = safePath(conversationId, path);
-  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  if (!target) return { error: INVALID_PATH_ERROR };
   const ext = extOf(path);
   if (!BINARY_EXTS.has(ext)) {
     return { error: `不允许写入该类型的二进制文件：${ext || "(无扩展名)"}（允许：${[...BINARY_EXTS].join("、")}）` };
@@ -161,7 +165,7 @@ export function fsRead(
   opts: { offset?: number; limit?: number } = {},
 ): { content: string; totalLines?: number } | { error: string } {
   const target = safePath(conversationId, path);
-  if (!target) return { error: "非法路径" };
+  if (!target) return { error: INVALID_PATH_ERROR };
   // 二进制产物（xlsx 等）按 UTF-8 读出来是乱码：明确拒绝胜过把乱码喂给模型。
   // 产物文件的用途是「交给用户下载」，本来也不需要读回内容。
   if (BINARY_EXTS.has(extOf(path))) {
@@ -441,21 +445,43 @@ export function fsGrep(
   return { files, hits, counts, truncated };
 }
 
-/** 精确替换（对齐 Deep Agents 的 edit_file：old_string 必须唯一命中）。 */
+/**
+ * 精确替换（对齐 Deep Agents 的 edit_file：old_string 必须唯一命中）。
+ * 换行符兜底：模型从 fs_read 复制出来的片段常被规范化成 LF，而源文件在 Windows 上是 CRLF；
+ * 先按原文精确匹配，唯独 0 命中时再按 LF/CRLF 归一化重试一次（仍要求唯一），
+ * 写回时恢复源文件原本的换行风格，避免整份文件的 diff 被换行符淹没。
+ */
 export function fsEdit(
   conversationId: string,
   path: string,
   oldString: string,
   newString: string,
-): { path: string } | { error: string } {
+): { path: string; note?: string } | { error: string } {
   const file = fsRead(conversationId, path);
   if ("error" in file) return file;
+  // fsEdit 是把 fsRead 的整段内容写回：若读取已被 MAX_FILE_BYTES 截断，写回就会静默丢掉尾部。
+  // 宁可明确拒绝，也不让「编辑成功」掩盖数据丢失（与交付护栏的诚实失败同口径）。
+  if (file.content.includes("…（文件过大，仅返回前 ")) {
+    return { error: "文件超过读取上限，fs_edit 不能安全替换（写回会截断文件）；请改用 run_command 或拆分文件" };
+  }
   const occurrences = file.content.split(oldString).length - 1;
-  if (occurrences === 0) return { error: "old_string 未在文件中找到" };
+  if (occurrences === 1) {
+    const written = fsWrite(conversationId, path, file.content.replace(oldString, newString));
+    return "error" in written ? written : { path: written.path };
+  }
   if (occurrences > 1) return { error: `old_string 命中 ${occurrences} 处，需要唯一` };
-  const written = fsWrite(conversationId, path, file.content.replace(oldString, newString));
+
+  const crlf = file.content.includes("\r\n");
+  const normalized = file.content.replace(/\r\n/g, "\n");
+  const normalizedOld = oldString.replace(/\r\n/g, "\n");
+  const normalizedHits = normalized.split(normalizedOld).length - 1;
+  if (normalizedHits === 0) return { error: "old_string 未在文件中找到" };
+  if (normalizedHits > 1) return { error: `old_string 命中 ${normalizedHits} 处，需要唯一` };
+  const merged = normalized.replace(normalizedOld, newString.replace(/\r\n/g, "\n"));
+  const restored = crlf ? merged.replace(/\n/g, "\r\n") : merged;
+  const written = fsWrite(conversationId, path, restored);
   if ("error" in written) return written;
-  return { path: written.path };
+  return { path: written.path, note: "已按换行符归一化后替换（源文件 CRLF / 输入 LF）" };
 }
 
 export function fsList(conversationId: string): Array<{ path: string; bytes: number }> {
@@ -509,7 +535,7 @@ export function fsImportFile(
   data: Uint8Array,
 ): { path: string; bytes: number } | { error: string } {
   const target = safePath(conversationId, path);
-  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  if (!target) return { error: INVALID_PATH_ERROR };
   const ext = extOf(path);
   if (!IMPORT_EXTS.has(ext)) {
     return { error: `不允许导入该类型：${ext || "(无扩展名)"}（允许：${[...IMPORT_EXTS].join("、")}）` };
@@ -538,7 +564,7 @@ export function fsImportFile(
  */
 export function fsDelete(conversationId: string, path: string): { path: string; bytes: number } | { error: string } {
   const target = safePath(conversationId, path);
-  if (!target) return { error: "非法路径（只允许对话工作区内的相对路径）" };
+  if (!target) return { error: INVALID_PATH_ERROR };
   if (!existsSync(target)) return { error: `文件不存在：${normalizeRel(conversationId, target)}` };
   try {
     if (!statSync(target).isFile()) return { error: "只能删除文件，不能删除目录" };

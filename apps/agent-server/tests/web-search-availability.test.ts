@@ -52,6 +52,8 @@ test("describeNetworkError 展开 cause，不把网络故障压成 fetch failed"
     cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8888"), { code: "ECONNREFUSED" }),
   });
   expect(describeNetworkError(refused)).toMatch(/ECONNREFUSED.*检索服务未启动/);
+  // 服务没起是确定性故障：明确告诉模型别换关键词重试（系统提示的「换说法再试」只适用于零命中/超时）。
+  expect(describeNetworkError(refused)).toMatch(/重试不会成功/);
 
   const dns = Object.assign(new Error("fetch failed"), { cause: Object.assign(new Error(""), { code: "ENOTFOUND" }) });
   expect(describeNetworkError(dns)).toMatch(/ENOTFOUND.*域名解析失败/);

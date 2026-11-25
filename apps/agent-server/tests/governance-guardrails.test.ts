@@ -56,7 +56,9 @@ describe("[G4] image_gen / run_script 已对齐自包含口径", () => {
   it("run_script 只透传原始执行输出，不包裹编造文案", () => {
     const code = readSrc("builtins.ts");
     const i = code.indexOf('case "run_script"');
-    const block = code.slice(i, i + 1400); // 覆盖到 runShell 调用
+    // 取到下一个 case 而不是固定字符窗口：case 里增加预检分支后，1400 字符会截不到 runShell。
+    const next = code.indexOf('case "image_gen"', i);
+    const block = next > i ? code.slice(i, next) : code.slice(i, i + 3000);
     expect(block, "run_script 未直接透传执行结果（runShell）").toContain("runShell");
   });
 });

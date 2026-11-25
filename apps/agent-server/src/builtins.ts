@@ -174,6 +174,16 @@ const RUN_TIMEOUT_MS = Number(process.env.RUN_COMMAND_TIMEOUT_MS || 120_000);
 /** 命令输出的展示预算（字符）：超了按「保头尾」截断（§13.4 B）——命令输出是最容易灌爆上下文的一类内容。 */
 const RUN_OUTPUT_MAX_CHARS = Math.max(2000, Number(process.env.RUN_OUTPUT_MAX_CHARS || 32_000));
 
+/** 运行环境口径：工具描述与失败提示共用一份，避免「文档说 Windows、提示说 bash」分裂。 */
+const IS_WINDOWS = process.platform === "win32";
+const SHELL_SYNTAX_HINT = IS_WINDOWS
+  ? "当前服务端是 Windows，默认 shell 为 cmd.exe：用 dir / type / findstr，切盘用 cd /d D:\\path && ...，选项用 / 或 -（不要用 --）；" +
+    "不要用 ls / pwd / head / grep / cat。需要 PowerShell 时先用 fs_write 写 .ps1 文件，再执行 powershell -NoProfile -File <文件>，避免多层引号转义出错。"
+  : "当前服务端是类 Unix，默认 shell 为 /bin/sh：用 ls / cat / grep，串联用 && 或 ||。";
+const SHELL_CMD_EXAMPLE = IS_WINDOWS ? "dir /b、type file.txt、findstr /n pattern file.txt" : "ls -la、cat file.txt、grep -n pattern file.txt";
+/** cmd.exe 下命中这些 Unix 专属命令时给一句可操作的提示，而不是让模型反复猜语法。 */
+const UNIX_ONLY_CMD_RE = /(^|[;&|]\s*)(ls|pwd|head|grep|cat|sed|awk|chmod|chown|rm|cp|mv|touch)\b/i;
+
 /**
  * 统一拼接 shell 输出的 stdout/stderr。失败分支把 stderr 放前面（失败时 stderr 才是关键信息），
  * 成功分支把 stdout 放前面，避免两处各写一套拼接逻辑、格式漂移。
@@ -217,10 +227,110 @@ export function truncateShellOutput(text: string, maxChars: number): string {
   return `${text.slice(0, head)}\n…（已省略 ${text.length - maxChars} 字符）\n${text.slice(text.length - tail)}`;
 }
 
+/** 命令失败时追加可操作的语法提示（仅 Windows 命中 Unix 专属命令时），不把原始报错吞掉。 */
+export function shellFailureHint(command: string): string {
+  if (!IS_WINDOWS || !UNIX_ONLY_CMD_RE.test(String(command || ""))) return "";
+  return `\n提示：${SHELL_SYNTAX_HINT}`;
+}
+
+/** 剥掉注释与字符串字面量，避免字符串里的 const/print 干扰语言形态判定（与 tool-code.ts 同思路）。 */
+function stripScriptNoise(code: string): string {
+  return String(code || "")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n\r]*/g, "$1 ")
+    .replace(/"""[\s\S]*?"""/g, '""')
+    .replace(/'''[\s\S]*?'''/g, "''")
+    .replace(/"(?:[^"\\\r\n]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\\r\n]|\\.)*'/g, "''")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+    .replace(/#[^\n\r]*/g, " ");
+}
+
+/**
+ * run_script 未传 language 时的兜底推断：弱模型经常写了整段 Node/Python 却漏掉 language，
+ * 旧实现默认按 shell 执行，得到「'const' 不是内部或外部命令」这种无指向报错（实测一轮白费一次调用）。
+ * 只认语言专有语法；拿不准仍回 shell（保持旧行为）。
+ */
+export function inferRunScriptLanguage(code: string): string {
+  const src = stripScriptNoise(code).trim();
+  if (!src) return "shell";
+  if (
+    /(^|[^.\w])(?:const|let|var)\s+[A-Za-z_$]|=>|console\.\w+\s*\(|\brequire\s*\(|(^|\n)\s*import[^\n]*\bfrom\b|\bawait\s+[A-Za-z_$]/.test(
+      src,
+    )
+  ) {
+    return "node";
+  }
+  if (/(^|\s)def\s+[A-Za-z_]|\bprint\s*\(|\belif\b|\b(?:True|False|None)\b/.test(src)) return "python";
+  return "shell";
+}
+
+/**
+ * Node 脚本扩展名：工作区在 agent-server（package.json 为 type=module）下，.js 会按 ESM 执行，
+ * 模型写 require 时必报「require is not defined in ES module scope」。按代码风格选 .cjs / .mjs，
+ * 两种写法都能跑；混写时选 .mjs 让真正的语法错误暴露出来，而不是悄悄改语义。
+ */
+export function nodeScriptExtension(code: string): string {
+  const src = stripScriptNoise(code);
+  const cjs = /\brequire\s*\(|\bmodule\.exports\b|\bexports\./.test(src);
+  const esm = /(^|\n)\s*import[^\n]*\bfrom\b|\bexport\s+(?:default|const|let|var|function|class|\{)/.test(src);
+  return cjs && !esm ? ".cjs" : ".mjs";
+}
+
+/**
+ * 执行前预检（Poka-yoke / 防错设计）：Windows 下把 Unix 专属命令拦在起子进程之前。
+ *
+ * Anthropic《Writing effective tools for agents》的核心一条是「最好的错误处理是让错误
+ * 根本发生不了」；项目内 `run_tool_code` 的 `detectToolCodeLanguageMismatch` 同思路——
+ * 错一次就白费一轮，给原始报错等于让模型再猜一次。此前 `shellFailureHint` 是**事后**
+ * 提示，模型已经烧掉一次调用；这里改成事前拦截，并给出可绕过的写法。
+ * 判据只认「命令位置」的 Unix 命令（不会误伤 `echo "cat"` 这类字符串），且始终给出路。
+ */
+export function shellSyntaxPreflight(command: string): string | null {
+  if (!IS_WINDOWS) return null;
+  const cmd = String(command || "");
+  if (!UNIX_ONLY_CMD_RE.test(cmd)) return null;
+  const first = cmd.trim().split(/[;&|]/)[0]?.trim().split(/\s+/)[0] || "(未知)";
+  return (
+    `[SHELL_SYNTAX] 当前 shell 是 Windows cmd.exe，命令里的「${first}」是 Unix/bash 写法，直接执行必然失败。` +
+    "请改用：dir（列目录）/ type（看文件）/ findstr（查文本）/ cd /d D:\\path（切盘）；选项用 / 或 -，不要用 --。" +
+    "确需 bash 语法且已装 Git Bash 时，请显式写 bash -c \"...\"。"
+  );
+}
+
+/**
+ * run_script 的语言错配预检：对齐 `tool-code.ts` 的同名实践，但覆盖 shell/python/node 三种。
+ * 只对**显式传入**的 language 生效——省略时由 inferRunScriptLanguage 按代码形态选，本身不会错配。
+ * 命中即在写文件/起解释器之前返回可操作提示，避免拿原始 SyntaxError 再猜一轮。
+ */
+export function detectRunScriptLanguageMismatch(language: string, code: string): string | null {
+  const lang = language.trim().toLowerCase();
+  const src = stripScriptNoise(code);
+  const js =
+    /(^|[^.\w])(?:const|let|var)\s+[A-Za-z_$]|=>|console\.\w+\s*\(|\brequire\s*\(|(^|\n)\s*import[^\n]*\bfrom\b/.test(
+      src,
+    );
+  const py = /(^|\s)def\s+[A-Za-z_]|\bprint\s*\(|\belif\b|\b(?:True|False|None)\b/.test(src);
+  if ((lang === "python" || lang === "py") && js && !py) {
+    return "[LANG_MISMATCH] language=python，但代码是 JavaScript 写法（const / console.log / require 等）。请把 language 改成 node，或改写成 Python（print / def）。";
+  }
+  if ((lang === "node" || lang === "js" || lang === "javascript") && py && !js) {
+    return "[LANG_MISMATCH] language=node，但代码是 Python 写法（print / def / True 等）。请把 language 改成 python，或改写成 JavaScript（console.log）。";
+  }
+  if ((lang === "shell" || lang === "bash" || lang === "sh") && (js || py)) {
+    const want = js && !py ? "node" : py && !js ? "python" : "node 或 python";
+    return `[LANG_MISMATCH] language=${lang}，但代码是 ${want} 源码而不是 shell 命令。请把 language 改成 ${want}，不要用 shell 执行。`;
+  }
+  return null;
+}
+
 function runShell(
   command: string,
   opts: { cwd: string; timeoutMs: number },
 ): Promise<{ ok: boolean; text: string }> {
+  // 防错设计：平台语法不匹配在起子进程前拦下，省一次调用也避免半途副作用。
+  const preflight = shellSyntaxPreflight(command);
+  if (preflight) return Promise.resolve({ ok: false, text: preflight });
   // 干净的执行环境（§13.4 C）：关掉颜色与交互式 TERM 特性，避免 ANSI 色码污染捕获到的输出
   // （对齐 Cursor 用 CURSOR_AGENT 让 shell 自降级）；注入 BX_AGENT 供用户的 shell 配置自检降级。
   // 子进程**只拿白名单环境**（见 toolCodeEnv）：不把服务端完整环境（数据库 URI、各家 API key 等）
@@ -281,7 +391,7 @@ function runShell(
           }
           const body = truncateShellOutput(formatShellStream(out, errOut, "stderr"), RUN_OUTPUT_MAX_CHARS);
           const detail = body || String((err as Error).message || err);
-          resolve({ ok: false, text: `命令执行失败${reason}：\n${detail}` });
+          resolve({ ok: false, text: `命令执行失败${reason}：\n${detail}${shellFailureHint(command)}` });
           return;
         }
         resolve({
@@ -692,15 +802,15 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "run_command",
       "在终端执行一条 shell 命令（如列目录、跑脚本、装依赖、调系统命令）。" +
         "命令在**当前对话工作区**目录下运行（产物可直接用 fs_read 取回），但也能访问系统其它位置。" +
+        `语法必须与运行环境匹配：${SHELL_SYNTAX_HINT}` +
         "只执行用户明确要求或明显必要的命令；不要在一条命令里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
         "命令较长或需要管道时正常写；超时（默认 120s）会被判为失败。" +
         "**必须非交互**：需要确认时自行加 -y / --yes 等免交互参数（如 npm init -y、apt-get install -y）；" +
-        "不要跑常驻型命令（watch / tail -f / dev server）或会等待输入的命令——stdin 已关闭，这类命令会直接失败而不是等你输入。" +
-        "Windows 命令的选项用 / 或 -，**不要用 --**（如 ipconfig /all、ipconfig -all；ipconfig --all 会报「无法识别的命令行」）。",
+        "不要跑常驻型命令（watch / tail -f / dev server）或会等待输入的命令——stdin 已关闭，这类命令会直接失败而不是等你输入。",
       {
         type: "object",
         properties: {
-          command: jsonType("string", "要执行的 shell 命令（如 ls -la、npm install lodash、python -c \"...\"）"),
+          command: jsonType("string", `要执行的 shell 命令（如 ${SHELL_CMD_EXAMPLE}）`),
           timeoutMs: jsonType("number", "超时毫秒数（默认 120000，上限 600000）"),
         },
         required: ["command"],
@@ -711,12 +821,14 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
       "在工作区沙箱内执行一段脚本（如 Python / Node / Shell），用于受控的代码执行、跑测试、处理已经落盘的数据。" +
         "脚本进程调不到 MCP 或其它工具。要在代码里调只读工具，用 run_tool_code。" +
         "shell 类语言直接交给系统 shell 执行（与 run_command 同护栏：超时 / 体积上限 / 工作区沙箱）；python/node 会先写入工作区再调用解释器。" +
+        `运行环境：${SHELL_SYNTAX_HINT} Node 脚本自动按代码风格选 .cjs / .mjs，require 与 import 都可用。` +
+        "language 省略时会按代码形态推断（写 Node/Python 请显式写出 language 更稳）；Windows 下没有 bash/sh，请改用 shell 语法。" +
         "只执行用户明确要求的脚本；不要在脚本里做不可逆的破坏性操作（如 rm -rf）除非用户明确要求。" +
         "超时（默认 120s）会被判为失败；需要交互输入的脚本会立即失败。",
       {
         type: "object",
         properties: {
-          language: jsonType("string", "脚本语言：shell / bash / sh / python / py / node / js / javascript"),
+          language: jsonType("string", "脚本语言：shell / bash / sh / python / py / node / js / javascript（省略则按代码推断）"),
           code: jsonType("string", "脚本源码（多行文本）"),
           timeoutMs: jsonType("number", "超时毫秒数（默认 120000，上限 600000）"),
         },
@@ -1714,7 +1826,7 @@ export async function execBuiltin(
     case "fs_edit": {
       const result = fsEdit(conversationId, str(args, "path"), str(args, "old_string"), str(args, "new_string"));
       if ("error" in result) return { ok: false, text: `编辑失败：${result.error}` };
-      return { ok: true, text: `已更新 ${result.path}` };
+      return { ok: true, text: `已更新 ${result.path}${result.note ? `（${result.note}）` : ""}` };
     }
     case "fs_ls": {
       const files = fsList(conversationId);
@@ -1765,9 +1877,16 @@ export async function execBuiltin(
     // 交付物护栏对齐（docs/DELIVERABLE_GUARDRAILS.md §1 原则 2/4）：
     // run_script 只透传原始执行输出（runShell），不包裹任何编造文案；缺 code 即如实报错。
     case "run_script": {
-      const language = str(args, "language").trim().toLowerCase() || "shell";
+      const requestedLanguage = str(args, "language").trim().toLowerCase();
       const code = str(args, "code");
       if (!code.trim()) return { ok: false, text: "run_script 需要 code" };
+      // 漏写 language 时按代码形态推断，而不是一律当 shell（实测整段 JS 被当成 cmd 执行）。
+      const language = requestedLanguage || inferRunScriptLanguage(code);
+      // 显式写了 language 却与代码语法不符时，在写文件/起解释器前给可操作提示（对齐 run_tool_code 的预检）。
+      if (requestedLanguage) {
+        const mismatch = detectRunScriptLanguageMismatch(requestedLanguage, code);
+        if (mismatch) return { ok: false, text: mismatch };
+      }
       const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || RUN_TIMEOUT_MS, 1_000), 600_000);
       const cwd = conversationFsRoot(conversationId);
       try {
@@ -1776,20 +1895,35 @@ export async function execBuiltin(
         console.warn(`[builtins] 工作区目录不可用，脚本将在系统临时目录执行：${String((err as Error)?.message || err)}`);
       }
       const safeCwd = existsSync(cwd) ? cwd : tmpdir();
+      // Windows 没有 bash/sh：把 bash 源码原样交给 cmd.exe 只会得到一串转义错误，直接给替代方案。
+      if (IS_WINDOWS && (language === "bash" || language === "sh")) {
+        return {
+          ok: false,
+          text:
+            "当前服务端是 Windows，没有 bash/sh。请把 language 改成 shell 并使用 cmd.exe 语法（dir / type / findstr / cd /d），" +
+            "或先用 fs_write 写 .ps1 文件再执行 powershell -NoProfile -File <文件>。",
+        };
+      }
       // shell 类语言直接交给系统 shell 执行（与 run_command 同底座，复用超时 / 体积护栏）。
       if (language === "shell" || language === "bash" || language === "sh") {
         return runShell(code, { cwd: safeCwd, timeoutMs });
       }
       // 其余语言：落盘到工作区沙箱后由对应解释器执行（路径受 safePath 约束，不会越界）。
-      const extByLang: Record<string, string> = { python: ".py", py: ".py", node: ".js", js: ".mjs", javascript: ".mjs" };
-      const ext = extByLang[language];
-      if (!ext) {
-        return { ok: false, text: `不支持的 run_script 语言：${language || "(空)"}（支持：shell/bash/sh、python/py、node/js/javascript）` };
+      let ext: string;
+      let isPython = false;
+      if (language === "python" || language === "py") {
+        ext = ".py";
+        isPython = true;
+      } else if (language === "node" || language === "js" || language === "javascript") {
+        // 工作区在 type=module 的包下，.js 会按 ESM 执行；require 代码必须落到 .cjs。
+        ext = nodeScriptExtension(code);
+      } else {
+        return { ok: false, text: `不支持的 run_script 语言：${language}（支持：shell/bash/sh、python/py、node/js/javascript）` };
       }
       const relName = `script_${Date.now()}${ext}`;
       const written = fsWrite(conversationId, relName, code);
       if ("error" in written) return { ok: false, text: `脚本写入失败：${written.error}` };
-      const runner = language.startsWith("py") ? `python "${relName}"` : `node "${relName}"`;
+      const runner = isPython ? `python "${relName}"` : `node "${relName}"`;
       return runShell(runner, { cwd: safeCwd, timeoutMs });
     }
     // 交付物护栏对齐（docs/DELIVERABLE_GUARDRAILS.md §1 原则 1）：

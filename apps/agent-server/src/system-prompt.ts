@@ -66,6 +66,25 @@ const CAPABILITY_HINT =
   "2. 澄清决策（request_clarification）只依据当前请求本身：仅当关键用词存在两个都说得通、且会导向不同答案的读法时才问；" +
   "是否澄清由本轮用户输入决定，不要因为长期记忆里写着「用户偏好少问」就跳过必要的澄清。";
 
+/**
+ * 运行环境告示（稳定前缀，仅在注入工具时出现）：把服务端 OS / 默认 shell 一次说清。
+ * 实测踩坑：模型把 Linux 习惯（ls / pwd / head / grep）带到 Windows 的 cmd.exe，
+ * 一轮里连着三次「不是内部或外部命令」才换成 dir/type/findstr（与 docs/artifact-delivery-plan.md §13 同源）。
+ * 与其在每次报错后补救，不如把语法口径写进稳定前缀（跨轮缓存命中，不增加动态段成本）。
+ */
+const RUNTIME_ENVIRONMENT = (() => {
+  const common =
+    "fs_* 工具只接受当前对话工作区内的相对路径；工作区外的文件用 run_command 以绝对路径读取。" +
+    "一条命令失败就先核对语法与当前 shell 是否匹配，不要连着重试同一种写法。";
+  return process.platform === "win32"
+    ? "[运行环境]\n服务端操作系统：Windows；run_command 与 run_script(shell) 的默认 shell 是 cmd.exe（不是 bash/sh）。" +
+        "列目录用 dir、看文件用 type、查文本用 findstr、切盘用 cd /d D:\\path && ...；选项用 / 或 -，不要用 --。" +
+        "不要用 ls / pwd / head / grep / cat（除非先确认装了 Git Bash）。" +
+        "需要 PowerShell 时先用 fs_write 写 .ps1 文件，再执行 powershell -NoProfile -File <文件>，避免多层引号转义出错。" +
+        common
+    : "[运行环境]\n服务端操作系统：类 Unix；run_command 与 run_script(shell) 的默认 shell 是 /bin/sh。" + common;
+})();
+
 const TOOLING_RULES = [
   "工具使用纪律（仅在工具可用时生效）：",
   "1. 只依据工具返回的真实结果作答；查不到、超时或报错就如实说明，不要编造或补全数据。",
@@ -136,7 +155,11 @@ const ANSWER_SHAPE_EXAMPLE = [
   "报告类建议末尾附「数据口径与方法」：数据源、各指标字段级口径、去重 / 计算陷阱（如须 COUNT(DISTINCT <键>) 否则因重复行虚高）、故障≠缺数（写明具体缺失项与替代口径）、小基数隔离（标明各分组的样本量、哪些分组因基数过小已被单列而非并列对比）；并单独列出本次未覆盖 / 无法回答的子问题（逐条枚举，不笼统带过）。",
 ].join("\n");
 
-/** 子代理系统提示：上下文隔离，只拿任务描述与最小工具集，回传摘要（对齐 Deep Agents Subagents）。 */
+/**
+ * 子代理系统提示：上下文隔离，只拿任务描述与最小工具集，回传摘要（对齐 Deep Agents Subagents）。
+ * 子代理的工具集仍含 run_command / run_script（chat.ts 的 subBuiltins 只排除了 save_memory 等），
+ * 故必须和主代理共用同一份运行环境口径，否则它仍会把 bash 习惯带进 cmd.exe。
+ */
 export const SUBAGENT_PROMPT = [
   "你是被主代理委派的执行子代理，只负责完成给定的单一任务。",
   "守则：",
@@ -144,6 +167,7 @@ export const SUBAGENT_PROMPT = [
   "2. 最终回复是交给主代理的唯一交接物：结论与关键数字，400 字以内，不贴原始数据。",
   "3. 分页列表的跨页计数用 count_list_by_time，不要自己逐页翻，也不要换筛选再取一页。complete 为 false 时只报告没翻完，不要估算。" +
     "小时桶以外的汇总用 run_tool_code，不要用 run_script 翻页。",
+  RUNTIME_ENVIRONMENT,
   "",
   UNTRUSTED_CONTENT_RULE,
 ].join("\n");
@@ -351,7 +375,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
   // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
   const role = getRole(input.role);
   // 全局安全护栏放稳定前缀最前：跨角色共享、优先级最高，且随角色前缀各自缓存（不互相击穿）。
-  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, CAPABILITY_HINT, input.tooling ? TOOLING_RULES : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
+  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, CAPABILITY_HINT, input.tooling ? TOOLING_RULES : "", input.tooling ? RUNTIME_ENVIRONMENT : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
     (part) => part && part.trim(),
   );
   // 记忆与摘要可能夹带工具结果里的原文：定界成数据，并放在动态段最后，不排在规则前面。
