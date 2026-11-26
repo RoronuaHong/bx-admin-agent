@@ -400,9 +400,14 @@ async function runTurn(text: string): Promise<void> {
   const controller = new AbortController();
   controllers.push(controller);
 
-  // 自动模式：auto 解析为具体模型（失败黑名单跳过、上次成功优先），与 /chat 同源。
+  // auto / 空值 / 失效 id 都交给服务端按「免费优先 + 全挂重检」挑选；
+  // 只有用户明确点名且仍在模型列表里的 id 才作为具体模型发送，避免落到列表第一个付费模型。
+  const storedModel = modelId.value;
+  const chosenModel =
+    !storedModel || storedModel === MODEL_AUTO_ID || !models.value.some((m) => m.id === storedModel)
+      ? MODEL_AUTO_ID
+      : resolveModel(storedModel);
   // 本页刻意不展示模型信息（终端用户界面），服务端 model 事件仅用于服务端标签跟踪，前端无需消费。
-  const chosenModel = modelId.value === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(modelId.value);
   const run: StreamRun<Bubble> = {
     convId,
     reply,

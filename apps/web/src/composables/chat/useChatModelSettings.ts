@@ -67,6 +67,8 @@ export function useChatModelSettings(options: ChatModelSettingsOptions) {
    * 「自动」模式解析：把 auto（或空/失效值）落到具体模型。
    * 优先用「上次成功用过的模型」，否则按列表顺序挑第一个「近期未失败」的——
    * 实现「哪个能用用哪个」：失败过的模型会被跳过，直到全部失败才重置黑名单重新探测。
+   * 注意：本函数只用于本地能力预判（resolvedModelId），不要直接当请求里的 model 发送——
+   * 它把 auto 落到列表第一个（可能是付费模型），会绕过服务端免费优先。
    */
   const lastGoodModelId = ref<string>("");
   const failedModelIds = ref<Set<string>>(new Set());
@@ -80,6 +82,18 @@ export function useChatModelSettings(options: ChatModelSettingsOptions) {
     // 全部失败过：清空黑名单，给一次重新探测的机会。
     failedModelIds.value.clear();
     return ids[0] ?? "";
+  }
+
+  /**
+   * 发给服务端的 model：只有「用户明确点名的有效模型」才是具体 id，
+   * auto / 空值 / 已从列表下架的失效 id 一律回 MODEL_AUTO_ID，由服务端做免费优先 + 全挂重检。
+   * 旧实现把失效 id 经 resolveModel 落到列表第一个（ds4flash0731 付费）并以点名模型发出，
+   * 表现为页面显示自动、实际每次都用付费模型。
+   */
+  function resolveSendModel(value: string): string {
+    if (!value || value === MODEL_AUTO_ID) return MODEL_AUTO_ID;
+    if (modelsLoaded.value && !models.value.some((m) => m.id === value)) return MODEL_AUTO_ID;
+    return resolveModel(value);
   }
 
   let settingsErrorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -203,6 +217,7 @@ export function useChatModelSettings(options: ChatModelSettingsOptions) {
     lastGoodModelId,
     failedModelIds,
     resolveModel,
+    resolveSendModel,
     settingsErrorTimer,
     showSettingsError,
     disposeSettingsErrorTimer,

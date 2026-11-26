@@ -295,9 +295,61 @@ export function modelAvailabilityNotice(status: ModelAvailabilityStatus, allExha
   return `这次没有完成：模型返回 ${status}（${info.reason}）。${availabilityHint(status, allExhausted)}。`;
 }
 
-/** 给用户看的中断说明（中段失败、已有部分输出时）。认得出状态码就连原因 + 建议一起说；认不出就不要把上游 JSON 贴进气泡。 */
+/**
+ * undici 的 TypeError.message 恒为 "fetch failed"，真正原因藏在 cause 链里。
+ * 只看 .message 会让日志和对话气泡都只剩一句没有信息量的外壳，排查时无法区分
+ * 服务没起（ECONNREFUSED）、域名写错（ENOTFOUND）、DNS 抖动还是证书问题。
+ */
+export function describeModelCallError(err: unknown): string {
+  const message = String((err as Error)?.message || err || "未知错误");
+  if (!/fetch failed/i.test(message)) return message;
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let node: unknown = (err as Error & { cause?: unknown })?.cause;
+  while (node && typeof node === "object" && !seen.has(node)) {
+    seen.add(node);
+    const current = node as { code?: unknown; message?: unknown; cause?: unknown };
+    if (typeof current.code === "string" && current.code && !parts.includes(current.code)) parts.push(current.code);
+    // cause 里偶尔会带完整 URL，查询串上可能有密钥：先打码再往外送。
+    const detail = typeof current.message === "string"
+      ? current.message.replace(/\b(api[_-]?key|token|secret)=[^&\s]+/gi, "$1=<已隐藏>")
+      : "";
+    if (detail && detail !== message && detail !== "fetch failed" && !parts.includes(detail)) parts.push(detail);
+    node = current.cause;
+  }
+  return parts.length ? `${message}（${parts.join(" / ").slice(0, 200)}）` : message;
+}
+
+/** 兜底错误文案：保留可操作的原因，但绝不把上游 JSON / 凭据原样贴进气泡。 */
 export const UNCLASSIFIED_MODEL_FAILURE = "模型没有返回结果，详情见服务端日志";
 
+/** 把未归类失败改写成用户能直接看懂的一句原因（网络类给出具体 code + 下一步）。 */
+export function userFacingModelFailure(failure: string): string {
+  const code = failure.match(
+    /\b(ECONNREFUSED|ENOTFOUND|ENODATA|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNABORTED|EPIPE|CERT_[A-Z_]+|SELF_SIGNED_CERT_IN_CHAIN|UND_ERR_[A-Z_]+|socket hang up)\b/i,
+  )?.[0];
+  if (code || /fetch failed/i.test(failure)) {
+    const hint = /ENOTFOUND|ENODATA/i.test(code || "")
+      ? "模型 API 域名解析失败，请检查网络或上游地址"
+      : /ECONNREFUSED/i.test(code || "")
+        ? "模型 API 拒绝连接，请确认上游服务已启动且地址/端口正确"
+        : /CERT_|SELF_SIGNED/i.test(code || "")
+          ? "模型 API 证书校验失败，请检查证书或系统时间"
+          : "请检查网络/代理后重试";
+    return `模型服务连接失败${code ? `（${code}）` : ""}：${hint}`;
+  }
+  // 上游错误体常是 JSON：优先取其中的 message，其次只保留脱壳后的短文案。
+  const jsonMessage = failure.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1];
+  const detail = (jsonMessage || failure)
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[{}\[\]\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  return detail ? `模型调用失败：${detail}` : UNCLASSIFIED_MODEL_FAILURE;
+}
+
+/** 给用户看的中断说明（中段失败、已有部分输出时）。认得出状态码就连原因 + 建议一起说；认不出也给出脱敏后的真实原因。 */
 export function partialInterruptLine(failure: string, allExhausted = false): string {
   const status = modelAvailabilityStatus(failure);
   if (status) {
@@ -305,7 +357,7 @@ export function partialInterruptLine(failure: string, allExhausted = false): str
     // 与 modelAvailabilityNotice 同口径：说清「哪个码 + 为什么 + 下一步」，而不是只甩一个裸码。
     return `生成因模型返回 ${status}（${info.reason}）中断，${availabilityHint(status, allExhausted)}。（以上为中断前的中间结果，可能不完整）`;
   }
-  return "生成中断，详情见服务端日志（以上为中断前的中间结果，可能不完整）";
+  return `生成中断：${userFacingModelFailure(failure)}（以上为中断前的中间结果，可能不完整）`;
 }
 
 /**
@@ -2006,7 +2058,8 @@ export async function* streamCall(
         if (result.text && !streamed) pending.push({ kind: "text", text: result.text });
       })
       .catch((err) => {
-        failure = String((err as Error)?.message || err);
+        // 网络类错误的真实原因在 err.cause 里；只取 message 会把 ECONNREFUSED 等吞成 "fetch failed"。
+        failure = describeModelCallError(err);
       })
       .finally(() => {
         settled = true;
@@ -4678,7 +4731,17 @@ export async function* chatStream(
     if (recheckPass > 0) {
       const recheck = await recheckModelAvailability(allModels, signal);
       const retryIds = new Set([...recheck.added, ...recheck.recovered]);
-      candidates = recheck.models.filter((m) => retryIds.has(m.id));
+      // 重检结果同样要走免费优先排序：recheck.models 是注册表原始顺序（付费在前），
+      // 直接 filter 会把刚「恢复」的付费模型排到免费模型前面——与首轮口径不一致。
+      candidates = orderModelCandidates(
+        recheck.models,
+        null,
+        true,
+        quotaCooldownUntil,
+        Date.now(),
+        unattended,
+        health,
+      ).filter((m) => retryIds.has(m.id));
       if (!candidates.length) {
         console.log("[chat:model] 重检未发现新可用模型，按原失败收束");
         break;
@@ -4949,10 +5012,12 @@ export async function* chatStream(
       yield { type: "text", text: modelAvailabilityNotice(availability, allExhausted402) };
     } else if (!text.trim() && !signal?.aborted) {
       console.warn(`[chat] 未归类的模型失败：${failure.slice(0, 400)}`);
+      // 直接在气泡里说清原因（网络类带具体 code + 下一步），不再只让用户去翻服务端日志。
+      const message = userFacingModelFailure(failure);
       yield {
         type: "error",
-        error: { code: "MODEL_ERROR", defaultMessage: UNCLASSIFIED_MODEL_FAILURE },
-        message: UNCLASSIFIED_MODEL_FAILURE,
+        error: { code: "MODEL_ERROR", defaultMessage: message },
+        message,
       };
     }
     yield usage;

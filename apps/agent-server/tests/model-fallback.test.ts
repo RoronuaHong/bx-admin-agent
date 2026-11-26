@@ -6,6 +6,8 @@ import {
   isTransientModelError,
   modelAvailabilityNotice,
   partialInterruptLine,
+  describeModelCallError,
+  userFacingModelFailure,
   UNCLASSIFIED_MODEL_FAILURE,
   modelAvailabilityStatus,
   orderModelCandidates,
@@ -57,9 +59,8 @@ test("402、500、429 都立刻换模型；当日额度用尽才按日切冷却�
   const partialExhausted = partialInterruptLine(raw, true);
   expect(partialExhausted).toContain("所有候选模型额度均已耗尽，请充值 / 续费");
   expect(partialExhausted).not.toContain("切换到仍有额度的模型");
-  expect(partialInterruptLine("socket hang up")).toBe(
-    `生成中断，详情见服务端日志（以上为中断前的中间结果，可能不完整）`,
-  );
+  expect(partialInterruptLine("socket hang up")).toContain("socket hang up");
+  expect(partialInterruptLine("socket hang up")).toContain("以上为中断前的中间结果");
   expect(UNCLASSIFIED_MODEL_FAILURE).not.toContain("{");
   for (const code of ["400", "401", "403", "404", "408", "413", "422", "529"] as const) {
     expect(modelAvailabilityStatus(`model http ${code}: detail`)).toBe(code);
@@ -137,6 +138,19 @@ test("健康度分档不得推翻免费优先：healthy 付费模型排在 unkno
   ]);
 });
 
+test("重检后重跑的候选也按免费优先排序，不被注册表原始顺序（付费在前）带偏", () => {
+  // recheck.models = [...registered, ...added]：registered 顺序是 .env 的 MODEL_PROVIDERS，付费在前。
+  const recheckModels = [
+    { id: "ds4flash0731", name: "deepseek/deepseek-flash", label: "DeepSeek-Flash" },
+    { id: "glm53", name: "glm-5.3", label: "GLM-5.3" },
+    { id: "ornem3u", name: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron(OR免费)" },
+    { id: "orcat_new_free", name: "new/model:free", label: "New(OR免费·动态发现)" },
+  ];
+  const retryIds = new Set(["ds4flash0731", "ornem3u", "orcat_new_free"]);
+  const retryCandidates = orderModelCandidates(recheckModels, null, true).filter((m) => retryIds.has(m.id));
+  expect(retryCandidates.map((m) => m.id)).toEqual(["ornem3u", "orcat_new_free", "ds4flash0731"]);
+});
+
 test("定时运行跳过冷却中的模型；一个能用的都没有就返回空名单", () => {
   const all = [{ id: "a" }, { id: "b" }, { id: "c" }];
   const cooling = new Map<string, number>([
@@ -148,4 +162,27 @@ test("定时运行跳过冷却中的模型；一个能用的都没有就返回�
   expect(orderModelCandidates(all, all[0]!, true, partial, 1, true).map((item) => item.id)).toEqual(["b", "c"]);
   expect(orderModelCandidates(all, all[0]!, false, partial, 1, true).map((item) => item.id)).toEqual(["a", "b", "c"]);
   expect(orderModelCandidates(all, null, true, cooling, 1, true)).toEqual([]);
+});
+
+test("fetch failed 还原 cause 原因，气泡直接显示可操作的失败原因且不泄露密钥", () => {
+  const err = Object.assign(new Error("fetch failed"), {
+    cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), {
+      code: "ECONNREFUSED",
+      cause: new Error("api_key=should-not-leak"),
+    }),
+  });
+  const failure = describeModelCallError(err);
+  expect(failure).toContain("ECONNREFUSED");
+  expect(failure).toContain("api_key=<已隐藏>");
+  expect(failure).not.toContain("should-not-leak");
+
+  const bubble = userFacingModelFailure(failure);
+  expect(bubble).toContain("ECONNREFUSED");
+  expect(bubble).toContain("请确认上游服务已启动");
+  expect(bubble).not.toContain("should-not-leak");
+  expect(userFacingModelFailure("fetch failed")).toContain("请检查网络/代理后重试");
+
+  const raw = 'model http 400: {"error":{"message":"bad request"}}';
+  expect(userFacingModelFailure(raw)).toContain("bad request");
+  expect(userFacingModelFailure(raw)).not.toContain("{");
 });

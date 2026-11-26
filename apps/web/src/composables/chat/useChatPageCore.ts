@@ -1850,6 +1850,7 @@ const {
   lastGoodModelId,
   failedModelIds,
   resolveModel,
+  resolveSendModel,
   settingsErrorTimer,
   showSettingsError,
   disposeSettingsErrorTimer,
@@ -2989,10 +2990,11 @@ async function runTurn(
   // 新一轮从底部开始：用户可能正停在历史上方，Enter 发送必须回到最底（不受 240px 跟随阈值限制）。
   if (currentId.value === convId) queueScroll(true);
   // 模型取自该对话自己的设置（后台出队时可能与当前展示的不同）。
-  // 失效 id 无需在此特殊处理：resolveModel 对查不到的 id 与 auto 走同一条回落链。
+  // 失效 id 由 resolveSendModel 统一回落 auto，不在服务端被当成点名模型。
   const selected = state.settings.modelId || MODEL_AUTO_ID;
-  // 自动模式把挑选权交给服务端：402 / 500 会当场换下一个还能用的模型，而不是先钉死一个再失败。
-  const chosenModel = selected === MODEL_AUTO_ID ? MODEL_AUTO_ID : resolveModel(selected);
+  // 自动模式 / 失效 id 把挑选权交给服务端：402 / 500 会当场换下一个还能用的模型，
+  // 且服务端按「免费优先 + 全挂重检」选，而不是被前端钉死到列表第一个付费模型。
+  const chosenModel = resolveSendModel(selected);
   // 中断句柄存进「该对话自己的」状态：切到别的对话后按停止不会误伤这一条。
   const controller = new AbortController();
   state.controllers.push(controller);
@@ -3338,7 +3340,7 @@ async function attachRunningTask(convId: string): Promise<void> {
     convId,
     reply,
     state: fresh,
-    chosenModel: resolveModel(fresh.settings.modelId),
+    chosenModel: resolveSendModel(fresh.settings.modelId),
     sawTerminal: false,
     lastSeq: 0,
     ...(status.task?.id ? { taskId: status.task.id } : {}),
