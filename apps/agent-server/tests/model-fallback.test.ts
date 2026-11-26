@@ -116,6 +116,27 @@ test("自动模式先免费模型，DeepSeek-Flash 兜底，不把默认模型�
   ]);
 });
 
+test("健康度分档不得推翻免费优先：healthy 付费模型排在 unknown 免费模型后面", () => {
+  const all = [
+    { id: "ds4flash0731", name: "deepseek/deepseek-flash", label: "DeepSeek-Flash" },
+    { id: "step5", name: "step-5-preview", label: "Step-5-Preview" },
+    { id: "ornem3u", name: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron-3-Ultra(OR免费)" },
+    { id: "orling32", name: "inclusionai/ling-3.2-flash:free", label: "Ling-3.2-Flash(OR免费)" },
+    { id: "orflaky", name: "liquid/lfm-3-1.7b:free", label: "LFM3-1.7B(OR免费)" },
+  ];
+  const health = new Map([
+    ["ds4flash0731", { samples: 50, failures: 0 }], // healthy
+    ["orflaky", { samples: 10, failures: 10 }], // unhealthy，组内沉底但仍在付费之前
+  ]);
+  expect(orderModelCandidates(all, all[0]!, true, undefined, 1, false, health).map((m) => m.id)).toEqual([
+    "ornem3u",
+    "orling32",
+    "orflaky",
+    "ds4flash0731",
+    "step5",
+  ]);
+});
+
 test("定时运行跳过冷却中的模型；一个能用的都没有就返回空名单", () => {
   const all = [{ id: "a" }, { id: "b" }, { id: "c" }];
   const cooling = new Map<string, number>([

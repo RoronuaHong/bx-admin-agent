@@ -797,6 +797,29 @@ export function autoModelOrder<T extends { id: string; name?: string; label?: st
 }
 
 /**
+ * 自动模式的稳定排序：先按免费 / 付费兜底 / 其余付费分组，再**组内**按健康度重排。
+ * 不能对整个名单套 `orderByHealth`——健康度分档会把 healthy 的付费模型排到 unknown 的免费模型前面，
+ * 等于把「免费优先」推翻（2026-11-26 告警任务实测：ds4flash0731 每 10 分钟抢在免费模型前面）。
+ * 组内分档只影响组内次序，跨组永远免费在前。
+ */
+function rankAutoModels<T extends { id: string; name?: string; label?: string }>(
+  items: readonly T[],
+  health?: ReadonlyMap<string, ModelHealth> | null,
+): T[] {
+  const ordered = autoModelOrder(items);
+  if (!health || !health.size) return ordered;
+  const free: T[] = [];
+  const flash: T[] = [];
+  const rest: T[] = [];
+  for (const item of ordered) {
+    if (isFlashFallback(item)) flash.push(item);
+    else if (isFreeTierModel(item)) free.push(item);
+    else rest.push(item);
+  }
+  return [...orderByHealth(free, health), ...orderByHealth(flash, health), ...orderByHealth(rest, health)];
+}
+
+/**
  * 排这一轮要试的模型。
  * 自动：先免费，再 DeepSeek-Flash，其余付费模型在最后。冷却中的放到队尾。
  * 用户点名的模型先试它，失败再换。
@@ -805,7 +828,7 @@ export function autoModelOrder<T extends { id: string; name?: string; label?: st
  * 点名的模型仍试它本身，不把其余冷却模型再走一遍。
  *
  * `health`：可选的模型健康度（`src/model-health.ts`，只读在线评测的确定性打分）。
- * 传了就按「可用 → 未验证 → 不稳」分档重排**新鲜候选**，同档内仍沿用上面的免费优先次序；
+ * 传了就按「可用 → 未验证 → 不稳」在**各费用组内**重排新鲜候选，跨组免费优先不变；
  * 不传（默认）= 纯次序函数，行为与从前逐字节一致——单测因此不需要任何评测数据。
  */
 export function orderModelCandidates<T extends { id: string; name?: string; label?: string }>(
@@ -818,7 +841,7 @@ export function orderModelCandidates<T extends { id: string; name?: string; labe
   health?: ReadonlyMap<string, ModelHealth> | null,
 ): T[] {
   const down = (item: T) => (coolingUntil.get(item.id) || 0) > now;
-  const rank = (items: readonly T[]) => (health ? orderByHealth(items, health) : autoModelOrder(items));
+  const rank = (items: readonly T[]) => rankAutoModels(items, health);
   const fresh = all.filter((item) => !down(item));
   const cooled = all.filter((item) => down(item));
   if (skipCooled) {
