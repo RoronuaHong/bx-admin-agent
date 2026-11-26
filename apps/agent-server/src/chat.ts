@@ -122,6 +122,7 @@ import {
   type ModelAvailabilityStatus,
 } from "./model-availability.js";
 import { findExhaustedQuotaModels, quotaPreflightEnabled } from "./model-quota.js";
+import { catalogDiscoveryEnabled, recheckModelAvailability } from "./model-catalog.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
@@ -4586,7 +4587,7 @@ export async function* chatStream(
     }
   }
   const health = !explicitModel && healthOrderEnabled() ? readModelHealth() : null;
-  const candidates = orderModelCandidates(
+  let candidates = orderModelCandidates(
     allModels,
     model,
     !explicitModel,
@@ -4647,10 +4648,27 @@ export async function* chatStream(
   // 否则「每个候选都能重试 N 次」叠加起来仍是重试风暴（AWS：只设最大次数防不住）。
   const runRetryBudgetState = { left: runRetryBudget() };
 
-  if (!candidates.length) {
-    failure = "没有可用模型：定时运行跳过了冷却中的模型";
-  }
-  for (const m of candidates) {
+  // 候选链最多跑两轮：第一轮常规候选；只有「所有候选都不可用」且无写副作用、未中止、自动模式时，
+  // 做一次重检（额度回充 / 目录增减 / 重新上架），把新可用的模型再跑一轮。只重检一次——
+  // 端点反复失败时不能无限循环（与运行级重试预算同一纪律：只在一层重试）。
+  for (let recheckPass = 0; recheckPass < 2; recheckPass += 1) {
+    if (recheckPass > 0) {
+      const recheck = await recheckModelAvailability(allModels, signal);
+      const retryIds = new Set([...recheck.added, ...recheck.recovered]);
+      candidates = recheck.models.filter((m) => retryIds.has(m.id));
+      if (!candidates.length) {
+        console.log("[chat:model] 重检未发现新可用模型，按原失败收束");
+        break;
+      }
+      console.log(
+        `[chat:model] 重检发现 ${candidates.length} 个新可用模型（新增 ${recheck.added.length} / 恢复 ${recheck.recovered.length}），再跑一轮`,
+      );
+      failure = null;
+    }
+    if (!candidates.length) {
+      failure = "没有可用模型：定时运行跳过了冷却中的模型";
+    }
+    for (const m of candidates) {
     // 中止短路（第 5 批，对标 AWS「重试不得把局部故障放大」+ 事故 L7）：运行被外部中止
     // （无进展看门狗 / 用户点停止）后**不再尝试剩余候选**——旧行为把剩余模型各打一遍，
     // 实测 abort 后 10 个候选 × 3 次瞬时重试全部 0-2ms 立即中断，白产 39 条无效 span 与日志。
@@ -4813,6 +4831,11 @@ export async function* chatStream(
     if (sideEffects > 0) break;
     modelFallbacks += 1;
     console.log(`[chat:fallback] model ${m.label} failed (${failure.slice(0, 200)}); trying next candidate`);
+    }
+    // 本轮成功 / 已中止 / 已有写副作用 → 收束，不做重检（写副作用重跑会重复写）。
+    if (!failure || signal?.aborted || sideEffects > 0) break;
+    // 用户点名模型不做重检：点名就是要用它，失败按既有候选链处理。
+    if (explicitModel || !catalogDiscoveryEnabled()) break;
   }
 
   // 所有候选都因同一状态码失败？典型是账号额度/余额整体耗尽（连付费模型都 402）。

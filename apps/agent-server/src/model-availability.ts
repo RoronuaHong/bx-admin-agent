@@ -10,7 +10,7 @@
 //   · 每日配额型 429 → 下一个 UTC 日切 + 1min 缓冲（固定小时数会在同一 UTC 日内到期后又重打）
 //   · plain 429（分钟级限流）→ 短冷却档（默认 90s）：既不「不冷却」，也不按小时冻
 //   · 500 → 一个调度周期；402 / 未开通 / 鉴权 → 小时级
-import { modelCooldownPersistenceEnabled, persistModelCooldown } from "./model-cooldown.js";
+import { modelCooldownPersistenceEnabled, persistModelCooldown, removeModelCooldown } from "./model-cooldown.js";
 
 const QUOTA_COOLDOWN_MS = Number(process.env.MODEL_QUOTA_COOLDOWN_MS || 6 * 60 * 60 * 1000);
 const TRANSIENT_COOLDOWN_MS = Number(process.env.MODEL_TRANSIENT_COOLDOWN_MS || 10 * 60 * 1000);
@@ -194,4 +194,16 @@ export function noteDailyQuotaExhausted(modelId: string, now = Date.now()): numb
     void persistModelCooldown({ modelId, until, status: "402", at: now });
   }
   return coolingMs;
+}
+
+/**
+ * 重检确认模型已恢复（额度回充 / 重新上架）后清掉冷却——进程内表与持久层一起清，
+ * 否则「恢复」只对当前进程有效，重启后又被旧冷却挡住。返回是否真的清过。
+ */
+export function clearModelCooldown(modelId: string): boolean {
+  const had = (quotaCooldownUntil.get(modelId) || 0) > Date.now() || quotaCooldownStatus.has(modelId);
+  quotaCooldownUntil.delete(modelId);
+  quotaCooldownStatus.delete(modelId);
+  if (modelCooldownPersistenceEnabled()) void removeModelCooldown(modelId);
+  return had;
 }

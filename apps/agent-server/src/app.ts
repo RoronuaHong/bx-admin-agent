@@ -966,6 +966,7 @@ function resolveModelSource(baseUrl: string, provider: string): string {
   const host = (baseUrl || "").replace(/^https?:\/\//, "").split("/")[0] || "";
   if (host.includes("integrate.api.nvidia.com")) return "NVIDIA";
   if (host.includes("opencode.ai")) return "Zen";
+  if (host.includes("openrouter.ai")) return "OpenRouter";
   if (host.includes("tokenhub.tencentmaas.com")) return "TokenHub";
   return provider;
 }

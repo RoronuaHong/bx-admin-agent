@@ -49,6 +49,25 @@ async function getColl(): Promise<Collection<CooldownEntry> | null> {
 }
 
 /**
+ * 清除一个模型的冷却记录（重检确认已恢复时调用，否则重启后又会从持久层读回旧冷却）。
+ * 内存副本先删（进程内立即生效），Mongo 侧 best-effort：失败只告警，不影响本次恢复。
+ */
+export async function removeModelCooldown(modelId: string): Promise<boolean> {
+  memory.delete(modelId);
+  const coll = await getColl();
+  if (!coll) return true; // 内存降级路径：删内存即算成功
+  try {
+    await coll.deleteOne({ _id: modelId } as never);
+    return true;
+  } catch (err) {
+    console.warn(
+      `[model-cooldown] 清除冷却落库失败（本进程已生效，重启后可能重现）：${String((err as Error)?.message || err)}`,
+    );
+    return false;
+  }
+}
+
+/**
  * 初始化持久层：连不上 Mongo 就静默退回内存（与任务留档同口径）。
  * 返回 true = 落库可用（重启后仍能恢复冷却状态）。
  */

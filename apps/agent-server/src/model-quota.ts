@@ -158,8 +158,17 @@ export async function findExhaustedQuotaTargets(models: readonly QuotaTarget[]):
 /** 兼容旧名（对话模型侧按 ModelEntry 调用，语义相同）。 */
 export const findExhaustedQuotaModels = findExhaustedQuotaTargets;
 
-/** 仅供测试：清空缓存与在途查询（避免用例之间互相命中）。 */
-export function resetQuotaPreflightForTest(): void {
+/**
+ * 作废额度预检缓存与在途查询：重检时调用，强制重新查询 `/api/v1/key`。
+ * 正在进行中的查询不取消（无法安全取消），但清掉 inflight 让下一次调用发起新查询；
+ * 旧查询返回时仍会写缓存（TTL 短），语义上是一次「尽快刷新」，不是严格单飞。
+ */
+export function invalidateQuotaPreflightCache(): void {
   cache.clear();
   inflight.clear();
+}
+
+/** 仅供测试：清空缓存与在途查询（避免用例之间互相命中）。 */
+export function resetQuotaPreflightForTest(): void {
+  invalidateQuotaPreflightCache();
 }
