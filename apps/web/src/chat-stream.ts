@@ -50,6 +50,10 @@ export interface StreamReply {
     id: string;
     parentId: string;
     description: string;
+    /** 子代理类型 id（task 的 subagent_type，缺省 general-purpose）；仅展示。 */
+    subagentType?: string;
+    /** UI 短标签（task 的 label）；仅展示，不影响执行。 */
+    label?: string;
     status: "running" | "done" | "cancelled" | "error" | "interrupted";
     text: string;
   }>;
@@ -216,6 +220,8 @@ export function applyStreamEvent<T extends StreamReply>(
       id: event.id,
       parentId: event.parentId,
       description: event.description,
+      ...(event.subagentType ? { subagentType: event.subagentType } : {}),
+      ...(event.label ? { label: event.label } : {}),
       status: "running",
       text: "",
     });

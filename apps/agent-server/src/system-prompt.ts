@@ -5,6 +5,7 @@
 import type { TodoItem } from "@bx/shared";
 import { renderMemory } from "./memory.js";
 import { renderEnabledSkills, renderSkillIndex } from "./skills.js";
+import { subagentIndexText } from "./subagents.js";
 import { UNTRUSTED_CONTENT_RULE, wrapUntrusted } from "./untrusted.js";
 import { normalizeTimeZone } from "./list-count.js";
 import { getRole } from "./roles.js";
@@ -375,7 +376,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): SystemPrompt {
   // 换角色 = 前缀整体换掉，不同角色各有一份前缀缓存，互不击穿）。
   const role = getRole(input.role);
   // 全局安全护栏放稳定前缀最前：跨角色共享、优先级最高，且随角色前缀各自缓存（不互相击穿）。
-  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, CAPABILITY_HINT, input.tooling ? TOOLING_RULES : "", input.tooling ? RUNTIME_ENVIRONMENT : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id)].filter(
+  const stableParts = [SAFETY_GUARDRAIL, role.basePrompt || BASE_PERSONA, INTENT_LINE, CAPABILITY_HINT, input.tooling ? TOOLING_RULES : "", input.tooling ? RUNTIME_ENVIRONMENT : "", input.tooling ? ANSWER_SHAPE_EXAMPLE : "", renderSkillIndex(role.id), subagentIndexText()].filter(
     (part) => part && part.trim(),
   );
   // 记忆与摘要可能夹带工具结果里的原文：定界成数据，并放在动态段最后，不排在规则前面。

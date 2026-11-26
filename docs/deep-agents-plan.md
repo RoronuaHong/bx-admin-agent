@@ -302,10 +302,12 @@ chatStream
 - `image_gen`：`{prompt, size?}`，opt-in（需 provider key）；产物落工作区 `assets/` 并内联预览。
 - **验收**：默认关闭时工具不出现在模型清单（`budget` 不变）；开启后写/外发类操作走确认门。
 
-**E. 子代理专业化（P1）**
+**E. 子代理专业化（P1）** ✅ 已落地（2026-11-26）
+
+> 落地形态从原计划的「`roles.ts` 注册单个 `bi-explorer`」扩展为**具名子代理类型体系**：`subagents.ts` 启动加载文件式定义，首批内置 `general-purpose` / `web-researcher` / `bi-explorer` / `explore`，`task` 通过可选 `subagent_type` 选择；未知类型 fail-closed。`bi-explorer` 为 `readonly: true`，写操作被强制过滤 + 风险闸门拒绝并记 `subagent_refused`。完整契约、不变量与验收见 [SUBAGENTS_DESIGN.md](./agent/SUBAGENTS_DESIGN.md)。
 
 - 新增专用子代理类型 `bi-explorer`（对齐 Cursor 预置类型 + 参考「任务专业化」）：**受限只读工具集**（BI / 知识库 / fs 读取），专用于多步 BI 探查并回传摘要；主代理保持高层协调（专治「查 N 行回灌上下文」的 context-bloat）。
-- 落点：`roles.ts` 子代理类型注册 + `chat.ts` `resolveSubagentTools` 白名单 + `task` 参数 `subagent_type`。
+- 子代理类型注册落点：`apps/agent-server/src/subagents.ts` + `subagents/*.md`，不再挂 roles.ts（`chat.ts` 负责工具求交与风险闸门，`task` 的 `subagent_type` 只是选择器）。
 - **验收**：`task(subagent_type: "bi-explorer")` 走受限工具集，写操作被拒（复用现有 `subagent_refused` 审计）。
 
 **F. 长期记忆的模型侧工具（P1）**
@@ -359,7 +361,7 @@ chatStream
 | 无 glob / grep / snapshot | `fs-store.ts` 导出仅有 `fsWrite` / `fsRead` / `fsEdit` / `fsList` / `fsRemoveConversation` / `offloadToolResult` |
 | 无 execute / browser / image_gen / web_search / http_request / fetch_url | 全仓无这些工具定义（`builtins.ts` + 各 MCP 适配器） |
 | 无结构化澄清工具 | 全仓 grep `clarif` / `ask_question` / `request_question` = **0**；澄清靠 `TOOLING_RULES` 第 3 条纯文本追问 |
-| `task` 无 `subagent_type` | `builtins.ts` 的 `task` 参数只有 `description` / `servers` |
+| ~~`task` 无 `subagent_type`（2026-09-20 核对结论）~~ ✅ 已落地（2026-11-26） | 当时 `builtins.ts` 的 `task` 参数只有 `description` / `servers`；现已新增可选 `subagent_type` / `label`，类型定义由 `subagents.ts` 加载，父代理只消费 `name + description` 索引。详见 [SUBAGENTS_DESIGN.md](./agent/SUBAGENTS_DESIGN.md) |
 | 业务工具已外置为 MCP（§11.0 判断成立） | `yapi-mcp.mjs` 的 `TOOLS` 含 `call_api` / `search_apis` / `get_api_desc` / `list_projects` / `list_categories`；`bi` → `metabase-mcp.mjs` |
 | backend 不可替换 | `fs-store.ts` 顶部 `FS_ROOT = resolve(__dirname, "..", ".data", "fs")` 硬编码 |
 

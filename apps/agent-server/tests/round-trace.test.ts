@@ -166,8 +166,23 @@ test("L2② 委派子代理：父轮 task 调用有 span，带低基数结构化
   expect(typeof taskSpan!.durationMs).toBe("number");
   expect(taskSpan!.attrs?.["gen_ai.tool.subagent.status"]).toBe("success");
   expect(taskSpan!.attrs?.["gen_ai.tool.subagent.calls"]).toBeGreaterThanOrEqual(0);
+  // 具名子代理类型：不传 subagent_type 时缺省 general-purpose（低基数 attr，随 span 落盘）。
+  expect(taskSpan!.attrs?.["gen_ai.tool.subagent.type"]).toBe("general-purpose");
   // 成功的委派不写 error.*（OTel：已被正常处理的不记录）
   expect(taskSpan!.attrs?.["error.type"]).toBeUndefined();
+}, 30000);
+
+test("L2④ 具名子代理委派：span 的 gen_ai.tool.subagent.type 跟随 subagent_type", async () => {
+  const { spans } = await runAndRead("run_unit_task_typed", "delegate", {
+    description: "联网核对口径",
+    subagent_type: "web-researcher",
+  });
+  const taskSpan = spans.find((s) => s.kind === "tool" && s.name === "task") as
+    | { ok?: boolean; attrs?: Record<string, unknown> }
+    | undefined;
+  expect(taskSpan, "父轮 task 调用必须落 span").toBeDefined();
+  expect(taskSpan!.ok).toBe(true);
+  expect(taskSpan!.attrs?.["gen_ai.tool.subagent.type"]).toBe("web-researcher");
 }, 30000);
 
 test("L2③ 委派失败：task span ok=false 且带 error.type/description（可复盘「哪一步失败」）", async () => {
@@ -184,4 +199,17 @@ test("L2③ 委派失败：task span ok=false 且带 error.type/description（�
   expect(typeof taskSpan!.attrs?.["error.type"]).toBe("string");
   expect((taskSpan!.attrs?.["error.type"] as string).length).toBeGreaterThan(0);
   expect(typeof taskSpan!.attrs?.["error.description"]).toBe("string");
+}, 30000);
+
+test("L2⑤ 未知类型的 span attr 收敛为 unknown（低基数，不写模型自由字符串）", async () => {
+  const { spans } = await runAndRead("run_unit_task_unknown_type", "delegate-failed", {
+    description: "核对口径",
+    subagent_type: "模型瞎编的类型-不应进 span",
+  });
+  const taskSpan = spans.find((s) => s.kind === "tool" && s.name === "task") as
+    | { ok?: boolean; attrs?: Record<string, unknown> }
+    | undefined;
+  expect(taskSpan).toBeDefined();
+  expect(taskSpan!.ok).toBe(false);
+  expect(taskSpan!.attrs?.["gen_ai.tool.subagent.type"]).toBe("unknown");
 }, 30000);

@@ -7,7 +7,7 @@
 //         子代理（task 工具：独立上下文 + 最小工具集 + 只回摘要）。
 import type { ArtifactSpec, ChatEvent, ClarifyOption, RiskLevel, TodoItem } from "@bx/shared";
 import { config, defaultModel, getModel, listModels, type ModelEntry } from "./config.js";
-import { BUILTIN_SERVER, builtinToolSpecs, CONVERSATION_STATE_TOOLS, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
+import { BUILTIN_RISK, BUILTIN_SERVER, builtinToolSpecs, CONVERSATION_STATE_TOOLS, execBuiltin, TOOL_SEARCH_NAME, WORKSPACE_FILE_WRITE_TOOLS, type BuiltinHooks } from "./builtins.js";
 import { admitDirectListCall, releaseDirectListCall, rememberDirectListPage } from "./list-page-gate.js";
 import { extractListRows, listResponseHasMore, normalizeTimeZone } from "./list-count.js";
 import { toolCodeDenied } from "./tool-code.js";
@@ -123,6 +123,8 @@ import {
 } from "./model-availability.js";
 import { findExhaustedQuotaModels, quotaPreflightEnabled } from "./model-quota.js";
 import { catalogDiscoveryEnabled, recheckModelAvailability } from "./model-catalog.js";
+import { GENERAL_PURPOSE_ID, getSubagentType, listSubagentTypes } from "./subagents.js";
+import { readSkillDocument } from "./skills.js";
 
 // 上下文预算以 token 计，并由「模型窗口」推导（不再用与模型无关的固定字符数）。
 const CONTEXT_SAFETY_RATIO = Number(process.env.CONTEXT_SAFETY_RATIO || 0.8);
@@ -496,6 +498,10 @@ interface SubagentHandle {
   description: string;
   controller: AbortController;
   status: "running" | "done" | "cancelled" | "error";
+  /** 子代理类型 id（缺省 general-purpose），供独立取消与展示区分。 */
+  subagentType?: string;
+  /** 调用方给的 UI 短标签，不影响执行。 */
+  label?: string;
 }
 const subagentRegistry = new Map<string, SubagentHandle>();
 let subagentSeq = 0;
@@ -1905,6 +1911,24 @@ export function toolCallSignature(name: string, argsJson: string): string {
 }
 
 /**
+ * task 专用去重指纹：先剥掉 label 再算，避免模型给同一子任务换标签绕过「同轮重复跳过」。
+ * 去重键仍为 description + subagent_type + servers（label 不参与）。
+ */
+export function taskCallSignature(argsJson: string): string {
+  let stripped = argsJson || "{}";
+  try {
+    const parsed = JSON.parse(stripped) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "label" in parsed) {
+      delete parsed.label;
+      stripped = JSON.stringify(parsed);
+    }
+  } catch {
+    /* 非法 JSON 交给 toolCallSignature 退化为原文比较 */
+  }
+  return toolCallSignature("task", stripped);
+}
+
+/**
  * 跨轮 Doom Loop 熔断：记录每轮「实际执行的调用指纹」（去重后的签名集合）。
  * 同一指纹**连续**重复达到阈值即判定陷入无效循环（如每次都执行同一组工具却拿不到进展），
  * 返回 true 让上层主动收束，避免无限循环空耗 token。空轮（无执行）不计入连击。
@@ -2152,6 +2176,8 @@ interface LoopContext {
   /** 主代理 = true；子代理 = false（子代理送不出确认事件 → 需要用户拍板的操作在闸门处立即拒绝，
    *  免确认的工作区写仍可执行；判定见 risk.ts `subagentMayExecute`）。 */
   allowWrite: boolean;
+  /** 子代理类型声明 readonly：风险闸门（risk.ts subagentMayExecute）据此连免确认的工作区写也拒绝。 */
+  subagentReadonly?: boolean;
   /** 会话级只读授权（conversation.readGrants）：仅对「未声明级别」的同服务器工具降级为只读。 */
   grantServers: ReadonlySet<string>;
   /**
@@ -3106,7 +3132,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
     while (index < calls.length) {
       const call = calls[index]!;
       // 同轮去重：本轮已执行过的相同调用（name + 规范化参数）不再重复执行，仍回灌结果保持模型上下文对齐。
-      const sig = toolCallSignature(call.name, call.argsJson);
+      const sig = call.name === "task" ? taskCallSignature(call.argsJson) : toolCallSignature(call.name, call.argsJson);
       if (TOOL_DEDUP_SAME_ROUND && executedSigs.has(sig)) {
         index += 1;
         yield { type: "tool_call", id: call.id, name: call.name, server: serverOf.get(call.name), args: call.argsJson };
@@ -3126,7 +3152,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
         const batch: ToolCall[] = [];
         while (index < calls.length && calls[index]!.name === "task") {
           const t = calls[index]!;
-          const tsig = toolCallSignature(t.name, t.argsJson);
+          const tsig = taskCallSignature(t.argsJson);
           if (TOOL_DEDUP_SAME_ROUND && executedSigs.has(tsig)) {
             // 重复子任务：单独回灌跳过结果，不进并行批量。
             yield { type: "tool_call", id: t.id, name: "task", server: BUILTIN_SERVER, args: t.argsJson };
@@ -3184,7 +3210,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
             content: wrappedTask.text,
             derived: true,
           });
-          roundExecuted.push(toolCallSignature("task", result.args));
+          roundExecuted.push(taskCallSignature(result.args));
           handles.push({
             name: "task",
             args: truncateArgs(result.args),
@@ -3209,6 +3235,7 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
                 "gen_ai.tool.name": "task",
                 "gen_ai.tool.type": "function",
                 "gen_ai.conversation.id": ctx.conversationId,
+                "gen_ai.tool.subagent.type": subagentTypeAttr(result.subagentType),
                 "gen_ai.tool.subagent.status": result.status,
                 "gen_ai.tool.subagent.calls": result.toolCalls,
                 ...(result.ok
@@ -3498,9 +3525,14 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
       // 的操作——子代理的确认事件送不进用户可见的事件流，送不出去就只能挂到超时。
       // 免确认的工作区写（fs_write / fs_edit：沙箱内、路径与体积有上限、可回查）与此无关，照常放行
       // （否则「让子代理把中间结果落盘」这类本来就安全的委派会被无谓挡住）。判定见 risk.ts。
-      if (!subagentMayExecute(verdict, ctx.allowWrite)) {
+      if (!subagentMayExecute(verdict, ctx.allowWrite, ctx.subagentReadonly ?? false)) {
         ok = false;
-        rawText = `该操作（${verdict.level}，带外部副作用）不能委派给子代理执行：请在主对话里直接发起（这类操作需要你确认，会在主对话弹确认卡）。`;
+        // 只读类型是更严格的一层：连免确认的工作区写也拒绝，文案要区分「只读类型禁止」与
+        // 「需用户确认的操作不能委派」，否则模型会误以为去主对话发起就能绕开只读边界。
+        const readonlyBlocked = !!ctx.subagentReadonly && verdict.level !== "read";
+        rawText = readonlyBlocked
+          ? `只读子代理禁止写操作：${call.name}；该类型不允许任何写或外部操作，请在主对话里另行发起。`
+          : `该操作（${verdict.level}，带外部副作用）不能委派给子代理执行：请在主对话里直接发起（这类操作需要你确认，会在主对话弹确认卡）。`;
         yield {
           type: "tool_result",
           id: call.id,
@@ -3510,7 +3542,13 @@ async function* runLoop(ctx: LoopContext, turns: Turn[]): AsyncGenerator<ChatEve
           text: rawText,
         };
         conversation.push({ role: "tool", toolCallId: call.id, name: call.name, content: rawText });
-        handles.push({ name: call.name, args: truncateArgs(call.argsJson), summary: "未执行（子代理不能做需确认的操作）" });
+        handles.push({
+          name: call.name,
+          args: truncateArgs(call.argsJson),
+          summary: readonlyBlocked
+            ? `未执行（只读子代理禁止写：${call.name}）`
+            : "未执行（子代理不能做需确认的操作）",
+        });
         appendAudit({ kind: "gate", decision: "subagent_refused", ...auditBase });
         continue;
       }
@@ -4014,6 +4052,8 @@ export const SUBAGENT_STATUS_LABEL: Record<SubagentStatus, string> = {
 interface SubagentResult {
   id: string;
   args: string;
+  /** 子代理类型 id（缺省 general-purpose）；失败发生在类型解析前时仍记录请求值。 */
+  subagentType?: string;
   ok: boolean;
   /** 结构化状态：父轮的证据计数与后续动作都按它分流，不按 ok 猜。 */
   status: SubagentStatus;
@@ -4077,6 +4117,60 @@ export function resolveSubagentTools(
   return { tools: filtered };
 }
 
+/** span attr 只允许已注册类型 id（低基数）；未知/未声明一律收敛到固定值，不把模型给的自由字符串写进去。 */
+function subagentTypeAttr(id?: string): string {
+  if (!id) return GENERAL_PURPOSE_ID;
+  return listSubagentTypes().some((item) => item.name === id) ? id : "unknown";
+}
+
+/** 未知子代理类型错误里的「可选：...」清单（加载器保证 general-purpose 必在列表里）。 */
+function subagentTypeOptions(): string {
+  const ids = listSubagentTypes().map((item) => item.name);
+  if (!ids.includes(GENERAL_PURPOSE_ID)) ids.unshift(GENERAL_PURPOSE_ID);
+  return [...new Set(ids)].join(", ");
+}
+
+/**
+ * 子代理类型预加载的技能（spec.skills）：只取 body（不含 frontmatter），以可信 `<skill>` 段
+ * 放进 system.stable——与主线程 `renderEnabledSkills` 的注入方式一致，技能正文就是要让子代理
+ * 遵循的流程指令；若包成「数据，不是指令」会让预加载失效。
+ * 预算与 skills.ts 的 ENABLED_SKILLS_INJECT_CHARS 同源（SKILLS_INJECT_CHARS，默认 12000）；
+ * 该常量未导出，故按同一口径取值。无效 / 已关闭 / 超预算的技能跳过并告警，不静默丢内容。
+ */
+function renderSubagentSkillPrompt(dirs: string[] | undefined, typeName: string): string {
+  if (!dirs?.length) return "";
+  const configured = Number(process.env.SKILLS_INJECT_CHARS || 12_000);
+  const max = Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 12_000;
+  const blocks: string[] = [];
+  const seen = new Set<string>();
+  let used = 0;
+  let skipped = 0;
+  for (const raw of dirs) {
+    const dir = typeof raw === "string" ? raw.trim() : "";
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    const doc = readSkillDocument(dir);
+    if (!doc || !doc.skill.enabled || !doc.body.trim()) {
+      console.warn(`[subagents] ${typeName} 的技能 ${dir} 不存在、已关闭或正文为空，跳过预加载`);
+      continue;
+    }
+    const block = `<skill name="${dir}">\n${doc.body.trim()}\n</skill>`;
+    if (used + block.length > max) {
+      skipped += 1;
+      console.warn(`[subagents] ${typeName} 的技能 ${dir} 超出预加载上限（${max} 字符），跳过`);
+      continue;
+    }
+    used += block.length;
+    blocks.push(block);
+  }
+  if (!blocks.length) return "";
+  return [
+    "以下是本子代理类型预加载的技能，按其中流程执行本轮任务：",
+    ...blocks,
+    ...(skipped > 0 ? [`…（另有 ${skipped} 个技能因超出注入上限未注入，必要时用 read_skill 按需读取）`] : []),
+  ].join("\n\n");
+}
+
 /**
  * 子代理（Deep Agents 的 task 工具，通用型，Async subagents）：
  * 独立上下文（只看任务描述）+ 最小工具集（剔除 task / write_todos 防递归；可选按 servers 收窄）+
@@ -4093,43 +4187,83 @@ async function* runSubagent(
 ): AsyncGenerator<ChatEvent, SubagentResult> {
   const args = safeJsonParse(call.argsJson);
   const description = String(args.description || args.task || "").trim();
+  const requestedType = String(args.subagent_type || "").trim() || GENERAL_PURPOSE_ID;
+  const spec = getSubagentType(requestedType);
+  const failed = (errors: string[], text: string): SubagentResult => ({
+    id: call.id,
+    args: call.argsJson,
+    subagentType: requestedType,
+    ok: false,
+    status: "failed",
+    errors,
+    text,
+    toolCalls: 0,
+  });
   if (!description) {
-    return {
-      id: call.id,
-      args: call.argsJson,
-      ok: false,
-      status: "failed",
-      errors: ["缺少任务描述（description）"],
-      text: "task 需要提供 description（要委派的具体任务）",
-      toolCalls: 0,
-    };
+    return failed(["缺少任务描述（description）"], "task 需要提供 description（要委派的具体任务）");
   }
-  // 可选白名单：把子代理的工具限定在它真正需要的服务器上（对齐 Deep Agents「只给它需要的工具」）。
+  // 未知类型 fail-closed：绝不退化成通用型，父轮据「可选：...」纠正。
+  if (!spec) {
+    const msg = `未知子代理类型：${requestedType}。可选：${subagentTypeOptions()}`;
+    return failed([msg], msg);
+  }
+  // 类型声明的模型：无效 id / 冷却中一律 failed。它等价于「用户点名模型」，固定该模型跳过 auto 候选排序，
+  // 但仍进入 runLoop → streamCall 的瞬时重试与端点自愈。
+  const requestedModel = spec.model && spec.model !== "inherit" ? String(spec.model).trim() : "";
+  let pinnedModel: ModelEntry | null = null;
+  if (requestedModel) {
+    pinnedModel = getModel(requestedModel);
+    if (!pinnedModel || isCoolingDown(requestedModel)) {
+      const msg = `子代理模型无效或处于冷却：${requestedModel}`;
+      return failed([msg], msg);
+    }
+  }
+  // MCP 侧：类型 mcpServers ∩ 会话工具；显式声明（含空数组 / 全未知被过滤后的 []）走 fail-closed，
+  // 只有「未声明」才继承会话全部 MCP 工具。servers 参数在类型允许范围之上再收窄，空交集仍由
+  // resolveSubagentTools 报错（保持该纯函数契约不变）。
+  const typeServers = spec.mcpServers !== undefined ? spec.mcpServers.map((id) => String(id || "").trim()) : null;
+  const typeMcpTools = typeServers ? ctx.mcpTools.filter((tool) => typeServers.includes(tool.serverId)) : ctx.mcpTools;
+  if (typeServers && !typeMcpTools.length) {
+    const msg = `子代理类型的 MCP 服务器在当前会话没有可用工具：${typeServers.join("、") || "（声明为空）"}`;
+    return failed([msg], msg);
+  }
   const resolved = resolveSubagentTools(
-    ctx.mcpTools,
+    typeMcpTools,
     Array.isArray(args.servers) ? args.servers.map((id) => String(id || "")) : [],
   );
-  if (resolved.error) {
-    return {
-      id: call.id,
-      args: call.argsJson,
-      ok: false,
-      status: "failed",
-      errors: [resolved.error],
-      text: resolved.error,
-      toolCalls: 0,
-    };
-  }
+  if (resolved.error) return failed([resolved.error], resolved.error);
   const subTools = resolved.tools;
-  // 子代理不得向用户提问（排除 request_clarification）：用户决策权归父任务（对齐 Deep Agents
-  // 「子代理只能回传候选」）——子代理的澄清要么到不了用户（挂到超时），要么绕过父代理的决策上下文。
-  const subBuiltins = builtinToolSpecs({ toolSearch: ctx.toolSearch }).filter(
-    (spec) =>
-      spec.name !== "task" &&
-      spec.name !== "write_todos" &&
-      spec.name !== "request_clarification" &&
-      !SUBAGENT_DENIED_BUILTINS.has(spec.name),
-  );
+  // 内置侧：类型 tools allowlist ∩ builtinToolSpecs → 强制必删 → disallowedTools → readonly 去非 read。
+  // 用 !== undefined 区分「显式声明但为空 / id 全未知」（fail-closed）与「未声明」（继承全部）。
+  const allow = spec.tools !== undefined ? new Set(spec.tools) : null;
+  const denied = new Set(spec.disallowedTools || []);
+  const subBuiltins = builtinToolSpecs({ toolSearch: ctx.toolSearch }).filter((b) => {
+    if (allow && !allow.has(b.name)) return false;
+    // 强制必删（防递归、用户决策权归父轮、长期记忆只由主对话写），先于类型 deny 应用。
+    if (b.name === "task" || b.name === "write_todos" || b.name === "request_clarification") return false;
+    if (SUBAGENT_DENIED_BUILTINS.has(b.name)) return false;
+    if (denied.has(b.name)) return false;
+    // 第一道闸：只读类型只保留 read 级内置工具；MCP 写无法静态剥离，留给运行期风险闸门。
+    if (spec.readonly && BUILTIN_RISK[b.name]?.level !== "read") return false;
+    return true;
+  });
+  if (!subTools.length && !subBuiltins.length) {
+    const msg = "task 的 tools 与当前可用工具无交集";
+    return failed([msg], msg);
+  }
+  // maxTurns 必须是正整数，钳制到 [1, SUBAGENT_MAX_ROUNDS] 后覆盖 LoopContext.maxRounds。
+  const wantedTurns = Number(spec.maxTurns);
+  const maxRounds =
+    Number.isFinite(wantedTurns) && wantedTurns > 0
+      ? Math.min(SUBAGENT_MAX_ROUNDS, Math.max(1, Math.floor(wantedTurns)))
+      : SUBAGENT_MAX_ROUNDS;
+  // 类型正文 + 预加载技能（可信 <skill> 段，与主线程一致）+ 共享尾部守则（运行环境 / 不可信内容 / 交接格式）；
+  // 不递归注入主代理的类型索引。技能段排在共享守则之前。
+  const skillPrompt = renderSubagentSkillPrompt(spec.skills, requestedType);
+  const subPrompt = [spec.systemPrompt, skillPrompt, SUBAGENT_PROMPT]
+    .filter((part) => part && part.trim())
+    .join("\n\n");
+  const label = typeof args.label === "string" && args.label.trim() ? args.label.trim() : undefined;
 
   const subagentId = nextSubagentId(ctx.conversationId);
   const controller = new AbortController();
@@ -4139,6 +4273,8 @@ async function* runSubagent(
     description,
     controller,
     status: "running",
+    subagentType: requestedType,
+    label,
   };
   subagentRegistry.set(subagentId, handle);
   // 级联：主代理整体取消 → 子代理也中止。
@@ -4156,7 +4292,7 @@ async function* runSubagent(
     else ctx.signal.addEventListener("abort", onParentAbort, { once: true });
   }
 
-  yield { type: "subagent_start", id: subagentId, parentId, description };
+  yield { type: "subagent_start", id: subagentId, parentId, description, subagentType: requestedType, label };
 
   const subCtx: LoopContext = {
     ...ctx,
@@ -4166,9 +4302,12 @@ async function* runSubagent(
     specs: [...subBuiltins, ...(ctx.toolSearch ? [] : selectMcpToolSpecs(subTools).specs)],
     toolSearch: ctx.toolSearch,
     loadedTools: new Set<string>(),
-    system: { stable: SUBAGENT_PROMPT, dynamic: "" },
+    system: { stable: subPrompt, dynamic: "" },
     allowTask: false,
     subagent: true,
+    subagentReadonly: !!spec.readonly,
+    // 类型钉住的模型：固定它、跳过 auto 候选排序；未声明则不覆盖，沿用父轮模型。
+    ...(pinnedModel ? { model: pinnedModel } : {}),
     // 子代理不参与接地护栏：它的产出是回传给主代理的**中间摘要**，不是用户可见的最终答案；
     // 最终答案由主代理那一层护栏把关（零证据照样拦）。让子代理也走护栏会把它正常的工作区操作
     // （fs_write 存中间结果这类工具不构成证据）判成「零证据作答」，摘要被换成兜底话术，
@@ -4178,7 +4317,7 @@ async function* runSubagent(
     // （risk.ts subagentMayExecute）——免确认的工作区写可用，外部写留给主对话。
     // SUBAGENT_ALLOW_WRITE=on 仅作预留（确认事件转发未实现，放开会导致挂起到超时），不改变本值。
     allowWrite: false,
-    maxRounds: SUBAGENT_MAX_ROUNDS,
+    maxRounds,
     namespace: ctx.namespace,
     ownerKey: ctx.ownerKey,
     signal: controller.signal,
@@ -4213,6 +4352,7 @@ async function* runSubagent(
     const result: SubagentResult = {
       id: call.id,
       args: call.argsJson,
+      subagentType: requestedType,
       ok: false,
       status: "failed",
       errors: [cancelled ? "运行被中止，子代理未跑完" : `子代理执行出错：${String((err as Error)?.message || err)}`],
@@ -4239,6 +4379,7 @@ async function* runSubagent(
       return {
         id: call.id,
         args: call.argsJson,
+        subagentType: requestedType,
         ok: true,
         status: "partial",
         coverage,
@@ -4253,6 +4394,7 @@ async function* runSubagent(
     return {
       id: call.id,
       args: call.argsJson,
+      subagentType: requestedType,
       ok: false,
       status: "failed",
       coverage,
@@ -4271,6 +4413,7 @@ async function* runSubagent(
     return {
       id: call.id,
       args: call.argsJson,
+      subagentType: requestedType,
       ok: false,
       status: "no_findings",
       coverage,
@@ -4288,6 +4431,7 @@ async function* runSubagent(
   return {
     id: call.id,
     args: call.argsJson,
+    subagentType: requestedType,
     ok: true,
     status: found ? "success" : "no_findings",
     coverage,

@@ -3,6 +3,8 @@
 // 属可逆的本地动作 → 免确认（否则确认疲劳会让用户退化成橡皮图章）。
 // 同时钉住「这次放宽没有波及外部写与未知工具」——那两类仍必须逐次确认（fail-closed）。
 import { test, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { resolveToolRisk, subagentMayExecute, verdictNeedsConfirm, type RiskVerdict } from "../src/risk.js";
 import { summarizeArgsForConfirm } from "../src/chat.js";
 import { BUILTIN_RISK, WORKSPACE_FILE_WRITE_TOOLS } from "../src/builtins.js";
@@ -70,6 +72,34 @@ test("[E] 子代理可执行范围按作用域判定：工作区写放行，需�
   expect(subagentMayExecute({ ...externalWrite, level: "destructive" }, false)).toBe(false);
   // 主代理（allowWrite=true，自己能弹确认卡）不受此闸门限制。
   expect(subagentMayExecute(externalWrite, true)).toBe(true);
+});
+
+test("[F] readonly 子代理：连免确认的工作区写也拒绝，闸门记 subagent_refused 审计", () => {
+  // 第二道闸：readonly=true 时，原本免确认的工作区写也必须拒（第一道闸已从工具集剥离，这里是兜底）。
+  for (const name of ["fs_write", "fs_edit"]) {
+    expect(subagentMayExecute(resolveToolRisk(name), false, true), name).toBe(false);
+  }
+  // 只读与分页计数不受影响，仍可直接执行。
+  for (const name of ["fs_read", "fs_ls", "count_list_by_time"]) {
+    expect(subagentMayExecute(resolveToolRisk(name), false, true), name).toBe(true);
+  }
+  // 非 readonly 的旧口径不变：工作区写照旧放行。
+  expect(subagentMayExecute(resolveToolRisk("fs_write"), false)).toBe(true);
+
+  // 接线断言：readonly 定义 → 子代理上下文标志 → 闸门调用 → subagent_refused 审计。
+  // 不做事件流 e2e：readonly 类型在工具清单阶段已剥掉非 read 内置写工具，模型拿不到 fs_write；
+  // 真正需要这道闸的是无法静态剥离的 MCP 写工具，因此这里锚定「标志传到了闸、闸会记审计」。
+  const chatSrc = readFileSync(fileURLToPath(new URL("../src/chat.ts", import.meta.url)), "utf8");
+  expect(chatSrc, "类型 readonly 必须传进子代理上下文").toMatch(/subagentReadonly:\s*!!?spec\.readonly/);
+  expect(chatSrc, "闸门必须收到 readonly 标志").toMatch(
+    /subagentMayExecute\(verdict,\s*ctx\.allowWrite,\s*ctx\.subagentReadonly\s*\?\?\s*false\)/,
+  );
+  const gateStart = chatSrc.indexOf("if (!subagentMayExecute(");
+  expect(gateStart, "子代理闸门分支应存在").toBeGreaterThan(-1);
+  expect(
+    chatSrc.slice(gateStart, gateStart + 1200),
+    "readonly 拒绝必须落 subagent_refused 审计，否则事后无法复盘",
+  ).toContain('decision: "subagent_refused"');
 });
 
 test("[D] 确认卡参数展示：长值头尾保留 + 显式省略，敏感键脱敏", () => {

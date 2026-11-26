@@ -1,8 +1,8 @@
 # 具名子代理（Subagent Types）设计稿
 
-> **状态**：设计稿，未实施。本文只描述目标方案，不代表当前代码行为。
+> **状态**：已实施（2026-11-26），本文同时作为实现契约。下文「设计」章节保留当时的背景与论证；「目标/非目标」「契约」「验收」等条目即为当前代码应满足的约束，若有偏差以源码为准并回归本文。
 > **日期**：2026-11-26
-> **关联**：[当前架构](./CURRENT_ARCHITECTURE.md)（唯一权威，D4 = 通用型 `task`）、[deep-agents-plan](../deep-agents-plan.md) §11.2-E 与 §11.6「`task` 无 `subagent_type`」、[子代理事故复盘](../agent-stall-incident-20261014.md)
+> **关联**：[当前架构](./CURRENT_ARCHITECTURE.md)（唯一权威，D4 = 具名子代理类型）、[deep-agents-plan](../deep-agents-plan.md) §11.2-E 与 §11.6（历史核对结论「`task` 无 `subagent_type`」已于 2026-11-26 落地）、[子代理事故复盘](../agent-stall-incident-20261014.md)
 > **范围**：进程内、同一次运行里的上下文隔离与能力收窄；不做多进程 Agent 集群、不接 A2A。
 
 ## 1. 背景与要解决的问题
@@ -12,7 +12,7 @@
 - `task` 参数只有 `description` 和 `servers`（`apps/agent-server/src/builtins.ts:721-742`）。
 - 子代理提示硬编码为 `SUBAGENT_PROMPT`（`apps/agent-server/src/system-prompt.ts:158-173`），不区分类型。
 - 工具白名单只按 MCP server 收窄；内置工具用一段硬编码 filter 排除递归/提问工具（`apps/agent-server/src/chat.ts:4107-4132`）。
-- 设计文档早已把「专业化子代理」列为 P1，但尚未落地（`docs/deep-agents-plan.md:305-309`、`:362`）。
+- 设计文档早已把「专业化子代理」列为 P1，当时尚未落地（`docs/deep-agents-plan.md:305-309`、`:362`；现已实施）。
 
 实际暴露的问题：模型想委派联网检索，但 `task` 只有 `servers` 一个表达能力的口子，于是把 `web` 当成 MCP server 填进去。trace `apps/agent-server/.data/traces/spans-run_21841e10-d959-4b68-9115-67b630a09cd1.jsonl` 第 5–7 行：
 
@@ -128,7 +128,7 @@ Markdown 正文 = 该类型专属 prompt。**全局守则仍在末尾统一拼�
 
 职责：
 
-1. 解析 frontmatter 与正文。**复用 `skills.ts:112-125` 的 `parseFrontmatter` / `bodyAfterFrontmatter`**，但这两个函数当前是私有的，需先导出（或抽到 `frontmatter.ts`）；解析器只支持单行 `key: value`，字段按标量或逗号分隔字符串写。
+1. 解析 frontmatter 与正文。**复用 `skills.ts:112-125` 的 `parseFrontmatter` / `bodyAfterFrontmatter`**（已由私有改为导出）；解析器只支持单行 `key: value`，字段按标量或逗号分隔字符串写。
 2. 合并优先级：代码内置定义 < `subagents/*.md` < `.data/subagents/*.md`，同名后者覆盖前者（对齐 Claude Code / Cursor 的作用域优先级）。
 3. 启动期校验：缺 `name` / `description`、文件名与 `name` 不一致、`name` 不匹配 `^[a-z0-9-]{1,64}$`、非法字段名、正文为空 → 跳过该文件并告警，不静默生效。`tools` / `skills` / `mcpServers` 中出现未知 id 时**逐项告警并忽略该项**，不连带废掉整个文件（动态工具如 `search_tools` 依赖运行时）。
 4. 对外导出：`listSubagentTypes()`、`getSubagentType(id)`、`subagentIndexText()`；预留 `invalidateSubagentCache()`，首版不接管理页。
@@ -180,7 +180,7 @@ Markdown 正文 = 该类型专属 prompt。**全局守则仍在末尾统一拼�
 | 文件 | 改动 |
 |---|---|
 | `apps/agent-server/src/subagents.ts`（新增） | 加载器、内置定义、索引生成 |
-| `apps/agent-server/src/skills.ts` | 导出 `parseFrontmatter` / `bodyAfterFrontmatter`；`skills` 预加载复用 `readSkillDocument`（`skills.ts:305`）取正文，上限复用 `ENABLED_SKILLS_INJECT_CHARS`，作为数据段拼入子代理 prompt，不注入 skills 索引 |
+| `apps/agent-server/src/skills.ts` | 导出 `parseFrontmatter` / `bodyAfterFrontmatter`；`skills` 预加载复用 `readSkillDocument`（`skills.ts:305`）取正文，上限复用 `ENABLED_SKILLS_INJECT_CHARS`，以可信 `<skill name="...">` 段拼入子代理 system.stable（与主线程技能注入一致），不注入 skills 索引 |
 | `apps/agent-server/src/builtins.ts` | `task` 加 `subagent_type` / `label`，改写描述 |
 | `apps/agent-server/src/system-prompt.ts` | `stableParts` 插入 `subagentIndexText()` |
 | `apps/agent-server/src/risk.ts:278-283` | `subagentMayExecute(v, allowWrite, readonly = false)`：readonly 时连免确认的工作区写也拒绝，记 `subagent_refused`（`audit.ts:18`） |
@@ -191,7 +191,7 @@ Markdown 正文 = 该类型专属 prompt。**全局守则仍在末尾统一拼�
 | `apps/web/src/chat-stream.ts:213-223` | 把新字段写入 `reply.subagents` |
 | `apps/web/src/components/ChatBubble.vue:215` | 步骤名改为 `label ?? toolDisplayName(step.name, uiLocale)`，`label` 从 `step.args` 解析，无需改 `ToolStep` 结构 |
 
-`subagents.ts` 只依赖 `skills.ts` 的解析函数，**不得 import `builtins.ts` / `chat.ts` / `system-prompt.ts`**，否则 `system-prompt.ts → subagents.ts → ...` 会成环。
+`subagents.ts` 依赖 `skills.ts` 的解析函数与 `builtins.ts` 的 `BUILTIN_RISK` 键（用于内置工具 id 校验，避免维护重复名单）；**不得 import `chat.ts` / `system-prompt.ts`**，否则会成环。已核对 `builtins.ts` 不依赖 `system-prompt.ts` / `subagents.ts`，该引用不成环。
 
 ### 4.6 首批内置类型
 

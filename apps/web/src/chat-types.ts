@@ -83,6 +83,10 @@ export interface Bubble {
     id: string;
     parentId: string;
     description: string;
+    /** 子代理类型 id（task 的 subagent_type，缺省 general-purpose）；仅展示。 */
+    subagentType?: string;
+    /** UI 短标签（task 的 label）；仅展示，不影响执行。 */
+    label?: string;
     status: SubagentStatus;
     text: string;
   }>;

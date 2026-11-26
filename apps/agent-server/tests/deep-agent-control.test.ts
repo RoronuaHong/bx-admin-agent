@@ -6,6 +6,7 @@ import {
   forcedToolChoiceSupported,
   markForcedToolChoiceUnsupported,
   resolveSubagentTools,
+  taskCallSignature,
   toolCallSignature,
   LoopGuard,
   selectMcpToolSpecs,
@@ -62,6 +63,27 @@ test("[B] toolCallSignature（同轮去重指纹）", () => {
   const f = toolCallSignature("x", "不是合法json");
   expect(e).toBe(f);
   expect(e.startsWith("x::")).toBe(true);
+});
+
+test("[B2] task 的 label 不参与同轮去重指纹（换标签不算新子任务）", () => {
+  // task 走专用签名（先剥 label 再交给 toolCallSignature），普通工具的签名口径不变。
+  const a = taskCallSignature(
+    JSON.stringify({ description: "查 X", subagent_type: "web-researcher", label: "甲" }),
+  );
+  const b = taskCallSignature(
+    JSON.stringify({ description: "查 X", subagent_type: "web-researcher", label: "乙" }),
+  );
+  expect(a, "label 只是 UI 短标签，不得让同一子任务绕过同轮去重").toBe(b);
+  // 真正的去重键仍是 description + subagent_type + servers：换其中任一项必须产生新指纹。
+  const c = taskCallSignature(
+    JSON.stringify({ description: "查 Y", subagent_type: "web-researcher", label: "甲" }),
+  );
+  const d = taskCallSignature(
+    JSON.stringify({ description: "查 X", subagent_type: "bi-explorer", label: "甲" }),
+  );
+  expect(a).not.toBe(c);
+  expect(a).not.toBe(d);
+  expect(a.startsWith("task::")).toBe(true);
 });
 
 test("[C] LoopGuard（跨轮 Doom Loop 熔断）", () => {

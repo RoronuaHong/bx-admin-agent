@@ -724,16 +724,21 @@ export function builtinToolSpecs(opts: { toolSearch?: boolean } = {}): ToolSpec[
         "适合：会产生大量中间数据的查询（主对话只拿结论）、可并行的多个独立子任务、多步骤小任务。" +
         "不适合一步就能完成的简单查询（直接调用工具更快）。" +
         "分页列表的跨页计数不要委派，直接用 count_list_by_time。小时桶以外的汇总用 run_tool_code，不要委派翻页。" +
-        "注意：子代理看不到当前对话内容，description 必须自带全部背景。",
+        "可选 subagent_type 从系统提示里的子代理类型索引中选（缺省 general-purpose）；未知类型会失败，不会退化成通用型。" +
+        "子代理看不到当前对话内容，description 必须自包含：写清目标、数据范围与期望返回格式，不要用「上面那个」这类指代。" +
+        "servers 只用于收窄 MCP 服务器（标识 = 工具名前缀 mcp__<服务器>__ 里的 <服务器>），在所选类型允许的范围内再限定；" +
+        "内置工具（如 web_search / fetch_url / fs_*）不要填进 servers，请通过 subagent_type 选择带这些工具的类型。",
       {
         type: "object",
         properties: {
-          description: jsonType("string", "子任务描述：目标、数据范围、期望返回格式"),
+          description: jsonType("string", "自包含的子任务描述：目标、数据范围、期望返回格式（子代理看不到当前对话）"),
+          subagent_type: jsonType("string", "可选：子代理类型 id，来自系统提示的子代理类型索引；不传 = general-purpose"),
+          label: jsonType("string", "可选：UI 短标签，仅用于展示，不影响执行与同轮去重"),
           servers: {
             type: "array",
             description:
-              "可选：只给该子代理这些服务器上的工具（服务器标识 = 工具名前缀 mcp__<服务器>__ 里的 <服务器>）。" +
-              "留空 = 继承主代理的全部工具。用于把子代理的能力限定在它真正需要的范围内。",
+              "可选：只收窄 MCP 服务器（标识 = mcp__<服务器>__ 里的 <服务器>），在所选类型的 mcpServers 范围内再取交集；" +
+              "留空 = 继承该类型允许的全部 MCP 工具。内置工具不要填这里，用 subagent_type 选类型。",
             items: { type: "string" },
           },
         },

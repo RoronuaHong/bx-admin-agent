@@ -98,6 +98,19 @@ function stepQuery(step: { args?: string }): string | null {
   }
 }
 
+// 步骤的 UI 短标签：仅 task 的 label 替代展示名（子代理自定义名）；其它工具按 args.label 展示会
+// 把工具真名遮掉（如某些工具把业务 label 塞进 args），故一律用 toolDisplayName。解析失败/无 label 忽略。
+function stepLabel(step: { name: string; args?: string }): string | null {
+  if (step.name !== "task" || !step.args) return null;
+  try {
+    const parsed = JSON.parse(step.args) as Record<string, unknown>;
+    const label = parsed.label;
+    return typeof label === "string" && label ? label : null;
+  } catch {
+    return null;
+  }
+}
+
 // 把工具结果里的裸 URL 切成片段：普通文本 + 可点击链接。
 // 用真实 <a> 绑定（:href + 文本插值），不走 v-html，从构造上杜绝注入。
 interface StepSegment {
@@ -212,7 +225,7 @@ function stepSegments(step: { result?: string }): StepSegment[] {
                   @click="toggleStep(b, step)"
                 >
                   <span class="mcp-dot" :class="stepClass(step.status)"></span>
-                  <span class="step-name" :title="step.name">{{ toolDisplayName(step.name, uiLocale) }}</span>
+                  <span class="step-name" :title="step.name">{{ stepLabel(step) ?? toolDisplayName(step.name, uiLocale) }}</span>
                   <span v-if="stepQuery(step)" class="step-server" :title="stepQuery(step) ?? undefined">「{{ stepQuery(step) }}」</span>
                   <span v-if="showToolServer(step.name, step.server)" class="step-server" :title="step.server">{{ step.server }}</span>
                   <span v-if="step.result && !openSteps.has(stepKey(b, step))" class="step-hint">

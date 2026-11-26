@@ -201,6 +201,10 @@ type ChatEventBody =
       /** 父代理发起的 task 工具调用 id（UI 关联步骤用）。 */
       parentId: string;
       description: string;
+      /** 子代理类型 id（task 的 subagent_type，缺省 general-purpose）；UI 展示用，不影响执行。可选，旧前端忽略。 */
+      subagentType?: string;
+      /** UI 短标签（task 的 label，不参与去重与执行）；可选，旧前端忽略。 */
+      label?: string;
     }
   | { type: "subagent_delta"; id: string; text: string }
   | {

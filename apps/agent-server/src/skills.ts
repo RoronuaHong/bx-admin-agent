@@ -110,7 +110,7 @@ export function invalidateSkillCache(): void {
 }
 
 /** 解析 SKILL.md 头部 frontmatter（--- 包裹的 `key: value` 行）。 */
-function parseFrontmatter(raw: string): Record<string, string> {
+export function parseFrontmatter(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   const text = raw.replace(/^\uFEFF/, "");
   if (!text.startsWith("---")) return out;
@@ -124,7 +124,7 @@ function parseFrontmatter(raw: string): Record<string, string> {
   return out;
 }
 
-function bodyAfterFrontmatter(raw: string): string | null {
+export function bodyAfterFrontmatter(raw: string): string | null {
   const text = raw.replace(/^\uFEFF/, "");
   if (!text.startsWith("---")) return null;
   const end = text.indexOf("\n---", 3);

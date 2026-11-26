@@ -2,8 +2,11 @@
 // 守住「同一条纪律只有一处措辞」的重构成果：通用纪律由 system-prompt 统一注入，
 // 角色人设只保留角色特有内容。若再有人往人设里回填一份工具守则，这里会先红。
 // 设计口径见 src/system-prompt.ts 与 src/roles.ts 头注释。
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test, expect } from "vitest";
-import { buildSystemPrompt, renderNowClock } from "../src/system-prompt.js";
+import { buildSystemPrompt, renderNowClock, SUBAGENT_PROMPT } from "../src/system-prompt.js";
 import { getRole } from "../src/roles.js";
 import { builtinToolSpecs } from "../src/builtins.js";
 
@@ -161,6 +164,61 @@ test("[L] 客服答复骨架示范：制度类与会话事实类各一个输入�
   expect(base).toContain("按文档：<一句话结论>");
   expect(base).toContain("依据：<来源文件>");
   expect(base).toContain("共 N 条会话");
+});
+
+test("[N] 子代理类型索引：只进主代理稳定段，只含 name+description，不含正文且按预算截断", async () => {
+  const { listSubagentTypes, invalidateSubagentCache, subagentIndexText } = await import("../src/subagents.js");
+  type SpecLike = {
+    id?: string;
+    name?: string;
+    description: string;
+    systemPrompt: string;
+  };
+  const specs = listSubagentTypes() as SpecLike[];
+  expect(specs.length).toBeGreaterThanOrEqual(3);
+  const index = subagentIndexText();
+  expect(index.length).toBeGreaterThan(0);
+  const stable = buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING }).stable;
+  expect(stable, "索引属于跨轮不变的稳定段").toContain(index);
+  for (const spec of specs) {
+    const id = spec.id ?? spec.name ?? "";
+    expect(index, `索引缺少类型 id：${id}`).toContain(id);
+    expect(index, `索引缺少类型 description：${id}`).toContain(spec.description.slice(0, 80));
+    // 正文（完整 systemPrompt）绝不能漏进父代理上下文：路由只需要 name + description。
+    // 实现字段是 systemPrompt；取足够长的片段作为“正文指纹”，确保断言真的会失败如果正文进了索引。
+    const body = (spec.systemPrompt || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    if (body.length >= 20) expect(index, `${id} 的正文泄漏进索引`).not.toContain(body);
+    // 子代理仍用 SUBAGENT_PROMPT，不得递归注入索引。
+    expect(SUBAGENT_PROMPT).not.toContain(id);
+  }
+
+  const prevSubagentDataDir = process.env.SUBAGENT_DATA_DIR;
+  const dataRoot = mkdtempSync(join(tmpdir(), "bx-prompt-subagents-"));
+  process.env.SUBAGENT_DATA_DIR = dataRoot;
+  const localDir = join(dataRoot, "subagents");
+  try {
+    mkdirSync(localDir, { recursive: true });
+    // 正文里放足够长且独特的 canary：若正文泄漏进索引，下面断言必红（不是恒真）。
+    const BODY_CANARY = "ZBODYCANARY_9f3c7a1e_正文绝不可进索引_SENTINEL_20261126";
+    for (let i = 0; i < 10; i += 1) {
+      const name = `zz-prompt-filler-${i}`;
+      writeFileSync(
+        join(localDir, `${name}.md`),
+        `---\nname: ${name}\ndescription: ${"P".repeat(400)}\n---\n\n${BODY_CANARY}_${i}\n`,
+        "utf-8",
+      );
+    }
+    invalidateSubagentCache();
+    const capped = subagentIndexText();
+    expect(capped.length, "父代理索引总长不得超过 SUBAGENT_INDEX_CHARS（默认 4000）").toBeLessThanOrEqual(4000);
+    expect(capped, "正文 canary 泄漏进索引：systemPrompt 不应出现在父代理路由索引").not.toContain("ZBODYCANARY_9f3c7a1e");
+    expect(buildSystemPrompt({ role: "generic", withMemory: false, tooling: TOOLING }).stable).toContain(capped);
+  } finally {
+    invalidateSubagentCache();
+    if (prevSubagentDataDir === undefined) delete process.env.SUBAGENT_DATA_DIR;
+    else process.env.SUBAGENT_DATA_DIR = prevSubagentDataDir;
+    rmSync(dataRoot, { recursive: true, force: true });
+  }
 });
 
 test("[M] export_data 格式枚举：既有 8 项顺序与文案不变，pptx 只追加在尾部", () => {

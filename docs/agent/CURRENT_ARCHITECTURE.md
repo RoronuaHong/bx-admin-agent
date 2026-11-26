@@ -25,7 +25,9 @@
 | D1 | 系统提示 + Skills + Prompt Caching | `system-prompt.ts`（稳定前缀 `SAFETY_GUARDRAIL`+`TOOLING_RULES`+`ANSWER_SHAPE_EXAMPLE`（few-shot 回答骨架，仅工具模式）+ 动态后缀：记忆/历史摘要/回复语言）；`skills.ts`（skills 目录索引常驻、`read_skill` 按需注入全文）；`models.ts`（anthropic 通道对稳定段加 `cache_control: ephemeral`，openai 走隐式前缀缓存）。Prompt 变更纪律（契约测试锚点先行 / 示例占位符 / 单一真相 / few-shot 优先 / 回归必跑）见 `AGENT_CHARTER.md`「Prompt 变更纪律」，锚点测试 `tests/system-prompt-contract.test.ts` |
 | D2 | 虚拟文件系统 | `fs-store.ts`（磁盘 backend `.data/fs/<convId>/`，拒绝 `..`/绝对路径/反斜杠，单文件 256KB、每对话 100 文件）；工具结果超预算先卸载为 `results/<callId>.txt` 并留 `fs_read` 指针。工具：`fs_write`/`fs_edit`/`fs_ls`/`fs_read` |
 | D3 | 任务规划 todo | `builtins.ts(write_todos)` + `conversation.todos` + NDJSON `todos` 事件 + 前端计划卡（✓/•/○/×） |
-| D4 | 子 Agent 委派（通用型） | `builtins.ts(task)` + `chat.ts runLoop/runSubagent`：独立上下文（只看 description）+ 最小工具集（剔除 `task`/`write_todos`）+ `SUBAGENT_PROMPT` + 回传摘要（≤4000 字）+ 并行上限 3（worker 池）+ 取消级联（沿用主代理 signal）+ `SUBAGENT_MAX_ROUNDS=10` |
+| D4 | 子 Agent 委派（具名子代理类型） | `subagents.ts`（文件式定义 + 启动加载 + 父代理索引）+ `builtins.ts(task)` + `chat.ts runLoop/runSubagent`：独立上下文（只看 description）+ 类型级最小工具集（剔除 `task`/`write_todos`）+ 类型正文 + `SUBAGENT_PROMPT` 尾部 + 回传摘要（≤4000 字）+ 并行上限 3（worker 池）+ 取消级联（沿用主代理 signal）+ `SUBAGENT_MAX_ROUNDS=10` |
+
+首批 4 个内置类型（`apps/agent-server/subagents/*.md`，本地 `.data/subagents/*.md` 可同名覆盖）：`general-purpose`（缺省，等同不传类型的旧行为）、`web-researcher`（`web_search`/`fetch_url`/`fs_read`/`fs_write`，消除把 `web` 填进 `servers` 的误用）、`bi-explorer`（BI MCP + fs 只读，`readonly: true`）、`explore`（可选，fs 只读探索）。`task` 新增可选 `subagent_type` 与 `label`（后者不参与同轮去重），未知类型 fail-closed；父代理只拿 `name + description` 索引（不含类型正文，受 `SUBAGENT_INDEX_CHARS` 约束）。**不变项**：不传 `subagent_type` 时执行路径与旧版一致；四态 handoff（`success`/`partial`/`no_findings`/`failed`）与只有 `success` 计入接地证据；`subagent_*` 事件、取消级联、span（新增低基数 attr `gen_ai.tool.subagent.type`）、不可信内容定界、风险闸门（readonly 记 `subagent_refused`）与审计均保留。实现契约与设计背景见 [`SUBAGENTS_DESIGN.md`](./SUBAGENTS_DESIGN.md)。
 
 `task` 是同一次运行里的上下文隔离，不是多进程集群（Anthropic《Building effective agents》：上下文互相污染或必须并行、且只需要摘要时才拆子任务）。
 

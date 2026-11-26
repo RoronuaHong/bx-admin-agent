@@ -274,8 +274,13 @@ export function confirmIgnoresFullAccess(name: string, argsJson: string): boolea
  * - 非只读且有外部副作用（需用户确认）：拒绝，交由主对话发起（那里会弹确认卡）。
  *
  * `allowWrite`（主代理传 true）只用于表达「调用方自己已能弹确认卡」的场景，默认口径不受影响。
+ *
+ * `readonly`（子代理类型声明）是更严格的一层：连「本来免确认的工作区写」也一并拒绝，
+ * 只读调用仍放行。工具白名单在 chat.ts 已按 BUILTIN_RISK 剥掉非 read 内置工具，这里作为第二道闸，
+ * MCP 写工具（无法静态按级别剥离）也在此被拒，拒绝由调用点记 `subagent_refused` 审计。
  */
-export function subagentMayExecute(v: RiskVerdict, allowWrite: boolean): boolean {
+export function subagentMayExecute(v: RiskVerdict, allowWrite: boolean, readonly = false): boolean {
+  if (readonly && v.level !== "read") return false;
   if (allowWrite) return true;
   if (v.level === "read") return true;
   // 与 verdictNeedsConfirm 同源：需要用户确认的动作一律留给主对话。
